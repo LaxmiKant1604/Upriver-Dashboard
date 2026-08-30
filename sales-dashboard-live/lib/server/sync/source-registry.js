@@ -162,7 +162,11 @@ export const SOURCE_REGISTRY = Object.freeze([
     dataDoeSourceId: "ba689c05d7f7cee1a1690990c28995680a0654b7ed258230f4173d61bbcd1ab3",
     scope: "seller",
     grain: "current-snapshot",
-    batching: { mode: "per-account", maxAccountsPerExport: 1, marketplaceSafe: true },
+    // fba-plan:awd is a marketplace-safe seller-scoped batchable contract (LISTINGS_AWD_COLUMNS carries
+    // seller_or_vendor_id + marketplace_country_code), so the source declares stable-batch/5. listing-health's
+    // own listings contract is NOT seller-scoped, so it still fetches per account (batching is driven by the
+    // contract sourceScope, not this registry flag).
+    batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
     usedByReports: ["fba-plan", "listing-health"],
     usedByDashboards: ["fba-plan", "listing-health", "priority-feed"],
     initialBackfill: { kind: "current-only" },
@@ -190,7 +194,11 @@ export const SOURCE_REGISTRY = Object.freeze([
     dataDoeSourceId: "44fc5ba0ce81a7807601f6d7a9b8b7aaec64be4c7e046ea30dc6864d1a4aa823",
     scope: "seller",
     grain: "current-snapshot",
-    batching: { mode: "per-account", maxAccountsPerExport: 1, marketplaceSafe: true },
+    // fba-plan:inventory-health is a marketplace-safe seller-scoped batchable contract (FBA_HEALTH_COLUMNS carries
+    // seller_or_vendor_id + marketplace_country_code), so the source declares stable-batch/5. The insight reports'
+    // inventory contracts (sales-movers/listing-health/buy-box-loss, INSIGHT_INVENTORY_COLUMNS) are NOT
+    // seller-scoped, so they still fetch per account -- unaffected (batching follows the contract, not this flag).
+    batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
     usedByReports: ["fba-plan", "sales-movers", "listing-health", "buy-box-loss"],
     usedByDashboards: ["fba-plan", "sales-movers", "listing-health", "buy-box-loss", "brand-view", "priority-feed"],
     // The latest VALIDATED current snapshot is what matters; historical inventory is never repeatedly

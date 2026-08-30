@@ -471,7 +471,14 @@ const REGISTRY = {
     // awd_total_inbound_quantity and stores reserved_fc_transfer RAW (the unproven subtraction was removed). The LIVE
     // served identity (fba-plan-shared-v1) is unchanged; the frontend reads accountSkuDirectory when present and falls
     // back to the string-only accountSkus for older snapshots.
-    snapshotVersion: "fba-plan/v2d-5", optionalRequestKeys: ["fba-plan:awd"], derivedSourceKeys: [],
+    snapshotVersion: "fba-plan/v2d-5", optionalRequestKeys: ["fba-plan:awd"],
+    // OLI sales + Product Catalog are durable derived dependencies (source_oli_daily_history + the org catalog
+    // snapshot), injected into the derive context by makeFbaPlanDurableContextLoader through the loadDerivedContext
+    // seam. derivedContextKeys is the allowlist buildDeriveContext uses to admit them (they never enter the
+    // snapshot params/identity). A missing/short durable input arrives absent -> the derive throws below ->
+    // last-known-good preserved (fail closed).
+    derivedSourceKeys: ["order-line-items", "product-catalog"],
+    derivedContextKeys: ["fbaPlanDurableOli", "fbaPlanDurableCatalog"],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";
       if (!isValidCalendarDate(asOf)) {
@@ -488,11 +495,24 @@ const REGISTRY = {
       // units for each completed month + the MTD month, and the current-month per-date units (latest-date
       // probe). Units are a currency-agnostic count, so the fold sums total_units_sum across currencies.
       const expectedOliSlices = canonicalOliSlices(completed[0].from, current.to);
-      const oliSalesRows = slicedFragmentRows(sources["fba-plan:oli-sales"], expectedOliSlices, rawSellerId, "fba-plan:oli-sales");
+      // DERIVED durable OLI: the loader bridges source_oli_daily_history into the exact sliced-fragment shape
+      // (slicedOliSourceFromHistory, proven byte-identical to a fetched slice payload), ONLY when the account's
+      // durable coverage proves through asOf. Missing/short/absent => block (last-known-good preserved).
+      const durableOli = context.fbaPlanDurableOli;
+      if (!durableOli || durableOli.available !== true || !Array.isArray(durableOli.fragments)) {
+        throw new Error("fba-plan requires durable Order Line Items evidence (source_oli_daily_history) proving coverage through asOf; it is missing or short, so the snapshot is blocked (previous data preserved).");
+      }
+      const oliSalesRows = slicedFragmentRows(durableOli, expectedOliSlices, rawSellerId, "fba-plan:oli-sales");
       const { completedUnitRows, mtdUnitRows, dailyDateRows } = foldOliSalesToFbaInputs(oliSalesRows, completed, current);
 
-      // 2) single-account single-fragment required ranges.
-      const catalogRows = singleAccountFragmentRows(sources["fba-plan:catalog"], "fba-plan:catalog", rawSellerId, completed[0].from, current.to);
+      // 2) single-account single-fragment required ranges. Catalog is a DERIVED durable dependency (the org
+      //    Product Catalog snapshot), wrapped by the loader as a single-account fragment over [completed[0].from
+      //    .. current.to]; absence blocks (last-known-good preserved).
+      const durableCatalog = context.fbaPlanDurableCatalog;
+      if (!durableCatalog || durableCatalog.available !== true || !Array.isArray(durableCatalog.fragments)) {
+        throw new Error("fba-plan requires the durable Product Catalog snapshot; it is missing, so the snapshot is blocked (previous data preserved).");
+      }
+      const catalogRows = singleAccountFragmentRows(durableCatalog, "fba-plan:catalog", rawSellerId, completed[0].from, current.to);
       // Inventory window is EXACTLY [asOf - 10d .. asOf]. Recompute the expected start here and pin
       // BOTH endpoints (a shortened or extended lookback fragment is rejected -> derive-invalid ->
       // last-known-good preserved), never implicitly trusting the planner/caller.

@@ -35,6 +35,7 @@ let assembleSources, deriveReportSnapshot, runReportJobs;
 let fbaPlanPayload, foldPlanAsinUnits;
 let planMonthWindows, addDaysStr, planFbaPlan, canonicalOliSlices;
 let slicedOliSourceFromHistory;
+let makeFbaPlanDurableContextLoader, oliCoverageProvesWindow;
 
 const ID = "A1";
 const ASOF = "2025-08-06";
@@ -88,8 +89,17 @@ function fbaPlanned({ oliByIdx = [[], [], [], []], catalogRows = [], invRows = [
 }
 
 const usContext = (over = {}) => ({ to: ASOF, rawSellerId: ID, accountName: "Acme Co", marketCountry: "US", isUS: true, ...over });
-const deriveFba = (planned, rows, context = usContext(), statusOverride) =>
-  deriveReportSnapshot({ reportKey: "fba-plan", sources: buildSources(planned, rows, statusOverride), context });
+// OLI sales + Product Catalog are now DERIVED durable dependencies injected via the derive CONTEXT
+// (fbaPlanDurableOli / fbaPlanDurableCatalog), not owned source fragments. assembleSources produces the exact
+// { available, rows, fragments } shape the loader emits, so relocating those two entries from `sources` to
+// `context` exercises the identical derive path the report worker's loadDerivedContext feeds. inventory-health +
+// AWD remain owned (fetched) sources. A test that omits the OLI/catalog fragments leaves the durable input absent
+// -> the derive fails closed, exactly as in production.
+const deriveFba = (planned, rows, context = usContext(), statusOverride) => {
+  const sources = buildSources(planned, rows, statusOverride);
+  const ctx = { ...context, fbaPlanDurableOli: sources["fba-plan:oli-sales"], fbaPlanDurableCatalog: sources["fba-plan:catalog"] };
+  return deriveReportSnapshot({ reportKey: "fba-plan", sources, context: ctx });
+};
 
 // A compact report-store double for the report worker (runReportJobs): all source deps are seeded
 // succeeded, so the FETCH gate passes and the DERIVE stage is exercised. Tracks snapshot save calls
@@ -119,14 +129,21 @@ function makeReportStore() {
   };
 }
 
-// Build a planned report + a seeded store for the worker, from fbaPlanned() fragments.
+// Build a planned report + a seeded store for the worker, from fbaPlanned() fragments. OLI + catalog are DERIVED
+// (no owned export): only inventory-health + AWD are owned sources; the durable OLI/catalog reach the derive via
+// an injected loadDerivedContext exactly as makeFbaPlanDurableContextLoader supplies them in production.
 function fbaReportPlan(planned, rows) {
   const store = makeReportStore();
-  for (const p of planned) store.seedSourceSucceeded(p.requestHash);
-  const sources = planned.map((p) => ({ ...p, optional: p.requestKey === "fba-plan:awd" }));
-  const plannedReport = { reportKey: "fba-plan", accountId: ID, connectionId: "primary", bucket: "us", reportVersion: "fba-plan/v2d-3", sources, context: usContext() };
+  const owned = planned.filter((p) => p.requestKey === "fba-plan:inventory-health" || p.requestKey === "fba-plan:awd");
+  for (const p of owned) store.seedSourceSucceeded(p.requestHash);
+  const sources = owned.map((p) => ({ ...p, optional: p.requestKey === "fba-plan:awd" }));
+  const plannedReport = { reportKey: "fba-plan", accountId: ID, connectionId: "primary", bucket: "us", reportVersion: "fba-plan/v2d-5", sources, context: usContext() };
   const sourceRows = (hash) => (Object.prototype.hasOwnProperty.call(rows, hash) ? { rows: rows[hash] } : { rows: [] });
-  return { store, plannedReport, sourceRows };
+  const derived = buildSources(planned, rows); // the assembled { available, rows, fragments } shapes, incl. OLI + catalog
+  const loadDerivedContext = async ({ reportKey }) => (reportKey === "fba-plan"
+    ? { fbaPlanDurableOli: derived["fba-plan:oli-sales"], fbaPlanDurableCatalog: derived["fba-plan:catalog"] }
+    : {});
+  return { store, plannedReport, sourceRows, loadDerivedContext };
 }
 
 // ---- shared parity fixture (a US account with sales, inventory + AWD) ----
@@ -257,8 +274,10 @@ test("fba-plan: DURABLE-bridged OLI produces a BYTE-IDENTICAL payload to fetched
   }));
   const bridged = slicedOliSourceFromHistory({ historyRows: durableRows, accountId: ID, rawSellerId: ID, from: WINS[0].from, to: ASOF });
   const sources = buildSources(planned, rows);
-  sources["fba-plan:oli-sales"] = { available: true, rows: bridged.rows, fragments: bridged.fragments };
-  const durable = deriveReportSnapshot({ reportKey: "fba-plan", sources, context: usContext() });
+  // The durable OLI reaches the derive via CONTEXT (fbaPlanDurableOli), exactly as makeFbaPlanDurableContextLoader
+  // supplies it; the catalog comes from the same durable path. inventory-health + AWD remain owned sources.
+  const context = { ...usContext(), fbaPlanDurableOli: { available: true, rows: bridged.rows, fragments: bridged.fragments }, fbaPlanDurableCatalog: sources["fba-plan:catalog"] };
+  const durable = deriveReportSnapshot({ reportKey: "fba-plan", sources, context });
   assert.equal(durable.status, "derived", "durable-bridged OLI derives");
   assert.deepEqual(durable.payload, fetched.payload, "durable OLI => byte-identical fba-plan payload; no derive change needed");
 });
@@ -420,9 +439,28 @@ test("fba-plan: derivation performs ZERO fetch/DataDoe calls", async () => {
 
 test("fba-plan: an unavailable required source preserves last-known-good (no snapshot)", () => {
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  const catHash = planned.find((p) => p.requestKey === "fba-plan:catalog").requestHash;
-  const res = deriveFba(planned, rows, usContext(), { [catHash]: "failed" });
+  // inventory-health is now the required OWNED source (OLI + catalog are durable derived deps). A failed required
+  // owned source yields "unavailable" (retryable) -> zero writes -> last-known-good preserved.
+  const invHash = planned.find((p) => p.requestKey === "fba-plan:inventory-health").requestHash;
+  const res = deriveFba(planned, rows, usContext(), { [invHash]: "failed" });
   assert.equal(res.status, "unavailable");
+  assert.equal(res.payload, null);
+});
+
+test("fba-plan: a MISSING durable OLI context fails closed (invalid -> last-known-good preserved)", () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const sources = buildSources(planned, rows);
+  // Durable OLI absent (loader returned {} for short/missing coverage) -> derive blocks, never fabricates.
+  const res = deriveReportSnapshot({ reportKey: "fba-plan", sources, context: { ...usContext(), fbaPlanDurableCatalog: sources["fba-plan:catalog"] } });
+  assert.equal(res.status, "invalid");
+  assert.equal(res.payload, null);
+});
+
+test("fba-plan: a MISSING durable Catalog context fails closed (invalid -> last-known-good preserved)", () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const sources = buildSources(planned, rows);
+  const res = deriveReportSnapshot({ reportKey: "fba-plan", sources, context: { ...usContext(), fbaPlanDurableOli: sources["fba-plan:oli-sales"] } });
+  assert.equal(res.status, "invalid");
   assert.equal(res.payload, null);
 });
 
@@ -449,12 +487,11 @@ test("planMonthWindows: matches the route formula (3 completed months + current 
   assert.deepEqual(planMonthWindows("2024-05-31").completed.map((m) => m.to), ["2024-02-29", "2024-03-31", "2024-04-30"]);
 });
 
-test("planFbaPlan: US account emits every source incl. AWD, single-account, deterministic hashes", () => {
+test("planFbaPlan: US account emits ONLY the owned FBA Health + AWD sources (OLI/catalog are derived), single-account, deterministic hashes", () => {
   const req = planFbaPlan({ accountId: ID, name: "Acme Co", country: "US", currency: "USD", connections: PL_CONN, asOf: ASOF });
   const keys = [...new Set(req.sources.map((s) => s.requestKey))].sort();
-  assert.deepEqual(keys, ["fba-plan:awd", "fba-plan:catalog", "fba-plan:inventory-health", "fba-plan:oli-sales"]);
-  const expectedOliSlices = canonicalOliSlices(planMonthWindows(ASOF).completed[0].from, ASOF);
-  assert.equal(req.sources.filter((s) => s.requestKey === "fba-plan:oli-sales").length, expectedOliSlices.length, "one fragment per canonical OLI slice (3 completed months + current MTD)");
+  // OLI + catalog are durable derived dependencies -> NOT planned exports. Only FBA Health + US AWD are owned.
+  assert.deepEqual(keys, ["fba-plan:awd", "fba-plan:inventory-health"]);
   assert.ok(req.sources.every((s) => s.sellerOrVendorIds.length === 1 && s.sellerOrVendorIds[0] === ID));
   assert.deepEqual(req.context, { to: ASOF, rawSellerId: ID, accountName: "Acme Co", marketCountry: "US", isUS: true });
   const b = planFbaPlan({ accountId: ID, name: "Acme Co", country: "US", currency: "USD", connections: PL_CONN, asOf: ASOF }).sources.map((s) => s.requestHash);
@@ -539,14 +576,79 @@ test("fba-plan worker: a shortened-inventory derive writes ZERO snapshots and pr
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
   planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -9) }; // shortened -> derive invalid before save
-  const { store, plannedReport, sourceRows } = fbaReportPlan(planned, rows);
+  const { store, plannedReport, sourceRows, loadDerivedContext } = fbaReportPlan(planned, rows);
   const LKG = { asOf: "2025-07-01", rows: [{ asin: "PRIOR" }] };
   store.seedSnapshot("scheduler-v2/fba-plan", ID, LKG); // prior good (shadow-namespaced) snapshot
   const saveSnapshot = async () => { store.saveCalls += 1; return { paramsHash: "ph" }; };
-  await runReportJobs({ store, cycleId: "cyc1", sourceRows, saveSnapshot, plannedReports: [plannedReport] });
+  await runReportJobs({ store, cycleId: "cyc1", sourceRows, saveSnapshot, plannedReports: [plannedReport], loadDerivedContext });
   assert.equal(store.saveCalls, 0, "no snapshot saved for the blocked derive");
   assert.deepEqual(store._snapshots.get("scheduler-v2/fba-plan|" + ID).payload, LKG, "last-known-good snapshot unchanged/readable");
   assert.equal(store.report("fba-plan", ID).derive_status, "failed", "report recorded a derive failure (terminal this cycle)");
+});
+
+/* ============================= durable derived-context loader ============================= */
+
+group("fba-plan: durable derived-context loader (OLI + Catalog)");
+
+// The SAME OLI as durable source_oli_daily_history rows (see the parity fixture), for the loader's getOliHistory.
+const durableOliRows = () => OLI.flat().map((r) => ({
+  account_id: ID, sale_date: r.date, seller_or_vendor_id: ID, sku: r.sku || "",
+  child_asin: r.child_asin, currency: r.item_price_currency || "USD", sales_amount: 0, units: r.total_units_sum,
+}));
+const fullCoverage = { read: "ok", windows: [{ from: WINS[0].from, to: ASOF }] };
+const makeLoader = (over = {}) => makeFbaPlanDurableContextLoader({
+  connections: PL_CONN,
+  getOliCoverage: over.getOliCoverage || (async () => fullCoverage),
+  getOliHistory: over.getOliHistory || (async () => durableOliRows()),
+  getCatalogSnapshot: over.getCatalogSnapshot || (async () => ({ read: "ok", snapshot: { object_path: "cat/x.json", validated_at: "2025-08-06T00:00:00Z" } })),
+  loadCatalogPayload: over.loadCatalogPayload || (async () => ({ rows: CATALOG })),
+});
+const loaderArgs = (over = {}) => ({ reportKey: "fba-plan", accountId: ID, planned: { context: usContext(over) } });
+
+test("oliCoverageProvesWindow: proves only when the span covers [from..to] end to end", () => {
+  assert.equal(oliCoverageProvesWindow([{ from: "2025-05-01", to: "2025-08-06" }], "2025-05-01", "2025-08-06"), true);
+  assert.equal(oliCoverageProvesWindow([{ from: "2025-06-01", to: "2025-08-06" }], "2025-05-01", "2025-08-06"), false, "starts too late");
+  assert.equal(oliCoverageProvesWindow([{ from: "2025-05-01", to: "2025-08-01" }], "2025-05-01", "2025-08-06"), false, "ends too early");
+  assert.equal(oliCoverageProvesWindow([], "2025-05-01", "2025-08-06"), false, "no windows");
+});
+
+test("loader: returns {} for every report that is NOT fba-plan", async () => {
+  assert.deepEqual(await makeLoader()({ reportKey: "daily-reporting", accountId: ID, planned: { context: usContext() } }), {});
+});
+
+test("loader: full durable coverage yields OLI + Catalog context that derives BYTE-IDENTICALLY", async () => {
+  const ctx = await makeLoader()(loaderArgs());
+  assert.equal(ctx.fbaPlanDurableOli.available, true);
+  assert.equal(ctx.fbaPlanDurableCatalog.available, true);
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const sources = buildSources(planned, rows);
+  const out = deriveReportSnapshot({ reportKey: "fba-plan", sources, context: { ...usContext(), ...ctx } });
+  assert.equal(out.status, "derived");
+  assert.deepEqual(out.payload, EXPECTED, "durable loader OLI+catalog => byte-identical fba-plan payload");
+});
+
+test("loader: SHORT durable OLI coverage (ends before asOf) fails closed -> no OLI context (derive blocks)", async () => {
+  const ctx = await makeLoader({ getOliCoverage: async () => ({ read: "ok", windows: [{ from: WINS[0].from, to: addDaysStr(ASOF, -1) }] }) })(loaderArgs());
+  assert.equal(ctx.fbaPlanDurableOli, undefined, "short coverage => OLI omitted (fail closed)");
+  assert.equal(ctx.fbaPlanDurableCatalog, undefined, "no OLI => the whole context is empty");
+});
+
+test("loader: a failed OLI coverage read fails closed", async () => {
+  const ctx = await makeLoader({ getOliCoverage: async () => ({ read: "read-failed", windows: [] }) })(loaderArgs());
+  assert.deepEqual(ctx, {});
+});
+
+test("loader: OLI present but catalog missing -> OLI supplied, catalog omitted (derive fails closed on catalog)", async () => {
+  const ctx = await makeLoader({ getCatalogSnapshot: async () => ({ read: "ok", snapshot: null }) })(loaderArgs());
+  assert.equal(ctx.fbaPlanDurableOli.available, true);
+  assert.equal(ctx.fbaPlanDurableCatalog, undefined);
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const out = deriveReportSnapshot({ reportKey: "fba-plan", sources: buildSources(planned, rows), context: { ...usContext(), ...ctx } });
+  assert.equal(out.status, "invalid", "missing durable catalog blocks the derive (last-known-good preserved)");
+});
+
+test("loader: a non-calendar asOf yields {} (derive fails closed)", async () => {
+  assert.deepEqual(await makeLoader()({ reportKey: "fba-plan", accountId: ID, planned: { context: usContext({ to: "not-a-date" }) } }), {});
 });
 
 /* ============================= run ============================= */
@@ -559,6 +661,7 @@ async function main() {
   ({ planMonthWindows, addDaysStr, canonicalOliSlices } = await import("../lib/server/date-windows.js"));
   ({ planFbaPlan } = await import("../lib/server/sync/report-planner.js"));
   ({ slicedOliSourceFromHistory } = await import("../lib/server/sync/durable-dashboards.js"));
+  ({ makeFbaPlanDurableContextLoader, oliCoverageProvesWindow } = await import("../lib/server/sync/fba-plan-durable-loader.js"));
   mark("modules loaded; running " + tests.filter((t) => !t.marker).length + " tests");
 
   let failures = 0;

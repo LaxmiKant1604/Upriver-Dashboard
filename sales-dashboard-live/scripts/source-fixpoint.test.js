@@ -305,12 +305,15 @@ test("A1. required vs optional families per report; tranche annotations + budget
   assert.deepEqual(g.reports["daily-reporting"].requiredFamilies, ["order-line-items", "product-catalog"]);
   assert.deepEqual(g.reports["brand-sales"].requiredFamilies, ["order-line-items", "product-catalog"]);
   assert.equal(g.reports["brand-view"].derivedOnly, true, "brand-view is snapshot-derived (no source families of its own)");
-  assert.deepEqual(g.reports["fba-plan"].requiredFamilies, ["fba-inventory-health", "order-line-items", "product-catalog"]);
+  // fba-plan fetches ONLY its FBA Inventory Health snapshot; OLI + Product Catalog are durable DERIVED deps (not
+  // fetched), so they are not required source families for fba-plan's own planning.
+  assert.deepEqual(g.reports["fba-plan"].requiredFamilies, ["fba-inventory-health"]);
   assert.deepEqual(g.reports["fba-plan"].optionalFamilies, ["listings"], "fba-plan:awd is optional");
   assert.deepEqual(g.reports["keyword-rank"].requiredFamilies, ["product-catalog", "sqp-weekly"]);
   assert.deepEqual(g.reports["keyword-rank"].optionalFamilies, ["sqp-monthly"]);
   const byName = Object.fromEntries(g.tranches.map((t) => [t.name, t]));
-  assert.deepEqual(byName["order-line-items"].requiredByReports, ["brand-sales", "daily-reporting", "fba-plan"]);
+  // fba-plan no longer fetches OLI (durable derived), so it is not an OLI-required report here.
+  assert.deepEqual(byName["order-line-items"].requiredByReports, ["brand-sales", "daily-reporting"]);
   assert.equal(byName["order-line-items"].budgetMode, "frozen");
   assert.equal(byName["date-sliceable"].budgetMode, "unbudgeted");
   assert.deepEqual(byName["staged-signal"].requiredByReports, ["keyword-rank"]);

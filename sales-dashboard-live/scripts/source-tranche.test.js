@@ -301,13 +301,14 @@ test("composition. buildSchedulerV2SourceTrancheRuntime FIXES the tranche at bui
 /* ============================= Part B: OLI hash sharing ============================= */
 group("Part B: OLI canonical hash sharing across reports + accounts");
 
-test("1. the five OLI reports share ONE canonical request_hash per overlapping account/slice", () => {
+test("1. the OLI-owning reports share ONE canonical request_hash per overlapping account/slice", () => {
+  // fba-plan reads OLI durably now (no owned OLI contract), so it is not in this owned-export sharing set.
   const REPORTS = {
-    "daily-reporting": "daily-reporting:oli-sales", "fba-plan": "fba-plan:oli-sales",
+    "daily-reporting": "daily-reporting:oli-sales",
     "buy-box-loss": "buy-box-loss:oli-sales", "returns-leakage": "returns-leakage:oli-sales",
     "ppc-performance": "ppc-performance:oli-sales",
   };
-  const win = { from: "2025-07-14", to: "2025-07-20" }; // one overlapping canonical slice, same for all five
+  const win = { from: "2025-07-14", to: "2025-07-20" }; // one overlapping canonical slice, same for all
   const sourceId = OLI_SOURCE_ID();
   const hashes = Object.entries(REPORTS).map(([rep, rk]) => {
     const c = oliContract(rep, rk);
@@ -315,7 +316,7 @@ test("1. the five OLI reports share ONE canonical request_hash per overlapping a
     const options = { groupBy: c.groupBy || undefined, aggregations: c.aggregations || undefined, orderByColumn: c.orderByColumn, orderByDirection: c.orderByDirection };
     return sourceRequestIdentity({ apiKey: "k", sourceId, columns: c.columns, ids: [ID], from: win.from, to: win.to, limit: c.limit, options }).requestHash;
   });
-  assert.equal(new Set(hashes).size, 1, "all five OLI reports resolve to ONE identical request_hash for the shared slice");
+  assert.equal(new Set(hashes).size, 1, "all OLI-owning reports resolve to ONE identical request_hash for the shared slice");
 });
 
 test("2. one canonical source row carries ALL applicable owner memberships (two OLI reports, one export)", async () => {

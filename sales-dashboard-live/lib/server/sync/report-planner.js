@@ -335,13 +335,11 @@ export function planReconciliation({ accountId, country, currency, connections, 
 export function planFbaPlan({ accountId, name, country, currency, connections, asOf }) {
   const scope = resolveAccountScope({ accountId, country, currency, connections });
   const asOfStr = String(asOf);
-  const { completed, current } = planMonthWindows(asOfStr);
   const isUS = scope.country === "US";
+  // OLI sales + Product Catalog are DERIVED durable dependencies for fba-plan (read from source_oli_daily_history +
+  // the org Product Catalog snapshot via makeFbaPlanDurableContextLoader) -- NOT owned exports -- so the planner
+  // emits NO OLI/catalog windows. Only the FBA Inventory Health snapshot + US-only AWD listing are owned exports.
   const windowsByRequestKey = {
-    // Blocker 1: ONE canonical Order Line Items sales fragment over [completed[0].from .. asOf], sliced by
-    // canonicalOliSlices. Per-ASIN monthly units + the current-month latest-date probe are DERIVED from it.
-    "fba-plan:oli-sales": canonicalOliSlices(completed[0].from, current.to),
-    "fba-plan:catalog": [{ from: completed[0].from, to: current.to }],
     "fba-plan:inventory-health": [{ from: addDaysStr(asOfStr, -FBA_INVENTORY_LOOKBACK_DAYS), to: asOfStr }],
   };
   // AWD is a US-only no-date source; supply its window ONLY for US (the contract's country gate would

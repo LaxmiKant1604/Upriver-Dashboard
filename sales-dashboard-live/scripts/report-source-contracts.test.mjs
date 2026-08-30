@@ -374,10 +374,8 @@ const FBA_ASOF = "2025-08-06";
 const fbaPlanMonths = planMonthWindows(FBA_ASOF); // completed[0].from = 2025-05-01, current.to = asOf
 const fbaOliSlices = canonicalOliSlices(fbaPlanMonths.completed[0].from, FBA_ASOF);
 const fbaBase = {
-  // Blocker 1: ONE canonical OLI sales fragment sliced by canonicalOliSlices over the 3-completed-month +
-  // current-MTD span (replaces the former fba-plan:monthly-units + fba-plan:current-daily-dates pair).
-  "fba-plan:oli-sales": fbaOliSlices,
-  "fba-plan:catalog": [{ from: fbaPlanMonths.completed[0].from, to: FBA_ASOF }],
+  // OLI sales + Product Catalog are DERIVED durable deps for fba-plan (no owned export), so they are NOT resolved
+  // here. Only the FBA Inventory Health snapshot (all markets) + the US-only AWD listing are owned exports.
   "fba-plan:inventory-health": [{ from: "2025-07-27", to: "2025-08-06" }],
 };
 const fbaWithAwd = { ...fbaBase, "fba-plan:awd": [{ from: null, to: null }] };
@@ -450,31 +448,27 @@ test("daily-reporting derivation strategy derives all-brand + named-brand from t
   assert.ok(!/splitDateRangeByMonth/.test(fdBody.slice(0, fdBody.indexOf("\n}\n"))), "named-brand fetch must NOT use splitDateRangeByMonth");
 });
 
-/* --- executable parity: fba-plan (ONE canonical OLI sales fragment; Blocker 1) --- */
-test("fba-plan oli-sales matches the canonical OLI sales fragment constants (folded to per-ASIN monthly units)", () => {
-  const c = byKey(fba, "fba-plan:oli-sales");
-  assert.deepEqual(c.columns, constArray("OLI_SALES_COLUMNS"));
-  assert.deepEqual(c.groupBy, constArray("OLI_SALES_GROUP_BY"));
-  assert.deepEqual(c.aggregations, constAggregations("OLI_SALES_AGGREGATIONS"));
-  assert.equal(c.limit, constNumber("OLI_SALES_ROW_LIMIT"));
-  assert.equal(c.orderByColumn, "date");
-  assert.equal(c.orderByDirection, "ASC");
-  assert.equal(c.sourceKey, "order-line-items");
-  // The live fba route fetches the canonical fragment and folds per-ASIN monthly units + the latest-date
-  // probe from it (foldOliSalesToFbaInputs derives the same inputs the payload assembly consumes).
-  assert.ok(DD.includes("PLAN_SALES_SOURCE_ID, OLI_SALES_COLUMNS"), "fba route must fetch the canonical OLI fragment");
+/* --- executable parity: fba-plan (OLI + catalog are DERIVED durable deps; only FBA Health + AWD are owned) --- */
+test("fba-plan owns NO OLI/catalog contract (both are durable derived deps)", () => {
+  assert.equal(byKey(fba, "fba-plan:oli-sales"), undefined, "fba-plan:oli-sales is not an owned contract");
+  assert.equal(byKey(fba, "fba-plan:catalog"), undefined, "fba-plan:catalog is not an owned contract");
+  // The two owned contracts remain FBA Health + AWD.
+  assert.ok(byKey(fba, "fba-plan:inventory-health"), "fba-plan:inventory-health is owned");
+  assert.ok(byKey(fba, "fba-plan:awd"), "fba-plan:awd is owned");
 });
-test("fba-plan catalog / inventory-health / awd match their constants", () => {
-  const cat = byKey(fba, "fba-plan:catalog");
-  assert.deepEqual(cat.columns, constArray("PRODUCT_CATALOG_COLUMNS"));
-  assert.equal(cat.limit, constNumber("CATALOG_ROW_LIMIT"));
+test("fba-plan inventory-health / awd match their constants (both now seller-scoped for marketplace-safe batching)", () => {
   const inv = byKey(fba, "fba-plan:inventory-health");
-  assert.deepEqual(inv.columns, constArray("FBA_HEALTH_COLUMNS"));
+  // The scheduler-v2 contract carries the marketplace-safe batch-split key seller_or_vendor_id IN ADDITION to the
+  // route's FBA_HEALTH_COLUMNS. The derive IGNORES that column (fbaPlanPayload never reads it), so the derived
+  // payload stays byte-identical to the route -- only the fetch identity gains the split key needed to batch.
+  assert.ok(inv.columns.includes("seller_or_vendor_id"), "batchable FBA Health contract carries the seller split key");
+  assert.deepEqual(inv.columns.filter((c) => c !== "seller_or_vendor_id"), constArray("FBA_HEALTH_COLUMNS"));
   assert.equal(inv.limit, constNumber("PLAN_INVENTORY_ROW_LIMIT"));
   assert.equal(inv.orderByColumn, "date");
   assert.equal(inv.orderByDirection, "DESC");
   const awd = byKey(fba, "fba-plan:awd");
-  assert.deepEqual(awd.columns, constArray("LISTINGS_AWD_COLUMNS"));
+  assert.ok(awd.columns.includes("seller_or_vendor_id"), "batchable AWD contract carries the seller split key");
+  assert.deepEqual(awd.columns.filter((c) => c !== "seller_or_vendor_id"), constArray("LISTINGS_AWD_COLUMNS"));
   assert.equal(awd.limit, constNumber("CATALOG_ROW_LIMIT"));
   assert.deepEqual(awd.marketplaceCountries, ["US"]);
   assert.equal(awd.orderByColumn, "child_asin");
@@ -489,32 +483,19 @@ test("reconciliation segments orders + settlements per month; catalog stays a si
   assert.equal(got.length, 13); // 6 + 6 + 1, single chunk (no cross-product)
   assert.equal(new Set(got.filter((r) => r.requestKey === "reconciliation:order-lines").map((r) => r.requestHash)).size, 6);
 });
-test("fba-plan oli-sales is one canonical fragment per canonicalOliSlices window; total is additive", () => {
+test("fba-plan resolves ONLY its owned FBA Health + US AWD sources (OLI/catalog are durable derived)", () => {
   const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });
-  assert.equal(got.filter((r) => r.requestKey === "fba-plan:oli-sales").length, fbaOliSlices.length);
-  assert.equal(got.filter((r) => r.requestKey === "fba-plan:catalog").length, 1);
+  assert.equal(got.filter((r) => r.requestKey === "fba-plan:oli-sales").length, 0, "no owned OLI fragments");
+  assert.equal(got.filter((r) => r.requestKey === "fba-plan:catalog").length, 0, "no owned catalog fragment");
   assert.equal(got.filter((r) => r.requestKey === "fba-plan:inventory-health").length, 1);
   assert.equal(got.filter((r) => r.requestKey === "fba-plan:awd").length, 1);
-  assert.equal(got.length, fbaOliSlices.length + 3);
-});
-
-/* --- one canonical OLI source id; distinct windows => distinct identities --- */
-test("fba-plan's canonical OLI fragments all use the OLI source id with per-window identities", () => {
-  const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });
-  const oli = got.filter((r) => r.requestKey === "fba-plan:oli-sales");
-  assert.ok(oli.length > 1);
-  assert.equal(new Set(oli.map((r) => r.sourceId)).size, 1); // one Order Line Items source id
-  assert.equal(new Set(oli.map((r) => r.requestHash)).size, oli.length); // distinct windows => distinct hashes
-  const augSlice = oli.find((r) => r.from === "2025-08-01");
-  assert.ok(augSlice, "the current-month Aug slice is present");
-  assert.equal(augSlice.sourceId, oli[0].sourceId); // same Order Line Items source id
-  assert.notEqual(augSlice.requestHash, oli[0].requestHash); // different windows => distinct hashes
+  assert.equal(got.length, 2);
 });
 
 /* --- country-driven US-only AWD --- */
 test("fba-plan resolves without AWD for a non-US account", () => {
   const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaBase, marketplaceCountry: "IN" });
-  assert.ok(got.length === fbaOliSlices.length + 2); // oli-sales slices + catalog + inventory, no AWD
+  assert.equal(got.length, 1); // only the owned FBA Health snapshot (OLI/catalog derived; no AWD for non-US)
   assert.ok(got.every((r) => r.requestKey !== "fba-plan:awd"));
 });
 test("fba-plan resolves AWD as a no-date request for a US account", () => {
@@ -561,7 +542,8 @@ for (const n of [0, 1, 5, 6, 11]) {
 }
 
 test("validation still applies to the new reports (missing required key throws)", () => {
-  assert.throws(() => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "fba-plan:oli-sales": fbaOliSlices }, marketplaceCountry: "IN" }), /Missing windows/);
+  // A US fba-plan with only AWD supplied is missing its required FBA Health snapshot window -> throws.
+  assert.throws(() => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "fba-plan:awd": [{ from: null, to: null }] }, marketplaceCountry: "US" }), /Missing windows/);
 });
 
 /* ===================== keyword-rank + content-changes ===================== */
@@ -851,7 +833,7 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
   // Phase 1e re-review (their canonical Scheduler-v2 dispatch is strict even though the live route is not).
   const SCHEDULER_V2_STRICT = [
     "reconciliation:catalog",
-    "fba-plan:oli-sales", "fba-plan:catalog",
+    // fba-plan's OLI + catalog are durable derived deps now (no owned export); only its FBA Health + AWD remain.
     "fba-plan:inventory-health", "fba-plan:awd",
     "brand-sales:order-lines", "brand-sales:catalog",
     "content-changes:events", "content-changes:catalog",
@@ -960,7 +942,7 @@ test("execution metadata does NOT change request_hash (identity ignores strict/p
 
 test("Scheduler-v2 integrity: every fba-plan resolved job + reconciliation:catalog is strict:true", () => {
   const fbaJobs = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });
-  for (const rk of ["fba-plan:oli-sales", "fba-plan:catalog", "fba-plan:inventory-health", "fba-plan:awd"]) {
+  for (const rk of ["fba-plan:inventory-health", "fba-plan:awd"]) {
     const jobs = fbaJobs.filter((j) => j.requestKey === rk);
     assert.ok(jobs.length >= 1, rk + " must resolve at least one job");
     for (const j of jobs) assert.equal(j.strict, true, rk + " resolved job must be strict:true");

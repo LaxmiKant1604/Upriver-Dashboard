@@ -142,10 +142,16 @@ const CONTENT_CHANGE_COLUMNS = ["event_time", "sp_api_notification_id", "sp_api_
 // is a SEPARATE reserved state (display-only, never usable stock). total_reserved_quantity + inbound_quantity (the
 // aggregates) are DELIBERATELY not requested -- inbound_quantity = sum(inbound_working, inbound_shipped, inbound_received)
 // per the source metadata, so requesting an aggregate alongside its components would double-count.
-const FBA_HEALTH_COLUMNS = ["date", "marketplace_country_code", "child_asin", "sku", "fnsku", "product_name", "available", "reserved_customer_order", "reserved_fc_transfer", "reserved_fc_processing", "inbound_working", "inbound_shipped", "inbound_received"];
+// seller_or_vendor_id makes this contract seller-scoped so a marketplace-safe <=5-seller export splits back per
+// account (isolateFragmentRowsForOwner) + per marketplace (marketplace_country_code). Used ONLY by
+// fba-plan:inventory-health (the insight reports use INSIGHT_INVENTORY_COLUMNS), so adding it changes ONLY
+// fba-plan's request_hash -- no other report is affected.
+const FBA_HEALTH_COLUMNS = ["date", "marketplace_country_code", "seller_or_vendor_id", "child_asin", "sku", "fnsku", "product_name", "available", "reserved_customer_order", "reserved_fc_transfer", "reserved_fc_processing", "inbound_working", "inbound_shipped", "inbound_received"];
 // Listings (ba689c05d7) AWD -- US only. awd_total_inbound_quantity added (verified NUMBER); marketplace_country_code
 // carried so the US-only rows can never be attributed to another marketplace.
-const LISTINGS_AWD_COLUMNS = ["marketplace_country_code", "child_asin", "sku", "fnsku", "awd_available_distributable_quantity", "awd_total_inbound_quantity"];
+// seller_or_vendor_id makes the AWD contract seller-scoped for marketplace-safe <=5-seller batching (US-only). Used
+// ONLY by fba-plan:awd, so it changes ONLY fba-plan's request_hash.
+const LISTINGS_AWD_COLUMNS = ["marketplace_country_code", "seller_or_vendor_id", "child_asin", "sku", "fnsku", "awd_available_distributable_quantity", "awd_total_inbound_quantity"];
 
 /* ---- insight-report constants (transcribed verbatim from lib/server/reports/*.js;
    parity-tested against the builder files). All insight DataDoe fetches use
@@ -367,33 +373,13 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   // AWD/inventory ASIN). The legacy api/datadoe.js FBA route fetches these non-strict; the scheduler
   // is intentionally stricter and rejects a cap-sized page (TRUNCATED) rather than persist/derive it.
   "fba-plan": [
-    {
-      requestKey: "fba-plan:oli-sales",
-      strict: true,
-      sourceKey: "order-line-items",
-      columns: OLI_SALES_COLUMNS,
-      limit: OLI_SALES_ROW_LIMIT,
-      groupBy: OLI_SALES_GROUP_BY,
-      aggregations: OLI_SALES_AGGREGATIONS,
-      orderByColumn: "date",
-      orderByDirection: "ASC",
-      // Blocker 1: ONE canonical Order Line Items sales fragment over [completed[0].from .. asOf], sliced by
-      // canonicalOliSlices. Per-ASIN monthly units AND the current-month latest-date probe are DERIVED from
-      // this single fragment (foldOliSalesToFbaInputs); it shares request_hashes with the other OLI reports.
-      windowKind: "canonicalOliSlices:completed[0].from..asOf (3 completed months + current MTD)",
-    },
-    {
-      requestKey: "fba-plan:catalog",
-      strict: true,
-      sourceKey: "product-catalog",
-      columns: PRODUCT_CATALOG_COLUMNS,
-      limit: 10000, // CATALOG_ROW_LIMIT
-      groupBy: null,
-      aggregations: null,
-      orderByColumn: "child_asin",
-      orderByDirection: "ASC",
-      windowKind: "range:completed[0].from..asOf",
-    },
+    // OLI sales + Product Catalog are DERIVED durable dependencies (see REPORT_DERIVED_SOURCE_KEYS["fba-plan"]),
+    // NOT owned DataDoe exports. fba-plan reads the account's durable Order Line Items daily history
+    // (source_oli_daily_history) + the org Product Catalog snapshot through the report-worker loadDerivedContext
+    // seam (makeFbaPlanDurableContextLoader), coverage-checked + provenance-bound + fail-closed per account
+    // (missing/short durable OLI coverage => the derive blocks => last-known-good preserved). The OLI bridge
+    // (slicedOliSourceFromHistory) is proven byte-identical to a fetched OLI slice payload. Only the FBA
+    // Inventory Health snapshot + the US-only AWD listing remain owned exports below.
     {
       requestKey: "fba-plan:inventory-health",
       strict: true,
@@ -870,6 +856,11 @@ export const REPORT_DERIVED_SOURCE_KEYS = Object.freeze({
   // scheduled worker maintains (ads_daily_source_rows). Opening/refreshing PPC never
   // runs an Amazon Ads export, so these four Ads sources are derived, not owned.
   "ppc-performance": ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"],
+  // FBA Shipment Plan reads its Order Line Items sales + Product Catalog from ALREADY-persisted durable evidence
+  // (source_oli_daily_history + the org Product Catalog snapshot the OLI/catalog scheduler maintains), NOT from an
+  // owned fba-plan export -- so opening/refreshing/publishing fba-plan spends ZERO tokens on OLI/catalog. Only the
+  // FBA Inventory Health snapshot + the US-only AWD listing are owned (fetched) sources.
+  "fba-plan": ["order-line-items", "product-catalog"],
 });
 
 // Reports that create ZERO owned DataDoe exports: every figure comes from other
@@ -921,7 +912,12 @@ export function reportAccountScope(reportKey) {
 export const SELLER_SCOPED_REQUEST_KEYS = Object.freeze([
   "brand-sales:order-lines",
   "daily-reporting:oli-sales",
-  "fba-plan:oli-sales",
+  // fba-plan:oli-sales is GONE -- OLI is now a durable derived dependency for fba-plan (no owned export). The two
+  // fba-plan owned exports that ARE seller-scoped/batchable (marketplace-safe <=5-seller batches) are its FBA
+  // Inventory Health snapshot + US-only AWD listing; both carry seller_or_vendor_id so a batched export splits
+  // back per account (isolateFragmentRowsForOwner) and per marketplace (marketplace_country_code).
+  "fba-plan:inventory-health",
+  "fba-plan:awd",
   "buy-box-loss:oli-sales",
   "returns-leakage:oli-sales",
   "ppc-performance:oli-sales",

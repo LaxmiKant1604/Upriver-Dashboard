@@ -17,11 +17,12 @@ import { fetchAccounts as fetchDataDoeAccounts } from "../datadoe.js";
 import { makeSupabaseSourceStore, makeDataDoeAdapter } from "./source-sync-driver.js";
 import { makeSupabaseReportStore, makeSourceRowLoader, makeShadowSnapshotSaver } from "./report-snapshot-store.js";
 import { makeDailyAdsContextLoader } from "./daily-ads-loader.js";
+import { makeFbaPlanDurableContextLoader } from "./fba-plan-durable-loader.js";
 import { schedulerV2ReportControlCatalog, CONTROLLED_REPORT_KEYS, SCHEDULER_V2_READY_REPORT_KEYS } from "./report-controls.js";
 import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "./report-publisher.js";
 import { runSchedulerV2Shadow } from "./sync-dispatch.js";
 import { makeSourceTranche, isSourceTranche } from "./source-tranche.js";
-import { getAsinAdsDailyRows, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings, getSchedulerAccountRollout } from "../supabase.js";
+import { getAsinAdsDailyRows, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings, getSchedulerAccountRollout, getSourceCoverageWindows, getSourceOliHistoryRows, getSourceSnapshot, getSourceSnapshotPayload } from "../supabase.js";
 import { auditSchemaContract, schedulerV2SchemaObjects, REQUIRED_WRAPPER_EXPORTS } from "./schema-contract.js";
 
 // The complete set of Supabase wrappers the composed runtime depends on. Re-exported from the schema contract
@@ -150,6 +151,11 @@ export function buildSchedulerV2Runtime(overrides = {}) {
     getAdsDailySourceRows: ppcRows = getAdsDailySourceRows,   // PPC persisted Ads rows reader
     getAdsSyncStates: ppcStates = getAdsSyncStates,           // PPC ads_sync_state reader
     getAdsSyncCoverage: ppcCoverage = getDailyAdsCoverage,    // PPC durable coverage reader (same generic reader)
+    // fba-plan durable OLI + Catalog readers -- ALL Supabase, cache-only; NEVER a DataDoe export:
+    getSourceCoverageWindows: readOliCoverage = getSourceCoverageWindows, // durable OLI coverage windows (fail-closed gate)
+    getSourceOliHistoryRows: readOliHistory = getSourceOliHistoryRows,     // durable OLI daily history rows
+    getSourceSnapshot: readCatalogSnapshot = getSourceSnapshot,            // durable org Product Catalog snapshot pointer
+    getSourceSnapshotPayload: loadCatalogPayload = getSourceSnapshotPayload, // durable catalog storage payload
     // BUILD-TIME source-tranche selector (Part A). null => execute every source family (unchanged). A raw
     // spec is normalized via makeSourceTranche; an already-built descriptor passes through unchanged. It is
     // fixed HERE (a trusted collaborator), NEVER on RUN_OPERATIONAL_ARGS, so no per-run caller can set it.
@@ -195,7 +201,11 @@ export function buildSchedulerV2Runtime(overrides = {}) {
   const saveSnapshot = snapshotSaverFactory();        // writes ONLY under the scheduler-v2/* shadow namespace
   const sourceRowLoader = sourceRowLoaderFactory();    // cache-only getSourceExportCache (== store.loadSourceRows)
   const ppcAdsProviders = { getAdsDailySourceRows: ppcRows, getAdsSyncStates: ppcStates, getAdsSyncCoverage: ppcCoverage };
-  const loadDerivedContext = makeDailyAdsContextLoader({ connections, getAdMetrics, getCoverageState });
+  // Report-scoped derived-context loaders: each returns {} for reports it does not own, so a shallow merge is a
+  // safe union (no report is claimed by two loaders). fba-plan reads its DERIVED durable OLI + Catalog here.
+  const dailyAdsLoader = makeDailyAdsContextLoader({ connections, getAdMetrics, getCoverageState });
+  const fbaPlanDurableLoader = makeFbaPlanDurableContextLoader({ connections, getOliCoverage: readOliCoverage, getOliHistory: readOliHistory, getCatalogSnapshot: readCatalogSnapshot, loadCatalogPayload });
+  const loadDerivedContext = async (args) => ({ ...(await dailyAdsLoader(args)), ...(await fbaPlanDurableLoader(args)) });
   const discoverAccounts = makeProductionDiscoverAccounts({ connections, fetchAccounts });
   // Gate-7 durable ACCOUNT gate loader (the dispatcher enforces it on EVERY dispatch, scheduled AND manual --
   // manualReportKeys selects reports only, never accounts). Trusted + fixed: RUN_OPERATIONAL_ARGS does not
