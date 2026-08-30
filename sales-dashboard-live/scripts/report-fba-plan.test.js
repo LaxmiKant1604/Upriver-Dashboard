@@ -34,6 +34,7 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 let assembleSources, deriveReportSnapshot, runReportJobs;
 let fbaPlanPayload, foldPlanAsinUnits;
 let planMonthWindows, addDaysStr, planFbaPlan, canonicalOliSlices;
+let slicedOliSourceFromHistory;
 
 const ID = "A1";
 const ASOF = "2025-08-06";
@@ -240,6 +241,26 @@ test("fba-plan: IDENTICAL child ASINs across sources are NOT a conflict (derives
   assert.equal(res.status, "derived");
   const e = res.payload.accountSkuDirectory.find((x) => x.sku === "SKU-1");
   assert.equal(e.childAsin, "ASIN1", "one agreed ASIN; no conflict");
+});
+
+test("fba-plan: DURABLE-bridged OLI produces a BYTE-IDENTICAL payload to fetched OLI slices (durable-OLI switch is correct)", () => {
+  // (1) Current path: OLI supplied as fetched canonical slices.
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const fetched = deriveFba(planned, rows);
+  assert.equal(fetched.status, "derived");
+
+  // (2) Durable path: the SAME OLI as source_oli_daily_history rows, bridged through the proven daily/brand-sales
+  //     bridge (slicedOliSourceFromHistory). This is exactly how the durable-OLI operator will supply fba-plan:oli-sales.
+  const durableRows = OLI.flat().map((r) => ({
+    account_id: ID, sale_date: r.date, seller_or_vendor_id: ID, sku: r.sku || "",
+    child_asin: r.child_asin, currency: r.item_price_currency || "USD", sales_amount: 0, units: r.total_units_sum,
+  }));
+  const bridged = slicedOliSourceFromHistory({ historyRows: durableRows, accountId: ID, rawSellerId: ID, from: WINS[0].from, to: ASOF });
+  const sources = buildSources(planned, rows);
+  sources["fba-plan:oli-sales"] = { available: true, rows: bridged.rows, fragments: bridged.fragments };
+  const durable = deriveReportSnapshot({ reportKey: "fba-plan", sources, context: usContext() });
+  assert.equal(durable.status, "derived", "durable-bridged OLI derives");
+  assert.deepEqual(durable.payload, fetched.payload, "durable OLI => byte-identical fba-plan payload; no derive change needed");
 });
 
 test("fba-plan: reserved_fc_transfer is stored RAW -- NO inbound-shipped subtraction (unproven overlap removed)", () => {
@@ -537,6 +558,7 @@ async function main() {
   ({ fbaPlanPayload, foldPlanAsinUnits } = await import("../lib/server/reports/derivation-core.js"));
   ({ planMonthWindows, addDaysStr, canonicalOliSlices } = await import("../lib/server/date-windows.js"));
   ({ planFbaPlan } = await import("../lib/server/sync/report-planner.js"));
+  ({ slicedOliSourceFromHistory } = await import("../lib/server/sync/durable-dashboards.js"));
   mark("modules loaded; running " + tests.filter((t) => !t.marker).length + " tests");
 
   let failures = 0;
