@@ -149,7 +149,18 @@ try {
   }
   log("PUBLISH: " + published.length + " live; " + skipped.length + " skipped" + (skipped.length ? " [" + skipped.join(", ") + "]" : ""));
 
-  // 4) ALWAYS safe-close.
+  // 4) OWNERSHIP BACKFILL -- part of the go-live completion path (never a forgotten manual step). Zero DataDoe,
+  //    idempotent; reads the freshly-published v2d-5 snapshots. Non-fatal (the publish already succeeded and it is
+  //    safely re-runnable) so an ownership hiccup never blocks the safe-close or the go-live result.
+  if (published.length) {
+    try {
+      const { backfillFbaOwnership } = await import("../backfill-fba-ownership.mjs");
+      const bf = await backfillFbaOwnership({ dry: false, log: (m) => log("ownership: " + m) });
+      log("OWNERSHIP: " + bf.applied + " accounts populated, " + bf.totalRows + " rows" + (bf.skippedNoV5 ? ", " + bf.skippedNoV5 + " skipped (no v2d-5)" : ""));
+    } catch (e) { log("WARN ownership backfill failed (re-runnable, non-fatal): " + (e && e.message ? e.message : e)); }
+  }
+
+  // 5) ALWAYS safe-close.
   await safeClose();
   if (!published.length) { console.error("STOP zero accounts published live -- see skipped dispositions above."); process.exit(1); }
   log("DONE: fba-plan published for " + published.length + " accounts (as-of " + asOf + "); controls safe-closed.");
