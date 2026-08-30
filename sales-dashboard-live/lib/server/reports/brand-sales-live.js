@@ -17,6 +17,7 @@ import { REPORT_DERIVATIONS } from "../sync/report-derivation.js";
 import { getDataDoeConnections } from "../datadoe-connections.js";
 import { organizationFingerprint } from "../source-identity.js";
 import { isPrimaryAccountId } from "./brand-membership.js";
+import { getEnrichedOliHistoryRows } from "../sync/oli-enriched-history.js";
 import {
   backfillBrandSalesV1, deriveBrandSalesFromDurable,
   BRAND_SALES_REPORT_KEY, BRAND_SALES_LIVE_VERSION,
@@ -26,7 +27,9 @@ const S = (v) => (v == null ? "" : String(v));
 
 // Durable-ONLY readers (no DataDoe adapter -> a create-export is structurally impossible here).
 const DURABLE_READERS = {
-  readOliHistory: sb.getSourceOliHistoryRows,
+  // Enriched OLI history: priced rollup + internal missing/zero-price sales estimates (same canonical calculation
+  // the scheduler-published Brand Sales snapshot uses), so the live refresh serves the SAME Total Sales.
+  readOliHistory: getEnrichedOliHistoryRows,
   readOliCoverage: sb.getSourceCoverageWindows,
   readAsinAds: sb.getAsinAdsDailyRows,
   readAdsCoverage: sb.getDailyAdsCoverage,

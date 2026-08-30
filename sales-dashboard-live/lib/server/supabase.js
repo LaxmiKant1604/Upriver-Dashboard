@@ -1936,6 +1936,90 @@ export async function replaceOliOperationalUnitsWindow({ organizationFingerprint
   }
 }
 
+// Bounded SALES-ESTIMATE read (source_oli_sales_estimates): the per-(account, sale_date, sku, child_asin, currency)
+// internal estimate of missing/zero-price sales, computed from same-product historical prices. PAGINATED + fail-soft
+// like the operational-unit read (pre-migration => [] so every consumer degrades to the priced evidence).
+export async function getSourceOliSalesEstimateRows({ organizationFingerprint, connectionId = "primary", accountIds = null, from, to, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS, pageRows = SOURCE_OLI_HISTORY_PAGE_ROWS, signal = null } = {}) {
+  if (!organizationFingerprint || !from || !to) {
+    throw new Error("getSourceOliSalesEstimateRows requires organizationFingerprint + from + to (fail closed).");
+  }
+  const PAGE = Math.max(1, Number(pageRows) || SOURCE_OLI_HISTORY_PAGE_ROWS);
+  const outRows = [];
+  try {
+    for (let offset = 0; ; offset += PAGE) {
+      const query = new URLSearchParams({
+        select: "account_id,seller_or_vendor_id,sale_date,sku,child_asin,currency,target_quantity,estimated_sales,reference_date,reference_unit_price,matching_method,reference_source_request_hash,target_source_request_hash,calculated_at",
+        organization_fingerprint: `eq.${organizationFingerprint}`,
+        connection_id: `eq.${connectionId}`,
+        sale_date: `gte.${from}`,
+        order: "sale_date.asc,account_id.asc,sku.asc,child_asin.asc,currency.asc",
+        limit: String(PAGE),
+        offset: String(offset),
+      });
+      query.append("sale_date", `lte.${to}`);
+      if (Array.isArray(accountIds) && accountIds.length) {
+        query.append("account_id", `in.(${accountIds.map((a) => `"${String(a).replaceAll('"', "")}"`).join(",")})`);
+      }
+      const rows = await request(`/rest/v1/source_oli_sales_estimates?${query}`, { signal });
+      const list = Array.isArray(rows) ? rows : [];
+      outRows.push(...list);
+      if (outRows.length > maxRows) {
+        const err = new Error("OLI_ESTIMATE_ROW_LIMIT_EXCEEDED: durable sales-estimate read exceeded its row cap; refusing a truncated series (fail closed).");
+        err.code = "OLI_ESTIMATE_ROW_LIMIT_EXCEEDED";
+        throw err;
+      }
+      if (list.length < PAGE) break;
+    }
+  } catch (readError) {
+    if (readError && readError.code === "OLI_ESTIMATE_ROW_LIMIT_EXCEEDED") throw readError;
+    if (isSchemaMissingError(readError)) return []; // additive layer not yet applied -> degrade to priced-only
+    throw readError;
+  }
+  return outRows;
+}
+
+// STANDALONE atomic replace of ONLY the sales-estimate window for one account (delete + insert by exact
+// account/window). Recomputed from durable truth (operational units + dimensional references) after every OLI
+// persist and by the zero-token backfill -- NEVER a DataDoe export. An EMPTY estimateRows clears the window.
+export async function replaceOliSalesEstimatesWindow({ organizationFingerprint, connectionId = "primary", accountId, coveredFrom, coveredTo, estimateRows, signal = null }) {
+  if (!organizationFingerprint || !accountId || !coveredFrom || !coveredTo || !Array.isArray(estimateRows)) {
+    throw new Error("replaceOliSalesEstimatesWindow requires organizationFingerprint/accountId/coveredFrom/coveredTo and an estimateRows array (fail closed).");
+  }
+  try {
+    const body = await request("/rest/v1/rpc/replace_oli_sales_estimates_window", {
+      method: "POST",
+      signal,
+      body: {
+        p_organization_fingerprint: organizationFingerprint,
+        p_connection_id: connectionId,
+        p_account_id: accountId,
+        p_covered_from: coveredFrom,
+        p_covered_to: coveredTo,
+        p_estimate_rows: estimateRows.map((r) => ({
+          seller_or_vendor_id: r.sellerOrVendorId ?? r.seller_or_vendor_id,
+          sale_date: r.saleDate ?? r.sale_date,
+          sku: String(r.sku ?? ""),
+          child_asin: String(r.childAsin ?? r.child_asin ?? ""),
+          currency: r.currency,
+          target_quantity: r.targetQuantity ?? r.target_quantity,
+          estimated_sales: r.estimatedSales ?? r.estimated_sales,
+          reference_date: r.referenceDate ?? r.reference_date,
+          reference_unit_price: r.referenceUnitPrice ?? r.reference_unit_price,
+          matching_method: r.matchingMethod ?? r.matching_method,
+          reference_source_request_hash: r.referenceSourceRequestHash ?? r.reference_source_request_hash ?? "",
+          target_source_request_hash: r.targetSourceRequestHash ?? r.target_source_request_hash ?? "",
+          calculated_at: r.calculatedAt ?? r.calculated_at ?? null,
+        })),
+      },
+    });
+    const value = Array.isArray(body) ? body[0] : body;
+    return { write: "ok", replaced: value?.estimatesReplaced ?? 0, inserted: value?.estimatesInserted ?? 0, error: null };
+  } catch (writeError) {
+    if (isSchemaMissingError(writeError)) return { write: "schema-missing", replaced: 0, inserted: 0, error: "OLI_ESTIMATE_SCHEMA_MISSING" };
+    return { write: "write-failed", replaced: 0, inserted: 0, error: "OLI_ESTIMATE_REPLACE_FAILED" };
+  }
+}
+
 // Durable read helper for future fulfillment / state / city contribution slices WITHOUT another historical
 // DataDoe export: reads the NON-CANCELLED dimensional OLI rows over a window for a set of accounts, aggregated by
 // the requested dimension keys. `dimensions` is a subset of ['fulfillment_channel','address_state','address_city']

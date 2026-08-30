@@ -50,6 +50,7 @@ const SUITES = [
   "test:oli-itemization",
   "test:oli-completeness-serve",
   "test:oli-operational-units",
+  "test:oli-sales-estimate",
   "test:sku-movement",
   "test:sku-movement-integration",
   "test:oli-value-policy",

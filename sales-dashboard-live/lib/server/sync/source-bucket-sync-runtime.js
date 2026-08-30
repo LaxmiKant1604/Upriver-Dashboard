@@ -52,11 +52,14 @@ import {
   recordSourceSnapshot, upsertSourceRunStatus,
   replaceOliHistoryWindow, replaceOliDimensionalWindow, recordOliCompleteness, saveSourceSnapshotPayload, getSourceSnapshotPayload,
   getSourceOliHistoryRows, getDailyAdsCoverage, getAsinAdsDailyRows,
+  getSourceOliOperationalUnitRows, getSourceOliDimensionalUnitRows, getSourceOliSalesEstimateRows, replaceOliSalesEstimatesWindow,
   listSourceBatchMembership, assignSourceAccountBatch,
   getReportSyncSettings, getSchedulerAccountRollout,
   upsertSyncReportJob, claimReportDeriveLease, reconcileReportDeriveSuccess, getReportSnapshot,
   getReportSnapshotStoragePayload, saveShadowSnapshotIfNewer,
 } from "../supabase.js";
+import { recomputeOliSalesEstimatesWindow } from "./oli-sales-estimate-recompute.js";
+import { enrichOliHistoryRowsWithEstimates } from "./oli-sales-estimate.js";
 import { paramsHashFor } from "../report-store.js";
 import { assertSnapshotWithinLimit } from "../report-limits.js";
 
@@ -286,6 +289,19 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     loadSnapshotPayload = getSourceSnapshotPayload,
     recordSnapshot = recordSourceSnapshot,
     loadHistoryRows = getSourceOliHistoryRows,
+    // OLI SALES ESTIMATE (ADDITIVE, ZERO DataDoe): after each OLI persist, recompute the internal missing/zero-price
+    // sales estimates from durable truth (operational units + dimensional references) and enrich the derive's Total
+    // Sales. Build-time bound (never a run() arg); fully NON-FATAL at the call site so the priced Total Sales + LKG
+    // are never regressed. Fail-soft pre-migration (the estimate reader/writer degrade to no-op).
+    // enableSalesEstimates gates the whole additive estimate step. Default OFF so a bare runtime (readiness reads,
+    // offline harnesses) NEVER touches the estimate tables; the production priority-release composition turns it ON.
+    enableSalesEstimates = false,
+    recomputeSalesEstimates = recomputeOliSalesEstimatesWindow,
+    readOperationalUnitsForEstimate = getSourceOliOperationalUnitRows,
+    readDimensionalRowsForEstimate = getSourceOliDimensionalUnitRows,
+    readSalesEstimates = getSourceOliSalesEstimateRows,
+    writeSalesEstimates = replaceOliSalesEstimatesWindow,
+    enrichHistoryWithEstimates = enrichOliHistoryRowsWithEstimates,
     updateRunStatus = upsertSourceRunStatus,
     makeShadowSaver = makeShadowSnapshotSaver,
     clock = () => Date.now(),
@@ -864,6 +880,35 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     rollup.derived.asOfBlockers = effResolution.blockers;
     dailyWindow = { from: monthBackStr(effectivePublishAsOf, 5), to: effectivePublishAsOf };
     brandViewWindow = { from: brandViewWindow.from, to: effectivePublishAsOf };
+
+    // ADDITIVE, ZERO-DataDoe: recompute the INTERNAL missing/zero-price sales estimates from the freshly-persisted
+    // durable truth (operational units + dimensional references) for the RECENT part of the derive window, then
+    // enrich the history rows so Daily Reporting + Brand View publish the estimate-included Total Sales through the
+    // one canonical calculation. Older estimates in the window are already materialized (one-time backfill + prior
+    // recomputes). FULLY NON-FATAL + never uses the route deadline: any failure leaves the priced Total Sales, the
+    // unit counts, and LKG completely intact -- the estimate layer can never break, slow past budget, or regress a
+    // derive. Fail-soft pre-migration (the estimate reader/writer degrade to a no-op). Gated by enableSalesEstimates.
+    if (enableSalesEstimates) try {
+      const estTo = effectivePublishAsOf;
+      const estRecomputeFrom = (() => { const s = addDaysStr(estTo, -45); return s > brandViewWindow.from ? s : brandViewWindow.from; })();
+      for (const a of accounts) {
+        await recomputeSalesEstimates({
+          organizationFingerprint: orgFingerprint, connectionId: "primary", accountId: a.accountId,
+          from: estRecomputeFrom, to: estTo,
+          readOperationalUnits: readOperationalUnitsForEstimate,
+          readDimensionalRows: readDimensionalRowsForEstimate,
+          writeEstimates: writeSalesEstimates,
+        }).catch(() => null);
+      }
+      const estimateRows = await readSalesEstimates({
+        organizationFingerprint: orgFingerprint, connectionId: "primary",
+        accountIds: accounts.map((a) => a.accountId), from: brandViewWindow.from, to: estTo,
+      });
+      if (Array.isArray(estimateRows) && estimateRows.length && Array.isArray(historyRows)) {
+        historyRows = enrichHistoryWithEstimates(historyRows, estimateRows);
+      }
+    } catch { /* additive: never regress the priced Total Sales or LKG */ }
+
     let derived;
     try {
       await ensureTime("derivation");

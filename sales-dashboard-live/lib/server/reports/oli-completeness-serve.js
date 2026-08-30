@@ -5,6 +5,7 @@
 // around an injected reader; the read is advisory and never fails a report read. 7-bit ASCII.
 
 import { operationalUnitMetrics } from "../sync/oli-order-rules.js";
+import { oliGroupKey, resolvedEstimateGroupKeys } from "../sync/oli-sales-estimate.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const N = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
@@ -13,7 +14,7 @@ const N = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 // breakdown, using the canonical operationalUnitMetrics classifier. `onDate` restricts to the report's headline day
 // (the completeness latestDate); when null the latest date PRESENT in the rows is used. Returns null when there are no
 // operational-unit rows on that day (the UI simply shows no breakdown). Revenue is never derived from this -- units only.
-export function summarizeOperationalUnitBreakdown(rows, onDate = null) {
+export function summarizeOperationalUnitBreakdown(rows, onDate = null, resolvedKeys = null) {
   const list = (Array.isArray(rows) ? rows : []).filter((r) => r && S(r.sale_date ?? r.saleDate));
   if (list.length === 0) return null;
   const day = onDate && S(onDate)
@@ -21,13 +22,28 @@ export function summarizeOperationalUnitBreakdown(rows, onDate = null) {
     : list.reduce((m, r) => { const d = S(r.sale_date ?? r.saleDate); return d > m ? d : m; }, S(list[0].sale_date ?? list[0].saleDate));
   const onDay = list.filter((r) => S(r.sale_date ?? r.saleDate) === day);
   if (onDay.length === 0) return null;
-  const m = operationalUnitMetrics(onDay.map((r) => ({
-    sku: S(r.sku), childAsin: S(r.child_asin ?? r.childAsin),
-    pricedUnits: N(r.priced_units ?? r.pricedUnits), pricedSales: N(r.priced_sales ?? r.pricedSales),
-    explicitZeroUnits: N(r.explicit_zero_units ?? r.explicitZeroUnits),
-    pendingUnits: N(r.pending_units ?? r.pendingUnits),
-    cancelledUnits: N(r.cancelled_units ?? r.cancelledUnits),
-  })));
+  // A grain whose missing units are RESOLVED by an internal sales estimate must no longer appear as unresolved:
+  // its explicit-zero + pending units move into priced (they now carry an estimated price -- no separate label).
+  // Genuinely-unresolved grains (no estimate) keep their explicit-zero / pending classes. observedUnits is
+  // unchanged either way (units are only reclassified, never added or removed). resolvedKeys=null => legacy behaviour.
+  const resolved = resolvedKeys instanceof Set ? resolvedKeys : null;
+  const m = operationalUnitMetrics(onDay.map((r) => {
+    const zero = N(r.explicit_zero_units ?? r.explicitZeroUnits);
+    const pending = N(r.pending_units ?? r.pendingUnits);
+    const priced = N(r.priced_units ?? r.pricedUnits);
+    const isResolved = resolved != null && resolved.has(oliGroupKey({
+      accountId: r.account_id ?? r.accountId, saleDate: r.sale_date ?? r.saleDate,
+      sku: r.sku, childAsin: r.child_asin ?? r.childAsin, currency: r.currency,
+    }));
+    return {
+      sku: S(r.sku), childAsin: S(r.child_asin ?? r.childAsin),
+      pricedUnits: priced + (isResolved ? zero + pending : 0),
+      pricedSales: N(r.priced_sales ?? r.pricedSales),
+      explicitZeroUnits: isResolved ? 0 : zero,
+      pendingUnits: isResolved ? 0 : pending,
+      cancelledUnits: N(r.cancelled_units ?? r.cancelledUnits),
+    };
+  }));
   return {
     onDate: day,
     pricedUnits: m.pricedUnits,
@@ -42,11 +58,20 @@ export function summarizeOperationalUnitBreakdown(rows, onDate = null) {
 
 // Advisory helper: read + summarise the observed-unit breakdown for a report's headline day. ANY failure (missing
 // reader, read error, additive table absent) yields null so a breakdown hiccup never affects the completeness read.
-async function readUnitBreakdownFor({ read, organizationFingerprint, connectionId, accountIds, onDate }) {
+async function readUnitBreakdownFor({ read, readEstimates = null, organizationFingerprint, connectionId, accountIds, onDate }) {
   if (typeof read !== "function" || !onDate || !S(onDate)) return null;
   try {
     const rows = await read({ organizationFingerprint, connectionId, accountIds, from: S(onDate), to: S(onDate) });
-    return summarizeOperationalUnitBreakdown(rows, S(onDate));
+    // Advisory: read the internal sales estimates for the day so RESOLVED grains drop out of the unresolved
+    // breakdown. Any failure leaves resolvedKeys null (legacy breakdown) -- it never breaks the completeness read.
+    let resolvedKeys = null;
+    if (typeof readEstimates === "function") {
+      try {
+        const est = await readEstimates({ organizationFingerprint, connectionId, accountIds, from: S(onDate), to: S(onDate) });
+        resolvedKeys = resolvedEstimateGroupKeys(Array.isArray(est) ? est : []);
+      } catch (_e2) { resolvedKeys = null; }
+    }
+    return summarizeOperationalUnitBreakdown(rows, S(onDate), resolvedKeys);
   } catch (_e) {
     return null;
   }
@@ -124,7 +149,7 @@ export function summarizePortfolioCompleteness(rows) {
 // Portfolio (multi-account) augment: reads completeness for a fixed set of accounts and aggregates. `params.asOf`
 // (Brand View) or `params.to` bounds the window; a null `from` reads all durable dates (the summariser keeps the
 // latest per account). Advisory: any failure returns {}.
-export function makePortfolioCompletenessAugment({ organizationFingerprint, connectionId = "primary", accountIds, read, readUnitBreakdown = null }) {
+export function makePortfolioCompletenessAugment({ organizationFingerprint, connectionId = "primary", accountIds, read, readUnitBreakdown = null, readEstimates = null }) {
   const ids = (Array.isArray(accountIds) ? accountIds : []).map(String).filter(Boolean);
   return async ({ params }) => {
     if (!organizationFingerprint || ids.length === 0 || typeof read !== "function") return {};
@@ -133,7 +158,7 @@ export function makePortfolioCompletenessAugment({ organizationFingerprint, conn
       const rows = await read({ organizationFingerprint, connectionId, accountIds: ids, from: null, to });
       const c = summarizePortfolioCompleteness(rows);
       if (!c) return {};
-      const breakdown = await readUnitBreakdownFor({ read: readUnitBreakdown, organizationFingerprint, connectionId, accountIds: ids, onDate: c.latestDate });
+      const breakdown = await readUnitBreakdownFor({ read: readUnitBreakdown, readEstimates, organizationFingerprint, connectionId, accountIds: ids, onDate: c.latestDate });
       if (breakdown) c.unitBreakdown = breakdown;
       return { completeness: c };
     } catch (_e) {
@@ -144,7 +169,7 @@ export function makePortfolioCompletenessAugment({ organizationFingerprint, conn
 
 // Build the async serveSharedReport augment: ({ accountId, params }) => { completeness } | {}. The read is advisory:
 // any failure returns {} so a completeness hiccup never breaks a report read.
-export function makeCompletenessAugment({ organizationFingerprint, connectionId = "primary", read, readUnitBreakdown = null }) {
+export function makeCompletenessAugment({ organizationFingerprint, connectionId = "primary", read, readUnitBreakdown = null, readEstimates = null }) {
   return async ({ accountId, params }) => {
     // Daily uses the real accountId as the serve id; the Brand endpoints use a brand-SCOPED serve id but carry the
     // real account in params.accountId -- prefer that so completeness always keys on the real account.
@@ -158,7 +183,7 @@ export function makeCompletenessAugment({ organizationFingerprint, connectionId 
       });
       const c = summarizeCompleteness(rows);
       if (!c) return {};
-      const breakdown = await readUnitBreakdownFor({ read: readUnitBreakdown, organizationFingerprint, connectionId, accountIds: [acc], onDate: c.latestDate });
+      const breakdown = await readUnitBreakdownFor({ read: readUnitBreakdown, readEstimates, organizationFingerprint, connectionId, accountIds: [acc], onDate: c.latestDate });
       if (breakdown) c.unitBreakdown = breakdown;
       return { completeness: c };
     } catch (_e) {

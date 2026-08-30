@@ -188,6 +188,10 @@ export function buildPriorityDashboardsRelease({
   // scheduled run passes "priority-dashboards/scheduled/YYYY-MM-DD" so each date owns its one-Catalog-create
   // reservation. Validated STRICTLY (any other shape fails closed).
   operationKey = PRIORITY_DASHBOARDS.operationKey,
+  // ADDITIVE OLI sales estimates (missing/zero-price filled from same-product historical prices): ON in production
+  // so Daily + Brand View publish the estimate-included Total Sales. Offline harnesses pass false to prove the
+  // priced derive is byte-identical (the estimate layer is purely additive) and to avoid touching the estimate tables.
+  enableSalesEstimates = true,
 } = {}) {
   if (typeof buildRuntime !== "function") throw new Error("buildPriorityDashboardsRelease requires buildRuntime (fail closed).");
   if (asOfOverride != null && !/^\d{4}-\d{2}-\d{2}$/.test(String(asOfOverride))) throw new Error("buildPriorityDashboardsRelease asOfOverride must be a YYYY-MM-DD date (fail closed).");
@@ -203,6 +207,7 @@ export function buildPriorityDashboardsRelease({
     priorityMode: true,
     budgetMs,
     asOfOverride,
+    enableSalesEstimates,
     makeAdapter: (connections) => makeDurableCatalogGuard({ inner: makeInnerAdapter(connections), reservation, operationKey }),
   });
   const publisher = buildPublisher(); // frozen production publisher; the composed surface is publish(rk, acct)

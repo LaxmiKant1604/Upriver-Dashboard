@@ -41,6 +41,7 @@ import {
   getSourceCoverageWindows,
   getSourceOliHistoryRows,
   getSourceOliOperationalUnitRows,
+  getSourceOliSalesEstimateRows,
   getSourceSnapshot,
   getSourceSnapshotPayload,
   getExplicitZeroOliUnits,
@@ -107,15 +108,16 @@ function primaryOrgFingerprintOrNull() {
 // pending-without-sku / cancelled) from the additive operational-unit table -- advisory; never breaks a report read.
 function oliCompletenessAugmentSingle() {
   const fp = primaryOrgFingerprintOrNull();
-  return fp ? makeCompletenessAugment({ organizationFingerprint: fp, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows }) : null;
+  return fp ? makeCompletenessAugment({ organizationFingerprint: fp, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows, readEstimates: getSourceOliSalesEstimateRows }) : null;
 }
 // A portfolio (multi-account) completeness augment (Brand View portfolio surfaces; any provisional -> provisional).
 function oliCompletenessAugmentPortfolio(accountIds) {
   const fp = primaryOrgFingerprintOrNull();
-  return fp ? makePortfolioCompletenessAugment({ organizationFingerprint: fp, connectionId: "primary", accountIds, read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows }) : null;
+  return fp ? makePortfolioCompletenessAugment({ organizationFingerprint: fp, connectionId: "primary", accountIds, read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows, readEstimates: getSourceOliSalesEstimateRows }) : null;
 }
 import { makeRouteDeadline } from "../lib/server/sync/source-bucket-sync-runtime.js";
 import { isCancelledStatus } from "../lib/server/sync/oli-order-rules.js";
+import { getEnrichedOliHistoryRows } from "../lib/server/sync/oli-enriched-history.js";
 import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
 import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION } from "../lib/server/reports/listing-health.js";
 import { buildBuyBoxLoss, BUY_BOX_REPORT_KEY, BUY_BOX_VERSION } from "../lib/server/reports/buy-box.js";
@@ -2840,7 +2842,9 @@ async function handleDataDoe(req, res) {
           const dailyAccountId = accountScope.accountIds[0];
           const dailyRawSellerId = (accountScope.rawAccountIds && accountScope.rawAccountIds[0]) || dailyAccountId;
           const dailyDurableReaders = {
-            readOliHistory: getSourceOliHistoryRows,
+            // Enriched OLI history (priced rollup + internal missing/zero-price estimates) so the Daily self-heal
+            // serves the SAME Total Sales as the scheduler-published snapshot (one canonical calculation).
+            readOliHistory: getEnrichedOliHistoryRows,
             readOliCoverage: getSourceCoverageWindows,
             readAsinAds: getAsinAdsDailyRows,
             readAdsCoverage: getDailyAdsCoverage,

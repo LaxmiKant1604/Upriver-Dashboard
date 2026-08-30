@@ -28,6 +28,7 @@ const sb = await import("../../lib/server/supabase.js");
 const { backfillDailyV2, makeProvenanceGuardedSave } = await import("../../lib/server/reports/daily-v2-backfill.js");
 const { paramsHashFor } = await import("../../lib/server/report-store.js");
 const { REPORT_DERIVATIONS } = await import("../../lib/server/sync/report-derivation.js");
+const { getEnrichedOliHistoryRows } = await import("../../lib/server/sync/oli-enriched-history.js");
 const { getDataDoeConnections } = await import("../../lib/server/datadoe-connections.js");
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 
@@ -45,7 +46,7 @@ console.log(`accounts: ${accounts.length} | window from=${FROM} asOfCeiling=${AS
 if (accounts.length !== 30) console.warn(`WARNING: expected 30 primary accounts, found ${accounts.length}`);
 
 const readers = {
-  readOliHistory: sb.getSourceOliHistoryRows,
+  readOliHistory: getEnrichedOliHistoryRows, // priced rollup + internal missing/zero-price estimates (canonical)
   readOliCoverage: sb.getSourceCoverageWindows,
   readAsinAds: sb.getAsinAdsDailyRows,
   readAdsCoverage: sb.getDailyAdsCoverage,
