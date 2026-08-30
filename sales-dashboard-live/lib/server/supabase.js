@@ -831,6 +831,32 @@ export async function getAccountDirectoryRows(accountIds) {
   return request(`/rest/v1/account_directory?${params}`);
 }
 
+/**
+ * The latest org-wide ACCOUNT-DIRECTORY snapshot accounts (report_snapshots, report_key 'account-directory').
+ * This is the COMPLETE, authoritative directory (every primary account with its marketplace country + currency)
+ * that the FBA Shipment Plan operator + the Data Sync Center FBA sync resolve their account scope + go-live as-of
+ * from. The account_directory TABLE (getAccountDirectoryRows) is populated INCREMENTALLY by bucket syncs and can
+ * lag (proven: 22/30 while this snapshot holds 30/30), so it must NEVER seed FBA scope resolution. Returns an
+ * array of { accountId, country, currency, name } (best-effort field aliasing); [] when the snapshot is absent.
+ */
+export async function getAccountDirectorySnapshotAccounts() {
+  const query = new URLSearchParams({
+    select: "payload,updated_at",
+    report_key: "eq.account-directory",
+    order: "updated_at.desc",
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/report_snapshots?${query}`);
+  const payload = rows && rows[0] ? rows[0].payload : null;
+  const accounts = Array.isArray(payload && payload.accounts) ? payload.accounts : (Array.isArray(payload) ? payload : []);
+  return accounts.map((a) => ({
+    accountId: String((a && (a.accountId || a.id || a.account_id)) || "").trim(),
+    country: String((a && (a.country || a.marketCountry || a.marketplace)) || "").trim(),
+    currency: (a && a.currency) || null,
+    name: (a && a.name) || null,
+  })).filter((a) => a.accountId);
+}
+
 export async function insertSyncRun({ bucket, trigger, createdBy = null }) {
   const rows = await request("/rest/v1/sync_runs", {
     method: "POST",

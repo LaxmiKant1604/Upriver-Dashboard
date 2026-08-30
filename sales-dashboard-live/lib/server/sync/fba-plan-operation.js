@@ -1,0 +1,302 @@
+// The ONE trusted FBA Shipment Plan operation core -- SHARED, with no drift, by:
+//   - the CLI operator            (scripts/release/fba-plan-golive.mjs): loops the bounded pass to completion;
+//   - the AUTOMATIC GitHub scheduler (.github/workflows/fba-plan-golive.yml): runs the CLI operator per bucket;
+//   - the Data Sync Center route  (api/admin/sources.js): runs ONE bounded slice per POST, resumed by polling.
+//
+// It runs the SAME reviewed Scheduler-v2 machinery every path uses: the shadow dispatcher (batched
+// marketplace-safe FBA Inventory Health + US Listings/AWD fetch, durable OLI + Catalog derive -- NEVER a new
+// OLI/Catalog/Ads export), the four-gate CAS publisher, the guarded fba-plan control package, an
+// ALWAYS-safe-close publication envelope, a hard token ceiling, and the durable operation identity (the
+// DEDICATED `${bucket}-fba` cycle at as-of = D-1). There is NO parallel implementation: the route and the
+// operator call THIS module.
+//
+// Deadline-aware + bounded-resumable: `advanceFbaPlanBucket` runs ONE pass bounded by the caller's slice budget
+// (`outOfTime` / `deadlineMs`). A route passes a ~50s budget and re-enters on the next poll; the CLI passes an
+// effectively-unbounded budget and loops until `phase === "complete"`. Every phase re-proves from DURABLE state
+// (the dedicated cycle's status + freshness-CAS publish), so a replay -- concurrent poll, retry, fallback cron --
+// is a zero-create idempotent no-op, never a duplicate export or double-spent token.
+
+import { organizationFingerprint } from "../source-identity.js";
+import { buildShadowReportPlan } from "./report-planner.js";
+import { resolveGoLiveAsOf, fbaGoLiveTokenCost } from "./fba-plan-golive-plan.js";
+
+const OLI_SOURCE_KEY = "order-line-items";
+const S = (v) => (v == null ? "" : String(v));
+const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(S(v));
+const TERMINAL = new Set(["succeeded", "partial", "failed"]);
+const OK_FINALIZE = new Set(["finalized", "already-terminal"]);
+const OK_PUBLISH = new Set(["published", "already-current", "newer-live"]);
+
+// The FBA source cards the Data Sync Center + scheduler drive through THIS operation. Both map to the ONE
+// fba-plan pipeline: the pipeline fetches FBA Inventory Health for the bucket and, for US only, Listings/AWD.
+// Syncing either card runs the same bucket pipeline (the pipeline decides US-only AWD internally); listings on a
+// non-US bucket is therefore a no-op source for that bucket.
+export const FBA_OPERATION_SOURCE_KEYS = Object.freeze(["fba-inventory-health", "listings"]);
+export function isFbaOperationSource(sourceKey) { return FBA_OPERATION_SOURCE_KEYS.includes(S(sourceKey).trim()); }
+
+// The dedicated fba-plan cycle bucket namespace (us-fba / non-us-fba) -- NEVER collides with the scheduler-v2
+// daily (us|non-us) cycle, so an FBA failure can never touch Daily Reporting / Brand View.
+export function fbaCycleBucket(bucket) { return S(bucket).trim() + "-fba"; }
+
+// The server D-1 ceiling (never publish past yesterday). Server-resolved -- never taken from a request body.
+export function fbaServerCeiling(now = Date.now()) { return new Date(now - 86400000).toISOString().slice(0, 10); }
+
+/**
+ * Resolve the coverage-maximizing go-live as-of + the included/blocked account split. Pure orchestration over
+ * injected readers (ZERO DataDoe): reads each account's durable OLI coverage and picks the as-of that maximizes
+ * publishable accounts within `maxBlocked` genuinely-stale accounts, clamped to the D-1 ceiling. An explicit
+ * `asOfArg` (operator override) is honored (clamped) with the same stale-account split.
+ *
+ * readers: { resolveDataDoeAccountIds, getSourceCoverageWindows }
+ * Returns { asOf, included: string[], blocked: [{accountId, provenTo}], proven: [{accountId, provenTo}] }.
+ */
+export async function resolveFbaPlanScope({ accounts, connections, asOfArg = null, maxBlocked = 2, ceiling = fbaServerCeiling(), readers } = {}) {
+  const { resolveDataDoeAccountIds, getSourceCoverageWindows } = readers || {};
+  if (typeof resolveDataDoeAccountIds !== "function" || typeof getSourceCoverageWindows !== "function") {
+    throw new Error("resolveFbaPlanScope requires readers.resolveDataDoeAccountIds + readers.getSourceCoverageWindows (fail closed).");
+  }
+  const provenTo = async (account) => {
+    let resolved;
+    try { resolved = resolveDataDoeAccountIds([account.accountId], connections); } catch { return null; }
+    if (!resolved || resolved.rawAccountIds.length !== 1) return null;
+    const org = resolved.connection.organizationFingerprint || organizationFingerprint(resolved.connection.apiKey);
+    const connectionId = resolved.connection.id === "secondary" ? "dd-secondary" : "primary";
+    let cov;
+    try { cov = await getSourceCoverageWindows({ organizationFingerprint: org, connectionId, accountId: account.accountId, sourceKey: OLI_SOURCE_KEY }); }
+    catch { return null; }
+    const wins = cov && cov.read === "ok" ? (cov.windows || []) : [];
+    const tos = wins.map((w) => S(w.to ?? w.covered_to ?? "")).filter((d) => isDate(d));
+    return tos.length ? tos.reduce((m, t) => (t > m ? t : m)) : null;
+  };
+  const proven = [];
+  for (const a of accounts) proven.push({ accountId: a.accountId, provenTo: await provenTo(a) });
+  const clamped = asOfArg && isDate(asOfArg) ? (asOfArg > ceiling ? ceiling : asOfArg) : null;
+  const resolved = clamped
+    ? {
+        asOf: clamped,
+        included: proven.filter((p) => p.provenTo && p.provenTo >= clamped).map((p) => p.accountId),
+        blocked: proven.filter((p) => !(p.provenTo && p.provenTo >= clamped)),
+      }
+    : resolveGoLiveAsOf(proven, { ceiling, maxBlocked });
+  return { ...resolved, proven };
+}
+
+// Partition accounts into the two independent buckets by their marketplace country (US vs everything else).
+// Only correctly-bound PRIMARY accounts survive: a connection-prefixed id (any id containing ":") or an account
+// without a marketplace country can never be batched or bucketed safely and is dropped (defense-in-depth -- the
+// release loader already excludes them, and the batcher's owner-metadata gate would reject them downstream).
+export function partitionFbaBucketAccounts(accounts) {
+  const us = [];
+  const nonUs = [];
+  for (const a of accounts || []) {
+    if (!a || !a.accountId || String(a.accountId).includes(":") || !S(a.country).trim()) continue;
+    (S(a.country).trim().toUpperCase() === "US" ? us : nonUs).push(a);
+  }
+  return { us, nonUs };
+}
+export function fbaBucketAccounts(accounts, bucket) {
+  const { us, nonUs } = partitionFbaBucketAccounts(accounts);
+  return bucket === "us" ? us : nonUs;
+}
+
+/**
+ * Build the exact batched plan + prove the token cost for ONE bucket (ZERO creates). `getSourceExportCache`
+ * proves what is already adoptable from the durable cache (adoptable => 0 tokens). Returns { plan, cost }.
+ */
+export async function planFbaBucketCost({ bucketAccounts, connections, asOf, getSourceExportCache }) {
+  const asOfFor = () => asOf;
+  const plan = bucketAccounts.length
+    ? buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: ["fba-plan"], connections, asOfFor })
+    : { sourceJobs: [], reportRequests: [] };
+  const adoptable = new Set();
+  for (const j of plan.sourceJobs) {
+    const h = j.requestHash ?? j.request_hash;
+    try { if (await getSourceExportCache(h)) adoptable.add(h); } catch { /* treat as not-adoptable */ }
+  }
+  const cost = fbaGoLiveTokenCost(plan.sourceJobs, (h) => adoptable.has(h));
+  return { plan, cost };
+}
+
+/**
+ * ONE bounded, resumable pass of the FBA Shipment Plan operation for a single bucket. Deadline-aware and
+ * stateless-resumable -- it derives its phase from the DURABLE dedicated cycle, so the caller re-enters with the
+ * SAME arguments until `phase === "complete"`:
+ *
+ *   FETCH   (cycle not terminal): run the shadow dispatch (batched FBA/AWD fetch + durable OLI/Catalog derive),
+ *           bounded by the slice budget. Drained -> finalize the dedicated cycle. Not drained -> continuation.
+ *   PUBLISH (cycle terminal): open ONLY the fba-plan gates -> preflight EVERY included account (capture the
+ *           exact live identity) -> publish until the budget runs out -> ALWAYS safe-close -> exact live
+ *           read-back of every published pair -> ownership backfill (non-fatal). Partial -> continuation.
+ *
+ * The HARD token ceiling is gated BEFORE any fetch (a plan over budget refuses with zero creates). Blocked
+ * (genuinely-stale-OLI) accounts are simply absent from `includedIds` -> their last-known-good is untouched.
+ *
+ * deps: {
+ *   bucket, asOf, includedIds (string[]), bucketAccounts, cost ({tokens}), maxTokens,
+ *   runtime  -- buildSchedulerV2Runtime() (needs .run + .store.getCycleByBucketDate + .store.finalizeCycle);
+ *   publisher -- buildSchedulerV2Publisher() (.preflight + .publish);
+ *   controls  -- { apply(): Promise, close(): Promise } (the guarded fba-plan control package; close in finally);
+ *   readbackLive -- ({reportKey, liveReportKey, accountId, paramsHash}) => {ok, reason?} exact-identity read-back;
+ *   ownershipBackfill -- optional async () => {applied, totalRows} (non-fatal completion step);
+ *   trigger   -- sync_cycles trigger enum ('github'|'manual'|'vercel'|'pg_cron'); default 'github';
+ *   deadlineMs, reserveMs -- the shadow dispatch slice budget (Infinity for the CLI);
+ *   outOfTime -- () => boolean publish-loop budget (() => false for the CLI);
+ *   maxSlices -- fetch-slice safety cap (default 40); log -- narration sink (safe strings only).
+ * }
+ * Returns a typed status:
+ *   { operationId, phase, ok?, continuationRequired?, problems?, accounts, batches, creates, tokens,
+ *     published, readback, blocked }
+ */
+export async function advanceFbaPlanBucket({
+  bucket, asOf, includedIds = [], bucketAccounts = [], cost = null, maxTokens = 80,
+  runtime, publisher, controls, readbackLive, ownershipBackfill = null,
+  trigger = "github", deadlineMs = Infinity, reserveMs = 3000, outOfTime = () => false,
+  maxSlices = 40, log = () => {},
+} = {}) {
+  const cycleBucket = fbaCycleBucket(bucket);
+  const included = [...new Set((includedIds || []).map(S).filter((x) => x))];
+  const batches = cost && cost.sourceJobs != null ? cost.sourceJobs : null;
+  const base = {
+    operationId: cycleBucket + "@" + S(asOf),
+    accounts: bucketAccounts.length,
+    batches: (cost && cost.plan && Array.isArray(cost.plan.sourceJobs)) ? cost.plan.sourceJobs.length : (batches || 0),
+    creates: cost ? Number(cost.creates || 0) : 0,
+    tokens: cost ? Number(cost.tokens || 0) : 0,
+    published: 0,
+    readback: 0,
+    blocked: 0,
+  };
+  if (!bucketAccounts.length) return { ...base, phase: "complete", ok: true, published: 0, note: "no-bucket-accounts" };
+  if (typeof runtime?.run !== "function" || !runtime.store || typeof runtime.store.getCycleByBucketDate !== "function" || typeof runtime.store.finalizeCycle !== "function") {
+    return { ...base, phase: "sync", ok: false, problems: ["fba runtime missing run/store.getCycleByBucketDate/finalizeCycle"] };
+  }
+  if (typeof publisher?.preflight !== "function" || typeof publisher.publish !== "function") {
+    return { ...base, phase: "publish", ok: false, problems: ["fba publisher missing preflight/publish"] };
+  }
+  if (!controls || typeof controls.apply !== "function" || typeof controls.close !== "function") {
+    return { ...base, phase: "publish", ok: false, problems: ["fba controls missing apply/close"] };
+  }
+
+  // HARD token ceiling BEFORE any fetch/create (idempotent: the same plan costs the same on every pass, so a
+  // replay re-proves the same budget; creates already claimed are one-per-hash and never re-charged).
+  if (cost && Number(cost.tokens || 0) > Number(maxTokens)) {
+    return { ...base, phase: "sync", ok: false, problems: ["plan costs " + cost.tokens + " tokens > the " + maxTokens + "-token ceiling; refusing (zero creates)"] };
+  }
+
+  const cycleOf = async () => runtime.store.getCycleByBucketDate(cycleBucket, asOf).catch(() => null);
+  let cycle = await cycleOf();
+  let cycleId = cycle && cycle.id ? cycle.id : null;
+
+  // ---------------- FETCH phase: shadow dispatch until drained (or the slice budget runs out) ----------------
+  if (!(cycle && cycleId && TERMINAL.has(S(cycle.status)))) {
+    let drained = false;
+    for (let slice = 1; slice <= maxSlices; slice += 1) {
+      // cycleBucket namespaces the fba-plan cycle; the account scope is still the REAL bucket (us|non-us).
+      const res = await runtime.run({
+        bucket, cycleBucket, cycleDate: asOf, asOf, asOfFor: () => asOf,
+        manualReportKeys: ["fba-plan"], trigger, deadlineMs, reserveMs,
+      });
+      cycleId = res.cycleId || cycleId;
+      log(bucket + " fetch slice " + slice + ": cycle=" + S(cycleId).slice(0, 8) + " drained=" + res.drained + (res.deadlineReached ? " (deadline)" : ""));
+      if (res.drained === true) { drained = true; break; }
+      if (res.continuationRequired !== true && res.stoppedForBudget !== true && res.deadlineReached !== true) {
+        return { ...base, phase: "sync", ok: false, problems: [bucket + " dispatch stopped un-drained without requesting continuation"] };
+      }
+      if (outOfTime()) return { ...base, phase: "sync", continuationRequired: true, cycleId };
+      if (slice === maxSlices) return { ...base, phase: "sync", ok: false, problems: [bucket + " dispatch did not drain within the slice budget"] };
+    }
+    if (!drained) return { ...base, phase: "sync", continuationRequired: true, cycleId };
+
+    // FINALIZE the DEDICATED fba-plan cycle (a manualReportKeys dispatch never auto-finalizes a shared cycle;
+    // this cycle is dedicated, and the four-gate publisher requires a validated job in a terminal cycle).
+    // Idempotent: an already-terminal cycle returns "already-terminal".
+    if (cycleId) {
+      const disp = await runtime.store.finalizeCycle({ cycleId });
+      const status = disp && disp.cycle && disp.cycle.status;
+      log(bucket + " cycle finalized: disposition=" + (disp && disp.disposition) + " status=" + status);
+      if (!disp || !OK_FINALIZE.has(S(disp.disposition)) || !TERMINAL.has(S(status))) {
+        return { ...base, phase: "sync", ok: false, problems: [bucket + " fba-plan cycle did not reach a terminal status: " + JSON.stringify(disp)] };
+      }
+    }
+    cycle = await cycleOf();
+    // Let the caller re-enter for the publish phase on a fresh budget if the fetch consumed the slice.
+    if (outOfTime()) return { ...base, phase: "publish", continuationRequired: true, cycleId };
+  }
+
+  // ---------------- PUBLISH phase: open gates -> preflight+publish -> ALWAYS safe-close -> read-back ----------
+  const published = [];
+  let remaining = [...included];
+  const liveIdentity = new Map(); // accountId -> { liveReportKey, paramsHash }
+  const problems = [];
+  await controls.apply();
+  try {
+    for (const accountId of included) {
+      const pre = await publisher.preflight("fba-plan", accountId);
+      if (pre.disposition !== "ready" || !S(pre.liveReportKey) || !S(pre.paramsHash)) {
+        problems.push(accountId.slice(0, 6) + ":preflight-" + S(pre.disposition));
+        continue; // a not-ready account is skipped (its LKG is untouched), never a hard failure of the bucket
+      }
+      liveIdentity.set(accountId, { liveReportKey: S(pre.liveReportKey), paramsHash: S(pre.paramsHash) });
+    }
+    // Publish only the preflight-ready accounts, bounded by the slice budget.
+    remaining = [...liveIdentity.keys()];
+    const stillToPublish = [...remaining];
+    for (const accountId of stillToPublish) {
+      if (outOfTime()) break;
+      const r = await publisher.publish("fba-plan", accountId);
+      if (OK_PUBLISH.has(S(r.disposition))) {
+        published.push(accountId);
+        // capture the proven live identity from the publish result too (authoritative for read-back)
+        if (S(r.liveReportKey) && S(r.paramsHash)) liveIdentity.set(accountId, { liveReportKey: S(r.liveReportKey), paramsHash: S(r.paramsHash) });
+        remaining = remaining.filter((x) => x !== accountId);
+      } else {
+        problems.push(accountId.slice(0, 6) + ":publish-" + S(r.disposition));
+        remaining = remaining.filter((x) => x !== accountId);
+      }
+    }
+  } finally {
+    // ALWAYS safe-close -- success, failure, or slice-budget pause. The gates never survive past this pass.
+    try { await controls.close(); } catch (e) { problems.push("SAFE-CLOSE:" + S(e && e.message ? e.message : e)); }
+  }
+
+  base.published = published.length;
+  base.blocked = bucketAccounts.length - included.length;
+
+  // Continuation: preflight-ready accounts remain unpublished because the slice budget ran out.
+  if (remaining.length) {
+    log(bucket + " publish slice: " + published.length + " live; " + remaining.length + " remaining -> continuation");
+    return { ...base, phase: "publish", continuationRequired: true, problems: problems.length ? problems : undefined };
+  }
+
+  // EXACT live read-back for every published account (post-safe-close, against the captured identity).
+  let readback = 0;
+  if (typeof readbackLive === "function") {
+    for (const accountId of published) {
+      const id = liveIdentity.get(accountId);
+      if (!id) { problems.push(accountId.slice(0, 6) + ":no-live-identity"); continue; }
+      const rb = await readbackLive({ reportKey: "fba-plan", liveReportKey: id.liveReportKey, accountId, paramsHash: id.paramsHash });
+      if (rb && rb.ok === true) readback += 1;
+      else problems.push(accountId.slice(0, 6) + ":readback-" + S(rb && (rb.reason || "failed")));
+    }
+  } else {
+    readback = published.length; // no read-back injected (the CLI proves publish disposition instead)
+  }
+  base.readback = readback;
+
+  // OWNERSHIP backfill -- part of the completion path (never a forgotten manual step). Non-fatal + idempotent.
+  if (published.length && typeof ownershipBackfill === "function") {
+    try {
+      const bf = await ownershipBackfill();
+      log(bucket + " ownership: " + (bf && bf.applied) + " accounts, " + (bf && bf.totalRows) + " rows");
+    } catch (e) { log(bucket + " WARN ownership backfill failed (re-runnable, non-fatal): " + S(e && e.message ? e.message : e)); }
+  }
+
+  const okReadback = typeof readbackLive === "function" ? readback === published.length : true;
+  if (!published.length) {
+    return { ...base, phase: "publish", ok: false, problems: problems.length ? problems : ["zero accounts published live"] };
+  }
+  if (!okReadback) {
+    return { ...base, phase: "readback", ok: false, problems: problems.length ? problems : ["live read-back mismatch"] };
+  }
+  return { ...base, phase: "complete", ok: true, problems: problems.length ? problems : undefined };
+}

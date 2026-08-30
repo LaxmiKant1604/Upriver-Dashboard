@@ -1030,11 +1030,20 @@ test("R8. endpoint ordering pins: PATCH boolean-strict BEFORE any write; POST pr
   assert.ok(boolCheck > 0 && patchWrite > boolCheck, "PATCH validates the boolean before its first write");
   const mkDeadline = src.indexOf("runtime.makeDeadline()");
   const preflight = src.indexOf("preflightEvidence({ bucket, sourceKey: onlySourceKey, deadline })");
-  const postAudit = src.indexOf('action: "source.sync.missing"');
+  // The OLI/orchestrated POST path's audit is the source.sync.missing write AT/AFTER its evidence preflight (a
+  // separate FBA branch above has its OWN audit-before-execution ordering, pinned below).
+  const postAudit = src.indexOf('action: "source.sync.missing"', preflight);
   assert.ok(mkDeadline > 0 && preflight > mkDeadline, "round-5: the ONE route-owned deadline is created BEFORE preflight");
   assert.ok(preflight > 0 && postAudit > preflight, "POST runs the evidence preflight BEFORE the audit write");
   const exec = src.indexOf("deadline, preflight });");
   assert.ok(exec > postAudit, "execution consumes the SAME route deadline + memoized preflight bundle");
+  // FBA branch ordering: the decoupled fba-plan sync audits BEFORE it runs the shared operation core (audit
+  // precedes any execution write). Its audit is the FIRST source.sync.missing occurrence (it is above the OLI
+  // path), and advanceFbaPlanBucket (its only execution) comes after it.
+  const fbaAudit = src.indexOf('action: "source.sync.missing"');
+  const fbaExec = src.indexOf("advanceFbaPlanBucket({");
+  assert.ok(fbaAudit > 0 && fbaAudit < preflight, "the FBA branch (with its own audit) precedes the OLI evidence preflight path");
+  assert.ok(fbaExec > fbaAudit, "the FBA branch audits before it executes the shared fba-plan operation");
 });
 
 test("R9. dropped / weakened / wrong-schema POLICIES each raise a typed audit blocker", () => {

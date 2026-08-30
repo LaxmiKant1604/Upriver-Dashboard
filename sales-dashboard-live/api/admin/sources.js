@@ -15,6 +15,7 @@ import { shapeSourceCards, dashboardReadinessSummary, CARD_BUCKETS } from "../..
 import { sourceRegistryEntry } from "../../lib/server/sync/source-registry.js";
 import { buildBucketSourceSyncRuntime } from "../../lib/server/sync/source-bucket-sync-runtime.js";
 import { validateSourceSyncRequest, runReleaseSlice, ORCHESTRATED_SOURCE_KEYS } from "../../lib/server/sync/source-sync-operation.js";
+import { isFbaOperationSource, resolveFbaPlanScope, planFbaBucketCost, fbaBucketAccounts, advanceFbaPlanBucket, fbaServerCeiling } from "../../lib/server/sync/fba-plan-operation.js";
 
 export const config = { maxDuration: 60 };
 
@@ -142,6 +143,77 @@ export default async function handler(req, res) {
           return;
         }
       }
+
+      // ---------------- FBA Shipment Plan sync (fba-inventory-health / US Listings-AWD) ----------------
+      // The FBA source cards run the SHARED, decoupled fba-plan operation core -- the SAME deadline-aware,
+      // bounded-resumable pipeline the CLI operator + the automatic GitHub scheduler use (batched marketplace-safe
+      // FBA Health/AWD fetch -> durable OLI + Catalog derive -> four-gate CAS publish -> exact live read-back ->
+      // ownership backfill -> ALWAYS safe-close). There is NO parallel implementation. ONE bounded slice per POST;
+      // the UI re-POSTs the SAME body until phase==="complete". The durable operation identity (the DEDICATED
+      // `${bucket}-fba` cycle at server-resolved as-of=D-1) makes every replay -- concurrent poll, retry, or the
+      // scheduled fallback -- a zero-create idempotent no-op (never a duplicate export or double-spent token), and
+      // an FBA failure NEVER touches Daily Reporting / Brand View (separate cycle namespace + control envelope).
+      if (onlySourceKey && isFbaOperationSource(onlySourceKey)) {
+        const fbaDeadline = buildBucketSourceSyncRuntime().makeDeadline();
+        // Audit BEFORE any execution write, bounded by the same route budget (a duplicate audit row on a retry is
+        // harmless; an unaudited execution is not).
+        await fbaDeadline.bound("audit-write", (signal) => insertAuditLog({
+          actorUserId: access.userId, action: "source.sync.missing", target: { bucket, sourceKey: onlySourceKey, family: "fba-plan" },
+        }, { signal }), { write: true });
+        const boundedStatusFn = async (dl) => {
+          try { return await dl.bound("status-reads", () => statusPayload()); }
+          catch (error) { if (error && error.code === "ROUTE_DEADLINE_EXCEEDED") return { unavailable: "ROUTE_DEADLINE_EXCEEDED" }; throw error; }
+        };
+        const operator = access.userId ? "admin:" + String(access.userId) : "admin:data-sync-center";
+        // The reviewed fba-plan RELEASE SEAM wires runtime/publisher/controls/read-back/ownership (the route
+        // never touches the publisher composition, the CAS primitive, or the control internals itself).
+        const { buildFbaPlanRelease } = await import("../../lib/server/sync/fba-plan-release-composition.js");
+        const release = buildFbaPlanRelease({ operator });
+        try {
+          // Respect an explicit source pause (parity with the OLI path): an admin who paused this FBA source must
+          // not have it synced. Fail closed on an unreadable control table (never a silent create).
+          const controlsRead = await fbaDeadline.bound("controls-read", () => getSourceControls());
+          if (controlsRead && controlsRead.read !== "ok") throw Object.assign(new Error("source controls unavailable (migration/read)"), { status: 503 });
+          const pausedSet = new Set((controlsRead.rows || []).filter((r) => r.paused === true).map((r) => r.source_key));
+          if (pausedSet.has(onlySourceKey)) {
+            res.status(409).json({ operation: { phase: "sync", ok: false, problems: ["source \"" + onlySourceKey + "\" is paused; resume it before syncing"] }, status: await boundedStatusFn(fbaDeadline) });
+            return;
+          }
+          const accounts = await release.loadAccounts();
+          if (!accounts.length) { res.status(200).json({ operation: { phase: "sync", ok: false, problems: ["no primary accounts with directory metadata"] }, status: await boundedStatusFn(fbaDeadline) }); return; }
+
+          // The go-live as-of is resolved GLOBALLY (across all accounts), identical to the CLI/scheduler, so the
+          // dedicated operation identity is the SAME regardless of which path or bucket triggers it.
+          const scope = await resolveFbaPlanScope({ accounts, connections: release.connections, asOfArg: null, maxBlocked: 2, ceiling: fbaServerCeiling(), readers: release.scopeReaders });
+          if (!scope.asOf) { res.status(200).json({ operation: { phase: "sync", ok: false, problems: ["no account has durable OLI coverage; cannot resolve an as-of"] }, status: await boundedStatusFn(fbaDeadline) }); return; }
+          const bucketAccounts = fbaBucketAccounts(accounts, bucket);
+          if (!bucketAccounts.length) { res.status(200).json({ operation: { phase: "complete", ok: true, published: 0, note: "no-bucket-accounts" }, status: await boundedStatusFn(fbaDeadline) }); return; }
+          const { cost } = await planFbaBucketCost({ bucketAccounts, connections: release.connections, asOf: scope.asOf, getSourceExportCache: release.getSourceExportCache });
+          const includedIds = scope.included.filter((id) => bucketAccounts.some((a) => a.accountId === id));
+          const maxTokens = bucket === "us" ? 30 : 70; // per-bucket share of the 80-token daily ceiling (scheduler parity)
+
+          const result = await advanceFbaPlanBucket({
+            bucket, asOf: scope.asOf, includedIds, bucketAccounts, cost, maxTokens,
+            runtime: release.runtime, publisher: release.publisher, controls: release.controls,
+            readbackLive: release.readbackLive, ownershipBackfill: release.ownershipBackfill,
+            trigger: "vercel", deadlineMs: fbaDeadline.deadlineMs, reserveMs: fbaDeadline.reserveMs, outOfTime: fbaDeadline.outOfTime,
+          });
+          const operation = result.phase === "complete" && result.ok === true
+            ? { phase: "complete", ok: true, published: result.published, readback: result.readback, accounts: result.accounts, batches: result.batches, creates: result.creates, tokens: result.tokens, blocked: result.blocked }
+            : result.continuationRequired === true
+              ? { phase: result.phase, continuationRequired: true, published: result.published, accounts: result.accounts, batches: result.batches, creates: result.creates, tokens: result.tokens }
+              : { phase: result.phase, ok: false, problems: result.problems || ["typed failure"], published: result.published };
+          res.status(200).json({ operation, result: { fbaPlan: { operationId: result.operationId, asOf: scope.asOf, includedAccounts: includedIds.length, blockedAccounts: result.blocked } }, status: await boundedStatusFn(fbaDeadline) });
+          return;
+        } catch (error) {
+          // Safety net: the core ALWAYS safe-closes in its own finally, but a throw before/around a pass could
+          // leave gates open -- close them explicitly (idempotent) through the same release seam before surfacing.
+          try { await release.controls.close(); } catch { /* the original error is surfaced below */ }
+          res.status(error?.status || 500).json({ operation: { phase: "sync", ok: false, problems: [String(error?.message || "fba sync failed")] } });
+          return;
+        }
+      }
+
       // Finding 8 + round-5 blocker 3: the FAIL-CLOSED EVIDENCE PREFLIGHT runs BEFORE the endpoint's FIRST
       // write -- including the audit row -- and now sweeps EVERY read execution needs (controls, discovery,
       // coverage, snapshot hydration/integrity, Ads coverage, Ads metrics, OLI history, membership,

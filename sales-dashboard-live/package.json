@@ -35,6 +35,7 @@
     "test:warehouse-validation": "node scripts/warehouse-validation.test.js",
     "test:warehouse-ownership": "node scripts/warehouse-ownership.test.js",
     "test:fba-plan-config-handler": "node scripts/fba-plan-config-handler.test.js",
+    "test:fba-plan-operation": "node scripts/fba-plan-operation.test.js",
     "test:plan-brand": "node scripts/plan-brand.test.js",
     "test:sku-movement": "node scripts/sku-movement.test.js",
     "test:sku-movement-integration": "node scripts/sku-movement-integration.test.js",
