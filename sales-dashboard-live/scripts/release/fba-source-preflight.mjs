@@ -12,7 +12,7 @@ import pg from "pg";
 
 const apiKey = process.env.DATADOE_API_KEY;
 if (!apiKey) { console.error("STOP DATADOE_API_KEY not configured."); process.exit(1); }
-const DATADOE_BASE = process.env.DATADOE_BASE || "https://api.datadoe.com";
+const DATADOE_BASE = process.env.DATADOE_BASE || "https://api.datadoe.com/api/v1";
 const FBA_HEALTH_ID = "44fc5ba0ce81a7807601f6d7a9b8b7aaec64be4c7e046ea30dc6864d1a4aa823";
 const LISTINGS_ID = "ba689c05d7f7cee1a1690990c28995680a0654b7ed258230f4173d61bbcd1ab3";
 const hdr = { "datadoe-api-key": apiKey, "Content-Type": "application/json" };
