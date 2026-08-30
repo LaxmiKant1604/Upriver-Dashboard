@@ -36,7 +36,7 @@ let fbaPlanPayload, foldPlanAsinUnits;
 let planMonthWindows, addDaysStr, planFbaPlan, canonicalOliSlices;
 let slicedOliSourceFromHistory;
 let makeFbaPlanDurableContextLoader, oliCoverageProvesWindow;
-let planFbaPlanBucketBatched;
+let planFbaPlanBucketBatched, marketplaceCodeFor;
 let resolveGoLiveAsOf, fbaGoLiveTokenCost;
 
 const ID = "A1";
@@ -690,6 +690,26 @@ test("planFbaPlanBucketBatched: single-marketplace <=5 batches, per-account owne
   for (const r of reqs) for (const s of r.sources) assert.equal(s.marketplaceConstraint, r.context.marketCountry);
 });
 
+test("marketplaceCodeFor: UK -> GB (Amazon code), every other marketplace unchanged", () => {
+  assert.equal(marketplaceCodeFor("UK"), "GB");
+  assert.equal(marketplaceCodeFor("uk"), "GB");
+  assert.equal(marketplaceCodeFor("IN"), "IN");
+  assert.equal(marketplaceCodeFor("US"), "US");
+  assert.equal(marketplaceCodeFor("DE"), "DE");
+});
+
+test("planFbaPlanBucketBatched: UK accounts batch under the GB marketplace (never UK) so FBA rows validate", () => {
+  const uk = [{ accountId: "UK1", name: "u1", country: "UK", currency: "GBP" }, { accountId: "UK2", name: "u2", country: "UK", currency: "GBP" }];
+  const reqs = planFbaPlanBucketBatched({ accounts: uk, connections: PL_CONN, asOfFor: bAsOfFor });
+  assert.equal(reqs.length, 2, "one request per UK account");
+  for (const r of reqs) for (const s of r.sources) assert.equal(s.marketplaceConstraint, "GB", "UK batch marketplace normalized to GB");
+  // Both UK accounts share ONE batched FBA export (same GB marketplace partition).
+  const invHashes = new Set(reqs.map((r) => r.sources.find((s) => s.requestKey === "fba-plan:inventory-health").requestHash));
+  assert.equal(invHashes.size, 1, "UK accounts batch together under GB");
+  // UK is non-US, so no AWD.
+  assert.ok(reqs.every((r) => !r.sources.some((s) => s.requestKey === "fba-plan:awd")), "no AWD for UK (non-US)");
+});
+
 test("fba-plan BATCHED derive ISOLATES each account's rows from a shared <=5-seller FBA/AWD export (no cross-account leak)", async () => {
   const reqs = planFbaPlanBucketBatched({ accounts: [bAccounts[0], bAccounts[1]], connections: PL_CONN, asOfFor: bAsOfFor });
   // The two US accounts share ONE FBA + ONE AWD export. Its rows carry BOTH accounts (tagged by seller_or_vendor_id).
@@ -797,7 +817,7 @@ async function main() {
   ({ deriveReportSnapshot } = await import("../lib/server/sync/report-derivation.js"));
   ({ fbaPlanPayload, foldPlanAsinUnits } = await import("../lib/server/reports/derivation-core.js"));
   ({ planMonthWindows, addDaysStr, canonicalOliSlices } = await import("../lib/server/date-windows.js"));
-  ({ planFbaPlan, planFbaPlanBucketBatched } = await import("../lib/server/sync/report-planner.js"));
+  ({ planFbaPlan, planFbaPlanBucketBatched, marketplaceCodeFor } = await import("../lib/server/sync/report-planner.js"));
   ({ slicedOliSourceFromHistory } = await import("../lib/server/sync/durable-dashboards.js"));
   ({ makeFbaPlanDurableContextLoader, oliCoverageProvesWindow } = await import("../lib/server/sync/fba-plan-durable-loader.js"));
   ({ resolveGoLiveAsOf, fbaGoLiveTokenCost } = await import("../lib/server/sync/fba-plan-golive-plan.js"));

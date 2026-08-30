@@ -385,7 +385,9 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       strict: true,
       sourceKey: "fba-inventory-health",
       columns: FBA_HEALTH_COLUMNS,
-      limit: 15000, // PLAN_INVENTORY_ROW_LIMIT
+      limit: 50000, // PLAN_INVENTORY_ROW_LIMIT -- raised from 15000: a marketplace-safe <=5-seller FBA Health batch
+                    // of large-inventory accounts (e.g. India ~5k rows each) exceeds 15k and TRUNCATES; DataDoe
+                    // honours the requested limit, so 50k lets a full <=5-account batch return without truncation.
       groupBy: null,
       aggregations: null,
       orderByColumn: "date",

@@ -140,18 +140,28 @@ try {
     if (!wantBucket(bucket)) continue;
     if (bucket === "us" ? !usAccounts.length : !nonUsAccounts.length) continue;
     let cycleId = null;
-    for (let slice = 1; slice <= 40; slice += 1) {
-      // trigger MUST be one of the sync_cycles_trigger_check enum ('pg_cron'|'github'|'vercel'|'manual'); this
-      // operator runs in GitHub Actions. The fba-plan operation identity (bucket + as-of + request_hash) is what
-      // distinguishes/idempotates fba-plan runs, NOT the trigger enum.
-      // cycleBucket namespaces the fba-plan cycle (us-fba / non-us-fba) so it NEVER collides with the scheduler-v2
-      // daily (us|non-us, cycle_date) cycle; account scope is still the real bucket (us | non-us).
-      const res = await runtime.run({ bucket, cycleBucket: bucket + "-fba", cycleDate, asOf, asOfFor, manualReportKeys: ["fba-plan"], trigger: "github" });
-      cycleId = res.cycleId || cycleId;
-      log(bucket + " slice " + slice + ": cycle=" + String(res.cycleId || "").slice(0, 8) + " drained=" + res.drained + " reports=" + JSON.stringify(res.reports ? { processed: res.reports.processed, drained: res.reports.drained } : null));
-      if (res.drained === true) break;
-      if (res.continuationRequired !== true) throw new Error(bucket + " dispatch stopped un-drained without requesting continuation");
-      if (slice === 40) throw new Error(bucket + " dispatch did not drain within the slice budget");
+    // IDEMPOTENCY: if this bucket's dedicated fba cycle for the as-of is ALREADY terminal (a prior primary or a
+    // fallback trigger completed it), the batched fetch + derive are done -- SKIP the dispatch entirely (never
+    // re-fetch, never double-spend) and go straight to finalize (already-terminal) + publish (already-current).
+    const existing = typeof runtime.store.getCycleByBucketDate === "function"
+      ? await runtime.store.getCycleByBucketDate(bucket + "-fba", cycleDate).catch(() => null) : null;
+    if (existing && existing.id && ["succeeded", "partial", "failed"].includes(String(existing.status))) {
+      cycleId = existing.id;
+      log(bucket + " fba cycle already terminal (" + existing.status + ") -> idempotent no-op: skipping dispatch, will publish already-current");
+    } else {
+      for (let slice = 1; slice <= 40; slice += 1) {
+        // trigger MUST be one of the sync_cycles_trigger_check enum ('pg_cron'|'github'|'vercel'|'manual'); this
+        // operator runs in GitHub Actions. The fba-plan operation identity (bucket + as-of + request_hash) is what
+        // distinguishes/idempotates fba-plan runs, NOT the trigger enum.
+        // cycleBucket namespaces the fba-plan cycle (us-fba / non-us-fba) so it NEVER collides with the scheduler-v2
+        // daily (us|non-us, cycle_date) cycle; account scope is still the real bucket (us | non-us).
+        const res = await runtime.run({ bucket, cycleBucket: bucket + "-fba", cycleDate, asOf, asOfFor, manualReportKeys: ["fba-plan"], trigger: "github" });
+        cycleId = res.cycleId || cycleId;
+        log(bucket + " slice " + slice + ": cycle=" + String(res.cycleId || "").slice(0, 8) + " drained=" + res.drained + " reports=" + JSON.stringify(res.reports ? { processed: res.reports.processed, drained: res.reports.drained } : null));
+        if (res.drained === true) break;
+        if (res.continuationRequired !== true) throw new Error(bucket + " dispatch stopped un-drained without requesting continuation");
+        if (slice === 40) throw new Error(bucket + " dispatch did not drain within the slice budget");
+      }
     }
     // FINALIZE the fba-plan cycle. A manualReportKeys dispatch deliberately NEVER auto-finalizes (it must not
     // terminalize a SHARED (bucket, cycle_date) cycle other reports may append to). But fba-plan's cycle is
@@ -162,8 +172,10 @@ try {
       const disp = await runtime.store.finalizeCycle({ cycleId });
       const status = disp && disp.cycle && disp.cycle.status;
       log(bucket + " cycle finalized: disposition=" + (disp && disp.disposition) + " status=" + status);
-      if (!disp || !["finalized", "already-terminal"].includes(disp.disposition) || !["succeeded", "partial"].includes(status)) {
-        throw new Error(bucket + " fba-plan cycle did not finalize to a terminal (succeeded|partial) status: " + JSON.stringify(disp));
+      // Any TERMINAL status is accepted; the four-gate publisher + the final zero-published guard decide what is
+      // publishable (a succeeded|partial cycle yields validated jobs; a fully-failed cycle publishes nothing).
+      if (!disp || !["finalized", "already-terminal"].includes(disp.disposition) || !["succeeded", "partial", "failed"].includes(status)) {
+        throw new Error(bucket + " fba-plan cycle did not reach a terminal status: " + JSON.stringify(disp));
       }
     }
   }

@@ -365,6 +365,15 @@ export function planFbaPlan({ accountId, name, country, currency, connections, a
   };
 }
 
+// The canonical AMAZON marketplace code for an account-directory country. Amazon (and the FBA Inventory Health
+// rows' marketplace_country_code) calls the United Kingdom marketplace "GB", while the account directory calls it
+// "UK"; every other marketplace already matches. Used so a marketplace-safe FBA batch is validated against the code
+// its rows actually carry. Exported for the batched planner + its tests.
+export function marketplaceCodeFor(country) {
+  const c = String(country || "").trim().toUpperCase();
+  return c === "UK" ? "GB" : c;
+}
+
 /**
  * MARKETPLACE-SAFE BATCHED FBA Shipment Plan planner for a WHOLE bucket's accounts. This is what a batched
  * go-live/refresh uses (planFbaPlan stays the per-account planner). fba-plan's only owned exports are the FBA
@@ -394,16 +403,20 @@ export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, 
 
   // 2) PARTITION by (connection & marketplace & as-of): a batch must share one org (isolation), one marketplace
   //    (the FBA/AWD contracts are marketplace-scoped), and one as-of (one identical FBA window => one shared hash).
+  //    The batch marketplace uses the AMAZON marketplace code that FBA Inventory Health rows actually carry -- the
+  //    account directory calls the United Kingdom marketplace "UK", but Amazon (and thus the FBA rows'
+  //    marketplace_country_code) uses "GB"; without this normalization a batch of "UK" accounts is validated
+  //    against "UK" while its rows say "GB" -> BATCH_CROSS_MARKETPLACE.
   const partitions = new Map();
   for (const s of scoped) {
-    const key = `${s.scope.connectionId}|${s.scope.country}|${s.asOf}`;
+    const key = `${s.scope.connectionId}|${marketplaceCodeFor(s.scope.country)}|${s.asOf}`;
     if (!partitions.has(key)) partitions.set(key, []);
     partitions.get(key).push(s);
   }
 
   const requests = [];
   for (const members of partitions.values()) {
-    const market = members[0].scope.country;
+    const market = marketplaceCodeFor(members[0].scope.country);
     const asOf = members[0].asOf;
     const isUS = market === "US";
     const apiKey = members[0].scope.apiKey;

@@ -1915,7 +1915,7 @@ const LISTINGS_AWD_COLUMNS = [
 // latest snapshot date. DESC ordering guarantees the full latest snapshot is at
 // the front of the result, so the row limit only ever drops older snapshots.
 const PLAN_INVENTORY_LOOKBACK_DAYS = 10;
-const PLAN_INVENTORY_ROW_LIMIT = 15000;
+const PLAN_INVENTORY_ROW_LIMIT = 50000; // raised from 15000 so a marketplace-safe <=5-seller FBA Health batch of large-inventory accounts returns without truncation (parity with the fba-plan:inventory-health contract limit).
 
 const DASHBOARD_ROW_LIMIT = 5000;
 // Order rows are grouped by day and ASIN before download. A year of data can
