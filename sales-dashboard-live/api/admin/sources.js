@@ -15,7 +15,7 @@ import { shapeSourceCards, dashboardReadinessSummary, CARD_BUCKETS } from "../..
 import { sourceRegistryEntry } from "../../lib/server/sync/source-registry.js";
 import { buildBucketSourceSyncRuntime } from "../../lib/server/sync/source-bucket-sync-runtime.js";
 import { validateSourceSyncRequest, runReleaseSlice, ORCHESTRATED_SOURCE_KEYS } from "../../lib/server/sync/source-sync-operation.js";
-import { isFbaOperationSource, resolveFbaPlanScope, planFbaBucketCost, fbaBucketAccounts, advanceFbaPlanBucket, fbaServerCeiling } from "../../lib/server/sync/fba-plan-operation.js";
+import { isFbaOperationSource, resolveFbaPlanScope, planFbaBucketCost, fbaBucketAccounts, advanceFbaPlanBucket, fbaServerCeiling, fbaCycleBucket } from "../../lib/server/sync/fba-plan-operation.js";
 
 export const config = { maxDuration: 60 };
 
@@ -188,7 +188,11 @@ export default async function handler(req, res) {
           if (!scope.asOf) { res.status(200).json({ operation: { phase: "sync", ok: false, problems: ["no account has durable OLI coverage; cannot resolve an as-of"] }, status: await boundedStatusFn(fbaDeadline) }); return; }
           const bucketAccounts = fbaBucketAccounts(accounts, bucket);
           if (!bucketAccounts.length) { res.status(200).json({ operation: { phase: "complete", ok: true, published: 0, note: "no-bucket-accounts" }, status: await boundedStatusFn(fbaDeadline) }); return; }
-          const { cost } = await planFbaBucketCost({ bucketAccounts, connections: release.connections, asOf: scope.asOf, getSourceExportCache: release.getSourceExportCache });
+          // Skip the FETCH-only cost plan when the dedicated cycle is already terminal: a publish-only pass has
+          // nothing to fetch (no token gate needed), and the plan/adopt reads would only slow the bounded slice.
+          const existingCycle = await release.runtime.store.getCycleByBucketDate(fbaCycleBucket(bucket), scope.asOf).catch(() => null);
+          const terminal = existingCycle && ["succeeded", "partial", "failed"].includes(String(existingCycle.status));
+          const cost = terminal ? null : (await planFbaBucketCost({ bucketAccounts, connections: release.connections, asOf: scope.asOf, getSourceExportCache: release.getSourceExportCache })).cost;
           const includedIds = scope.included.filter((id) => bucketAccounts.some((a) => a.accountId === id));
           const maxTokens = bucket === "us" ? 30 : 70; // per-bucket share of the 80-token daily ceiling (scheduler parity)
 

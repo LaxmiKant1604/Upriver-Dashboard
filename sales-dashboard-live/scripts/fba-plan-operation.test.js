@@ -208,6 +208,7 @@ test("HAPPY PATH: fetch drains -> finalize -> publish -> read-back -> ownership 
   assert.equal(runtime.finalizeCalls, 1);
   assert.deepEqual(controls.calls, ["apply", "close"], "gates opened then ALWAYS safe-closed");
   assert.equal(publisher.calls.publish.length, 2);
+  assert.equal(publisher.calls.preflight.length, 0, "single publish pass (no redundant preflight gate) -- convergence fix");
   assert.equal(ownershipRan, 1, "ownership backfill runs on the completion path");
 });
 

@@ -68,8 +68,9 @@ export async function resolveFbaPlanScope({ accounts, connections, asOfArg = nul
     const tos = wins.map((w) => S(w.to ?? w.covered_to ?? "")).filter((d) => isDate(d));
     return tos.length ? tos.reduce((m, t) => (t > m ? t : m)) : null;
   };
-  const proven = [];
-  for (const a of accounts) proven.push({ accountId: a.accountId, provenTo: await provenTo(a) });
+  // Resolve every account's proven coverage in PARALLEL (a bounded route re-resolves this each poll; sequential
+  // reads were the dominant per-slice cost and starved the publish phase). Each read is independent + fail-soft.
+  const proven = await Promise.all(accounts.map(async (a) => ({ accountId: a.accountId, provenTo: await provenTo(a) })));
   const clamped = asOfArg && isDate(asOfArg) ? (asOfArg > ceiling ? ceiling : asOfArg) : null;
   const resolved = clamped
     ? {
@@ -225,34 +226,27 @@ export async function advanceFbaPlanBucket({
 
   // ---------------- PUBLISH phase: open gates -> preflight+publish -> ALWAYS safe-close -> read-back ----------
   const published = [];
-  let remaining = [...included];
   const liveIdentity = new Map(); // accountId -> { liveReportKey, paramsHash }
   const problems = [];
+  const processed = new Set(); // published (OK/already-current) OR conclusively failed this operation
   await controls.apply();
   try {
+    // ONE publish pass per account (publish() runs the SAME four gates internally and returns the exact live
+    // identity even for already-current), bounded by the slice budget. A separate preflight pass would DOUBLE the
+    // gate reads and, under the route budget, starved the publish so it never converged -- publish() alone gates
+    // before its CAS write, so the all-or-nothing per-account guarantee holds without it. Already-published
+    // accounts return "already-current" (fast, no re-write); genuinely-unfetched accounts (stale-OLI, or a failed
+    // source batch) return not-successful and are skipped (their LKG is untouched), never a hard bucket failure.
     for (const accountId of included) {
-      const pre = await publisher.preflight("fba-plan", accountId);
-      if (pre.disposition !== "ready" || !S(pre.liveReportKey) || !S(pre.paramsHash)) {
-        problems.push(accountId.slice(0, 6) + ":preflight-" + S(pre.disposition));
-        continue; // a not-ready account is skipped (its LKG is untouched), never a hard failure of the bucket
-      }
-      liveIdentity.set(accountId, { liveReportKey: S(pre.liveReportKey), paramsHash: S(pre.paramsHash) });
-    }
-    // Publish only the preflight-ready accounts, bounded by the slice budget.
-    remaining = [...liveIdentity.keys()];
-    const stillToPublish = [...remaining];
-    for (const accountId of stillToPublish) {
-      if (outOfTime()) break;
+      if (outOfTime()) break; // remaining (unprocessed) accounts publish on the next poll
       const r = await publisher.publish("fba-plan", accountId);
-      if (OK_PUBLISH.has(S(r.disposition))) {
+      if (OK_PUBLISH.has(S(r.disposition)) && S(r.liveReportKey) && S(r.paramsHash)) {
         published.push(accountId);
-        // capture the proven live identity from the publish result too (authoritative for read-back)
-        if (S(r.liveReportKey) && S(r.paramsHash)) liveIdentity.set(accountId, { liveReportKey: S(r.liveReportKey), paramsHash: S(r.paramsHash) });
-        remaining = remaining.filter((x) => x !== accountId);
+        liveIdentity.set(accountId, { liveReportKey: S(r.liveReportKey), paramsHash: S(r.paramsHash) });
       } else {
-        problems.push(accountId.slice(0, 6) + ":publish-" + S(r.disposition));
-        remaining = remaining.filter((x) => x !== accountId);
+        problems.push(accountId.slice(0, 6) + ":" + S(r.disposition));
       }
+      processed.add(accountId);
     }
   } finally {
     // ALWAYS safe-close -- success, failure, or slice-budget pause. The gates never survive past this pass.
@@ -262,29 +256,34 @@ export async function advanceFbaPlanBucket({
   base.published = published.length;
   base.blocked = bucketAccounts.length - included.length;
 
-  // Continuation: preflight-ready accounts remain unpublished because the slice budget ran out.
+  // Continuation: some included accounts were not reached this slice (budget ran out). A replay re-publishes the
+  // already-live ones as "already-current" (fast, no regression) and reaches the rest.
+  const remaining = included.filter((id) => !processed.has(id));
   if (remaining.length) {
     log(bucket + " publish slice: " + published.length + " live; " + remaining.length + " remaining -> continuation");
     return { ...base, phase: "publish", continuationRequired: true, problems: problems.length ? problems : undefined };
   }
 
-  // EXACT live read-back for every published account (post-safe-close, against the captured identity).
+  // EXACT live read-back for every published account (post-safe-close, against the captured identity), in
+  // PARALLEL (independent reads; keeps the completing slice under the route budget).
   let readback = 0;
   if (typeof readbackLive === "function") {
-    for (const accountId of published) {
+    const rbs = await Promise.all(published.map(async (accountId) => {
       const id = liveIdentity.get(accountId);
-      if (!id) { problems.push(accountId.slice(0, 6) + ":no-live-identity"); continue; }
+      if (!id) return { accountId, ok: false, reason: "no-live-identity" };
       const rb = await readbackLive({ reportKey: "fba-plan", liveReportKey: id.liveReportKey, accountId, paramsHash: id.paramsHash });
-      if (rb && rb.ok === true) readback += 1;
-      else problems.push(accountId.slice(0, 6) + ":readback-" + S(rb && (rb.reason || "failed")));
-    }
+      return { accountId, ok: !!(rb && rb.ok === true), reason: rb && (rb.reason || "failed") };
+    }));
+    for (const r of rbs) { if (r.ok) readback += 1; else problems.push(r.accountId.slice(0, 6) + ":readback-" + S(r.reason)); }
   } else {
     readback = published.length; // no read-back injected (the CLI proves publish disposition instead)
   }
   base.readback = readback;
 
-  // OWNERSHIP backfill -- part of the completion path (never a forgotten manual step). Non-fatal + idempotent.
-  if (published.length && typeof ownershipBackfill === "function") {
+  // OWNERSHIP backfill -- part of the completion path (never a forgotten manual step). Non-fatal + idempotent +
+  // budget-aware: a route slice that has spent its budget skips it (the scheduler's authoritative backfill + the
+  // next read still cover it) rather than overrunning the serverless deadline.
+  if (published.length && typeof ownershipBackfill === "function" && !outOfTime()) {
     try {
       const bf = await ownershipBackfill();
       log(bucket + " ownership: " + (bf && bf.applied) + " accounts, " + (bf && bf.totalRows) + " rows");
