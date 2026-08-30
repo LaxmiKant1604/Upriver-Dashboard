@@ -13318,3 +13318,40 @@ PENDING MIGRATIONS to apply together (credential-gated): 20260903 + 20260904 + 2
 scripts/backfill-fba-ownership.mjs (zero-export), guarded refresh (<=9 creates/39 tok), re-derive/publish v2d-5,
 re-run backfill, 30-account read-backs. Until 20260905 is applied, a new-manual-SKU write fails closed (503 on the
 ownership probe) -- existing-SKU writes still work. See [[fba-plan-advanced]].
+
+================================================================================
+2026-08-30 -- FBA Plan PRODUCTION: migrations APPLIED + verified; source refresh/publish BLOCKED (DataDoe key + first-time go-live)
+================================================================================
+Credentials this session: production DB + Supabase service role ARE available via the linked, authenticated Vercel
+project (`vercel env pull` -> .vercel/.env.production.local: POSTGRES_URL, SUPABASE_SERVICE_ROLE_KEY, etc.). DataDoe key
+is NOT (DATADOE_API_KEY is a Sensitive Vercel secret -> pulls EMPTY, like CRON_SECRET). gh authenticated but NO
+workflow contains fba-plan.
+
+PHASE 1 read-only reconciliation (prod, sslmode=no-verify):
+* Migrations 20260903/20260904/20260905 were MISSING (unapplied); exactly those 3 were the pending set.
+* MATERIAL DISCREPANCY vs the mission premise: FBA Plan is essentially UNPUBLISHED in prod. report_key='fba-plan'
+  (the live/frontend key) = 0 snapshots. Only scheduler-v2/fba-plan = 1 account at fba-plan/v2d-1 (2026-08-15). So
+  "publish v2d-5 for 30 accounts" is a FIRST-TIME go-live, NOT a re-derive of an existing v2d-4/v2d-5. (Other reports
+  ARE live at 30 accounts: daily-reporting, brand-inventory, sku-movement.)
+* source_controls schema = (source_key, paused, schedule_enabled, updated_by, updated_at). Publish infra tables exist
+  (scheduler_publish_approvals, scheduler_account_rollout, scheduler_rollout_mode, source_promoted_publish_settings).
+
+PHASE 2 DONE (real prod mutation): applied 20260903 + 20260904 + 20260905 via the guarded runner
+(node --env-file=.vercel/.env.production.local scripts/apply-supabase-migrations.mjs). Verified: recorded exactly once;
+re-run idempotent (all skipped); fba_account_sku_ownership columns/PK/index correct; source_oli_daily_history_org_sku_idx
+created; RPCs record_fba_seller_warehouse_bulk + replace_fba_account_sku_ownership present + SECURITY DEFINER; RLS ON;
+grants least-privilege (authenticated SELECT only, service_role full); ownership + col_prefs tables empty (fresh). No
+protected table or existing snapshot changed.
+
+BLOCKED (genuine): Phases 4-8 (source refresh -> v2d-5 derive/publish -> read-backs -> security/responsive on published
+data) require DATADOE_API_KEY, which is unavailable locally (Sensitive secret). Additionally fba-plan is a FIRST-TIME
+go-live (0 live snapshots), which needs a scheduler-v2 orchestration (source enablement + a source cycle + publish
+approvals + rollout) that does not currently exist for fba-plan -- materially larger than the mission's assumed
+"refresh + re-derive". Ownership backfill is a no-op until v2d-5 is published (0 fba-plan snapshots). Warehouse writes
+are currently fail-closed in prod (no snapshot -> "no published FBA plan"), which is correct/safe.
+
+TO FINISH (needs an env WITH the DataDoe key, e.g. Vercel runtime / the scheduler, + a go-live decision): confirm
+DataDoe balance; bounded FBA Health (US+Non-US) + US Listings/AWD refresh (<=9 creates/39 tokens, <=5 sellers/export,
+US/Non-US never mixed); derive + FIRST-TIME publish fba-plan/v2d-5 for 30 accounts through the reviewed path; run
+scripts/backfill-fba-ownership.mjs; 30-account read-backs; security + responsive verification. Migrations are already
+applied so the DB is ready. See [[fba-plan-advanced]].
