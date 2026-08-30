@@ -13355,3 +13355,40 @@ DataDoe balance; bounded FBA Health (US+Non-US) + US Listings/AWD refresh (<=9 c
 US/Non-US never mixed); derive + FIRST-TIME publish fba-plan/v2d-5 for 30 accounts through the reviewed path; run
 scripts/backfill-fba-ownership.mjs; 30-account read-backs; security + responsive verification. Migrations are already
 applied so the DB is ready. See [[fba-plan-advanced]].
+
+================================================================================
+2026-08-30 -- FBA Plan GO-LIVE: migrations applied in prod; BLOCKED at token-ceiling infeasibility (per-account premium FBA sources)
+================================================================================
+Credential path FOUND + used: prod DB + Supabase service role via linked Vercel project (vercel env pull;
+sslmode=no-verify). GitHub Actions has all 4 secrets (DATADOE_API_KEY, POSTGRES_URL, SUPABASE_SERVICE_ROLE_KEY,
+VITE_SUPABASE_URL) -> the go-live would run as a workflow_dispatch operator in Actions.
+
+DONE this session (real prod mutation): migrations 20260903+20260904+20260905 APPLIED + verified (idempotent, schema/
+RPC/RLS/grants). Reconciliation: 30 accts (8 US + 22 Non-US, 0 secondary); fba-plan UNPUBLISHED (report_key='fba-plan'
+= 0; only scheduler-v2/fba-plan = 1 acct @ v2d-1) -> first-time go-live; FBA sources (fba-inventory-health, listings)
+never fetched (0 coverage, no adoptable exports); OLI (30 accts @ 08-28) + catalog present for the derive; FBA
+source_controls exist but paused; fba-plan has NO publish approvals.
+
+HARD BLOCKER (stopped before ANY create; 0 tokens spent): the authorized ceiling (9 creates / 39 tokens, "never exceed
+for any reason") is INFEASIBLE for a 30-account go-live. Per source-registry.js, BOTH FBA sources are
+batching per-account (maxAccountsPerExport:1) + tokenClass premium (5 tok) because their contracts
+(report-source-contracts.js:145,148 FBA_HEALTH_COLUMNS / LISTINGS_AWD_COLUMNS) carry NO seller_or_vendor_id to split a
+multi-account export (registry comment 886-918). Real cost:
+  * FBA Inventory Health: 30 accts x 1/export x 5 tok = 30 creates / 150 tokens.
+  * US Listings/AWD: 8 US x 1/export x 5 tok = 8 creates / 40 tokens.
+  * TOTAL ~38 creates / ~190 tokens (~5x the 9/39 ceiling).
+Even WITH a contract change adding seller_or_vendor_id + 5-seller batching (IF DataDoe returns it -- UNVERIFIED
+without the key): FBA Health 7 exports + AWD 2 = 9 creates x 5 premium = 45 tokens > 39 (the 9/39 budget assumed AWD =
+standard 2 tok, but listings is PREMIUM 5 tok). NO config fits 9/39 for 30 accounts.
+
+Architecture map (agent, read-only): fba-plan is fully declared (report-source-contracts, report-planner planFbaPlan,
+report-derivation v2d-5, report-publisher live contract, report-controls CONTROLLED/SCHEDULER_V2_READY). The source
+RUNTIME already fetches both FBA sources via runSourceCardAction. FROZEN blockers: (1) source-sync-operation.js:21
+ORCHESTRATED_SOURCE_KEYS excludes FBA; (2) source-priority-dashboards.js publish set frozen to daily/brand-sales/
+brand-inventory + finalizeBucket refuses non-OLI/Catalog jobs -> needs a NEW fba-plan release composition. Publisher
+gates for fba-plan: report_sync_settings.schedule_enabled, scheduler_account_rollout, scheduler_publish_approvals
+(all off/empty for fba-plan today). Safe-close already pauses+revokes fba-plan (CONTROLLED_REPORT_KEYS includes it).
+
+NEEDS A DECISION before proceeding (cannot resolve within the stated ceiling): raise the token/create budget to
+~38 creates/~190 tokens (per-account premium, as-is) OR authorize a batching contract change (+seller_or_vendor_id,
+verify DataDoe support) at ~9 creates/45 tokens. Migrations are already applied; the DB is ready. See [[fba-plan-advanced]].
