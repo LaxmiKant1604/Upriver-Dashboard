@@ -660,35 +660,66 @@ export async function recordFbaSellerWarehouseBulk({ organizationFingerprint, co
   return Array.isArray(body) ? body[0] : body;
 }
 
+// Canonical marketplace code (GB==UK), mirrored from lib/server/reports/warehouse-validation.js#canonMkt.
+const canonMktCode = (v) => { const m = String(v == null ? "" : v).trim().toUpperCase(); return m === "GB" ? "UK" : m; };
+
 // The account's OWN seller-warehouse rows (durable identity: marketplace/sku/child_asin), for server-side
-// identity-immutability validation. Account-scoped; empty on a schema-missing table.
+// identity-immutability validation. Account-scoped. STRICT: any failure (incl. schema-missing) THROWS so the write
+// path fails closed -- it must never be conflated with "no stored identity".
 export async function getSellerWarehouseRows({ organizationFingerprint, connectionId = "primary", accountId, signal = null } = {}) {
   if (!organizationFingerprint || !accountId) throw new Error("getSellerWarehouseRows requires organizationFingerprint + accountId (fail closed).");
   const q = new URLSearchParams({
     organization_fingerprint: `eq.${organizationFingerprint}`, connection_id: `eq.${connectionId}`, account_id: `eq.${accountId}`,
     select: "marketplace,sku,child_asin",
   });
-  try { const r = await request(`/rest/v1/fba_seller_warehouse?${q}`, { signal }); return Array.isArray(r) ? r : []; }
-  catch (e) { if (isSchemaMissingError(e)) return []; throw e; }
+  const r = await request(`/rest/v1/fba_seller_warehouse?${q}`, { signal });
+  return Array.isArray(r) ? r : [];
 }
 
-// Cross-account SKU-ownership evidence: which of `skus` are proven under a DIFFERENT account (durable OLI sales
-// history -- an account-scoped source). Returns a Set of those SKUs. Never exposes WHICH account owns them.
-export async function getSkusOwnedByOtherAccounts({ organizationFingerprint, accountId, skus, signal = null } = {}) {
-  const list = [...new Set((Array.isArray(skus) ? skus : []).map((s) => String(s == null ? "" : s).trim()).filter(Boolean))].slice(0, 500);
+// Cross-account SKU-ownership probe against the durable account-SKU ownership authority (fba_account_sku_ownership,
+// populated from every account's validated v2d-5 directory + warehouse identity). `pairs` are {marketplace, sku}
+// candidates. Returns a Set of canonical "MKT sku" keys proven under a DIFFERENT account (same canonical marketplace
+// only -- the same SKU text in another legitimate marketplace is never a conflict). NEVER exposes which account owns
+// them. STRICT: any failure THROWS so the write path fails closed (never treated as "no ownership").
+export async function getWarehouseOwnershipConflicts({ organizationFingerprint, accountId, pairs, signal = null } = {}) {
+  const list = (Array.isArray(pairs) ? pairs : [])
+    .map((p) => ({ marketplace: canonMktCode(p && p.marketplace), sku: String(p && p.sku == null ? "" : p.sku).trim() }))
+    .filter((p) => p.marketplace && p.sku).slice(0, 500);
   if (!organizationFingerprint || !accountId || list.length === 0) return new Set();
-  const inList = `(${list.map((s) => `"${String(s).replace(/"/g, '""')}"`).join(",")})`;
+  const skus = [...new Set(list.map((p) => p.sku))];
+  const markets = [...new Set(list.map((p) => p.marketplace))];
+  const inStr = (arr) => `(${arr.map((s) => `"${String(s).replace(/"/g, '""')}"`).join(",")})`;
   const q = new URLSearchParams({
-    organization_fingerprint: `eq.${organizationFingerprint}`,
-    account_id: `neq.${accountId}`,
-    select: "sku",
-    limit: "1000",
+    organization_fingerprint: `eq.${organizationFingerprint}`, account_id: `neq.${accountId}`,
+    select: "marketplace,sku", limit: "5000",
   });
-  q.append("sku", `in.${inList}`);
-  try {
-    const rows = await request(`/rest/v1/source_oli_daily_history?${q}`, { signal });
-    return new Set((Array.isArray(rows) ? rows : []).map((r) => String(r.sku || "").trim()).filter(Boolean));
-  } catch (e) { if (isSchemaMissingError(e)) return new Set(); throw e; }
+  q.append("sku", `in.${inStr(skus)}`);
+  q.append("marketplace", `in.${inStr(markets)}`);
+  const rows = await request(`/rest/v1/fba_account_sku_ownership?${q}`, { signal });
+  const want = new Set(list.map((p) => `${p.marketplace} ${p.sku}`));
+  const owned = new Set();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    const k = `${canonMktCode(r.marketplace)} ${String(r.sku || "").trim()}`;
+    if (want.has(k)) owned.add(k);
+  }
+  return owned;
+}
+
+// Distinct account_ids that have a published fba-plan snapshot -- the set to backfill ownership for. Service-role read.
+export async function listFbaPlanSnapshotAccountIds({ signal = null } = {}) {
+  const rows = await request(`/rest/v1/report_snapshots?report_key=eq.fba-plan&select=account_id`, { signal });
+  return [...new Set((Array.isArray(rows) ? rows : []).map((r) => String(r.account_id || "").trim()).filter(Boolean))];
+}
+
+// Atomically REPLACE one account's ownership rows from validated directory evidence (delete + insert in one
+// transaction) via the SECURITY DEFINER RPC. rows: [{ marketplace, sku, child_asin?, sources? }].
+export async function replaceFbaAccountSkuOwnership({ organizationFingerprint, connectionId = "primary", accountId, rows }) {
+  const p_rows = (Array.isArray(rows) ? rows : []).map((r) => ({ marketplace: r.marketplace, sku: r.sku, child_asin: r.child_asin || "", sources: r.sources || "" }));
+  const body = await request("/rest/v1/rpc/replace_fba_account_sku_ownership", {
+    method: "POST",
+    body: { p_organization_fingerprint: organizationFingerprint, p_connection_id: connectionId, p_account_id: accountId, p_rows },
+  });
+  return Array.isArray(body) ? body[0] : body;
 }
 
 // Per-user column visibility prefs for the FBA plan (hidden column ids). Absent row => all defaults visible.

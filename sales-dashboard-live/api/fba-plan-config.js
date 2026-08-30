@@ -11,7 +11,7 @@ import {
   DashboardAccessError, getDashboardAccess, assertAccountAccess,
   getFbaPlanningConfig, setFbaPlanningSettings, setFbaSkuHorizonOverride, deleteFbaSkuHorizonOverride,
   recordFbaSellerWarehouse, recordFbaSellerWarehouseBulk, insertAuditLog,
-  getLatestReportSnapshotHydrated, getSellerWarehouseRows, getSkusOwnedByOtherAccounts,
+  getLatestReportSnapshotHydrated, getSellerWarehouseRows, getWarehouseOwnershipConflicts,
 } from "../lib/server/supabase.js";
 import { getDataDoeConnections } from "../lib/server/datadoe-connections.js";
 import { organizationFingerprint } from "../lib/server/source-identity.js";
@@ -49,21 +49,33 @@ const DEFAULT_DEPS = {
   getDashboardAccess, assertAccountAccess,
   getFbaPlanningConfig, setFbaPlanningSettings, setFbaSkuHorizonOverride, deleteFbaSkuHorizonOverride,
   recordFbaSellerWarehouse, recordFbaSellerWarehouseBulk, insertAuditLog,
-  getLatestReportSnapshotHydrated, getSellerWarehouseRows, getSkusOwnedByOtherAccounts,
+  getLatestReportSnapshotHydrated, getSellerWarehouseRows, getWarehouseOwnershipConflicts,
   orgFingerprint,
 };
 
 // Build the trusted warehouse-write authority for an account: the published snapshot evidence + the account's OWN
 // existing warehouse identity + (for genuinely new manual SKUs among `rows`) cross-account ownership evidence.
+// FAIL CLOSED: any failure loading the account's warehouse identity or the cross-account ownership authority stops the
+// request with a typed, sanitized 503 BEFORE any write/audit RPC -- an unavailable/errored read is NEVER treated as
+// "no identity" or "no ownership". A genuinely-absent snapshot (null, not an error) is handled downstream (rejected).
 async function buildAuthority(deps, { organizationFingerprint: org, connectionId, accountId, rows }) {
-  const snap = await deps.getLatestReportSnapshotHydrated({ reportKey: "fba-plan", accountId }).catch(() => null);
-  const existingWarehouseRows = await deps.getSellerWarehouseRows({ organizationFingerprint: org, connectionId, accountId }).catch(() => []);
+  let snap, existingWarehouseRows;
+  try {
+    snap = await deps.getLatestReportSnapshotHydrated({ reportKey: "fba-plan", accountId });
+    existingWarehouseRows = await deps.getSellerWarehouseRows({ organizationFingerprint: org, connectionId, accountId });
+  } catch (_e) {
+    throw new DashboardAccessError("Warehouse write authority is temporarily unavailable; please retry.", 503);
+  }
   const authority = buildWarehouseAuthority(snap?.payload || null, { existingWarehouseRows });
-  const candidates = newManualSkuCandidates(rows, authority);
-  if (candidates.size > 0) {
-    authority.crossAccountOwnedSkus = await deps.getSkusOwnedByOtherAccounts({ organizationFingerprint: org, accountId, skus: [...candidates] }).catch(() => new Set());
+  const candidates = newManualSkuCandidates(rows, authority); // [{ marketplace, sku }]
+  if (candidates.length > 0) {
+    try {
+      authority.crossAccountOwnedKeys = await deps.getWarehouseOwnershipConflicts({ organizationFingerprint: org, accountId, pairs: candidates });
+    } catch (_e) {
+      throw new DashboardAccessError("Warehouse ownership check is temporarily unavailable; please retry.", 503);
+    }
   } else {
-    authority.crossAccountOwnedSkus = new Set();
+    authority.crossAccountOwnedKeys = new Set();
   }
   return authority;
 }

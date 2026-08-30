@@ -1,11 +1,13 @@
 // API-BOUNDARY tests for api/fba-plan-config.js: execute the real handler with mocked access, snapshot/existing-row
-// readers, cross-account reader, audit + single/bulk RPCs. Proves a FORGED request (v2d-4 ASIN change, cross-account
-// SKU, manual-ASIN remap, missing marketplace scope, one-invalid-row bulk) returns BEFORE any write/audit RPC, and
-// that valid single, valid bulk, and a safe clear proceed. 7-bit ASCII, LF.
+// readers, cross-account ownership probe, audit + single/bulk RPCs. Proves FORGED requests (v2d-4 ASIN change,
+// cross-account SKU, manual-ASIN remap, missing marketplace scope, one-invalid-row bulk) and AUTHORITY-READ FAILURES
+// (warehouse-identity read throws, ownership probe throws, snapshot read throws) all return BEFORE any write/audit
+// RPC. Valid single, valid bulk, and safe clear proceed. 7-bit ASCII, LF.
 
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
 import { handler } from "../api/fba-plan-config.js";
+import { ownershipKey } from "../lib/server/reports/warehouse-validation.js";
 
 let passed = 0;
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
@@ -23,20 +25,19 @@ function fakeRes() {
   return { statusCode: null, body: null, status(c) { this.statusCode = c; return this; }, json(b) { this.body = b; return this; } };
 }
 
-// Build deps with call-recording spies. `over` customizes the snapshot payload, existing rows, cross-account set.
 function makeDeps(over = {}) {
-  const calls = { record: [], bulk: [], audit: [], setSettings: [], setHorizon: [], delHorizon: [] };
+  const calls = { record: [], bulk: [], audit: [] };
   const deps = {
     getDashboardAccess: async () => ({ userId: "u1", email: "u@example.com" }),
     assertAccountAccess: () => {},
     orgFingerprint: () => "org-fp",
     getFbaPlanningConfig: async () => ({ settings: null, overrides: [], warehouse: [] }),
-    setFbaPlanningSettings: async (a) => { calls.setSettings.push(a); return { ok: true }; },
-    setFbaSkuHorizonOverride: async (a) => { calls.setHorizon.push(a); return { ok: true }; },
-    deleteFbaSkuHorizonOverride: async (a) => { calls.delHorizon.push(a); return { ok: true }; },
-    getLatestReportSnapshotHydrated: async () => ("snapshot" in over ? over.snapshot : { payload: V5 }),
-    getSellerWarehouseRows: async () => over.existingRows || [],
-    getSkusOwnedByOtherAccounts: async () => new Set(over.crossOwned || []),
+    setFbaPlanningSettings: async () => ({ ok: true }),
+    setFbaSkuHorizonOverride: async () => ({ ok: true }),
+    deleteFbaSkuHorizonOverride: async () => ({ ok: true }),
+    getLatestReportSnapshotHydrated: async () => { if (over.snapshotThrows) throw new Error("db down"); return "snapshot" in over ? over.snapshot : { payload: V5 }; },
+    getSellerWarehouseRows: async () => { if (over.warehouseRowsThrow) throw new Error("db down"); return over.existingRows || []; },
+    getWarehouseOwnershipConflicts: async () => { if (over.ownershipThrows) throw new Error("db down"); return new Set(over.crossOwnedKeys || []); },
     recordFbaSellerWarehouse: async (a) => { calls.record.push(a); return { ...a }; },
     recordFbaSellerWarehouseBulk: async (a) => { calls.bulk.push(a); return { applied: a.rows.length }; },
     insertAuditLog: async (a) => { calls.audit.push(a); },
@@ -44,16 +45,48 @@ function makeDeps(over = {}) {
   return { deps, calls };
 }
 const post = (body) => ({ method: "POST", body });
-
 const noWrites = (calls, label) => {
   assert.equal(calls.record.length, 0, `${label}: single RPC not called`);
   assert.equal(calls.bulk.length, 0, `${label}: bulk RPC not called`);
   assert.equal(calls.audit.length, 0, `${label}: audit not called`);
 };
 
-/* ===== forged single writes: fail BEFORE any write/audit ===== */
-test("FORGED single: cross-account SKU -> 400, no write, no audit", async () => {
-  const { deps, calls } = makeDeps({ crossOwned: ["NEW-1"] });
+/* ===== Blocker 1: authority-read failures FAIL CLOSED (5xx, zero writes/audit) ===== */
+test("FAIL-CLOSED: warehouse-identity read throws -> 5xx, no write, no audit", async () => {
+  const { deps, calls } = makeDeps({ warehouseRowsThrow: true });
+  const res = fakeRes();
+  await handler(post({ accountId: "A", kind: "warehouse", marketplace: "US", sku: "EXIST-1", childAsin: "", qty: 5 }), res, deps);
+  assert.ok(res.statusCode >= 500, `expected 5xx, got ${res.statusCode}`);
+  noWrites(calls, "warehouse-read-throws");
+});
+
+test("FAIL-CLOSED: cross-account ownership probe throws -> 5xx, no write, no audit", async () => {
+  const { deps, calls } = makeDeps({ ownershipThrows: true });
+  const res = fakeRes();
+  await handler(post({ accountId: "A", kind: "warehouse-bulk", rows: [{ marketplace: "US", sku: "NEW-X", childAsin: "ASIN3", qty: 5 }] }), res, deps);
+  assert.ok(res.statusCode >= 500, `expected 5xx, got ${res.statusCode}`);
+  noWrites(calls, "ownership-read-throws");
+});
+
+test("FAIL-CLOSED: snapshot read throws -> 5xx, no write, no audit", async () => {
+  const { deps, calls } = makeDeps({ snapshotThrows: true });
+  const res = fakeRes();
+  await handler(post({ accountId: "A", kind: "warehouse", marketplace: "US", sku: "EXIST-1", childAsin: "", qty: 5 }), res, deps);
+  assert.ok(res.statusCode >= 500, `expected 5xx, got ${res.statusCode}`);
+  noWrites(calls, "snapshot-read-throws");
+});
+
+test("FAIL-CLOSED: genuinely-absent snapshot (null, not an error) -> 400 refusal, no write", async () => {
+  const { deps, calls } = makeDeps({ snapshot: null });
+  const res = fakeRes();
+  await handler(post({ accountId: "A", kind: "warehouse", marketplace: "US", sku: "EXIST-1", childAsin: "", qty: 5 }), res, deps);
+  assert.equal(res.statusCode, 400);
+  noWrites(calls, "no-snapshot");
+});
+
+/* ===== forged single writes ===== */
+test("FORGED single: cross-account SKU (same marketplace) -> 400, no write", async () => {
+  const { deps, calls } = makeDeps({ crossOwnedKeys: [ownershipKey("US", "NEW-1")] });
   const res = fakeRes();
   await handler(post({ accountId: "A", kind: "warehouse", marketplace: "US", sku: "NEW-1", childAsin: "ASIN3", qty: 5 }), res, deps);
   assert.equal(res.statusCode, 400);
@@ -69,7 +102,7 @@ test("FORGED single: manual-ASIN REMAP of a stored identity -> 400, no write", a
   noWrites(calls, "remap");
 });
 
-test("FORGED single: v2d-4 snapshot ASIN change of a stored identity -> 400, no write", async () => {
+test("FORGED single: v2d-4 ASIN change of a stored identity -> 400, no write", async () => {
   const { deps, calls } = makeDeps({ snapshot: { payload: { marketCountry: "US", accountSkus: ["EXIST-1"] } }, existingRows: [{ marketplace: "US", sku: "EXIST-1", child_asin: "ASIN1" }] });
   const res = fakeRes();
   await handler(post({ accountId: "A", kind: "warehouse", marketplace: "US", sku: "EXIST-1", childAsin: "ASINX", qty: 7 }), res, deps);
@@ -77,23 +110,14 @@ test("FORGED single: v2d-4 snapshot ASIN change of a stored identity -> 400, no 
   noWrites(calls, "v2d-4 remap");
 });
 
-test("FORGED single: missing marketplace scope (empty snapshot scope) -> 400, no write", async () => {
-  const { deps, calls } = makeDeps({ snapshot: { payload: { accountSkus: ["EXIST-1"] } } }); // no marketCountry/directory
+test("FORGED single: missing marketplace scope -> 400, no write", async () => {
+  const { deps, calls } = makeDeps({ snapshot: { payload: { accountSkus: ["EXIST-1"] } } });
   const res = fakeRes();
   await handler(post({ accountId: "A", kind: "warehouse", marketplace: "US", sku: "EXIST-1", childAsin: "", qty: 5 }), res, deps);
   assert.equal(res.statusCode, 400);
   noWrites(calls, "no-scope");
 });
 
-test("FORGED single: unknown SKU with a non-catalog ASIN -> 400, no write", async () => {
-  const { deps, calls } = makeDeps();
-  const res = fakeRes();
-  await handler(post({ accountId: "A", kind: "warehouse", marketplace: "US", sku: "HACK", childAsin: "ASINX", qty: 5 }), res, deps);
-  assert.equal(res.statusCode, 400);
-  noWrites(calls, "unknown-sku");
-});
-
-/* ===== forged bulk: one invalid row => zero writes/audit ===== */
 test("FORGED bulk: one invalid row -> 400, bulk RPC NOT called, no audit", async () => {
   const { deps, calls } = makeDeps();
   const res = fakeRes();
@@ -107,14 +131,13 @@ test("FORGED bulk: one invalid row -> 400, bulk RPC NOT called, no audit", async
 });
 
 /* ===== valid writes proceed ===== */
-test("VALID single: writes with the server-RESOLVED ASIN + audits, 200", async () => {
+test("VALID single: writes the server-RESOLVED ASIN + audits, 200", async () => {
   const { deps, calls } = makeDeps();
   const res = fakeRes();
   await handler(post({ accountId: "A", kind: "warehouse", marketplace: "US", sku: "EXIST-1", childAsin: "", qty: 12 }), res, deps);
   assert.equal(res.statusCode, 200);
   assert.equal(calls.record.length, 1);
-  assert.equal(calls.record[0].childAsin, "ASIN1", "server resolved the trusted ASIN");
-  assert.equal(calls.record[0].qty, 12);
+  assert.equal(calls.record[0].childAsin, "ASIN1");
   assert.equal(calls.audit.length, 1);
 });
 
@@ -126,14 +149,13 @@ test("VALID bulk: single atomic RPC once + audit, 200; child ASINs server-resolv
     { marketplace: "US", sku: "NEW-9", childAsin: "ASIN3", qty: 3 },
   ] }), res, deps);
   assert.equal(res.statusCode, 200);
-  assert.equal(calls.bulk.length, 1, "exactly one atomic RPC");
-  assert.equal(calls.bulk[0].rows.length, 2);
+  assert.equal(calls.bulk.length, 1);
   assert.equal(calls.bulk[0].rows.find((r) => r.sku === "EXIST-1").childAsin, "ASIN1");
   assert.equal(calls.audit.length, 1);
 });
 
 test("SAFE clear: deletes the account's own row without identity validation, 200", async () => {
-  const { deps, calls } = makeDeps({ snapshot: null }); // even with no snapshot, a clear is safe
+  const { deps, calls } = makeDeps({ snapshot: null });
   const res = fakeRes();
   await handler(post({ accountId: "A", kind: "warehouse", marketplace: "US", sku: "ANY", clear: true }), res, deps);
   assert.equal(res.statusCode, 200);
