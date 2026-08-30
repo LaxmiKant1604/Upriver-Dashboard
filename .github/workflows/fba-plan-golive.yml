@@ -1,0 +1,72 @@
+name: fba-plan-golive
+run-name: fba-plan-golive ${{ inputs.mode }} ${{ inputs.dispatch_id }}
+
+# TRUSTED, MANUAL-ONLY (workflow_dispatch) operator for the FIRST-TIME FBA Shipment Plan go-live. It runs the SAME
+# reviewed source/derive/publish/safe-close architecture as scheduler-v2, in GitHub Actions where the production
+# secrets live. It is NOT scheduled -- there is no cron here; the only automatic scheduler remains scheduler-v2, whose
+# OLI/Ads times are untouched. Modes:
+#   preflight  -- READ ONLY. Reads the DataDoe balance + GET /exports/sources column metadata for FBA Inventory Health
+#                 + Listings. ZERO exports, ZERO tokens. Proves the credential path + batching feasibility.
+# (Further modes -- source refresh, derive/publish, backfill -- are added only after preflight verifies feasibility.)
+#
+# Required repository secrets (never printed): POSTGRES_URL, SUPABASE_URL (or VITE_SUPABASE_URL),
+# SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Operation mode"
+        required: true
+        default: "preflight"
+        type: choice
+        options:
+          - preflight
+      dispatch_id:
+        description: "Free-text run identity for the log (e.g. golive-2026-08-30)."
+        required: false
+        default: "manual"
+
+concurrency:
+  group: fba-plan-golive
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Verify required secrets are present (fail fast, never print values)
+        run: |
+          set -uo pipefail
+          missing=""
+          for v in POSTGRES_URL SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY; do
+            if [ -z "${!v:-}" ]; then missing="$missing $v"; fi
+          done
+          if [ -z "${SUPABASE_URL:-}" ] && [ -z "${VITE_SUPABASE_URL:-}" ]; then missing="$missing SUPABASE_URL|VITE_SUPABASE_URL"; fi
+          if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
+          echo "All required secrets present."
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: FBA source preflight (READ ONLY -- balance + source column metadata; zero tokens)
+        if: ${{ inputs.mode == 'preflight' }}
+        run: node scripts/release/fba-source-preflight.mjs
