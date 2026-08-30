@@ -227,19 +227,22 @@ test("IDEMPOTENT REPLAY: an already-terminal dedicated cycle skips the fetch ent
   assert.equal(r.published, 1);
 });
 
-test("PUBLISH partial (slice budget mid-publish) -> continuation; controls STILL safe-closed", async () => {
+test("PUBLISH partial (slice budget between chunks) -> continuation; controls STILL safe-closed", async () => {
   const runtime = makeRuntime({ preTerminal: { id: "cyc-us-fba", status: "succeeded" } });
   const publisher = makePublisher();
   const controls = makeControls();
+  // 8 accounts > the 6-per-chunk publish concurrency; out of time AFTER the first chunk -> chunk 1 (6) publishes,
+  // chunk 2 (2) defers to the next poll.
+  const ids = ["a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8"];
   let n = 0;
   const r = await OP.advanceFbaPlanBucket({
-    bucket: "us", asOf: "2026-08-29", includedIds: ["a1", "a2", "a3"], bucketAccounts: [{ accountId: "a1", country: "US" }, { accountId: "a2", country: "US" }, { accountId: "a3", country: "US" }], cost: OK_COST, maxTokens: 80,
+    bucket: "us", asOf: "2026-08-29", includedIds: ids, bucketAccounts: ids.map((a) => ({ accountId: a, country: "US" })), cost: OK_COST, maxTokens: 80,
     runtime, publisher, controls, readbackLive: okReadback,
-    outOfTime: () => (++n > 2), // publish one, then out of time
+    outOfTime: () => (++n > 1), // first chunk proceeds; second chunk is out of time
   });
   assert.equal(r.phase, "publish");
   assert.equal(r.continuationRequired, true);
-  assert.ok(r.published >= 1 && r.published < 3, "some but not all published");
+  assert.ok(r.published >= 1 && r.published < 8, "some but not all published (" + r.published + ")");
   assert.ok(controls.calls.includes("close"), "ALWAYS safe-close even on a budget pause");
 });
 

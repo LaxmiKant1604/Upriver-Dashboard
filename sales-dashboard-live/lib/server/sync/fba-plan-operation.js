@@ -237,16 +237,24 @@ export async function advanceFbaPlanBucket({
     // before its CAS write, so the all-or-nothing per-account guarantee holds without it. Already-published
     // accounts return "already-current" (fast, no re-write); genuinely-unfetched accounts (stale-OLI, or a failed
     // source batch) return not-successful and are skipped (their LKG is untouched), never a hard bucket failure.
-    for (const accountId of included) {
-      if (outOfTime()) break; // remaining (unprocessed) accounts publish on the next poll
-      const r = await publisher.publish("fba-plan", accountId);
-      if (OK_PUBLISH.has(S(r.disposition)) && S(r.liveReportKey) && S(r.paramsHash)) {
-        published.push(accountId);
-        liveIdentity.set(accountId, { liveReportKey: S(r.liveReportKey), paramsHash: S(r.paramsHash) });
-      } else {
-        problems.push(accountId.slice(0, 6) + ":" + S(r.disposition));
+    // Publish in bounded-CONCURRENCY chunks: each publish() runs an independent per-account gate + CAS write (a
+    // storage hydration dominates its ~seconds), so N-at-a-time collapses the wall-clock (8 sequential publishes
+    // overran a single route slice and never reached read-back). outOfTime is checked BETWEEN chunks so a paused
+    // slice always stops on a whole-account boundary and resumes cleanly.
+    const PUBLISH_CONCURRENCY = 6;
+    for (let i = 0; i < included.length; i += PUBLISH_CONCURRENCY) {
+      if (outOfTime()) break; // unprocessed accounts publish on the next poll
+      const chunk = included.slice(i, i + PUBLISH_CONCURRENCY);
+      const results = await Promise.all(chunk.map((accountId) => publisher.publish("fba-plan", accountId).then((r) => ({ accountId, r }))));
+      for (const { accountId, r } of results) {
+        if (OK_PUBLISH.has(S(r.disposition)) && S(r.liveReportKey) && S(r.paramsHash)) {
+          published.push(accountId);
+          liveIdentity.set(accountId, { liveReportKey: S(r.liveReportKey), paramsHash: S(r.paramsHash) });
+        } else {
+          problems.push(accountId.slice(0, 6) + ":" + S(r.disposition));
+        }
+        processed.add(accountId);
       }
-      processed.add(accountId);
     }
   } finally {
     // ALWAYS safe-close -- success, failure, or slice-budget pause. The gates never survive past this pass.
