@@ -412,6 +412,10 @@ export async function reconstructSignals({ store, cycleId, resolvePlan, adsRowsP
 export async function runStagedSourceCycle({
   store, dataDoe, resolvePlan, adsRowsProvider, extraSignals = {},
   bucket, cycleDate, scheduledAt = null, trigger = "manual",
+  // OPTIONAL cycle-bucket NAMESPACE (defaults to `bucket`, so the scheduler-v2 path is byte-identical). A dedicated
+  // operator (FBA Plan) passes e.g. "us-fba" so ITS sync_cycles row never collides with the scheduler-v2 daily
+  // (bucket, cycle_date) cycle. ONLY the cycle key is namespaced; account scope stays the real `bucket`.
+  cycleBucket = null,
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = 3_000, maxJobs = Infinity, maxRounds = 5,
   // BUILD-TIME source-tranche selector (Part A); passed straight to runSourceJobs. A filtered pass never
   // drains, so it never reaches the fixpoint below -- no owner membership is reconciled mid-tranche.
@@ -423,7 +427,7 @@ export async function runStagedSourceCycle({
   // reservation. null => the legacy one-attempt claim (behavior byte-identical). NEVER a per-run caller arg.
   budget = null,
 }) {
-  const cycleId = await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
+  const cycleId = await store.openCycle({ bucket: cycleBucket || bucket, cycleDate, scheduledAt, trigger });
   let signals = { ...(await reconstructSignals({ store, cycleId, resolvePlan, adsRowsProvider })), ...extraSignals };
 
   const rollup = {
@@ -455,7 +459,9 @@ export async function runStagedSourceCycle({
     if (remaining === 0) { rollup.drained = false; break; }
 
     const res = await runSourceJobs({
-      store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleDate, scheduledAt, trigger,
+      // cycleBucket namespaces runSourceJobs' OWN cycle resolution (getCycleByBucketDate + openCycle) to the SAME
+      // namespaced cycle this driver opened above, so it never re-resolves the raw-bucket scheduler-v2 cycle.
+      store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleBucket, cycleDate, scheduledAt, trigger,
       clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly, budget,
     });
     rollup.cycleId = res.cycleId;
