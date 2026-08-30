@@ -1,5 +1,43 @@
 # Project Memory
 
+## OLI sales estimates — fill missing/zero-price sales from same-product historical prices (2026-08-31)
+
+LIVE + production-verified. Non-cancelled OLI units with a MISSING (pending itemization) or ZERO
+`item_price_value` carry real sales the priced rollup (`source_oli_daily_history`) deliberately excludes -- they
+live in `source_oli_operational_units` as `explicit_zero_units + pending_units`. This ADDITIVE, INTERNAL layer
+estimates those units' sales from a valid historical unit price for the SAME product and adds it into the existing
+Total Sales across Daily Reporting, Brand View / Brand Sales, and the Sales Dashboard -- no separate KPI or label.
+
+- **Matching**: same account + seller + marketplace + currency + ASIN + SKU (account+currency prove the
+  marketplace, so no separate field). ASIN-only fallback ONLY when the target SKU is blank. Reference = the finest
+  durable priced grain (`source_oli_dimensional_history`, non-cancelled, value>0, units>0). Search same-day -> D-1
+  -> ... -> D-7 (never a future date), stop at the nearest date with matches, MEDIAN of that date's unit prices,
+  `estimated_sales = median_unit_price x (explicit_zero_units + pending_units)`, rounded to currency precision.
+- **Reconciliation/idempotency (inherent)**: the estimate covers EXACTLY the still-unpriced quantity, so as DataDoe
+  itemizes on the normal 7-day refresh priced_units grows, the missing quantity shrinks, the estimate shrinks, and
+  the ACTUAL value supersedes it with ZERO double-count (fully itemized -> the estimate row is deleted). Recomputed
+  from durable truth after every OLI persist (scheduler / manual OLI sync / force-latest / self-heal) + a
+  zero-token backfill -- NEVER a DataDoe export (creates=0, tokens=0). Byte-identical replay.
+- **Canonical data**: RAW OLI evidence is never modified. NEW table `source_oli_sales_estimates` (migration 20260907,
+  applied) + `replace_oli_sales_estimates_window` RPC (atomic replace, fail-closed, service-role-only, RLS) store
+  the estimate with full provenance (target qty, reference date/unit price, matching method, reference request hash).
+- **Code**: pure engine `lib/server/sync/oli-sales-estimate.js` (computeOliSalesEstimates + enrichOliHistoryRows-
+  WithEstimates + resolvedEstimateGroupKeys); `oli-sales-estimate-recompute.js` (durable-in / atomic-replace-out);
+  `oli-enriched-history.js` (drop-in enriched OLI history reader = priced + estimates). Wired into the priority
+  derive (`source-bucket-sync-runtime`, gated `enableSalesEstimates`, ON via `source-priority-dashboards`) + the
+  Daily self-heal + live Brand Sales + the daily/brand backfills. Missing-value breakdown (`oli-completeness-serve`)
+  drops resolved grains (units reclassified to priced; observed unchanged) while genuinely-unresolved remain.
+- **Untouched**: unit counts, order statuses, Ads, inventory, FBA Plan, SKU Movement unit logic, scheduler timing,
+  source controls, DataDoe contracts. Named-brand filtering stays exact (estimate attributed by the target ASIN
+  only). ROI = Total Sales / Ad Spend + TACoS = Ad Spend / Total Sales recompute from the corrected Total Sales.
+  NOTE: PPC-performance TACoS + SKU P&L read SEPARATE DataDoe OLI/profit exports (not the durable rollup), so they
+  are outside this durable-OLI enrichment by design.
+- **Commits**: b9fb2ae (feature + tests), a08e095 (thread readEstimates into every completeness augment). verify
+  95/74 green. Deployed. Migration 20260907 applied. Zero-token backfill: 1,497 estimate grains / 16 accounts
+  (INR 750,826.71 + USD 9,740.00), 310 genuinely-unresolved. Daily + Brand Sales re-published (0 tokens). Read-back
+  proven: account 59f12ccc 2026-06-24 priced 38,879 + estimate 7,423 = 46,302 served live (DB + HTTP exact match);
+  leakage=0, future-ref=0, beyond-7-day=0; no-estimate accounts stay priced-only (no double-count).
+
 ## Scheduler v2 Blocker 4d — frozen create-export + AI-token budget with atomic pre-POST reservation (2026-08-17)
 
 Implemented Blocker 4d on `main`. Offline/unwired SHADOW MODE; the migration is PREPARED but NOT applied;
