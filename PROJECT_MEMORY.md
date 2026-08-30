@@ -13285,3 +13285,36 @@ scripts/fba-plan-config-handler.test.js (9), supabase/migrations/20260904_*.sql.
 
 PENDING MIGRATIONS to apply together (credential-gated): 20260903 (column prefs + bulk RPC) + 20260904 (cross-account
 index). Then guarded refresh -> v2d-5 -> read-backs. See [[fba-plan-advanced]].
+
+================================================================================
+2026-08-30 -- FBA Plan: fail-closed authority reads + complete cross-account ownership (Codex round 3) (commit c934dcf)
+================================================================================
+`npm run verify` 92/92 across 72 suites. NO migrations applied, NO DataDoe tokens, NO source refresh (credential-
+blocked; only VERCEL_OIDC_TOKEN).
+
+1) Authority reads FAIL CLOSED on the write path: api/fba-plan-config.js#buildAuthority no longer swallows read
+   failures -- a snapshot / existing-warehouse-identity / cross-account-ownership read error (incl. schema-missing,
+   timeout, malformed, network, DB) throws a typed sanitized 503 BEFORE any write/audit RPC. getSellerWarehouseRows is
+   STRICT now (throws on schema-missing). A genuinely-absent snapshot (null) still yields a 400 refusal; read-only
+   page loads keep graceful degradation.
+2) Blank directory ASIN never takes a browser ASIN: warehouse-validation.js -- an existing directory SKU with blank
+   trusted childAsin stays blank; a supplied unverifiable nonblank ASIN is rejected. Stored nonblank warehouse ASIN
+   immutable; v2d-4 preserves stored/blank, never trusts the caller.
+3) Complete marketplace-aware cross-account ownership authority: new additive table fba_account_sku_ownership
+   (migration 20260905, atomic replace RPC) keyed by (org, conn, account, canonical marketplace, sku). Populated by
+   lib/server/reports/warehouse-ownership.js#buildOwnershipRows from the validated v2d-5 directory (FBA Inventory +
+   AWD + OLI incl operational/pending) + the account's own warehouse identities -- NOT the org-wide Product Catalog.
+   scripts/backfill-fba-ownership.mjs backfills zero-export from current snapshots. Probe getWarehouseOwnershipConflicts
+   is canonical-marketplace scoped (same SKU text in another legit marketplace is NOT a false conflict; owned in the
+   same marketplace under another account -> rejected without naming it). Ownership NOT wired into the fragile CAS
+   publisher -- population is via the backfill script (re-run after each republish/refresh).
+
+New/updated: warehouse-validation.js (marketplace-aware crossAccountOwnedKeys + blank-ASIN fix), warehouse-ownership.js,
+supabase.js (getSellerWarehouseRows strict, getWarehouseOwnershipConflicts, replaceFbaAccountSkuOwnership,
+listFbaPlanSnapshotAccountIds), api/fba-plan-config.js (fail-closed buildAuthority), tests
+(warehouse-validation 18 / warehouse-ownership 7 / fba-plan-config-handler 12), migration 20260905, backfill script.
+
+PENDING MIGRATIONS to apply together (credential-gated): 20260903 + 20260904 + 20260905. Then run
+scripts/backfill-fba-ownership.mjs (zero-export), guarded refresh (<=9 creates/39 tok), re-derive/publish v2d-5,
+re-run backfill, 30-account read-backs. Until 20260905 is applied, a new-manual-SKU write fails closed (503 on the
+ownership probe) -- existing-SKU writes still work. See [[fba-plan-advanced]].
