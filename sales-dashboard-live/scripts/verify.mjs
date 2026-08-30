@@ -89,6 +89,7 @@ const SUITES = [
   "test:fba-planning",
   "test:warehouse-import",
   "test:warehouse-validation",
+  "test:fba-plan-config-handler",
   "test:plan-brand",
   "test:asin-ads-backfill-window",
   "test:manual-source-continuation",

@@ -2,22 +2,20 @@
 // account; admins bypass). GET returns the saved planning settings + SKU horizon overrides + seller-warehouse rows
 // for one account. POST writes ONE of: the account planning settings, a SKU horizon override (or its removal), or a
 // seller-warehouse quantity (upsert/clear). NEVER touches DataDoe or any source-derived table; every write is audited.
+//
+// Warehouse writes (single + bulk) are TRUSTED-validated server-side against the account's OWN evidence (published
+// fba-plan snapshot directory/catalog/marketplace scope + the account's existing warehouse identity + cross-account
+// SKU ownership). The browser is never a boundary. Dependencies are injectable (DEFAULT_DEPS) so the handler is
+// unit-testable without a database.
 import {
   DashboardAccessError, getDashboardAccess, assertAccountAccess,
   getFbaPlanningConfig, setFbaPlanningSettings, setFbaSkuHorizonOverride, deleteFbaSkuHorizonOverride,
   recordFbaSellerWarehouse, recordFbaSellerWarehouseBulk, insertAuditLog,
-  getLatestReportSnapshotHydrated,
+  getLatestReportSnapshotHydrated, getSellerWarehouseRows, getSkusOwnedByOtherAccounts,
 } from "../lib/server/supabase.js";
 import { getDataDoeConnections } from "../lib/server/datadoe-connections.js";
 import { organizationFingerprint } from "../lib/server/source-identity.js";
-import { buildWarehouseAuthority, validateWarehouseRow, validateWarehouseRows } from "../lib/server/reports/warehouse-validation.js";
-
-// Load the TRUSTED per-account warehouse-write authority from the account's OWN published fba-plan snapshot (the SKU
-// directory + catalog + marketplace scope). Server-side evidence only; the browser cannot influence it.
-async function loadWarehouseAuthority(accountId) {
-  const snap = await getLatestReportSnapshotHydrated({ reportKey: "fba-plan", accountId }).catch(() => null);
-  return buildWarehouseAuthority(snap?.payload || null);
-}
+import { buildWarehouseAuthority, validateWarehouseRow, validateWarehouseRows, newManualSkuCandidates } from "../lib/server/reports/warehouse-validation.js";
 
 function bodyOf(req) {
   if (!req.body) return {};
@@ -46,17 +44,41 @@ function normHorizon(b) {
   throw new DashboardAccessError("horizonKind must be 'months' or 'days'.", 400);
 }
 
-export default async function handler(req, res) {
+// The real dependency wiring. Tests pass a mocked subset.
+const DEFAULT_DEPS = {
+  getDashboardAccess, assertAccountAccess,
+  getFbaPlanningConfig, setFbaPlanningSettings, setFbaSkuHorizonOverride, deleteFbaSkuHorizonOverride,
+  recordFbaSellerWarehouse, recordFbaSellerWarehouseBulk, insertAuditLog,
+  getLatestReportSnapshotHydrated, getSellerWarehouseRows, getSkusOwnedByOtherAccounts,
+  orgFingerprint,
+};
+
+// Build the trusted warehouse-write authority for an account: the published snapshot evidence + the account's OWN
+// existing warehouse identity + (for genuinely new manual SKUs among `rows`) cross-account ownership evidence.
+async function buildAuthority(deps, { organizationFingerprint: org, connectionId, accountId, rows }) {
+  const snap = await deps.getLatestReportSnapshotHydrated({ reportKey: "fba-plan", accountId }).catch(() => null);
+  const existingWarehouseRows = await deps.getSellerWarehouseRows({ organizationFingerprint: org, connectionId, accountId }).catch(() => []);
+  const authority = buildWarehouseAuthority(snap?.payload || null, { existingWarehouseRows });
+  const candidates = newManualSkuCandidates(rows, authority);
+  if (candidates.size > 0) {
+    authority.crossAccountOwnedSkus = await deps.getSkusOwnedByOtherAccounts({ organizationFingerprint: org, accountId, skus: [...candidates] }).catch(() => new Set());
+  } else {
+    authority.crossAccountOwnedSkus = new Set();
+  }
+  return authority;
+}
+
+export async function handler(req, res, deps = DEFAULT_DEPS) {
   try {
-    const access = await getDashboardAccess(req);
+    const access = await deps.getDashboardAccess(req);
     const accountId = S(req.method === "GET" ? req.query.accountId : bodyOf(req).accountId).trim();
     if (!accountId) { res.status(400).json({ error: "accountId is required." }); return; }
-    assertAccountAccess(access, [accountId]); // admins bypass; a member must hold this account
-    const organization_fingerprint = orgFingerprint();
+    deps.assertAccountAccess(access, [accountId]); // admins bypass; a member must hold this account
+    const organization_fingerprint = deps.orgFingerprint();
     const connectionId = "primary";
 
     if (req.method === "GET") {
-      const config = await getFbaPlanningConfig({ organizationFingerprint: organization_fingerprint, connectionId, accountId });
+      const config = await deps.getFbaPlanningConfig({ organizationFingerprint: organization_fingerprint, connectionId, accountId });
       res.status(200).json(config);
       return;
     }
@@ -79,8 +101,8 @@ export default async function handler(req, res) {
         }
         const safetyDays = Number(body.safetyDays);
         if (!Number.isInteger(safetyDays) || safetyDays < 0 || safetyDays > 365) { res.status(400).json({ error: "safetyDays must be a whole number 0-365." }); return; }
-        const saved = await setFbaPlanningSettings({ organizationFingerprint: organization_fingerprint, connectionId, accountId, ...h, forecastMethod: method, forecastWeights: weights, safetyDays, updatedBy: access.userId });
-        await insertAuditLog({ actorUserId: access.userId, action: "fba-plan.settings.updated", target: { accountId, horizon: h, forecastMethod: method, safetyDays } });
+        const saved = await deps.setFbaPlanningSettings({ organizationFingerprint: organization_fingerprint, connectionId, accountId, ...h, forecastMethod: method, forecastWeights: weights, safetyDays, updatedBy: access.userId });
+        await deps.insertAuditLog({ actorUserId: access.userId, action: "fba-plan.settings.updated", target: { accountId, horizon: h, forecastMethod: method, safetyDays } });
         res.status(200).json({ settings: saved });
         return;
       }
@@ -89,14 +111,14 @@ export default async function handler(req, res) {
         const sku = S(body.sku).trim();
         if (!sku) { res.status(400).json({ error: "sku is required." }); return; }
         if (body.clear === true) {
-          await deleteFbaSkuHorizonOverride({ organizationFingerprint: organization_fingerprint, connectionId, accountId, sku });
-          await insertAuditLog({ actorUserId: access.userId, action: "fba-plan.sku-horizon.cleared", target: { accountId, sku } });
+          await deps.deleteFbaSkuHorizonOverride({ organizationFingerprint: organization_fingerprint, connectionId, accountId, sku });
+          await deps.insertAuditLog({ actorUserId: access.userId, action: "fba-plan.sku-horizon.cleared", target: { accountId, sku } });
           res.status(200).json({ cleared: true, sku });
           return;
         }
         const h = normHorizon(body);
-        const saved = await setFbaSkuHorizonOverride({ organizationFingerprint: organization_fingerprint, connectionId, accountId, sku, ...h, updatedBy: access.userId });
-        await insertAuditLog({ actorUserId: access.userId, action: "fba-plan.sku-horizon.set", target: { accountId, sku, horizon: h } });
+        const saved = await deps.setFbaSkuHorizonOverride({ organizationFingerprint: organization_fingerprint, connectionId, accountId, sku, ...h, updatedBy: access.userId });
+        await deps.insertAuditLog({ actorUserId: access.userId, action: "fba-plan.sku-horizon.set", target: { accountId, sku, horizon: h } });
         res.status(200).json({ override: saved });
         return;
       }
@@ -111,28 +133,28 @@ export default async function handler(req, res) {
           if (!Number.isInteger(qty) || qty < 0) { res.status(400).json({ error: "qty must be a nonnegative whole number of units." }); return; }
         }
         // Trusted server-side identity + isolation validation (a SET only; a CLEAR just removes the account's own row).
-        // The SAME rules as the bulk path, so inline and bulk cannot diverge. The child ASIN is RESOLVED server-side.
+        // Same rules as bulk, so inline + bulk cannot diverge. The child ASIN is RESOLVED server-side (browser ignored).
         let childAsin = S(body.childAsin).trim();
         if (body.clear !== true) {
-          const authority = await loadWarehouseAuthority(accountId);
+          const authority = await buildAuthority(deps, { organizationFingerprint: organization_fingerprint, connectionId, accountId, rows: [{ marketplace, sku, childAsin }] });
           const check = validateWarehouseRow({ marketplace, sku, childAsin }, authority);
           if (!check.ok) { res.status(400).json({ error: check.problems.join("; ") }); return; }
           childAsin = check.resolvedChildAsin;
         }
-        const result = await recordFbaSellerWarehouse({
+        const result = await deps.recordFbaSellerWarehouse({
           organizationFingerprint: organization_fingerprint, connectionId, accountId, marketplace, sku,
           childAsin, qty, note: S(body.note).slice(0, 500),
           updatedBy: access.userId, updatedByEmail: S(access.email), action: body.clear === true ? "clear" : "set",
         });
-        await insertAuditLog({ actorUserId: access.userId, action: body.clear === true ? "fba-plan.warehouse.cleared" : "fba-plan.warehouse.set", target: { accountId, marketplace, sku, qty } });
+        await deps.insertAuditLog({ actorUserId: access.userId, action: body.clear === true ? "fba-plan.warehouse.cleared" : "fba-plan.warehouse.set", target: { accountId, marketplace, sku, qty } });
         res.status(200).json({ warehouse: result });
         return;
       }
 
       if (kind === "warehouse-bulk") {
         // Atomic multi-row apply. The browser preview is NOT trusted: every row is independently re-validated here
-        // against the account's OWN published fba-plan evidence (SKU directory + catalog + marketplace scope). ANY
-        // invalid row => zero writes (validated BEFORE the single atomic RPC). Child ASINs are RESOLVED server-side.
+        // against the account's OWN evidence. ANY invalid row => zero writes AND zero audit (validated BEFORE the
+        // single atomic RPC). Child ASINs are RESOLVED server-side.
         const rawRows = Array.isArray(body.rows) ? body.rows : null;
         if (!rawRows || rawRows.length === 0) { res.status(400).json({ error: "rows must be a non-empty array." }); return; }
         if (rawRows.length > 5000) { res.status(400).json({ error: "too many rows (max 5000 per import)." }); return; }
@@ -142,7 +164,7 @@ export default async function handler(req, res) {
           if (!Number.isInteger(qty) || qty < 0) { res.status(400).json({ error: `qty for ${S(raw.marketplace)} / ${S(raw.sku)} must be a nonnegative whole number.` }); return; }
           norm.push({ marketplace: S(raw.marketplace).trim(), sku: S(raw.sku).trim(), childAsin: S(raw.childAsin).trim(), qty, note: S(raw.note).slice(0, 500) });
         }
-        const authority = await loadWarehouseAuthority(accountId);
+        const authority = await buildAuthority(deps, { organizationFingerprint: organization_fingerprint, connectionId, accountId, rows: norm });
         const checked = validateWarehouseRows(norm, authority);
         if (!checked.ok) {
           const first = checked.errors[0];
@@ -150,11 +172,11 @@ export default async function handler(req, res) {
           return;
         }
         const rows = checked.valid.map((r) => ({ marketplace: r.marketplace, sku: r.sku, childAsin: r.childAsin || "", qty: r.qty, note: r.note || "" }));
-        const result = await recordFbaSellerWarehouseBulk({
+        const result = await deps.recordFbaSellerWarehouseBulk({
           organizationFingerprint: organization_fingerprint, connectionId, accountId, rows,
           updatedBy: access.userId, updatedByEmail: S(access.email),
         });
-        await insertAuditLog({ actorUserId: access.userId, action: "fba-plan.warehouse.bulk", target: { accountId, applied: rows.length } });
+        await deps.insertAuditLog({ actorUserId: access.userId, action: "fba-plan.warehouse.bulk", target: { accountId, applied: rows.length } });
         res.status(200).json({ bulk: result, applied: rows.length });
         return;
       }
@@ -169,3 +191,5 @@ export default async function handler(req, res) {
     res.status(500).json({ error: "FBA plan config request failed." });
   }
 }
+
+export default function (req, res) { return handler(req, res); }

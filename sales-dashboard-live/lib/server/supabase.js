@@ -660,6 +660,37 @@ export async function recordFbaSellerWarehouseBulk({ organizationFingerprint, co
   return Array.isArray(body) ? body[0] : body;
 }
 
+// The account's OWN seller-warehouse rows (durable identity: marketplace/sku/child_asin), for server-side
+// identity-immutability validation. Account-scoped; empty on a schema-missing table.
+export async function getSellerWarehouseRows({ organizationFingerprint, connectionId = "primary", accountId, signal = null } = {}) {
+  if (!organizationFingerprint || !accountId) throw new Error("getSellerWarehouseRows requires organizationFingerprint + accountId (fail closed).");
+  const q = new URLSearchParams({
+    organization_fingerprint: `eq.${organizationFingerprint}`, connection_id: `eq.${connectionId}`, account_id: `eq.${accountId}`,
+    select: "marketplace,sku,child_asin",
+  });
+  try { const r = await request(`/rest/v1/fba_seller_warehouse?${q}`, { signal }); return Array.isArray(r) ? r : []; }
+  catch (e) { if (isSchemaMissingError(e)) return []; throw e; }
+}
+
+// Cross-account SKU-ownership evidence: which of `skus` are proven under a DIFFERENT account (durable OLI sales
+// history -- an account-scoped source). Returns a Set of those SKUs. Never exposes WHICH account owns them.
+export async function getSkusOwnedByOtherAccounts({ organizationFingerprint, accountId, skus, signal = null } = {}) {
+  const list = [...new Set((Array.isArray(skus) ? skus : []).map((s) => String(s == null ? "" : s).trim()).filter(Boolean))].slice(0, 500);
+  if (!organizationFingerprint || !accountId || list.length === 0) return new Set();
+  const inList = `(${list.map((s) => `"${String(s).replace(/"/g, '""')}"`).join(",")})`;
+  const q = new URLSearchParams({
+    organization_fingerprint: `eq.${organizationFingerprint}`,
+    account_id: `neq.${accountId}`,
+    select: "sku",
+    limit: "1000",
+  });
+  q.append("sku", `in.${inList}`);
+  try {
+    const rows = await request(`/rest/v1/source_oli_daily_history?${q}`, { signal });
+    return new Set((Array.isArray(rows) ? rows : []).map((r) => String(r.sku || "").trim()).filter(Boolean));
+  } catch (e) { if (isSchemaMissingError(e)) return new Set(); throw e; }
+}
+
 // Per-user column visibility prefs for the FBA plan (hidden column ids). Absent row => all defaults visible.
 export async function getFbaPlanColumnPrefs({ userId, reportKey = "fba-plan", signal = null } = {}) {
   if (!userId) throw new Error("getFbaPlanColumnPrefs requires userId (fail closed).");
