@@ -13257,3 +13257,31 @@ STILL PENDING (credential-blocked): apply migration 20260903; guarded source ref
 balance first) -> re-derive/publish v2d-5; 30-account authenticated read-backs (incl. forged single+bulk => zero DB
 change); responsive screenshots. Server validation degrades gracefully until v2d-5 is live (v2d-4 membership tier).
 See [[fba-plan-advanced]].
+
+================================================================================
+2026-08-30 -- FBA Plan: trusted warehouse-write hardening (Codex round 2) (commit eacc6a0)
+================================================================================
+`npm run verify` 91/91 across 71 suites. NO migrations applied, NO DataDoe tokens, NO source refresh (stopped for
+Codex re-review). Still credential-blocked for production (only VERCEL_OIDC_TOKEN).
+
+Fixed 5 trusted-write blockers (all server-side; browser never a boundary):
+1) v2d-4 fallback never persists an unverified browser ASIN: a member SKU resolves its ASIN from the account's STORED
+   warehouse identity or BLANK; a stale v2d-4 snapshot can never change a stored ASIN.
+2) Durable + immutable manual identity: endpoint loads the account's OWN fba_seller_warehouse rows; a stored nonblank
+   (marketplace,SKU)->childAsin is immutable across single+bulk (remap rejected); a CLEAR still deletes the exact row.
+3) Real cross-account isolation: new lib/server/supabase.js#getSkusOwnedByOtherAccounts queries the durable
+   account-scoped source_oli_daily_history (org + sku, account != current); a new manual SKU proven under another
+   account is rejected WITHOUT naming it; only genuinely-new SKUs (not in this account's directory/warehouse) checked.
+   Migration 20260904 adds the (organization_fingerprint, sku) index (FILE ONLY, not applied).
+4) Marketplace fail-closed: empty/malformed allowed scope rejects every set/bulk write; canonical UK/GB equivalence.
+5) API-handler tests: api/fba-plan-config.js dependency-injectable; scripts/fba-plan-config-handler.test.js executes
+   the handler with mocked deps proving forged v2d-4 ASIN / cross-account SKU / manual-ASIN remap / missing marketplace
+   scope / one-invalid-row bulk all return BEFORE any write/audit RPC; valid single, valid bulk (one atomic RPC), safe
+   clear proceed.
+
+New/updated files: lib/server/reports/warehouse-validation.js (rewrite), lib/server/supabase.js (+2 wrappers),
+api/fba-plan-config.js (deps-injectable + authority builder), scripts/warehouse-validation.test.js (16),
+scripts/fba-plan-config-handler.test.js (9), supabase/migrations/20260904_*.sql.
+
+PENDING MIGRATIONS to apply together (credential-gated): 20260903 (column prefs + bulk RPC) + 20260904 (cross-account
+index). Then guarded refresh -> v2d-5 -> read-backs. See [[fba-plan-advanced]].
