@@ -13734,3 +13734,55 @@ inside its container, no body horizontal overflow; ASIN/Identifier/SKU sticky co
 
 PENDING (external): confirm the deployed Vercel SHA in the dashboard (push to origin/main @ 94ed9ef triggers the
 auto-deploy; no Vercel token/prod URL available here). See [[sku-movement-live]], [[oli-operational-units-feature]].
+
+================================================================================
+2026-09-01 -- Account + BRAND authorization (org+user+account+brand scope), server-enforced (migration 20260913)
+================================================================================
+Shipped (code dc964af + 91553e5 pushed origin/main; migration 20260913 APPLIED + verified live). Upgrades
+authorization from ACCOUNT-ONLY to organization+user+account+brand. NON-REGRESSIVE: enforcement changes behaviour
+ONLY for a SELECTED_BRANDS user; admin + ALL_BRANDS resolve to `restricted:false` and EVERY serving path is
+byte-identical. After the additive migration all 12 existing grants are ALL_BRANDS, so prod output is byte-identical
+for 100% of current users until an admin narrows someone. No report/source data rewritten; DataDoe creates=0 tokens=0.
+
+ROOT-CAUSE LEAKS (pre-fix): the Dashboard (brand-sales), reconciliation, sku-pl, keyword-rank, content-changes,
+fba-plan, brand-inventory, sales + 6 insight reports returned the account's ALL-BRAND payload and relied on
+BROWSER-side brand filtering; Brand View's contributing account set was browser-chosen (account-gated only, no
+per-(account,brand) pair check); the brand directory listed org-wide brand names. Server CSV/XLSX exports don't
+exist (client-side) so the enforcement point is simply WHAT DATA LEAVES THE SERVER. No pre-auth-read leaks existed.
+
+MODEL: account_permissions gains explicit brand_scope_mode (ALL_BRANDS|SELECTED_BRANDS, backfilled explicitly, never
+inferred) + organization_fingerprint/granted_by/updated_at; new account_brand_grant (one permitted CANONICAL brand
+key per user+account; FK cascade from the account grant, canonical-key CHECK) + account_brand_grant_audit; atomic
+SECURITY DEFINER RPC replace_account_brand_scope (upsert grant + replace brand rows + audit). RLS: authenticated read
+own + admin; DML + RPC service-role only. replaceAccountPermissions is now a SURGICAL DIFF (an account-list edit
+preserves the brand scope of retained accounts).
+
+ENFORCEMENT (lib/server/report-authorization.js = the ONE resolver + capability registry): getDashboardAccess now
+carries per-account {mode, brandKeys}. resolveUserReportScope: unknown account/brand -> 403 without disclosure;
+granted keys INTERSECTED with the account's TRUSTED brand-sales membership (getTrustedAccountBrands -- same source as
+Brand View, no contradiction) so a removed/stale brand disappears; punctuation-distinct brands stay distinct; a lone
+permitted brand auto-selects; a named request NEVER falls back to ALL. Capability registry (every action registered,
+fail-closed): brand-sales + sku-movement = project rows to permitted keys; daily/brand-view*/oli-quality = server
+named-brand derive; the account-wide reports = DENY (403) for brand-restricted users. api/datadoe.js enforces at one
+chokepoint + projects served payloads on EVERY send path (serveSharedReport `present` hook, sku-movement scopeProject,
+brand-directory project); Brand View portfolio filters the account set to authorized (account,brand) pairs
+(accountBrandPairAuthorized). Access fingerprint (accessFingerprint) changes on any grant mutation.
+
+ADMIN + FRONTEND: /api/access gains user-scopes + account-brands (TRUSTED membership) + an atomic validated
+brand-scope write (one unknown brand -> zero writes). AccessPanel gains a per-account brand-scope editor (mode +
+searchable brand multi-select over trusted membership, narrow-warning). Brand selector shows only permitted brands
+(server-projected) with "All permitted brands", auto-selecting a lone brand. An access-fingerprint change purges ALL
+cached report data (localStorage + IndexedDB). Data Sync Center + all source mutations stay admin-only (brand-limited
+users are viewers) -- Phase 12 satisfied with no scheduler/control change.
+
+TESTS: brand-authorization (22), access-brand-scope (9), report-registry-coverage (5); full verify 102 steps / 80
+suites incl. build:check. Migration proven in a ROLLED-BACK prod tx (24 checks: schema/RPC/constraints/cascade/RLS)
+then applied + verified live (12 grants ALL_BRANDS, RLS + least-privilege + RPC service-role-only, PostgREST schema
+cache fresh). PROD READ-BACK (20 checks): trusted membership read for US/IN/DE/FR/IT/ES/UK; the resolver denies
+forbidden brand/account/report + keeps admin+ALL_BRANDS unrestricted against REAL data; a REAL 986-row Dashboard
+payload projected to one brand -> 607 rows, ZERO cross-brand leak; rolled-back RPC round-trip left the real user
+unchanged. creates=0/tokens=0.
+
+RESIDUAL: confirm the deployed Vercel SHA (push @ 91553e5 auto-deploys; no token/URL here) + a live browser
+screenshot pass at 1440/1280/768/390 (the new UI reuses the responsive access-grid/bounded-scroll/flex-wrap/aria
+primitives; compiled clean). See [[brand-view-membership-selfheal]], [[sku-movement-live]].
