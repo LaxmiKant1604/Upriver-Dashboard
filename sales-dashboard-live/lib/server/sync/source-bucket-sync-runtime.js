@@ -64,6 +64,7 @@ import {
   resolveUniqueMarketplaceByAccount, authoritativeMarketplace, summarizeMarketplaceResolution,
   OLI_ESTIMATE_MARKETPLACE_MISSING, OLI_ESTIMATE_MARKETPLACE_AMBIGUOUS,
 } from "./oli-sales-estimate.js";
+import { enrichOrderedOliHistory } from "./oli-enriched-history.js";
 import { paramsHashFor } from "../report-store.js";
 import { assertSnapshotWithinLimit } from "../report-limits.js";
 
@@ -307,6 +308,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     readSalesEstimates = getSourceOliSalesEstimateRows,
     writeSalesEstimates = replaceOliSalesEstimatesWindow,
     enrichHistoryWithEstimates = enrichOliHistoryRowsWithEstimates,
+    enrichOrderedHistory = enrichOrderedOliHistory,
     updateRunStatus = upsertSourceRunStatus,
     makeShadowSaver = makeShadowSnapshotSaver,
     clock = () => Date.now(),
@@ -920,12 +922,21 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
           writeEstimates: writeSalesEstimates,
         }).catch(() => null);
       }
-      const estimateRows = await readSalesEstimates({
-        organizationFingerprint: orgFingerprint, connectionId: "primary",
-        accountIds: accounts.map((a) => a.accountId), from: brandViewWindow.from, to: estTo,
-      });
-      if (Array.isArray(estimateRows) && estimateRows.length && Array.isArray(historyRows)) {
-        historyRows = enrichHistoryWithEstimates(historyRows, estimateRows);
+      // CANONICAL ORDERED MERGE: priced rollup + operational units (ordered units = priced + explicit-zero +
+      // pending) + estimates (actual-plus-estimated sales), per account, so Daily Reporting + Brand View publish
+      // BOTH ordered units and the enriched Total Sales through the ONE shared seam. A blank ASIN on a pending/zero
+      // grain is resolved to its unique ASIN (same resolver as the estimator) so units co-locate with the estimate.
+      // Additive + non-fatal: on ANY failure historyRows stays the priced rows (units + sales + LKG never regressed).
+      const marketplaceByAccount = new Map(accounts.map((a) => [String(a.accountId), authoritativeMarketplace(marketplaceResolution, a.accountId)]));
+      if (Array.isArray(historyRows)) {
+        historyRows = await enrichOrderedHistory({
+          organizationFingerprint: orgFingerprint, connectionId: "primary",
+          accountIds: accounts.map((a) => a.accountId), from: brandViewWindow.from, to: estTo,
+          historyRows, marketplaceByAccount,
+          readOperationalUnits: readOperationalUnitsForEstimate,
+          readEstimates: readSalesEstimates,
+          readSkuAsinResolution: readSkuAsinResolutionForEstimate,
+        });
       }
     } catch { /* additive: never regress the priced Total Sales or LKG */ }
 

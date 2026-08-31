@@ -112,4 +112,30 @@ test("12. true missing-value case: typed warning > 0, and those units are NOT in
   assert.equal(aggregateSales(out), 200, "Total Sales never fabricated for missing values");
 });
 
+/* ---- ORDERED-UNITS POLICY (canonical merge rows carrying `ordered_units_sum`): every observed non-cancelled unit
+   is Units Sold; the unresolved subset (`unpriced_units_sum`) is the breakdown gap. The RAW-row behaviour above is
+   UNCHANGED (those rows never carry `ordered_units_sum`). ---- */
+const mrow = (over = {}) => ({ date: "2026-08-10", seller_or_vendor_id: "S1", seller_or_vendor_name: "Store", marketplace_country_code: "US", item_price_currency: "USD", child_asin: "B0A", total_sales_sum: 0, total_units_sold_sum: 0, ordered_units_sum: 0, unpriced_units_sum: 0, ...over });
+
+test("12b. ordered-units row (resolved): all observed units count, sales included, no unresolved gap", () => {
+  const out = orderSalesByBrand([mrow({ total_sales_sum: 500, total_units_sold_sum: 8, ordered_units_sum: 8, unpriced_units_sum: 0 })], CAT);
+  assert.equal(out[0].total_units_sold, 8, "priced + explicit-zero + pending all count under the ordered-units policy");
+  assert.equal(out[0].total_sales, 500, "actual + estimated sales");
+  assert.equal(out[0].missing_order_value_units, 0, "nothing unresolved");
+});
+
+test("12c. ordered-units row (partly unresolved): units all count; the unresolved subset is the breakdown gap", () => {
+  const out = orderSalesByBrand([mrow({ total_sales_sum: 200, total_units_sold_sum: 10, ordered_units_sum: 10, unpriced_units_sum: 3 })], CAT);
+  assert.equal(out[0].total_units_sold, 10, "every observed non-cancelled unit is in Units Sold");
+  assert.equal(out[0].total_sales, 200, "only the resolved/priced sales -- unresolved units add no fabricated sales");
+  assert.equal(out[0].missing_order_value_units, 3, "the 3 unresolved units are the honest breakdown gap");
+});
+
+test("12d. ordered-units row with sales 0 but units>0 (fully unresolved): units STILL count (unlike a raw present-zero)", () => {
+  const out = orderSalesByBrand([mrow({ total_sales_sum: 0, total_units_sold_sum: 4, ordered_units_sum: 4, unpriced_units_sum: 4 })], CAT);
+  assert.equal(out[0].total_units_sold, 4, "ordered units count even with zero resolved sales");
+  assert.equal(out[0].missing_order_value_units, 4);
+  assert.equal(out[0].total_sales, 0, "no fabricated sales");
+});
+
 out("\n" + passed + " assertions passed");

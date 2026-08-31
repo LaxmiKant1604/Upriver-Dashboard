@@ -722,4 +722,106 @@ test("ACTUAL SUPERSEDES: as itemization shrinks the pending qty the estimate shr
   assert.equal(mk(0).length, 0, "fully itemized -> no estimate row (actual value stands alone)");
 });
 
+// ---------------------------------------------------------------------------------------------------------------
+group("mergeOrderedOliHistory: ordered units (priced + explicit-zero + pending) + actual-plus-estimated sales");
+
+const priced = (date, { units = 1, sales = 100, sku = "SKU-A", asin = "B0ASIN", cur = "INR" } = {}) => ({
+  account_id: ACC, seller_or_vendor_id: SELLER, sale_date: date, sku, child_asin: asin, currency: cur, units, sales_amount: sales, source_request_hash: "h",
+});
+const op = (date, { priced_units = 0, zero = 0, pending = 0, cancelled = 0, sku = "SKU-A", asin = "", cur = "INR" } = {}) => ({
+  account_id: ACC, seller_or_vendor_id: SELLER, sale_date: date, sku, child_asin: asin, currency: cur,
+  priced_units, explicit_zero_units: zero, pending_units: pending, cancelled_units: cancelled, source_request_hash: "op",
+});
+const estRow = (date, { qty = 1, sales = 100, sku = "SKU-A", asin = "B0ASIN", cur = "INR" } = {}) => ({
+  account_id: ACC, seller_or_vendor_id: SELLER, sale_date: date, sku, child_asin: asin, currency: cur, target_quantity: qty, estimated_sales: sales,
+});
+const oneGrain = (rows) => { assert.equal(rows.length, 1, "expected exactly one merged grain, got " + rows.length); return rows[0]; };
+
+test("priced-only grain: ordered = priced units, sales = priced, unpriced = 0", () => {
+  const r = oneGrain(ENG.mergeOrderedOliHistory({ historyRows: [priced("2026-08-30", { units: 5, sales: 500 })] }));
+  assert.equal(r.units, 5); assert.equal(r.ordered_units, 5); assert.equal(r.sales_amount, 500); assert.equal(r.unpriced_units, 0);
+});
+
+test("priced + resolved pending + estimate co-locate: ordered = priced+pending, sales = priced+est, unpriced = 0", () => {
+  const rows = ENG.mergeOrderedOliHistory({
+    historyRows: [priced("2026-08-30", { units: 2, sales: 200 })],
+    operationalRows: [op("2026-08-30", { priced_units: 2, pending: 3, asin: "" })], // blank ASIN pending
+    estimateRows: [estRow("2026-08-30", { qty: 3, sales: 300 })],                    // resolved to B0ASIN
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+  });
+  const g = oneGrain(rows);
+  assert.equal(g.units, 5, "2 priced + 3 pending");
+  assert.equal(g.sales_amount, 500, "200 priced + 300 estimate");
+  assert.equal(g.unpriced_units, 0, "estimate covers the pending units");
+  assert.equal(g.child_asin, "B0ASIN", "pending resolved + co-located with the priced/estimate grain");
+});
+
+test("UNRESOLVED pending (no estimate): units counted, sales 0, unpriced = pending (the honest gap)", () => {
+  const rows = ENG.mergeOrderedOliHistory({
+    operationalRows: [op("2026-08-30", { pending: 4, sku: "SKU-N", asin: "" })],
+    skuAsinResolver: mkResolver({ history: [] }), // no resolution
+  });
+  const g = oneGrain(rows);
+  assert.equal(g.units, 4); assert.equal(g.ordered_units, 4); assert.equal(g.sales_amount, 0);
+  assert.equal(g.unpriced_units, 4, "unresolved pending units are the unpriced gap");
+  assert.equal(g.child_asin, "", "unresolved keeps the blank ASIN (honest)");
+});
+
+test("explicit-zero non-cancelled units are counted (ordered), estimated if resolvable", () => {
+  const rows = ENG.mergeOrderedOliHistory({
+    operationalRows: [op("2026-08-30", { zero: 2, asin: "" })],
+    estimateRows: [estRow("2026-08-30", { qty: 2, sales: 20 })],
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+  });
+  const g = oneGrain(rows);
+  assert.equal(g.units, 2); assert.equal(g.sales_amount, 20); assert.equal(g.unpriced_units, 0);
+});
+
+test("CANCELLED units are NEVER added (audit-only)", () => {
+  const rows = ENG.mergeOrderedOliHistory({
+    historyRows: [priced("2026-08-30", { units: 3, sales: 300 })],
+    operationalRows: [op("2026-08-30", { priced_units: 3, cancelled: 99, asin: "B0ASIN" })],
+  });
+  const g = oneGrain(rows);
+  assert.equal(g.units, 3, "cancelled_units never enter ordered units");
+});
+
+test("NO DOUBLE-COUNT of priced units: operational priced_units are never re-added (only zero+pending)", () => {
+  const rows = ENG.mergeOrderedOliHistory({
+    historyRows: [priced("2026-08-30", { units: 10, sales: 1000 })],
+    operationalRows: [op("2026-08-30", { priced_units: 10, pending: 0, zero: 0, asin: "B0ASIN" })],
+  });
+  const g = oneGrain(rows);
+  assert.equal(g.units, 10, "priced counted once (from the rollup), operational priced_units ignored");
+  assert.equal(g.sales_amount, 1000);
+});
+
+test("PENDING -> ACTUAL settlement: no double count as itemization moves a unit from pending to priced", () => {
+  // Before: 2 priced + 3 pending (estimate 300). After a refresh: 5 priced, 0 pending, estimate cleared.
+  const before = oneGrain(ENG.mergeOrderedOliHistory({
+    historyRows: [priced("2026-08-30", { units: 2, sales: 200 })],
+    operationalRows: [op("2026-08-30", { priced_units: 2, pending: 3, asin: "" })],
+    estimateRows: [estRow("2026-08-30", { qty: 3, sales: 300 })],
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+  }));
+  assert.equal(before.units, 5); assert.equal(before.sales_amount, 500);
+  const after = oneGrain(ENG.mergeOrderedOliHistory({
+    historyRows: [priced("2026-08-30", { units: 5, sales: 500 })], // all itemized now
+    operationalRows: [op("2026-08-30", { priced_units: 5, pending: 0, asin: "B0ASIN" })],
+    estimateRows: [], // estimate window cleared
+  }));
+  assert.equal(after.units, 5, "ordered units unchanged across settlement (each unit counted exactly once)");
+  assert.equal(after.sales_amount, 500, "actual sales replace the estimate -- no addition on top");
+});
+
+test("IDEMPOTENT replay: same durable evidence -> byte-identical merged rows", () => {
+  const args = {
+    historyRows: [priced("2026-08-30", { units: 2, sales: 200 })],
+    operationalRows: [op("2026-08-30", { priced_units: 2, pending: 3, asin: "" })],
+    estimateRows: [estRow("2026-08-30", { qty: 3, sales: 300 })],
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+  };
+  assert.deepEqual(ENG.mergeOrderedOliHistory(args), ENG.mergeOrderedOliHistory(args));
+});
+
 main().then((f) => { if (f) process.exitCode = 1; }).catch((e) => { out("FATAL " + String(e && e.stack ? e.stack : e)); process.exitCode = 1; });

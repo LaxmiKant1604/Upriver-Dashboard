@@ -42,6 +42,8 @@ import {
   getSourceOliHistoryRows,
   getSourceOliOperationalUnitRows,
   getSourceOliSalesEstimateRows,
+  getOliSkuAsinResolutionRows,
+  getAccountDirectorySnapshotAccounts,
   getSourceSnapshot,
   getSourceSnapshotPayload,
   getExplicitZeroOliUnits,
@@ -995,6 +997,7 @@ async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, co
     readOliHistory: getSourceOliHistoryRows, readOliCoverage: getSourceCoverageWindows,
     readCatalogSnapshot: getSourceSnapshot, loadCatalogPayload: getSourceSnapshotPayload,
     readOliOperationalUnits: getSourceOliOperationalUnitRows,
+    readOliSkuAsinResolution: getOliSkuAsinResolutionRows, readDirectory: getAccountDirectorySnapshotAccounts,
   };
   const augment = makeCompletenessAugment({ organizationFingerprint: orgFp, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows, readEstimates: getSourceOliSalesEstimateRows });
 

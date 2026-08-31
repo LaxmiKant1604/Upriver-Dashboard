@@ -477,6 +477,82 @@ export function enrichOliHistoryRowsWithEstimates(historyRows = [], estimateRows
   return out;
 }
 
+/**
+ * THE ONE canonical OLI merge: combine the priced rollup (source_oli_daily_history), the operational-unit classes
+ * (source_oli_operational_units: explicit-zero + pending), and the internal sales estimates
+ * (source_oli_sales_estimates) into ONE enriched row per (account, date, sku, ASIN, currency) grain, so every OLI
+ * unit + sales consumer inherits BOTH ordered units AND the actual-plus-estimated Total Sales through ONE calculation.
+ *
+ *   ordered units = priced_units (from the rollup) + explicit_zero_units + pending_units (from operational units)
+ *   total sales   = actual priced sales (from the rollup) + safely-estimated sales (from the estimates)
+ *   unpriced units = the explicit-zero + pending units NOT yet covered by an estimate (the honest unresolved gap)
+ *
+ * NO DOUBLE-COUNT: the overlay adds ONLY the explicit-zero + pending classes (DISJOINT from the rollup's priced
+ * units -- the rollup, by contract, counts only non-cancelled value-present-positive units), so a priced unit is
+ * never counted twice. A blank child_asin on a pending/zero grain is RESOLVED to its unique ASIN (same resolver as
+ * the estimator) so the overlay units co-locate with the estimate sales at the resolved grain (and attribute by
+ * ASIN); an unresolved grain keeps its blank ASIN and its units stay honestly unpriced. Cancelled units are NEVER
+ * added (they are audit-only). Estimates never add units (they carry sales only). The estimate's target_quantity
+ * marks how many overlay units it covers, so replaying after a later itemization (priced grows, pending shrinks,
+ * estimate shrinks) is idempotent and never double counts. Returns a NEW array; inputs are never mutated.
+ *
+ * Every emitted row carries `ordered_units` (= units) as an EXPLICIT marker so the durable brand derive counts every
+ * observed non-cancelled unit; a legacy RAW row (no `ordered_units`) keeps the historic present-zero/missing policy.
+ */
+export function mergeOrderedOliHistory({ historyRows = [], operationalRows = [], estimateRows = [], skuAsinResolver = null } = {}) {
+  const resolver = skuAsinResolver && typeof skuAsinResolver.resolve === "function" ? skuAsinResolver : null;
+  const grains = new Map(); // oliGroupKey -> accumulator
+  const ensure = (accountId, saleDate, sku, childAsin, currency, seller, hash) => {
+    const key = oliGroupKey({ accountId, saleDate, sku, childAsin, currency });
+    let g = grains.get(key);
+    if (!g) {
+      g = { account_id: S(accountId), seller_or_vendor_id: S(seller), sale_date: S(saleDate), sku: S(sku), child_asin: S(childAsin), currency: S(currency), pricedUnits: 0, overlayUnits: 0, sales: 0, estimateCovered: 0, source_request_hash: S(hash) };
+      grains.set(key, g);
+    } else if (!g.seller_or_vendor_id && seller) g.seller_or_vendor_id = S(seller);
+    return g;
+  };
+  // 1. PRICED rollup rows -> priced units + actual sales.
+  for (const r of Array.isArray(historyRows) ? historyRows : []) {
+    const g = ensure(r.account_id ?? r.accountId, r.sale_date ?? r.saleDate, r.sku ?? "", r.child_asin ?? r.childAsin ?? "", r.currency, r.seller_or_vendor_id ?? r.sellerOrVendorId, r.source_request_hash ?? r.sourceRequestHash);
+    g.pricedUnits += Number(r.units ?? 0) || 0;
+    g.sales += Number(r.sales_amount ?? r.salesAmount ?? 0) || 0;
+  }
+  // 2. OPERATIONAL overlay -> the explicit-zero + pending units the rollup excludes (DISJOINT). A blank child_asin is
+  //    resolved to its unique ASIN so the units co-locate with the estimate sales; unresolved stays blank (honest).
+  for (const raw of Array.isArray(operationalRows) ? operationalRows : []) {
+    const additive = (Number(raw.explicit_zero_units ?? raw.explicitZeroUnits) || 0) + (Number(raw.pending_units ?? raw.pendingUnits) || 0);
+    if (!(additive > 0)) continue;
+    const sku = S(raw.sku ?? "");
+    const currency = S(raw.currency);
+    const seller = S(raw.seller_or_vendor_id ?? raw.sellerOrVendorId);
+    let childAsin = S(raw.child_asin ?? raw.childAsin ?? "");
+    if (!childAsin && resolver && sku) {
+      const rr = resolver.resolve({ sellerId: seller, currency, sku });
+      if (rr && rr.status === "unique" && rr.asin) childAsin = rr.asin;
+    }
+    const g = ensure(raw.account_id ?? raw.accountId, raw.sale_date ?? raw.saleDate, sku, childAsin, currency, seller, raw.source_request_hash ?? raw.sourceRequestHash);
+    g.overlayUnits += additive;
+  }
+  // 3. ESTIMATES (already at the resolved grain) -> add sales, record the covered quantity (NEVER add units).
+  for (const e of Array.isArray(estimateRows) ? estimateRows : []) {
+    const g = ensure(e.account_id ?? e.accountId, e.sale_date ?? e.saleDate, e.sku ?? "", e.child_asin ?? e.childAsin ?? "", e.currency, e.seller_or_vendor_id ?? e.sellerOrVendorId, e.reference_source_request_hash ?? e.referenceSourceRequestHash);
+    g.sales += Number(e.estimated_sales ?? e.estimatedSales ?? 0) || 0;
+    g.estimateCovered += Number(e.target_quantity ?? e.targetQuantity) || 0;
+  }
+  const out = [];
+  for (const g of grains.values()) {
+    const orderedUnits = g.pricedUnits + g.overlayUnits;
+    const unpricedUnits = Math.max(0, g.overlayUnits - g.estimateCovered);
+    out.push({
+      account_id: g.account_id, seller_or_vendor_id: g.seller_or_vendor_id, sale_date: g.sale_date,
+      sku: g.sku, child_asin: g.child_asin, currency: g.currency,
+      sales_amount: g.sales, units: orderedUnits, ordered_units: orderedUnits, unpriced_units: unpricedUnits,
+      source_request_hash: g.source_request_hash,
+    });
+  }
+  return out;
+}
+
 // The set of (account, date, sku, ASIN, currency) group keys a set of estimate rows RESOLVES -- used by the
 // missing-value breakdown to stop showing resolved grains while genuinely-unresolved grains remain.
 export function resolvedEstimateGroupKeys(estimateRows = []) {

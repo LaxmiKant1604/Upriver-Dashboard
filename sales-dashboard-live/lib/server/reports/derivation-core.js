@@ -73,7 +73,17 @@ export function orderSalesByBrand(rows, catalogRows) {
     const rawValue = row.total_sales_sum ?? row.item_price_value;
     const valuePresent = rawValue != null && String(rawValue).trim() !== "";
     const units = num(row.total_units_sold_sum ?? row.quantity);
-    if (!valuePresent) {
+    // ORDERED-UNITS POLICY (durable canonical merge only): a row carrying an explicit `ordered_units_sum` has been
+    // pre-classified into ORDERED units (priced + explicit-zero + pending) with its actual-plus-estimated sales; count
+    // EVERY observed non-cancelled unit into Units Sold, and surface the still-unresolved (no-sales) units via
+    // `unpriced_units_sum` in the missing-order-value breakdown. A row WITHOUT `ordered_units_sum` (a legacy RAW OLI
+    // row) keeps the historic present-zero/missing policy UNCHANGED (present-zero contributes zero units; a genuinely
+    // missing value is typed evidence only) -- this preserves the reviewed raw-row behaviour and its regression tests.
+    if (row.ordered_units_sum != null) {
+      current.total_units_sold += num(row.ordered_units_sum);
+      current.missing_order_value_units += num(row.unpriced_units_sum);
+      if (valuePresent) current.total_sales += num(rawValue);
+    } else if (!valuePresent) {
       // Genuinely missing order value: typed evidence ONLY; never fabricate sales, never count units.
       current.missing_order_value_units += units;
     } else {

@@ -19,7 +19,7 @@ const START = Date.now();
 const mark = (m) => { try { writeSync(2, "[+" + (Date.now() - START) + "ms] " + m + "\n"); } catch (_e) { /* ignore */ } };
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
-let ENG, RECOMP, DASH, SERVE;
+let ENG, RECOMP, DASH, SERVE, DERIV;
 const ACC = "acct-1"; const SELLER = "SELLER1"; const ORG = "org-1";
 
 // Build a recompute harness with injectable durable rows + a captured write.
@@ -50,6 +50,7 @@ async function main() {
   RECOMP = await import("../lib/server/sync/oli-sales-estimate-recompute.js");
   DASH = await import("../lib/server/sync/durable-dashboards.js");
   SERVE = await import("../lib/server/reports/oli-completeness-serve.js");
+  DERIV = await import("../lib/server/reports/derivation-core.js");
   mark("running " + tests.filter((t) => !t.marker).length + " tests");
   let failures = 0;
   for (const t of tests) {
@@ -287,6 +288,62 @@ test("AMBIGUOUS resolution through the recompute -> unresolved, empty write", as
   assert.equal(r.estimates.length, 0);
   assert.equal(r.unresolved[0].reason, ENG.UNRESOLVED_ASIN_AMBIGUOUS);
   assert.deepEqual(h.writes[0], []);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+group("ordered-units PARITY through the REAL derive: Daily == Brand Sales == ordered units (priced + zero + pending)");
+
+const CAT_PAR = [{ child_asin: "B0X", product_brand: "BrandX" }];
+const ACCT = { accountId: ACC, name: "Store IN", country: "IN" };
+// One account, one day: 2 priced (sales 200), 3 pending (resolved -> estimate 300), 1 explicit-zero (resolved -> est 10).
+function mergedEvidence() {
+  const historyRows = [{ account_id: ACC, seller_or_vendor_id: SELLER, sale_date: "2026-08-30", sku: "SKU-A", child_asin: "B0X", currency: "INR", sales_amount: 200, units: 2 }];
+  const operationalRows = [{ account_id: ACC, seller_or_vendor_id: SELLER, sale_date: "2026-08-30", sku: "SKU-A", child_asin: "", currency: "INR", priced_units: 2, explicit_zero_units: 1, pending_units: 3, cancelled_units: 5, source_request_hash: "op" }];
+  const estimateRows = [{ account_id: ACC, seller_or_vendor_id: SELLER, sale_date: "2026-08-30", sku: "SKU-A", child_asin: "B0X", currency: "INR", target_quantity: 4, estimated_sales: 310 }];
+  const resolver = ENG.buildSkuAsinResolver({ accountMarketplace: "IN", historyRows: [{ seller_or_vendor_id: SELLER, currency: "INR", sku: "SKU-A", asin_count: 1, child_asin: "B0X" }], catalogRows: [] });
+  return ENG.mergeOrderedOliHistory({ historyRows, operationalRows, estimateRows, skuAsinResolver: resolver });
+}
+
+test("merged grain: ordered = 2 priced + 1 zero + 3 pending = 6 (cancelled excluded), sales = 200 + 310", () => {
+  const m = mergedEvidence();
+  assert.equal(m.length, 1);
+  assert.equal(m[0].units, 6, "priced 2 + zero 1 + pending 3; cancelled 5 excluded");
+  assert.equal(m[0].sales_amount, 510, "priced 200 + estimate 310");
+  assert.equal(m[0].child_asin, "B0X", "pending/zero resolved + co-located with priced + estimate");
+  assert.equal(m[0].unpriced_units, 0, "estimate covers the 4 zero+pending units");
+});
+
+test("DAILY (rollupSupersetToDaily) Units Sold = 6 ordered units; Total Sales = 510", () => {
+  const frag = DASH.fragmentRowsFromHistory(mergedEvidence(), ACC);
+  const daily = DERIV.rollupSupersetToDaily(frag);
+  const units = daily.reduce((s, r) => s + Number(r.total_units_sum || 0), 0);
+  const sales = daily.reduce((s, r) => s + Number(r.total_sales_sum || 0), 0);
+  assert.equal(units, 6, "Daily counts every ordered non-cancelled unit");
+  assert.equal(sales, 510, "Daily Total Sales includes estimated sales");
+});
+
+test("BRAND SALES (orderSalesByBrand) total_units_sold = 6 ordered; sales = 510; attributed to BrandX", () => {
+  const orderRows = DASH.orderRowsFromHistory(mergedEvidence(), ACCT);
+  const brand = DERIV.orderSalesByBrand(orderRows, CAT_PAR);
+  const bx = brand.find((r) => r.product_brand === "BrandX");
+  assert.ok(bx, "resolved pending/zero units attribute to BrandX (not Unassigned)");
+  assert.equal(bx.total_units_sold, 6, "Brand Sales Units Sold = ordered (parity with Daily)");
+  assert.equal(bx.total_sales, 510, "Brand Sales Total Sales includes estimate");
+  assert.equal(bx.missing_order_value_units, 0, "nothing unresolved here");
+});
+
+test("PARITY with an UNRESOLVED grain: units counted in BOTH Daily and Brand Sales; breakdown shows the gap", () => {
+  // A pending grain that cannot resolve (no history) -> no estimate. Its units must still count in both reports.
+  const historyRows = [];
+  const operationalRows = [{ account_id: ACC, seller_or_vendor_id: SELLER, sale_date: "2026-08-30", sku: "SKU-N", child_asin: "", currency: "INR", pending_units: 4, source_request_hash: "op" }];
+  const merged = ENG.mergeOrderedOliHistory({ historyRows, operationalRows, estimateRows: [], skuAsinResolver: ENG.buildSkuAsinResolver({ accountMarketplace: "IN", historyRows: [], catalogRows: [] }) });
+  const dailyUnits = DERIV.rollupSupersetToDaily(DASH.fragmentRowsFromHistory(merged, ACC)).reduce((s, r) => s + Number(r.total_units_sum || 0), 0);
+  const brand = DERIV.orderSalesByBrand(DASH.orderRowsFromHistory(merged, ACCT), CAT_PAR);
+  const totUnits = brand.reduce((s, r) => s + Number(r.total_units_sold || 0), 0);
+  const totMissing = brand.reduce((s, r) => s + Number(r.missing_order_value_units || 0), 0);
+  assert.equal(dailyUnits, 4, "Daily counts the unresolved pending units");
+  assert.equal(totUnits, 4, "Brand Sales ALSO counts them (parity)");
+  assert.equal(totMissing, 4, "and surfaces them as the unresolved breakdown gap");
 });
 
 main().then((f) => { if (f) process.exitCode = 1; }).catch((e) => { out("FATAL " + String(e && e.stack ? e.stack : e)); process.exitCode = 1; });

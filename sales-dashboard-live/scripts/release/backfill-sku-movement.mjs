@@ -50,6 +50,8 @@ const readers = {
   readCatalogSnapshot: sb.getSourceSnapshot,
   loadCatalogPayload: sb.getSourceSnapshotPayload,
   readOliOperationalUnits: sb.getSourceOliOperationalUnitRows,
+  readOliSkuAsinResolution: sb.getOliSkuAsinResolutionRows,
+  readDirectory: sb.getAccountDirectorySnapshotAccounts,
 };
 
 const guardedSave = makeSkuMovementProvenanceGuardedSave({

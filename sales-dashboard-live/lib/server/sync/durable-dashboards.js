@@ -267,22 +267,34 @@ export function fragmentRowsFromHistory(historyRows, accountId) {
 }
 
 // Durable history rows -> the brand-sales order-lines shape (seller name + marketplace from the account
-// directory record -- an account is one marketplace; unpriced units are not tracked durably => 0).
+// directory record -- an account is one marketplace). A row from the canonical ORDERED merge carries
+// `ordered_units` (every observed non-cancelled unit) + `unpriced_units` (the still-unresolved gap); those flow
+// through as `ordered_units_sum` / `unpriced_units_sum` so orderSalesByBrand counts ordered units + surfaces the
+// unresolved gap. A legacy priced-only row (no `ordered_units`) carries neither, keeping the historic behaviour.
 export function orderRowsFromHistory(historyRows, account) {
   if (!account || !String(account.name || "").trim() || !String(account.country || "").trim()) {
     throw new Error("orderRowsFromHistory requires the account's directory name + marketplace country (fail closed).");
   }
-  return fragmentRowsFromHistory(historyRows, account.accountId).map((r) => ({
-    date: r.date,
-    seller_or_vendor_id: r.seller_or_vendor_id,
-    seller_or_vendor_name: String(account.name),
-    marketplace_country_code: String(account.country),
-    item_price_currency: r.item_price_currency,
-    child_asin: r.child_asin,
-    total_sales_sum: r.total_sales_sum,
-    total_units_sold_sum: r.total_units_sum,
-    unpriced_units_sum: 0,
-  }));
+  return (Array.isArray(historyRows) ? historyRows : [])
+    .filter((r) => String(r.account_id ?? r.accountId) === String(account.accountId))
+    .map((r) => {
+      const row = {
+        date: String(r.sale_date ?? r.saleDate),
+        seller_or_vendor_id: String(r.seller_or_vendor_id ?? r.sellerOrVendorId ?? ""),
+        seller_or_vendor_name: String(account.name),
+        marketplace_country_code: String(account.country),
+        item_price_currency: String(r.currency ?? ""),
+        child_asin: String(r.child_asin ?? r.childAsin ?? ""),
+        total_sales_sum: Number(r.sales_amount ?? r.salesAmount ?? 0),
+        total_units_sold_sum: Number(r.units ?? 0),
+        unpriced_units_sum: Number(r.unpriced_units ?? 0),
+      };
+      // Only a canonical-merge row carries `ordered_units`; setting the marker switches orderSalesByBrand to the
+      // ordered-units policy (raw rows never carry it, so their present-zero/missing policy is untouched).
+      if (r.ordered_units != null) row.ordered_units_sum = Number(r.ordered_units);
+      return row;
+    })
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 }
 
 // The sliced single-account source structure the daily derive validates (exact ordered canonical slices,

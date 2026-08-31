@@ -6,7 +6,7 @@
 
 import { monthBackStr } from "../date-windows.js";
 import { skuMovementPayload } from "./sku-movement-core.js";
-import { hasCanonicalIdentity } from "../sync/oli-order-rules.js";
+import { mergeOrderedOliHistory, buildSkuAsinResolver, resolveUniqueMarketplaceByAccount, authoritativeMarketplace } from "../sync/oli-sales-estimate.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const isDate = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
@@ -31,35 +31,40 @@ export function skuMovementProvenDates(oliWindows, ceiling) {
   return { effectiveAsOf, coverageFrom: minFrom };
 }
 
-// Read the ADDITIVE operational units (explicit-zero + pending) for the window and map them onto history-row shape so
-// the SAME pure movement core sums them alongside the priced rollup. ONLY identity-bearing grains are emitted (a
-// SKU-less unit never becomes a movement row). Advisory + fail-soft: a missing reader or a read error yields [] (the
-// report degrades to the priced series). `units` = explicit_zero_units + pending_units; sales are never included.
-async function readAdditiveOperationalUnits(readOliOperationalUnits, { organizationFingerprint, connectionId, accountId, from, to }) {
+// Read the raw operational units (all classes) for the window. Advisory + fail-soft: a missing reader or a read
+// error yields [] (the report degrades to the priced series). The canonical mergeOrderedOliHistory folds their
+// explicit-zero + pending classes into ordered units (resolving a blank ASIN) alongside the priced rollup.
+async function readOperationalUnits(readOliOperationalUnits, { organizationFingerprint, connectionId, accountId, from, to }) {
   if (typeof readOliOperationalUnits !== "function") return [];
-  let rows;
   try {
-    rows = await readOliOperationalUnits({ organizationFingerprint, connectionId, accountIds: [S(accountId)], from, to, additiveOnly: true });
+    const rows = await readOliOperationalUnits({ organizationFingerprint, connectionId, accountIds: [S(accountId)], from, to, additiveOnly: true });
+    return Array.isArray(rows) ? rows : [];
   } catch (_e) {
     return [];
   }
-  const out = [];
-  for (const r of Array.isArray(rows) ? rows : []) {
-    if (!hasCanonicalIdentity(r)) continue; // never allocate a SKU-less pending/zero unit to a movement row
-    const additive = (Number(r.explicit_zero_units ?? r.explicitZeroUnits) || 0) + (Number(r.pending_units ?? r.pendingUnits) || 0);
-    if (!(additive > 0)) continue;
-    out.push({
-      account_id: S(r.account_id ?? r.accountId), seller_or_vendor_id: S(r.seller_or_vendor_id ?? r.sellerOrVendorId),
-      sale_date: S(r.sale_date ?? r.saleDate), sku: S(r.sku), child_asin: S(r.child_asin ?? r.childAsin),
-      currency: S(r.currency), sales_amount: 0, units: additive, source_request_hash: S(r.source_request_hash ?? r.sourceRequestHash),
-    });
+}
+
+// Build the account-scoped SKU->ASIN resolver (same server-side resolver the estimator + Brand View use) so a
+// pending unit's blank child_asin resolves to its unique ASIN -- SO SKU Movement's named-brand attribution matches
+// Brand View exactly (no divergence). Fail-soft: no directory/resolution reader, unknown marketplace, or a read
+// error -> a null resolver (blank-ASIN pending units stay under their SKU as Unmapped, exactly as before).
+async function buildAccountResolver({ readDirectory, readOliSkuAsinResolution }, { organizationFingerprint, connectionId, accountId }) {
+  if (typeof readDirectory !== "function" || typeof readOliSkuAsinResolution !== "function") return null;
+  try {
+    const accounts = await readDirectory();
+    const resolution = resolveUniqueMarketplaceByAccount(Array.isArray(accounts) ? accounts : []);
+    const mkt = authoritativeMarketplace(resolution, accountId);
+    if (!mkt) return null;
+    const resRows = await readOliSkuAsinResolution({ organizationFingerprint, connectionId, accountId });
+    return buildSkuAsinResolver({ accountMarketplace: mkt, historyRows: Array.isArray(resRows) ? resRows : [], catalogRows: [] });
+  } catch (_e) {
+    return null;
   }
-  return out;
 }
 
 // I/O: gather one account's durable evidence (ZERO DataDoe). `ceiling` = the server-resolved D-1 (previous UTC day).
 export async function gatherSkuMovementEvidence({ accountId, organizationFingerprint, connectionId = "primary", ceiling }, readers) {
-  const { readOliHistory, readOliCoverage, readCatalogSnapshot, loadCatalogPayload, readOliOperationalUnits } = readers;
+  const { readOliHistory, readOliCoverage, readCatalogSnapshot, loadCatalogPayload, readOliOperationalUnits, readOliSkuAsinResolution, readDirectory } = readers;
   const cov = await readOliCoverage({ organizationFingerprint, connectionId, accountId, sourceKey: OLI_SOURCE_KEY });
   const oliWindows = cov && cov.read === "ok" ? (cov.windows || []) : [];
   const { effectiveAsOf, coverageFrom } = skuMovementProvenDates(oliWindows, ceiling);
@@ -69,12 +74,14 @@ export async function gatherSkuMovementEvidence({ accountId, organizationFingerp
   // The three completed months + MTD + the last-10 days all live within [start of the -3 month, effectiveAsOf].
   const from = monthBackStr(effectiveAsOf, 3);
   const pricedRows = await readOliHistory({ organizationFingerprint, connectionId, accountIds: [S(accountId)], from, to: effectiveAsOf });
-  // OPERATIONAL UNITS: add the units the PRICED rollup deliberately excludes -- explicit-zero (value===0) and pending
-  // (null price) units -- ONLY where a canonical SKU/ASIN exists (a SKU-less unit is NEVER placed under an "Unmapped"
-  // SKU). Revenue is untouched: these rows carry no sales_amount, only a unit count. The priced series is read from
-  // the UNCHANGED daily rollup above, so priced movement is byte-identical; this is purely additive.
-  const additiveRows = await readAdditiveOperationalUnits(readOliOperationalUnits, { organizationFingerprint, connectionId, accountId, from, to: effectiveAsOf });
-  const historyRows = Array.isArray(pricedRows) ? pricedRows.concat(additiveRows) : additiveRows;
+  // ORDERED UNITS: add the units the PRICED rollup deliberately excludes -- explicit-zero (value===0) and pending
+  // (null price) units -- through the ONE canonical mergeOrderedOliHistory (the SAME seam Daily + Brand View use),
+  // resolving a blank ASIN to its unique ASIN so attribution matches Brand View and can NEVER diverge. estimateRows
+  // is [] (SKU Movement is units-only: no estimated dollars), so priced sales stay byte-identical; units become
+  // ordered (priced + explicit-zero + pending). A SKU-less unit is dropped downstream by skuMovementRows.
+  const operationalRows = await readOperationalUnits(readOliOperationalUnits, { organizationFingerprint, connectionId, accountId, from, to: effectiveAsOf });
+  const resolver = await buildAccountResolver({ readDirectory, readOliSkuAsinResolution }, { organizationFingerprint, connectionId, accountId });
+  const historyRows = mergeOrderedOliHistory({ historyRows: Array.isArray(pricedRows) ? pricedRows : [], operationalRows, estimateRows: [], skuAsinResolver: resolver });
   const catRead = await readCatalogSnapshot({ organizationFingerprint, connectionId, sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY });
   const catalogSnapshot = catRead && typeof catRead === "object" && "snapshot" in catRead ? catRead.snapshot : catRead;
   const catalogReadOk = !catRead || typeof catRead !== "object" || !("read" in catRead) || catRead.read === "ok";
