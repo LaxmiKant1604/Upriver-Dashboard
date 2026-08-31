@@ -240,7 +240,7 @@ export function AccountSelector({ accounts, value, onChange, flags, onRefresh, r
   );
 }
 
-export function BrandSelector({ brands, value, onChange, includeAll = true, label = "Brand" }) {
+export function BrandSelector({ brands, value, onChange, includeAll = true, label = "Brand", allLabel = "All brands" }) {
   return (
     <div className="tb-select brand">
       <Tag size={15} aria-hidden="true" />
@@ -248,7 +248,7 @@ export function BrandSelector({ brands, value, onChange, includeAll = true, labe
         <div className="tb-select-label">{label}</div>
         <div className="tb-select-value">
           <select aria-label="Brand selection" value={value} onChange={(event) => onChange(event.target.value)}>
-            {includeAll ? <option value="ALL">All brands</option> : <option value="">Select a brand</option>}
+            {includeAll ? <option value="ALL">{allLabel}</option> : <option value="">Select a brand</option>}
             {brands.map((brand) => <option value={brand} key={brand}>{brand}</option>)}
           </select>
           <ChevronDown size={14} aria-hidden="true" />
@@ -272,7 +272,7 @@ function DashboardModeSelector({ value, onChange }) {
 export function TopBar({
   viewTitle, onOpenMenu, mobileOpen, showScope,
   accounts, selectedAccountId, onAccountChange, onRefreshAccounts, accountsRefreshing,
-  brands, selectedBrand, onBrandChange, flags,
+  brands, selectedBrand, onBrandChange, flags, brandAllLabel = "All brands",
   dashboardMode = "account", onDashboardModeChange, portfolioBrands = [], selectedPortfolioBrand = "", onPortfolioBrandChange,
   refresh,
 }) {
@@ -306,7 +306,7 @@ export function TopBar({
               onRefresh={onRefreshAccounts}
               refreshing={accountsRefreshing}
             />
-            <BrandSelector brands={brands} value={selectedBrand} onChange={onBrandChange} />
+            <BrandSelector brands={brands} value={selectedBrand} onChange={onBrandChange} allLabel={brandAllLabel} />
           </>}
           <div className="refresh-cluster">
             <div className="refresh-status">

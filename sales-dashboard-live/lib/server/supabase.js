@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { sourceJobOwnerId } from "./source-identity.js";
 import { normalizeFulfillmentChannel } from "./sync/oli-order-rules.js";
 import { resolveActiveCycleHead } from "./sync/source-cycle-attempts.js";
+import { membershipBrandsForAccount } from "./reports/brand-membership.js";
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 // Vercel Marketplace projects can expose either the legacy service-role JWT or
@@ -186,16 +187,45 @@ export async function getDashboardAccess(req) {
   const profile = profiles[0];
   if (!profile) throw new DashboardAccessError("Your dashboard profile is still being created. Please try again in a moment.", 403);
   const permissionsQuery = new URLSearchParams({
-    select: "account_id",
+    select: "account_id,brand_scope_mode",
     user_id: `eq.${user.id}`,
   });
   const permissions = await request(`/rest/v1/account_permissions?${permissionsQuery}`);
+  // Per-account brand scope. A grant is ALL_BRANDS unless it explicitly stores SELECTED_BRANDS AND has at least one
+  // selected-brand row (a defensive read: a SELECTED_BRANDS mode with zero brand rows is treated as no brands, never
+  // as "all"). The canonical brand keys are loaded once (only when at least one account is narrowed) and intersected
+  // with the account's TRUSTED membership later, at serve time, by resolveUserReportScope.
+  const selectedAccountIds = permissions.filter((p) => p.brand_scope_mode === "SELECTED_BRANDS").map((p) => p.account_id);
+  let brandRows = [];
+  if (selectedAccountIds.length) {
+    const inList = selectedAccountIds.map((id) => `"${String(id).replace(/"/g, "")}"`).join(",");
+    const grantQuery = new URLSearchParams({
+      select: "account_id,canonical_brand_key",
+      user_id: `eq.${user.id}`,
+    });
+    grantQuery.append("account_id", `in.(${inList})`);
+    brandRows = await request(`/rest/v1/account_brand_grant?${grantQuery}`).catch(() => []);
+  }
+  const brandKeysByAccount = new Map();
+  for (const r of Array.isArray(brandRows) ? brandRows : []) {
+    const list = brandKeysByAccount.get(r.account_id) || [];
+    if (r.canonical_brand_key) list.push(r.canonical_brand_key);
+    brandKeysByAccount.set(r.account_id, list);
+  }
+  const accountGrants = {};
+  for (const p of permissions) {
+    const mode = p.brand_scope_mode === "SELECTED_BRANDS" ? "SELECTED_BRANDS" : "ALL_BRANDS";
+    accountGrants[p.account_id] = { mode, brandKeys: mode === "SELECTED_BRANDS" ? (brandKeysByAccount.get(p.account_id) || []) : null };
+  }
   return {
     userId: user.id,
     email: user.email || "",
     displayName: profile.display_name || user.user_metadata?.display_name || "",
     role: profile.role,
     accountIds: permissions.map((permission) => permission.account_id),
+    // Per-account brand scope keyed by account_id: { mode, brandKeys }. brandKeys is null for ALL_BRANDS, an array of
+    // canonical brand keys for SELECTED_BRANDS. Admins ignore this (full access). Never trusted from the browser.
+    accountGrants,
   };
 }
 
@@ -258,20 +288,96 @@ function normalizeAccountIds(accountIds) {
   return [...new Set(accountIds.map((accountId) => String(accountId).trim()).filter(Boolean))];
 }
 
-export async function replaceAccountPermissions(userId, accountIds) {
+// Set a user's ACCOUNT grants to exactly `accountIds`, as a SURGICAL DIFF so a brand-scope narrowing survives an
+// account-list edit: accounts removed from the set are deleted (which CASCADE-removes their selected-brand grants),
+// newly added accounts are inserted as ALL_BRANDS (the safe default), and accounts that remain keep their existing
+// brand_scope_mode + selected-brand rows untouched. (The old delete-all-then-insert would have silently reset every
+// account back to ALL_BRANDS on any edit.)
+export async function replaceAccountPermissions(userId, accountIds, { grantedBy = null } = {}) {
   const normalized = normalizeAccountIds(accountIds);
-  await request(`/rest/v1/account_permissions?user_id=eq.${encodeURIComponent(userId)}`, {
-    method: "DELETE",
-    headers: { Prefer: "return=minimal" },
-  });
-  if (normalized.length) {
+  const wanted = new Set(normalized);
+  const currentRows = await request(`/rest/v1/account_permissions?${new URLSearchParams({ select: "account_id", user_id: `eq.${userId}` })}`).catch(() => []);
+  const current = new Set((Array.isArray(currentRows) ? currentRows : []).map((r) => r.account_id));
+  const toRemove = [...current].filter((id) => !wanted.has(id));
+  const toAdd = normalized.filter((id) => !current.has(id));
+  for (const accountId of toRemove) {
+    // Delete one account at a time so the FK cascade removes exactly that account's brand grants.
+    await request(`/rest/v1/account_permissions?${new URLSearchParams({ user_id: `eq.${userId}`, account_id: `eq.${accountId}` })}`, {
+      method: "DELETE", headers: { Prefer: "return=minimal" },
+    });
+  }
+  if (toAdd.length) {
     await request("/rest/v1/account_permissions", {
       method: "POST",
       headers: { Prefer: "return=minimal" },
-      body: normalized.map((accountId) => ({ user_id: userId, account_id: accountId })),
+      body: toAdd.map((accountId) => ({ user_id: userId, account_id: accountId, brand_scope_mode: "ALL_BRANDS", granted_by: grantedBy || null })),
     });
   }
   return normalized;
+}
+
+// The current brand-scope grants for one user, for the admin User Access UI: [{ accountId, mode, brandKeys, brandDisplays }].
+// Read-only; never a secret. brandKeys/brandDisplays are the STORED selected-brand rows (not yet intersected with live
+// membership -- the UI shows what was saved; the resolver enforces live membership at serve time).
+export async function getUserAccountBrandScopes(userId) {
+  const perms = await request(`/rest/v1/account_permissions?${new URLSearchParams({ select: "account_id,brand_scope_mode", user_id: `eq.${userId}` })}`).catch(() => []);
+  const grants = await request(`/rest/v1/account_brand_grant?${new URLSearchParams({ select: "account_id,canonical_brand_key,brand_display", user_id: `eq.${userId}` })}`).catch(() => []);
+  const byAccount = new Map();
+  for (const g of Array.isArray(grants) ? grants : []) {
+    const e = byAccount.get(g.account_id) || { keys: [], displays: [] };
+    if (g.canonical_brand_key) { e.keys.push(g.canonical_brand_key); e.displays.push(g.brand_display || g.canonical_brand_key); }
+    byAccount.set(g.account_id, e);
+  }
+  return (Array.isArray(perms) ? perms : []).map((p) => {
+    const mode = p.brand_scope_mode === "SELECTED_BRANDS" ? "SELECTED_BRANDS" : "ALL_BRANDS";
+    const e = byAccount.get(p.account_id) || { keys: [], displays: [] };
+    return { accountId: p.account_id, mode, brandKeys: mode === "SELECTED_BRANDS" ? e.keys : [], brandDisplays: mode === "SELECTED_BRANDS" ? e.displays : [] };
+  });
+}
+
+// Atomically REPLACE one (user, account) grant's brand scope via the SECURITY DEFINER RPC (the only brand-scope write
+// path). The api/ layer authorizes the acting admin + validates the brand keys against the account's trusted
+// membership BEFORE calling this. Returns { mode, brandKeys, added, removed }.
+export async function replaceAccountBrandScope({ organizationFingerprint = "", userId, accountId, mode, brandKeys = [], brandDisplays = [], actorId = null, actorEmail = "", correlationId = "" }) {
+  if (!userId || !accountId) throw new DashboardAccessError("A user and account are required.", 400);
+  const m = String(mode || "").toUpperCase();
+  if (m !== "ALL_BRANDS" && m !== "SELECTED_BRANDS") throw new DashboardAccessError("Brand scope mode must be ALL_BRANDS or SELECTED_BRANDS.", 400);
+  const rows = await request("/rest/v1/rpc/replace_account_brand_scope", {
+    method: "POST",
+    body: {
+      p_organization_fingerprint: String(organizationFingerprint || ""),
+      p_user_id: userId,
+      p_account_id: String(accountId),
+      p_mode: m,
+      p_brand_keys: Array.isArray(brandKeys) ? brandKeys : [],
+      p_brand_displays: Array.isArray(brandDisplays) ? brandDisplays : [],
+      p_actor: actorId,
+      p_actor_email: String(actorEmail || ""),
+      p_correlation_id: String(correlationId || ""),
+    },
+  });
+  return rows || null;
+}
+
+// TRUSTED brand membership for ONE account: the canonical brand keys proven by the account's LATEST validated
+// brand-sales snapshot (the SAME membership evidence Brand View uses -- catalogBrands, falling back to joined row
+// brands). Returns [{ key, display }] (canonical-key de-duplicated). A selected-brand grant is effective ONLY while
+// its key appears here, so a brand removed from the account's trusted membership disappears from the user's scope
+// even if a stale grant row remains. Fail-soft: no snapshot / read error -> [] (no brand is trusted, so a
+// SELECTED_BRANDS user sees nothing rather than everything). NEVER fabricated from a user request.
+export async function getTrustedAccountBrands({ accountId }) {
+  const id = String(accountId || "").trim();
+  if (!id) return [];
+  const snap = await getLatestReportSnapshotForScope({ reportKey: "brand-sales", accountId: id }).catch(() => null);
+  if (!snap) return [];
+  let payload = snap.payload;
+  if (!(payload && (Array.isArray(payload.catalogBrands) || Array.isArray(payload.rows)))) {
+    if (snap.payload_storage_path) { try { payload = await getReportSnapshotStoragePayload(snap.payload_storage_path); } catch { /* keep inline */ } }
+  }
+  const names = new Set();
+  for (const b of (payload && payload.catalogBrands) || []) { const s = String(b || "").trim(); if (s) names.add(s); }
+  for (const r of (payload && payload.rows) || []) { const b = r && (r.product_brand || r.brand); const s = String(b || "").trim(); if (s) names.add(s); }
+  return membershipBrandsForAccount([...names]);
 }
 
 export async function updateDashboardUser({ userId, role, accountIds }) {

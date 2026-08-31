@@ -38,6 +38,7 @@ import {
   getLatestSourceProvenance,
   getReportSnapshot,
   getReportSnapshotsOlderThan,
+  getTrustedAccountBrands,
   getSourceCoverageWindows,
   getSourceOliHistoryRows,
   getSourceOliOperationalUnitRows,
@@ -58,6 +59,13 @@ import {
   releaseRefreshLock,
   saveReportSnapshot,
 } from "../lib/server/supabase.js";
+// CENTRAL account+brand authorization: resolve a SELECTED_BRANDS user's permitted scope + project served payloads.
+// Admin/ALL_BRANDS users resolve to `restricted:false` and every serving path stays byte-identical.
+import {
+  resolveUserReportScope, BrandAccessError, CAPABILITY, REPORT_CAPABILITIES, isBrandAccessible,
+  projectBrandSalesPayload, projectSkuMovementPayload, projectBrandDirectoryPayload,
+} from "../lib/server/report-authorization.js";
+import { brandKey as canonicalBrandKey } from "../lib/server/reports/brand-membership.js";
 // Shared DataDoe transport. Extracted so every report — the seven original ones
 // and the six insight reports — shares one 2-req/sec rate limiter, one export
 // poller, and one row-cap policy.
@@ -919,7 +927,7 @@ function buildBrandDirectoryReadPayload(directory, brandDirectoryAccounts) {
  * lock held by another reader) preserves and serves the previous LKG with a typed stale warning; nothing calls
  * DataDoe. This closes the rollout gap where a new scheduler brand-sales publication left the directory stale.
  */
-async function serveSelfHealingBrandDirectory({ res, accountIds, legacyShared, brandDirectoryAccounts }) {
+async function serveSelfHealingBrandDirectory({ res, accountIds, legacyShared, brandDirectoryAccounts, project = (p) => p }) {
   const { reportKey, reportVersion, accountId, params } = legacyShared;
   const paramsHash = params ? paramsHashFor(reportVersion, params) : null;
   const stored = await getLatestReportSnapshot({ reportKey, accountId }).catch(() => null);
@@ -929,7 +937,7 @@ async function serveSelfHealingBrandDirectory({ res, accountIds, legacyShared, b
   const liveFp = await brandSalesFingerprint(accountIds).catch(() => null);
 
   const serveStored = (extra = {}) => res.status(200).json({
-    ...storedPayload, reportKey, reportVersion, paramsHash,
+    ...project(storedPayload), reportKey, reportVersion, paramsHash,
     snapshot: {
       savedAt: stored?.source_refreshed_at || stored?.updated_at || null, updatedAt: stored?.updated_at || null,
       shared: true, legacyDirectory: storedPayload?.membershipFingerprint == null, ...extra,
@@ -950,7 +958,7 @@ async function serveSelfHealingBrandDirectory({ res, accountIds, legacyShared, b
     // Double-check inside the lock -- the race winner may have just rebuilt it.
     const fresh = await getLatestReportSnapshot({ reportKey, accountId }).catch(() => null);
     if (Array.isArray(fresh?.payload?.brands) && fresh.payload.brands.length && liveFp != null && fresh.payload.membershipFingerprint === liveFp) {
-      res.status(200).json({ ...fresh.payload, reportKey, reportVersion, paramsHash, snapshot: { savedAt: fresh.source_refreshed_at || fresh.updated_at || null, updatedAt: fresh.updated_at || null, shared: true } });
+      res.status(200).json({ ...project(fresh.payload), reportKey, reportVersion, paramsHash, snapshot: { savedAt: fresh.source_refreshed_at || fresh.updated_at || null, updatedAt: fresh.updated_at || null, shared: true } });
       return;
     }
     let payload;
@@ -965,7 +973,7 @@ async function serveSelfHealingBrandDirectory({ res, accountIds, legacyShared, b
       const payloadBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
       await saveReportSnapshot({ reportKey, accountId, paramsHash, params: { reportVersion, ...params }, payload, payloadBytes, sourceRefreshedAt: new Date().toISOString() }).catch(() => {});
     }
-    res.status(200).json({ ...payload, reportKey, reportVersion, paramsHash, snapshot: { savedAt: new Date().toISOString(), updatedAt: null, shared: true, rebuilt: true } });
+    res.status(200).json({ ...project(payload), reportKey, reportVersion, paramsHash, snapshot: { savedAt: new Date().toISOString(), updatedAt: null, shared: true, rebuilt: true } });
   } finally {
     if (locked && paramsHash) await releaseRefreshLock({ reportKey, accountId, paramsHash }).catch(() => {});
   }
@@ -981,10 +989,14 @@ async function serveSelfHealingBrandDirectory({ res, accountIds, legacyShared, b
 const SKU_MOVEMENT_OLI_SOURCE_KEY = "order-line-items";
 const SKU_MOVEMENT_CATALOG_SOURCE_KEY = "product-catalog";
 const SKU_MOVEMENT_ORG_SCOPE = "__organization";
-async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, connections }) {
+async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, connections, userScope = null }) {
   const { reportKey, reportVersion, accountId, params, label } = legacyShared;
   const brand = params && params.brand != null ? params.brand : "ALL";
   const brandScope = { brand: String(brand).trim() === "" ? "ALL" : String(brand).trim() };
+  // BRAND-SCOPE PROJECTION (SELECTED_BRANDS users): a NAMED brand is already served by the brand-scoped derive (the
+  // caller forced params.brand to the permitted brand); for ALL_PERMITTED the derive serves the account payload, so
+  // filter its ASIN rows to the permitted brand keys. Unrestricted -> identity (byte-identical).
+  const scopeProject = (payload) => (userScope && userScope.restricted ? projectSkuMovementPayload(payload, userScope.permittedBrandKeys) : payload);
   const primary = connections.find((c) => c && c.id === "primary" && String(c.apiKey || "").trim());
   if (!accountId || !primary) {
     res.status(200).json({ snapshotMissing: true, reportKey, reportVersion, accountId, message: `${label} needs the primary connection and a selected account.` });
@@ -1005,9 +1017,12 @@ async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, co
   // Manual per-(account, marketplace, ASIN) identifiers, JOINED at serve time (kept OUT of the snapshot so a
   // re-derive never erases them). Account-scoped; fail-soft (any read failure -> no identifiers, report unaffected).
   const identifierMap = await getSkuMovementIdentifiers({ organizationFingerprint: orgFp, connectionId: "primary", accountId }).catch(() => ({}));
-  const withIdentifiers = (payload) => (payload && Array.isArray(payload.rows)
-    ? { ...payload, rows: payload.rows.map((r) => ({ ...r, identifier: identifierMap[String(r.asin || "").trim().toUpperCase()] || "" })) }
-    : payload);
+  const withIdentifiers = (payload) => {
+    const scoped = scopeProject(payload); // narrow to permitted brands FIRST (never attach identifiers to hidden rows)
+    return scoped && Array.isArray(scoped.rows)
+      ? { ...scoped, rows: scoped.rows.map((r) => ({ ...r, identifier: identifierMap[String(r.asin || "").trim().toUpperCase()] || "" })) }
+      : scoped;
+  };
 
   // CHEAP freshness probe (coverage + catalog metadata only -- NO history load, NO DataDoe): the current proven
   // as-of + the provenance the derive WOULD stamp. Used to decide "serve stored" vs "re-derive".
@@ -1582,6 +1597,50 @@ async function brandViewDirectory(accountId, { rebuild = false } = {}) {
 // The first dashboard reports predate the shared snapshot layer. Keep their
 // existing builders intact, but give them the exact same saved-data contract as
 // the newer insight reports. Browser storage is now only a fast fallback.
+// Phase 7 (Brand View pair enforcement): restrict a multi-account Brand View request to the (account, brand) pairs
+// the requesting user is authorized for. An ALL_BRANDS account contributes for any brand it truly sells; a
+// SELECTED_BRANDS account contributes ONLY when the requested brand is BOTH granted to the user for that account AND
+// present in the account's TRUSTED membership (so a stale grant or a removed brand contributes nothing). Admin ->
+// unchanged. Returns the filtered account id array (never widens; an empty result means the caller must 403).
+async function authorizedAccountsForBrand(access, accountIds, brand) {
+  if (!access || access.role === "admin") return [...accountIds];
+  const key = canonicalBrandKey(brand);
+  if (!key) return [];
+  const out = [];
+  for (const id of accountIds) {
+    const grant = access.accountGrants && access.accountGrants[String(id)];
+    if (!grant) continue; // not granted (assertAccountAccess already ran; this is defence in depth)
+    if (grant.mode !== "SELECTED_BRANDS") { out.push(id); continue; } // ALL_BRANDS: any brand the account actually sells
+    const permitted = new Set((grant.brandKeys || []).map((k) => canonicalBrandKey(k)).filter(Boolean));
+    if (!permitted.has(key)) continue;
+    const trusted = await getTrustedAccountBrands({ accountId: id }).catch(() => []);
+    if (Array.isArray(trusted) && trusted.some((b) => b && b.key === key)) out.push(id);
+  }
+  return out;
+}
+
+// Phase 7 (Brand View directory): a payload projector that limits a brand-restricted user's brand DIRECTORY to the
+// brands they may access + the (account, brand) pairs they may see. Non-restricted / all-ALL_BRANDS -> null (identity,
+// byte-identical: the directory already spans only the user's own accounts).
+async function brandDirectoryProjector(access, accountIds) {
+  if (!access || access.role === "admin") return null;
+  const ids = [...new Set((accountIds || []).map(String))];
+  const hasSelected = ids.some((id) => access.accountGrants && access.accountGrants[id] && access.accountGrants[id].mode === "SELECTED_BRANDS");
+  if (!hasSelected) return null;
+  const permitted = new Set();
+  const pairs = new Map();
+  for (const sid of ids) {
+    const grant = access.accountGrants && access.accountGrants[sid];
+    const trusted = await getTrustedAccountBrands({ accountId: sid }).catch(() => []);
+    const trustedKeys = new Set((Array.isArray(trusted) ? trusted : []).map((b) => b && b.key).filter(Boolean));
+    const keys = (!grant || grant.mode !== "SELECTED_BRANDS")
+      ? trustedKeys
+      : new Set((grant.brandKeys || []).map((k) => canonicalBrandKey(k)).filter((k) => trustedKeys.has(k)));
+    for (const k of keys) { permitted.add(k); if (!pairs.has(k)) pairs.set(k, new Set()); pairs.get(k).add(sid); }
+  }
+  return (payload) => projectBrandDirectoryPayload(payload, permitted, pairs);
+}
+
 function legacySharedDescriptor({ action, req, access, publicAccountIds, accountScope }) {
   const accountId = accountScope?.accountIds?.[0];
   const from = String(req.query.from || "");
@@ -2489,6 +2548,54 @@ async function handleDataDoe(req, res) {
       // Supabase and response metadata.
       if (accountScope) req.query.ids = accountScope.rawAccountIds.join(",");
     }
+
+    // ============================ BRAND-SCOPE ENFORCEMENT (Phase 6) ============================
+    // For a SELECTED_BRANDS user, resolve the trusted brand scope for THIS report action + single account and either
+    // DENY (403/409) or prepare a server-side projection. Admin + ALL_BRANDS users resolve to `restricted:false`, so
+    // `brandScope` stays null and every serving path below is byte-identical. The resolver reads ONLY the
+    // authenticated grants + the account's TRUSTED (brand-sales) membership -- never a browser-supplied brand/role.
+    // Multi-account brand actions (brand-portfolio / brand-view-portfolio / brand-directory) enforce their own
+    // per-(account,brand) pair projection at their handlers below.
+    let brandScope = null;
+    const singleAccountForScope = accountScope && accountScope.accountIds && accountScope.accountIds.length === 1 ? accountScope.accountIds[0] : null;
+    const requestedScopeAccounts = accountScope && accountScope.accountIds && accountScope.accountIds.length ? accountScope.accountIds : publicAccountIds;
+    const anySelectedBrandGrant = access.role !== "admin" && requestedScopeAccounts.some((id) => access.accountGrants && access.accountGrants[id] && access.accountGrants[id].mode === "SELECTED_BRANDS");
+    if (anySelectedBrandGrant && (action in REPORT_CAPABILITIES) && REPORT_CAPABILITIES[action] !== CAPABILITY.NON_REPORT) {
+      const capability = REPORT_CAPABILITIES[action];
+      // A report with no reviewed brand filter is DENIED for any brand-restricted account in scope (covers the
+      // multi-account `sales` case too), BEFORE any snapshot is read -- a deliberate secure denial, never a leak.
+      if (!isBrandAccessible(capability)) {
+        res.status(403).json({ error: "This report is not available for your brand-limited access." });
+        return;
+      }
+      // Brand-accessible + single account: resolve the permitted brand scope (may 403/409 or force a NAMED brand).
+      if (singleAccountForScope) {
+        try {
+          brandScope = await resolveUserReportScope({
+            access, requestedAccountId: singleAccountForScope, requestedBrand: req.query.brand,
+            action, getTrustedBrands: getTrustedAccountBrands,
+          });
+        } catch (e) {
+          if (e instanceof BrandAccessError) { res.status(e.status).json({ error: e.message }); return; }
+          throw e;
+        }
+        // A resolved NAMED brand forces the derive to that exact permitted brand (its trusted display), so the
+        // existing brand-filtered derive path serves only that brand. ALL_PERMITTED (derivable reports) keeps the
+        // account payload and projects it below via `present`.
+        if (brandScope && brandScope.restricted && brandScope.brandScope === "NAMED" && brandScope.requestedBrandKey) {
+          const disp = brandScope.permittedBrandDisplays instanceof Map ? brandScope.permittedBrandDisplays.get(brandScope.requestedBrandKey) : null;
+          req.query.brand = disp || brandScope.requestedBrandKey;
+        }
+      }
+    }
+    // A server-side payload projection to the user's permitted brand keys (used as serveSharedReport `present`), or
+    // identity when unrestricted. Only ever narrows -- never adds a row.
+    const brandProject = (payload) => {
+      if (!brandScope || !brandScope.restricted) return payload;
+      if (action === "brand-sales") return projectBrandSalesPayload(payload, brandScope.permittedBrandKeys);
+      return payload;
+    };
+
     const apiKey = accountScope?.connection.apiKey || connections[0].apiKey;
     if (action === "fields" || action === "sample") assertAdmin(access);
     // The Brand View inventory SOURCE fetch spends a DataDoe export, so it is
@@ -2555,7 +2662,11 @@ async function handleDataDoe(req, res) {
         res.status(400).json({ error: "Brand View requires brand, one or more allowed account ids, and an asOf date (YYYY-MM-DD)." });
         return;
       }
-      const accountIds = [...new Set(publicAccountIds.map(String))].sort();
+      // Phase 7: restrict the contributing accounts to the (account, brand) pairs THIS user is authorized for. A
+      // brand-restricted account contributes only when the requested brand is granted + trusted for it. Admin -> all.
+      const bpAuthorized = await authorizedAccountsForBrand(access, [...new Set(publicAccountIds.map(String))], brand);
+      if (!bpAuthorized.length) { res.status(403).json({ error: "You do not have access to the requested brand for these accounts." }); return; }
+      const accountIds = [...bpAuthorized].sort();
       const bpPrimary = getDataDoeConnections().find((cn) => cn && cn.id === "primary" && String(cn.apiKey || "").trim());
       const bpOrgFp = bpPrimary ? (bpPrimary.organizationFingerprint || organizationFingerprint(bpPrimary.apiKey)) : null;
       await serveSharedReport({
@@ -2603,8 +2714,14 @@ async function handleDataDoe(req, res) {
         return;
       }
       const { payload, savedAt, shared } = await brandViewDirectory(accountId, { rebuild: wantsRefresh(req) });
+      // BRAND-SCOPE: a brand-restricted user's per-account brand list shows only their permitted brands.
+      let brandPayload = payload;
+      if (brandScope && brandScope.restricted) {
+        const allow = brandScope.permittedBrandKeys;
+        brandPayload = { ...payload, brands: (Array.isArray(payload.brands) ? payload.brands : []).filter((b) => allow.has(canonicalBrandKey(b))) };
+      }
       res.status(200).json({
-        ...payload,
+        ...brandPayload,
         reportKey: BRAND_VIEW_BRANDS_REPORT_KEY,
         reportVersion: BRAND_VIEW_BRANDS_VERSION,
         snapshot: { savedAt, shared },
@@ -2685,14 +2802,20 @@ async function handleDataDoe(req, res) {
     if (action === "brand-view-portfolio") {
       const brand = String(req.query.brand || "").trim();
       const asOf = String(req.query.asOf || "");
-      const accountIds = [...new Set(publicAccountIds.map(String))].sort();
-      if (!brand || !accountIds.length || !isDateStr(asOf)) {
+      const requestedIds = [...new Set(publicAccountIds.map(String))].sort();
+      if (!brand || !requestedIds.length || !isDateStr(asOf)) {
         res.status(400).json({ error: "Brand View requires a brand, one or more allowed account ids, and an asOf date (YYYY-MM-DD)." });
         return;
       }
       // Authorised above for this action, but assert again next to the read so
       // the guarantee is visible at the point of use.
-      assertAccountAccess(access, accountIds);
+      assertAccountAccess(access, requestedIds);
+      // Phase 7: restrict the aggregation to the (account, brand) pairs THIS user is authorized for, so a
+      // brand-restricted account never contributes a brand it is not permitted (its country/marketplace/sales/ads/
+      // inventory are all excluded because it drops out of the account set entirely). Admin -> unchanged.
+      const bvAuthorized = await authorizedAccountsForBrand(access, requestedIds, brand);
+      if (!bvAuthorized.length) { res.status(403).json({ error: "You do not have access to the requested brand for these accounts." }); return; }
+      const accountIds = [...bvAuthorized].sort();
 
       const directory = await getLatestReportSnapshot({
         reportKey: "account-directory",
@@ -2834,6 +2957,13 @@ async function handleDataDoe(req, res) {
         ...legacyShared,
         userId: access.userId,
       };
+      // BRAND-SCOPE PROJECTION: compose the descriptor's own `present` (e.g. account-directory filtering) with the
+      // permitted-brand projection, applied on EVERY serveSharedReport send path (stored / stale-LKG / self-heal).
+      // For an unrestricted user brandProject is identity, so the served payload is byte-identical.
+      if (brandScope && brandScope.restricted) {
+        const basePresent = legacyShared.present || ((payload) => payload);
+        sharedOptions.present = (payload) => brandProject(basePresent(payload));
+      }
       // Brand Sales (single account) carries the SAME two-layer completeness label as Daily / Brand View, so its
       // provisional/final D-1 state is consistent across every OLI surface.
       if (action === "brand-sales" && accountScope && accountScope.accountIds.length === 1) {
@@ -2898,7 +3028,7 @@ async function handleDataDoe(req, res) {
       // saved OLI + Catalog the moment the durable evidence advances -- so a scheduler OR manual OLI sync propagates
       // on the very next page load, with NO export ever created (even when a refresh is forced).
       if (action === "sku-movement") {
-        await serveSelfHealingSkuMovement({ res, legacyShared, accountScope, connections });
+        await serveSelfHealingSkuMovement({ res, legacyShared, accountScope, connections, userScope: brandScope });
         return;
       }
       if (!wantsRefresh(req)) {
@@ -2907,7 +3037,7 @@ async function handleDataDoe(req, res) {
         // latest validated brand-sales (storage-first) under the shared lock -- so a new scheduler brand-sales
         // publication is picked up automatically without a manual refresh, page reload, or DataDoe export.
         if (action === "brand-directory") {
-          await serveSelfHealingBrandDirectory({ res, accountIds: publicAccountIds, legacyShared, brandDirectoryAccounts });
+          await serveSelfHealingBrandDirectory({ res, accountIds: publicAccountIds, legacyShared, brandDirectoryAccounts, project: (await brandDirectoryProjector(access, publicAccountIds)) || ((p) => p) });
           return;
         }
         // Reading a report is always server-side and shared. It never reaches

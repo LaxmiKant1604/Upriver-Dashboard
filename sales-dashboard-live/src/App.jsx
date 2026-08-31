@@ -1066,6 +1066,95 @@ function LoginScreen({ passwordSetup = false }) {
   );
 }
 
+// Per-account BRAND SCOPE manager (admin). For each account a user is granted, choose "All brands" or "Selected
+// brands"; in Selected mode a searchable checklist offers ONLY the account's TRUSTED membership (fetched from the
+// server, never fabricated). Saving is atomic + validated server-side; narrowing from All -> Selected warns first.
+function BrandScopeManager({ accessToken, userId, grantedAccountIds, accounts }) {
+  const [scopes, setScopes] = useState({});     // accountId -> { mode, brandKeys, brandDisplays }
+  const [trusted, setTrusted] = useState({});   // accountId -> [{ key, display }]
+  const [openAccount, setOpenAccount] = useState("");
+  const [draftMode, setDraftMode] = useState("ALL_BRANDS");
+  const [draftKeys, setDraftKeys] = useState(() => new Set());
+  const [search, setSearch] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const nameOf = (id) => { const a = accounts.find((x) => String(x.id) === String(id)); return a ? `${FLAGS[a.country] || ""} ${a.name}` : id; };
+
+  const loadScopes = useCallback(async () => {
+    if (!userId) return;
+    try { const r = await authFetch(`/api/access?action=user-scopes&userId=${encodeURIComponent(userId)}`, accessToken); const map = {}; for (const s of r.scopes || []) map[s.accountId] = s; setScopes(map); }
+    catch (e) { setErr(e.message); }
+  }, [accessToken, userId]);
+  useEffect(() => { loadScopes(); setOpenAccount(""); }, [loadScopes]);
+
+  const openEditor = async (accountId) => {
+    setOpenAccount(accountId); setErr(""); setMsg(""); setSearch("");
+    const cur = scopes[accountId] || { mode: "ALL_BRANDS", brandKeys: [] };
+    setDraftMode(cur.mode === "SELECTED_BRANDS" ? "SELECTED_BRANDS" : "ALL_BRANDS");
+    setDraftKeys(new Set(cur.brandKeys || []));
+    if (!trusted[accountId]) {
+      try { const r = await authFetch(`/api/access?action=account-brands&accountId=${encodeURIComponent(accountId)}`, accessToken); setTrusted((t) => ({ ...t, [accountId]: r.brands || [] })); }
+      catch (e) { setErr(e.message); }
+    }
+  };
+  const toggleKey = (key) => setDraftKeys((cur) => { const n = new Set(cur); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+
+  const save = async () => {
+    if (draftMode === "SELECTED_BRANDS" && draftKeys.size === 0) { setErr("Select at least one brand, or choose All brands."); return; }
+    const cur = scopes[openAccount];
+    if ((!cur || cur.mode !== "SELECTED_BRANDS") && draftMode === "SELECTED_BRANDS") {
+      if (!window.confirm(`Narrow this user to only the selected brand(s) for ${nameOf(openAccount)}? They will lose access to this account's other brands.`)) return;
+    }
+    setBusy(true); setErr(""); setMsg("");
+    try {
+      const brands = draftMode === "SELECTED_BRANDS" ? (trusted[openAccount] || []).filter((b) => draftKeys.has(b.key)).map((b) => ({ key: b.key, display: b.display })) : [];
+      await authFetch("/api/access?action=brand-scope", accessToken, { method: "POST", body: JSON.stringify({ userId, accountId: openAccount, mode: draftMode, brands }) });
+      setMsg("Brand access saved."); await loadScopes(); setOpenAccount("");
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  const ids = (grantedAccountIds || []).filter(Boolean);
+  if (!ids.length) return <div className="empty-note" style={{ marginTop: 8 }}>Grant one or more accounts above and save, then set each account's brand access here.</div>;
+  const list = trusted[openAccount] || [];
+  const q = search.trim().toLowerCase();
+  const shown = q ? list.filter((b) => String(b.display).toLowerCase().includes(q)) : list;
+
+  return <div className="access-brandscope" style={{ marginTop: 12 }}>
+    <div className="access-field-label">Brand access per account</div>
+    {err && <div className="error-banner"><AlertTriangle size={14} />{err}</div>}
+    {msg && <div className="access-notice">{msg}</div>}
+    <div className="access-account-list">
+      {ids.map((id) => {
+        const s = scopes[id] || { mode: "ALL_BRANDS", brandKeys: [] };
+        const isSel = s.mode === "SELECTED_BRANDS";
+        return <div key={id} className="access-scope-row" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "6px 0", borderBottom: "1px solid var(--border-default)", flexWrap: "wrap" }}>
+          <span style={{ minWidth: 140, flex: "1 1 160px" }}>{nameOf(id)}</span>
+          <span className={"access-role " + (isSel ? "role-viewer" : "role-editor")} style={{ whiteSpace: "nowrap" }}>{isSel ? `${(s.brandDisplays || s.brandKeys || []).length} brand${(s.brandDisplays || s.brandKeys || []).length === 1 ? "" : "s"}` : "All brands"}</span>
+          <button type="button" className="secondary-action" onClick={() => openEditor(id)} style={{ padding: "3px 10px" }}>Edit brands</button>
+        </div>;
+      })}
+    </div>
+    {openAccount && <div className="panel" style={{ marginTop: 10, padding: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <strong>{nameOf(openAccount)}</strong>
+        <button type="button" className="icon-action" onClick={() => setOpenAccount("")} title="Close"><X size={15} /></button>
+      </div>
+      <label className="access-account-check" style={{ display: "flex", gap: 7 }}><input type="radio" name="brandmode" checked={draftMode === "ALL_BRANDS"} onChange={() => setDraftMode("ALL_BRANDS")} /><span>All brands in this account (includes brands added later)</span></label>
+      <label className="access-account-check" style={{ display: "flex", gap: 7 }}><input type="radio" name="brandmode" checked={draftMode === "SELECTED_BRANDS"} onChange={() => setDraftMode("SELECTED_BRANDS")} /><span>Selected brands only</span></label>
+      {draftMode === "SELECTED_BRANDS" && <div style={{ marginTop: 8 }}>
+        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search brands…" aria-label="Search brands" style={{ width: "100%", padding: "5px 8px", marginBottom: 6, borderRadius: 6, border: "1px solid var(--border-strong)" }} />
+        <div className="access-account-list" style={{ maxHeight: 220, overflowY: "auto" }}>
+          {list.length === 0 && <div className="empty-note">No proven brands for this account yet.</div>}
+          {shown.map((b) => <label className="access-account-check" key={b.key}><input type="checkbox" checked={draftKeys.has(b.key)} onChange={() => toggleKey(b.key)} /><span>{b.display}</span></label>)}
+        </div>
+        <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 4 }}>{draftKeys.size} selected. A newly discovered brand is NOT added automatically.</div>
+      </div>}
+      <button type="button" className="auth-submit" onClick={save} disabled={busy} style={{ marginTop: 10 }}>{busy ? "Saving…" : "Save brand access"}</button>
+    </div>}
+  </div>;
+}
+
 function AccessPanel({ accessToken, accounts, onLoadAccounts }) {
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -1149,7 +1238,7 @@ function AccessPanel({ accessToken, accounts, onLoadAccounts }) {
     {editingUserId && (() => {
       const user = users.find((candidate) => candidate.id === editingUserId);
       if (!user) return null;
-      return <div className="panel access-editor"><div className="panel-head"><div><div className="panel-title">Edit access</div><div className="page-sub">{user.email}</div></div><button className="icon-action" type="button" onClick={() => setEditingUserId("")} title="Close"><X size={15} /></button></div>{user.role === "admin" ? <div className="empty-note">The initial administrator remains protected in this panel.</div> : <><label className="auth-field"><span>Role</span><select value={editRole} onChange={(e) => setEditRole(e.target.value)}><option value="viewer">Viewer</option><option value="editor">Editor</option></select></label><div className="access-field-label">Allowed Amazon accounts</div><div className="access-account-list">{accounts.map((account) => <label className="access-account-check" key={account.id}><input type="checkbox" checked={editAccountIds.includes(account.id)} onChange={() => toggle(account.id, setEditAccountIds)} /><span>{FLAGS[account.country] || ""} {account.name}</span></label>)}</div><button className="auth-submit" type="button" onClick={saveEdit} disabled={loading}>Save access</button></>}</div>;
+      return <div className="panel access-editor"><div className="panel-head"><div><div className="panel-title">Edit access</div><div className="page-sub">{user.email}</div></div><button className="icon-action" type="button" onClick={() => setEditingUserId("")} title="Close"><X size={15} /></button></div>{user.role === "admin" ? <div className="empty-note">The initial administrator remains protected in this panel.</div> : <><label className="auth-field"><span>Role</span><select value={editRole} onChange={(e) => setEditRole(e.target.value)}><option value="viewer">Viewer</option><option value="editor">Editor</option></select></label><div className="access-field-label">Allowed Amazon accounts</div><div className="access-account-list">{accounts.map((account) => <label className="access-account-check" key={account.id}><input type="checkbox" checked={editAccountIds.includes(account.id)} onChange={() => toggle(account.id, setEditAccountIds)} /><span>{FLAGS[account.country] || ""} {account.name}</span></label>)}</div><button className="auth-submit" type="button" onClick={saveEdit} disabled={loading}>Save access</button><BrandScopeManager accessToken={accessToken} userId={user.id} grantedAccountIds={user.accountIds} accounts={accounts} /></>}</div>;
     })()}
   </div>;
 }
@@ -1214,6 +1303,24 @@ function removeUnauthorizedCachedData(allowedAccountIds, isAdmin) {
   } catch (e) {
     // Browser storage can be unavailable; server authorization remains final.
   }
+}
+
+// Phase 11: a CLIENT access fingerprint mirroring the server's -- changes whenever account access, a brand-scope
+// mode, the selected brands, or the role changes. Used to invalidate ALL of this user's cached report data on any
+// permission mutation so a broader pre-change payload (or a pre-restriction brand list) can never survive.
+function accessFingerprintClient(access) {
+  const grants = access && access.accountGrants ? access.accountGrants : {};
+  const parts = Object.keys(grants).sort().map((a) => { const g = grants[a] || {}; const keys = Array.isArray(g.brandKeys) ? [...g.brandKeys].sort() : []; return `${a}:${g.mode || "ALL_BRANDS"}:${keys.join("|")}`; });
+  return JSON.stringify({ u: (access && access.userId) || "", r: (access && access.role) || "", g: parts });
+}
+// Remove EVERY cached report entry for the current owner from localStorage (a full purge, regardless of account).
+function purgeAllOwnerReportCacheLocal() {
+  const ownerPrefix = API_CACHE_PREFIX + encodeURIComponent(apiCacheOwner) + ":";
+  try {
+    const keys = [];
+    for (let i = 0; i < window.localStorage.length; i++) { const k = window.localStorage.key(i); if (k && k.startsWith(ownerPrefix)) keys.push(k); }
+    keys.forEach((k) => window.localStorage.removeItem(k));
+  } catch (e) { /* storage may be unavailable; server authorization is final */ }
 }
 
 function writeApiCache(params, body) {
@@ -1486,9 +1593,20 @@ function DashboardApp({ session, access, onSignOut }) {
   const allowedAccountIds = useMemo(() => new Set(access.accountIds || []), [access.accountIds]);
   useEffect(() => {
     configureApiSession(session);
+    // Phase 11: on ANY access-fingerprint change (account added/removed, brand-scope mode, selected brands, role),
+    // purge ALL of this user's cached report data so a broader pre-change payload or brand list can never persist.
+    try {
+      const fpKey = `upriver:accessfp:${access.userId || "anon"}`;
+      const fp = accessFingerprintClient(access);
+      if (window.localStorage.getItem(fpKey) !== fp) {
+        purgeAllOwnerReportCacheLocal();
+        void clearAllOwnerLargeCache();
+        window.localStorage.setItem(fpKey, fp);
+      }
+    } catch (e) { /* storage may be unavailable; server authorization is final */ }
     removeUnauthorizedCachedData(access.accountIds || [], isAdmin);
     void removeUnauthorizedLargeCachedData(access.accountIds || [], isAdmin);
-  }, [session, access.accountIds, isAdmin]);
+  }, [session, access.accountIds, access.accountGrants, access.userId, isAdmin]);
 
   const [accounts, setAccounts] = useState([]);
   const [accountsLoading, setAccountsLoading] = useState(true);
@@ -3335,6 +3453,18 @@ function DashboardApp({ session, access, onSignOut }) {
     const names = new Set([...cachedAccountBrands, ...currentSnapshotBrands, ...currentRowBrands]);
     return [...names].sort((a, b) => a.localeCompare(b));
   }, [cachedAccountBrands, catalogBrands, catalogBrandsAccountId, rows, selectedAccountId]);
+  // BRAND-SCOPE (frontend UX; the server is the security boundary): is the selected account brand-limited for this
+  // user? The served brand list is ALREADY projected to permitted brands server-side, so this only drives the label
+  // + single-brand auto-select.
+  const brandRestricted = useMemo(() => {
+    if (isAdmin || !selectedAccountId) return false;
+    const g = access.accountGrants && access.accountGrants[selectedAccountId];
+    return !!(g && g.mode === "SELECTED_BRANDS");
+  }, [isAdmin, selectedAccountId, access.accountGrants]);
+  // If exactly one brand is permitted, auto-select it (the mission's single-permitted-brand rule).
+  useEffect(() => {
+    if (brandRestricted && brandList.length === 1 && selectedBrand === "ALL") setSelectedBrand(brandList[0]);
+  }, [brandRestricted, brandList, selectedBrand]);
   const portfolioBrandList = useMemo(() => {
     const names = new Set(brandDirectoryBrands);
     accounts.forEach((account) => cachedBrandsForAccount(account.id).forEach((brand) => names.add(brand)));
@@ -3656,6 +3786,7 @@ function DashboardApp({ session, access, onSignOut }) {
             brands={view === "fbaplan" ? planBrandOptions : brandList}
             selectedBrand={selectedBrand}
             onBrandChange={setSelectedBrand}
+            brandAllLabel={brandRestricted ? "All permitted brands" : "All brands"}
             dashboardMode={view === "dashboard" ? dashboardMode : "account"}
             onDashboardModeChange={view === "dashboard" ? setDashboardMode : undefined}
             portfolioBrands={portfolioBrandList}
@@ -4935,4 +5066,19 @@ async function removeUnauthorizedLargeCachedData(allowedAccountIds, isAdmin) {
   } catch (e) {
     // Server authorization remains the final protection if IndexedDB is unavailable.
   }
+}
+
+// Phase 11: clear EVERY large cached report entry for the current owner (a full purge on an access-fingerprint change).
+async function clearAllOwnerLargeCache() {
+  const ownerPrefix = API_CACHE_PREFIX + encodeURIComponent(apiCacheOwner) + ":";
+  try {
+    const db = await openLargeCache();
+    await new Promise((resolve, reject) => {
+      const store = db.transaction(LARGE_CACHE_STORE, "readwrite").objectStore(LARGE_CACHE_STORE);
+      const cursor = store.openCursor();
+      cursor.onsuccess = () => { const cur = cursor.result; if (!cur) { resolve(); return; } if (String(cur.key || "").startsWith(ownerPrefix)) cur.delete(); cur.continue(); };
+      cursor.onerror = () => reject(cursor.error);
+    });
+    db.close();
+  } catch (e) { /* IndexedDB may be unavailable; server authorization is final */ }
 }
