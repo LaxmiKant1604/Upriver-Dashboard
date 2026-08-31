@@ -13675,3 +13675,62 @@ sku-movement) instead of re-fetching fba-plan:oli-sales -> eliminates the 1200-t
 just FBA Health + AWD (+ catalog), ~80-130 tokens, reusing proven architecture. Needs a fba-plan derive change (read
 OLI from durable history). Awaiting direction: (a) authorize ~366-token batched re-fetch as-is, (b) do the
 durable-OLI refactor first (cheaper), or (c) hold. See [[fba-plan-advanced]].
+
+================================================================================
+2026-09-01 -- SKU Movement v2: ASIN-grain + selectable N window + manual identifiers + column chooser (LIVE, zero export)
+================================================================================
+Shipped end-to-end (code 94ed9ef pushed origin/main; migration 20260912 applied). Built ONLY from durable OLI +
+Product Catalog evidence -- NO DataDoe report/export/token; scheduler, source controls, OLI contracts, Daily,
+Dashboard, Brand View, FBA, Ads all UNTOUCHED (full verify 99 steps / 77 suites green). creates=0 tokens=0.
+
+WHAT CHANGED
+  * ROW GRAIN is now ASIN: one row per organization+account+marketplace+currency+ASIN. Multiple legitimate SKUs of
+    one ASIN aggregate into ONE row (units summed, no double count). A SKU with no resolvable ASIN stays an honest
+    per-SKU Unmapped row (never attached to an ASIN). Representative SKU excludes case-insensitive amzn* return SKUs
+    (em dash / "No seller SKU" when all are amzn); its units still count.
+  * DEFAULT window 5 -> 7; user-selectable N (1..30). The snapshot carries a 60-day sparse daily-unit history per row
+    (lib/sku-movement-window.js) so Last N / Previous N / move% / status recompute CLIENT-side with the SAME shared
+    math -- never a refetch, never DataDoe.
+  * MANUAL per-(account, ASIN) Identifier column (before SKU): inline edit + bulk download/upload (CSV/XLSX). Server
+    derives marketplace + org fingerprint + re-validates ownership + ASIN membership; all-or-nothing bulk; blank =
+    clear; length(<=120) + control-char guards. Identifiers JOIN at serve (api/datadoe.js withIdentifiers), kept OUT
+    of the snapshot so a re-derive NEVER erases them.
+  * COLUMN chooser + window N persist per USER (reuses fba_plan_column_prefs under report_key 'sku-movement' + an
+    additive prefs jsonb). ASIN never hideable.
+  * SNAPSHOT VERSION bumped sku-movement/v1 -> v2: a stale SKU-grain v1 snapshot can never serve/be reinterpreted as
+    v2 (params-hash folds the version); the read-path self-heal re-derives v2 (zero export).
+
+MIGRATION 20260912 (applied + prod-verified, least-privilege confirmed live): sku_movement_identifier (PK org+conn+
+account+marketplace+child_asin; identifier <=120 + !~ '[[:cntrl:]]'; audit fields) + sku_movement_identifier_audit +
+record_sku_movement_identifier (single upsert-or-clear+audit) + record_sku_movement_identifier_bulk (all-or-nothing,
+rejects conflicting-duplicate ASIN, <=5000 rows). RLS: SELECT to authenticated (account_permissions OR admin) only;
+DML+RPC execute to service_role only (anon/authenticated revoked). Plus fba_plan_column_prefs.prefs jsonb (additive;
+FBA's hidden_columns use byte-unchanged).
+
+NEW FILES: lib/sku-movement-window.js (shared pure math), api/sku-movement-identifier.js, api/sku-movement-prefs.js,
+src/lib/sku-movement-import.js, src/views/SkuMovement.jsx (rewritten). Tests: sku-movement(.test) 20, integration 18,
+identifier-api 10, import 12, v2-rederive 9 + brand-view-render fixture -> v2. New verify suites registered.
+
+PRODUCTION READ-BACKS (all zero-export):
+  * Backfill APPLY: 30/30 published, creates=0 tokens=0 (scripts/release/backfill-sku-movement.mjs).
+  * scripts/release/verify-sku-movement-v2.mjs: 30/30 PASS on GRAIN (rowCount == distinct grain keys),
+    CONSERVATION (v2 payload completed-month units == the raw MERGED ordered-unit history for the same months --
+    EXACT for every account), and no-amzn representative SKU. Row totals v1(SKU-grain) 1862 -> v2(ASIN-grain) 1627 =
+    235 duplicate SKU rows collapsed (e.g. 26f7a1a6 56->20, fd7653e8 697->565, 12f3a683 283->246). Brand isolation:
+    a named-brand re-derive ("Brilliant Kids") yields ONLY that brand, brandFiltered=true.
+  * NOTE: some accounts' v2 unit totals are HIGHER than the old v1 snapshot (e.g. 916be46e 1168 -> 2101). PROVEN
+    correct: v2's total == the raw ordered merge (priced + explicit-zero + pending-with-SKU); the OLD v1 snapshots
+    were priced-only undercounts -- exactly what the version bump supersedes. Same source_refreshed_at, not stale
+    evidence: the improvement is the ordered-units policy, not a defect.
+  * Identifier RPCs proved in prod via a ROLLED-BACK transaction (17/17): single set/clear/upsert, atomic bulk,
+    audit append, and every guard (over-long, control-char, blank ASIN, conflicting-duplicate bulk) rejects with
+    zero write; ROLLBACK left zero net mutation. Cross-account write impossible at the DB layer (authenticated has no
+    DML; RPCs service-role-only) and refused at the API layer BEFORE any mutation (assertAccountAccess, unit-tested).
+
+RESPONSIVE: reuses the proven primitives -- .plan-scroll (overflow-x:auto; max-width:100% -> wide table scrolls
+inside its container, no body horizontal overflow; ASIN/Identifier/SKU sticky columns pinned), .skupl-toolbar
+(flex-wrap:wrap), .rvkpi-grid-5 (5->3->2 cols at 1180/640). Pixel-perfect visual pass in a real browser at
+1440/1280/768/390 is the one step not executable headlessly here.
+
+PENDING (external): confirm the deployed Vercel SHA in the dashboard (push to origin/main @ 94ed9ef triggers the
+auto-deploy; no Vercel token/prod URL available here). See [[sku-movement-live]], [[oli-operational-units-feature]].
