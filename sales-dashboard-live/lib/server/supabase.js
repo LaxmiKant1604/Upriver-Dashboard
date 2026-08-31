@@ -1948,7 +1948,7 @@ export async function getSourceOliSalesEstimateRows({ organizationFingerprint, c
   try {
     for (let offset = 0; ; offset += PAGE) {
       const query = new URLSearchParams({
-        select: "account_id,seller_or_vendor_id,sale_date,sku,child_asin,currency,target_quantity,estimated_sales,reference_date,reference_unit_price,matching_method,reference_source_request_hash,target_source_request_hash,calculated_at",
+        select: "account_id,seller_or_vendor_id,marketplace_country_code,sale_date,sku,child_asin,currency,target_quantity,estimated_sales,reference_date,reference_unit_price,matching_method,reference_source_request_hash,target_source_request_hash,calculated_at",
         organization_fingerprint: `eq.${organizationFingerprint}`,
         connection_id: `eq.${connectionId}`,
         sale_date: `gte.${from}`,
@@ -1997,6 +1997,7 @@ export async function replaceOliSalesEstimatesWindow({ organizationFingerprint, 
         p_covered_to: coveredTo,
         p_estimate_rows: estimateRows.map((r) => ({
           seller_or_vendor_id: r.sellerOrVendorId ?? r.seller_or_vendor_id,
+          marketplace_country_code: r.marketplaceCountryCode ?? r.marketplace_country_code,
           sale_date: r.saleDate ?? r.sale_date,
           sku: String(r.sku ?? ""),
           child_asin: String(r.childAsin ?? r.child_asin ?? ""),

@@ -894,6 +894,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       for (const a of accounts) {
         await recomputeSalesEstimates({
           organizationFingerprint: orgFingerprint, connectionId: "primary", accountId: a.accountId,
+          accountMarketplace: a.country, // the account's AUTHORITATIVE marketplace (engine normalizes UK->GB)
           from: estRecomputeFrom, to: estTo,
           readOperationalUnits: readOperationalUnitsForEstimate,
           readDimensionalRows: readDimensionalRowsForEstimate,

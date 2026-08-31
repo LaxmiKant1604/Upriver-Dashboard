@@ -64,7 +64,7 @@ group("recomputeOliSalesEstimatesWindow: durable truth in, atomic replace out");
 
 test("recompute writes an estimate for a missing-price grain from a dimensional reference", async () => {
   const h = harness({ operationalRows: [opRow("2026-08-29", { pending: 3 })], referenceRows: [dimRow("2026-08-29", 100)] });
-  const r = await RECOMP.recomputeOliSalesEstimatesWindow({ organizationFingerprint: ORG, accountId: ACC, from: "2026-08-01", to: "2026-08-31", ...h, calculatedAt: "T" });
+  const r = await RECOMP.recomputeOliSalesEstimatesWindow({ organizationFingerprint: ORG, accountId: ACC, accountMarketplace: "IN", from: "2026-08-01", to: "2026-08-31", ...h, calculatedAt: "T" });
   assert.equal(r.estimates.length, 1);
   assert.equal(r.estimates[0].estimatedSales, 300);
   assert.equal(h.writes.length, 1);
@@ -72,7 +72,7 @@ test("recompute writes an estimate for a missing-price grain from a dimensional 
 });
 
 test("recompute is IDEMPOTENT: same durable evidence -> byte-identical estimate rows", async () => {
-  const args = { organizationFingerprint: ORG, accountId: ACC, from: "2026-08-01", to: "2026-08-31", calculatedAt: "T" };
+  const args = { organizationFingerprint: ORG, accountId: ACC, accountMarketplace: "IN", from: "2026-08-01", to: "2026-08-31", calculatedAt: "T" };
   const a = await RECOMP.recomputeOliSalesEstimatesWindow({ ...args, ...harness({ operationalRows: [opRow("2026-08-29", { pending: 3 })], referenceRows: [dimRow("2026-08-29", 100)] }) });
   const b = await RECOMP.recomputeOliSalesEstimatesWindow({ ...args, ...harness({ operationalRows: [opRow("2026-08-29", { pending: 3 })], referenceRows: [dimRow("2026-08-29", 100)] }) });
   assert.deepEqual(a.estimates, b.estimates);
@@ -80,7 +80,7 @@ test("recompute is IDEMPOTENT: same durable evidence -> byte-identical estimate 
 
 test("ACTUAL supersedes: once itemized (no missing units) the estimate window is CLEARED (empty write)", async () => {
   const h = harness({ operationalRows: [opRow("2026-08-29", { priced: 3, pending: 0 })] }); // additiveOnly filters it out
-  const r = await RECOMP.recomputeOliSalesEstimatesWindow({ organizationFingerprint: ORG, accountId: ACC, from: "2026-08-01", to: "2026-08-31", ...h, calculatedAt: "T" });
+  const r = await RECOMP.recomputeOliSalesEstimatesWindow({ organizationFingerprint: ORG, accountId: ACC, accountMarketplace: "IN", from: "2026-08-01", to: "2026-08-31", ...h, calculatedAt: "T" });
   assert.equal(r.estimates.length, 0);
   assert.equal(h.writes.length, 1);
   assert.deepEqual(h.writes[0], [], "the window is cleared so a resolved grain leaves no estimate (no double-count)");
@@ -88,7 +88,7 @@ test("ACTUAL supersedes: once itemized (no missing units) the estimate window is
 
 test("no reference within 7 days -> unresolved, empty estimate write (grain stays in the breakdown)", async () => {
   const h = harness({ operationalRows: [opRow("2026-08-29", { pending: 2 })], referenceRows: [dimRow("2026-08-10", 100)] });
-  const r = await RECOMP.recomputeOliSalesEstimatesWindow({ organizationFingerprint: ORG, accountId: ACC, from: "2026-08-01", to: "2026-08-31", ...h, calculatedAt: "T" });
+  const r = await RECOMP.recomputeOliSalesEstimatesWindow({ organizationFingerprint: ORG, accountId: ACC, accountMarketplace: "IN", from: "2026-08-01", to: "2026-08-31", ...h, calculatedAt: "T" });
   assert.equal(r.estimates.length, 0);
   assert.equal(r.unresolved.length, 1);
   assert.deepEqual(h.writes[0], []);

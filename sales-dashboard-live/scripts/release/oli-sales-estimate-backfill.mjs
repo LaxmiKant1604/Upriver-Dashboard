@@ -36,13 +36,15 @@ const LOOKBACK_ONLY_DAYS = Number(process.env.ESTIMATE_BACKFILL_DAYS || 0); // 0
 
 const sb = await import("../../lib/server/supabase.js");
 const { recomputeOliSalesEstimatesWindow } = await import("../../lib/server/sync/oli-sales-estimate-recompute.js");
+const { normalizeMarketplace } = await import("../../lib/server/sync/oli-sales-estimate.js");
 const { addDaysStr } = await import("../../lib/server/date-windows.js");
 const pg = (await import("pg")).default;
 
 if (!process.env.POSTGRES_URL) { console.error("POSTGRES_URL is required."); process.exit(1); }
 
-// Resolve org fingerprint + accounts + per-account date span from the durable operational-units table itself
-// (NO DataDoe key needed -- the rows are already stamped with the organization fingerprint).
+// Resolve org fingerprint + accounts + per-account date span from the durable operational-units table, AND the
+// authoritative account->marketplace mapping from the COMPLETE account-directory snapshot (never inferred from
+// currency; an account absent from the snapshot is left unresolved -> its window is cleared, never guessed).
 async function loadScope() {
   const u = new URL(process.env.POSTGRES_URL); u.searchParams.set("sslmode", "no-verify");
   const c = new pg.Client({ connectionString: u.toString() });
@@ -54,11 +56,19 @@ async function loadScope() {
       "where (explicit_zero_units > 0 or pending_units > 0) " +
       "group by organization_fingerprint, connection_id, account_id order by account_id"
     )).rows;
-    return rows;
+    const snap = (await c.query("select payload from public.report_snapshots where report_key='account-directory' order by updated_at desc limit 1")).rows[0];
+    const accts = (snap && snap.payload && Array.isArray(snap.payload.accounts)) ? snap.payload.accounts : [];
+    const mktByAccount = new Map();
+    for (const a of accts) {
+      const id = String(a.accountId || a.id || a.account_id || "").trim();
+      const mkt = normalizeMarketplace(a.country || a.marketCountry || a.marketplace);
+      if (id && !id.includes(":") && mkt) mktByAccount.set(id, mkt);
+    }
+    return { rows, mktByAccount };
   } finally { await c.end(); }
 }
 
-const scope = await loadScope();
+const { rows: scope, mktByAccount } = await loadScope();
 if (!scope.length) { console.log("No accounts have missing/zero-price operational units -> nothing to estimate."); process.exit(0); }
 const orgFingerprint = scope[0].organization_fingerprint;
 console.log(`org=${String(orgFingerprint).slice(0, 8)} | accounts with missing/zero units: ${scope.length} | mode=${APPLY ? "APPLY (writes)" : "DRY-RUN (no writes)"}${LOOKBACK_ONLY_DAYS ? ` | last ${LOOKBACK_ONLY_DAYS} days only` : ""}`);
@@ -80,15 +90,23 @@ const monthsBetween = (from, to) => {
 
 let totals = { accounts: 0, estimated: 0, unresolved: 0, windows: 0 };
 const ceiling = LOOKBACK_ONLY_DAYS ? addDaysStr(new Date().toISOString().slice(0, 10), -1) : null;
+let skippedNoMkt = 0;
 for (const s of scope) {
   const accountId = s.account_id;
   const connectionId = s.connection_id || "primary";
+  const accountMarketplace = mktByAccount.get(accountId) || "";
   let from = s.from_date; const to = s.to_date;
   if (LOOKBACK_ONLY_DAYS && ceiling) { const cut = addDaysStr(ceiling, -(LOOKBACK_ONLY_DAYS - 1)); if (cut > from) from = cut; }
+  if (!accountMarketplace) {
+    // No authoritative marketplace -> fail closed: clear any prior estimate window (never guess) and leave the
+    // grains unresolved. Still runs the recompute (which writes []) so a stale estimate can never linger.
+    skippedNoMkt += 1;
+    console.log(`  ${accountId.slice(0, 6)} [${from}..${to}] NO authoritative marketplace -> unresolved (fail closed)`);
+  }
   let acctEst = 0; let acctUnres = 0; let acctWin = 0;
   for (const win of monthsBetween(from, to)) {
     const r = await recomputeOliSalesEstimatesWindow({
-      organizationFingerprint: orgFingerprint, connectionId, accountId, from: win.from, to: win.to,
+      organizationFingerprint: orgFingerprint, connectionId, accountId, accountMarketplace, from: win.from, to: win.to,
       readOperationalUnits: sb.getSourceOliOperationalUnitRows,
       readDimensionalRows: sb.getSourceOliDimensionalUnitRows,
       // DRY-RUN never writes: a no-op writer that reports what WOULD be written.
@@ -98,6 +116,7 @@ for (const s of scope) {
     if (APPLY && r.write && r.write.write !== "ok") { console.error(`  WRITE FAILED account=${accountId.slice(0, 6)} window=${win.from}..${win.to} (${r.write.error})`); }
   }
   totals.accounts += 1; totals.estimated += acctEst; totals.unresolved += acctUnres; totals.windows += acctWin;
-  console.log(`  ${accountId.slice(0, 6)} [${from}..${to}] months=${acctWin} estimated=${acctEst} unresolved=${acctUnres}`);
+  console.log(`  ${accountId.slice(0, 6)} [${from}..${to}] mkt=${accountMarketplace || "(none)"} months=${acctWin} estimated=${acctEst} unresolved=${acctUnres}`);
 }
+if (skippedNoMkt) console.log(`WARN ${skippedNoMkt} account(s) had no authoritative marketplace -> left unresolved (fail closed)`);
 console.log(`\nDONE ${APPLY ? "(APPLIED)" : "(DRY-RUN)"}: accounts=${totals.accounts} windows=${totals.windows} estimatedGrains=${totals.estimated} unresolvedGrains=${totals.unresolved}`);
