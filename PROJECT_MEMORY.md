@@ -1,5 +1,40 @@
 # Project Memory
 
+## OLI sales estimates -- durable MARKETPLACE isolation (2026-08-31)
+
+Codex re-review closed: account + currency do NOT identify a marketplace (BE/DE/ES/FR/IT/NL all use EUR), so a
+same-seller, same-ASIN/SKU EUR reference from another country could theoretically have been used. Closed AT THE
+ESTIMATOR (the locus of the cross-marketplace risk), structurally + with executable proof.
+
+- **Read-only reconciliation (production)**: every account maps to exactly ONE marketplace (from the complete
+  report_snapshots account-directory snapshot; UK/GB normalized to GB) -- 0 ambiguous, 0 multi-marketplace, 0
+  seller ids shared across accounts, all 30 dimensional accounts uniquely resolvable. So the authoritative
+  marketplace is uniquely proven per account and NEVER inferred from currency; zero re-fetch, zero tokens.
+- **Engine (oli-sales-estimate.js)**: the matching key now carries a CANONICAL marketplace (normalizeMarketplace,
+  UK->GB) between account and currency; every account has ONE authoritative marketplace; every reference AND target
+  is validated against it and REJECTED if it differs (fail closed); a blank authoritative marketplace leaves every
+  grain unresolved (never guessed). Keys are now unambiguous JSON arrays (removed a hidden 0x01 separator).
+- **Grain**: migration 20260908 recreates source_oli_sales_estimates with marketplace_country_code (NONBLANK,
+  canonical) IN THE PK -- a grain is isolated per marketplace. The atomic replace RPC + reader/writer carry it. The
+  recompute (runtime a.country), the self-heal, and the zero-token backfill (account-directory snapshot mapping) all
+  pass the account's authoritative marketplace.
+- **Scope note**: marketplace is enforced at the ESTIMATOR, NOT added to the raw source_oli_dimensional_history /
+  source_oli_operational_units grain -- OLI is fetched in MULTI-marketplace batches (a non-us batch mixes DE/IN/UK;
+  unlike FBA which partitions by marketplace), and adding marketplace_country_code to the shared OLI_SALES_COLUMNS
+  auto-flips marketplaceScoped=true (report-source-contracts.js:1759) which would break those batches. The estimator
+  binds each account's AUTHORITATIVE marketplace (reconciliation-proven uniquely correct) to every reference +
+  target instead, functionally equivalent to a stamped raw grain for single-marketplace accounts, without risking
+  the most critical OLI ingestion RPC.
+- **Tests**: 7 new marketplace regressions (DE never uses an FR price; same seller across EUR marketplaces stays
+  isolated; UK/GB equivalence; blank fails closed; target-marketplace mismatch unresolved; INR/USD byte-identical) --
+  each doubles as a mutation guard (fails if the marketplace check is weakened). 35 engine + 10 integration
+  assertions. verify 95/74 green.
+- **Commit b515803, migration 20260908 applied.** Backfill: 1,497 estimate grains re-tagged by marketplace (IN
+  1,145 / US 352, each single-currency), 0 blank marketplace, 0 estimates whose marketplace != the account's
+  authoritative marketplace, values byte-identical to before (single-marketplace accounts). Daily + Brand re-derive:
+  already-current (0 republished, 0 tokens) -- no regression. Live read-back: account 59f12ccc 2026-06-24 still
+  served 46,302 (priced 38,879 + estimate 7,423, marketplace IN).
+
 ## OLI sales estimates — fill missing/zero-price sales from same-product historical prices (2026-08-31)
 
 LIVE + production-verified. Non-cancelled OLI units with a MISSING (pending itemization) or ZERO
