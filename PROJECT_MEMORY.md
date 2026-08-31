@@ -1,5 +1,43 @@
 # Project Memory
 
+## OLI sales estimates -- fail-closed marketplace AUTHORITY + canonical DB enforcement (2026-08-31)
+
+Final durability gap closed: the account->marketplace AUTHORITY is now permanently fail-closed if directory data is
+ever missing or ambiguous (the earlier work enforced isolation but the backfill still built its account->marketplace
+map with last-write-wins `Map.set`, which would silently pick ONE marketplace for an ambiguous account).
+
+- **ONE shared resolver** `resolveUniqueMarketplaceByAccount(directoryAccounts)` in `oli-sales-estimate.js` (pure):
+  groups EVERY directory row per canonical account id into a SET of canonical marketplaces (normalizeMarketplace,
+  UK->GB) -- NO last-write-wins. size 1 => `unique`; size 0 => `missing`; size >1 => `ambiguous`. Marketplace is read
+  ONLY from the directory marketplace/country field -- NEVER inferred from currency/seller/ASIN/SKU/connection/bucket.
+  `authoritativeMarketplace(map, id)` returns the marketplace ONLY when unique, else "" (fail closed).
+  `summarizeMarketplaceResolution` gives redacted telemetry (short-hashed ids only).
+- **Both estimate authorities use it**: `oli-sales-estimate-backfill.mjs` (replaced the last-write-wins map) and
+  `source-bucket-sync-runtime.js` (replaced `a.country`). unique => estimate under that canonical marketplace;
+  missing/ambiguous => the recompute still runs with "" so it resolves NOTHING and writes [] -> the estimate window
+  is CLEARED (no stale estimate lingers) and the grains stay unresolved. Typed, non-silent, redacted diagnostics
+  `OLI_ESTIMATE_MARKETPLACE_MISSING` / `OLI_ESTIMATE_MARKETPLACE_AMBIGUOUS`. Fully additive + non-fatal: the priced
+  Total Sales, unit counts, scheduler, manual sync, force-latest, and LKG are never touched or blocked by this step.
+- **Migration 20260909** (additive, idempotent, applied via the guarded-tracked path -- transaction + record in
+  app_schema_migrations, applied ALONE since db:migrate would also re-touch the already-applied-but-untracked
+  20260906; 20260908 untouched): a CHECK constraint (`marketplace_country_code = upper(btrim(...))` AND `~ '^[A-Z]{2}$'`
+  AND `<> 'UK'`) + the atomic replace RPC now rejects blank/lowercase/whitespace-padded/UK/malformed marketplace
+  values BEFORE any delete/insert (one malformed row => zero mutation), and stores `upper(btrim(...))`. PK, RLS,
+  least-privilege grants, security-definer all preserved.
+- **Proof (production)**: constraint present; RPC body carries the canonical validation; existing 1,497 rows preserved
+  (all IN/US canonical, CHECK passed); RLS on + service_role EXECUTE. RPC probe (savepoints, rolled back, zero real
+  mutation 1497->1497): rejected "", "uk", "UK", "de", " DE ", "D1", "XYZ", "gb"; accepted canonical "DE"/"GB".
+  Backfill via the new resolver: marketplace authority unique=30 missing=0 ambiguous=0, estimatedGrains=1497
+  (byte-identical), zero-token. Invariants: 0 non-canonical/blank/UK/lowercase/padded, 0 whose marketplace != the
+  account's UNIQUE authoritative, 0 for a non-unique account, 0 whose reference is not a same-account (=same-marketplace)
+  priced row. Daily + Brand re-derive already-current (0 republished, 0 tokens; LKG-safe). +13 tests (8 resolver
+  incl. order-independence + last-write-wins mutation guard; 5 orchestration fail-closed incl. stale-window clear on
+  unique->ambiguous flip + base-priced-unchanged): engine 43, integration 15, verify 95/74.
+- **Untouched (scope)**: raw OLI export contract + `source_oli_dimensional_history`/`source_oli_operational_units`
+  grain (OLI still fetched in multi-marketplace batches; marketplaceScoped never flipped); batching; sales formulas;
+  units; Ads; FBA; Catalog; report identities; scheduler timing; publication controls; other dashboards. **Commit
+  f5e5615** (code/tests/migration), docs separate. No DataDoe export, 0 tokens.
+
 ## OLI sales estimates -- durable MARKETPLACE isolation (2026-08-31)
 
 Codex re-review closed: account + currency do NOT identify a marketplace (BE/DE/ES/FR/IT/NL all use EUR), so a
