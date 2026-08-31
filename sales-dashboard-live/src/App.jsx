@@ -2656,11 +2656,16 @@ function DashboardApp({ session, access, onSignOut }) {
   const dailyCurrency = selectedMarketplace.currency || "INR";
   const refreshScopeAccount = accountById[selectedAccountId];
   const dailyReport = useMemo(() => {
-    // The sales source can emit a newer zero-sales row before its daily data
-    // arrives. Anchor to the latest completed sales date, not that placeholder.
+    // The report HORIZON is the ACCOUNT's latest proven date (dailyCompleteness.latestDate -- account-level, read
+    // live from source_oli_completeness, IDENTICAL for All Brands and every named brand), NOT the selected brand's
+    // last sale. So a covered date on which the selected brand had no activity still renders (as an honest numeric
+    // zero -- the per-column sum below is 0) instead of shortening the table to the brand's last-sold date. Fall
+    // back to the latest sales-bearing row (then any row) only when completeness is unavailable.
     const yesterday = addDays(TODAY, -1);
     const rowsWithSales = dailyRows.filter((r) => Number(r.total_sales) > 0 || Number(r.total_units_sold) > 0);
-    let latest = rowsWithSales.reduce((mx, r) => (!mx || r.date > mx ? r.date : mx), null)
+    const coverageLatest = dailyCompleteness && /^\d{4}-\d{2}-\d{2}$/.test(String(dailyCompleteness.latestDate || "")) ? dailyCompleteness.latestDate : null;
+    let latest = coverageLatest
+      || rowsWithSales.reduce((mx, r) => (!mx || r.date > mx ? r.date : mx), null)
       || dailyRows.reduce((mx, r) => (!mx || r.date > mx ? r.date : mx), null)
       || yesterday;
     if (latest > yesterday) latest = yesterday;
@@ -2679,7 +2684,7 @@ function DashboardApp({ session, access, onSignOut }) {
     });
     return { latest, columns, cells };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dailyRows]);
+  }, [dailyRows, dailyCompleteness]);
 
   // Derived FBA Shipment Plan: raw rows -> computed metrics -> filter -> sort.
   // Everything here is local, so search/sort/target/config changes never refetch (ZERO DataDoe).

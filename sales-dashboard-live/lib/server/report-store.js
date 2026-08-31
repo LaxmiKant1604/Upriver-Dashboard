@@ -202,8 +202,24 @@ export async function serveSharedReport({
   // When set (a makeRouteDeadline handle), the REFRESH build is bounded: on ROUTE_DEADLINE_EXCEEDED the caller
   // serves the last-known-good + `updating:true` (HTTP 200), never a 504. Default null = unbounded (unchanged).
   routeDeadline = null,
+  // FRESHNESS-BY-COVERAGE-ADVANCE (Daily Reporting): the account's CURRENT latest proven durable date (YYYY-MM-DD).
+  // When set and a found snapshot's own as-of (`params.to`) is BEFORE it, the snapshot is stale-by-source-advance:
+  // re-derive via `deriveDurable` (self-heal, ZERO DataDoe) instead of serving it, so a NAMED-brand snapshot
+  // refreshes the moment the ACCOUNT's proven OLI/completeness horizon advances -- even though the brand itself had
+  // no new activity (the horizon is account-level, never the brand's last sale). The self-heal is serialized by the
+  // existing refresh lock, persists under the honest EFFECTIVE (clamped) identity, and on a not-ready derive it
+  // falls back to serving the found snapshot as last-known-good (never a blank page). Default null = unchanged for
+  // every other report (they never pass it, so the stale-scope/exact behaviour is byte-identical).
+  staleWhenParamsToBefore = null,
 }) {
   const paramsHash = paramsHashFor(reportVersion, params);
+  // A found snapshot is stale-by-coverage-advance when the account's proven horizon has moved past the snapshot's
+  // own as-of (`params.to`). Gated on `staleWhenParamsToBefore` (only Daily supplies it) + a durable re-derivation.
+  const paramsToBehindProven = (snap) => {
+    if (!staleWhenParamsToBefore || !snap || !snap.params) return false;
+    const snapTo = snap.params.to != null ? String(snap.params.to) : "";
+    return !!snapTo && snapTo < String(staleWhenParamsToBefore);
+  };
   // Null-safe source-staleness probe: a served snapshot whose source provenance predates the newest contributing
   // provenance is stale (a rebuild is due). Returns false whenever no provenance was supplied (never fabricates).
   const isSourceStale = (snap) => {
@@ -235,6 +251,13 @@ export async function serveSharedReport({
   if (!refresh) {
     const snapshot = await readSnapshot({ reportKey, accountId, paramsHash });
     if (snapshot && snapshot.payload) {
+      // Stale-by-coverage-advance (Daily named-brand): the account's proven horizon moved past this snapshot's
+      // as-of -> re-derive via the durable self-heal (ZERO DataDoe) instead of serving an out-of-date as-of. On a
+      // not-ready derive the self-heal returns un-served and we fall through to serve THIS snapshot as LKG.
+      if (paramsToBehindProven(snapshot) && deriveDurable && !deferRebuildOnRead) {
+        const healed = await selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds, augmentResponse }, store);
+        if (healed.served) return;
+      }
       // The EXACT snapshot exists. If the contributing sources have advanced past it (e.g. brand-sales rolled
       // 21 -> 25 Aug under the same asOf), serve it NOW but flag `updating` so a zero-export rebuild is triggered.
       const updating = isSourceStale(snapshot);
@@ -263,6 +286,13 @@ export async function serveSharedReport({
     if (latest && latest.payload
         && staleSnapshotMatchesReportVersion(latest, reportVersion)
         && staleSnapshotMatchesScope(latest, params, staleScopeKeys)) {
+      // Stale-by-coverage-advance (Daily named-brand): if the account's proven horizon moved past this snapshot's
+      // as-of, re-derive via the durable self-heal (ZERO DataDoe) so the named-brand horizon tracks the account's,
+      // not the brand's last sale. On a not-ready derive, fall through to serving this snapshot as LKG (stale-scope).
+      if (paramsToBehindProven(latest) && deriveDurable && !deferRebuildOnRead) {
+        const healed = await selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds, augmentResponse }, store);
+        if (healed.served) return;
+      }
       // A last-known-good for a DIFFERENT params hash (across-day / changed account set) is itself a stale
       // scope; when a rebuild is deferred (Brand View portfolio) OR the sources advanced past it, flag updating
       // so the caller shows this LKG NOW and polls until the rebuild republishes the exact-identity snapshot.

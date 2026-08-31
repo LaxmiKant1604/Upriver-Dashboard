@@ -149,4 +149,92 @@ await testAsync("no regression: with NO staleScopeKeys the report-version-only s
   assert.equal(cap.body.snapshot.staleScope, true);
 });
 
+// ---- STALE-BY-COVERAGE-ADVANCE self-heal (named-brand horizon tracks the ACCOUNT, not the brand's last sale) ----
+const PROVEN_NEW = "2026-08-30";
+function makeSelfHealStore() {
+  const snaps = new Map(); const locks = new Set();
+  const key = (o) => [o.reportKey, o.accountId, o.paramsHash].join("|");
+  const store = {
+    claimRefreshLock: async (o) => { const k = key(o); if (locks.has(k)) return false; locks.add(k); return true; },
+    releaseRefreshLock: async (o) => { locks.delete(key(o)); },
+    getReportSnapshot: async (o) => snaps.get(key(o)) || null,
+    saveReportSnapshot: async (o) => { const row = { id: "s", updated_at: "u", source_refreshed_at: o.sourceRefreshedAt, payload: o.payload, params: o.params }; snaps.set(key(o), row); return row; },
+    publishSnapshotUpdate: async () => {},
+  };
+  return { store, snaps, locks, key };
+}
+const brandDerive = (to, sales) => async () => ({
+  payload: { rows: [{ date: to, total_sales: sales }], brandFiltered: true },
+  sourceRefreshedAt: to + "T01:00:00.000Z",
+  effectiveParams: { from: FROM, to, brand: "Caruso Italy" }, latestCompletedDate: to,
+});
+
+await testAsync("STALE named-brand snapshot (as-of behind the account's proven horizon) SELF-HEALS on read (zero exports)", async () => {
+  const { readers, seed } = makeReaders();
+  seed({ to: PROVEN, brand: "Caruso Italy", payload: { rows: [{ date: PROVEN, total_sales: 10 }], brandFiltered: true } }); // stale as-of PROVEN(08-22)
+  const { store, snaps } = makeSelfHealStore();
+  let derives = 0; const dd = async () => { derives += 1; return brandDerive(PROVEN_NEW, 55)(); };
+  const { res, cap } = fakeRes();
+  await serveSharedReport(req({ res, params: { from: FROM, to: TODAY, brand: "Caruso Italy" }, staleScopeKeys: ["brand"], readers, store, deriveDurable: dd, staleWhenParamsToBefore: PROVEN_NEW }));
+  assert.equal(derives, 1, "the account's proven horizon advanced past the snapshot's as-of -> re-derived once");
+  assert.equal(cap.body.rows[0].total_sales, 55, "the FRESH named-brand payload is served");
+  assert.equal(cap.body.snapshot.rederived, true, "flagged re-derived");
+  const saved = [...snaps.values()][0];
+  assert.equal(saved.params.to, PROVEN_NEW, "saved under the account's proven horizon (not the brand's last sale)");
+  assert.equal(saved.params.brand, "Caruso Italy", "brand isolation preserved through the self-heal");
+});
+
+await testAsync("FRESH named-brand snapshot (as-of == proven horizon) is REUSED without a write", async () => {
+  const { readers, seed } = makeReaders();
+  seed({ to: PROVEN_NEW, brand: "Caruso Italy", payload: { rows: [{ date: PROVEN_NEW, total_sales: 33 }], brandFiltered: true } });
+  const { store } = makeSelfHealStore();
+  let derives = 0; const dd = async () => { derives += 1; return brandDerive(PROVEN_NEW, 99)(); };
+  const { res, cap } = fakeRes();
+  await serveSharedReport(req({ res, params: { from: FROM, to: PROVEN_NEW, brand: "Caruso Italy" }, staleScopeKeys: ["brand"], readers, store, deriveDurable: dd, staleWhenParamsToBefore: PROVEN_NEW }));
+  assert.equal(derives, 0, "as-of is not behind the proven horizon -> NO re-derive, NO write");
+  assert.equal(cap.body.rows[0].total_sales, 33, "the existing fresh snapshot is served");
+});
+
+await testAsync("stale self-heal with a NOT-READY derive falls back to serving the snapshot as LKG (never blank)", async () => {
+  const { readers, seed } = makeReaders();
+  seed({ to: PROVEN, brand: "Caruso Italy", payload: { rows: [{ date: PROVEN, total_sales: 10 }], brandFiltered: true } });
+  const { store } = makeSelfHealStore();
+  const dd = async () => ({ notReady: "not-ready", blockedBy: [{ sourceKey: "order-line-items", blocksSales: true }] });
+  const { res, cap } = fakeRes();
+  await serveSharedReport(req({ res, params: { from: FROM, to: TODAY, brand: "Caruso Italy" }, staleScopeKeys: ["brand"], readers, store, deriveDurable: dd, staleWhenParamsToBefore: PROVEN_NEW }));
+  assert.equal(cap.body.snapshotMissing, undefined, "never a blank page");
+  assert.equal(cap.body.rows[0].total_sales, 10, "the stale LKG is served when the derive is not ready");
+});
+
+await testAsync("concurrent stale reads self-heal exactly ONCE (serialized by the refresh lock)", async () => {
+  const { readers, seed } = makeReaders();
+  seed({ to: PROVEN, brand: "Caruso Italy", payload: { rows: [{ date: PROVEN, total_sales: 10 }], brandFiltered: true } });
+  const { store } = makeSelfHealStore();
+  let derives = 0; const dd = async () => { derives += 1; await new Promise((r) => setTimeout(r, 5)); return brandDerive(PROVEN_NEW, 55)(); };
+  const r1 = fakeRes(); const r2 = fakeRes();
+  await Promise.all([
+    serveSharedReport(req({ res: r1.res, params: { from: FROM, to: TODAY, brand: "Caruso Italy" }, staleScopeKeys: ["brand"], readers, store, deriveDurable: dd, staleWhenParamsToBefore: PROVEN_NEW })),
+    serveSharedReport(req({ res: r2.res, params: { from: FROM, to: TODAY, brand: "Caruso Italy" }, staleScopeKeys: ["brand"], readers, store, deriveDurable: dd, staleWhenParamsToBefore: PROVEN_NEW })),
+  ]);
+  assert.equal(derives, 1, "the lock serializes -> exactly ONE derive/save across concurrent reads");
+  // The lock winner serves the FRESH re-derive (55); the loser serves the last-known-good (10) while the winner
+  // is mid-derive -- neither ever blanks, and the derive/save happens exactly once.
+  for (const x of [r1, r2]) assert.ok(x.cap.body.rows && x.cap.body.rows.length, "neither concurrent read blanks");
+  const served = [r1.cap.body.rows[0].total_sales, r2.cap.body.rows[0].total_sales].sort((a, b) => a - b);
+  assert.deepEqual(served, [10, 55], "one fresh (55) + one LKG (10) -- exactly one derive, no blank, no double-write");
+});
+
+await testAsync("stale self-heal is OFF for reports that never pass staleWhenParamsToBefore (byte-identical stale-scope serve)", async () => {
+  const { readers, seed } = makeReaders();
+  seed({ to: PROVEN, brand: "Caruso Italy", payload: { rows: [{ date: PROVEN, total_sales: 10 }], brandFiltered: true } });
+  const { store } = makeSelfHealStore();
+  let derives = 0; const dd = async () => { derives += 1; return brandDerive(PROVEN_NEW, 55)(); };
+  const { res, cap } = fakeRes();
+  // staleWhenParamsToBefore omitted -> the old stale-scope serve, no self-heal.
+  await serveSharedReport(req({ res, params: { from: FROM, to: TODAY, brand: "Caruso Italy" }, staleScopeKeys: ["brand"], readers, store, deriveDurable: dd }));
+  assert.equal(derives, 0, "without the proven-horizon signal the stale-scope serve is unchanged");
+  assert.equal(cap.body.snapshot.staleScope, true);
+  assert.equal(cap.body.rows[0].total_sales, 10);
+});
+
 out("\n" + passed + " assertions passed");

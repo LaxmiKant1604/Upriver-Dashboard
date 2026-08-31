@@ -152,7 +152,7 @@ import {
 import { aggregateAsinAdsDailyRows } from "../lib/server/reports/asin-ads-aggregation.js";
 import { refreshCorrectedBrandSalesForAccount } from "../lib/server/reports/brand-sales-live.js";
 import { summarizeExplicitZeroOli, brandByAsinFromCatalog } from "../lib/server/reports/oli-quality.js";
-import { rederiveDailyV2 } from "../lib/server/reports/daily-durable-rederive.js";
+import { rederiveDailyV2, latestProvenDailyTo, DAILY_OLI_SOURCE_KEY } from "../lib/server/reports/daily-durable-rederive.js";
 import { rederiveSkuMovement, skuMovementProvenDates, skuMovementRefreshedAt } from "../lib/server/reports/sku-movement-durable-rederive.js";
 import { organizationFingerprint } from "../lib/server/source-identity.js";
 import { FX_DISPLAY_CURRENCIES, getFxRates } from "../lib/server/fx.js";
@@ -2854,6 +2854,16 @@ async function handleDataDoe(req, res) {
             readCatalogSnapshot: getSourceSnapshot,
             loadCatalogPayload: getSourceSnapshotPayload,
           };
+          // FRESHNESS BY COVERAGE ADVANCE: the account's CURRENT latest proven OLI date (the SAME clamp
+          // rederiveDailyV2 uses). When a stored NAMED-brand snapshot's own as-of (params.to) is behind this,
+          // serveSharedReport re-derives it (zero-export self-heal) so the named-brand horizon tracks the ACCOUNT's
+          // proven date, never the brand's last sale. Fail-soft: any read failure leaves it null (stale-scope serve
+          // unchanged). Account-level (never brand-scoped), so ALL Brands and every named brand share one horizon.
+          try {
+            const dailyCov = await getSourceCoverageWindows({ organizationFingerprint: dailyOrgFingerprint, connectionId: "primary", accountId: dailyAccountId, sourceKey: DAILY_OLI_SOURCE_KEY });
+            const dailyOliWindows = dailyCov && dailyCov.read === "ok" ? (dailyCov.windows || []) : [];
+            sharedOptions.staleWhenParamsToBefore = latestProvenDailyTo({ oliWindows: dailyOliWindows, from: legacyShared.params.from, ceiling: legacyShared.params.to });
+          } catch { sharedOptions.staleWhenParamsToBefore = null; }
           // Two-layer PROVISIONAL/FINAL completeness: attach the current itemization state (read live from
           // source_oli_completeness) so Daily Reporting labels D-1 provisional/final without a snapshot rewrite.
           sharedOptions.augmentResponse = makeCompletenessAugment({ organizationFingerprint: dailyOrgFingerprint, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows, readEstimates: getSourceOliSalesEstimateRows });
