@@ -21,6 +21,7 @@ import {
   pad2, parts, pct, shiftMonthRange, toUTC, weekStart, yearStart,
 } from "./lib/format.js";
 import { marketplaceProfile, marketplaceToday } from "../lib/marketplaces.js";
+import { clampRecentDays, DEFAULT_RECENT_DAYS } from "../lib/sku-movement-window.js";
 import { csvCell } from "./lib/csv.js";
 import {
   computePlanRow as computePlanningRow, resolveHorizon, normalizeHorizon,
@@ -1567,6 +1568,13 @@ function DashboardApp({ session, access, onSignOut }) {
   const [planColsBusy, setPlanColsBusy] = useState(false);
   const [skuHorizonEdit, setSkuHorizonEdit] = useState(null); // { sku, asin, effective, source } | null
   const [warehouseImportOpen, setWarehouseImportOpen] = useState(false);
+  // SKU Movement (v2): per-USER window N + hidden columns, persisted via /api/sku-movement-prefs (never DataDoe).
+  const [skuRecentDays, setSkuRecentDays] = useState(DEFAULT_RECENT_DAYS);
+  const [skuHiddenCols, setSkuHiddenCols] = useState([]);
+  const [skuIdentBusy, setSkuIdentBusy] = useState(false);
+  // Points at the SKU Movement report's current reload() (declared later); an identifier write re-reads via this ref
+  // so the callbacks below don't have to close over the params-dependent report object (which would be a TDZ).
+  const skuReloadRef = React.useRef(null);
 
   // Reconciliation is a six-full-month, cache-first report. Once refreshed,
   // its month selector and Order Explorer operate entirely in the browser.
@@ -2303,6 +2311,51 @@ function DashboardApp({ session, access, onSignOut }) {
     finally { setPlanColsBusy(false); }
   }, [columnPrefsKey, session?.access_token]);
 
+  // SKU Movement per-USER prefs (window N + hidden columns). localStorage gives an instant first paint; the durable
+  // server copy (user-scoped) wins. Kept SEPARATE from the report snapshot so a zero-export re-derive never erases it.
+  const skuPrefsKey = useMemo(() => `skumv.prefs.${session?.user?.id || "anon"}`, [session?.user?.id]);
+  const loadSkuPrefs = useCallback(async () => {
+    try { const raw = localStorage.getItem(skuPrefsKey); if (raw) { const p = JSON.parse(raw); if (p && typeof p === "object") { if (p.recentDays != null) setSkuRecentDays(clampRecentDays(p.recentDays)); if (Array.isArray(p.hiddenColumns)) setSkuHiddenCols(p.hiddenColumns.map(String)); } } } catch { /* ignore */ }
+    if (!session?.access_token) return;
+    try {
+      const r = await authFetch("/api/sku-movement-prefs", session.access_token);
+      if (r) { setSkuRecentDays(clampRecentDays(r.recentDays)); setSkuHiddenCols((r.hiddenColumns || []).map(String)); }
+    } catch { /* keep local */ }
+  }, [skuPrefsKey, session?.access_token]);
+  useEffect(() => { if (view === "skumovement") loadSkuPrefs(); }, [view, loadSkuPrefs]);
+  const persistSkuPrefs = useCallback(async (patch) => {
+    // Optimistic local write so the UI reacts instantly; the server copy is the durable source of truth.
+    const next = { recentDays: patch.recentDays != null ? clampRecentDays(patch.recentDays) : skuRecentDays, hiddenColumns: patch.hiddenColumns != null ? patch.hiddenColumns.map(String) : skuHiddenCols };
+    if (patch.recentDays != null) setSkuRecentDays(next.recentDays);
+    if (patch.hiddenColumns != null) setSkuHiddenCols(next.hiddenColumns);
+    try { localStorage.setItem(skuPrefsKey, JSON.stringify(next)); } catch { /* ignore */ }
+    if (!session?.access_token) return;
+    try { await authFetch("/api/sku-movement-prefs", session.access_token, { method: "POST", body: JSON.stringify(patch) }); }
+    catch { /* localStorage already holds it */ }
+  }, [skuPrefsKey, session?.access_token, skuRecentDays, skuHiddenCols]);
+  const onSkuRecentDaysChange = useCallback((n) => persistSkuPrefs({ recentDays: clampRecentDays(n) }), [persistSkuPrefs]);
+  const onSkuColumnsChange = useCallback((cols) => persistSkuPrefs({ hiddenColumns: Array.isArray(cols) ? cols : [] }), [persistSkuPrefs]);
+
+  // Manual per-(account, ASIN) Identifier writes. The server derives marketplace + org fingerprint and re-validates
+  // ownership + ASIN membership; a successful write re-reads the durable snapshot (identifiers join at serve).
+  const onSaveIdentifier = useCallback(async (childAsin, identifier) => {
+    if (!selectedAccountId || !session?.access_token || !childAsin) return;
+    setSkuIdentBusy(true);
+    try {
+      await authFetch("/api/sku-movement-identifier", session.access_token, { method: "POST", body: JSON.stringify({ kind: "set", accountId: selectedAccountId, childAsin, identifier: identifier || "" }) });
+      if (skuReloadRef.current) await skuReloadRef.current();
+    } finally { setSkuIdentBusy(false); }
+  }, [selectedAccountId, session?.access_token]);
+  const onBulkIdentifiers = useCallback(async (rows) => {
+    if (!selectedAccountId || !session?.access_token) throw new Error("No account selected.");
+    setSkuIdentBusy(true);
+    try {
+      const res = await authFetch("/api/sku-movement-identifier", session.access_token, { method: "POST", body: JSON.stringify({ kind: "bulk", accountId: selectedAccountId, rows }) });
+      if (skuReloadRef.current) await skuReloadRef.current();
+      return res;
+    } finally { setSkuIdentBusy(false); }
+  }, [selectedAccountId, session?.access_token]);
+
   const reconciliationWindow = useMemo(() => sixFullCalendarMonths(TODAY), [TODAY]);
   const reconciliationParams = useMemo(() => {
     if (!selectedAccountId) return null;
@@ -2605,7 +2658,7 @@ function DashboardApp({ session, access, onSignOut }) {
   // SKU Movement is BRAND-scoped (unlike the insight reports), so its snapshot identity includes the selected brand.
   // Read-only + durable: loading/reloading/changing account or brand only reads saved OLI+Catalog, never DataDoe.
   const skuMovementParams = useMemo(
-    () => (selectedAccountId ? { action: "sku-movement", reportVersion: "sku-movement/v1", ids: selectedAccountId, brand: selectedBrand, to: TODAY } : null),
+    () => (selectedAccountId ? { action: "sku-movement", reportVersion: "sku-movement/v2", ids: selectedAccountId, brand: selectedBrand, to: TODAY } : null),
     [selectedAccountId, selectedBrand, TODAY]
   );
 
@@ -2620,6 +2673,7 @@ function DashboardApp({ session, access, onSignOut }) {
   const ppc = useSharedReport({ params: ppcParams, active: view === "ppc" || onFeed });
   const optimizer = useSharedReport({ params: optimizerParams, active: view === "optimizer" || onFeed });
   const skuMovement = useSharedReport({ params: skuMovementParams, active: view === "skumovement" });
+  useEffect(() => { skuReloadRef.current = skuMovement.reload; }, [skuMovement.reload]);
 
   const INSIGHT_VIEWS = useMemo(() => ({
     salesmovers: { report: salesMovers, label: "Sales Movers" },
@@ -4655,12 +4709,19 @@ function DashboardApp({ session, access, onSignOut }) {
         <SkuMovement
           data={skuMovement.data}
           loading={skuMovement.loading}
-          updating={skuMovement.updating}
+          updating={skuMovement.updating || skuIdentBusy}
           error={skuMovement.error}
           accountName={refreshScopeAccount?.name}
           selectedBrand={selectedBrand}
           onReload={skuMovement.reload}
           cachedAt={skuMovement.cachedAt}
+          recentDays={skuRecentDays}
+          onRecentDaysChange={onSkuRecentDaysChange}
+          hiddenColumns={skuHiddenCols}
+          onColumnsChange={onSkuColumnsChange}
+          onSaveIdentifier={onSaveIdentifier}
+          onBulkIdentifiers={onBulkIdentifiers}
+          canEdit={!!session?.access_token && !!selectedAccountId}
         />
       )}
 

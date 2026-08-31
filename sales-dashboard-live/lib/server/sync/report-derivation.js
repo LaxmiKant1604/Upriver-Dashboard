@@ -1230,7 +1230,9 @@ const REGISTRY = {
   // The pure movement math lives in sku-movement-core.js; the derive here folds durable OLI rows + Catalog for the
   // registry/backfill path. context: { effectiveAsOf, brand, coverageFrom }.
   "sku-movement": {
-    snapshotVersion: "sku-movement/v1",
+    // v2: ASIN-grain aggregation + 7-day default window + client-selectable N (dailyDates history in the payload).
+    // The version bump means an old SKU-grain v1 snapshot NEVER serves as v2 -- the self-heal re-derives v2 (zero export).
+    snapshotVersion: "sku-movement/v2",
     optionalRequestKeys: [],
     derivedSourceKeys: [],
     derive: ({ sources, context }) => skuMovementPayload({

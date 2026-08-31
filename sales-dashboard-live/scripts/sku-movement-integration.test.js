@@ -147,13 +147,15 @@ await testAsync("no coverage -> failed (typed), NO write, last-known-good untouc
   assert.ok(store.snaps.has([SKU_MOVEMENT_REPORT_KEY, "NONE", "old"].join("|")), "LKG must remain");
 });
 
-await testAsync("no double-count across currency; covered no-sale date = 0 (not null/omitted)", async () => {
+await testAsync("v2 currency ISOLATION: EUR + USD for the same ASIN are separate rows (never summed); covered no-sale = 0", async () => {
   const readers = makeReaders();
   const derived = await rederiveSkuMovement({ accountId: "A", brand: "ALL", organizationFingerprint: "fp", ceiling: CEIL }, readers);
-  const a1 = rowByAsin(derived.payload, "A1");
-  assert.equal(a1.last5Total, 8, "Aug27 EUR(5)+USD(3) sum once");
-  const aug23 = a1.last5Dates.find((d) => d.date === "2026-08-23");
-  assert.equal(aug23.units, 0, "covered date with no sale is an honest 0");
+  const a1Rows = (derived.payload.rows || []).filter((r) => r.asin === "A1");
+  assert.equal(a1Rows.length, 2, "EUR and USD A1 are currency-isolated rows (Phase 4: never combine across currency)");
+  const eur = a1Rows.find((r) => r.currency === "EUR"); const usd = a1Rows.find((r) => r.currency === "USD");
+  assert.equal(eur.dailyUnits["2026-08-27"], 5, "EUR Aug27 units, summed once (no double count within the currency)");
+  assert.equal(usd.dailyUnits["2026-08-27"], 3, "USD Aug27 units stay in the USD row");
+  assert.equal(eur.dailyUnits["2026-08-23"] || 0, 0, "a covered date with no sale is an honest 0 (absent from the sparse daily map)");
 });
 
 await testAsync("month entirely before coverage is UNAVAILABLE (null), never a fabricated 0", async () => {
@@ -179,7 +181,7 @@ await testAsync("brand isolation: a named brand yields ONLY its Catalog-proven A
   const readers = makeReaders();
   const d = await rederiveSkuMovement({ accountId: "A", brand: "Caruso Italy", organizationFingerprint: "fp", ceiling: CEIL }, readers);
   assert.equal(d.payload.brandFiltered, true);
-  assert.deepEqual(d.payload.rows.map((r) => r.asin), ["A1"], "only A1; A2 (hyphen) + A3 (Unmapped) excluded");
+  assert.deepEqual([...new Set(d.payload.rows.map((r) => r.asin))], ["A1"], "only A1 (its currency rows); A2 (hyphen) + A3 (Unmapped) excluded");
 });
 
 await testAsync("brand punctuation is significant: 'Caruso-Italy' is a different brand from 'Caruso Italy'", async () => {

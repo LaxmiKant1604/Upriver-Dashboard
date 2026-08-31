@@ -1,10 +1,15 @@
-// SKU MOVEMENT core -- deterministic OFFLINE proof of the dynamic date/month windows, the central movement-status
-// thresholds, the per-(account,ASIN,SKU) aggregation, brand isolation (canonical brandKey, Unmapped excluded from a
-// named brand, no All-Brands fallback), and the durable OLI units policy (rollup units, no double count, no
-// fabrication, covered=0 vs uncovered=null). ZERO DataDoe. 7-bit ASCII.
+// SKU MOVEMENT core (v2) -- deterministic OFFLINE proof of: the default-7 / user-selectable N daily window (with
+// client-side recompute over the shared daily history), ASIN-grain aggregation (multiple SKUs -> one row, summed
+// once), the representative SKU (amzn... excluded, deterministic), brand isolation (canonical brandKey, Unmapped
+// excluded from a named brand, no All-Brands fallback), and the durable ORDERED-unit policy (covered=0 vs
+// uncovered=null, never fabricated). ZERO DataDoe. 7-bit ASCII.
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
-import { skuMovementPayload, skuMovementRows, skuMovementDateWindows, movementStatus, movementPercent, catalogAsinMap, MOVEMENT_THRESHOLDS } from "../lib/server/reports/sku-movement-core.js";
+import {
+  skuMovementPayload, skuMovementRows, skuMovementDateWindows, movementStatus, movementPercent, catalogAsinMap,
+  representativeSku, isLegitimateSku, MOVEMENT_THRESHOLDS, DEFAULT_RECENT_DAYS, MAX_RECENT_DAYS,
+} from "../lib/server/reports/sku-movement-core.js";
+import { computeRowWindow, recentPrevDates, clampRecentDays, DAILY_HISTORY_DAYS, dailyUnitAt } from "../lib/sku-movement-window.js";
 
 let passed = 0;
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
@@ -16,163 +21,165 @@ const CAT = [
   { child_asin: "B0C", product_brand: "Caruso-Italy", product_name: "Hyphen C" }, // distinct brand (punctuation)
 ];
 const oli = (o) => ({ currency: "USD", units: 1, ...o });
-
-/* ===== DATE / MONTH WINDOWS (dynamic, UTC, rollover, leap) ===== */
-test("10/6. three completed months + MTD label are derived from effectiveAsOf (never hard-coded)", () => {
-  const w = skuMovementDateWindows("2026-08-15");
-  assert.deepEqual(w.completedMonths.map((m) => m.label), ["May '26", "Jun '26", "Jul '26"]);
-  assert.deepEqual([w.completedMonths[0].from, w.completedMonths[0].to], ["2026-05-01", "2026-05-31"]);
-  assert.deepEqual([w.completedMonths[2].from, w.completedMonths[2].to], ["2026-07-01", "2026-07-31"]);
-  assert.equal(w.mtd.label, "Aug '26 MTD");
-  assert.deepEqual([w.mtd.from, w.mtd.to, w.mtd.daysElapsed, w.mtd.daysInMonth], ["2026-08-01", "2026-08-15", 15, 31]);
-});
-test("12. latest five individual dates + previous five are exact + contiguous (ascending, ending at D-1)", () => {
-  const w = skuMovementDateWindows("2026-08-15");
-  assert.deepEqual(w.last5Dates, ["2026-08-11", "2026-08-12", "2026-08-13", "2026-08-14", "2026-08-15"]);
-  assert.deepEqual(w.prev5Dates, ["2026-08-06", "2026-08-07", "2026-08-08", "2026-08-09", "2026-08-10"]);
-});
-test("15. month-end rollover: the first day of a new month rolls the completed-month set forward", () => {
-  const aug31 = skuMovementDateWindows("2026-08-31");
-  assert.deepEqual(aug31.completedMonths.map((m) => m.label), ["May '26", "Jun '26", "Jul '26"]);
-  assert.equal(aug31.mtd.daysElapsed, 31);
-  const sep1 = skuMovementDateWindows("2026-09-01");
-  assert.deepEqual(sep1.completedMonths.map((m) => m.label), ["Jun '26", "Jul '26", "Aug '26"], "Aug becomes the newest completed month; May drops off");
-  assert.equal(sep1.mtd.label, "Sep '26 MTD");
-  assert.equal(sep1.mtd.daysElapsed, 1);
-});
-test("16. December -> January rollover crosses the year correctly", () => {
-  const jan10 = skuMovementDateWindows("2027-01-10");
-  assert.deepEqual(jan10.completedMonths.map((m) => m.label), ["Oct '26", "Nov '26", "Dec '26"]);
-  assert.equal(jan10.mtd.label, "Jan '27 MTD");
-  assert.deepEqual([jan10.completedMonths[2].from, jan10.completedMonths[2].to], ["2026-12-01", "2026-12-31"]);
-});
-test("17. leap-year February (2028) has 29 days; a MTD in Feb reports 29 days-in-month", () => {
-  const feb = skuMovementDateWindows("2028-02-10");
-  const febMonth = skuMovementDateWindows("2028-03-05").completedMonths.find((m) => m.key === "2028-02");
-  assert.equal(febMonth.to, "2028-02-29", "leap Feb ends on the 29th");
-  assert.equal(feb.mtd.daysInMonth, 29);
-  const nonLeap = skuMovementDateWindows("2026-03-05").completedMonths.find((m) => m.key === "2026-02");
-  assert.equal(nonLeap.to, "2026-02-28", "non-leap Feb ends on the 28th");
-});
-test("18. a LAGGING effectiveAsOf (earlier than D-1) computes honest windows through that date", () => {
-  const w = skuMovementDateWindows("2026-08-09");
-  assert.equal(w.mtd.to, "2026-08-09");
-  assert.equal(w.mtd.daysElapsed, 9);
-  assert.deepEqual(w.last5Dates, ["2026-08-05", "2026-08-06", "2026-08-07", "2026-08-08", "2026-08-09"]);
-});
-
-/* ===== MOVEMENT STATUS (central thresholds) ===== */
-test("14. every status: New / Rising / Stable / Declining / Dormant / No Data via the central thresholds", () => {
-  assert.equal(movementStatus({ last5Units: 5, prev5Units: 0, monthsTotalUnits: 0, mtdUnits: 5 }), "New");
-  assert.equal(movementStatus({ last5Units: 15, prev5Units: 10, monthsTotalUnits: 50 }), "Rising"); // +50% > +20
-  assert.equal(movementStatus({ last5Units: 12, prev5Units: 10, monthsTotalUnits: 50 }), "Stable"); // +20% not strictly >20
-  assert.equal(movementStatus({ last5Units: 7, prev5Units: 10, monthsTotalUnits: 50 }), "Declining"); // -30% < -20
-  assert.equal(movementStatus({ last5Units: 0, prev5Units: 0, monthsTotalUnits: 50 }), "Dormant"); // history, no recent
-  assert.equal(movementStatus({ last5Units: 0, prev5Units: 0, monthsTotalUnits: 0, mtdUnits: 0 }), "No Data");
-  assert.equal(MOVEMENT_THRESHOLDS.RISING_PCT, 20);
-  assert.equal(MOVEMENT_THRESHOLDS.DECLINING_PCT, -20);
-});
-test("13. movement% = ((last5 - prev5)/prev5)*100; null when there is no prior baseline (em dash)", () => {
-  assert.equal(movementPercent(15, 10), 50);
-  assert.equal(movementPercent(5, 10), -50);
-  assert.equal(movementPercent(9, 0), null, "no baseline -> undefined percentage");
-  assert.equal(movementPercent(0, 0), null);
-  // status still classifies a no-baseline active SKU with history as Rising
-  assert.equal(movementStatus({ last5Units: 9, prev5Units: 0, monthsTotalUnits: 40 }), "Rising");
-});
-
-/* ===== AGGREGATION + ISOLATION ===== */
 const D = "2026-08-15";
-test("3. ALL brands includes EVERY eligible ASIN/SKU incl. honestly-unmapped, never assigned to another brand", () => {
-  const rows = skuMovementRows({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "S1" }), oli({ sale_date: D, child_asin: "B0Z", sku: "S9" })], catalogRows: CAT, effectiveAsOf: D, brand: "ALL" });
-  assert.equal(rows.length, 2);
-  assert.equal(rows.find((r) => r.asin === "B0A").brand, "Caruso Italy");
-  assert.equal(rows.find((r) => r.asin === "B0Z").brand, "Unmapped", "an ASIN absent from Catalog is Unmapped, never another brand");
+const rowFor = (rows, asin) => rows.find((r) => r.asin === asin);
+
+/* ===== 1-6: DAILY WINDOW (default 7, adjacent, client N) ===== */
+test("1. default window is 7: recentDates = the last 7 dates, prevDates = the 7 immediately-preceding (adjacent)", () => {
+  const w = skuMovementDateWindows(D);
+  assert.equal(w.recentDays, DEFAULT_RECENT_DAYS);
+  assert.equal(DEFAULT_RECENT_DAYS, 7);
+  assert.deepEqual(w.recentDates, ["2026-08-09", "2026-08-10", "2026-08-11", "2026-08-12", "2026-08-13", "2026-08-14", "2026-08-15"]);
+  assert.deepEqual(w.prevDates, ["2026-08-02", "2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06", "2026-08-07", "2026-08-08"]);
 });
-test("4/6. a specific brand includes ONLY Catalog-proven matching ASINs; Unmapped is excluded", () => {
-  const rows = skuMovementRows({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "S1" }), oli({ sale_date: D, child_asin: "B0Z", sku: "S9" }), oli({ sale_date: D, child_asin: "B0B", sku: "S2" })], catalogRows: CAT, effectiveAsOf: D, brand: "Caruso Italy" });
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].asin, "B0A");
-  assert.ok(!rows.some((r) => r.brand === "Unmapped"), "Unmapped never appears in a named-brand result");
-  assert.ok(!rows.some((r) => r.asin === "B0B"), "another brand's ASIN never appears");
+test("dailyDates carries DAILY_HISTORY_DAYS (60) dates ending at effectiveAsOf (ascending)", () => {
+  const w = skuMovementDateWindows(D);
+  assert.equal(w.dailyDates.length, DAILY_HISTORY_DAYS);
+  assert.equal(w.dailyDates[w.dailyDates.length - 1], D);
+  assert.equal(w.dailyDates[0], "2026-06-17"); // 59 days before Aug 15
 });
-test("7. canonical brandKey matches case/whitespace variants; punctuation stays DISTINCT", () => {
-  const rowsA = skuMovementRows({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "S1" })], catalogRows: CAT, effectiveAsOf: D, brand: "  caruso   ITALY " });
-  assert.equal(rowsA.length, 1, "'  caruso   ITALY ' matches 'Caruso Italy'");
-  const rowsHyphen = skuMovementRows({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "S1" }), oli({ sale_date: D, child_asin: "B0C", sku: "S3" })], catalogRows: CAT, effectiveAsOf: D, brand: "Caruso-Italy" });
-  assert.equal(rowsHyphen.length, 1);
-  assert.equal(rowsHyphen[0].asin, "B0C", "'Caruso-Italy' (hyphen) is a DISTINCT brand from 'Caruso Italy'");
+test("2. N=1, N=6, N=7, N=30 (max) all use exact adjacent Last-N / Previous-N windows", () => {
+  const dates = skuMovementDateWindows(D).dailyDates;
+  const chk = (n, lastEnd, prevEnd) => { const { recentDates, prevDates } = recentPrevDates(dates, n); assert.equal(recentDates.length, n); assert.equal(recentDates[recentDates.length - 1], D); assert.equal(prevDates[prevDates.length - 1], prevEnd); assert.equal(recentDates[0], lastEnd); };
+  chk(1, D, "2026-08-14");
+  chk(6, "2026-08-10", "2026-08-09");
+  chk(7, "2026-08-09", "2026-08-08");
+  chk(30, "2026-07-17", "2026-07-16");
+  assert.equal(clampRecentDays(30), 30); assert.equal(clampRecentDays(31), MAX_RECENT_DAYS); assert.equal(clampRecentDays(0), 1); assert.equal(clampRecentDays("x"), DEFAULT_RECENT_DAYS);
 });
-test("5/8. a named brand with no matching sales is a VALID EMPTY report, never an All-Brands fallback", () => {
-  const oliRows = [oli({ sale_date: D, child_asin: "B0A", sku: "S1" }), oli({ sale_date: D, child_asin: "B0Z", sku: "S9" })];
-  const p = skuMovementPayload({ oliRows, catalogRows: CAT, effectiveAsOf: D, brand: "Bolt" });
-  assert.equal(p.rows.length, 0, "empty, not the All-Brands rows");
-  assert.equal(p.brandFiltered, true);
-  assert.equal(p.brand, "Bolt");
+test("3. covered date with no sale = honest 0; 4. uncovered (before coverage) = unavailable (null)", () => {
+  const du = { "2026-08-15": 4 };
+  assert.equal(dailyUnitAt(du, "2026-08-15", "2026-05-01"), 4);
+  assert.equal(dailyUnitAt(du, "2026-08-12", "2026-05-01"), 0, "covered, no sale -> 0");
+  assert.equal(dailyUnitAt(du, "2026-04-30", "2026-05-01"), null, "before coverage -> unavailable, never 0");
 });
-test("11. MTD sums ONLY dates in [first-of-month, effectiveAsOf]; earlier-month dates never leak into MTD", () => {
-  const rows = skuMovementRows({ oliRows: [oli({ sale_date: "2026-08-15", child_asin: "B0A", sku: "S1", units: 3 }), oli({ sale_date: "2026-08-01", child_asin: "B0A", sku: "S1", units: 2 }), oli({ sale_date: "2026-07-31", child_asin: "B0A", sku: "S1", units: 99 })], catalogRows: CAT, effectiveAsOf: D, brand: "ALL", coverageFrom: "2026-05-01" });
-  assert.equal(rows[0].mtdUnits, 5, "3 + 2 in Aug; the Jul 31 unit is NOT MTD");
-  assert.equal(rows[0].months.find((m) => m.key === "2026-07").units, 99, "the Jul 31 unit lands in the Jul completed month");
+test("5. Previous N = 0 never returns Infinity/NaN (null percentage; status still classifies)", () => {
+  assert.equal(movementPercent(9, 0), null);
+  assert.equal(movementPercent(0, 0), null);
+  assert.equal(Number.isFinite(movementPercent(9, 0) ?? 0), true);
+  assert.equal(movementStatus({ lastUnits: 9, prevUnits: 0, monthsTotalUnits: 40 }), "Rising");
 });
-test("23. no double count: multiple currency / dimensional rows for the same (asin,sku,date) SUM once", () => {
+test("6. CLIENT recompute (computeRowWindow) for a different N matches server aggregation exactly", () => {
+  const oliRows = [];
+  for (let i = 0; i < 14; i += 1) oliRows.push(oli({ sale_date: skuMovementDateWindows(D).dailyDates[DAILY_HISTORY_DAYS - 1 - i], child_asin: "B0A", sku: "S1", units: i + 1 }));
+  const p = skuMovementPayload({ oliRows, catalogRows: CAT, effectiveAsOf: D, brand: "ALL", coverageFrom: "2026-05-01" });
+  const r = p.rows[0];
+  // server default N=7
+  const w7 = computeRowWindow({ dailyUnits: r.dailyUnits, monthsTotalUnits: r.monthsTotalUnits, mtdUnits: r.mtdUnits }, p.dailyDates, 7);
+  assert.equal(w7.lastTotal, r.recentTotal, "client Last 7 == server default recentTotal");
+  assert.equal(w7.prevTotal, r.prevTotal);
+  assert.equal(w7.status, r.status);
+  // a different N recomputes from the same daily history (no re-derive)
+  const w3 = computeRowWindow({ dailyUnits: r.dailyUnits, monthsTotalUnits: r.monthsTotalUnits, mtdUnits: r.mtdUnits }, p.dailyDates, 3);
+  const { recentDates, prevDates } = recentPrevDates(p.dailyDates, 3);
+  const expLast = recentDates.reduce((s, d) => s + (r.dailyUnits[d] || 0), 0);
+  assert.equal(w3.lastTotal, expLast, "Last 3 recomputed from daily history");
+  assert.notEqual(w3.lastTotal, w7.lastTotal, "N changes the totals");
+});
+
+/* ===== 7-14: ASIN AGGREGATION + ISOLATION ===== */
+test("7/8. two SKUs under one ASIN combine into ONE row; units sum exactly once", () => {
+  const rows = skuMovementRows({ oliRows: [
+    oli({ sale_date: D, child_asin: "B0A", sku: "SKU-1", units: 3 }),
+    oli({ sale_date: D, child_asin: "B0A", sku: "SKU-2", units: 4 }),
+    oli({ sale_date: "2026-08-01", child_asin: "B0A", sku: "SKU-2", units: 5 }),
+  ], catalogRows: CAT, effectiveAsOf: D, brand: "ALL", coverageFrom: "2026-05-01" });
+  assert.equal(rows.length, 1, "ONE ASIN row (SKUs aggregated)");
+  assert.equal(rows[0].recentTotal, 7, "3 + 4 on the day, summed once");
+  assert.equal(rows[0].mtdUnits, 12, "3 + 4 + 5 in Aug");
+  assert.equal(rows[0].skuCount, 2, "two distinct SKUs combined");
+});
+test("9. same ASIN across two accounts NEVER combines (core is per-account; two separate calls stay separate)", () => {
+  const a1 = skuMovementRows({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "S1", units: 5 })], catalogRows: CAT, effectiveAsOf: D, brand: "ALL" });
+  const a2 = skuMovementRows({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "S1", units: 9 })], catalogRows: CAT, effectiveAsOf: D, brand: "ALL" });
+  assert.equal(a1[0].recentTotal, 5); assert.equal(a2[0].recentTotal, 9, "each account's rows are independent");
+});
+test("10. same ASIN in two currencies never merges (currency-isolated rows)", () => {
   const rows = skuMovementRows({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "S1", currency: "USD", units: 2 }), oli({ sale_date: D, child_asin: "B0A", sku: "S1", currency: "EUR", units: 3 })], catalogRows: CAT, effectiveAsOf: D, brand: "ALL" });
-  assert.equal(rows.length, 1, "one (asin,sku) row");
-  assert.equal(rows[0].last5Total, 5, "2 + 3 summed, not duplicated into two rows");
+  assert.equal(rows.length, 2, "USD and EUR are separate rows");
+  assert.deepEqual(rows.map((r) => r.currency).sort(), ["EUR", "USD"]);
 });
-test("13b. Last-5 vs Previous-5 totals + per-date columns are exact", () => {
-  const oliRows = [
-    oli({ sale_date: "2026-08-15", child_asin: "B0A", sku: "S1", units: 4 }),
-    oli({ sale_date: "2026-08-11", child_asin: "B0A", sku: "S1", units: 6 }),
-    oli({ sale_date: "2026-08-08", child_asin: "B0A", sku: "S1", units: 5 }), // in prev5
-    oli({ sale_date: "2026-08-06", child_asin: "B0A", sku: "S1", units: 5 }), // in prev5
-  ];
-  const r = skuMovementRows({ oliRows, catalogRows: CAT, effectiveAsOf: D, brand: "ALL" })[0];
-  assert.equal(r.last5Total, 10); assert.equal(r.prev5Total, 10);
-  assert.equal(r.movementPercent, 0);
-  assert.equal(r.last5Dates.find((d) => d.date === "2026-08-15").units, 4);
-  assert.equal(r.last5Dates.find((d) => d.date === "2026-08-12").units, 0, "a covered date with no sale is an honest 0");
+test("11/12. named brand includes ONLY catalog-proven ASINs; unmatched brand = valid EMPTY (never All-Brands)", () => {
+  const oliRows = [oli({ sale_date: D, child_asin: "B0A", sku: "S1" }), oli({ sale_date: D, child_asin: "B0B", sku: "S2" }), oli({ sale_date: D, child_asin: "B0Z", sku: "S9" })];
+  const caruso = skuMovementRows({ oliRows, catalogRows: CAT, effectiveAsOf: D, brand: "Caruso Italy" });
+  assert.equal(caruso.length, 1); assert.equal(caruso[0].asin, "B0A");
+  assert.ok(!caruso.some((r) => r.brand === "Unmapped"), "Unmapped never in a named brand");
+  const none = skuMovementPayload({ oliRows, catalogRows: CAT, effectiveAsOf: D, brand: "Nope" });
+  assert.equal(none.rows.length, 0); assert.equal(none.brandFiltered, true);
 });
-test("22. a completed month ENTIRELY before coverage is UNAVAILABLE (null), never a fabricated 0", () => {
-  const rows = skuMovementRows({ oliRows: [oli({ sale_date: "2026-07-10", child_asin: "B0A", sku: "S1", units: 8 })], catalogRows: CAT, effectiveAsOf: D, brand: "ALL", coverageFrom: "2026-07-01" });
-  const r = rows[0];
-  assert.equal(r.months.find((m) => m.key === "2026-05").units, null, "May is before coverage -> unavailable");
-  assert.equal(r.months.find((m) => m.key === "2026-06").units, null, "Jun is before coverage -> unavailable");
-  assert.equal(r.months.find((m) => m.key === "2026-07").units, 8, "Jul is covered -> real units");
-  assert.equal(r.avgMonthlyUnits, 8, "average is over AVAILABLE months only (never divides by unavailable months)");
+test("7b. canonical brandKey matches case/whitespace; punctuation stays DISTINCT", () => {
+  assert.equal(skuMovementRows({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "S1" })], catalogRows: CAT, effectiveAsOf: D, brand: "  caruso   ITALY " }).length, 1);
+  const hy = skuMovementRows({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "S1" }), oli({ sale_date: D, child_asin: "B0C", sku: "S3" })], catalogRows: CAT, effectiveAsOf: D, brand: "Caruso-Italy" });
+  assert.equal(hy.length, 1); assert.equal(hy[0].asin, "B0C", "hyphen brand is DISTINCT");
 });
-test("14b/15b/16b (derived): run rate + projection from MTD; avg over available months", () => {
-  const oliRows = [oli({ sale_date: "2026-08-15", child_asin: "B0A", sku: "S1", units: 30 })]; // 30 units over 15 days
-  const r = skuMovementRows({ oliRows, catalogRows: CAT, effectiveAsOf: D, brand: "ALL", coverageFrom: "2026-05-01" })[0];
+test("14. an ordered-unit row with a SKU but NO resolvable ASIN stays Unmapped per-SKU (never attached to an ASIN)", () => {
+  const rows = skuMovementRows({ oliRows: [
+    oli({ sale_date: D, child_asin: "B0A", sku: "S1", units: 5 }),
+    oli({ sale_date: D, child_asin: "", sku: "ORPHAN-1", units: 2 }),
+    oli({ sale_date: D, child_asin: "", sku: "ORPHAN-2", units: 3 }),
+  ], catalogRows: CAT, effectiveAsOf: D, brand: "ALL" });
+  assert.equal(rows.length, 3, "B0A + two distinct Unmapped per-SKU rows (never collapsed onto B0A)");
+  const unmapped = rows.filter((r) => r.unmapped);
+  assert.equal(unmapped.length, 2);
+  assert.ok(unmapped.every((r) => r.brand === "Unmapped" && !r.asin));
+  assert.equal(rowFor(rows, "B0A").recentTotal, 5, "Unmapped units never leak into B0A");
+});
+
+/* ===== 15-17: REPRESENTATIVE SKU ===== */
+test("15. representative SKU EXCLUDES case-insensitive amzn... return SKUs while a legit SKU exists", () => {
+  const rep = representativeSku(["amzn.gr.OASC068N-CA_uB", "amzn.gr.OASC068N-XquL", "OASC068N"]);
+  assert.equal(rep.sku, "OASC068N", "the legitimate seller SKU, not an amzn return SKU");
+  assert.equal(rep.skuCount, 3, "all 3 SKUs counted as combined");
+  assert.equal(rep.legitCount, 1);
+  assert.equal(isLegitimateSku("AMZN.gr.x"), false); assert.equal(isLegitimateSku("amznAbc"), false); assert.equal(isLegitimateSku("OASC068N"), true);
+});
+test("16. representative SKU is deterministic: catalog primary wins; else lexicographically smallest legit", () => {
+  assert.equal(representativeSku(["Zeta", "Alpha", "Mango"]).sku, "Alpha", "lexicographically smallest");
+  assert.equal(representativeSku(["Zeta", "Alpha"], "Zeta").sku, "Zeta", "proven catalog primary wins");
+  assert.equal(representativeSku(["Zeta", "Alpha"], "NotPresent").sku, "Alpha", "a primary not among the SKUs falls back to smallest");
+  assert.equal(representativeSku(["Zeta", "Alpha"], "amzn.x").sku, "Alpha", "an amzn primary is never chosen");
+});
+test("17. every-SKU-amzn case exposes NO seller SKU (empty) but still aggregates the units", () => {
+  const rep = representativeSku(["amzn.gr.A", "amzn.gr.B"]);
+  assert.equal(rep.sku, "", "no legitimate seller SKU -> empty (UI shows em dash / No seller SKU)");
+  const rows = skuMovementRows({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "amzn.gr.A", units: 4 }), oli({ sale_date: D, child_asin: "B0A", sku: "amzn.gr.B", units: 6 })], catalogRows: CAT, effectiveAsOf: D, brand: "ALL" });
+  assert.equal(rows.length, 1); assert.equal(rows[0].sku, "", "no seller SKU displayed");
+  assert.equal(rows[0].recentTotal, 10, "amzn SKUs' units are NOT discarded from the aggregate");
+  assert.equal(rows[0].hasSellerSku, false);
+});
+
+/* ===== 18 + derived: units policy, months/MTD/run-rate/projection, payload envelope ===== */
+test("18. covered=0 vs uncovered=null months; avg over available months; run rate + projection", () => {
+  const r = skuMovementRows({ oliRows: [oli({ sale_date: "2026-07-10", child_asin: "B0A", sku: "S1", units: 8 }), oli({ sale_date: "2026-08-15", child_asin: "B0A", sku: "S1", units: 30 })], catalogRows: CAT, effectiveAsOf: D, brand: "ALL", coverageFrom: "2026-07-01" })[0];
+  assert.equal(r.months.find((m) => m.key === "2026-05").units, null, "May before coverage -> unavailable");
+  assert.equal(r.months.find((m) => m.key === "2026-07").units, 8);
+  assert.equal(r.avgMonthlyUnits, 8, "average over AVAILABLE months only");
   assert.equal(r.mtdRunRate, 2, "30 units / 15 days elapsed");
   assert.equal(r.projectedUnits, 62, "2/day * 31 days in Aug");
 });
-test("19/20/21. units come from the durable rollup (cancelled/explicit-zero/pending already excluded); never fabricated", () => {
-  // The daily rollup passed in already reflects the OLI contribution rules -- the core sums rollup.units verbatim and
-  // invents nothing. A date present with 0 rollup units contributes 0; an absent (uncovered) date is null, not 0.
-  const rows = skuMovementRows({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "S1", units: 0 })], catalogRows: CAT, effectiveAsOf: D, brand: "ALL" });
-  assert.equal(rows[0].last5Total, 0, "an explicit-zero rollup row contributes 0, never a fabricated positive");
-  const noRows = skuMovementRows({ oliRows: [], catalogRows: CAT, effectiveAsOf: D, brand: "ALL" });
-  assert.equal(noRows.length, 0, "no OLI evidence -> no fabricated rows");
+test("units are summed verbatim (explicit-zero -> 0, no evidence -> no row, never fabricated)", () => {
+  assert.equal(skuMovementRows({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "S1", units: 0 })], catalogRows: CAT, effectiveAsOf: D, brand: "ALL" })[0].recentTotal, 0);
+  assert.equal(skuMovementRows({ oliRows: [], catalogRows: CAT, effectiveAsOf: D, brand: "ALL" }).length, 0);
 });
-test("1. account isolation: the core aggregates ONLY the rows it is given (the reader supplies one account's rows)", () => {
-  // The serve/reader layer supplies exactly one account's durable rows; the core never reaches back for more.
-  const rows = skuMovementRows({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "S1", units: 7 })], catalogRows: CAT, effectiveAsOf: D, brand: "ALL" });
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].last5Total, 7);
-});
-test("26. the payload is brand-scoped end to end (what CSV/export serialize): brand + brandFiltered + dynamic labels", () => {
+test("payload envelope carries the daily axis + default/max N + dynamic labels (no hard-coded 5/7)", () => {
   const p = skuMovementPayload({ oliRows: [oli({ sale_date: D, child_asin: "B0A", sku: "S1" })], catalogRows: CAT, effectiveAsOf: D, brand: "Caruso Italy" });
   assert.equal(p.brand, "Caruso Italy"); assert.equal(p.brandFiltered, true);
+  assert.equal(p.defaultRecentDays, 7); assert.equal(p.maxRecentDays, 30);
+  assert.equal(p.dailyDates.length, DAILY_HISTORY_DAYS);
   assert.deepEqual(p.monthLabels, ["May '26", "Jun '26", "Jul '26"]);
   assert.equal(p.mtdLabel, "Aug '26 MTD");
-  assert.equal(p.rows.length, 1);
+  assert.equal(p.rows[0].sku, "S1");
 });
-test("catalogAsinMap: first catalog row per ASIN wins; blank brand -> Unmapped (null key)", () => {
-  const m = catalogAsinMap([{ child_asin: "b0a", product_brand: "  Foo  Bar ", product_name: "P" }, { child_asin: "B0A", product_brand: "Other" }, { child_asin: "B0X", product_brand: "  " }]);
+test("month/leap rollovers still correct (Aug->Sep drops May; Dec->Jan crosses year; leap Feb 29)", () => {
+  assert.deepEqual(skuMovementDateWindows("2026-09-01").completedMonths.map((m) => m.label), ["Jun '26", "Jul '26", "Aug '26"]);
+  assert.deepEqual(skuMovementDateWindows("2027-01-10").completedMonths.map((m) => m.label), ["Oct '26", "Nov '26", "Dec '26"]);
+  assert.equal(skuMovementDateWindows("2028-03-05").completedMonths.find((m) => m.key === "2028-02").to, "2028-02-29");
+});
+test("catalogAsinMap: first row per ASIN wins; blank brand -> Unmapped; carries primarySku when present", () => {
+  const m = catalogAsinMap([{ child_asin: "b0a", product_brand: "  Foo  Bar ", product_name: "P", sku: "PRIMARY-1" }, { child_asin: "B0A", product_brand: "Other" }, { child_asin: "B0X", product_brand: "  " }]);
   assert.equal(m.get("B0A").brandKey, "foo bar");
-  assert.equal(m.get("B0A").brandDisplay, "Foo Bar");
-  assert.equal(m.get("B0X").brandKey, null, "blank brand -> unmapped");
+  assert.equal(m.get("B0A").primarySku, "PRIMARY-1");
+  assert.equal(m.get("B0X").brandKey, null);
 });
 
 out("\n" + passed + " assertions passed");

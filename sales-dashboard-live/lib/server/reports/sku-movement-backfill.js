@@ -18,7 +18,7 @@ import { rederiveSkuMovement } from "./sku-movement-durable-rederive.js";
 import { REPORT_DERIVATIONS } from "../sync/report-derivation.js";
 
 export const SKU_MOVEMENT_REPORT_KEY = "sku-movement";
-export const SKU_MOVEMENT_VERSION = "sku-movement/v1";
+export const SKU_MOVEMENT_VERSION = "sku-movement/v2";
 const SKU_MOVEMENT_OLI_SOURCE_KEY = "order-line-items";
 const SKU = REPORT_DERIVATIONS["sku-movement"];
 

@@ -722,26 +722,82 @@ export async function replaceFbaAccountSkuOwnership({ organizationFingerprint, c
   return Array.isArray(body) ? body[0] : body;
 }
 
-// Per-user column visibility prefs for the FBA plan (hidden column ids). Absent row => all defaults visible.
+// Per-user column visibility prefs (hidden column ids) + an additive per-(user, report) `prefs` jsonb (e.g. SKU
+// Movement's chosen recent-window N). Absent row => all defaults visible + empty prefs. Reused by BOTH FBA Plan
+// (report_key 'fba-plan', hidden_columns only) and SKU Movement (report_key 'sku-movement', + prefs.recentDays).
 export async function getFbaPlanColumnPrefs({ userId, reportKey = "fba-plan", signal = null } = {}) {
   if (!userId) throw new Error("getFbaPlanColumnPrefs requires userId (fail closed).");
-  const q = new URLSearchParams({ user_id: `eq.${userId}`, report_key: `eq.${reportKey}`, select: "hidden_columns,updated_at" });
+  const q = new URLSearchParams({ user_id: `eq.${userId}`, report_key: `eq.${reportKey}`, select: "hidden_columns,prefs,updated_at" });
   try {
     const rows = await request(`/rest/v1/fba_plan_column_prefs?${q}`, { signal });
     const row = Array.isArray(rows) ? rows[0] : null;
-    return { hiddenColumns: Array.isArray(row?.hidden_columns) ? row.hidden_columns.map(String) : [], updatedAt: row?.updated_at || null };
-  } catch (e) { if (isSchemaMissingError(e)) return { hiddenColumns: [], updatedAt: null }; throw e; }
+    return {
+      hiddenColumns: Array.isArray(row?.hidden_columns) ? row.hidden_columns.map(String) : [],
+      prefs: row && row.prefs && typeof row.prefs === "object" && !Array.isArray(row.prefs) ? row.prefs : {},
+      updatedAt: row?.updated_at || null,
+    };
+  } catch (e) { if (isSchemaMissingError(e)) return { hiddenColumns: [], prefs: {}, updatedAt: null }; throw e; }
 }
 
-export async function setFbaPlanColumnPrefs({ userId, reportKey = "fba-plan", hiddenColumns }) {
+export async function setFbaPlanColumnPrefs({ userId, reportKey = "fba-plan", hiddenColumns, prefs = undefined }) {
   const hidden = Array.from(new Set((Array.isArray(hiddenColumns) ? hiddenColumns : []).map(String))).slice(0, 200);
+  const body = { user_id: userId, report_key: reportKey, hidden_columns: hidden, updated_at: new Date().toISOString() };
+  // prefs is OPTIONAL + additive: only written when supplied (FBA callers never pass it, so their row's prefs is untouched).
+  if (prefs !== undefined) body.prefs = (prefs && typeof prefs === "object" && !Array.isArray(prefs)) ? prefs : {};
   const rows = await request("/rest/v1/fba_plan_column_prefs?on_conflict=user_id,report_key", {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-    body: { user_id: userId, report_key: reportKey, hidden_columns: hidden, updated_at: new Date().toISOString() },
+    body,
   });
   const row = Array.isArray(rows) ? rows[0] : rows;
-  return { hiddenColumns: Array.isArray(row?.hidden_columns) ? row.hidden_columns.map(String) : hidden };
+  return {
+    hiddenColumns: Array.isArray(row?.hidden_columns) ? row.hidden_columns.map(String) : hidden,
+    prefs: row && row.prefs && typeof row.prefs === "object" && !Array.isArray(row.prefs) ? row.prefs : (prefs || {}),
+  };
+}
+
+// ---- SKU MOVEMENT identifier (manual per-(org, account, marketplace, ASIN) metadata) --------------------------
+// Read the account's saved identifiers -> a map { CHILD_ASIN(upper): identifier }. Account-scoped (the caller
+// authorizes account access). Fail-soft: schema-missing / read error => {} (the report renders without identifiers).
+export async function getSkuMovementIdentifiers({ organizationFingerprint, connectionId = "primary", accountId, signal = null } = {}) {
+  if (!organizationFingerprint || !accountId) throw new Error("getSkuMovementIdentifiers requires organizationFingerprint + accountId (fail closed).");
+  const q = new URLSearchParams({
+    organization_fingerprint: `eq.${organizationFingerprint}`, connection_id: `eq.${connectionId}`, account_id: `eq.${accountId}`,
+    select: "child_asin,marketplace,identifier,updated_at",
+  });
+  try {
+    const rows = await request(`/rest/v1/sku_movement_identifier?${q}`, { signal });
+    const map = {};
+    for (const r of Array.isArray(rows) ? rows : []) { const a = String(r.child_asin || "").trim().toUpperCase(); if (a) map[a] = String(r.identifier || ""); }
+    return map;
+  } catch (e) { if (isSchemaMissingError(e)) return {}; throw e; }
+}
+
+// Single-row identifier upsert-or-clear (blank identifier CLEARS) via the SECURITY DEFINER RPC. Atomic + audited.
+export async function recordSkuMovementIdentifier({ organizationFingerprint, connectionId = "primary", accountId, marketplace, childAsin, identifier, updatedBy = null, updatedByEmail = "" }) {
+  const body = await request("/rest/v1/rpc/record_sku_movement_identifier", {
+    method: "POST",
+    body: {
+      p_organization_fingerprint: organizationFingerprint, p_connection_id: connectionId, p_account_id: accountId,
+      p_marketplace: marketplace, p_child_asin: childAsin, p_identifier: identifier == null ? "" : String(identifier),
+      p_updated_by: updatedBy, p_updated_by_email: updatedByEmail,
+    },
+  });
+  return Array.isArray(body) ? body[0] : body;
+}
+
+// Atomic BULK identifier apply for ONE account (single canonical marketplace), all-or-nothing, via the RPC.
+// rows: [{ childAsin, identifier }] -- a blank identifier CLEARS that ASIN.
+export async function recordSkuMovementIdentifierBulk({ organizationFingerprint, connectionId = "primary", accountId, marketplace, rows, updatedBy = null, updatedByEmail = "" }) {
+  const p_rows = (Array.isArray(rows) ? rows : []).map((r) => ({ child_asin: r.childAsin ?? r.child_asin, identifier: r.identifier == null ? "" : String(r.identifier) }));
+  const body = await request("/rest/v1/rpc/record_sku_movement_identifier_bulk", {
+    method: "POST",
+    body: {
+      p_organization_fingerprint: organizationFingerprint, p_connection_id: connectionId, p_account_id: accountId,
+      p_marketplace: marketplace, p_rows, p_updated_by: updatedBy, p_updated_by_email: updatedByEmail,
+    },
+  });
+  return Array.isArray(body) ? body[0] : body;
 }
 
 const ADS_ROW_CONFLICT_KEY = "source_key,account_id,marketplace_country_code,metric_date,dimension_key";

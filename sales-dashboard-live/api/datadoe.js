@@ -44,6 +44,7 @@ import {
   getSourceOliSalesEstimateRows,
   getOliSkuAsinResolutionRows,
   getAccountDirectorySnapshotAccounts,
+  getSkuMovementIdentifiers,
   getSourceSnapshot,
   getSourceSnapshotPayload,
   getExplicitZeroOliUnits,
@@ -1001,6 +1002,13 @@ async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, co
   };
   const augment = makeCompletenessAugment({ organizationFingerprint: orgFp, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows, readEstimates: getSourceOliSalesEstimateRows });
 
+  // Manual per-(account, marketplace, ASIN) identifiers, JOINED at serve time (kept OUT of the snapshot so a
+  // re-derive never erases them). Account-scoped; fail-soft (any read failure -> no identifiers, report unaffected).
+  const identifierMap = await getSkuMovementIdentifiers({ organizationFingerprint: orgFp, connectionId: "primary", accountId }).catch(() => ({}));
+  const withIdentifiers = (payload) => (payload && Array.isArray(payload.rows)
+    ? { ...payload, rows: payload.rows.map((r) => ({ ...r, identifier: identifierMap[String(r.asin || "").trim().toUpperCase()] || "" })) }
+    : payload);
+
   // CHEAP freshness probe (coverage + catalog metadata only -- NO history load, NO DataDoe): the current proven
   // as-of + the provenance the derive WOULD stamp. Used to decide "serve stored" vs "re-derive".
   let effectiveAsOf = null;
@@ -1022,7 +1030,7 @@ async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, co
     const paramsHash = paramsHashFor(reportVersion, storedParams);
     const extraAug = await augment({ accountId, params, payload: snap.payload }).catch(() => ({}));
     res.status(200).json({
-      ...snap.payload, reportKey, reportVersion, paramsHash,
+      ...withIdentifiers(snap.payload), reportKey, reportVersion, paramsHash,
       ...(extraAug && typeof extraAug === "object" ? extraAug : {}),
       ...extra,
       snapshot: { savedAt: snap.source_refreshed_at || snap.updated_at || null, updatedAt: snap.updated_at || null, shared: true },
@@ -1070,7 +1078,7 @@ async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, co
     if (saved && saved.id) await publishSnapshotUpdate({ reportKey, accountId, paramsHash: publishedHash, snapshotId: saved.id }).catch(() => {});
     const extraAug = await augment({ accountId, params, payload: derived.payload }).catch(() => ({}));
     res.status(200).json({
-      ...derived.payload, reportKey, reportVersion, paramsHash: publishedHash,
+      ...withIdentifiers(derived.payload), reportKey, reportVersion, paramsHash: publishedHash,
       ...(extraAug && typeof extraAug === "object" ? extraAug : {}),
       snapshot: { savedAt: derived.sourceRefreshedAt || new Date().toISOString(), updatedAt: null, shared: true, rebuilt: true },
     });
@@ -1637,7 +1645,7 @@ function legacySharedDescriptor({ action, req, access, publicAccountIds, account
       // so the snapshot the self-heal publishes is keyed by { asOf: <effectiveAsOf>, brand } and the read
       // stale-serves the latest snapshot for the same brand scope. `to` is only a request-time hint.
       return {
-        reportKey: "sku-movement", reportVersion: "sku-movement/v1", accountId,
+        reportKey: "sku-movement", reportVersion: "sku-movement/v2", accountId,
         params: { asOf: to || "", brand: String(req.query.brand || "ALL") }, label: "SKU Movement",
       };
     case "reconciliation":
