@@ -44,6 +44,58 @@ export function oliGroupKey({ accountId, saleDate, sku, childAsin, currency }) {
   return JSON.stringify([S(accountId), S(saleDate), S(sku), S(childAsin), S(currency)]);
 }
 
+// The ONE shared authority for an account's canonical marketplace, used by BOTH the runtime and the backfill so
+// they can NEVER diverge. It groups EVERY directory row by canonical account id and collects the SET of canonical
+// marketplaces (UK->GB) -- NEVER last-write-wins. Marketplace is read ONLY from the directory's own marketplace/
+// country field; it is NEVER inferred from currency, seller id, ASIN, SKU, connection, or bucket. Result per account:
+//   { status: "unique",    marketplace }  -- exactly one distinct nonblank canonical marketplace;
+//   { status: "missing",   marketplace: null } -- no nonblank marketplace at all;
+//   { status: "ambiguous", marketplace: null, count } -- more than one distinct canonical marketplace.
+// Only "unique" is safe to estimate under; missing/ambiguous fail closed (the estimator never picks one).
+export function resolveUniqueMarketplaceByAccount(directoryAccounts = []) {
+  const canonicalByAccount = new Map(); // accountId -> Set(canonical marketplace)
+  for (const a of (Array.isArray(directoryAccounts) ? directoryAccounts : [])) {
+    const id = S(a && (a.accountId ?? a.account_id ?? a.id)).trim();
+    if (!id) continue;
+    const mkt = normalizeMarketplace(a && (a.country ?? a.marketCountry ?? a.marketplace ?? a.marketplace_country_code));
+    let set = canonicalByAccount.get(id);
+    if (!set) { set = new Set(); canonicalByAccount.set(id, set); }
+    if (mkt) set.add(mkt); // only nonblank canonical marketplaces count toward uniqueness
+  }
+  const byAccount = new Map();
+  for (const [id, set] of canonicalByAccount) {
+    if (set.size === 0) byAccount.set(id, { status: "missing", marketplace: null });
+    else if (set.size === 1) byAccount.set(id, { status: "unique", marketplace: [...set][0] });
+    else byAccount.set(id, { status: "ambiguous", marketplace: null, count: set.size });
+  }
+  return byAccount;
+}
+
+// The account's authoritative canonical marketplace ONLY when it is uniquely proven; "" (fail closed) otherwise.
+export function authoritativeMarketplace(resolutionMap, accountId) {
+  const r = resolutionMap instanceof Map ? resolutionMap.get(S(accountId).trim()) : null;
+  return r && r.status === "unique" && r.marketplace ? r.marketplace : "";
+}
+
+// Redacted diagnostics for telemetry: counts + the SHORT-hashed account ids of the missing/ambiguous accounts
+// (never any unrelated account detail). Safe to log.
+export function summarizeMarketplaceResolution(resolutionMap) {
+  let unique = 0; let missing = 0; let ambiguous = 0;
+  const missingAccounts = []; const ambiguousAccounts = [];
+  if (resolutionMap instanceof Map) {
+    for (const [id, r] of resolutionMap) {
+      if (r.status === "unique") unique += 1;
+      else if (r.status === "missing") { missing += 1; missingAccounts.push(S(id).slice(0, 8)); }
+      else { ambiguous += 1; ambiguousAccounts.push(S(id).slice(0, 8)); }
+    }
+  }
+  return { unique, missing, ambiguous, missingAccounts, ambiguousAccounts };
+}
+
+// Typed diagnostic codes for a fail-closed marketplace authority (never silently swallowed).
+export const OLI_ESTIMATE_MARKETPLACE_MISSING = "OLI_ESTIMATE_MARKETPLACE_MISSING";
+export const OLI_ESTIMATE_MARKETPLACE_AMBIGUOUS = "OLI_ESTIMATE_MARKETPLACE_AMBIGUOUS";
+
 // Round a COMPLETE line amount to a currency's minor units (default 2). Applied only AFTER unit-price x quantity,
 // per the spec ("appropriate currency precision only after calculating the complete target-line amount").
 function roundMoney(amount, precision = 2) {

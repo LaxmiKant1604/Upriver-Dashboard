@@ -36,7 +36,10 @@ const LOOKBACK_ONLY_DAYS = Number(process.env.ESTIMATE_BACKFILL_DAYS || 0); // 0
 
 const sb = await import("../../lib/server/supabase.js");
 const { recomputeOliSalesEstimatesWindow } = await import("../../lib/server/sync/oli-sales-estimate-recompute.js");
-const { normalizeMarketplace } = await import("../../lib/server/sync/oli-sales-estimate.js");
+const {
+  resolveUniqueMarketplaceByAccount, authoritativeMarketplace, summarizeMarketplaceResolution,
+  OLI_ESTIMATE_MARKETPLACE_MISSING, OLI_ESTIMATE_MARKETPLACE_AMBIGUOUS,
+} = await import("../../lib/server/sync/oli-sales-estimate.js");
 const { addDaysStr } = await import("../../lib/server/date-windows.js");
 const pg = (await import("pg")).default;
 
@@ -58,17 +61,19 @@ async function loadScope() {
     )).rows;
     const snap = (await c.query("select payload from public.report_snapshots where report_key='account-directory' order by updated_at desc limit 1")).rows[0];
     const accts = (snap && snap.payload && Array.isArray(snap.payload.accounts)) ? snap.payload.accounts : [];
-    const mktByAccount = new Map();
-    for (const a of accts) {
-      const id = String(a.accountId || a.id || a.account_id || "").trim();
-      const mkt = normalizeMarketplace(a.country || a.marketCountry || a.marketplace);
-      if (id && !id.includes(":") && mkt) mktByAccount.set(id, mkt);
-    }
-    return { rows, mktByAccount };
+    // ONE shared authority (NO last-write-wins): group EVERY directory row per account; unique->safe, missing/ambiguous->fail closed.
+    const resolution = resolveUniqueMarketplaceByAccount(accts);
+    return { rows, resolution };
   } finally { await c.end(); }
 }
 
-const { rows: scope, mktByAccount } = await loadScope();
+const { rows: scope, resolution } = await loadScope();
+{
+  const rs = summarizeMarketplaceResolution(resolution);
+  console.log(`marketplace authority: unique=${rs.unique} missing=${rs.missing} ambiguous=${rs.ambiguous}` +
+    (rs.missingAccounts.length ? ` | ${OLI_ESTIMATE_MARKETPLACE_MISSING}=[${rs.missingAccounts.join(",")}]` : "") +
+    (rs.ambiguousAccounts.length ? ` | ${OLI_ESTIMATE_MARKETPLACE_AMBIGUOUS}=[${rs.ambiguousAccounts.join(",")}]` : ""));
+}
 if (!scope.length) { console.log("No accounts have missing/zero-price operational units -> nothing to estimate."); process.exit(0); }
 const orgFingerprint = scope[0].organization_fingerprint;
 console.log(`org=${String(orgFingerprint).slice(0, 8)} | accounts with missing/zero units: ${scope.length} | mode=${APPLY ? "APPLY (writes)" : "DRY-RUN (no writes)"}${LOOKBACK_ONLY_DAYS ? ` | last ${LOOKBACK_ONLY_DAYS} days only` : ""}`);
@@ -94,14 +99,19 @@ let skippedNoMkt = 0;
 for (const s of scope) {
   const accountId = s.account_id;
   const connectionId = s.connection_id || "primary";
-  const accountMarketplace = mktByAccount.get(accountId) || "";
+  const res = resolution.get(accountId);
+  // Only a UNIQUELY proven marketplace is used; missing OR ambiguous authority -> "" (fail closed). NEVER pick one
+  // from an ambiguous mapping, and NEVER infer from currency.
+  const accountMarketplace = authoritativeMarketplace(resolution, accountId);
   let from = s.from_date; const to = s.to_date;
   if (LOOKBACK_ONLY_DAYS && ceiling) { const cut = addDaysStr(ceiling, -(LOOKBACK_ONLY_DAYS - 1)); if (cut > from) from = cut; }
   if (!accountMarketplace) {
-    // No authoritative marketplace -> fail closed: clear any prior estimate window (never guess) and leave the
-    // grains unresolved. Still runs the recompute (which writes []) so a stale estimate can never linger.
+    // No UNIQUE authoritative marketplace -> fail closed: still runs the recompute below with "" (which resolves
+    // NOTHING and writes []), so any prior/stale estimate window is CLEARED and the grains are left unresolved --
+    // never guessed, never one-of-an-ambiguous-set.
     skippedNoMkt += 1;
-    console.log(`  ${accountId.slice(0, 6)} [${from}..${to}] NO authoritative marketplace -> unresolved (fail closed)`);
+    const code = res && res.status === "ambiguous" ? OLI_ESTIMATE_MARKETPLACE_AMBIGUOUS : OLI_ESTIMATE_MARKETPLACE_MISSING;
+    console.log(`  ${accountId.slice(0, 6)} [${from}..${to}] ${code} -> estimates cleared + unresolved (fail closed)`);
   }
   let acctEst = 0; let acctUnres = 0; let acctWin = 0;
   for (const win of monthsBetween(from, to)) {

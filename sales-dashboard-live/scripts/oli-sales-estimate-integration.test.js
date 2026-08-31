@@ -163,4 +163,76 @@ test("UNRELATED byte-identical: no estimates -> the enriched history rows are th
   assert.deepEqual(withEmpty, before, "an empty resolved set never changes the breakdown");
 });
 
+// ---------------------------------------------------------------------------------------------------------------
+group("orchestration fail-closed: shared resolver + recompute (runtime/backfill pattern)");
+
+// Mirror EXACTLY what the runtime and the backfill do: resolve the authoritative marketplace with the ONE shared
+// resolver, then recompute each account under authoritativeMarketplace() ("" when missing/ambiguous).
+async function orchestrate(directoryAccounts, jobs) {
+  const resolution = ENG.resolveUniqueMarketplaceByAccount(directoryAccounts);
+  const out = [];
+  for (const j of jobs) {
+    const acctMkt = ENG.authoritativeMarketplace(resolution, j.accountId);
+    const r = await RECOMP.recomputeOliSalesEstimatesWindow({
+      organizationFingerprint: ORG, accountId: j.accountId, accountMarketplace: acctMkt,
+      from: "2026-08-01", to: "2026-08-31", ...j.h, calculatedAt: "T",
+    });
+    out.push({ accountId: j.accountId, acctMkt, r, status: (resolution.get(j.accountId) || {}).status });
+  }
+  return out;
+}
+const eurOp = (date, pending) => ({ account_id: ACC, seller_or_vendor_id: SELLER, sale_date: date, sku: "SKU-A", child_asin: "B0X", currency: "EUR", marketplace_country_code: "DE", priced_units: 0, priced_sales: null, explicit_zero_units: 0, pending_units: pending, cancelled_units: 0, source_request_hash: "op" });
+const eurRef = (date, unitPrice, mkt) => ({ seller_or_vendor_id: SELLER, sale_date: date, sku: "SKU-A", child_asin: "B0X", currency: "EUR", marketplace_country_code: mkt, is_cancelled: false, total_sales_sum: unitPrice, total_units_sum: 1, source_request_hash: "ref" });
+
+test("AMBIGUOUS account: orchestration NEVER computes or persists an estimate, even with a valid same-marketplace reference", async () => {
+  const dir = [{ accountId: ACC, country: "DE" }, { accountId: ACC, country: "FR" }]; // ambiguous
+  const h = harness({ operationalRows: [eurOp("2026-08-29", 3)], referenceRows: [eurRef("2026-08-29", 100, "DE")] });
+  const [res] = await orchestrate(dir, [{ accountId: ACC, h }]);
+  assert.equal(res.status, "ambiguous");
+  assert.equal(res.acctMkt, "", "ambiguous authority never yields a marketplace");
+  assert.equal(res.r.estimates.length, 0, "no estimate is ever computed for an ambiguous account");
+  assert.equal(res.r.unresolved.length, 1, "the grain is left unresolved");
+  assert.deepEqual(h.writes[0], [], "the estimate window is CLEARED (stale estimates cannot linger)");
+});
+
+test("MISSING account: orchestration recompute clears the window and leaves grains unresolved", async () => {
+  const dir = [{ accountId: ACC, country: "" }]; // missing
+  const h = harness({ operationalRows: [eurOp("2026-08-29", 2)], referenceRows: [eurRef("2026-08-29", 100, "DE")] });
+  const [res] = await orchestrate(dir, [{ accountId: ACC, h }]);
+  assert.equal(res.status, "missing");
+  assert.equal(res.r.estimates.length, 0);
+  assert.deepEqual(h.writes[0], []);
+});
+
+test("UNIQUE account: orchestration estimates normally (no regression) under the proven marketplace", async () => {
+  const dir = [{ accountId: ACC, country: "DE" }, { accountId: ACC, country: "DE" }]; // duplicate-same -> unique
+  const h = harness({ operationalRows: [eurOp("2026-08-29", 2)], referenceRows: [eurRef("2026-08-29", 100, "DE")] });
+  const [res] = await orchestrate(dir, [{ accountId: ACC, h }]);
+  assert.equal(res.status, "unique");
+  assert.equal(res.acctMkt, "DE");
+  assert.equal(res.r.estimates.length, 1);
+  assert.equal(res.r.estimates[0].estimatedSales, 200);
+  assert.equal(res.r.estimates[0].marketplaceCountryCode, "DE");
+});
+
+test("STALE window is cleared when authority FLIPS unique -> ambiguous", async () => {
+  const h1 = harness({ operationalRows: [eurOp("2026-08-29", 2)], referenceRows: [eurRef("2026-08-29", 100, "DE")] });
+  const [a] = await orchestrate([{ accountId: ACC, country: "DE" }], [{ accountId: ACC, h: h1 }]);
+  assert.equal(a.r.estimates.length, 1, "initially unique -> an estimate is written");
+  // Directory later becomes ambiguous (DE + FR): the very next recompute writes [] over the same window.
+  const h2 = harness({ operationalRows: [eurOp("2026-08-29", 2)], referenceRows: [eurRef("2026-08-29", 100, "DE")] });
+  const [b] = await orchestrate([{ accountId: ACC, country: "DE" }, { accountId: ACC, country: "FR" }], [{ accountId: ACC, h: h2 }]);
+  assert.equal(b.r.estimates.length, 0);
+  assert.deepEqual(h2.writes[0], [], "the previously-estimated window is cleared once authority is ambiguous");
+});
+
+test("BASE priced sales + units are unchanged when estimates fail closed (fail-closed never regresses the priced path)", async () => {
+  const dir = [{ accountId: ACC, country: "DE" }, { accountId: ACC, country: "FR" }]; // ambiguous -> no estimates
+  const h = harness({ operationalRows: [eurOp("2026-08-29", 3)], referenceRows: [eurRef("2026-08-29", 100, "DE")] });
+  const [res] = await orchestrate(dir, [{ accountId: ACC, h }]);
+  const priced = [hist("2026-08-29", "SKU-A", "B0X", 300, 3, "EUR")];
+  const enriched = ENG.enrichOliHistoryRowsWithEstimates(priced, res.r.estimates); // res.r.estimates === []
+  assert.deepEqual(enriched, priced, "no estimate -> the priced Total Sales and units are byte-identical");
+});
+
 main().then((f) => { if (f) process.exitCode = 1; }).catch((e) => { out("FATAL " + String(e && e.stack ? e.stack : e)); process.exitCode = 1; });

@@ -59,7 +59,11 @@ import {
   getReportSnapshotStoragePayload, saveShadowSnapshotIfNewer,
 } from "../supabase.js";
 import { recomputeOliSalesEstimatesWindow } from "./oli-sales-estimate-recompute.js";
-import { enrichOliHistoryRowsWithEstimates } from "./oli-sales-estimate.js";
+import {
+  enrichOliHistoryRowsWithEstimates,
+  resolveUniqueMarketplaceByAccount, authoritativeMarketplace, summarizeMarketplaceResolution,
+  OLI_ESTIMATE_MARKETPLACE_MISSING, OLI_ESTIMATE_MARKETPLACE_AMBIGUOUS,
+} from "./oli-sales-estimate.js";
 import { paramsHashFor } from "../report-store.js";
 import { assertSnapshotWithinLimit } from "../report-limits.js";
 
@@ -891,10 +895,23 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     if (enableSalesEstimates) try {
       const estTo = effectivePublishAsOf;
       const estRecomputeFrom = (() => { const s = addDaysStr(estTo, -45); return s > brandViewWindow.from ? s : brandViewWindow.from; })();
+      // ONE shared authority (same resolver as the backfill; NO last-write-wins): an account is estimated ONLY under
+      // its UNIQUELY proven canonical marketplace. Missing OR ambiguous authority -> "" so the recompute still runs
+      // but resolves NOTHING and writes [] -> any stale estimate window is CLEARED and the grains stay unresolved
+      // (fail closed; never guessed, never one-of-an-ambiguous-set). Additive + non-fatal: the priced Total Sales,
+      // the unit counts, and LKG are never touched by this step.
+      const marketplaceResolution = resolveUniqueMarketplaceByAccount(accounts);
+      rollup.derived.marketplaceResolution = summarizeMarketplaceResolution(marketplaceResolution);
       for (const a of accounts) {
+        const acctMkt = authoritativeMarketplace(marketplaceResolution, a.accountId);
+        if (!acctMkt) {
+          const st = marketplaceResolution.get(String(a.accountId).trim());
+          const code = st && st.status === "ambiguous" ? OLI_ESTIMATE_MARKETPLACE_AMBIGUOUS : OLI_ESTIMATE_MARKETPLACE_MISSING;
+          try { console.warn(`${code} account=${String(a.accountId).slice(0, 8)} -> estimates cleared + unresolved (fail closed)`); } catch { /* telemetry only */ }
+        }
         await recomputeSalesEstimates({
           organizationFingerprint: orgFingerprint, connectionId: "primary", accountId: a.accountId,
-          accountMarketplace: a.country, // the account's AUTHORITATIVE marketplace (engine normalizes UK->GB)
+          accountMarketplace: acctMkt, // UNIQUELY proven canonical marketplace only ("" fails closed)
           from: estRecomputeFrom, to: estTo,
           readOperationalUnits: readOperationalUnitsForEstimate,
           readDimensionalRows: readDimensionalRowsForEstimate,

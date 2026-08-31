@@ -394,4 +394,82 @@ test("INR + USD estimates stay byte-identical when marketplace matches the accou
   assert.equal(usd.estimates[0].estimatedSales, 20);
 });
 
+// ---------------------------------------------------------------------------------------------------------------
+group("resolveUniqueMarketplaceByAccount: fail-closed authoritative mapping (NO last-write-wins)");
+
+test("duplicate directory rows with the SAME marketplace resolve uniquely", () => {
+  const m = ENG.resolveUniqueMarketplaceByAccount([
+    { accountId: "a1", country: "IN" }, { accountId: "a1", country: "IN" }, { accountId: "a1", country: "IN" },
+  ]);
+  assert.equal(m.get("a1").status, "unique");
+  assert.equal(m.get("a1").marketplace, "IN");
+  assert.equal(ENG.authoritativeMarketplace(m, "a1"), "IN");
+});
+
+test("DE + FR entries for the SAME account resolve as AMBIGUOUS (never one of them)", () => {
+  const m = ENG.resolveUniqueMarketplaceByAccount([
+    { accountId: "a1", country: "DE" }, { accountId: "a1", country: "FR" },
+  ]);
+  assert.equal(m.get("a1").status, "ambiguous");
+  assert.equal(m.get("a1").marketplace, null);
+  assert.equal(ENG.authoritativeMarketplace(m, "a1"), "", "ambiguous never yields a usable marketplace");
+});
+
+test("no nonblank marketplace resolves as MISSING", () => {
+  const m = ENG.resolveUniqueMarketplaceByAccount([
+    { accountId: "a1", country: "" }, { accountId: "a1", country: "   " }, { accountId: "a1" },
+  ]);
+  assert.equal(m.get("a1").status, "missing");
+  assert.equal(ENG.authoritativeMarketplace(m, "a1"), "");
+});
+
+test("UK + GB rows resolve UNIQUELY to canonical GB", () => {
+  const m = ENG.resolveUniqueMarketplaceByAccount([
+    { accountId: "a1", country: "UK" }, { accountId: "a1", country: "GB" }, { accountId: "a1", country: "uk" },
+  ]);
+  assert.equal(m.get("a1").status, "unique");
+  assert.equal(m.get("a1").marketplace, "GB");
+});
+
+test("directory row ORDER cannot change the result (order-independent)", () => {
+  const rows = [{ accountId: "a1", country: "FR" }, { accountId: "a1", country: "DE" }];
+  const forward = ENG.resolveUniqueMarketplaceByAccount(rows);
+  const reversed = ENG.resolveUniqueMarketplaceByAccount([...rows].reverse());
+  assert.equal(forward.get("a1").status, "ambiguous");
+  assert.equal(reversed.get("a1").status, "ambiguous");
+  // MUTATION GUARD: last-write-wins would make these differ (FR vs DE); the resolver keeps both ambiguous.
+  assert.equal(forward.get("a1").marketplace, reversed.get("a1").marketplace);
+});
+
+test("MUTATION GUARD: an ambiguous account never collapses to the LAST-written marketplace", () => {
+  // If the resolver ever regressed to Map.set (last-write-wins), 'a1' would resolve to 'FR' (the last row).
+  const m = ENG.resolveUniqueMarketplaceByAccount([
+    { accountId: "a1", country: "DE" }, { accountId: "a1", country: "IT" }, { accountId: "a1", country: "FR" },
+  ]);
+  assert.notEqual(ENG.authoritativeMarketplace(m, "a1"), "FR", "last-write-wins would wrongly pick FR");
+  assert.equal(m.get("a1").status, "ambiguous");
+  assert.equal(m.get("a1").count, 3);
+});
+
+test("marketplace is read ONLY from the marketplace/country field (never currency/seller/asin/sku)", () => {
+  const m = ENG.resolveUniqueMarketplaceByAccount([
+    { accountId: "a1", currency: "EUR", sellerOrVendorId: "S1", childAsin: "B0", sku: "K" }, // no country -> missing
+  ]);
+  assert.equal(m.get("a1").status, "missing", "currency/seller/asin/sku are never used to infer a marketplace");
+});
+
+test("distinct accounts each resolve independently; summary counts are redacted", () => {
+  const m = ENG.resolveUniqueMarketplaceByAccount([
+    { accountId: "uniq", country: "US" },
+    { accountId: "miss", country: "" },
+    { accountId: "ambi", country: "DE" }, { accountId: "ambi", country: "FR" },
+  ]);
+  const s = ENG.summarizeMarketplaceResolution(m);
+  assert.equal(s.unique, 1);
+  assert.equal(s.missing, 1);
+  assert.equal(s.ambiguous, 1);
+  assert.equal(s.missingAccounts.includes("miss"), true);
+  assert.equal(s.ambiguousAccounts.includes("ambi"), true);
+});
+
 main().then((f) => { if (f) process.exitCode = 1; }).catch((e) => { out("FATAL " + String(e && e.stack ? e.stack : e)); process.exitCode = 1; });
