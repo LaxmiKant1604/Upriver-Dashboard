@@ -181,6 +181,23 @@ export async function resolveUserReportScope({ access, requestedAccountId, reque
 }
 
 // ---- projection helpers (Phase 6): filter an already-built canonical payload to the permitted brand keys ----------
+// Phase 7 (pure): is the (account, requested-brand) pair authorized for this user? An admin/ALL_BRANDS account
+// contributes for any brand the account actually sells; a SELECTED_BRANDS account contributes ONLY when the brand is
+// BOTH granted for that account AND present in the account's trusted membership. `trustedKeys` is the Set of the
+// account's trusted brand keys; `grant` is { mode, brandKeys } for THIS account (or null). Used by the Brand View
+// account-set filter so a brand-restricted account never contributes a brand it is not permitted.
+export function accountBrandPairAuthorized({ isAdmin = false, grant, requestedBrandKey, trustedKeys }) {
+  if (isAdmin) return true;
+  if (!grant) return false; // not granted this account at all
+  const key = brandKey(requestedBrandKey);
+  if (!key) return false;
+  if (grant.mode !== "SELECTED_BRANDS") return true; // ALL_BRANDS: any brand the account sells (membership checked upstream)
+  const permitted = new Set((grant.brandKeys || []).map((k) => brandKey(k)).filter(Boolean));
+  if (!permitted.has(key)) return false;
+  const trusted = trustedKeys instanceof Set ? trustedKeys : new Set(trustedKeys || []);
+  return trusted.has(key);
+}
+
 // A payload row's brand key, from any of the common brand fields.
 export function rowBrandKey(row) {
   if (!row) return null;

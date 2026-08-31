@@ -7,7 +7,7 @@ import { writeSync } from "node:fs";
 import {
   CAPABILITY, REPORT_CAPABILITIES, resolveUserReportScope, accessFingerprint, BrandAccessError,
   isBrandAccessible, requiresScopeAdapter, projectBrandSalesPayload, projectSkuMovementPayload,
-  projectBrandDirectoryPayload, filterRowsToBrands,
+  projectBrandDirectoryPayload, filterRowsToBrands, accountBrandPairAuthorized,
 } from "../lib/server/report-authorization.js";
 
 let passed = 0;
@@ -150,6 +150,22 @@ await test("35. projection: brand directory keeps only permitted brands + inters
   assert.deepEqual(projected.brandKeys, ["bebi born"]);
   assert.deepEqual(projected.brandAccounts, { "bebi born": ["A"] }, "account B dropped for Bebi Born (not an authorized pair)");
   assert.ok(!projected.brands.includes("Zeta"), "Zeta hidden entirely");
+});
+
+await test("36/37. Brand View pair: a SELECTED_BRANDS account contributes a brand ONLY if granted AND trusted", () => {
+  const trusted = new Set(["bebi born", "acme corp"]);
+  // Account A: user granted Bebi Born only.
+  const grantA = { mode: "SELECTED_BRANDS", brandKeys: ["bebi born"] };
+  assert.equal(accountBrandPairAuthorized({ grant: grantA, requestedBrandKey: "Bebi Born", trustedKeys: trusted }), true, "granted + trusted -> contributes");
+  assert.equal(accountBrandPairAuthorized({ grant: grantA, requestedBrandKey: "ACME Corp", trustedKeys: trusted }), false, "same account, ungranted brand -> excluded (test 36: not another account's brand)");
+  // A granted brand that is NOT in trusted membership (removed) -> excluded.
+  assert.equal(accountBrandPairAuthorized({ grant: { mode: "SELECTED_BRANDS", brandKeys: ["gone"] }, requestedBrandKey: "gone", trustedKeys: trusted }), false, "granted but not trusted -> excluded");
+});
+
+await test("39. an ALL_BRANDS account contributes any brand; a non-granted account never contributes; admin always", () => {
+  assert.equal(accountBrandPairAuthorized({ grant: { mode: "ALL_BRANDS", brandKeys: null }, requestedBrandKey: "Anything", trustedKeys: new Set(["anything"]) }), true, "ALL_BRANDS -> contributes");
+  assert.equal(accountBrandPairAuthorized({ grant: null, requestedBrandKey: "Bebi Born", trustedKeys: new Set(["bebi born"]) }), false, "no grant for this account -> never contributes");
+  assert.equal(accountBrandPairAuthorized({ isAdmin: true, grant: null, requestedBrandKey: "X", trustedKeys: new Set() }), true, "admin -> always");
 });
 
 await test("30b. filterRowsToBrands never lets an Unmapped/blank-brand row into a named scope", () => {

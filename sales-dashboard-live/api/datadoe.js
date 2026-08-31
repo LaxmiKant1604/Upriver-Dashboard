@@ -63,7 +63,7 @@ import {
 // Admin/ALL_BRANDS users resolve to `restricted:false` and every serving path stays byte-identical.
 import {
   resolveUserReportScope, BrandAccessError, CAPABILITY, REPORT_CAPABILITIES, isBrandAccessible,
-  projectBrandSalesPayload, projectSkuMovementPayload, projectBrandDirectoryPayload,
+  projectBrandSalesPayload, projectSkuMovementPayload, projectBrandDirectoryPayload, accountBrandPairAuthorized,
 } from "../lib/server/report-authorization.js";
 import { brandKey as canonicalBrandKey } from "../lib/server/reports/brand-membership.js";
 // Shared DataDoe transport. Extracted so every report — the seven original ones
@@ -1609,12 +1609,12 @@ async function authorizedAccountsForBrand(access, accountIds, brand) {
   const out = [];
   for (const id of accountIds) {
     const grant = access.accountGrants && access.accountGrants[String(id)];
-    if (!grant) continue; // not granted (assertAccountAccess already ran; this is defence in depth)
-    if (grant.mode !== "SELECTED_BRANDS") { out.push(id); continue; } // ALL_BRANDS: any brand the account actually sells
-    const permitted = new Set((grant.brandKeys || []).map((k) => canonicalBrandKey(k)).filter(Boolean));
-    if (!permitted.has(key)) continue;
-    const trusted = await getTrustedAccountBrands({ accountId: id }).catch(() => []);
-    if (Array.isArray(trusted) && trusted.some((b) => b && b.key === key)) out.push(id);
+    // An ALL_BRANDS account only needs its grant; a SELECTED_BRANDS account also needs the brand in trusted membership.
+    const needsMembership = grant && grant.mode === "SELECTED_BRANDS";
+    const trustedKeys = needsMembership
+      ? new Set((await getTrustedAccountBrands({ accountId: id }).catch(() => [])).map((b) => b && b.key).filter(Boolean))
+      : null;
+    if (accountBrandPairAuthorized({ isAdmin: false, grant, requestedBrandKey: key, trustedKeys })) out.push(id);
   }
   return out;
 }
