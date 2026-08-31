@@ -1,5 +1,55 @@
 # Project Memory
 
+## OLI sales estimates -- server-side missing-ASIN resolution for pending SKU units (2026-08-31)
+
+THE remaining gap in the estimate feature, closed. Pending-itemization OLI units carry a SKU but a BLANK `child_asin`
+(Amazon populates the per-line item detail -- item_status / child_asin / item_price_value -- ~1-2 days AFTER the
+order is placed). The estimator matched a reference price at the account+seller+marketplace+currency+ASIN+SKU grain,
+so a blank ASIN could never reach a priced reference (which always carries a real ASIN) -- those units returned
+"no-reference" and their real sales stayed UNESTIMATED. Reproduced live from durable evidence: 30 Aug had **734
+non-cancelled pending units, ALL SKU-but-no-ASIN, and 0 estimate rows** (the estimate table ended 2026-08-29).
+
+- **Root cause**: `computeOliSalesEstimates` built the SKU-exact key with the target's OWN `child_asin`; for a pending
+  target that is blank, so `skuExactKey(..., "", sku)` never matched a priced reference's `skuExactKey(..., <ASIN>, sku)`.
+  Currency was NOT a second gap -- the operational-units table requires a canonical currency (constraint) and the
+  classifier resolves it upstream; a read-only recon proved 0 currency mismatches vs the account directory.
+- **Fix (engine, oli-sales-estimate.js)**: `buildSkuAsinResolver({accountMarketplace, historyRows, catalogRows})` +
+  `resolve()` fill a blank ASIN under the EXACT boundary (account+seller+marketplace+currency+SKU), accepting ONLY a
+  UNIQUE non-blank ASIN across ALL non-cancelled history; a Catalog/history conflict or any historical ambiguity stays
+  UNRESOLVED (fail closed, typed reason). Product Catalog has NO sku field (DataDoe rejects it HTTP 400, per
+  brand-resolution.js), so DURABLE HISTORY is the production source; the engine still supports a catalog SKU->ASIN map
+  so the agreement/conflict policy is real + tested. The RESOLVED ASIN is used for the price lookup AND stamped on the
+  estimate's `child_asin` (correct brand / ASIN attribution); `resolvedEstimateGroupKeys` emits BOTH the resolved grain
+  and the original blank-ASIN grain so the completeness breakdown still reclassifies. `matching_method` stays
+  'sku-exact' (the write RPC allow-list is untouched). Units are NEVER changed; raw evidence is immutable.
+- **DB (migrations 20260910 + 20260911, applied via tracked db:migrate)**: `resolve_oli_sku_asin(org,conn,acct)` --
+  a READ-ONLY security-definer function that GROUP-BYs the account's non-cancelled dimensional history
+  (seller, currency, sku) with `count(distinct child_asin)` and returns the compact per-account resolution set (server-
+  side, so ~465k raw rows never page into the app). A covering PARTIAL index in group order turns a 1.7s external-merge
+  disk sort (which tripped the PostgREST statement_timeout, HTTP 500) into a sub-100ms Index-Only Scan; the function
+  also pins statement_timeout=30s as a margin. Reader `getOliSkuAsinResolutionRows`.
+- **Canonical path**: `recomputeOliSalesEstimatesWindow` gains `readSkuAsinResolution`, wired into BOTH the priority
+  runtime (scheduler / force-latest / manual DSC sync all funnel here) AND the backfill -- the ONE canonical recompute.
+  Fully fail-soft: a missing/failed/throwing resolver -> the grain stays unresolved, never a broken priced read
+  (proven by two integration regressions). The backfill memoizes the resolver per account.
+- **Tests**: +27 engine (baseline bug; history/catalog resolve; agree; conflict; ambiguous; seller/currency/marketplace
+  isolation; resolved-from-blank price precedence + no-future; cancelled excluded; explicit-zero+pending counted;
+  no-identity; idempotent; both-grain breakdown key; no double-count; actual supersedes) + 5 recompute integration
+  (resolve through orchestration; fail-soft x2; brand-fold attribution; ambiguous) + 7 migration-structural. **verify
+  96/96 across 74 suites (incl. build:check).** node --check + git diff --check clean.
+- **Prod apply (zero-token backfill; NO DataDoe adapter -> creates=0 tokens=0)**: estimate table **1499 -> 1737 rows**,
+  sum **762,195.69 -> 1,069,422.68**; **30 Aug 0 -> 153 rows / +300,081.72**; NEW EUR/GBP/AUD estimates (were 0 -- their
+  blank-ASIN units could not resolve before). 30-account recon: **0 accounts with changed units** (units NEVER change),
+  26 gained estimate sales (+325,463.58 for August). Live enriched read-backs: 08-30 priced 70,923.94 -> enriched
+  371,005.66 (delta 300,081.72 == DB) across IN/IT/UK/AU/ES/FR/DE; US on 08-29 (its D-1) all 8 accounts $0 priced ->
+  estimated (e.g. 51bec5e7 $960, 916be46e $834.40). Completeness breakdown (12f3a683 08-30): observed 348 UNCHANGED,
+  pending 296 -> 2 reclassified. Integrity: 0 future-ref / 0 bad-marketplace / 0 negative-estimate / 0 blank-ASIN;
+  source_oli_daily_history + source_oli_operational_units untouched. 9 genuinely-new SKUs (never priced) correctly stay
+  unresolved. Brand-sales + daily-v2 snapshots re-derived + republished (zero-token, newerLive=0 = no regression;
+  brand-sales 12f3a683 08-30 snapshot = 138,933.03 == enriched). **Commit 4a0a6ed** (code+tests+migrations, pushed);
+  Vercel 200. Serve paths (Daily, Brand Sales) are enriched at read time; Brand View aggregates the republished
+  brand-sales snapshots; future flow = the SAME recompute (no new scheduler / persistence path).
+
 ## OLI sales estimates -- fail-closed marketplace AUTHORITY + canonical DB enforcement (2026-08-31)
 
 Final durability gap closed: the account->marketplace AUTHORITY is now permanently fail-closed if directory data is
