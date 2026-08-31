@@ -1,5 +1,63 @@
 # Project Memory
 
+## OLI -- ONE canonical ORDERED-UNITS merge: propagate ordered units into every OLI unit report (2026-08-31)
+
+The prior estimate work propagated estimated SALES but explicitly left UNITS priced-only (synthetic estimate rows
+carried `units:0`), so Daily Reporting + Brand Sales / Brand View counted PRICED units only while SKU Movement (its
+own operational overlay) counted ORDERED units -- a cross-surface divergence. Confirmed live: Daily 12f3a683 08-30
+showed `total_units=52` (priced) though the account observed 348 non-cancelled units (52 priced + 296 pending).
+
+- **Business rule now honored everywhere OLI supplies unit metrics**: `ordered_units = priced_units +
+  explicit_zero_units + pending_units` (cancelled excluded); `total_sales = actual priced + safely-estimated`;
+  `unpriced_units = the still-unresolved zero+pending gap` (breakdown only, never fabricated sales).
+- **ONE canonical merge** `mergeOrderedOliHistory({historyRows, operationalRows, estimateRows, skuAsinResolver})`
+  (pure, in `oli-sales-estimate.js`): at each (account, date, sku, ASIN, currency) grain it sums the priced rollup
+  units + the operational overlay (ONLY the explicit-zero + pending classes the rollup excludes -- DISJOINT, so NO
+  double-count) + the estimate sales. A blank child_asin on a pending/zero grain is RESOLVED to its unique ASIN
+  (the SAME server-side resolver the estimator uses) so the overlay units CO-LOCATE with the estimate sales and
+  attribute by ASIN; an unresolved grain keeps its blank ASIN and its units stay honestly `unpriced`. Cancelled
+  never added; estimates never add units; the estimate's target_quantity marks how many overlay units it covers, so
+  a later itemization (priced grows, pending shrinks, estimate shrinks) replays idempotently with no double count.
+- **ONE shared seam** `enrichOrderedOliHistory` (in `oli-enriched-history.js`): the enriched reader now does the
+  ordered merge per account (operational + estimates + resolution, marketplace from the account directory), fail-soft
+  to priced / priced+estimate on any read failure. The scheduler runtime uses the SAME seam (no parallel logic) --
+  scheduler / force-latest / manual DSC sync / self-heal / backfill all converge on it.
+- **Derive**: Daily needs NO change (it sums units unconditionally -> `total_units` = ordered). Brand Sales
+  `orderSalesByBrand` is FIELD-DRIVEN: a row carrying `ordered_units_sum` (only a merge row does) counts EVERY
+  observed non-cancelled unit into `total_units_sold` and surfaces `unpriced_units_sum` as the missing-order-value
+  breakdown; a legacy RAW OLI row (no `ordered_units_sum`) keeps the reviewed present-zero/missing policy UNCHANGED
+  -- the "118 present-zero units" incident fix + its `oli-value-policy` tests are fully preserved. `orderRowsFromHistory`
+  carries `ordered_units_sum` / `unpriced_units_sum`.
+- **SKU Movement** refactored onto the SAME `mergeOrderedOliHistory` (estimateRows `[]` -- units-only, no estimated
+  dollars) with ASIN resolution, so its ordered units + brand attribution can NEVER diverge from Brand View.
+- **No migration** (reads existing source_oli_daily_history + source_oli_operational_units + source_oli_sales_estimates
+  + resolve_oli_sku_asin). **Zero DataDoe / zero tokens.**
+- **Tests**: +16 engine (priced-only; priced+resolved-pending+estimate co-locate; unresolved pending; explicit-zero;
+  cancelled never added; no double-count; pending->actual settlement; idempotent replay) +4 integration PARITY
+  (Daily == Brand Sales ordered units through the REAL derive, incl an unresolved grain) +3 value-policy
+  ordered-units tests; every existing safety test preserved. **verify 96/96 across 74 suites (incl build:check).**
+  node --check + git diff --check clean.
+- **Prod DRY-RUN (30 accounts, zero-token, via the real seam)**: pricedUnits **28,141 -> orderedUnits 29,125**
+  (+984 zero/pending, == the operational (explicit_zero + pending) total EXACTLY -> no double-count/no miss),
+  enrichedSales +325K, unresolvedUnits 43; **cross-account rows = 0, wrong-currency rows = 0** (isolation proven).
+  Coverage: operational fully covers every recent date (op_priced == daily_priced 08-20..08-30) and ALL pending
+  units live on those covered dates, so the overlay is complete; older-date operational gaps have no zero/pending to
+  overlay -> honest priced-only fallback. `getSourceOliHistoryRows` filters sales>0 (excludes 352 LEGACY daily
+  present-zero remnants without operational evidence -- pre-existing, honest).
+- **Republished (zero-token, provenance-guarded, newerLive=0 no regression)**: Daily (26) + Brand Sales (26) +
+  SKU Movement (28 published + 2). Serve paths (Daily rederive / Brand Sales refresh / SKU Movement rederive) use
+  the seam directly. **Live read-backs**: Daily 12f3a683 08-30 `total_units` **52 -> 348**; Brand Sales
+  `total_units_sold` **348** (missing_order_value_units 2); SKU Movement 08-30 sum **348** -- all == operational
+  ordered 348. **Daily == Brand Sales ordered-unit parity across US/IN/DE/FR/IT/ES/UK: 0 mismatches.** Controls
+  untouched (steady-state ads-asin-date/order-line-items/product-catalog only; no cycle opened -> nothing to
+  safe-close). **Commit a71b8e5** (code/tests), pushed; Vercel 200.
+- **FBA Shipment Plan (documented, deliberately NOT changed)**: FBA demand reads the SETTLED priced rollup by
+  design -- replenishment forecasting must not react to unsettled PROVISIONAL pending orders (which can cancel) or
+  one-off free-unit giveaways; ordered units are the correct semantic for UNIT REPORTING (Daily/Brand/SKU Movement),
+  not DEMAND forecasting. Impact would be <1% (pending is a recent tail; explicit-zero is ~54 units/month). This is
+  a reviewed choice, not a silent bypass. Sales Dashboard / PPC-TACoS / Returns / Buy Box / Reconciliation read
+  SEPARATE live DataDoe exports (not the durable rollup) -- outside this seam by design.
+
 ## OLI sales estimates -- server-side missing-ASIN resolution for pending SKU units (2026-08-31)
 
 THE remaining gap in the estimate feature, closed. Pending-itemization OLI units carry a SKU but a BLANK `child_asin`
