@@ -7,7 +7,7 @@
 // Run AFTER every OLI persist (scheduler / manual sync / force-latest / self-heal) and by the standalone backfill,
 // BEFORE the dependent dashboards are derived, so the enriched Total Sales reflects the latest estimates.
 
-import { computeOliSalesEstimates, OLI_ESTIMATE_LOOKBACK_DAYS, normalizeMarketplace } from "./oli-sales-estimate.js";
+import { computeOliSalesEstimates, OLI_ESTIMATE_LOOKBACK_DAYS, normalizeMarketplace, buildSkuAsinResolver } from "./oli-sales-estimate.js";
 import { addDaysStr } from "../date-windows.js";
 
 const isDateStr = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v ?? ""));
@@ -29,7 +29,7 @@ const isDateStr = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v ?? ""));
  */
 export async function recomputeOliSalesEstimatesWindow({
   organizationFingerprint, connectionId = "primary", accountId, accountMarketplace, from, to,
-  readOperationalUnits, readDimensionalRows, writeEstimates,
+  readOperationalUnits, readDimensionalRows, writeEstimates, readSkuAsinResolution = null,
   lookbackDays = OLI_ESTIMATE_LOOKBACK_DAYS, precision = 2, calculatedAt = null, signal = null,
 } = {}) {
   if (!organizationFingerprint || !accountId || !isDateStr(from) || !isDateStr(to) || from > to) {
@@ -57,8 +57,21 @@ export async function recomputeOliSalesEstimatesWindow({
   const maxTarget = dates.reduce((m, d) => (d > m ? d : m), dates[0]);
   const referenceRows = await readDimensionalRows({ organizationFingerprint, connectionId, accountId, from: addDaysStr(minTarget, -lookbackDays), to: maxTarget, signal });
 
+  // 2b. SKU->ASIN RESOLUTION set: the unique ASIN each SKU has mapped to across ALL non-cancelled durable history
+  //     (server-side aggregation via resolve_oli_sku_asin -- account+seller+currency scoped). Lets a pending unit
+  //     that carries a SKU but a blank child_asin resolve its ASIN and match a priced reference. Fail-soft: any
+  //     failure (pre-migration / read error) leaves an EMPTY resolver -> those grains stay unresolved, never a
+  //     cross-boundary guess and never a broken priced read.
+  let skuAsinResolver = null;
+  if (typeof readSkuAsinResolution === "function" && acctMarketplace) {
+    try {
+      const resolutionRows = await readSkuAsinResolution({ organizationFingerprint, connectionId, accountId, signal });
+      skuAsinResolver = buildSkuAsinResolver({ accountMarketplace: acctMarketplace, historyRows: Array.isArray(resolutionRows) ? resolutionRows : [], catalogRows: [] });
+    } catch { skuAsinResolver = null; }
+  }
+
   // 3. COMPUTE (pure) + 4. REPLACE the window (delete + insert; [] clears a fully-resolved window).
-  const { estimates, unresolved } = computeOliSalesEstimates({ accountId, accountMarketplace: acctMarketplace, operationalRows, referenceRows: Array.isArray(referenceRows) ? referenceRows : [], maxLookbackDays: lookbackDays, precision, calculatedAt });
+  const { estimates, unresolved } = computeOliSalesEstimates({ accountId, accountMarketplace: acctMarketplace, operationalRows, referenceRows: Array.isArray(referenceRows) ? referenceRows : [], skuAsinResolver, maxLookbackDays: lookbackDays, precision, calculatedAt });
   const write = await writeEstimates({ organizationFingerprint, connectionId, accountId, coveredFrom: from, coveredTo: to, estimateRows: estimates, signal });
   return { estimates, unresolved, write };
 }

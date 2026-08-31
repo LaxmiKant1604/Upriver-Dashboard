@@ -1978,6 +1978,35 @@ export async function getSourceOliSalesEstimateRows({ organizationFingerprint, c
   return outRows;
 }
 
+// Server-side SKU -> child_asin RESOLUTION for ONE account (resolve_oli_sku_asin RPC). Returns the compact per-
+// account (seller_or_vendor_id, currency, sku, asin_count, child_asin) resolution set aggregated in the database
+// over ALL non-cancelled dimensional history under the exact isolation boundary (org + connection + account +
+// seller + currency + sku). asin_count is the number of DISTINCT non-blank ASINs the SKU has ever mapped to;
+// child_asin is meaningful ONLY when asin_count === 1 (the caller resolves a missing ASIN only when it is unique,
+// and leaves an ambiguous SKU unresolved -- fail closed). Fail-soft: pre-migration (function absent) returns [] so
+// the estimator degrades to blank-ASIN-targets-unresolved, never breaking the priced read. Reads only already-
+// fetched durable evidence -- ZERO DataDoe.
+export async function getOliSkuAsinResolutionRows({ organizationFingerprint, connectionId = "primary", accountId, signal = null } = {}) {
+  if (!organizationFingerprint || !accountId) {
+    throw new Error("getOliSkuAsinResolutionRows requires organizationFingerprint + accountId (fail closed).");
+  }
+  try {
+    const body = await request("/rest/v1/rpc/resolve_oli_sku_asin", {
+      method: "POST",
+      signal,
+      body: {
+        p_organization_fingerprint: organizationFingerprint,
+        p_connection_id: connectionId,
+        p_account_id: accountId,
+      },
+    });
+    return Array.isArray(body) ? body : [];
+  } catch (readError) {
+    if (isSchemaMissingError(readError)) return []; // additive RPC not yet applied -> degrade (no ASIN resolution)
+    throw readError;
+  }
+}
+
 // STANDALONE atomic replace of ONLY the sales-estimate window for one account (delete + insert by exact
 // account/window). Recomputed from durable truth (operational units + dimensional references) after every OLI
 // persist and by the zero-token backfill -- NEVER a DataDoe export. An EMPTY estimateRows clears the window.

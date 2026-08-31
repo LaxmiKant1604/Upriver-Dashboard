@@ -67,6 +67,18 @@ async function loadScope() {
   } finally { await c.end(); }
 }
 
+// The SKU->ASIN resolver aggregates an account's FULL non-cancelled history and is IDENTICAL for every window of
+// that account, so memoize it per account -- the backfill calls it ONCE per account, not once per monthly window
+// (the server-side aggregation is the same result every time). Fail-soft is preserved (an error caches nothing).
+const _resolverCache = new Map();
+async function memoSkuAsinResolution(args) {
+  const key = `${args.organizationFingerprint}|${args.connectionId || "primary"}|${args.accountId}`;
+  if (_resolverCache.has(key)) return _resolverCache.get(key);
+  const rows = await sb.getOliSkuAsinResolutionRows(args);
+  _resolverCache.set(key, rows);
+  return rows;
+}
+
 const { rows: scope, resolution } = await loadScope();
 {
   const rs = summarizeMarketplaceResolution(resolution);
@@ -119,6 +131,7 @@ for (const s of scope) {
       organizationFingerprint: orgFingerprint, connectionId, accountId, accountMarketplace, from: win.from, to: win.to,
       readOperationalUnits: sb.getSourceOliOperationalUnitRows,
       readDimensionalRows: sb.getSourceOliDimensionalUnitRows,
+      readSkuAsinResolution: memoSkuAsinResolution, // server-side SKU->ASIN resolution (same canonical path), memoized per account
       // DRY-RUN never writes: a no-op writer that reports what WOULD be written.
       writeEstimates: APPLY ? sb.replaceOliSalesEstimatesWindow : (async () => ({ write: "dry-run" })),
     });

@@ -174,6 +174,96 @@ function asinFallbackKey(accountId, sellerId, marketplace, currency, childAsin) 
   return JSON.stringify(["a", accountId, sellerId, marketplace, currency, childAsin]);
 }
 
+// ===========================================================================
+// SERVER-SIDE SKU -> child_asin RESOLUTION (for pending units that carry a SKU but a blank ASIN)
+// ---------------------------------------------------------------------------
+// A pending-itemization OLI unit frequently has a SKU but a BLANK child_asin (Amazon populates the per-line item
+// detail ~1-2 days after the order). The estimator matches a reference price at the ...+ASIN+SKU grain, so a blank
+// ASIN could never match a priced reference. This resolver fills the missing ASIN from proven, ALREADY-DURABLE
+// evidence under the EXACT isolation boundary (account + seller + marketplace + currency + SKU), NEVER crossing an
+// account/seller/marketplace/currency and NEVER inventing an ASIN.
+//
+// Resolution order (spec):
+//   1. the OLI row's own child_asin when present (handled in computeOliSalesEstimates, before this resolver);
+//   2. Product Catalog SKU -> child_asin -- STRUCTURALLY EMPTY in production (Product Catalog 68d2de238e has NO sku
+//      field; DataDoe rejects it HTTP 400), so `catalogRows` is [] in production. The resolver still SUPPORTS a
+//      catalog map so the agreement/conflict policy is real and testable;
+//   3. durable historical OLI -- the unique non-blank ASIN this SKU has EVER mapped to (same account+seller+currency,
+//      non-cancelled), from resolve_oli_sku_asin. Accepted ONLY when unique across all eligible history.
+//   4. when BOTH Catalog and history provide a mapping they MUST agree, else it is a conflict (unresolved);
+//   5. any ambiguity (more than one distinct ASIN) or conflict stays UNRESOLVED (fail closed);
+//   6. never uses another seller/account/marketplace/currency.
+export const ASIN_VIA_HISTORY = "history";
+export const ASIN_VIA_CATALOG = "catalog";
+export const ASIN_VIA_CATALOG_HISTORY = "catalog+history";
+// Typed unresolved reasons a blank-ASIN, SKU-carrying target can end at (each shows in the breakdown, adds no sales).
+export const UNRESOLVED_ASIN_AMBIGUOUS = "asin-ambiguous"; // SKU maps to >1 ASIN across eligible history
+export const UNRESOLVED_ASIN_CONFLICT = "asin-conflict";   // Catalog and history disagree on the SKU's ASIN
+export const UNRESOLVED_ASIN_NONE = "asin-unresolved";     // no Catalog and no history mapping for the SKU
+export const UNRESOLVED_NO_IDENTITY = "no-identity";       // neither SKU nor ASIN -> no canonical product identity
+
+function resolverKey(sellerId, marketplace, currency, sku) {
+  return JSON.stringify(["r", S(sellerId), normalizeMarketplace(marketplace), S(currency), S(sku)]);
+}
+
+/**
+ * Build the account-scoped SKU -> child_asin resolver. Pure. `accountMarketplace` is the account's AUTHORITATIVE
+ * canonical marketplace (bound to every key so a blank one resolves NOTHING). `historyRows` come from the
+ * resolve_oli_sku_asin RPC ([{ seller_or_vendor_id, currency, sku, asin_count, child_asin }]); `catalogRows` are an
+ * optional proven catalog SKU->ASIN mapping ([{ seller_or_vendor_id, currency, sku, child_asin }] -- [] in production).
+ * Returns a frozen resolver { marketplace, historyIndex, catalogIndex, resolve(target) }.
+ */
+export function buildSkuAsinResolver({ accountMarketplace, historyRows = [], catalogRows = [] } = {}) {
+  const acctMkt = normalizeMarketplace(accountMarketplace);
+  const historyIndex = new Map(); // key -> { count, asin }
+  for (const raw of Array.isArray(historyRows) ? historyRows : []) {
+    const sellerId = S(raw.sellerOrVendorId ?? raw.seller_or_vendor_id);
+    const currency = S(raw.currency);
+    const sku = S(raw.sku);
+    if (!sku) continue; // only a canonical SKU can resolve a SKU
+    const count = Math.max(0, Number(raw.asinCount ?? raw.asin_count) || 0);
+    const asin = S(raw.childAsin ?? raw.child_asin).trim();
+    // account+marketplace are bound (the RPC is account-scoped; acctMkt is authoritative for the account).
+    historyIndex.set(resolverKey(sellerId, acctMkt, currency, sku), { count, asin });
+  }
+  const catalogIndex = new Map(); // key -> asin (a proven catalog mapping; empty in production)
+  for (const raw of Array.isArray(catalogRows) ? catalogRows : []) {
+    const sellerId = S(raw.sellerOrVendorId ?? raw.seller_or_vendor_id);
+    const currency = S(raw.currency);
+    const sku = S(raw.sku);
+    const asin = S(raw.childAsin ?? raw.child_asin).trim();
+    if (!sku || !asin) continue;
+    catalogIndex.set(resolverKey(sellerId, acctMkt, currency, sku), asin);
+  }
+  const resolve = ({ sellerId, currency, sku } = {}) => {
+    if (!acctMkt) return { status: "none", asin: "", via: null }; // no authoritative marketplace -> resolve nothing
+    if (!S(sku)) return { status: "none", asin: "", via: null };
+    const key = resolverKey(sellerId, acctMkt, currency, sku);
+    const hist = historyIndex.get(key);
+    const catAsin = catalogIndex.get(key) || null;
+    const histAmbiguous = hist && hist.count > 1;
+    const histUnique = hist && hist.count === 1 && hist.asin ? hist.asin : null;
+    // Fail closed on ANY historical ambiguity (a SKU that has mapped to >1 ASIN is never resolved, even if a
+    // catalog value exists -- the durable evidence itself is inconsistent).
+    if (histAmbiguous) return { status: "ambiguous", asin: "", via: null };
+    if (histUnique && catAsin) {
+      return histUnique === catAsin
+        ? { status: "unique", asin: histUnique, via: ASIN_VIA_CATALOG_HISTORY }
+        : { status: "conflict", asin: "", via: null }; // Catalog and history must agree (spec rule 4)
+    }
+    if (histUnique) return { status: "unique", asin: histUnique, via: ASIN_VIA_HISTORY };
+    if (catAsin) return { status: "unique", asin: catAsin, via: ASIN_VIA_CATALOG };
+    return { status: "none", asin: "", via: null };
+  };
+  return Object.freeze({ marketplace: acctMkt, historyIndex, catalogIndex, resolve });
+}
+
+// A no-op resolver (resolves nothing) -- the fail-soft default when no resolution evidence is available (pre-
+// migration, read failure). It NEVER resolves an ASIN, so blank-ASIN SKU targets stay unresolved exactly as before.
+export function emptySkuAsinResolver(accountMarketplace) {
+  return buildSkuAsinResolver({ accountMarketplace, historyRows: [], catalogRows: [] });
+}
+
 /**
  * Compute the estimated sales for every eligible missing/zero-price operational grain of ONE account+marketplace.
  *
@@ -188,9 +278,12 @@ function asinFallbackKey(accountId, sellerId, marketplace, currency, childAsin) 
  * @param {string} [args.calculatedAt]      - ISO stamp for provenance (defaults to now); pin it for byte-identical tests.
  * @returns {{estimates: object[], unresolved: object[]}}
  */
-export function computeOliSalesEstimates({ accountId, accountMarketplace, operationalRows = [], referenceRows = [], maxLookbackDays = OLI_ESTIMATE_LOOKBACK_DAYS, precision = 2, calculatedAt = null } = {}) {
+export function computeOliSalesEstimates({ accountId, accountMarketplace, operationalRows = [], referenceRows = [], skuAsinResolver = null, maxLookbackDays = OLI_ESTIMATE_LOOKBACK_DAYS, precision = 2, calculatedAt = null } = {}) {
   const stamp = calculatedAt || new Date().toISOString();
   const acctMkt = normalizeMarketplace(accountMarketplace);
+  // The SKU->ASIN resolver (fills a blank ASIN for a SKU-carrying pending unit). A null resolver degrades to a
+  // no-op (blank-ASIN SKU targets stay unresolved) -- fully non-regressive and fail-soft.
+  const resolver = skuAsinResolver && typeof skuAsinResolver.resolve === "function" ? skuAsinResolver : emptySkuAsinResolver(acctMkt);
 
   // FAIL CLOSED: with no authoritative marketplace we cannot prove same-marketplace isolation -- every
   // missing/zero-price grain stays UNRESOLVED (counted, shown in the breakdown), never estimated across a boundary.
@@ -240,12 +333,41 @@ export function computeOliSalesEstimates({ accountId, accountMarketplace, operat
       continue;
     }
 
+    // RESOLVE A MISSING ASIN (server-side, isolated). A pending unit often carries a SKU but a BLANK child_asin.
+    // (1) the row's own child_asin wins when present; (2)/(3) otherwise resolve it from Catalog then durable history
+    // under the exact account+seller+marketplace+currency+SKU boundary, accepting ONLY a unique ASIN. An ambiguous
+    // or conflicting mapping, or none at all, stays UNRESOLVED (fail closed) -- the units count, but add no sales.
+    let effectiveChildAsin = t.childAsin;
+    let asinResolvedFromBlank = false;
+    let asinResolutionVia = null;
+    if (S(t.childAsin) === "") {
+      if (S(t.sku) === "") {
+        // No SKU and no ASIN -> no canonical product identity; nothing can resolve it.
+        unresolved.push({ accountId: t.accountId, sellerOrVendorId: t.sellerId, marketplaceCountryCode: acctMkt, saleDate: t.date, sku: t.sku, childAsin: t.childAsin, currency: t.currency, targetQuantity: targetQty, reason: UNRESOLVED_NO_IDENTITY });
+        continue;
+      }
+      const r = resolver.resolve({ sellerId: t.sellerId, currency: t.currency, sku: t.sku });
+      if (r && r.status === "unique" && r.asin) {
+        effectiveChildAsin = r.asin;
+        asinResolvedFromBlank = true;
+        asinResolutionVia = r.via;
+      } else {
+        const reason = r && r.status === "ambiguous" ? UNRESOLVED_ASIN_AMBIGUOUS
+          : r && r.status === "conflict" ? UNRESOLVED_ASIN_CONFLICT
+            : UNRESOLVED_ASIN_NONE;
+        unresolved.push({ accountId: t.accountId, sellerOrVendorId: t.sellerId, marketplaceCountryCode: acctMkt, saleDate: t.date, sku: t.sku, childAsin: t.childAsin, currency: t.currency, targetQuantity: targetQty, reason });
+        continue;
+      }
+    }
+
     // The SKU-fallback rule: use the ASIN-only key ONLY when the target SKU is genuinely blank; never otherwise.
+    // effectiveChildAsin is now non-blank (observed or uniquely resolved); a resolved-from-blank target always has a
+    // SKU, so it matches SKU-exact against the priced references that carry that SKU + the resolved ASIN.
     const usingFallback = S(t.sku) === "";
     const index = usingFallback ? asinIndex : skuIndex;
     const key = usingFallback
-      ? asinFallbackKey(t.accountId, t.sellerId, acctMkt, t.currency, t.childAsin)
-      : skuExactKey(t.accountId, t.sellerId, acctMkt, t.currency, t.childAsin, t.sku);
+      ? asinFallbackKey(t.accountId, t.sellerId, acctMkt, t.currency, effectiveChildAsin)
+      : skuExactKey(t.accountId, t.sellerId, acctMkt, t.currency, effectiveChildAsin, t.sku);
     const byDate = index.get(key);
 
     let referenceDate = null;
@@ -273,17 +395,26 @@ export function computeOliSalesEstimates({ accountId, accountMarketplace, operat
         marketplaceCountryCode: acctMkt,
         saleDate: t.date,
         sku: t.sku,
-        childAsin: t.childAsin,
+        // Store the RESOLVED ASIN so estimated sales attribute to the real product (brand / ASIN surfaces); a
+        // resolved-from-blank grain's units stay at the observed blank-ASIN operational grain (units are never
+        // changed) -- resolvedEstimateGroupKeys emits BOTH grain keys so the completeness breakdown still matches.
+        childAsin: effectiveChildAsin,
+        // The ORIGINAL observed ASIN (blank when resolved) -- lets the breakdown match the operational grain.
+        targetChildAsin: t.childAsin,
         currency: t.currency,
         targetQuantity: targetQty,
         estimatedSales,
         referenceDate,
         referenceUnitPrice: unitPrice,
         matchingMethod: usingFallback ? MATCH_ASIN_FALLBACK : MATCH_SKU_EXACT,
+        asinResolvedFromBlank,   // provenance (in-memory only; not a stored column) -- true when ASIN was resolved
+        asinResolutionVia,       // "history" | "catalog" | "catalog+history" | null
         referenceSourceRequestHash: referenceHash,
         calculatedAt: stamp,
       });
     } else {
+      // The ASIN was known/resolved but no eligible priced reference exists within the look-back (e.g. a brand-new
+      // product priced only in the future, or beyond the horizon). Genuinely unresolved -- counted, no sales.
       unresolved.push({
         accountId: t.accountId, sellerOrVendorId: t.sellerId, marketplaceCountryCode: acctMkt, saleDate: t.date,
         sku: t.sku, childAsin: t.childAsin, currency: t.currency, targetQuantity: targetQty, reason: "no-reference",
@@ -351,7 +482,17 @@ export function enrichOliHistoryRowsWithEstimates(historyRows = [], estimateRows
 export function resolvedEstimateGroupKeys(estimateRows = []) {
   const set = new Set();
   for (const e of estimateRows) {
-    set.add(oliGroupKey({ accountId: e.accountId ?? e.account_id, saleDate: e.saleDate ?? e.sale_date, sku: e.sku, childAsin: e.childAsin ?? e.child_asin, currency: e.currency }));
+    const accountId = e.accountId ?? e.account_id;
+    const saleDate = e.saleDate ?? e.sale_date;
+    const sku = e.sku;
+    const currency = e.currency;
+    const childAsin = S(e.childAsin ?? e.child_asin);
+    // The RESOLVED grain (where the estimated sales attribute) ...
+    set.add(oliGroupKey({ accountId, saleDate, sku, childAsin, currency }));
+    // ... AND the original blank-ASIN target grain, so an operational-unit grain whose ASIN was resolved from blank
+    // still reclassifies out of the unresolved breakdown. (When the ASIN was already known, the blank variant simply
+    // matches no operational grain -- there is no blank-ASIN grain for that SKU -- so this is always safe.)
+    if (childAsin) set.add(oliGroupKey({ accountId, saleDate, sku, childAsin: "", currency }));
   }
   return set;
 }

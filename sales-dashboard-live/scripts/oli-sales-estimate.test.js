@@ -472,4 +472,254 @@ test("distinct accounts each resolve independently; summary counts are redacted"
   assert.equal(s.ambiguousAccounts.includes("ambi"), true);
 });
 
+// ---------------------------------------------------------------------------------------------------------------
+group("server-side SKU -> child_asin RESOLUTION (pending units that carry a SKU but a blank ASIN)");
+
+// A target OPERATIONAL row whose child_asin is BLANK (pending itemization) but that carries a SKU.
+const blankAsinTarget = (date, missing, over = {}) => ({
+  account_id: ACC, seller_or_vendor_id: SELLER, sale_date: date, sku: "SKU-A", child_asin: "", currency: "INR",
+  priced_units: 0, explicit_zero_units: 0, pending_units: missing, cancelled_units: 0, source_request_hash: "op-" + date, ...over,
+});
+// A resolve_oli_sku_asin RPC row (seller/currency/sku -> unique-or-ambiguous ASIN).
+const histRow = (over = {}) => ({ seller_or_vendor_id: SELLER, currency: "INR", sku: "SKU-A", asin_count: 1, child_asin: "B0ASIN", ...over });
+const mkResolver = ({ history = [], catalog = [], mkt = "IN" } = {}) => ENG.buildSkuAsinResolver({ accountMarketplace: mkt, historyRows: history, catalogRows: catalog });
+
+test("BASELINE (the bug): blank-ASIN SKU target with NO resolver stays unresolved (no-reference)", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 5)],
+    referenceRows: [ref("2026-08-30", 100)], // priced ref carries a real ASIN; blank-ASIN key can't reach it
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 0, "without ASIN resolution the blank-ASIN target cannot match");
+  assert.equal(r.unresolved.length, 1);
+  assert.equal(r.unresolved[0].reason, ENG.UNRESOLVED_ASIN_NONE);
+  assert.equal(r.unresolved[0].targetQuantity, 5, "units still counted as unresolved");
+});
+
+test("HISTORY resolves the missing ASIN (Catalog empty) -> estimate at the resolved ASIN", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 4)],
+    referenceRows: [ref("2026-08-30", 100)],
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 1);
+  assert.equal(r.estimates[0].childAsin, "B0ASIN", "estimate attributes to the resolved ASIN");
+  assert.equal(r.estimates[0].targetChildAsin, "", "original observed ASIN was blank");
+  assert.equal(r.estimates[0].estimatedSales, 400); // 100 x 4
+  assert.equal(r.estimates[0].matchingMethod, ENG.MATCH_SKU_EXACT);
+  assert.equal(r.estimates[0].asinResolvedFromBlank, true);
+  assert.equal(r.estimates[0].asinResolutionVia, ENG.ASIN_VIA_HISTORY);
+});
+
+test("CATALOG resolves the missing ASIN when history has none", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 2)],
+    referenceRows: [ref("2026-08-30", 100)],
+    skuAsinResolver: mkResolver({ history: [], catalog: [{ seller_or_vendor_id: SELLER, currency: "INR", sku: "SKU-A", child_asin: "B0ASIN" }] }),
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 1);
+  assert.equal(r.estimates[0].childAsin, "B0ASIN");
+  assert.equal(r.estimates[0].asinResolutionVia, ENG.ASIN_VIA_CATALOG);
+});
+
+test("Catalog and history AGREE -> resolved (via catalog+history)", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 1)],
+    referenceRows: [ref("2026-08-30", 100)],
+    skuAsinResolver: mkResolver({ history: [histRow()], catalog: [{ seller_or_vendor_id: SELLER, currency: "INR", sku: "SKU-A", child_asin: "B0ASIN" }] }),
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 1);
+  assert.equal(r.estimates[0].asinResolutionVia, ENG.ASIN_VIA_CATALOG_HISTORY);
+});
+
+test("Catalog and history CONFLICT -> unresolved (fail closed), units still counted", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 3)],
+    referenceRows: [ref("2026-08-30", 100), ref("2026-08-30", 100, 1, { child_asin: "B0OTHER" })],
+    skuAsinResolver: mkResolver({ history: [histRow({ child_asin: "B0ASIN" })], catalog: [{ seller_or_vendor_id: SELLER, currency: "INR", sku: "SKU-A", child_asin: "B0OTHER" }] }),
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 0);
+  assert.equal(r.unresolved[0].reason, ENG.UNRESOLVED_ASIN_CONFLICT);
+  assert.equal(r.unresolved[0].targetQuantity, 3);
+});
+
+test("AMBIGUOUS historical SKU->ASIN (asin_count>1) -> unresolved, never a guess", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 3)],
+    referenceRows: [ref("2026-08-30", 100)],
+    skuAsinResolver: mkResolver({ history: [histRow({ asin_count: 2, child_asin: "B0ASIN" })] }),
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 0);
+  assert.equal(r.unresolved[0].reason, ENG.UNRESOLVED_ASIN_AMBIGUOUS);
+});
+
+test("ambiguity fails closed even when a catalog value is present (durable evidence is inconsistent)", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 3)],
+    referenceRows: [ref("2026-08-30", 100)],
+    skuAsinResolver: mkResolver({ history: [histRow({ asin_count: 2 })], catalog: [{ seller_or_vendor_id: SELLER, currency: "INR", sku: "SKU-A", child_asin: "B0ASIN" }] }),
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 0);
+  assert.equal(r.unresolved[0].reason, ENG.UNRESOLVED_ASIN_AMBIGUOUS);
+});
+
+test("SELLER isolation: a resolution for ANOTHER seller never resolves this seller's SKU", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 3)],
+    referenceRows: [ref("2026-08-30", 100)],
+    skuAsinResolver: mkResolver({ history: [histRow({ seller_or_vendor_id: "OTHER-SELLER" })] }),
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 0);
+  assert.equal(r.unresolved[0].reason, ENG.UNRESOLVED_ASIN_NONE);
+});
+
+test("CURRENCY isolation: a resolution under another currency never resolves this INR SKU", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 3)],
+    referenceRows: [ref("2026-08-30", 100)],
+    skuAsinResolver: mkResolver({ history: [histRow({ currency: "USD" })] }),
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 0);
+  assert.equal(r.unresolved[0].reason, ENG.UNRESOLVED_ASIN_NONE);
+});
+
+test("MARKETPLACE isolation: a blank authoritative marketplace resolves nothing (fail closed)", () => {
+  const resolver = mkResolver({ history: [histRow()], mkt: "" });
+  const res = resolver.resolve({ sellerId: SELLER, currency: "INR", sku: "SKU-A" });
+  assert.equal(res.status, "none");
+});
+
+test("resolved-from-blank obeys price precedence: same-day before D-1, MEDIAN, no future", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 2)],
+    referenceRows: [ref("2026-08-30", 40), ref("2026-08-30", 60), ref("2026-08-29", 999), ref("2026-08-31", 1)],
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 1);
+  assert.equal(r.estimates[0].referenceDate, "2026-08-30");
+  assert.equal(r.estimates[0].referenceUnitPrice, 50); // median(40,60); the 2026-08-31 future ref is never used
+  assert.equal(r.estimates[0].estimatedSales, 100);
+});
+
+test("resolved ASIN but NO in-window priced reference -> no-reference (counted, no sales)", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 3)],
+    referenceRows: [ref("2026-08-20", 100)], // 10 days before -> beyond the 7-day look-back
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 0);
+  assert.equal(r.unresolved[0].reason, "no-reference");
+  assert.equal(r.unresolved[0].targetQuantity, 3);
+});
+
+test("cancelled history never provides a resolved-ASIN price", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 3)],
+    referenceRows: [ref("2026-08-30", 100, 1, { is_cancelled: true })],
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 0);
+  assert.equal(r.unresolved[0].reason, "no-reference");
+});
+
+test("explicit-zero + pending both count toward the resolved target quantity", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 0, { explicit_zero_units: 2, pending_units: 3 })],
+    referenceRows: [ref("2026-08-30", 10)],
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 1);
+  assert.equal(r.estimates[0].targetQuantity, 5);
+  assert.equal(r.estimates[0].estimatedSales, 50);
+});
+
+test("no SKU and no ASIN -> no-identity (never resolved)", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 3, { sku: "" })],
+    referenceRows: [ref("2026-08-30", 100)],
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates.length, 0);
+  assert.equal(r.unresolved[0].reason, ENG.UNRESOLVED_NO_IDENTITY);
+});
+
+test("IDEMPOTENT: same durable evidence -> byte-identical resolved estimates", () => {
+  const args = {
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 4)],
+    referenceRows: [ref("2026-08-30", 100)],
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+    calculatedAt: "T",
+  };
+  assert.deepEqual(ENG.computeOliSalesEstimates(args).estimates, ENG.computeOliSalesEstimates(args).estimates);
+});
+
+test("resolvedEstimateGroupKeys emits BOTH the resolved grain AND the blank target grain", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 4)],
+    referenceRows: [ref("2026-08-30", 100)],
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+    calculatedAt: "T",
+  });
+  const keys = ENG.resolvedEstimateGroupKeys(r.estimates);
+  assert.equal(keys.has(ENG.oliGroupKey({ accountId: ACC, saleDate: "2026-08-30", sku: "SKU-A", childAsin: "B0ASIN", currency: "INR" })), true);
+  assert.equal(keys.has(ENG.oliGroupKey({ accountId: ACC, saleDate: "2026-08-30", sku: "SKU-A", childAsin: "", currency: "INR" })), true, "blank target grain reclassifies in the breakdown");
+});
+
+test("NO DOUBLE-COUNT: a resolved estimate merges into the SAME priced (sku, resolved-ASIN) row", () => {
+  const est = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", 2)],
+    referenceRows: [ref("2026-08-30", 100)],
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+    calculatedAt: "T",
+  }).estimates;
+  const priced = [{ account_id: ACC, sale_date: "2026-08-30", sku: "SKU-A", child_asin: "B0ASIN", currency: "INR", sales_amount: 1000, units: 10 }];
+  const enriched = ENG.enrichOliHistoryRowsWithEstimates(priced, est);
+  assert.equal(enriched.length, 1, "estimate folds into the existing priced row, not a duplicate");
+  assert.equal(enriched[0].sales_amount, 1200); // 1000 priced + 200 estimated
+  assert.equal(enriched[0].units, 10, "units NEVER change");
+});
+
+test("ACTUAL SUPERSEDES: as itemization shrinks the pending qty the estimate shrinks (no double-count)", () => {
+  const mk = (pending) => ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [blankAsinTarget("2026-08-30", pending)],
+    referenceRows: [ref("2026-08-30", 100)],
+    skuAsinResolver: mkResolver({ history: [histRow()] }),
+    calculatedAt: "T",
+  }).estimates;
+  assert.equal(mk(5)[0].estimatedSales, 500);
+  assert.equal(mk(2)[0].estimatedSales, 200, "fewer still-pending units -> smaller estimate");
+  assert.equal(mk(0).length, 0, "fully itemized -> no estimate row (actual value stands alone)");
+});
+
 main().then((f) => { if (f) process.exitCode = 1; }).catch((e) => { out("FATAL " + String(e && e.stack ? e.stack : e)); process.exitCode = 1; });

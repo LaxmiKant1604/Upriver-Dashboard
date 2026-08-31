@@ -23,12 +23,15 @@ let ENG, RECOMP, DASH, SERVE;
 const ACC = "acct-1"; const SELLER = "SELLER1"; const ORG = "org-1";
 
 // Build a recompute harness with injectable durable rows + a captured write.
-function harness({ operationalRows = [], referenceRows = [] } = {}) {
+function harness({ operationalRows = [], referenceRows = [], resolutionRows = null } = {}) {
   const writes = [];
   return {
     writes,
     readOperationalUnits: async ({ additiveOnly }) => operationalRows.filter((r) => !additiveOnly || (Number(r.explicit_zero_units || 0) + Number(r.pending_units || 0)) > 0),
     readDimensionalRows: async () => referenceRows,
+    // Only wire a resolver reader when resolutionRows is supplied (else the recompute runs with NO resolver --
+    // proving the fail-soft default: blank-ASIN targets stay unresolved exactly as before).
+    ...(resolutionRows ? { readSkuAsinResolution: async () => resolutionRows } : {}),
     writeEstimates: async (args) => { writes.push(args.estimateRows); return { write: "ok", replaced: 0, inserted: args.estimateRows.length }; },
   };
 }
@@ -233,6 +236,57 @@ test("BASE priced sales + units are unchanged when estimates fail closed (fail-c
   const priced = [hist("2026-08-29", "SKU-A", "B0X", 300, 3, "EUR")];
   const enriched = ENG.enrichOliHistoryRowsWithEstimates(priced, res.r.estimates); // res.r.estimates === []
   assert.deepEqual(enriched, priced, "no estimate -> the priced Total Sales and units are byte-identical");
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+group("recompute WITH server-side SKU->ASIN resolution (the fix, end-to-end through the orchestration)");
+
+const blankOp = (date, pending, { sku = "SKU-A", cur = "INR" } = {}) => ({
+  account_id: ACC, seller_or_vendor_id: SELLER, sale_date: date, sku, child_asin: "", currency: cur,
+  priced_units: 0, priced_sales: null, explicit_zero_units: 0, pending_units: pending, cancelled_units: 0, source_request_hash: "op",
+});
+const resRow = (over = {}) => ({ seller_or_vendor_id: SELLER, currency: "INR", sku: "SKU-A", asin_count: 1, child_asin: "B0X", ...over });
+
+test("recompute resolves a blank-ASIN pending grain via the injected resolver and writes the estimate", async () => {
+  const h = harness({ operationalRows: [blankOp("2026-08-30", 5)], referenceRows: [dimRow("2026-08-30", 100)], resolutionRows: [resRow()] });
+  const r = await RECOMP.recomputeOliSalesEstimatesWindow({ organizationFingerprint: ORG, accountId: ACC, accountMarketplace: "IN", from: "2026-08-01", to: "2026-08-31", ...h, calculatedAt: "T" });
+  assert.equal(r.estimates.length, 1);
+  assert.equal(r.estimates[0].estimatedSales, 500);
+  assert.equal(r.estimates[0].childAsin, "B0X", "resolved ASIN attributed");
+  assert.equal(h.writes[0][0].estimatedSales, 500);
+});
+
+test("FAIL-SOFT: no resolver reader -> the blank-ASIN grain stays unresolved (priced path never breaks)", async () => {
+  const h = harness({ operationalRows: [blankOp("2026-08-30", 5)], referenceRows: [dimRow("2026-08-30", 100)] });
+  const r = await RECOMP.recomputeOliSalesEstimatesWindow({ organizationFingerprint: ORG, accountId: ACC, accountMarketplace: "IN", from: "2026-08-01", to: "2026-08-31", ...h, calculatedAt: "T" });
+  assert.equal(r.estimates.length, 0);
+  assert.equal(r.unresolved.length, 1);
+  assert.deepEqual(h.writes[0], []);
+});
+
+test("FAIL-SOFT: a THROWING resolver reader is swallowed -> unresolved, never a thrown recompute", async () => {
+  const h = harness({ operationalRows: [blankOp("2026-08-30", 5)], referenceRows: [dimRow("2026-08-30", 100)] });
+  h.readSkuAsinResolution = async () => { throw new Error("boom"); };
+  const r = await RECOMP.recomputeOliSalesEstimatesWindow({ organizationFingerprint: ORG, accountId: ACC, accountMarketplace: "IN", from: "2026-08-01", to: "2026-08-31", ...h, calculatedAt: "T" });
+  assert.equal(r.estimates.length, 0);
+  assert.equal(r.unresolved.length, 1);
+});
+
+test("resolved-from-blank estimate flows through the REAL brand fold to the resolved ASIN's brand", async () => {
+  const h = harness({ operationalRows: [blankOp("2026-08-30", 2)], referenceRows: [dimRow("2026-08-30", 100)], resolutionRows: [resRow()] });
+  const r = await RECOMP.recomputeOliSalesEstimatesWindow({ organizationFingerprint: ORG, accountId: ACC, accountMarketplace: "IN", from: "2026-08-01", to: "2026-08-31", ...h, calculatedAt: "T" });
+  const enriched = ENG.enrichOliHistoryRowsWithEstimates([], r.estimates);
+  const bv = DASH.brandViewRowsFromHistory({ historyRows: enriched, brandMaps, from: "2026-08-01", to: "2026-08-31" });
+  const byBrand = new Map(bv.brands.map((x) => [x.brand, x.sales]));
+  assert.equal(byBrand.get("BrandX"), 200, "the resolved-from-blank estimate attributes to BrandX (via resolved ASIN B0X)");
+});
+
+test("AMBIGUOUS resolution through the recompute -> unresolved, empty write", async () => {
+  const h = harness({ operationalRows: [blankOp("2026-08-30", 3)], referenceRows: [dimRow("2026-08-30", 100)], resolutionRows: [resRow({ asin_count: 2 })] });
+  const r = await RECOMP.recomputeOliSalesEstimatesWindow({ organizationFingerprint: ORG, accountId: ACC, accountMarketplace: "IN", from: "2026-08-01", to: "2026-08-31", ...h, calculatedAt: "T" });
+  assert.equal(r.estimates.length, 0);
+  assert.equal(r.unresolved[0].reason, ENG.UNRESOLVED_ASIN_AMBIGUOUS);
+  assert.deepEqual(h.writes[0], []);
 });
 
 main().then((f) => { if (f) process.exitCode = 1; }).catch((e) => { out("FATAL " + String(e && e.stack ? e.stack : e)); process.exitCode = 1; });

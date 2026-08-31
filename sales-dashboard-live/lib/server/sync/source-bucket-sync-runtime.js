@@ -52,7 +52,7 @@ import {
   recordSourceSnapshot, upsertSourceRunStatus,
   replaceOliHistoryWindow, replaceOliDimensionalWindow, recordOliCompleteness, saveSourceSnapshotPayload, getSourceSnapshotPayload,
   getSourceOliHistoryRows, getDailyAdsCoverage, getAsinAdsDailyRows,
-  getSourceOliOperationalUnitRows, getSourceOliDimensionalUnitRows, getSourceOliSalesEstimateRows, replaceOliSalesEstimatesWindow,
+  getSourceOliOperationalUnitRows, getSourceOliDimensionalUnitRows, getSourceOliSalesEstimateRows, replaceOliSalesEstimatesWindow, getOliSkuAsinResolutionRows,
   listSourceBatchMembership, assignSourceAccountBatch,
   getReportSyncSettings, getSchedulerAccountRollout,
   upsertSyncReportJob, claimReportDeriveLease, reconcileReportDeriveSuccess, getReportSnapshot,
@@ -303,6 +303,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     recomputeSalesEstimates = recomputeOliSalesEstimatesWindow,
     readOperationalUnitsForEstimate = getSourceOliOperationalUnitRows,
     readDimensionalRowsForEstimate = getSourceOliDimensionalUnitRows,
+    readSkuAsinResolutionForEstimate = getOliSkuAsinResolutionRows,
     readSalesEstimates = getSourceOliSalesEstimateRows,
     writeSalesEstimates = replaceOliSalesEstimatesWindow,
     enrichHistoryWithEstimates = enrichOliHistoryRowsWithEstimates,
@@ -915,6 +916,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
           from: estRecomputeFrom, to: estTo,
           readOperationalUnits: readOperationalUnitsForEstimate,
           readDimensionalRows: readDimensionalRowsForEstimate,
+          readSkuAsinResolution: readSkuAsinResolutionForEstimate,
           writeEstimates: writeSalesEstimates,
         }).catch(() => null);
       }
