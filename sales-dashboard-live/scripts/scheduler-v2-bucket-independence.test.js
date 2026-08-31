@@ -243,9 +243,13 @@ async function main() {
   /* ============ 14-16: failure safety + no campaign/fba + manual dispatch parity (workflow shape) ============ */
   group("workflow: always-safe-close, no Campaign Ads/FBA, manual dispatch parity");
 
-  test("14. EVERY failure path safe-closes controls: the rollback step is if: always() for BOTH buckets", () => {
-    assert.match(yml, /if:\s*always\(\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close runs ALWAYS");
-    assert.doesNotMatch(yml, /always\(\)\s*&&\s*steps\.cfg\.outputs\.bucket == 'us'/, "safe-close is NOT gated to US only");
+  test("14. EVERY real pipeline failure safe-closes controls; the verified US duplicate no-op stays zero-write", () => {
+    assert.match(
+      yml,
+      /if:\s*always\(\)\s*&&\s*\(steps\.cfg\.outputs\.bucket != 'us' \|\| steps\.us_guard\.outputs\.run_required == 'true'\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/,
+      "Non-US and every non-no-op US pipeline attempt safe-close",
+    );
+    assert.match(yml, /already_published == 'true'[\s\S]*zero creates, zero controls, zero tokens/i, "the verified US duplicate is explicitly zero-write");
   });
 
   test("15. Campaign Ads / FBA can never publish or create: not schedule-enabled, not a control, not a workflow step, and the Catalog guard refuses any non-catalog create", async () => {

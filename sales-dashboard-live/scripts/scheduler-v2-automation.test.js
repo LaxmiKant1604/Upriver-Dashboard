@@ -176,15 +176,16 @@ group("D. GitHub Actions workflow: INDEPENDENT per-bucket publish + always-safe-
 test("D1. scheduler-v2.yml: cron ACTIVE at exactly 02:00 UTC (non-us) + 10:30 UTC (us), bucket resolved FROM the fired cron, dispatch kept, concurrency, Node 24, >=90-min timeout", () => {
   const yml = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-v2.yml"), "utf8");
   assert.match(yml, /workflow_dispatch:/, "manual dispatch kept");
-  // Four crons: a PRIMARY + a ~1h FALLBACK per bucket (Non-US 02:00/03:00 UTC, US 10:30/11:30 UTC).
+  // Non-US keeps PRIMARY + FALLBACK (02:00/03:00 UTC); US keeps one GitHub primary (10:30 UTC) and uses the
+  // independent Cloudflare workflow_dispatch watchdog as its backup.
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *", "30 11 * * *"], "primary + fallback crons per bucket");
+  assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *"], "Non-US primary/fallback + one US GitHub primary");
   // The bucket comes from WHICH cron fired -- deterministic mapping, never inferred from the clock. Primary AND
   // fallback of a bucket map to the SAME bucket.
   assert.match(yml, /"0 2 \* \* \*"\)\s*bucket="non-us"/, "02:00 UTC (primary) maps to non-us");
   assert.match(yml, /"0 3 \* \* \*"\)\s*bucket="non-us"/, "03:00 UTC (fallback) maps to non-us");
   assert.match(yml, /"30 10 \* \* \*"\)\s*bucket="us"/, "10:30 UTC (primary) maps to us");
-  assert.match(yml, /"30 11 \* \* \*"\)\s*bucket="us"/, "11:30 UTC (fallback) maps to us");
+  assert.doesNotMatch(yml, /30 11 \* \* \*/, "the duplicate US GitHub fallback is removed");
   assert.match(yml, /Unknown cron[^\n]*refusing/, "an unknown cron fails closed");
   assert.doesNotMatch(yml, /only workflow_dispatch is accepted/, "the pause-era dispatch-only gate is gone");
   assert.match(yml, /concurrency:\s*\n\s*group:\s*scheduler-v2/, "single-run concurrency group");
@@ -226,9 +227,8 @@ test("D2. workflow shape: INDEPENDENT per-bucket ordered pipeline -- token ceili
     assert.match(before, /steps\.tokengate\.outputs\.proceed == 'true'/, step + " is gated on the token-gate proceed");
   }
   assert.match(yml, /SKIPPED_INSUFFICIENT_TOKENS/, "the run visibly reports the insufficient-tokens skip");
-  // safe-close ALWAYS for BOTH buckets (idempotent, discovery-independent), even on failure -- NOT US-only.
-  assert.match(yml, /if:\s*always\(\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS for BOTH buckets");
-  assert.doesNotMatch(yml, /always\(\)\s*&&\s*steps\.cfg\.outputs\.bucket == 'us'/, "safe-close is no longer gated to the US bucket");
+  // safe-close ALWAYS after any pipeline execution; the read-only US duplicate no-op skips this write entirely.
+  assert.match(yml, /if:\s*always\(\) && \(steps\.cfg\.outputs\.bucket != 'us' \|\| steps\.us_guard\.outputs\.run_required == 'true'\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS after a pipeline execution");
   // date-scoped operation key uses the requestedAsOf (shared Catalog reservation across both buckets on a date).
   assert.match(yml, /--operation-key=priority-dashboards\/scheduled\/\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "date-scoped (requestedAsOf) operation key");
   assert.match(yml, /timeout-minutes:\s*(1[0-9][0-9]|[2-9][0-9])/, "job timeout covers OLI+Ads+publication");
@@ -267,9 +267,9 @@ test("D4. previous-day (D-1) freshness shape: refresh_mode input, scheduled-alwa
   assert.doesNotMatch(yml, /oli-force-latest\.mjs/, "the separate force-latest step is merged into the one D-1 OLI step");
   // the readiness proof is STRICT D-1 and the publish carries --strict-d1 (never publish a clamped D-2).
   assert.match(yml, /priority-dashboards-release\.mjs[^\n]*--strict-d1/, "release fails closed below D-1");
-  // schedules: primary + fallback per bucket.
+  // schedules: Non-US primary/fallback + US primary; Cloudflare is the independent US backup.
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *", "30 11 * * *"], "02:00/03:00 non-us + 10:30/11:30 us");
+  assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *"], "02:00/03:00 non-us + 10:30 us");
 });
 
 group("E. DataDoe token-confirmation gate (read-only balance from usage-logs; fail-closed)");

@@ -1,0 +1,97 @@
+// READ-ONLY, US-ONLY whole-workflow duplicate guard.
+// A delayed/repeated US trigger becomes a green no-op only after exact D-1 live identities for every current
+// primary US account x the frozen three priority reports pass the real storage-first frontend payload read-back.
+
+import { appendFileSync } from "node:fs";
+import pg from "pg";
+import { loadReleaseEnv } from "./env-bootstrap.mjs";
+
+loadReleaseEnv();
+
+const argOf = (name) => { const a = process.argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.split("=").slice(1).join("=") : null; };
+const bucket = argOf("bucket");
+const requestedAsOf = argOf("requested-as-of");
+if (bucket !== "us") { console.error("STOP verify-us-d1-published is US-only (got bucket=" + bucket + ")."); process.exit(2); }
+if (!/^\d{4}-\d{2}-\d{2}$/.test(String(requestedAsOf || ""))) { console.error("STOP --requested-as-of must be YYYY-MM-DD."); process.exit(2); }
+
+const ghOut = (key, value) => { const f = process.env.GITHUB_OUTPUT; if (f) appendFileSync(f, key + "=" + value + "\n"); };
+const ghSum = (value) => { const f = process.env.GITHUB_STEP_SUMMARY; if (f) appendFileSync(f, value + "\n"); };
+const short = (s) => String(s || "").slice(0, 8);
+
+const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
+const { fetchAccounts } = await import("../../lib/server/datadoe.js");
+const { bucketForCountry } = await import("../../lib/server/sync/registry.js");
+const { selectPublishedUsD1Identities, US_PRIORITY_REPORT_KEYS } = await import("../../lib/server/sync/source-us-publication-guard.js");
+const { buildLiveReadback } = await import("../../lib/server/sync/source-priority-release-runner.js");
+const { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } = await import("../../lib/server/sync/report-publisher.js");
+const { REPORT_DERIVATIONS } = await import("../../lib/server/sync/report-derivation.js");
+const { paramsHashFor } = await import("../../lib/server/report-store.js");
+const sb = await import("../../lib/server/supabase.js");
+
+const connections = getDataDoeConnections();
+const primary = connections.find((c) => c && c.id === "primary" && String(c.apiKey || "").trim());
+if (!primary) { console.error("STOP primary DataDoe connection unavailable."); process.exit(1); }
+const directory = (await fetchAccounts(primary.apiKey)) || [];
+const { active } = classifyDirectoryAccounts(directory, connections);
+const accountIds = [];
+const seen = new Set();
+for (const account of active) {
+  const accountId = String((account && (account.accountId ?? account.id)) || "").trim();
+  const country = String((account && account.country) || "").toUpperCase();
+  if (!accountId || accountId.includes(":") || seen.has(accountId) || bucketForCountry(country) !== "us") continue;
+  seen.add(accountId); accountIds.push(accountId);
+}
+if (!accountIds.length) { console.error("STOP no primary US accounts discovered."); process.exit(1); }
+
+const client = new pg.Client({ connectionString: String(process.env.POSTGRES_URL).split("?")[0], ssl: { rejectUnauthorized: false } });
+let rows;
+try {
+  await client.connect();
+  await client.query("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  rows = (await client.query(
+    "select report_key,account_id,params_hash,params,updated_at from public.report_snapshots where report_key=any($1::text[]) and account_id=any($2::text[]) and params->>'to'=$3",
+    [US_PRIORITY_REPORT_KEYS, accountIds, requestedAsOf],
+  )).rows;
+  await client.query("ROLLBACK");
+} catch (error) {
+  try { await client.query("ROLLBACK"); } catch { /* ignore */ }
+  console.error("STOP US duplicate-guard read failed: " + (error && error.message ? error.message : error));
+  process.exitCode = 1;
+} finally {
+  try { await client.end(); } catch { /* ignore */ }
+}
+if (process.exitCode) process.exit(process.exitCode);
+
+const selected = selectPublishedUsD1Identities({
+  accountIds, requestedAsOf, rows,
+  liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS,
+  computeHash: paramsHashFor,
+});
+const readback = buildLiveReadback({
+  getReportSnapshot: sb.getReportSnapshot,
+  loadStoragePayload: sb.getReportSnapshotStoragePayload,
+  liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS,
+  reportDerivations: REPORT_DERIVATIONS,
+  computeHash: paramsHashFor,
+});
+const problems = [...selected.problems];
+if (selected.complete) {
+  for (const identity of selected.identities) {
+    let result;
+    try { result = await readback(identity); } catch { result = { ok: false, reason: "read-error" }; }
+    if (!result || result.ok !== true) problems.push(identity.reportKey + "/" + short(identity.accountId) + ":" + String(result && result.reason || "readback-failed"));
+  }
+}
+const complete = selected.complete && problems.length === 0;
+ghOut("already_published", complete ? "true" : "false");
+ghOut("run_required", complete ? "false" : "true");
+ghOut("account_count", String(selected.accountCount));
+ghOut("expected_count", String(selected.expectedCount));
+if (complete) {
+  console.log("ALREADY_PUBLISHED_US_D1: exact " + selected.expectedCount + " live read-backs passed for " + selected.accountCount + " US accounts at " + requestedAsOf + "; zero writes.");
+  ghSum("### US D-1 duplicate guard\n- **ALREADY_PUBLISHED_US_D1** -- exact " + selected.expectedCount + " live read-backs passed (" + selected.accountCount + " accounts x 3 reports)\n- The delayed/repeated trigger is a green no-op: zero creates, zero controls, zero tokens.");
+} else {
+  console.log("US_D1_RUN_REQUIRED: " + problems.length + " exact live proof(s) missing/invalid; continuing through the normal US refresh and publish path.");
+  for (const problem of problems.slice(0, 12)) console.log("note: " + problem);
+  ghSum("### US D-1 duplicate guard\n- **RUN_REQUIRED** -- " + problems.length + " exact live proof(s) missing/invalid for requested D-1 " + requestedAsOf + "\n- Continue through the normal fail-closed US refresh and publish path.");
+}

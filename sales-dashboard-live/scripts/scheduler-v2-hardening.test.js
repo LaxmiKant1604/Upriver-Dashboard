@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { writeSync, readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { selectPublishedUsD1Identities, US_PRIORITY_REPORT_KEYS } from "../lib/server/sync/source-us-publication-guard.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
@@ -29,13 +30,14 @@ test("external dispatches have a unique run title and a non-forgeable-by-schedul
 });
 
 /* 12/13. correct cron -> correct bucket; unknown cron fails BEFORE any production I/O */
-test("12/13. each cron maps deterministically to its bucket; unknown cron fails closed before I/O", () => {
+test("12/13. Non-US schedules stay unchanged; US has one GitHub primary plus external watchdog; unknown cron fails closed", () => {
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *", "30 11 * * *"]);
+  assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *"]);
   assert.match(yml, /"0 2 \* \* \*"\)\s*bucket="non-us";\s*run_kind="primary"/);
   assert.match(yml, /"0 3 \* \* \*"\)\s*bucket="non-us";\s*run_kind="fallback"/);
   assert.match(yml, /"30 10 \* \* \*"\)\s*bucket="us";\s*run_kind="primary"/);
-  assert.match(yml, /"30 11 \* \* \*"\)\s*bucket="us";\s*run_kind="fallback"/);
+  assert.doesNotMatch(yml, /30 11 \* \* \*/, "the duplicate US GitHub fallback is removed");
+  assert.match(yml, /Cloudflare watchdog dispatches the same workflow at 10:50 UTC/, "the external US backup is documented");
   assert.match(yml, /Unknown cron[^\n]*refusing \(fail closed\)/);
   // the unknown-cron guard is in the SAME cfg step, before install/preflight/token/fetch.
   const cfgIdx = yml.indexOf("Resolve bucket + requestedAsOf");
@@ -78,7 +80,7 @@ test("14. the summary prints immutable run metadata (event/cron/dispatch/bucket/
 });
 
 /* fallback shares ONE durable operation identity (bucket + requestedAsOf, NOT the cron) */
-test("primary + fallback share one durable operation key (bucket + requestedAsOf, never the cron string)", () => {
+test("all repeated dispatches share one durable operation key (bucket + requestedAsOf, never the cron string)", () => {
   assert.match(yml, /opkey="scheduled-fresh\/\$bucket\/\$asof"/, "operation key is bucket + requestedAsOf");
   assert.doesNotMatch(yml, /opkey="[^"]*\* \*/, "the operation key never embeds a cron expression");
 });
@@ -114,8 +116,57 @@ test("10. the release is --strict-d1 and its clamp gate is coverage-based (provi
 
 /* 18/19. controls always safe-close; Campaign Ads / FBA never create exports */
 test("18/19. controls safe-close ALWAYS; the scheduler never runs Campaign Ads / FBA export steps", () => {
-  assert.match(yml, /if:\s*always\(\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS");
+  assert.match(yml, /if:\s*always\(\) && \(steps\.cfg\.outputs\.bucket != 'us' \|\| steps\.us_guard\.outputs\.run_required == 'true'\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS when a pipeline run could have opened controls");
   assert.doesNotMatch(yml, /campaign-ads|fba-refresh|campaign_ads/i, "no Campaign Ads / FBA export step in the scheduler");
+});
+
+test("US duplicate guard selects only exact D-1 identities for every account x three reports", () => {
+  const requestedAsOf = "2026-08-30";
+  const accountIds = ["us-account-1", "us-account-2"];
+  const liveContracts = {
+    "daily-reporting": { liveReportKey: "daily-reporting", liveReportVersion: "daily-v2", liveParams: (p) => ({ from: p.from, to: p.to, brand: p.brand || "ALL" }) },
+    "brand-sales": { liveReportKey: "brand-sales", liveReportVersion: "brand-v1", liveParams: (p) => ({ from: p.from, to: p.to }) },
+    "brand-inventory": { liveReportKey: "brand-inventory", liveReportVersion: "inventory-v1", liveParams: (p) => ({ to: p.to }) },
+  };
+  const computeHash = (version, params) => version + ":" + JSON.stringify(params);
+  const rows = [];
+  for (const accountId of accountIds) {
+    for (const reportKey of US_PRIORITY_REPORT_KEYS) {
+      const contract = liveContracts[reportKey];
+      const liveParams = reportKey === "daily-reporting"
+        ? { from: "2026-03-01", to: requestedAsOf, brand: "ALL" }
+        : reportKey === "brand-sales"
+          ? { from: "2026-03-01", to: requestedAsOf }
+          : { to: requestedAsOf };
+      rows.push({ report_key: contract.liveReportKey, account_id: accountId, params_hash: computeHash(contract.liveReportVersion, liveParams), params: { reportVersion: contract.liveReportVersion, ...liveParams }, updated_at: "2026-08-31T01:00:00Z" });
+    }
+  }
+  const complete = selectPublishedUsD1Identities({ accountIds, requestedAsOf, rows, liveContracts, computeHash });
+  assert.equal(complete.complete, true);
+  assert.equal(complete.identities.length, 6);
+  const wrongBrand = rows.map((row) => row.report_key === "daily-reporting" && row.account_id === accountIds[0]
+    ? { ...row, params: { ...row.params, brand: "Named Brand" } }
+    : row);
+  assert.equal(selectPublishedUsD1Identities({ accountIds, requestedAsOf, rows: wrongBrand, liveContracts, computeHash }).complete, false, "a named-brand Daily row cannot authorize the ALL-brand scheduler no-op");
+  const missing = rows.filter((row) => !(row.report_key === "brand-inventory" && row.account_id === accountIds[1]));
+  assert.equal(selectPublishedUsD1Identities({ accountIds, requestedAsOf, rows: missing, liveContracts, computeHash }).complete, false, "one missing identity requires the normal US run");
+});
+
+test("US duplicate guard runs before production I/O and every later write/create path is skipped on a complete read-back", () => {
+  const guardIdx = yml.indexOf("verify-us-d1-published.mjs");
+  const preflightIdx = yml.indexOf("scheduled-cycle-preflight.mjs");
+  assert.ok(guardIdx > 0 && guardIdx < preflightIdx, "US proof runs before cycle/token/create/control I/O");
+  assert.match(yml, /id:\s*us_guard[\s\S]*?if:\s*steps\.cfg\.outputs\.bucket == 'us'/, "the duplicate guard is US-only");
+  assert.match(yml, /ALREADY_PUBLISHED_US_D1 -- exact live read-backs passed; zero creates, zero controls, zero tokens/, "the green no-op is explicit");
+  for (const command of ["scheduled-cycle-preflight.mjs", "confirm-token-budget.mjs", "oli-refresh-d1.mjs", "scheduled-asin-ads-refresh.mjs", "priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
+    const at = yml.indexOf(command);
+    assert.ok(at > 0, "workflow command missing: " + command);
+    const before = yml.slice(Math.max(0, at - 420), at);
+    assert.match(before, /steps\.cfg\.outputs\.bucket != 'us' \|\| steps\.us_guard\.outputs\.run_required == 'true'/, command + " is skipped by a completed US proof while Non-US remains unchanged");
+  }
+  const cli = readFileSync(resolve(ROOT, "scripts", "release", "verify-us-d1-published.mjs"), "utf8");
+  assert.match(cli, /bucket !== "us"/, "the production guard refuses any Non-US invocation");
+  assert.match(cli, /buildLiveReadback/, "the production guard uses the real storage-first frontend payload read-back");
 });
 
 /* token ceilings unchanged (Non-US 20 / US 10), operation-wide across primary + fallback */

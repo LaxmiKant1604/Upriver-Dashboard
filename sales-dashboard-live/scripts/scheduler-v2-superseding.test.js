@@ -129,12 +129,12 @@ async function main() {
     assert.match(rb, /addDays\(requestedAsOf, -20\)/, "ads window starts 20 days before D-1 (21 inclusive days)");
   });
 
-  test("18/19. Campaign Ads / FBA are never force-fetched (forceFreshOli OLI-only) and the crons are unchanged", () => {
+  test("18/19. Campaign Ads / FBA are never force-fetched; Non-US crons stay unchanged and US has one GitHub primary", () => {
     const rt = readFileSync(resolve(HERE, "..", "lib", "server", "sync", "source-bucket-sync-runtime.js"), "utf8");
     assert.match(rt, /forceFreshOli === true && sourceKey === "order-line-items"/, "force-fresh is OLI-only");
     assert.doesNotMatch(yml, /node scripts\/[^\n]*(campaign|fba)/i, "no campaign/fba workflow step");
     const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-    assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *", "30 11 * * *"]);
+    assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *"]);
   });
 
   test("14. a successful workflow cannot report provenThrough below requestedAsOf: the strict D-1 gate publishes ONLY at status 'exact'", () => {
