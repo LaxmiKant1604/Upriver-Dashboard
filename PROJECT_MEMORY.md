@@ -1,5 +1,43 @@
 # Project Memory
 
+## Daily Reporting -- named brand uses the ACCOUNT's proven horizon, not the brand's last sale (2026-08-31)
+
+Defect: Haven&Hue US (account 916be46e) All Brands showed data through 2026-08-30 but the Caruso Italy named brand
+stopped at 2026-08-24. Two INDEPENDENT causes, both fixed so every brand shares ONE account-level effectiveAsOf.
+
+- **ROOT CAUSE 1 -- render horizon (src/App.jsx `dailyReport` useMemo)**: the daily table anchored its date columns
+  to the selected brand's latest SALES-bearing row (`rowsWithSales` max), so a covered date with no brand activity
+  SHORTENED the table. Now it anchors to the ACCOUNT-level `dailyCompleteness.latestDate` (read live from
+  source_oli_completeness by the completeness augment -- identical for All Brands and every named brand); a covered
+  date on which the brand had no activity renders as an honest per-column ZERO (the column sum is 0) instead of
+  truncating. Falls back to the row max only when completeness is unavailable. Request guards / currency / marketplace
+  / brand isolation / formulas untouched.
+- **ROOT CAUSE 2 -- stale named-brand snapshot (lib/server/report-store.js `serveSharedReport`)**: a named-brand
+  daily snapshot is refreshed ONLY by the read self-heal, which previously fired ONLY on a total miss -- so once
+  created it was served stale forever (the stale-scope fallback served it without re-deriving). The account's
+  proven date advanced (24->28->29->30) but Caruso stayed at its 24-Aug-era snapshot. FIX: `serveSharedReport` gains
+  an OPT-IN `staleWhenParamsToBefore` (only Daily passes it = the account's current proven OLI date); when a FOUND
+  snapshot's own as-of (`params.to`) is behind it, it re-derives via the EXISTING zero-export durable self-heal
+  (`selfHealFromDurable`: serialized by the refresh lock -> one save under concurrency; persisted under the honest
+  clamped identity so `params.to` advances; a not-ready derive falls back to serving the found snapshot as LKG ->
+  never a blank page). Every OTHER report omits the flag => byte-identical behaviour (proven by a regression). The
+  daily serve computes the proven horizon from the account's OLI coverage (fail-soft) and passes it.
+- **Fix C -- bounded zero-export backfill** `scripts/release/backfill-daily-named-brands.mjs`: re-derives EVERY
+  existing named-brand daily snapshot (12 across 8 accounts) to the account's current proven date via the SAME
+  rederiveDailyV2 (clampToProven), CAS-guarded (never overwrites an equal-or-newer identity). Corrects the live
+  defect IMMEDIATELY after deploy, not only after a future visit. Applied: 9 rederived to 2026-08-30, 3 already-fresh
+  skipped (newer-live), 0 failed, creates=0 tokens=0.
+- **NOTE**: the ordered-units merge (previous change) already gives a brand with PENDING units rows through the
+  latest date, so the re-derive alone advances most named brands; Fix 1 (render horizon) is the safety for a brand
+  with GENUINELY zero activity after some covered date (honest zeros through the account horizon).
+- **Tests**: +5 serve regressions in `daily-v2-serving.test.js` (stale self-heals; fresh reused WITHOUT a write;
+  not-ready -> LKG never blank; concurrent -> exactly ONE derive; OFF for reports without the flag). verify 96/96.
+  No migration, no DataDoe, no scheduler/contract/control/formula change; 4 code files + 1 backfill script.
+- **Production read-backs**: All-Brands vs named-brand snapshot as-of MISMATCHES = 0 across US/IN/IT/FR/DE + more.
+  AUTHENTICATED serve (real serveSharedReport daily path): Haven&Hue US both `ALL` and `Caruso Italy` serve
+  rowsMaxDate=2026-08-30, completeness.latestDate=2026-08-30, snapshot.to=2026-08-30, rederived=false (fresh reused).
+  **Commit d7296c0** (code/tests), backfill + docs separate; Vercel 200.
+
 ## OLI -- ONE canonical ORDERED-UNITS merge: propagate ordered units into every OLI unit report (2026-08-31)
 
 The prior estimate work propagated estimated SALES but explicitly left UNITS priced-only (synthetic estimate rows
