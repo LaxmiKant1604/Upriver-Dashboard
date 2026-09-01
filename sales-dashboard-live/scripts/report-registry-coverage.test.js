@@ -45,19 +45,19 @@ test("34. no report action is BOTH brand-accessible AND account-wide-only (capab
 test("34b. the account-wide reports that MUST deny a brand-restricted user are denied (not silently brand-accessible)", () => {
   // These carry account-wide payloads with no reviewed per-brand server projection -> must be DENY.
   const mustDeny = ["reconciliation", "sku-pl", "keyword-rank", "content-changes", "fba-plan", "brand-inventory", "sales",
-    "sales-movers", "listing-health", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer", "oli-quality-summary"];
+    "sales-movers", "listing-health", "buy-box-loss", "ppc-performance", "listing-optimizer", "oli-quality-summary"];
   for (const a of mustDeny) {
     assert.equal(REPORT_CAPABILITIES[a], CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS, `'${a}' must DENY for brand-restricted users`);
     assert.equal(isBrandAccessible(REPORT_CAPABILITIES[a]), false);
   }
 });
 
-test("34c. the brand-projected reports are exactly the reviewed set (Dashboard/SKU Movement/Daily/Brand View/oli-quality)", () => {
+test("34c. the brand-projected reports are exactly the reviewed set (Dashboard/SKU Movement/Daily/Brand View/oli-quality/returns-leakage)", () => {
   const accessible = Object.entries(REPORT_CAPABILITIES).filter(([, c]) => isBrandAccessible(c)).map(([a]) => a).sort();
   assert.deepEqual(accessible, [
     "brand-directory", "brand-portfolio", "brand-sales", "brand-view", "brand-view-brands", "brand-view-portfolio",
-    "daily", "oli-quality", "sku-movement",
-  ], "the brand-accessible set is exactly the reviewed reports");
+    "daily", "oli-quality", "returns-leakage", "sku-movement",
+  ], "the brand-accessible set is exactly the reviewed reports (returns-leakage now brand-projected)");
 });
 
 out("\n" + passed + " assertions passed");

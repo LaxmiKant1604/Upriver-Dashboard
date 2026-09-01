@@ -51,7 +51,7 @@ export const REPORT_CAPABILITIES = Object.freeze({
   "sales-movers": CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS,
   "listing-health": CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS,
   "buy-box-loss": CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS,
-  "returns-leakage": CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS,
+  "returns-leakage": CAPABILITY.BRAND_DERIVABLE_FROM_ASIN_SKU,  // per-(currency, ASIN) rows carry `brand`
   "ppc-performance": CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS,
   "listing-optimizer": CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS,
   // Not brand-scoped (self-filtered / own-scope / admin diagnostics).
@@ -231,6 +231,60 @@ export function projectSkuMovementPayload(payload, keySet) {
   const rows = (Array.isArray(payload.rows) ? payload.rows : []).filter((r) => allow.has(brandKey(r && r.brand)));
   const catalogBrands = (Array.isArray(payload.catalogBrands) ? payload.catalogBrands : []).filter((b) => allow.has(brandKey(b)));
   return { ...payload, rows, catalogBrands, brandScoped: true };
+}
+
+// Project a Returns & Refund Leakage (returns-leakage-v3) payload to permitted brand keys. Each row carries `brand`,
+// so filtering rows is the core safety guarantee (no unauthorized brand rows in the payload OR the client CSV/XLSX,
+// which derive from these rows). Because the advanced payload ALSO carries account-level aggregates (series,
+// breakdowns, reasonTotals, fbmOnly), those are RE-SCOPED to the filtered rows so a restricted user can never see
+// another brand's totals: the returns + money daily series are recomputed from the permitted rows' own `daily`
+// sub-series; the per-account counts/provisional are re-summed; and the dimension breakdown series + fbmOnly +
+// reasonTotals (which cannot be re-derived from rows without leakage) are cleared. Unrestricted users never hit this
+// path (brandProject is identity), so their payload stays byte-identical.
+export function projectReturnsLeakagePayload(payload, keySet) {
+  if (!payload || typeof payload !== "object") return payload;
+  const allow = keySet instanceof Set ? keySet : new Set(keySet || []);
+  const rows = (Array.isArray(payload.rows) ? payload.rows : []).filter((r) => allow.has(brandKey(r && r.brand)));
+  const catalogBrands = (Array.isArray(payload.catalogBrands) ? payload.catalogBrands : []).filter((b) => allow.has(brandKey(b)));
+  const axis = Array.isArray(payload.dayAxis) ? payload.dayAxis : [];
+  const idx = new Map(axis.map((d, i) => [d, i]));
+  const N = axis.length;
+  const z = () => new Array(N).fill(0);
+  const returns = { returnCount: z(), fba: z(), fbm: z(), pending: z() };
+  const money = {};
+  let returnRecordCount = 0, pendingReturnRequests = 0, provisionalReturnCount = 0, confirmedReturnCount = 0;
+  for (const r of rows) {
+    returnRecordCount += Number(r.returnCount) || 0;
+    pendingReturnRequests += Number(r.pendingReturnRequests) || 0;
+    provisionalReturnCount += Number(r.provisionalReturnCount) || 0;
+    confirmedReturnCount += Number(r.confirmedReturnCount) || 0;
+    const cur = r.currency;
+    if (cur && !money[cur]) {
+      money[cur] = { refundedAmount: z(), refundTax: z(), refundedReferralFeeCredit: z(), commissionAbs: z(), unitFeeAbs: z(), restockAbs: z(), cogsOnRefundedUnits: z(), refundedUnitsSettled: z(), refundEvents: z(), settledSales: z(), settledUnits: z(), orderedUnits: z(), orderedSales: z() };
+    }
+    for (const cell of Array.isArray(r.daily) ? r.daily : []) {
+      const i = idx.get(cell.date); if (i == null) continue;
+      returns.returnCount[i] += cell.rc || 0; returns.fba[i] += cell.fba || 0; returns.fbm[i] += cell.fbm || 0; returns.pending[i] += cell.pend || 0;
+      if (cur && money[cur]) {
+        const m = money[cur];
+        m.refundedAmount[i] += cell.rfd || 0; m.refundTax[i] += cell.rtx || 0; m.refundedReferralFeeCredit[i] += cell.rrf || 0;
+        m.commissionAbs[i] += cell.com || 0; m.unitFeeAbs[i] += cell.ufe || 0; m.restockAbs[i] += cell.rst || 0;
+        m.cogsOnRefundedUnits[i] += cell.cog || 0; m.refundedUnitsSettled[i] += cell.rus || 0; m.refundEvents[i] += cell.rev || 0;
+        m.settledSales[i] += cell.ssl || 0; m.settledUnits[i] += cell.sun || 0; m.orderedUnits[i] += cell.ord || 0; m.orderedSales[i] += cell.sal || 0;
+      }
+    }
+  }
+  const emptyBucket = () => ({});
+  return {
+    ...payload, rows, catalogBrands, brandScoped: true,
+    returnRecordCount, pendingReturnRequests,
+    // reasonTotals/fbmOnly/breakdown series are account-wide and cannot be re-scoped from rows without leakage;
+    // cleared for a restricted view (the client recomputes the reason mix + channel/status splits from the filtered rows).
+    reasonTotals: [],
+    fbmOnly: { refundedAmount: 0, sellerBorneLabelCost: 0, brandScopedUnavailable: true },
+    provisional: { ...(payload.provisional || {}), returnCount: provisionalReturnCount, confirmedReturnCount },
+    series: { returns, money, channel: emptyBucket(), status: emptyBucket(), labelPayer: emptyBucket(), reasonBucket: emptyBucket() },
+  };
 }
 
 // Filter a brand DIRECTORY payload ({ brands, brandKeys, brandAccounts, brandDisplay }) to the permitted keys so a

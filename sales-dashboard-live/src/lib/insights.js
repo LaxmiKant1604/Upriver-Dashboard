@@ -1189,6 +1189,15 @@ export function buildPpcInsights(data, rows, level, breakEvenAcos) {
 
 const RETURNS_LABEL = "Returns & Refund Leakage";
 
+// Deterministic thresholds for the returns signal set, kept in one place so a reader can see exactly what the report
+// means by "unusually high" / "excessive" / "aged". None of these invent a cause; each fires only on measured columns.
+const HIGH_RETURN_RATE_PCT = 20;      // a product returned at/above this rate on real volume is a product problem
+const HIGH_RATE_MIN_ORDERED = 25;     // ...but only once enough units were ordered for the rate to be trustworthy
+const FBA_FEE_MIN = 50;               // absolute floor so a pennies fee never produces an alert
+const FBA_FEE_SHARE = 0.3;            // return fees this large a share of the refund are unusually heavy
+const AGED_RETURN_MIN = 5;            // this many return records with no settlement money at all -> flag for reconcile
+const SELLER_LABEL_COST_MIN = 100;    // seller-paid FBM return-label cost worth surfacing at the account level
+
 export const RETURN_BUCKET_META = {
   product_quality: {
     label: "Product / quality",
@@ -1370,6 +1379,117 @@ export function buildReturnsInsights(data, rows) {
         : row.returnCount === 0
           ? "Check Seller Central for the return reasons behind these refunds; they may predate this report's return history."
           : "Review the individual return reasons for this product before choosing a fix — the mix is genuinely split.",
+    }));
+
+    // Unusually high return rate on real volume. The rate is recomputed from summed units (never averaged) and is
+    // only trusted once enough units were ordered, so a tiny product's scary-looking rate does not raise an alert.
+    if (row.returnRate !== null && row.returnRate >= HIGH_RETURN_RATE_PCT && (row.orderedUnits || 0) >= HIGH_RATE_MIN_ORDERED) {
+      insights.push(makeInsight({
+        id: `returns-rate-${row.currency || "na"}-${row.asin}`,
+        reportKey: "returns-leakage",
+        reportLabel: RETURNS_LABEL,
+        category: "returns-high-rate",
+        severity: row.returnRate >= HIGH_RETURN_RATE_PCT * 1.5 ? "high" : "medium",
+        title: `${label} is returned ${row.returnRate.toFixed(1)}% of the time on ${Math.round(row.orderedUnits)} ordered units`,
+        asin: row.asin, sku: row.sku, brand: row.brand, entityLabel: label,
+        evidence: [
+          { label: "Return rate", value: `${row.returnRate.toFixed(1)}%` },
+          { label: "Returned items", value: row.returnCount || 0 },
+          { label: "Units ordered in window", value: Math.round(row.orderedUnits) },
+          { label: "Top reason", value: row.topReasons?.[0] ? `${row.topReasons[0].reason} (${row.topReasons[0].count})` : null },
+          { label: "Fixable share of returns", value: row.actionableShare === null ? null : `${row.actionableShare.toFixed(0)}%` },
+        ],
+        moneyAtRisk: row.hasMoney ? row.totalLeakage : null,
+        moneyBasis: row.hasMoney ? `settled refunds plus seller-borne return fees on this product over ${data.window?.days} days` : null,
+        currency: row.currency,
+        confidence: "high",
+        freshness,
+        why: `This product's return rate is at or above ${HIGH_RETURN_RATE_PCT}% on a meaningful order volume: ${row.returnCount} returned items over ${Math.round(row.orderedUnits)} ordered units in the window.`,
+        action: meta && meta.actionable
+          ? meta.action
+          : "Pull this product's return reasons in Seller Central; a high rate on real volume usually has one fixable cause even when the mix looks split.",
+      }));
+    }
+
+    // Excessive seller-borne FBA return fees relative to the refund itself: the fulfilment cost of each return is
+    // heavy against what the customer got back, which is a packaging / returnless-refund signal, not a product one.
+    if ((row.fbaReturns || 0) > 0 && (row.returnFees || 0) >= FBA_FEE_MIN && (row.returnFees || 0) >= (Number(row.refundedAmount) || 0) * FBA_FEE_SHARE) {
+      insights.push(makeInsight({
+        id: `returns-fees-${row.currency || "na"}-${row.asin}`,
+        reportKey: "returns-leakage",
+        reportLabel: RETURNS_LABEL,
+        category: "returns-fba-fees",
+        severity: severityFromExposure({ share: totalLeakage > 0 ? row.returnFees / totalLeakage : 0, moneyAtRisk: row.returnFees }),
+        title: `${label} paid ${Number(row.returnFees).toFixed(0)} in return fees against ${Number(row.refundedAmount || 0).toFixed(0)} of refunds`,
+        asin: row.asin, sku: row.sku, brand: row.brand, entityLabel: label,
+        evidence: [
+          { label: "Seller-borne return fees", value: Number(row.returnFees).toFixed(2) },
+          { label: "Customer refunds", value: Number(row.refundedAmount || 0).toFixed(2) },
+          { label: "FBA returns", value: row.fbaReturns || 0 },
+          { label: "Returned items", value: row.returnCount || 0 },
+        ],
+        moneyAtRisk: row.returnFees,
+        moneyBasis: "seller-borne return commission plus the FBA customer-return per-unit fee, less restocking recovered, over the window",
+        currency: row.currency,
+        confidence: "high",
+        freshness,
+        why: `Return fees are ${((row.returnFees / Math.max(1, Number(row.refundedAmount) || 0)) * 100).toFixed(0)}% of the refund value on this FBA product, so the cost of processing each return is unusually high relative to what was refunded.`,
+        action: "Check the FBA per-unit return fee and returns processing for this ASIN; a high fee-to-refund ratio often points to oversized or overweight packaging, or to returnless-refund handling.",
+      }));
+    }
+
+    // Aged unmatched returns: return records exist but no REFUND settlement has posted against them in the window.
+    if ((row.returnCount || 0) >= AGED_RETURN_MIN && (row.refundEvents || 0) === 0 && (Number(row.refundedAmount) || 0) === 0) {
+      insights.push(makeInsight({
+        id: `returns-aged-${row.currency || "na"}-${row.asin}`,
+        reportKey: "returns-leakage",
+        reportLabel: RETURNS_LABEL,
+        category: "returns-aged-unmatched",
+        severity: "low",
+        title: `${label} has ${row.returnCount} returned items with no matching refund settlement yet`,
+        asin: row.asin, sku: row.sku, brand: row.brand, entityLabel: label,
+        evidence: [
+          { label: "Returned items", value: row.returnCount || 0 },
+          { label: "Pending return requests", value: row.pendingReturnRequests || 0 },
+          { label: "Refund settlement events", value: 0 },
+          { label: "Top reason", value: row.topReasons?.[0] ? `${row.topReasons[0].reason} (${row.topReasons[0].count})` : null },
+        ],
+        moneyAtRisk: null,
+        moneyBasis: null,
+        currency: row.currency,
+        confidence: "medium",
+        freshness,
+        why: "The Returns source shows return records for this product but no REFUND settlement event has posted against them in the window, so either the refunds are still settling or these returns predate this report's settlement coverage.",
+        action: "Reconcile these returns in Seller Central: confirm whether the refunds are still processing or the returns are older than the settlement window before treating them as resolved.",
+      }));
+    }
+  }
+
+  // Account-level: a high seller-paid FBM return-label cost, an FBM-only figure the Returns source reports directly.
+  // It is separate from the settlement leakage above (which covers both channels), so it is surfaced on its own.
+  const labelCost = Number(data.fbmOnly?.sellerBorneLabelCost) || 0;
+  if (labelCost >= SELLER_LABEL_COST_MIN) {
+    const labelCurrency = (data.currencies || []).length === 1 ? data.currencies[0] : null;
+    insights.push(makeInsight({
+      id: "returns-seller-label-cost",
+      reportKey: "returns-leakage",
+      reportLabel: RETURNS_LABEL,
+      category: "returns-label-cost",
+      severity: "medium",
+      title: `${labelCost.toFixed(0)} of FBM return labels were billed to the seller in this window`,
+      entityLabel: "Account pattern",
+      evidence: [
+        { label: "Seller-borne return-label cost (FBM)", value: labelCost.toFixed(2) },
+        { label: "FBM refunded amount", value: Number(data.fbmOnly?.refundedAmount || 0).toFixed(2) },
+        { label: "Pending return requests", value: data.pendingReturnRequests || 0 },
+      ],
+      moneyAtRisk: labelCurrency ? labelCost : null,
+      moneyBasis: labelCurrency ? "return-shipping labels the Returns source reports as billed to the seller for FBM returns in the window" : null,
+      currency: labelCurrency,
+      confidence: "high",
+      freshness,
+      why: "The Returns source reports return-shipping labels billed to the seller for FBM returns. A high seller-paid label total is a return-policy and packaging cost separate from the settlement leakage above.",
+      action: "Review the FBM return-shipping policy and label cost for the most-returned SKUs; consider right-sizing packaging and revisiting who pays return postage.",
     }));
   }
 

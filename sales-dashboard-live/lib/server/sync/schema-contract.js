@@ -756,6 +756,77 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
     wrappers: ["replaceOliDimensionalWindow", "replaceOliOperationalUnitsWindow", "getSourceOliOperationalUnitRows"],
     note: "Migration 16: operational units (priced/explicit-zero/pending/cancelled) + p_unit_rows on the replace RPC + standalone backfill RPC (revenue byte-identical).",
   },
+  {
+    // Migration 20260914: DURABLE Returns + Settlement history for the Returns & Refund Leakage report. Two ADDITIVE
+    // standalone tables + two standalone atomic replace RPCs (delete + insert by exact account/date window; validate
+    // EVERY row fail-closed BEFORE any mutation, so a malformed payload preserves last-known-good). Service-role-only,
+    // written ONLY through the SECURITY DEFINER RPCs. Touches no existing table/RPC/report/scheduler. The RPC bodies
+    // are proven by scripts/returns-durable-history.test.js (idempotent replace + fail-closed validation), so no
+    // structural body-proof checker is wired here (provenFunctions stays empty).
+    migration: "20260914_returns_leakage_durable.sql",
+    tables: [
+      {
+        name: "source_returns_history",
+        unique: [["organization_fingerprint", "connection_id", "account_id", "return_date", "sku", "child_asin", "amazon_return_reason", "fulfillment_channel", "request_status", "label_payer"]],
+        namedConstraints: [
+          { name: "source_returns_hist_pk", kind: "primary key", columns: ["organization_fingerprint", "connection_id", "account_id", "return_date", "sku", "child_asin", "amazon_return_reason", "fulfillment_channel", "request_status", "label_payer"] },
+          { name: "source_returns_hist_connection_id_check", kind: "check", canonical: "connection_id in ('primary', 'dd-secondary')" },
+          { name: "source_returns_hist_account_nonblank", kind: "check", canonical: "char_length(btrim(account_id)) > 0" },
+          { name: "source_returns_hist_seller_nonblank", kind: "check", canonical: "char_length(btrim(seller_or_vendor_id)) > 0" },
+          { name: "source_returns_hist_count_pos", kind: "check", canonical: "return_count > 0" },
+          { name: "source_returns_hist_fbm_refund_nonneg", kind: "check", canonical: "fbm_refunded_amount >= 0" },
+          { name: "source_returns_hist_fbm_label_nonneg", kind: "check", canonical: "fbm_seller_label_cost >= 0" },
+          { name: "source_returns_hist_hash_nonblank", kind: "check", canonical: "char_length(btrim(source_request_hash)) > 0" },
+        ],
+        requiredIndexes: [
+          { name: "source_returns_hist_account_date_idx", columns: ["account_id", "return_date"] },
+          { name: "source_returns_hist_org_date_idx", columns: ["organization_fingerprint", "return_date"] },
+        ],
+        rlsEnabled: true,
+        serviceRoleAcl: { revokeAll: true, grants: ["select"] },
+        requiredPolicies: [],
+        authenticatedAcl: { grants: [] },
+        requiredTriggers: [{ name: "source_returns_hist_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["organization_fingerprint", "connection_id", "account_id", "seller_or_vendor_id", "marketplace_country_code",
+          "return_date", "sku", "child_asin", "amazon_return_reason", "fulfillment_channel", "request_status", "label_payer",
+          "detailed_disposition", "return_count", "fbm_refunded_amount", "fbm_seller_label_cost", "cogs_total_value", "source_request_hash"],
+      },
+      {
+        name: "source_settlement_history",
+        unique: [["organization_fingerprint", "connection_id", "account_id", "settlement_date", "sku", "child_asin", "currency", "settlement_type"]],
+        namedConstraints: [
+          { name: "source_settle_hist_pk", kind: "primary key", columns: ["organization_fingerprint", "connection_id", "account_id", "settlement_date", "sku", "child_asin", "currency", "settlement_type"] },
+          { name: "source_settle_hist_connection_id_check", kind: "check", canonical: "connection_id in ('primary', 'dd-secondary')" },
+          { name: "source_settle_hist_account_nonblank", kind: "check", canonical: "char_length(btrim(account_id)) > 0" },
+          { name: "source_settle_hist_seller_nonblank", kind: "check", canonical: "char_length(btrim(seller_or_vendor_id)) > 0" },
+          { name: "source_settle_hist_currency_check", kind: "check", canonical: "currency ~ '^[A-Z]{3}$'" },
+          { name: "source_settle_hist_type_check", kind: "check", canonical: "settlement_type in ('ORDER', 'REFUND', 'OTHER')" },
+          { name: "source_settle_hist_refund_events_nonneg", kind: "check", canonical: "refund_event_count >= 0" },
+          { name: "source_settle_hist_hash_nonblank", kind: "check", canonical: "char_length(btrim(source_request_hash)) > 0" },
+        ],
+        requiredIndexes: [
+          { name: "source_settle_hist_account_date_idx", columns: ["account_id", "settlement_date"] },
+          { name: "source_settle_hist_org_date_idx", columns: ["organization_fingerprint", "settlement_date"] },
+        ],
+        rlsEnabled: true,
+        serviceRoleAcl: { revokeAll: true, grants: ["select"] },
+        requiredPolicies: [],
+        authenticatedAcl: { grants: [] },
+        requiredTriggers: [{ name: "source_settle_hist_touch", timing: "before", events: ["update"], level: "row", function: "touch_updated_at" }],
+        keyColumns: ["organization_fingerprint", "connection_id", "account_id", "seller_or_vendor_id", "marketplace_country_code",
+          "settlement_date", "sku", "child_asin", "currency", "settlement_type", "quantity", "item_price", "refunded_amount",
+          "refund_tax", "refunded_referral_fee", "refund_commission", "refund_restocking_fee", "fba_customer_return_per_unit_fee",
+          "fba_customer_return_fee", "customer_return_hrr_unit_fee", "cogs_total_value", "refund_event_count", "source_request_hash"],
+      },
+    ],
+    rpcs: [
+      { name: "replace_returns_history_window", params: ["p_organization_fingerprint", "p_connection_id", "p_account_id", "p_covered_from", "p_covered_to", "p_return_rows"] },
+      { name: "replace_settlement_history_window", params: ["p_organization_fingerprint", "p_connection_id", "p_account_id", "p_covered_from", "p_covered_to", "p_settlement_rows"] },
+    ],
+    provenFunctions: [],
+    wrappers: ["replaceReturnsHistoryWindow", "getReturnsHistoryRows", "replaceSettlementHistoryWindow", "getSettlementHistoryRows"],
+    note: "Migration 20260914: durable per-account Returns + Settlement history + two atomic replace RPCs (dedicated to Returns & Refund Leakage; touches nothing else).",
+  },
 ]);
 
 // ---- SQL-aware lexical layer -----------------------------------------------------------------------------

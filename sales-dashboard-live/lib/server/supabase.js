@@ -2212,6 +2212,186 @@ export async function replaceOliSalesEstimatesWindow({ organizationFingerprint, 
   }
 }
 
+/* ===================== Returns & Refund Leakage -- durable Returns + Settlement history ===================== */
+// Read the durable per-account Returns history (source_returns_history) over a [from,to] return_date window. Paginated
+// + hard-capped; pre-migration (schema absent) returns [] so the dedicated returns publisher degrades to
+// last-known-good rather than throwing. ZERO DataDoe -- reads already-fetched durable evidence.
+export async function getReturnsHistoryRows({ organizationFingerprint, connectionId = "primary", accountIds = null, from, to, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS, pageRows = SOURCE_OLI_HISTORY_PAGE_ROWS, signal = null } = {}) {
+  if (!organizationFingerprint || !from || !to) {
+    throw new Error("getReturnsHistoryRows requires organizationFingerprint + from + to (fail closed).");
+  }
+  const PAGE = Math.max(1, Number(pageRows) || SOURCE_OLI_HISTORY_PAGE_ROWS);
+  const outRows = [];
+  try {
+    for (let offset = 0; ; offset += PAGE) {
+      const query = new URLSearchParams({
+        select: "account_id,seller_or_vendor_id,marketplace_country_code,return_date,sku,child_asin,amazon_return_reason,fulfillment_channel,request_status,label_payer,detailed_disposition,return_count,fbm_refunded_amount,fbm_seller_label_cost,cogs_total_value,source_request_hash,refreshed_at",
+        organization_fingerprint: `eq.${organizationFingerprint}`,
+        connection_id: `eq.${connectionId}`,
+        return_date: `gte.${from}`,
+        order: "return_date.asc,account_id.asc,child_asin.asc,sku.asc",
+        limit: String(PAGE),
+        offset: String(offset),
+      });
+      query.append("return_date", `lte.${to}`);
+      if (Array.isArray(accountIds) && accountIds.length) {
+        query.append("account_id", `in.(${accountIds.map((a) => `"${String(a).replaceAll('"', "")}"`).join(",")})`);
+      }
+      const rows = await request(`/rest/v1/source_returns_history?${query}`, { signal });
+      const list = Array.isArray(rows) ? rows : [];
+      outRows.push(...list);
+      if (outRows.length > maxRows) {
+        const err = new Error("RETURNS_HISTORY_ROW_LIMIT_EXCEEDED: durable returns read exceeded its row cap; refusing a truncated series (fail closed).");
+        err.code = "RETURNS_HISTORY_ROW_LIMIT_EXCEEDED";
+        throw err;
+      }
+      if (list.length < PAGE) break;
+    }
+  } catch (readError) {
+    if (readError && readError.code === "RETURNS_HISTORY_ROW_LIMIT_EXCEEDED") throw readError;
+    if (isSchemaMissingError(readError)) return []; // durable returns table not yet applied -> LKG
+    throw readError;
+  }
+  return outRows;
+}
+
+// STANDALONE atomic replace of ONLY the returns window for one account (delete + insert by exact account/return_date
+// window). p_return_rows is REQUIRED (a non-null array; an EMPTY [] legitimately clears the window). Returns a typed
+// outcome; schema-missing is non-fatal (pre-migration) so a write hiccup never regresses last-known-good.
+export async function replaceReturnsHistoryWindow({ organizationFingerprint, connectionId = "primary", accountId, coveredFrom, coveredTo, returnRows, signal = null }) {
+  if (!organizationFingerprint || !accountId || !coveredFrom || !coveredTo || !Array.isArray(returnRows)) {
+    throw new Error("replaceReturnsHistoryWindow requires organizationFingerprint/accountId/coveredFrom/coveredTo and a returnRows array (fail closed).");
+  }
+  try {
+    const body = await request("/rest/v1/rpc/replace_returns_history_window", {
+      method: "POST",
+      signal,
+      body: {
+        p_organization_fingerprint: organizationFingerprint,
+        p_connection_id: connectionId,
+        p_account_id: accountId,
+        p_covered_from: coveredFrom,
+        p_covered_to: coveredTo,
+        p_return_rows: returnRows.map((r) => ({
+          seller_or_vendor_id: r.sellerOrVendorId ?? r.seller_or_vendor_id,
+          marketplace_country_code: r.marketplaceCountryCode ?? r.marketplace_country_code ?? "",
+          return_date: r.returnDate ?? r.return_date,
+          sku: String(r.sku ?? ""),
+          child_asin: String(r.childAsin ?? r.child_asin ?? ""),
+          amazon_return_reason: String(r.amazonReturnReason ?? r.amazon_return_reason ?? ""),
+          fulfillment_channel: String(r.fulfillmentChannel ?? r.fulfillment_channel ?? ""),
+          request_status: String(r.requestStatus ?? r.request_status ?? ""),
+          label_payer: String(r.labelPayer ?? r.label_payer ?? ""),
+          detailed_disposition: String(r.detailedDisposition ?? r.detailed_disposition ?? ""),
+          return_count: r.returnCount ?? r.return_count,
+          fbm_refunded_amount: r.fbmRefundedAmount ?? r.fbm_refunded_amount ?? 0,
+          fbm_seller_label_cost: r.fbmSellerLabelCost ?? r.fbm_seller_label_cost ?? 0,
+          cogs_total_value: r.cogsTotalValue ?? r.cogs_total_value ?? 0,
+          source_request_hash: r.sourceRequestHash ?? r.source_request_hash ?? "",
+          refreshed_at: r.refreshedAt ?? r.refreshed_at ?? null,
+          calculated_at: r.calculatedAt ?? r.calculated_at ?? null,
+        })),
+      },
+    });
+    const value = Array.isArray(body) ? body[0] : body;
+    return { write: "ok", replaced: value?.returnsReplaced ?? 0, inserted: value?.returnsInserted ?? 0, error: null };
+  } catch (writeError) {
+    if (isSchemaMissingError(writeError)) return { write: "schema-missing", replaced: 0, inserted: 0, error: "RETURNS_HISTORY_SCHEMA_MISSING" };
+    return { write: "write-failed", replaced: 0, inserted: 0, error: "RETURNS_HISTORY_REPLACE_FAILED" };
+  }
+}
+
+// Read the durable per-account Settlement history (source_settlement_history) over a [from,to] settlement_date window.
+export async function getSettlementHistoryRows({ organizationFingerprint, connectionId = "primary", accountIds = null, from, to, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS, pageRows = SOURCE_OLI_HISTORY_PAGE_ROWS, signal = null } = {}) {
+  if (!organizationFingerprint || !from || !to) {
+    throw new Error("getSettlementHistoryRows requires organizationFingerprint + from + to (fail closed).");
+  }
+  const PAGE = Math.max(1, Number(pageRows) || SOURCE_OLI_HISTORY_PAGE_ROWS);
+  const outRows = [];
+  try {
+    for (let offset = 0; ; offset += PAGE) {
+      const query = new URLSearchParams({
+        select: "account_id,seller_or_vendor_id,marketplace_country_code,settlement_date,sku,child_asin,currency,settlement_type,quantity,item_price,refunded_amount,refund_tax,refunded_referral_fee,refund_commission,refund_restocking_fee,fba_customer_return_per_unit_fee,fba_customer_return_fee,customer_return_hrr_unit_fee,cogs_total_value,refund_event_count,source_request_hash,refreshed_at",
+        organization_fingerprint: `eq.${organizationFingerprint}`,
+        connection_id: `eq.${connectionId}`,
+        settlement_date: `gte.${from}`,
+        order: "settlement_date.asc,account_id.asc,child_asin.asc,sku.asc",
+        limit: String(PAGE),
+        offset: String(offset),
+      });
+      query.append("settlement_date", `lte.${to}`);
+      if (Array.isArray(accountIds) && accountIds.length) {
+        query.append("account_id", `in.(${accountIds.map((a) => `"${String(a).replaceAll('"', "")}"`).join(",")})`);
+      }
+      const rows = await request(`/rest/v1/source_settlement_history?${query}`, { signal });
+      const list = Array.isArray(rows) ? rows : [];
+      outRows.push(...list);
+      if (outRows.length > maxRows) {
+        const err = new Error("SETTLEMENT_HISTORY_ROW_LIMIT_EXCEEDED: durable settlement read exceeded its row cap; refusing a truncated series (fail closed).");
+        err.code = "SETTLEMENT_HISTORY_ROW_LIMIT_EXCEEDED";
+        throw err;
+      }
+      if (list.length < PAGE) break;
+    }
+  } catch (readError) {
+    if (readError && readError.code === "SETTLEMENT_HISTORY_ROW_LIMIT_EXCEEDED") throw readError;
+    if (isSchemaMissingError(readError)) return []; // durable settlement table not yet applied -> LKG
+    throw readError;
+  }
+  return outRows;
+}
+
+// STANDALONE atomic replace of ONLY the settlement window for one account (delete + insert by exact account/
+// settlement_date window). Blank/invalid-currency rows are rejected fail-closed by the RPC (no money without a
+// currency). An EMPTY [] clears the window.
+export async function replaceSettlementHistoryWindow({ organizationFingerprint, connectionId = "primary", accountId, coveredFrom, coveredTo, settlementRows, signal = null }) {
+  if (!organizationFingerprint || !accountId || !coveredFrom || !coveredTo || !Array.isArray(settlementRows)) {
+    throw new Error("replaceSettlementHistoryWindow requires organizationFingerprint/accountId/coveredFrom/coveredTo and a settlementRows array (fail closed).");
+  }
+  try {
+    const body = await request("/rest/v1/rpc/replace_settlement_history_window", {
+      method: "POST",
+      signal,
+      body: {
+        p_organization_fingerprint: organizationFingerprint,
+        p_connection_id: connectionId,
+        p_account_id: accountId,
+        p_covered_from: coveredFrom,
+        p_covered_to: coveredTo,
+        p_settlement_rows: settlementRows.map((r) => ({
+          seller_or_vendor_id: r.sellerOrVendorId ?? r.seller_or_vendor_id,
+          marketplace_country_code: r.marketplaceCountryCode ?? r.marketplace_country_code ?? "",
+          settlement_date: r.settlementDate ?? r.settlement_date,
+          sku: String(r.sku ?? ""),
+          child_asin: String(r.childAsin ?? r.child_asin ?? ""),
+          currency: r.currency,
+          settlement_type: r.settlementType ?? r.settlement_type,
+          quantity: r.quantity ?? 0,
+          item_price: r.itemPrice ?? r.item_price ?? 0,
+          refunded_amount: r.refundedAmount ?? r.refunded_amount ?? 0,
+          refund_tax: r.refundTax ?? r.refund_tax ?? 0,
+          refunded_referral_fee: r.refundedReferralFee ?? r.refunded_referral_fee ?? 0,
+          refund_commission: r.refundCommission ?? r.refund_commission ?? 0,
+          refund_restocking_fee: r.refundRestockingFee ?? r.refund_restocking_fee ?? 0,
+          fba_customer_return_per_unit_fee: r.fbaCustomerReturnPerUnitFee ?? r.fba_customer_return_per_unit_fee ?? 0,
+          fba_customer_return_fee: r.fbaCustomerReturnFee ?? r.fba_customer_return_fee ?? 0,
+          customer_return_hrr_unit_fee: r.customerReturnHrrUnitFee ?? r.customer_return_hrr_unit_fee ?? 0,
+          cogs_total_value: r.cogsTotalValue ?? r.cogs_total_value ?? 0,
+          refund_event_count: r.refundEventCount ?? r.refund_event_count ?? 0,
+          source_request_hash: r.sourceRequestHash ?? r.source_request_hash ?? "",
+          refreshed_at: r.refreshedAt ?? r.refreshed_at ?? null,
+          calculated_at: r.calculatedAt ?? r.calculated_at ?? null,
+        })),
+      },
+    });
+    const value = Array.isArray(body) ? body[0] : body;
+    return { write: "ok", replaced: value?.settlementsReplaced ?? 0, inserted: value?.settlementsInserted ?? 0, error: null };
+  } catch (writeError) {
+    if (isSchemaMissingError(writeError)) return { write: "schema-missing", replaced: 0, inserted: 0, error: "SETTLEMENT_HISTORY_SCHEMA_MISSING" };
+    return { write: "write-failed", replaced: 0, inserted: 0, error: "SETTLEMENT_HISTORY_REPLACE_FAILED" };
+  }
+}
+
 // Durable read helper for future fulfillment / state / city contribution slices WITHOUT another historical
 // DataDoe export: reads the NON-CANCELLED dimensional OLI rows over a window for a set of accounts, aggregated by
 // the requested dimension keys. `dimensions` is a subset of ['fulfillment_channel','address_state','address_city']

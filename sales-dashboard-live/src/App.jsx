@@ -4886,6 +4886,7 @@ function DashboardApp({ session, access, onSignOut }) {
           accountName={refreshScopeAccount?.name}
           selectedBrand={selectedBrand}
           currency={displayCurrency}
+          user={session?.user || null}
         />
       )}
 

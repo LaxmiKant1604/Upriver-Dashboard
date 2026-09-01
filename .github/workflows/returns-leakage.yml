@@ -1,0 +1,102 @@
+# Returns & Refund Leakage -- DEDICATED scheduler. Fully decoupled from scheduler-v2 and fba-plan-golive: its own
+# concurrency group, its own durable Returns + Settlement history + returns-leakage snapshots, its own cron rows.
+# It NEVER touches Daily / Brand View / SKU Movement / FBA / Ads / OLI processing or their timings. US and Non-US run
+# INDEPENDENTLY (separate cron rows -> separate runs) so one bucket's failure can never block the other or any other
+# report. Each bucket fetches exactly two standard exports per <=5-seller batch (Returns 60d + Settlements 21d/initial)
+# = 4 tokens/batch, hard-capped at US<=8 / Non-US<=20 (total 28/day). A batch already covering asOf is a zero-token
+# skip, so the FALLBACK run after a successful PRIMARY spends nothing (shared durable coverage marker). Controls are
+# implicit: the atomic window-replace + CAS publish preserve last-known-good on every failure.
+name: returns-leakage
+
+concurrency:
+  group: returns-leakage
+  cancel-in-progress: false
+
+on:
+  schedule:
+    # Runs AFTER scheduler-v2 OLI (02:00-03:00 UTC Non-US / 10:30 UTC US) and fba-plan (04:00-05:00 / 12:30-13:30),
+    # so the reused durable OLI is already refreshed to D-1 before Returns derives its rate denominator.
+    - cron: "0 6 * * *"    # 06:00 UTC / 11:30 IST -- Non-US PRIMARY
+    - cron: "0 7 * * *"    # 07:00 UTC / 12:30 IST -- Non-US FALLBACK (zero-token if primary already covered D-1)
+    - cron: "30 14 * * *"  # 14:30 UTC / 20:00 IST -- US PRIMARY
+    - cron: "30 15 * * *"  # 15:30 UTC / 21:00 IST -- US FALLBACK
+  workflow_dispatch:
+    inputs:
+      bucket:
+        description: "Bucket to run"
+        required: true
+        default: "non-us"
+        type: choice
+        options: ["non-us", "us"]
+      mode:
+        description: "dry-run (zero creates/writes) or go-live (bounded, token-gated)"
+        required: true
+        default: "dry-run"
+        type: choice
+        options: ["dry-run", "go-live"]
+      as_of:
+        description: "As-of date YYYY-MM-DD (blank = auto D-1 UTC)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      POSTGRES_URL_NON_POOLING: ${{ secrets.POSTGRES_URL_NON_POOLING }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify required secrets
+        run: |
+          missing=0
+          for v in POSTGRES_URL SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY; do
+            if [ -z "$(printenv $v)" ]; then echo "MISSING SECRET: $v"; missing=1; fi
+          done
+          if [ "$missing" = "1" ]; then echo "Refusing to run without every required secret."; exit 1; fi
+
+      - name: Resolve bucket + mode (deterministic cron -> bucket map, never the clock)
+        id: cfg
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "bucket=${{ github.event.inputs.bucket }}" >> "$GITHUB_OUTPUT"
+            echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
+            echo "asof=${{ github.event.inputs.as_of }}" >> "$GITHUB_OUTPUT"
+          else
+            case "${{ github.event.schedule }}" in
+              "0 6 * * *")   echo "bucket=non-us" >> "$GITHUB_OUTPUT"; echo "mode=go-live" >> "$GITHUB_OUTPUT" ;;
+              "0 7 * * *")   echo "bucket=non-us" >> "$GITHUB_OUTPUT"; echo "mode=go-live" >> "$GITHUB_OUTPUT" ;;
+              "30 14 * * *") echo "bucket=us"     >> "$GITHUB_OUTPUT"; echo "mode=go-live" >> "$GITHUB_OUTPUT" ;;
+              "30 15 * * *") echo "bucket=us"     >> "$GITHUB_OUTPUT"; echo "mode=go-live" >> "$GITHUB_OUTPUT" ;;
+              *) echo "Unknown schedule '${{ github.event.schedule }}' -- failing closed."; exit 1 ;;
+            esac
+            echo "asof=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Run Returns Leakage cycle (${{ steps.cfg.outputs.bucket }} / ${{ steps.cfg.outputs.mode }})
+        run: |
+          ARGS="--bucket=${{ steps.cfg.outputs.bucket }} --mode=${{ steps.cfg.outputs.mode }}"
+          if [ -n "${{ steps.cfg.outputs.asof }}" ]; then ARGS="$ARGS --as-of=${{ steps.cfg.outputs.asof }}"; fi
+          echo "returns-leakage-golive.mjs $ARGS"
+          node scripts/release/returns-leakage-golive.mjs $ARGS

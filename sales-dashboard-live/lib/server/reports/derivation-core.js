@@ -1472,22 +1472,13 @@ export function returnsLeakageOrderedFold(rows) {
 }
 
 /**
- * Full Returns & Refund Leakage payload, byte-identical to buildReturnsLeakage() for the same saved rows.
- * One row per (currency, ASIN); an ASIN with no returns AND no refund events is excluded. Money never
- * crosses currencies; product-name precedence is catalog -> ordered; brand comes from the catalog only.
- * `returnRecordCount` is the RAW return-row count (incl. rows the fold skips). Pure.
+ * Assemble the one-row-per-(currency, ASIN) leakage rows from the three pre-computed folds + the catalog fold.
+ * Extracted VERBATIM from returnsLeakagePayload so both the raw-source path AND the durable Returns-history path
+ * share ONE row-assembly authority (multi-currency primary-row rule, zero-clamped fees already inside the fold,
+ * withheld returnedUnits on multi-currency ASINs). Pure; returns the ordered `rows` array. The durable path proves
+ * its folds equal the raw folds, so feeding them here yields byte-identical rows.
  */
-export function returnsLeakagePayload({
-  accountId, asOf, from, windowDays, returnsSourceLabel, moneySourceLabel, rateSourceLabel,
-  rateSourceLagDays, returnHistoryDays, returnRows, settlementRows, orderedRows, catalogRows,
-}) {
-  const { returnsByAsin, reasonTotals, pendingReturnRequests, fbmRefundedAmount, fbmLabelCostBorneBySeller } = returnsLeakageReturnsFold(returnRows);
-  // Blocker 3: settlement-fold currencies are no longer the payload's `currencies`; that field is now the
-  // union of the currencies EMITTED on the rows (computed at the return below). Only moneyByKey is needed here.
-  const { moneyByKey } = returnsLeakageSettlementFold(settlementRows);
-  const { orderedByKey } = returnsLeakageOrderedFold(orderedRows);
-  const catalog = salesMoversCatalogFold(catalogRows);
-
+export function assembleReturnsLeakageRows({ returnsByAsin, moneyByKey, orderedByKey, catalog }) {
   const asins = new Set([
     ...returnsByAsin.keys(),
     ...[...orderedByKey.values()].map((entry) => entry.asin),
@@ -1497,8 +1488,6 @@ export function returnsLeakagePayload({
   for (const asin of asins) {
     const returns = returnsByAsin.get(asin) || null;
     const meta = catalog.byAsin.get(asin) || {};
-    // The ASIN's currency universe = union of settlement-money currencies + ordered currencies. Each row's
-    // orderedUnits/sales/refund money come from THAT currency ONLY (never a combined total copied across).
     const byCurrency = new Map();
     for (const m of [...moneyByKey.values()].filter((e) => e.asin === asin)) {
       const c = m.currency ?? null;
@@ -1510,14 +1499,9 @@ export function returnsLeakagePayload({
       const slot = byCurrency.get(c) || { currency: c, money: null, ordered: null };
       slot.ordered = o; byCurrency.set(c, slot);
     }
-    // An ASIN with returns but NO money and NO ordered evidence has a single null-currency row.
     if (byCurrency.size === 0 && returns) byCurrency.set(null, { currency: null, money: null, ordered: null });
     const slots = [...byCurrency.values()];
     const multiCurrency = slots.length > 1;
-    // Returns carry no currency. SINGLE currency: the sole row holds the returnCount + returnedUnits (rate
-    // known). MULTIPLE currencies: the returnCount goes on exactly ONE deterministic PRIMARY row (greatest
-    // ordered units; tie-break lexicographically smallest currency), 0 on the others, and returnedUnits is
-    // WITHHELD (null) on ALL of the ASIN's rows so the rate is never computed from a currency-ambiguous count.
     let primary = null;
     if (returns && multiCurrency) {
       primary = slots.slice().sort((a, b) => {
@@ -1531,7 +1515,6 @@ export function returnsLeakagePayload({
       const money = slot.money;
       const ordered = slot.ordered;
       const isReturnHolder = Boolean(returns) && (!multiCurrency || slot === primary);
-      // A return-leakage candidate row holds the ASIN's returns OR has its OWN currency's refund events.
       const hasReturnActivity = isReturnHolder || (money && money.refundEvents > 0);
       if (!hasReturnActivity) continue;
       const skus = new Set([...(isReturnHolder ? returns.skus : []), ...(money?.skus || [])]);
@@ -1560,8 +1543,6 @@ export function returnsLeakagePayload({
         settledSales: money ? money.settledSales : 0,
         settledUnits: money ? money.settledUnits : 0,
         hasMoney: Boolean(money),
-        // Return rate = returned units (Returns record count) / ordered units (Order Line Items), per THIS
-        // currency. returnedUnits is WITHHELD (null) whenever the ASIN spans multiple currencies.
         orderedUnits: ordered ? ordered.orderedUnits : null,
         returnedUnits: (!multiCurrency && isReturnHolder) ? returns.returnCount : null,
         sales: ordered ? ordered.sales : null,
@@ -1569,6 +1550,27 @@ export function returnsLeakagePayload({
       });
     }
   }
+  return rows;
+}
+
+/**
+ * Full Returns & Refund Leakage payload, byte-identical to buildReturnsLeakage() for the same saved rows.
+ * One row per (currency, ASIN); an ASIN with no returns AND no refund events is excluded. Money never
+ * crosses currencies; product-name precedence is catalog -> ordered; brand comes from the catalog only.
+ * `returnRecordCount` is the RAW return-row count (incl. rows the fold skips). Pure.
+ */
+export function returnsLeakagePayload({
+  accountId, asOf, from, windowDays, returnsSourceLabel, moneySourceLabel, rateSourceLabel,
+  rateSourceLagDays, returnHistoryDays, returnRows, settlementRows, orderedRows, catalogRows,
+}) {
+  const { returnsByAsin, reasonTotals, pendingReturnRequests, fbmRefundedAmount, fbmLabelCostBorneBySeller } = returnsLeakageReturnsFold(returnRows);
+  // Blocker 3: settlement-fold currencies are no longer the payload's `currencies`; that field is now the
+  // union of the currencies EMITTED on the rows (computed at the return below). Only moneyByKey is needed here.
+  const { moneyByKey } = returnsLeakageSettlementFold(settlementRows);
+  const { orderedByKey } = returnsLeakageOrderedFold(orderedRows);
+  const catalog = salesMoversCatalogFold(catalogRows);
+
+  const rows = assembleReturnsLeakageRows({ returnsByAsin, moneyByKey, orderedByKey, catalog });
   return {
     accountId,
     asOf,

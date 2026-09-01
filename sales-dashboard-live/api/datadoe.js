@@ -58,12 +58,14 @@ import {
   publishSnapshotUpdate,
   releaseRefreshLock,
   saveReportSnapshot,
+  getReturnsHistoryRows,
+  getSettlementHistoryRows,
 } from "../lib/server/supabase.js";
 // CENTRAL account+brand authorization: resolve a SELECTED_BRANDS user's permitted scope + project served payloads.
 // Admin/ALL_BRANDS users resolve to `restricted:false` and every serving path stays byte-identical.
 import {
   resolveUserReportScope, BrandAccessError, CAPABILITY, REPORT_CAPABILITIES, isBrandAccessible,
-  projectBrandSalesPayload, projectSkuMovementPayload, projectBrandDirectoryPayload, accountBrandPairAuthorized,
+  projectBrandSalesPayload, projectSkuMovementPayload, projectBrandDirectoryPayload, projectReturnsLeakagePayload, accountBrandPairAuthorized,
 } from "../lib/server/report-authorization.js";
 import { brandKey as canonicalBrandKey } from "../lib/server/reports/brand-membership.js";
 // Shared DataDoe transport. Extracted so every report — the seven original ones
@@ -163,6 +165,8 @@ import { refreshCorrectedBrandSalesForAccount } from "../lib/server/reports/bran
 import { summarizeExplicitZeroOli, brandByAsinFromCatalog } from "../lib/server/reports/oli-quality.js";
 import { rederiveDailyV2, latestProvenDailyTo, DAILY_OLI_SOURCE_KEY } from "../lib/server/reports/daily-durable-rederive.js";
 import { rederiveSkuMovement, skuMovementProvenDates, skuMovementRefreshedAt } from "../lib/server/reports/sku-movement-durable-rederive.js";
+import { gatherReturnsEvidence } from "../lib/server/reports/returns-publish.js";
+import { RETURNS_ADVANCED_VERSION } from "../lib/server/reports/returns-advanced.js";
 import { organizationFingerprint } from "../lib/server/source-identity.js";
 import { FX_DISPLAY_CURRENCIES, getFxRates } from "../lib/server/fx.js";
 
@@ -986,6 +990,68 @@ async function serveSelfHealingBrandDirectory({ res, accountIds, legacyShared, b
 // NO DataDoe adapter is on this path: derive / serve / reload / account-change / brand-change can NEVER spend a token.
 // Brand scope is honoured strictly (a named-brand read never falls back to the ALL-brand snapshot); the effectiveAsOf
 // is server-resolved from the account's own proven coverage (the account/marketplace date, never the viewer clock).
+// Returns & Refund Leakage -- read-only, self-healing durable serve (returns-leakage-v3). Serves the dedicated
+// scheduler-published snapshot; on a miss (or an explicit reload) it re-derives the advanced payload from ALREADY-
+// DURABLE evidence (this report's Returns + Settlement history + the reused OLI + org Catalog) under a per-account
+// lock and publishes it -- ZERO DataDoe, so a page load / reload / account-change can NEVER spend a token. A brand-
+// restricted user receives the brand-projected payload (no unauthorized brand rows in the JSON or the client export).
+async function serveSelfHealingReturns({ res, accountId, connections, userScope = null, to, refresh }) {
+  const reportKey = "returns-leakage";
+  const reportVersion = RETURNS_ADVANCED_VERSION;
+  const label = "Returns & Refund Leakage";
+  const scopeProject = (payload) => (userScope && userScope.restricted ? projectReturnsLeakagePayload(payload, userScope.permittedBrandKeys) : payload);
+  const primary = connections.find((c) => c && c.id === "primary" && String(c.apiKey || "").trim());
+  if (!accountId || !primary) {
+    res.status(200).json({ snapshotMissing: true, reportKey, reportVersion, accountId, message: `${label} needs the primary connection and a selected account.` });
+    return;
+  }
+  const orgFp = primary.organizationFingerprint || organizationFingerprint(primary.apiKey);
+  const serveStored = (snap, extra = {}) => {
+    res.status(200).json({
+      ...scopeProject(snap.payload), reportKey, reportVersion, paramsHash: paramsHashFor(reportVersion, { to }), ...extra,
+      snapshot: { savedAt: snap.source_refreshed_at || snap.updated_at || null, updatedAt: snap.updated_at || null, shared: true },
+    });
+  };
+  const stored = await getLatestReportSnapshotForScope({ reportKey, accountId, reportVersion, scope: {} }).catch(() => null);
+  if (stored && stored.payload && !refresh) { serveStored(stored); return; }
+
+  const lockHash = paramsHashFor(reportVersion, { selfHeal: "returns-leakage" });
+  const locked = await claimRefreshLock({ reportKey, accountId, paramsHash: lockHash, lockSeconds: 300 }).catch(() => false);
+  if (!locked) {
+    if (stored && stored.payload) { serveStored(stored, { updating: true }); return; }
+    res.status(200).json({ snapshotMissing: true, updating: true, reportKey, reportVersion, accountId, message: `${label} is being prepared from saved data — no export is created.` });
+    return;
+  }
+  try {
+    const readers = {
+      readReturnsHistory: getReturnsHistoryRows, readSettlementHistory: getSettlementHistoryRows,
+      readOliHistory: getSourceOliHistoryRows, readOliCoverage: getSourceCoverageWindows,
+      readOliOperationalUnits: getSourceOliOperationalUnitRows, readCatalogSnapshot: getSourceSnapshot,
+      loadCatalogPayload: getSourceSnapshotPayload, readOliSkuAsinResolution: getOliSkuAsinResolutionRows,
+      readDirectory: getAccountDirectorySnapshotAccounts,
+    };
+    const ev = await gatherReturnsEvidence({ accountId, organizationFingerprint: orgFp, connectionId: "primary", asOf: to }, readers).catch(() => null);
+    if (!ev || ev.notReady || !ev.payload) {
+      if (stored && stored.payload) { serveStored(stored, { updating: true }); return; }
+      res.status(200).json({ snapshotMissing: true, reportKey, reportVersion, accountId, waitingForScheduledData: true, message: `No saved ${label} for this account yet — waiting for the scheduled data refresh.` });
+      return;
+    }
+    const publishedHash = paramsHashFor(reportVersion, { to });
+    const payloadBytes = Buffer.byteLength(JSON.stringify(ev.payload), "utf8");
+    const saved = await saveReportSnapshot({
+      reportKey, accountId, paramsHash: publishedHash, params: { reportVersion, to },
+      payload: ev.payload, payloadBytes, sourceRefreshedAt: ev.sourceRefreshedAt || new Date().toISOString(),
+    }).catch(() => null);
+    if (saved && saved.id) await publishSnapshotUpdate({ reportKey, accountId, paramsHash: publishedHash, snapshotId: saved.id }).catch(() => {});
+    res.status(200).json({
+      ...scopeProject(ev.payload), reportKey, reportVersion, paramsHash: publishedHash,
+      snapshot: { savedAt: ev.sourceRefreshedAt || null, updatedAt: new Date().toISOString(), shared: true },
+    });
+  } finally {
+    await releaseRefreshLock({ reportKey, accountId, paramsHash: lockHash }).catch(() => {});
+  }
+}
+
 const SKU_MOVEMENT_OLI_SOURCE_KEY = "order-line-items";
 const SKU_MOVEMENT_CATALOG_SOURCE_KEY = "product-catalog";
 const SKU_MOVEMENT_ORG_SCOPE = "__organization";
@@ -3931,17 +3997,9 @@ async function handleDataDoe(req, res) {
       if (!ids) return;
       const to = reportAsOf(req, res);
       if (!to) return;
-      await serveSharedReport({
-        res,
-        refresh: wantsRefresh(req),
-        reportKey: RETURNS_REPORT_KEY,
-        reportVersion: RETURNS_VERSION,
-        accountId: accountScope.accountIds[0],
-        params: { to },
-        userId: access.userId,
-        label: "Returns & Refund Leakage",
-        build: () => buildReturnsLeakage({ apiKey, ids, to }),
-      });
+      // Read-only, self-healing durable serve (returns-leakage-v3). The dedicated Returns scheduler is the sole
+      // producer; a page load/reload NEVER creates a DataDoe export. Brand scope is projected server-side.
+      await serveSelfHealingReturns({ res, accountId: accountScope.accountIds[0], connections, userScope: brandScope, to, refresh: wantsRefresh(req) });
       return;
     }
 

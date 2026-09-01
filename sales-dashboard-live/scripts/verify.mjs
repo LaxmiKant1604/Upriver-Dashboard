@@ -59,6 +59,7 @@ const SUITES = [
   "test:brand-authorization",
   "test:access-brand-scope",
   "test:report-registry-coverage",
+  "test:returns-durable",
   "test:oli-value-policy",
   "test:oli-quality",
   "test:oli-order-audit",

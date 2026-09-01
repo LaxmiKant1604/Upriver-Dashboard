@@ -1208,9 +1208,13 @@ test("(F3) the pinned shared mappings appear VERBATIM in the live api/datadoe.js
   assert.match(src, /reportKey: "content-changes"[\s\S]{0,220}params: \{ asOf:/, "live Content Changes params are keyed by asOf");
   assert.match(src, /reportKey: "daily-reporting"[\s\S]{0,220}params: \{ from, to, brand:/, "live Daily params carry from/to/brand");
   assert.match(src, /reportKey: "keyword-rank"[\s\S]{0,120}params: \{ to \}/, "live Keyword Rank params are { to }");
-  for (const ident of ["SALES_MOVERS_VERSION", "LISTING_HEALTH_VERSION", "BUY_BOX_VERSION", "RETURNS_VERSION", "PPC_VERSION", "OPTIMIZER_VERSION"]) {
+  for (const ident of ["SALES_MOVERS_VERSION", "LISTING_HEALTH_VERSION", "BUY_BOX_VERSION", "PPC_VERSION", "OPTIMIZER_VERSION"]) {
     assert.match(src, new RegExp("reportVersion: " + ident + ",[\\s\\S]{0,220}params: \\{ to \\}"), ident + ": live insight serves params { to }");
   }
+  // Returns & Refund Leakage was UPGRADED to a dedicated, read-only, self-healing DURABLE serve (returns-leakage-v3):
+  // it no longer uses the shared serveSharedReport + RETURNS_VERSION (v2) build path -- a page load never spends a token.
+  assert.match(src, /action === "returns-leakage"[\s\S]{0,700}serveSelfHealingReturns\(/, "returns-leakage now uses the dedicated self-healing durable serve");
+  assert.match(src, /reportVersion = RETURNS_ADVANCED_VERSION/, "the self-healing returns serve pins returns-leakage-v3");
 });
 
 // =================================================================================================

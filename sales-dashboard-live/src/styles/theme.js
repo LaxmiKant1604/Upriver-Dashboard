@@ -984,6 +984,54 @@ body{ overflow-x:hidden; }
 .optimizer-table{ min-width:1480px; }
 .optimizer-note{ text-align:left; white-space:normal; min-width:230px; max-width:330px; line-height:1.45; color:var(--text-secondary); font-size:11px; }
 
+/* ===== Returns & Refund Leakage (v3): advanced window/trend view. Scoped under .rl-* so no other report is touched. ===== */
+.rvkpi-grid-6{ grid-template-columns:repeat(6,minmax(0,1fr)); }
+.rl-controls{ display:flex; align-items:flex-end; gap:var(--space-3); flex-wrap:wrap; margin-top:var(--space-4); }
+.rl-controls .skupl-toolbar-spacer{ flex:1; min-width:12px; }
+.rl-prov{ display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-top:10px; font-size:12px; color:var(--text-secondary); line-height:1.5; }
+.rl-charts{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; margin-top:var(--space-4); }
+.rl-charts .chart-card{ margin-top:0; }
+.rl-chart-wrap{ height:230px; min-height:0; }
+.rl-breakdowns{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; margin-top:var(--space-4); }
+.rl-breakdowns .panel{ padding:15px 16px; }
+.rl-seg-title{ font-size:13px; font-weight:800; color:var(--text-primary); }
+.rl-seg-sub{ font-size:11px; color:var(--text-muted); margin-top:2px; }
+.rl-seg-bar{ display:flex; height:14px; border-radius:7px; overflow:hidden; margin:12px 0 11px; background:var(--bg-sunken); }
+.rl-seg-bar i{ display:block; height:100%; }
+.rl-seg-legend{ display:flex; flex-direction:column; gap:7px; }
+.rl-seg-row{ display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:12px; }
+.rl-seg-key{ display:inline-flex; align-items:center; gap:7px; color:var(--text-secondary); }
+.rl-seg-dot{ width:9px; height:9px; border-radius:3px; flex-shrink:0; }
+.rl-seg-val{ font-variant-numeric:tabular-nums; color:var(--text-primary); font-weight:700; }
+.rl-seg-share{ color:var(--text-muted); font-weight:600; margin-left:6px; }
+.rl-table{ min-width:1180px; }
+.rl-table thead th{ background:linear-gradient(90deg,#1E1245,#2d1b69); color:rgba(196,181,253,.72); border-bottom:0; }
+.rl-table thead th.pt-id{ background:#1E1245; }
+.rl-table .pt-sortable:hover{ color:#fff; }
+.rl-table th.pt-sorted{ color:#C4B5FD; }
+.rl-id-wrap{ display:flex; align-items:flex-start; gap:6px; }
+.rl-expand-btn{ border:none; background:none; cursor:pointer; color:var(--text-muted); padding:2px 2px 0 0; display:inline-flex; align-items:center; flex-shrink:0; }
+.rl-expand-btn:hover{ color:var(--accent-strong); }
+.rl-drill-cell{ background:var(--bg-subtle); padding:0; }
+.rl-drill{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; padding:14px 16px; }
+.rl-drill h4{ margin:0 0 8px; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--text-muted); }
+.rl-dl{ display:flex; flex-direction:column; gap:5px; }
+.rl-dl-row{ display:flex; justify-content:space-between; gap:12px; font-size:12px; }
+.rl-dl-row span{ color:var(--text-secondary); }
+.rl-dl-row b{ font-variant-numeric:tabular-nums; color:var(--text-primary); font-weight:700; text-align:right; }
+.rl-fresh-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:2px 22px; margin-top:12px; }
+.rl-fresh-row{ display:flex; justify-content:space-between; gap:12px; font-size:12px; border-bottom:1px solid var(--border-default); padding:6px 0; }
+.rl-fresh-row span{ color:var(--text-muted); }
+.rl-fresh-row b{ font-weight:700; color:var(--text-primary); text-align:right; }
+@media (max-width:1180px){
+  .rvkpi-grid-6{ grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .rl-charts, .rl-breakdowns{ grid-template-columns:1fr; }
+  .rl-drill{ grid-template-columns:1fr; }
+}
+@media (max-width:640px){
+  .rvkpi-grid-6{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
+
 /* ======================= INSIGHT ENGINE ======================= */
 .priority-panel{ margin-top:var(--space-4); }
 .insight-list{ display:flex; flex-direction:column; gap:9px; margin-top:10px; }

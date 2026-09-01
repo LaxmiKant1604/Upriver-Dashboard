@@ -237,14 +237,29 @@ test("D2. workflow shape: INDEPENDENT per-bucket ordered pipeline -- token ceili
   assert.doesNotMatch(yml, /api\/cron\/sync/, "never drives the deprecated Vercel cron endpoint");
 });
 
-test("D3. exactly TWO reviewed scheduled workflows: scheduler-v2 (OLI/Ads) + the DECOUPLED fba-plan-golive (FBA)", () => {
+test("D3. exactly THREE reviewed scheduled workflows: scheduler-v2 (OLI/Ads) + DECOUPLED fba-plan-golive (FBA) + DECOUPLED returns-leakage", () => {
   const files = readdirSync(WORKFLOWS_DIR).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
   const scheduled = files.filter((f) => /\n\s*schedule:\s*\n/.test(readFileSync(resolve(WORKFLOWS_DIR, f), "utf8"))).sort();
-  // The FBA Shipment Plan refresh is a SEPARATE, DECOUPLED scheduled workflow with its OWN dedicated cycle
-  // namespace (us-fba / non-us-fba), so an FBA failure can never block Daily Reporting / Brand View and the
-  // scheduler-v2 OLI/Ads schedules stay untouched. No OTHER workflow may declare a schedule (an accidental
-  // third scheduled workflow still fails this pin).
-  assert.deepEqual(scheduled, ["fba-plan-golive.yml", "scheduler-v2.yml"], "exactly the two reviewed scheduled workflows; got " + JSON.stringify(scheduled));
+  // FBA Shipment Plan (us-fba / non-us-fba) AND Returns & Refund Leakage (its own returns-leakage concurrency group,
+  // its own durable Returns/Settlement history + returns-leakage snapshots) are SEPARATE, DECOUPLED scheduled
+  // workflows, so a failure in either can never block Daily Reporting / Brand View and the scheduler-v2 OLI/Ads
+  // schedules stay untouched. No OTHER workflow may declare a schedule (an accidental fourth still fails this pin).
+  assert.deepEqual(scheduled, ["fba-plan-golive.yml", "returns-leakage.yml", "scheduler-v2.yml"], "exactly the three reviewed scheduled workflows; got " + JSON.stringify(scheduled));
+});
+
+test("D3b. returns-leakage.yml is fully DECOUPLED: own concurrency group, independent US/Non-US cron rows, cron->bucket map, dry-run/go-live modes, Node 24, does not touch scheduler-v2/fba crons", () => {
+  const yml = readFileSync(resolve(WORKFLOWS_DIR, "returns-leakage.yml"), "utf8");
+  assert.match(yml, /concurrency:\s*\n\s*group:\s*returns-leakage/, "own concurrency group");
+  assert.match(yml, /cron:\s*"0 6 \* \* \*"/, "Non-US primary cron");
+  assert.match(yml, /cron:\s*"0 7 \* \* \*"/, "Non-US fallback cron");
+  assert.match(yml, /cron:\s*"30 14 \* \* \*"/, "US primary cron");
+  assert.match(yml, /cron:\s*"30 15 \* \* \*"/, "US fallback cron");
+  assert.match(yml, /returns-leakage-golive\.mjs/, "runs the dedicated operator");
+  assert.match(yml, /node-version:\s*"24"/, "Node 24");
+  assert.match(yml, /bucket=non-us[\s\S]*mode=go-live/, "cron->bucket->go-live map");
+  // It must NOT reuse the scheduler-v2 / fba cron times (independence).
+  assert.doesNotMatch(yml, /cron:\s*"0 2 \* \* \*"/, "does not reuse scheduler-v2 Non-US 02:00 cron");
+  assert.doesNotMatch(yml, /cron:\s*"30 10 \* \* \*"/, "does not reuse scheduler-v2 US 10:30 cron");
 });
 
 test("D4. previous-day (D-1) freshness shape: refresh_mode input, scheduled-always-normal, force-latest step (run_id, gated on mode + OLI-first), strict D-1 readiness + --strict-d1 release", () => {
