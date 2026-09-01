@@ -30,6 +30,7 @@ const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
 // stays LAST so a red test fails fast before the slow bundle build.
 const SUITES = [
   "test:currency",
+  "test:water-capability",
   "test:insights",
   "test:brand-view",
   "test:sync",

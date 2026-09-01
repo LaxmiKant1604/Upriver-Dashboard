@@ -4138,7 +4138,7 @@ function DashboardApp({ session, access, onSignOut }) {
             )}
           </ChartCard>
 
-          <div className="breakdown-grid">
+          <div className={"breakdown-grid" + (byAccountBreakdown.length <= 1 ? " single-account" : "")}>
             <BreakdownCard
               title="Sales by Account"
               subtitle="The selected account is highlighted"
@@ -4152,7 +4152,7 @@ function DashboardApp({ session, access, onSignOut }) {
               title="Sales by Brand"
               subtitle="Contribution to the selected range"
               items={byBrandBreakdown}
-              palette={["#FF6B6B", "#9B7BFF", "#28D7A1", "#FFB81C", "#38BDF8", "#F472B6"]}
+              palette={DASH_CHART.brandPalette}
               activeKeys={activeBrandKeys}
               formatValue={(value) => fmtMoneyCompact(value, displayCurrency)}
               emptyMessage="No brand sales in this range."

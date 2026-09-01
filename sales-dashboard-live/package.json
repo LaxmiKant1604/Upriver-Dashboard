@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "build:check": "node scripts/build-check.mjs",
     "test:currency": "node scripts/currency.test.mjs",
+    "test:water-capability": "node scripts/water-capability.test.mjs",
     "test:insights": "node scripts/test-insights.mjs",
     "test:brand-view": "node scripts/test-brand-view.mjs",
     "test:sync": "node scripts/test-sync.mjs",

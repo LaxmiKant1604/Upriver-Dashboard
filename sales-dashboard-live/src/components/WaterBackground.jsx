@@ -2,12 +2,12 @@
    WaterBackground — the Dashboard's premium fluid-motion background layer
    =====================================================================
 
-   A subtle, unframed water/ripple visual that sits BEHIND the Dashboard
-   content (never behind a table — the KPI/chart cards are opaque white and
-   cover the animation; only the workspace gutters reveal it). It is fully
-   isolated from React report state: the render loop lives in a single effect
-   and mutates plain uniforms, so it never triggers a React re-render and can
-   never touch a formula, a value or a request.
+   A subtle, unframed water visual that sits BEHIND the Dashboard content
+   (never behind a table — the KPI/chart cards are opaque pearl-white and cover
+   the animation; only the workspace gutters and inter-card space reveal it). It
+   is fully isolated from React report state: the render loop lives in a single
+   effect and mutates plain uniforms, so it never triggers a React re-render and
+   can never touch a formula, a value or a request.
 
    Everything about it fails safe:
      - Three.js is DYNAMICALLY imported, so it is code-split into its own
@@ -19,26 +19,30 @@
        the layer scrolls out of view, it honours prefers-reduced-motion, and it
        only reads the pointer on pointer-capable (fine) devices.
      - It is absolutely positioned and pointer-transparent, so it can never
-       cause layout shift or intercept a click.                              */
+       cause layout shift or intercept a click.
+
+   The visual: gentle water caustics with fbm domain-warp displacement (fluid,
+   not a flat wash), a slow surface-highlight ripple, and a soft expanding ring
+   on pointer-down on capable desktops. Kept low-alpha and faded under the page
+   heading so text areas stay clean; it reads mainly in the open gutters.     */
 
 import React, { useEffect, useRef } from "react";
+import { shouldUseStaticFallback } from "../lib/water-capability.js";
 
 /** Coarse capability probe. Returns true when we should NOT start WebGL and
  *  should leave the static CSS fallback in place instead. */
-function shouldUseStaticFallback() {
+function useStaticFallback() {
   if (typeof window === "undefined") return true;
   try {
-    const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    if (reduce) return true;
-    // Low-power / mobile: a coarse pointer on a small viewport, or a very
-    // low core count. Tablets and desktops keep the live layer.
-    const coarse = window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
-    const small = window.innerWidth < 900;
-    if (coarse && small) return true;
-    const cores = navigator.hardwareConcurrency;
-    if (typeof cores === "number" && cores > 0 && cores <= 3) return true;
-  } catch (_e) { return true; }
-  return false;
+    return shouldUseStaticFallback({
+      reduceMotion: !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches),
+      coarsePointer: !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches),
+      innerWidth: window.innerWidth,
+      cores: navigator.hardwareConcurrency,
+    });
+  } catch (_e) {
+    return true;
+  }
 }
 
 /** Real WebGL support probe (independent of Three.js loading). */
@@ -55,14 +59,17 @@ const VERTEX = `
   void main(){ gl_Position = vec4(position.xy, 0.0, 1.0); }
 `;
 
-// A gentle, layered water surface: two drifting fbm fields make a soft caustic,
-// a slow sine ripple adds a highlight, and the whole thing is kept at a low
-// alpha and faded toward the top so the page heading stays clean.
+// A gentle, layered water surface. An fbm field is domain-warped by a second fbm
+// field to give true fluid displacement (not a static wash); a slow sine ripple
+// adds a moving highlight; a pointer-driven expanding ring adds a soft touch
+// response. The whole thing is kept low-alpha and faded toward the top so the
+// page heading stays clean, and reads mainly in the open workspace gutters.
 const FRAGMENT = `
   precision mediump float;
   uniform float uTime;
   uniform vec2  uRes;
-  uniform vec2  uPointer;
+  uniform vec2  uPointer;      // eased parallax, -1..1
+  uniform vec3  uRipple;       // xy in uv space (0..1), z = age in seconds (<0 => none)
   uniform float uIntensity;
 
   float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
@@ -80,23 +87,38 @@ const FRAGMENT = `
   void main(){
     vec2 uv = gl_FragCoord.xy / uRes.xy;
     float aspect = uRes.x / max(uRes.y, 1.0);
-    vec2 p = vec2(uv.x * aspect, uv.y) * 2.6;
-    p += uPointer * 0.18;                       // subtle pointer parallax
-    float t = uTime * 0.045;
-    float n1 = fbm(p + vec2(t, t * 0.6));
-    float n2 = fbm(p * 1.7 - vec2(t * 0.7, t));
-    float caustic = smoothstep(0.35, 0.95, n1 * 0.6 + n2 * 0.5);
-    float ripple = sin((uv.x * 5.0 + n1 * 4.0) + uTime * 0.28) * 0.5 + 0.5;
+    vec2 p = vec2(uv.x * aspect, uv.y);
+    float t = uTime * 0.05;
 
-    // Soft Upriver navy -> blue water palette (never a harsh gradient).
-    vec3 deep  = vec3(0.086, 0.145, 0.235);     // #16253C-ish navy
-    vec3 mid   = vec3(0.145, 0.400, 0.640);     // #2566A3-ish blue
-    vec3 light = vec3(0.560, 0.780, 0.945);     // #8FC7F1-ish highlight
+    // Domain warp: displace the sampling position by a slow fbm flow field so the
+    // caustics drift and fold like a fluid surface rather than sliding rigidly.
+    vec2 q = vec2(fbm(p * 2.2 + vec2(0.0, t)), fbm(p * 2.2 + vec2(5.2, -t)));
+    vec2 r = p * 2.6 + 1.35 * q + uPointer * 0.15;   // + subtle pointer parallax
+    float n1 = fbm(r + vec2(t, t * 0.6));
+    float n2 = fbm(r * 1.8 - vec2(t * 0.7, t));
+    float caustic = smoothstep(0.30, 0.92, n1 * 0.65 + n2 * 0.5);
+    float ripple = sin((uv.x * 4.0 + n1 * 5.0) + uTime * 0.30) * 0.5 + 0.5;
+
+    // Soft expanding ring on pointer-down (fine pointers only; -1 disables it).
+    float pr = 0.0;
+    if (uRipple.z >= 0.0){
+      vec2 d = (uv - uRipple.xy) * vec2(aspect, 1.0);
+      float dist = length(d);
+      float age  = uRipple.z;
+      float wave = sin(dist * 34.0 - age * 7.0);
+      float ring = smoothstep(0.05, 0.0, abs(dist - age * 0.34));
+      pr = wave * ring * exp(-age * 2.2) * exp(-dist * 3.0);
+    }
+
+    // Soft Upriver navy -> steel -> light-water palette (never a harsh gradient).
+    vec3 deep  = vec3(0.078, 0.145, 0.240);
+    vec3 mid   = vec3(0.145, 0.400, 0.640);
+    vec3 light = vec3(0.620, 0.820, 0.960);
     vec3 col = mix(deep, mid, caustic);
-    col = mix(col, light, ripple * 0.22 * caustic);
+    col = mix(col, light, ripple * 0.30 * caustic + max(pr, 0.0) * 0.45);
 
-    float alpha = (0.05 + caustic * 0.15 + ripple * 0.04) * uIntensity;
-    alpha *= 0.35 + smoothstep(0.0, 0.65, uv.y) * 0.65;   // fade under the header
+    float alpha = (0.06 + caustic * 0.20 + ripple * 0.05 + abs(pr) * 0.28) * uIntensity;
+    alpha *= 0.30 + smoothstep(0.0, 0.62, uv.y) * 0.70;   // fade under the header
     gl_FragColor = vec4(col, alpha);
   }
 `;
@@ -107,7 +129,7 @@ export default function WaterBackground() {
 
   useEffect(() => {
     // If we cannot / should not run WebGL, leave the CSS fallback and do nothing.
-    if (shouldUseStaticFallback() || !webglAvailable()) return undefined;
+    if (useStaticFallback() || !webglAvailable()) return undefined;
 
     const canvas = canvasRef.current;
     const host = hostRef.current;
@@ -128,6 +150,8 @@ export default function WaterBackground() {
 
     const pointer = { x: 0, y: 0 };       // target
     const smooth = { x: 0, y: 0 };        // eased, fed to the shader
+    const ripple = { x: 0.5, y: 0.5, start: 0, active: false };
+    const RIPPLE_MS = 1400;               // one soft ring, then it fades out
     const finePointer = !!(window.matchMedia && window.matchMedia("(pointer: fine)").matches);
 
     const DPR_CAP = 1.5;
@@ -144,6 +168,18 @@ export default function WaterBackground() {
       // -1..1 around the centre
       pointer.x = (event.clientX / w) * 2 - 1;
       pointer.y = (event.clientY / h) * 2 - 1;
+    };
+    const onPointerDown = (event) => {
+      // Soft touch ripple, in the host's own uv space (0..1, y flipped for WebGL).
+      try {
+        const rect = host.getBoundingClientRect();
+        if (!rect.width || !rect.height) return;
+        ripple.x = (event.clientX - rect.left) / rect.width;
+        ripple.y = 1 - (event.clientY - rect.top) / rect.height;
+        ripple.start = (typeof performance !== "undefined" ? performance.now() : Date.now());
+        ripple.active = true;
+        if (!raf && visible && onScreen && !disposed) loop(performance.now());
+      } catch (_e) { /* ignore */ }
     };
     const onVisibility = () => { visible = !document.hidden; if (visible && !raf && !disposed) loop(start); };
 
@@ -167,6 +203,14 @@ export default function WaterBackground() {
       smooth.y += (pointer.y - smooth.y) * 0.05;
       material.uniforms.uTime.value = (now - start) / 1000;
       material.uniforms.uPointer.value.set(smooth.x, smooth.y);
+      // advance / expire the pointer ripple
+      let rippleAge = -1;
+      if (ripple.active) {
+        const age = now - ripple.start;
+        if (age >= RIPPLE_MS) ripple.active = false;
+        else rippleAge = age / 1000;
+      }
+      material.uniforms.uRipple.value.set(ripple.x, ripple.y, rippleAge);
       renderer.render(scene, camera);
     }
 
@@ -197,6 +241,7 @@ export default function WaterBackground() {
             uTime: { value: 0 },
             uRes: { value: new THREE.Vector2(1, 1) },
             uPointer: { value: new THREE.Vector2(0, 0) },
+            uRipple: { value: new THREE.Vector3(0.5, 0.5, -1) },
             uIntensity: { value: 1 },
           },
         });
@@ -219,7 +264,10 @@ export default function WaterBackground() {
           window.addEventListener("resize", resize);
         }
 
-        if (finePointer) window.addEventListener("pointermove", onPointerMove, { passive: true });
+        if (finePointer) {
+          window.addEventListener("pointermove", onPointerMove, { passive: true });
+          window.addEventListener("pointerdown", onPointerDown, { passive: true });
+        }
         document.addEventListener("visibilitychange", onVisibility);
 
         loop(performance.now());
@@ -235,6 +283,7 @@ export default function WaterBackground() {
       if (raf) window.cancelAnimationFrame(raf);
       try { document.removeEventListener("visibilitychange", onVisibility); } catch (_e) { /* noop */ }
       try { window.removeEventListener("pointermove", onPointerMove); } catch (_e) { /* noop */ }
+      try { window.removeEventListener("pointerdown", onPointerDown); } catch (_e) { /* noop */ }
       try { window.removeEventListener("resize", resize); } catch (_e) { /* noop */ }
       try { if (io) io.disconnect(); } catch (_e) { /* noop */ }
       try { if (ro) ro.disconnect(); } catch (_e) { /* noop */ }
