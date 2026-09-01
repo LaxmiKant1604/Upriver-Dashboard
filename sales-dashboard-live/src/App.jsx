@@ -4021,10 +4021,13 @@ function DashboardApp({ session, access, onSignOut }) {
         <>
           {/* Primary KPI section. Comparisons and sparklines appear only where
               real history exists for this scope; nothing is back-filled.
-              The key remounts the grid on a scope/range change so the entrance
-              and KPI-number reveal animations replay — a presentation-only
-              transition that never alters the real, already-computed values. */}
-          <div className="metric-grid" key={`kpi-${selectedAccountId}|${selectedBrand}|${rangeFrom}|${rangeTo}`}>
+              The grid is deliberately NOT keyed by scope/date: a stable identity
+              lets React reconcile the cards in place so the value and its matching
+              date label swap together in ONE atomic render — no unmount, no
+              entrance-animation replay, no full-KPI-row flash on a filter change.
+              The entrance animation therefore runs only once, when the Dashboard
+              route first mounts. */}
+          <div className="metric-grid">
             <MetricCard
               label="Total Sales"
               variant="hero"
@@ -4063,8 +4066,10 @@ function DashboardApp({ session, access, onSignOut }) {
           </div>
 
           {/* Performance comparisons. Each one states its own basis and shows an
-              em dash when this account has too little history to compare. */}
-          <div className="cmp-grid" key={`cmp-${selectedAccountId}|${selectedBrand}|${rangeFrom}|${rangeTo}`}>
+              em dash when this account has too little history to compare. Stable
+              identity (no scope/date key) so the row updates in place without a
+              remount or entrance-animation replay on a filter change. */}
+          <div className="cmp-grid">
             <ComparisonMetric label="Day over Day" basis="vs previous day" data={comparisons?.dod} format={fmtPct} />
             <ComparisonMetric label="Week over Week" basis="vs prior 7 days" data={comparisons?.wow} format={fmtPct} />
             <ComparisonMetric label="Month to Date" basis="vs last month, same days" data={comparisons?.mtd} format={fmtPct} />
@@ -4130,7 +4135,7 @@ function DashboardApp({ session, access, onSignOut }) {
                       fill="url(#fillSales)" dot={false}
                       activeDot={{ r: 4, fill: DASH_CHART.primary, stroke: "#fff", strokeWidth: 2 }}
                       isAnimationActive={!prefersReducedMotion}
-                      animationDuration={420}
+                      animationDuration={180}
                     />
                   </AreaChart>
                 </ResponsiveContainer>

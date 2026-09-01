@@ -31,6 +31,7 @@ const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
 const SUITES = [
   "test:currency",
   "test:water-capability",
+  "test:dashboard-transition",
   "test:insights",
   "test:brand-view",
   "test:sync",
