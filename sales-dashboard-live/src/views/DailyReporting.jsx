@@ -13,15 +13,18 @@ import { fmtMoneyCompact, fmtDateHuman } from "../lib/format.js";
 import { dailyMtdKpis, dailyTrendSeries, lastFinite, dailyCompletenessLabel } from "../lib/daily-view-model.js";
 
 // Per-row identity for the table (icon + accent). Colours mirror the design's row accents and the KPI gradients.
+// Restrained per-metric accent keys in the operational palette (steel / emerald /
+// amber / coral) so the icon chips, MTD accents and trend keys match the premium
+// Sales Dashboard. Presentation only -- no metric, value or formula changes.
 const METRIC_META = {
-  sales:   { color: "#FF6B6B", Icon: Wallet },
-  adSales: { color: "#A78BFA", Icon: Megaphone },
-  adSpend: { color: "#F59E0B", Icon: BarChart3 },
-  clicks:  { color: "#38BDF8", Icon: MousePointerClick },
-  units:   { color: "#34D399", Icon: Boxes },
-  roi:     { color: "#10B981", Icon: TrendingUp },
-  acos:    { color: "#FBBF24", Icon: Target },
-  tacos:   { color: "#F472B6", Icon: Percent },
+  sales:   { color: "#2F6FB0", Icon: Wallet },
+  adSales: { color: "#5B8DB8", Icon: Megaphone },
+  adSpend: { color: "#E08600", Icon: BarChart3 },
+  clicks:  { color: "#7C9FC0", Icon: MousePointerClick },
+  units:   { color: "#0E9F6E", Icon: Boxes },
+  roi:     { color: "#0B7D5A", Icon: TrendingUp },
+  acos:    { color: "#C97E12", Icon: Target },
+  tacos:   { color: "#D6492E", Icon: Percent },
 };
 
 // The six MTD KPI cards, in design order. `bg` is the gradient; `text` is the pre-formatted value (currency-aware,
@@ -59,7 +62,7 @@ export default function DailyReporting({
   ];
 
   return (
-    <div className="container dr-page">
+    <div className="container dr-page op-report">
       {/* Heading -- existing title + dynamic account/brand subtitle */}
       <div className="controls-bar">
         <div>

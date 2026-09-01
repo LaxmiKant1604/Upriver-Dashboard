@@ -1958,6 +1958,51 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .op-report .bv-table .bv-total .cell-share{ color:var(--op-steel); }
 .op-report .bv-table .bv-band td{ background:#F6F8FA; color:var(--op-ink-2); }
 .op-report .bv-table .bv-section td{ color:var(--op-ink-3); }
+
+/* ---- DAILY REPORTING (.dr-page) ---------------------------------------- */
+.op-report .dr-band{ background:#EFF5FA; border:1px solid #CFE0EE; border-radius:9px; }
+.op-report .dr-band-icon{ color:var(--op-steel); }
+.op-report .dr-band-title{ color:#1B4E76; }
+.op-report .dr-band-text{ color:#1B4E76; opacity:.8; }
+/* KPI tiles: neutralise inline gradients -> pearl + restrained top keyline. */
+.op-report .dr-kpi{ background:var(--op-card)!important; color:var(--op-ink)!important; border:1px solid var(--op-border); border-radius:8px; box-shadow:0 1px 2px rgba(15,17,17,.05); }
+.op-report .dr-kpi-label{ color:var(--op-ink-3)!important; }
+.op-report .dr-kpi-value{ color:var(--op-ink)!important; }
+.op-report .dr-kpis .dr-kpi:nth-child(1){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--dash-primary); }
+.op-report .dr-kpis .dr-kpi:nth-child(2){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-steel-2); }
+.op-report .dr-kpis .dr-kpi:nth-child(3){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-orange-dark); }
+.op-report .dr-kpis .dr-kpi:nth-child(4){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-green); }
+.op-report .dr-kpis .dr-kpi:nth-child(5){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-orange); }
+.op-report .dr-kpis .dr-kpi:nth-child(6){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-red); }
+.op-report .dr-card{ background:var(--op-card); border:1px solid var(--op-border); border-radius:8px; box-shadow:0 1px 2px rgba(15,17,17,.05), 0 12px 30px -22px rgba(15,23,32,.30); }
+.op-report .dr-card-head{ background:none; border-bottom-color:var(--op-hair); }
+.op-report .dr-card-title{ color:var(--op-ink); }
+.op-report .dr-card-meta{ color:var(--op-ink-3); }
+.op-report .dr-badge-provisional{ background:var(--op-warn-soft); color:var(--op-warn-ink); }
+.op-report .dr-badge-final{ background:var(--op-green-soft); color:var(--op-green); }
+.op-report .dr-badge-defect{ background:var(--op-red-soft); color:var(--op-red); }
+.op-report .dr-refresh{ border-color:var(--op-border); background:#fff; color:var(--op-ink-2); border-radius:8px; }
+.op-report .dr-refresh:hover{ color:var(--op-orange-dark); border-color:var(--op-orange); background:var(--op-orange-soft); }
+/* Table: deep-navy sticky header, amber MTD accent, op body + sticky metric col. */
+.op-report .dr-table .dr-th{ background:var(--op-navy); color:rgba(233,238,242,.78); }
+.op-report .dr-table .dr-th-metric{ background:var(--op-navy); color:#FFFFFF; }
+.op-report .dr-table .dr-th-mtd{ color:#FFD9A6; box-shadow:inset 0 -2px 0 var(--op-orange); }
+.op-report .dr-table tbody tr{ background:var(--op-card); }
+.op-report .dr-table tbody tr:nth-child(even){ background:#FAFBFC; }
+.op-report .dr-table tbody tr:hover{ background:#F3F6F8; }
+.op-report .dr-table tbody tr.dr-row-highlight{ background:#EAF1F8; }
+.op-report .dr-table .dr-td{ border-bottom-color:var(--op-hair); color:var(--op-ink-2); }
+.op-report .dr-table .dr-td-metric{ border-right-color:var(--op-hair); color:var(--op-ink); }
+.op-report .dr-table .dr-td-mtd{ background:#EAF1F8; border-left-color:#CFE0EE; border-right-color:#CFE0EE; }
+.op-report .dr-table tbody tr:hover .dr-td-mtd{ background:#DEEAF5; }
+.op-report .dr-table tbody tr.dr-row-highlight .dr-td-mtd{ background:#E1EBF4; }
+.op-report .dr-metric-label{ color:var(--op-ink); }
+.op-report .dr-dash{ color:var(--op-ink-4); }
+.op-report .dr-trend{ background:var(--op-card); border:1px solid var(--op-border); border-radius:8px; box-shadow:0 1px 2px rgba(15,17,17,.05); }
+.op-report .dr-trend-label{ color:var(--op-ink-3); }
+.op-report .dr-note{ background:#FBFCFD; border:1px solid var(--op-border-2); border-radius:9px; color:var(--op-ink-2); }
+.op-report .dr-note strong{ color:var(--op-ink); }
+.op-report .dr-note code{ background:#EEF1F3; color:var(--op-steel); }
 `;
 
 /* Chart colours, exported so recharts series stay in step with the CSS tokens
