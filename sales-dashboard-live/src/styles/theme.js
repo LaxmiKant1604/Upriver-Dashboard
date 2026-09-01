@@ -2063,6 +2063,30 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .op-report .pt-meta{ color:var(--op-ink-3); }
 .op-report .pt-brand{ color:var(--op-steel); }
 .op-report .plan-table td.pt-strong{ color:var(--op-ink); }
+
+/* ---- SKU MOVEMENT (.sku-mv-page) --------------------------------------- */
+/* Explicit deep-navy header for the sku-mv table (its own .sku-mv thead th
+   gradient otherwise fights the shared plan-table rule at this grain). */
+.op-report .sku-mv thead th{ background:var(--op-navy); color:rgba(233,238,242,.82); border-bottom:1px solid rgba(0,0,0,.20); }
+.op-report .rvkpi-grid-5 .rvkpi:nth-child(1){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--dash-primary); }
+.op-report .rvkpi-grid-5 .rvkpi:nth-child(2){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-orange-dark); }
+.op-report .rvkpi-grid-5 .rvkpi:nth-child(3){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-steel-2); }
+.op-report .rvkpi-grid-5 .rvkpi:nth-child(4){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-ink-4); }
+.op-report .rvkpi-grid-5 .rvkpi:nth-child(5){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-green); }
+/* MTD -> amber accent, Last-N -> steel accent (were coral / violet). */
+.op-report .sku-mv thead th.sku-mv-mtd{ color:#FFD9A6; box-shadow:inset 0 -2px 0 var(--op-orange); }
+.op-report .sku-mv thead th.sku-mv-last5{ color:#BBD6EE; box-shadow:inset 0 -2px 0 var(--op-steel); }
+.op-report .sku-mv td.sku-mv-mtd{ background:#FBF3E2; border-left-color:#E7D19A; border-right-color:#E7D19A; color:var(--op-ink); }
+.op-report .sku-mv td.sku-mv-last5{ background:#EAF1F8; border-left-color:#CFE0EE; border-right-color:#CFE0EE; color:var(--op-ink); }
+.op-report .sku-mv tbody tr:hover td.sku-mv-mtd{ background:#F6E8CC; }
+.op-report .sku-mv tbody tr:hover td.sku-mv-last5{ background:#DEEAF5; }
+.op-report .sku-mv tfoot td.sku-mv-mtd,.op-report .sku-mv tfoot td.sku-mv-last5{ background:#EEF1F3; }
+.op-report .sku-mv th.pt-sorted{ color:#BBD6EE; }
+.op-report .sku-mv-move-pos{ background:var(--op-green-soft); color:var(--op-green); }
+.op-report .sku-mv-move-neg{ background:var(--op-red-soft); color:var(--op-red); }
+.op-report .sku-mv-move-flat{ color:var(--op-ink-4); }
+.op-report .sku-mv-ident-view{ color:var(--op-ink); }
+.op-report .sku-mv-ident-view:hover{ color:var(--op-steel); }
 `;
 
 /* Chart colours, exported so recharts series stay in step with the CSS tokens

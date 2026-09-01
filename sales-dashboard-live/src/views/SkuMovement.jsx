@@ -34,7 +34,7 @@ const STATUS_STYLE = {
 
 // Sticky first THREE columns (ASIN/product, Identifier, SKU): opaque so scrolling numeric columns never show through.
 const STICKY_BG = "var(--bg-elevated)";
-const STICKY_HEAD_BG = "#1E1245";
+const STICKY_HEAD_BG = "var(--op-navy)"; // premium deep-navy sticky identity header (matches the op-report theme)
 const C1 = 210, C2 = 140; // ASIN/product column, Identifier column
 const sticky = (left, w) => ({ position: "sticky", left, zIndex: 1, background: STICKY_BG, minWidth: w, maxWidth: w, textAlign: "left" });
 const stickyHead = (left, w) => ({ ...sticky(left, w), top: 0, zIndex: 3, background: STICKY_HEAD_BG });
@@ -306,7 +306,7 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
   const nOptions = useMemo(() => { const o = []; for (let i = MIN_RECENT_DAYS; i <= maxN; i += 1) o.push({ value: String(i), label: `${i} day${i === 1 ? "" : "s"}` }); return o; }, [maxN]);
 
   return (
-    <div className="container skupl-page">
+    <div className="container skupl-page sku-mv-page op-report">
       <ReportHeader title="SKU Movement" subtitle={`Per-ASIN units, momentum and month projection for ${scopeLabel} — built from saved order data only, no export`} />
       {state}
 
