@@ -5,13 +5,17 @@ import { supabase } from "./lib/supabase.js";
 // The whole workspace is styled from one token-based stylesheet. Every current
 // and future report must build on these tokens and shared patterns rather than
 // introducing its own colours, spacing or radii.
-import { STYLE, CHART } from "./styles/theme.js";
+import { STYLE, CHART, DASH_CHART } from "./styles/theme.js";
 import {
   BreakdownCard, ChartCard, ChartTooltip, ComparisonMetric, DataQualityAlert,
   EmptyState, ErrorState, MetricCard, ObservedUnitsBreakdown, SegmentedControl, SkeletonChart,
   SkeletonMetricGrid, SkeletonTable, Sparkline, TrendIndicator,
 } from "./components/ui.jsx";
 import { DateRangeSelector, Sidebar, TopBar, VIEW_TITLES } from "./components/shell.jsx";
+// The fluid-motion water/ripple background is an isolated, lazily code-split
+// layer (it dynamic-imports Three.js on mount). It carries no report state and
+// never re-renders React, so it cannot affect a value, formula or request.
+import WaterBackground from "./components/WaterBackground.jsx";
 // Display and CSV helpers are shared with the insight report views so both
 // render money, dates and units identically. Nothing here converts currency.
 import {
@@ -3772,7 +3776,12 @@ function DashboardApp({ session, access, onSignOut }) {
 
         {mobileOpen && <div className="sb-backdrop" onClick={() => setMobileOpen(false)} />}
 
-        <div className="main-area">
+        <div className={"main-area" + (view === "dashboard" && dashboardMode === "account" ? " dash-workspace" : "")}>
+          {/* Isolated fluid-motion background, only behind the account Dashboard.
+              It self-disables under reduced motion / low-power / no-WebGL and
+              falls back to the static CSS wash, so nothing here can block or
+              alter the data render. */}
+          {view === "dashboard" && dashboardMode === "account" && <WaterBackground />}
           <TopBar
             viewTitle={VIEW_TITLES[view] || "Dashboard"}
             onOpenMenu={() => setMobileOpen(true)}
@@ -3824,7 +3833,7 @@ function DashboardApp({ session, access, onSignOut }) {
           sourceAccounts={portfolioSourceAccounts}
         />
       ) : (
-      <div className="container">
+      <div className="container dashboard-page">
         <div className="page-head">
           <div>
             <div className="page-title">Sales Dashboard</div>
@@ -4011,8 +4020,11 @@ function DashboardApp({ session, access, onSignOut }) {
         ) : (
         <>
           {/* Primary KPI section. Comparisons and sparklines appear only where
-              real history exists for this scope; nothing is back-filled. */}
-          <div className="metric-grid">
+              real history exists for this scope; nothing is back-filled.
+              The key remounts the grid on a scope/range change so the entrance
+              and KPI-number reveal animations replay — a presentation-only
+              transition that never alters the real, already-computed values. */}
+          <div className="metric-grid" key={`kpi-${selectedAccountId}|${selectedBrand}|${rangeFrom}|${rangeTo}`}>
             <MetricCard
               label="Total Sales"
               variant="hero"
@@ -4020,7 +4032,7 @@ function DashboardApp({ session, access, onSignOut }) {
               hint={`Order value in ${displayCurrency}. Currencies are never converted or combined.`}
               period={fmtRangeLabel(rangeFrom, rangeTo)}
               trend={kpiDeltas ? <TrendIndicator value={kpiDeltas.sales} text={fmtPct(kpiDeltas.sales)} title={`vs ${kpiDeltas.label}`} /> : null}
-              spark={<Sparkline values={kpiSpark.sales} color={CHART.primary} ariaLabel="Daily sales for the selected range" />}
+              spark={<Sparkline values={kpiSpark.sales} color={DASH_CHART.primary} ariaLabel="Daily sales for the selected range" />}
             />
             <MetricCard
               label="Units Sold"
@@ -4028,7 +4040,7 @@ function DashboardApp({ session, access, onSignOut }) {
               value={kpi.units.toLocaleString("en-US")}
               period={fmtRangeLabel(rangeFrom, rangeTo)}
               trend={kpiDeltas ? <TrendIndicator value={kpiDeltas.units} text={fmtPct(kpiDeltas.units)} title={`vs ${kpiDeltas.label}`} /> : null}
-              spark={<Sparkline values={kpiSpark.units} color={CHART.teal} ariaLabel="Daily units for the selected range" />}
+              spark={<Sparkline values={kpiSpark.units} color={DASH_CHART.teal} ariaLabel="Daily units for the selected range" />}
             />
             <MetricCard
               label="Orders"
@@ -4037,7 +4049,7 @@ function DashboardApp({ session, access, onSignOut }) {
               hint={hasOrders ? undefined : "This sales source reports no order count, so Orders and Average Order Value are unavailable rather than shown as zero."}
               period={fmtRangeLabel(rangeFrom, rangeTo)}
               trend={hasOrders && kpiDeltas && kpiDeltas.orders !== null ? <TrendIndicator value={kpiDeltas.orders} text={fmtPct(kpiDeltas.orders)} title={`vs ${kpiDeltas.label}`} /> : null}
-              spark={hasOrders ? <Sparkline values={kpiSpark.orders} color={CHART.violet} ariaLabel="Daily orders for the selected range" /> : null}
+              spark={hasOrders ? <Sparkline values={kpiSpark.orders} color={DASH_CHART.orders} ariaLabel="Daily orders for the selected range" /> : null}
             />
             <MetricCard
               label="Avg. Order Value"
@@ -4046,13 +4058,13 @@ function DashboardApp({ session, access, onSignOut }) {
               hint={hasOrders ? "Total sales divided by orders for the selected range." : "Requires an order count, which this sales source does not report."}
               period={fmtRangeLabel(rangeFrom, rangeTo)}
               trend={hasOrders && kpiDeltas && kpiDeltas.aov !== null ? <TrendIndicator value={kpiDeltas.aov} text={fmtPct(kpiDeltas.aov)} title={`vs ${kpiDeltas.label}`} /> : null}
-              spark={hasOrders ? <Sparkline values={kpiSpark.aov} color={CHART.gold} ariaLabel="Daily average order value for the selected range" /> : null}
+              spark={hasOrders ? <Sparkline values={kpiSpark.aov} color={DASH_CHART.gold} ariaLabel="Daily average order value for the selected range" /> : null}
             />
           </div>
 
           {/* Performance comparisons. Each one states its own basis and shows an
               em dash when this account has too little history to compare. */}
-          <div className="cmp-grid">
+          <div className="cmp-grid" key={`cmp-${selectedAccountId}|${selectedBrand}|${rangeFrom}|${rangeTo}`}>
             <ComparisonMetric label="Day over Day" basis="vs previous day" data={comparisons?.dod} format={fmtPct} />
             <ComparisonMetric label="Week over Week" basis="vs prior 7 days" data={comparisons?.wow} format={fmtPct} />
             <ComparisonMetric label="Month to Date" basis="vs last month, same days" data={comparisons?.mtd} format={fmtPct} />
@@ -4086,27 +4098,27 @@ function DashboardApp({ session, access, onSignOut }) {
                   <AreaChart data={trend} margin={{ top: 8, right: 18, left: 6, bottom: 0 }}>
                     <defs>
                       <linearGradient id="fillSales" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor={CHART.primary} stopOpacity={0.20} />
-                        <stop offset="100%" stopColor={CHART.primary} stopOpacity={0.01} />
+                        <stop offset="0%" stopColor={DASH_CHART.primary} stopOpacity={0.20} />
+                        <stop offset="100%" stopColor={DASH_CHART.primary} stopOpacity={0.01} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid stroke={CHART.grid} vertical={false} />
+                    <CartesianGrid stroke={DASH_CHART.grid} vertical={false} />
                     <XAxis
-                      dataKey="label" tick={{ fontSize: 10.5, fill: CHART.axis }}
-                      axisLine={{ stroke: CHART.axisLine }} tickLine={false}
+                      dataKey="label" tick={{ fontSize: 10.5, fill: DASH_CHART.axis }}
+                      axisLine={{ stroke: DASH_CHART.axisLine }} tickLine={false}
                       minTickGap={18} tickMargin={8}
                     />
                     <YAxis
-                      tick={{ fontSize: 10.5, fill: CHART.axis }} axisLine={false} tickLine={false}
+                      tick={{ fontSize: 10.5, fill: DASH_CHART.axis }} axisLine={false} tickLine={false}
                       tickFormatter={(value) => compactNumber(value, displayCurrency)} width={56}
                     />
                     <Tooltip
-                      cursor={{ stroke: CHART.axis, strokeWidth: 1, strokeDasharray: "3 3" }}
+                      cursor={{ stroke: DASH_CHART.axis, strokeWidth: 1, strokeDasharray: "3 3" }}
                       content={(props) => (
                         <ChartTooltip
                           {...props}
                           rows={(point) => [
-                            { key: "sales", label: "Sales", value: fmtMoney(point.value, displayCurrency), color: CHART.primary },
+                            { key: "sales", label: "Sales", value: fmtMoney(point.value, displayCurrency), color: DASH_CHART.primary },
                             point.hasUnits ? { key: "units", label: "Units", value: point.units.toLocaleString("en-US") } : null,
                             point.hasOrders ? { key: "orders", label: "Orders", value: point.orders.toLocaleString("en-US") } : null,
                           ]}
@@ -4114,9 +4126,9 @@ function DashboardApp({ session, access, onSignOut }) {
                       )}
                     />
                     <Area
-                      type="monotone" dataKey="value" stroke={CHART.primary} strokeWidth={2}
+                      type="monotone" dataKey="value" stroke={DASH_CHART.primary} strokeWidth={2}
                       fill="url(#fillSales)" dot={false}
-                      activeDot={{ r: 4, fill: CHART.primary, stroke: "#fff", strokeWidth: 2 }}
+                      activeDot={{ r: 4, fill: DASH_CHART.primary, stroke: "#fff", strokeWidth: 2 }}
                       isAnimationActive={!prefersReducedMotion}
                       animationDuration={420}
                     />

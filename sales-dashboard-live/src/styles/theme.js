@@ -1553,6 +1553,208 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
   .sidebar{ width:272px; }
   .sb-backdrop{ background:rgba(15,7,43,.58); backdrop-filter:blur(2px); }
 }
+
+/* ========================================================================
+   UPRIVER OPERATIONAL THEME — Amazon-inspired shell + Dashboard redesign.
+   ------------------------------------------------------------------------
+   Loaded LAST so it overrides the Royal Violet layer above. Two scopes only:
+     1. SHARED CHROME (.sidebar / .topbar and their parts) is restyled
+        GLOBALLY so the navigation rail and command bar look identical on
+        every route — navy rail, white command bar, orange accent.
+     2. DASHBOARD content is restyled ONLY under .dashboard-page /
+        .dash-workspace, so the violet styling of every other report
+        (Daily, Brand View, SKU Movement, Returns, FBA, ...) is untouched.
+   No data, formula, route, permission or request is affected here.
+   ======================================================================== */
+:root{
+  --op-navy:#232F3E; --op-navy-2:#1B2530; --op-navy-hover:#37475A;
+  --op-orange:#FF9900; --op-orange-dark:#E47911; --op-orange-strong:#C45500; --op-orange-soft:#FFF3E0;
+  --op-blue:#1E6FE0; --op-blue-link:#0066C0; --op-blue-soft:#EAF4FB; --op-blue-border:#BDD8EE;
+  --op-bg:#F3F4F6; --op-card:#FFFFFF; --op-border:#D5D9D9; --op-border-2:#E3E6E6;
+  --op-ink:#0F1111; --op-ink-2:#565959; --op-ink-3:#8D9D9D;
+  --op-green:#067D5A; --op-green-soft:#EAF6EF; --op-green-border:#BFE3D0;
+  --op-red:#B12704; --op-red-soft:#FCEDEA; --op-red-border:#F1B7AC;
+  --op-warn-soft:#FEF9EE; --op-warn-border:#F5C842; --op-warn-ink:#8A6100;
+  /* Dashboard chart palette (mirrors DASH_CHART in this module). */
+  --dash-primary:#1E6FE0; --dash-teal:#0E9F6E; --dash-orders:#3B82C4; --dash-gold:#E88B00;
+}
+
+/* ---------------- SHARED CHROME · SIDEBAR (dark navy rail) ---------------- */
+.sidebar{
+  background:var(--op-navy); border-right:1px solid rgba(0,0,0,.30);
+  box-shadow:2px 0 12px rgba(15,23,32,.10); color:#FFFFFF;
+}
+.sb-brand{ border-bottom-color:rgba(255,255,255,.10); }
+.sb-logo{
+  background:linear-gradient(160deg,#FFB020 0%,#E47911 100%); color:#241500;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.22), 0 2px 6px rgba(228,121,17,.30);
+}
+.sb-ws-name{ color:#FFFFFF; }
+.sb-ws-sub{ color:rgba(255,255,255,.56); }
+.sb-group-label{ color:rgba(255,255,255,.42); }
+.sb-group + .sb-group{ border-color:rgba(255,255,255,.10); }
+.sb-nav::-webkit-scrollbar-thumb{ background:rgba(255,255,255,.18); border-color:transparent; }
+.sb-nav-item{ color:rgba(255,255,255,.74); }
+.sb-nav-item svg{ color:rgba(255,255,255,.70); opacity:1; }
+.sb-nav-item:hover{ color:#FFFFFF; background:rgba(255,255,255,.09); }
+.sb-nav-item:hover svg{ color:#FFFFFF; }
+.sb-nav-item.active{
+  color:#FFFFFF; background:rgba(255,153,0,.15); box-shadow:none; font-weight:750;
+}
+.sb-nav-item.active svg{ color:var(--op-orange); }
+.sb-nav-item.active::before{
+  left:-8px; width:3px; height:20px; border-radius:0 3px 3px 0;
+  background:var(--op-orange); box-shadow:none;
+}
+.sb-nav-item.active::after{ display:none; }
+.sidebar.collapsed .sb-nav-item.active::before{ left:0; }
+.sb-footer{ border-top-color:rgba(255,255,255,.10); background:transparent; }
+.sb-collapse,.sb-close{ color:rgba(255,255,255,.66); }
+.sb-collapse:hover,.sb-close:hover{ color:#FFFFFF; background:rgba(255,255,255,.09); }
+.sb-collapse.signout:hover{ background:rgba(255,90,80,.18); color:#FFB4A8; }
+/* Keyboard focus is always visible on the navy rail (orange ring). */
+.sb-nav-item:focus-visible,.sb-collapse:focus-visible,.sb-close:focus-visible{
+  outline:2px solid var(--op-orange); outline-offset:-2px; border-radius:var(--radius-sm);
+}
+
+/* ---------------- SHARED CHROME · TOP COMMAND BAR (white) ---------------- */
+.topbar{
+  background:#FFFFFF; border-bottom:1px solid var(--op-border);
+  box-shadow:0 1px 2px rgba(15,17,17,.04); backdrop-filter:none; -webkit-backdrop-filter:none;
+}
+.crumb-root{ color:var(--op-ink-2); }
+.crumb-root .crumb-mark{
+  color:var(--op-orange-strong); background:var(--op-orange-soft);
+  border:1px solid var(--op-warn-border); box-shadow:none; border-radius:var(--radius-sm);
+}
+.crumb-current{ color:var(--op-ink); }
+.crumb-sep{ color:var(--op-ink-3); }
+.tb-select,.refresh-cluster{ border-color:var(--op-border); background:#FFFFFF; box-shadow:0 1px 2px rgba(15,17,17,.04); }
+.tb-select:hover,.refresh-cluster:hover{ border-color:#ADB1B8; box-shadow:0 1px 2px rgba(15,17,17,.06); }
+.tb-select:focus-within{ border-color:var(--op-orange); box-shadow:0 0 0 3px rgba(255,153,0,.18); }
+.tb-select-label,.refresh-status-label{ color:var(--op-ink-3); }
+.tb-select select{ color:var(--op-ink); }
+.tb-select-value > svg,.tb-select > svg:first-child{ color:var(--op-ink-3); }
+.tb-select-value select:focus-visible{ outline:none; }
+.refresh-status-value{ color:var(--op-ink); }
+.account-sync-btn,.refresh-btn,.menu-btn{ border-color:var(--op-border); background:#FFFFFF; color:var(--op-ink-2); }
+.account-sync-btn:hover:not(:disabled),.refresh-btn:hover:not(:disabled){
+  border-color:var(--op-orange); color:var(--op-orange-dark); background:var(--op-orange-soft);
+}
+.menu-btn:hover{ border-color:#ADB1B8; }
+.account-sync-btn:focus-visible,.refresh-btn:focus-visible,.menu-btn:focus-visible{ outline:2px solid var(--op-orange); outline-offset:1px; }
+.live-dot{ background:var(--op-green); box-shadow:0 0 0 3px var(--op-green-soft); }
+.live-dot.idle{ background:var(--op-ink-3); box-shadow:0 0 0 3px #E7E9EC; }
+/* Account view / Brand view segmented control (top bar chrome only). */
+.topbar .segmented{ background:#EDEFF1; border:1px solid var(--op-border); box-shadow:inset 0 1px 2px rgba(15,17,17,.03); }
+.topbar .segmented button{ color:var(--op-ink-2); }
+.topbar .segmented button:hover:not(.active){ color:var(--op-ink); background:rgba(255,255,255,.72); }
+.topbar .segmented button.active{ color:var(--op-blue-link); background:#FFFFFF; box-shadow:0 1px 2px rgba(15,17,17,.10); }
+.topbar .segmented button:focus-visible{ outline:2px solid var(--op-orange); outline-offset:1px; }
+
+/* ---------------- DASHBOARD WORKSPACE (scoped, light neutral grey) ------- */
+.main-area.dash-workspace{ position:relative; background:var(--op-bg); }
+.container.dashboard-page{ position:relative; z-index:1; }
+.dashboard-page .page-title{ color:var(--op-ink); }
+.dashboard-page .page-sub{ color:var(--op-ink-2); }
+
+/* Water/ripple background layer — unframed, behind the content, pointer-safe.
+   A CSS wash is painted immediately; the WebGL canvas (if it runs) draws over
+   it. Both are low-contrast so the workspace stays readable if WebGL is off. */
+.water-bg{
+  position:absolute; inset:0; z-index:0; pointer-events:none; overflow:hidden;
+  background:
+    radial-gradient(1200px 560px at 84% -10%, rgba(120,178,235,.16), transparent 60%),
+    radial-gradient(940px 520px at 6% 112%, rgba(28,88,150,.10), transparent 58%),
+    var(--op-bg);
+}
+.water-bg-canvas{ position:absolute; inset:0; width:100%; height:100%; display:block; }
+
+/* Date range bar + segmented (dashboard scope only). */
+.dashboard-page .segmented{ background:#EDEFF1; border:1px solid var(--op-border); box-shadow:inset 0 1px 2px rgba(15,17,17,.03); }
+.dashboard-page .segmented button{ color:var(--op-ink-2); }
+.dashboard-page .segmented button:hover:not(.active){ color:var(--op-ink); background:rgba(255,255,255,.72); }
+.dashboard-page .segmented button.active{ color:var(--op-ink); background:#FFFFFF; box-shadow:0 1px 2px rgba(15,17,17,.10); }
+.dashboard-page .segmented button:focus-visible{ outline:2px solid var(--op-orange); outline-offset:1px; }
+.dashboard-page .range-readout{ color:var(--op-ink-2); }
+.dashboard-page .range-readout svg{ color:var(--op-ink-3); }
+.dashboard-page .custom-range input[type=date]{ border:1px solid var(--op-border); border-radius:6px; color:var(--op-ink); background:#FFFFFF; }
+
+/* Data-quality alerts (Amazon palette; blue info, amber warning, red error). */
+.dashboard-page .alert{ border-radius:8px; }
+.dashboard-page .alert.info{ background:var(--op-blue-soft); border-color:var(--op-blue-border); color:#0A4A86; }
+.dashboard-page .alert.warning{ background:var(--op-warn-soft); border-color:var(--op-warn-border); color:var(--op-warn-ink); }
+.dashboard-page .alert.error{ background:var(--op-red-soft); border-color:var(--op-red-border); color:#8A2D17; }
+
+/* KPI + comparison cards — compact white, thin border, 8px radius, soft shadow. */
+.dashboard-page .metric-card,
+.dashboard-page .cmp-card{
+  background:var(--op-card); border:1px solid var(--op-border); border-radius:8px;
+  box-shadow:0 1px 2px rgba(15,17,17,.05);
+}
+.dashboard-page .metric-card:hover{ transform:translateY(-1px); border-color:#C7CCCC; box-shadow:0 3px 10px -4px rgba(15,17,17,.20); }
+.dashboard-page .cmp-card:hover{ border-color:#C7CCCC; box-shadow:0 3px 10px -4px rgba(15,17,17,.16); }
+.dashboard-page .metric-label,.dashboard-page .cmp-label{ color:var(--op-ink-3); }
+.dashboard-page .metric-value{ color:var(--op-ink); }
+.dashboard-page .metric-period,.dashboard-page .cmp-basis{ color:var(--op-ink-3); }
+.dashboard-page .metric-icon,
+.dashboard-page .metric-card:nth-child(3) .metric-icon,
+.dashboard-page .metric-card:nth-child(4) .metric-icon{ color:var(--op-ink-2); background:#EEF1F3; }
+/* Neutralise the coral HERO card -> a plain white KPI card like the others. */
+.dashboard-page .metric-card.hero{ background:var(--op-card); border:1px solid var(--op-border); color:var(--op-ink); box-shadow:0 1px 2px rgba(15,17,17,.05); }
+.dashboard-page .metric-card.hero::after{ display:none; }
+.dashboard-page .metric-card.hero .metric-label,
+.dashboard-page .metric-card.hero .metric-period,
+.dashboard-page .metric-card.hero .metric-hint{ color:var(--op-ink-3); }
+.dashboard-page .metric-card.hero .metric-value{ color:var(--op-ink); }
+.dashboard-page .metric-card.hero .metric-spark path:first-child{ fill:var(--dash-primary); fill-opacity:.12; stroke:none; }
+.dashboard-page .metric-card.hero .metric-spark path:nth-child(2){ fill:none; stroke:var(--dash-primary); }
+.dashboard-page .metric-card.hero .metric-spark circle{ fill:var(--dash-primary); }
+/* Trend pills + comparison values: green up / red down (never colour alone —
+   the arrow icon is still rendered by the component). */
+.dashboard-page .trend.up,.dashboard-page .metric-card.hero .trend.up{ color:var(--op-green); background:var(--op-green-soft); border-color:var(--op-green-border); }
+.dashboard-page .trend.down,.dashboard-page .metric-card.hero .trend.down{ color:var(--op-red); background:var(--op-red-soft); border-color:var(--op-red-border); }
+.dashboard-page .cmp-value.up{ color:var(--op-green); }
+.dashboard-page .cmp-value.down{ color:var(--op-red); }
+
+/* Chart + breakdown surfaces. */
+.dashboard-page .chart-card,
+.dashboard-page .panel{ background:var(--op-card); border:1px solid var(--op-border); border-radius:8px; box-shadow:0 1px 2px rgba(15,17,17,.05); }
+.dashboard-page .chart-card-head{ border-bottom-color:var(--op-border-2); }
+.dashboard-page .chart-card-title,.dashboard-page .panel-title{ color:var(--op-ink); }
+.dashboard-page .chart-card-sub{ color:var(--op-ink-3); }
+.dashboard-page .bd-value{ color:var(--op-ink); }
+.dashboard-page .bd-share{ color:var(--op-ink-3); }
+.dashboard-page .footer-note{ color:var(--op-ink-3); border-top-color:var(--op-border-2); }
+.dashboard-page .footer-note code{ color:var(--op-ink-2); background:#EEF1F3; }
+.dashboard-page .footer-note strong{ color:var(--op-ink-2); }
+
+/* ---------------- MOTION — premium, subtle, reduced-motion aware --------- */
+@media (prefers-reduced-motion: no-preference){
+  .dashboard-page .page-head,
+  .dashboard-page .controls-bar,
+  .dashboard-page .metric-grid > *,
+  .dashboard-page .cmp-grid > *,
+  .dashboard-page .chart-card,
+  .dashboard-page .breakdown-grid > *{ animation:dashRise .5s var(--ease) both; }
+  .dashboard-page .metric-grid > *:nth-child(2){ animation-delay:.05s; }
+  .dashboard-page .metric-grid > *:nth-child(3){ animation-delay:.10s; }
+  .dashboard-page .metric-grid > *:nth-child(4){ animation-delay:.15s; }
+  .dashboard-page .cmp-grid > *{ animation-delay:.10s; }
+  .dashboard-page .cmp-grid > *:nth-child(2){ animation-delay:.14s; }
+  .dashboard-page .cmp-grid > *:nth-child(3){ animation-delay:.18s; }
+  .dashboard-page .cmp-grid > *:nth-child(4){ animation-delay:.22s; }
+  .dashboard-page .chart-card{ animation-delay:.16s; }
+  .dashboard-page .breakdown-grid > *{ animation-delay:.20s; }
+  .dashboard-page .metric-value{ animation:kpiReveal .55s var(--ease) both; }
+}
+@keyframes dashRise{ from{ opacity:0; transform:translateY(10px); } to{ opacity:1; transform:none; } }
+@keyframes kpiReveal{ from{ opacity:0; transform:translateY(4px); } to{ opacity:1; transform:none; } }
+@media (prefers-reduced-motion: reduce){
+  .water-bg{ background:
+      radial-gradient(1100px 520px at 85% -10%, rgba(120,178,235,.10), transparent 60%),
+      var(--op-bg); }
+}
 `;
 
 /* Chart colours, exported so recharts series stay in step with the CSS tokens
@@ -1572,6 +1774,23 @@ export const CHART = {
   positive: "#0B9F76",
   negative: "#F34F5D",
   info: "#6D5CE7",
+};
+
+/* DASHBOARD-SCOPED chart palette (Amazon-inspired blue/green/orange). Kept
+   SEPARATE from CHART so the Sales Dashboard's recharts series and sparklines
+   can adopt the operational palette WITHOUT changing any other report's chart
+   colours (CHART is still used by Reconciliation and Returns & Refund Leakage).
+   Mirrors the --dash-* CSS tokens in STYLE. */
+export const DASH_CHART = {
+  primary: "#1E6FE0",                        // Total Sales — blue
+  primaryFillTop: "rgba(30,111,224,0.18)",
+  primaryFillBottom: "rgba(30,111,224,0.01)",
+  teal: "#0E9F6E",                           // Units — green
+  orders: "#3B82C4",                         // Orders — secondary blue
+  gold: "#E88B00",                           // Avg. Order Value — orange
+  grid: "#E7E9EC",
+  axis: "#565959",
+  axisLine: "#D5D9D9",
 };
 
 export default STYLE;
