@@ -237,29 +237,34 @@ test("D2. workflow shape: INDEPENDENT per-bucket ordered pipeline -- token ceili
   assert.doesNotMatch(yml, /api\/cron\/sync/, "never drives the deprecated Vercel cron endpoint");
 });
 
-test("D3. exactly THREE reviewed scheduled workflows: scheduler-v2 (OLI/Ads) + DECOUPLED fba-plan-golive (FBA) + DECOUPLED returns-leakage", () => {
+test("D3. exactly TWO reviewed scheduled workflows remain: scheduler-v2 (OLI/Ads) + DECOUPLED fba-plan-golive (FBA); Returns & Refund Leakage is MANUAL-ONLY (its automatic schedule was disabled 2026-09-01)", () => {
   const files = readdirSync(WORKFLOWS_DIR).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
   const scheduled = files.filter((f) => /\n\s*schedule:\s*\n/.test(readFileSync(resolve(WORKFLOWS_DIR, f), "utf8"))).sort();
-  // FBA Shipment Plan (us-fba / non-us-fba) AND Returns & Refund Leakage (its own returns-leakage concurrency group,
-  // its own durable Returns/Settlement history + returns-leakage snapshots) are SEPARATE, DECOUPLED scheduled
-  // workflows, so a failure in either can never block Daily Reporting / Brand View and the scheduler-v2 OLI/Ads
-  // schedules stay untouched. No OTHER workflow may declare a schedule (an accidental fourth still fails this pin).
-  assert.deepEqual(scheduled, ["fba-plan-golive.yml", "returns-leakage.yml", "scheduler-v2.yml"], "exactly the three reviewed scheduled workflows; got " + JSON.stringify(scheduled));
+  // scheduler-v2 (OLI/Ads) and the DECOUPLED FBA Shipment Plan (us-fba / non-us-fba) are the ONLY automatic
+  // schedulers and are UNCHANGED. Returns & Refund Leakage had its four cron rows removed on 2026-09-01 -- it now
+  // runs ONLY on demand via workflow_dispatch, so it MUST NOT appear in the scheduled set. No OTHER workflow may
+  // declare a schedule (an accidental new schedule -- or a re-added Returns cron -- still fails this pin).
+  assert.deepEqual(scheduled, ["fba-plan-golive.yml", "scheduler-v2.yml"], "exactly the two remaining scheduled workflows; got " + JSON.stringify(scheduled));
+  assert.ok(files.includes("returns-leakage.yml"), "the Returns workflow file still exists (manual-only) -- only its schedule was removed");
 });
 
-test("D3b. returns-leakage.yml is fully DECOUPLED: own concurrency group, independent US/Non-US cron rows, cron->bucket map, dry-run/go-live modes, Node 24, does not touch scheduler-v2/fba crons", () => {
+test("D3b. returns-leakage.yml is MANUAL-ONLY: automatic schedule/cron REMOVED (disabled 2026-09-01), workflow_dispatch retained, own concurrency group unchanged, dry-run/go-live modes, Node 24, still runs the dedicated operator", () => {
   const yml = readFileSync(resolve(WORKFLOWS_DIR, "returns-leakage.yml"), "utf8");
-  assert.match(yml, /concurrency:\s*\n\s*group:\s*returns-leakage/, "own concurrency group");
-  assert.match(yml, /cron:\s*"0 6 \* \* \*"/, "Non-US primary cron");
-  assert.match(yml, /cron:\s*"0 7 \* \* \*"/, "Non-US fallback cron");
-  assert.match(yml, /cron:\s*"30 14 \* \* \*"/, "US primary cron");
-  assert.match(yml, /cron:\s*"30 15 \* \* \*"/, "US fallback cron");
-  assert.match(yml, /returns-leakage-golive\.mjs/, "runs the dedicated operator");
+  assert.match(yml, /concurrency:\s*\n\s*group:\s*returns-leakage/, "own concurrency group unchanged");
+  // The automatic schedule is DISABLED: no active `schedule:` trigger key and no active `- cron:` row remain, and
+  // none of the four previously-active Returns cron expressions survives as a live trigger.
+  assert.doesNotMatch(yml, /\n {2}schedule:/, "no active schedule: trigger remains (automatic schedule disabled)");
+  assert.doesNotMatch(yml, /\n\s*- cron:/, "no active '- cron:' row remains");
+  assert.doesNotMatch(yml, /cron:\s*"0 6 \* \* \*"/, "the Non-US 06:00 primary cron is gone");
+  assert.doesNotMatch(yml, /cron:\s*"0 7 \* \* \*"/, "the Non-US 07:00 fallback cron is gone");
+  assert.doesNotMatch(yml, /cron:\s*"30 14 \* \* \*"/, "the US 14:30 primary cron is gone");
+  assert.doesNotMatch(yml, /cron:\s*"30 15 \* \* \*"/, "the US 15:30 fallback cron is gone");
+  // Manual operation is PRESERVED: workflow_dispatch with the bucket + mode inputs, running the dedicated operator.
+  assert.match(yml, /workflow_dispatch:/, "manual workflow_dispatch retained (an administrator can still run it)");
+  assert.match(yml, /returns-leakage-golive\.mjs/, "still runs the dedicated Returns operator on a manual run");
   assert.match(yml, /node-version:\s*"24"/, "Node 24");
-  assert.match(yml, /bucket=non-us[\s\S]*mode=go-live/, "cron->bucket->go-live map");
-  // It must NOT reuse the scheduler-v2 / fba cron times (independence).
-  assert.doesNotMatch(yml, /cron:\s*"0 2 \* \* \*"/, "does not reuse scheduler-v2 Non-US 02:00 cron");
-  assert.doesNotMatch(yml, /cron:\s*"30 10 \* \* \*"/, "does not reuse scheduler-v2 US 10:30 cron");
+  assert.match(yml, /options:\s*\["dry-run", "go-live"\]/, "manual dry-run/go-live modes retained");
+  assert.match(yml, /options:\s*\["non-us", "us"\]/, "manual bucket choice retained");
 });
 
 test("D4. previous-day (D-1) freshness shape: refresh_mode input, scheduled-always-normal, force-latest step (run_id, gated on mode + OLI-first), strict D-1 readiness + --strict-d1 release", () => {

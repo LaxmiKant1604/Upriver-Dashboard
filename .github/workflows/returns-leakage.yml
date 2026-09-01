@@ -1,11 +1,12 @@
-# Returns & Refund Leakage -- DEDICATED scheduler. Fully decoupled from scheduler-v2 and fba-plan-golive: its own
-# concurrency group, its own durable Returns + Settlement history + returns-leakage snapshots, its own cron rows.
+# Returns & Refund Leakage -- DEDICATED, MANUAL-ONLY workflow. Fully decoupled from scheduler-v2 and fba-plan-golive:
+# its own concurrency group, its own durable Returns + Settlement history + returns-leakage snapshots. Its automatic
+# cron schedule was DISABLED 2026-09-01 (see the `on:` block below); it now runs ONLY on demand via workflow_dispatch.
 # It NEVER touches Daily / Brand View / SKU Movement / FBA / Ads / OLI processing or their timings. US and Non-US run
-# INDEPENDENTLY (separate cron rows -> separate runs) so one bucket's failure can never block the other or any other
-# report. Each bucket fetches exactly two standard exports per <=5-seller batch (Returns 60d + Settlements 21d/initial)
-# = 4 tokens/batch, hard-capped at US<=8 / Non-US<=20 (total 28/day). A batch already covering asOf is a zero-token
-# skip, so the FALLBACK run after a successful PRIMARY spends nothing (shared durable coverage marker). Controls are
-# implicit: the atomic window-replace + CAS publish preserve last-known-good on every failure.
+# INDEPENDENTLY (separate manual runs) so one bucket's failure can never block the other or any other report. Each
+# bucket fetches exactly two standard exports per <=5-seller batch (Returns 60d + Settlements 21d/initial) = 4
+# tokens/batch, hard-capped at US<=8 / Non-US<=20 (total 28/day). A batch already covering asOf is a zero-token skip,
+# so a re-run after a successful run spends nothing (shared durable coverage marker). Controls are implicit: the
+# atomic window-replace + CAS publish preserve last-known-good on every failure.
 name: returns-leakage
 
 concurrency:
@@ -13,13 +14,14 @@ concurrency:
   cancel-in-progress: false
 
 on:
-  schedule:
-    # Runs AFTER scheduler-v2 OLI (02:00-03:00 UTC Non-US / 10:30 UTC US) and fba-plan (04:00-05:00 / 12:30-13:30),
-    # so the reused durable OLI is already refreshed to D-1 before Returns derives its rate denominator.
-    - cron: "0 6 * * *"    # 06:00 UTC / 11:30 IST -- Non-US PRIMARY
-    - cron: "0 7 * * *"    # 07:00 UTC / 12:30 IST -- Non-US FALLBACK (zero-token if primary already covered D-1)
-    - cron: "30 14 * * *"  # 14:30 UTC / 20:00 IST -- US PRIMARY
-    - cron: "30 15 * * *"  # 15:30 UTC / 21:00 IST -- US FALLBACK
+  # AUTOMATIC SCHEDULE DISABLED 2026-09-01 -- the four Returns cron triggers were REMOVED so Returns & Refund Leakage
+  # no longer runs automatically. The report stays fully LIVE (durable Returns + Settlement history, published
+  # snapshots, the returns-leakage-v3 advanced page, the serving APIs, migration 20260914, and brand authorization --
+  # all untouched) and an administrator can still run it ON DEMAND below via workflow_dispatch. No shared scheduler,
+  # scheduler-v2, fba-plan, Vercel cron, Cloudflare trigger, API route, or other automation can dispatch this pipeline.
+  #
+  # The removed rows (all UTC), kept ONLY as a record for a future deliberate re-enable, were:
+  #   "0 6 * * *" Non-US primary, "0 7 * * *" Non-US fallback, "30 14 * * *" US primary, "30 15 * * *" US fallback.
   workflow_dispatch:
     inputs:
       bucket:
