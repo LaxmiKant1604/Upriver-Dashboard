@@ -3778,7 +3778,7 @@ function DashboardApp({ session, access, onSignOut }) {
 
         <div className={"main-area"
           + (view === "dashboard" && dashboardMode === "account" ? " dash-workspace" : "")
-          + ((view === "brandview" || view === "daily" || (view === "dashboard" && dashboardMode === "brand")) ? " op-workspace" : "")}>
+          + ((view === "brandview" || view === "daily" || view === "returns" || (view === "dashboard" && dashboardMode === "brand")) ? " op-workspace" : "")}>
           {/* Isolated fluid-motion background, only behind the account Dashboard.
               It self-disables under reduced motion / low-power / no-WebGL and
               falls back to the static CSS wash, so nothing here can block or

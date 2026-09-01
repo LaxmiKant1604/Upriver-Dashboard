@@ -31,7 +31,7 @@ import {
 import { downloadCsv, reportFilename } from "../lib/csv.js";
 import { buildXlsx } from "../lib/xlsx.js";
 import { fmtDateHuman, fmtMoney, fmtRate, nInt, compactNumber } from "../lib/format.js";
-import { CHART } from "../styles/theme.js";
+import { DASH_CHART } from "../styles/theme.js";
 import { GradientKpi, ChartCard, ChartTooltip, SegmentedControl } from "../components/ui.jsx";
 import {
   ExportButton, FreshnessBar, Notice, Pagination, PriorityActions, ReportHeader, SearchField,
@@ -86,8 +86,8 @@ const ACCESSORS = {
 
 // Reason-bucket colours (deterministic), reused by the breakdown and the reason column badge tone mapping.
 const REASON_COLORS = {
-  product_quality: CHART.red, listing_accuracy: CHART.gold, sizing: CHART.violet,
-  delivery: CHART.teal, low_actionability: "#8E87AA", other: CHART.neutral,
+  product_quality: DASH_CHART.negative, listing_accuracy: DASH_CHART.gold, sizing: "#5B8DB8",
+  delivery: DASH_CHART.teal, low_actionability: "#8E87AA", other: "#C3CBD1",
 };
 
 /* ------------------------------------------------------------- cell factory */
@@ -358,29 +358,29 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
   // Windowed portfolio breakdowns from the index-aligned account series.
   const series = hasSeries ? data.series : null;
   const reasonSeg = useMemo(() => Object.entries(sumSeriesGroup(series?.reasonBucket, slices.windowIdx))
-    .map(([key, value]) => ({ key, value, label: RETURN_BUCKET_META[key]?.label || key, color: REASON_COLORS[key] || CHART.neutral }))
+    .map(([key, value]) => ({ key, value, label: RETURN_BUCKET_META[key]?.label || key, color: REASON_COLORS[key] || "#C3CBD1" }))
     .sort((a, b) => b.value - a.value), [series, slices.windowIdx]);
   const channelSeg = useMemo(() => {
     const s = sumSeriesGroup(series?.channel, slices.windowIdx);
     return [
-      { key: "FBA", value: s.FBA, label: "FBA", color: CHART.primary },
-      { key: "FBM", value: s.FBM, label: "FBM", color: CHART.teal },
-      { key: "UNKNOWN", value: s.UNKNOWN, label: "Unknown", color: CHART.neutral },
+      { key: "FBA", value: s.FBA, label: "FBA", color: DASH_CHART.primary },
+      { key: "FBM", value: s.FBM, label: "FBM", color: DASH_CHART.teal },
+      { key: "UNKNOWN", value: s.UNKNOWN, label: "Unknown", color: "#C3CBD1" },
     ];
   }, [series, slices.windowIdx]);
   const statusSeg = useMemo(() => {
     const s = sumSeriesGroup(series?.status, slices.windowIdx);
     return [
-      { key: "settled", value: s.settled, label: "Settled", color: CHART.positive },
-      { key: "pending", value: s.pending, label: "Pending / provisional", color: CHART.gold },
+      { key: "settled", value: s.settled, label: "Settled", color: DASH_CHART.positive },
+      { key: "pending", value: s.pending, label: "Pending / provisional", color: DASH_CHART.gold },
     ];
   }, [series, slices.windowIdx]);
   const payerSeg = useMemo(() => {
     const s = sumSeriesGroup(series?.labelPayer, slices.windowIdx);
     return [
-      { key: "seller", value: s.seller, label: "Seller-paid label", color: CHART.red },
-      { key: "amazon", value: s.amazon, label: "Amazon-paid", color: CHART.violet },
-      { key: "other", value: s.other, label: "Other / unknown", color: CHART.neutral },
+      { key: "seller", value: s.seller, label: "Seller-paid label", color: DASH_CHART.negative },
+      { key: "amazon", value: s.amazon, label: "Amazon-paid", color: "#5B8DB8" },
+      { key: "other", value: s.other, label: "Other / unknown", color: "#C3CBD1" },
     ];
   }, [series, slices.windowIdx]);
 
@@ -468,7 +468,7 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
   const stamp = (v) => { if (!v) return "—"; const d = new Date(v); return Number.isFinite(d.getTime()) ? d.toLocaleString() : String(v); };
 
   return (
-    <div className="container skupl-page">
+    <div className="container skupl-page rl-page op-report">
       <ReportHeader
         title="Returns &amp; Refund Leakage"
         subtitle={`What returns actually cost ${scopeLabel} — settled leakage, fees and rates over a window you choose, ranked by money not percentage`}
@@ -568,18 +568,18 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
               <div className="rl-chart-wrap">
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={trend} margin={{ top: 8, right: 12, left: -14, bottom: 0 }}>
-                    <CartesianGrid stroke={CHART.grid} vertical={false} />
-                    <XAxis dataKey="label" tick={{ fontSize: 10, fill: CHART.axis }} axisLine={{ stroke: CHART.axisLine }} tickLine={false} minTickGap={16} tickMargin={7} />
-                    <YAxis tick={{ fontSize: 10, fill: CHART.axis }} axisLine={false} tickLine={false} width={38} allowDecimals={false} />
-                    <Tooltip cursor={{ fill: "rgba(139,92,246,0.06)" }} content={(p) => (
+                    <CartesianGrid stroke={DASH_CHART.grid} vertical={false} />
+                    <XAxis dataKey="label" tick={{ fontSize: 10, fill: DASH_CHART.axis }} axisLine={{ stroke: DASH_CHART.axisLine }} tickLine={false} minTickGap={16} tickMargin={7} />
+                    <YAxis tick={{ fontSize: 10, fill: DASH_CHART.axis }} axisLine={false} tickLine={false} width={38} allowDecimals={false} />
+                    <Tooltip cursor={{ fill: "rgba(47,111,176,0.06)" }} content={(p) => (
                       <ChartTooltip {...p} rows={(pt) => [
-                        { key: "fba", label: "FBA returns", value: nInt(pt.fba), color: CHART.primary },
-                        { key: "fbm", label: "FBM returns", value: nInt(pt.fbm), color: CHART.teal },
+                        { key: "fba", label: "FBA returns", value: nInt(pt.fba), color: DASH_CHART.primary },
+                        { key: "fbm", label: "FBM returns", value: nInt(pt.fbm), color: DASH_CHART.teal },
                         pt.provisional ? { key: "prov", label: "of which provisional", value: nInt(pt.provisional) } : null,
                       ]} />
                     )} />
-                    <Bar dataKey="fba" stackId="c" fill={CHART.primary} radius={[0, 0, 0, 0]} />
-                    <Bar dataKey="fbm" stackId="c" fill={CHART.teal} radius={[3, 3, 0, 0]} />
+                    <Bar dataKey="fba" stackId="c" fill={DASH_CHART.primary} radius={[0, 0, 0, 0]} />
+                    <Bar dataKey="fbm" stackId="c" fill={DASH_CHART.teal} radius={[3, 3, 0, 0]} />
                   </BarChart>
                 </ResponsiveContainer>
               </div>
@@ -591,20 +591,20 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
                   <AreaChart data={trend} margin={{ top: 8, right: 12, left: 2, bottom: 0 }}>
                     <defs>
                       <linearGradient id="rlRefund" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor={CHART.red} stopOpacity={0.22} />
-                        <stop offset="100%" stopColor={CHART.red} stopOpacity={0.01} />
+                        <stop offset="0%" stopColor={DASH_CHART.negative} stopOpacity={0.22} />
+                        <stop offset="100%" stopColor={DASH_CHART.negative} stopOpacity={0.01} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid stroke={CHART.grid} vertical={false} />
-                    <XAxis dataKey="label" tick={{ fontSize: 10, fill: CHART.axis }} axisLine={{ stroke: CHART.axisLine }} tickLine={false} minTickGap={16} tickMargin={7} />
-                    <YAxis tick={{ fontSize: 10, fill: CHART.axis }} axisLine={false} tickLine={false} width={50} tickFormatter={(v) => compactNumber(v, chartCurrency)} />
-                    <Tooltip cursor={{ stroke: CHART.axis, strokeWidth: 1, strokeDasharray: "3 3" }} content={(p) => (
+                    <CartesianGrid stroke={DASH_CHART.grid} vertical={false} />
+                    <XAxis dataKey="label" tick={{ fontSize: 10, fill: DASH_CHART.axis }} axisLine={{ stroke: DASH_CHART.axisLine }} tickLine={false} minTickGap={16} tickMargin={7} />
+                    <YAxis tick={{ fontSize: 10, fill: DASH_CHART.axis }} axisLine={false} tickLine={false} width={50} tickFormatter={(v) => compactNumber(v, chartCurrency)} />
+                    <Tooltip cursor={{ stroke: DASH_CHART.axis, strokeWidth: 1, strokeDasharray: "3 3" }} content={(p) => (
                       <ChartTooltip {...p} rows={(pt) => [
-                        { key: "refund", label: "Refunds", value: fmtMoney(pt.refund, chartCurrency), color: CHART.red },
+                        { key: "refund", label: "Refunds", value: fmtMoney(pt.refund, chartCurrency), color: DASH_CHART.negative },
                         { key: "fees", label: "Return fees", value: fmtMoney(pt.fees, chartCurrency) },
                       ]} />
                     )} />
-                    <Area type="monotone" dataKey="refund" stroke={CHART.red} strokeWidth={2} fill="url(#rlRefund)" dot={false} />
+                    <Area type="monotone" dataKey="refund" stroke={DASH_CHART.negative} strokeWidth={2} fill="url(#rlRefund)" dot={false} />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
@@ -614,16 +614,16 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
               <div className="rl-chart-wrap">
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={trend} margin={{ top: 8, right: 12, left: -8, bottom: 0 }}>
-                    <CartesianGrid stroke={CHART.grid} vertical={false} />
-                    <XAxis dataKey="label" tick={{ fontSize: 10, fill: CHART.axis }} axisLine={{ stroke: CHART.axisLine }} tickLine={false} minTickGap={16} tickMargin={7} />
-                    <YAxis tick={{ fontSize: 10, fill: CHART.axis }} axisLine={false} tickLine={false} width={40} tickFormatter={(v) => `${Math.round(v)}%`} />
-                    <Tooltip cursor={{ stroke: CHART.axis, strokeWidth: 1, strokeDasharray: "3 3" }} content={(p) => (
+                    <CartesianGrid stroke={DASH_CHART.grid} vertical={false} />
+                    <XAxis dataKey="label" tick={{ fontSize: 10, fill: DASH_CHART.axis }} axisLine={{ stroke: DASH_CHART.axisLine }} tickLine={false} minTickGap={16} tickMargin={7} />
+                    <YAxis tick={{ fontSize: 10, fill: DASH_CHART.axis }} axisLine={false} tickLine={false} width={40} tickFormatter={(v) => `${Math.round(v)}%`} />
+                    <Tooltip cursor={{ stroke: DASH_CHART.axis, strokeWidth: 1, strokeDasharray: "3 3" }} content={(p) => (
                       <ChartTooltip {...p} rows={(pt) => [
-                        pt.returnRate == null ? { key: "rate", label: "Return rate", value: "— (no ordered units)" } : { key: "rate", label: "Return rate", value: fmtRate(pt.returnRate), color: CHART.gold },
+                        pt.returnRate == null ? { key: "rate", label: "Return rate", value: "— (no ordered units)" } : { key: "rate", label: "Return rate", value: fmtRate(pt.returnRate), color: DASH_CHART.gold },
                         { key: "ret", label: "Returns / ordered", value: `${nInt(pt.returnCount)} / ${nInt(pt.orderedUnits)}` },
                       ]} />
                     )} />
-                    <Line type="monotone" dataKey="returnRate" stroke={CHART.gold} strokeWidth={2} dot={false} connectNulls={false} />
+                    <Line type="monotone" dataKey="returnRate" stroke={DASH_CHART.gold} strokeWidth={2} dot={false} connectNulls={false} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
@@ -635,20 +635,20 @@ export default function ReturnsLeakage({ data, loading, error, accountName, sele
                   <AreaChart data={trend} margin={{ top: 8, right: 12, left: 2, bottom: 0 }}>
                     <defs>
                       <linearGradient id="rlImpact" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor={CHART.primary} stopOpacity={0.22} />
-                        <stop offset="100%" stopColor={CHART.primary} stopOpacity={0.01} />
+                        <stop offset="0%" stopColor={DASH_CHART.primary} stopOpacity={0.22} />
+                        <stop offset="100%" stopColor={DASH_CHART.primary} stopOpacity={0.01} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid stroke={CHART.grid} vertical={false} />
-                    <XAxis dataKey="label" tick={{ fontSize: 10, fill: CHART.axis }} axisLine={{ stroke: CHART.axisLine }} tickLine={false} minTickGap={16} tickMargin={7} />
-                    <YAxis tick={{ fontSize: 10, fill: CHART.axis }} axisLine={false} tickLine={false} width={50} tickFormatter={(v) => compactNumber(v, chartCurrency)} />
-                    <Tooltip cursor={{ stroke: CHART.axis, strokeWidth: 1, strokeDasharray: "3 3" }} content={(p) => (
+                    <CartesianGrid stroke={DASH_CHART.grid} vertical={false} />
+                    <XAxis dataKey="label" tick={{ fontSize: 10, fill: DASH_CHART.axis }} axisLine={{ stroke: DASH_CHART.axisLine }} tickLine={false} minTickGap={16} tickMargin={7} />
+                    <YAxis tick={{ fontSize: 10, fill: DASH_CHART.axis }} axisLine={false} tickLine={false} width={50} tickFormatter={(v) => compactNumber(v, chartCurrency)} />
+                    <Tooltip cursor={{ stroke: DASH_CHART.axis, strokeWidth: 1, strokeDasharray: "3 3" }} content={(p) => (
                       <ChartTooltip {...p} rows={(pt) => [
-                        { key: "leak", label: "Leakage", value: fmtMoney(pt.leakage, chartCurrency), color: CHART.primary },
+                        { key: "leak", label: "Leakage", value: fmtMoney(pt.leakage, chartCurrency), color: DASH_CHART.primary },
                         { key: "net", label: "Net impact", value: fmtMoney(pt.netImpact, chartCurrency) },
                       ]} />
                     )} />
-                    <Area type="monotone" dataKey="leakage" stroke={CHART.primary} strokeWidth={2} fill="url(#rlImpact)" dot={false} />
+                    <Area type="monotone" dataKey="leakage" stroke={DASH_CHART.primary} strokeWidth={2} fill="url(#rlImpact)" dot={false} />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>

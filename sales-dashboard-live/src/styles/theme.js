@@ -2003,6 +2003,34 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .op-report .dr-note{ background:#FBFCFD; border:1px solid var(--op-border-2); border-radius:9px; color:var(--op-ink-2); }
 .op-report .dr-note strong{ color:var(--op-ink); }
 .op-report .dr-note code{ background:#EEF1F3; color:var(--op-steel); }
+
+/* ---- RETURNS & REFUND LEAKAGE (.rl-page) ------------------------------- */
+.op-report .recon-notice{ background:#EFF5FA; border:1px solid #CFE0EE; color:#1B4E76; border-radius:9px; padding:10px 13px; }
+/* 6-KPI risk hierarchy: recoverable leakage (4th) + net impact carry the risk amber/coral keys. */
+.op-report .rvkpi-grid-6 .rvkpi:nth-child(1){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--dash-primary); }
+.op-report .rvkpi-grid-6 .rvkpi:nth-child(2){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-steel-2); }
+.op-report .rvkpi-grid-6 .rvkpi:nth-child(3){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-red); }
+.op-report .rvkpi-grid-6 .rvkpi:nth-child(4){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-orange); }
+.op-report .rvkpi-grid-6 .rvkpi:nth-child(5){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-orange-dark); }
+.op-report .rvkpi-grid-6 .rvkpi:nth-child(6){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-red); }
+.op-report .rl-prov{ color:var(--op-ink-2); }
+.op-report .pt-badge.sku-badge-ok{ background:var(--op-green-soft); color:var(--op-green); border-color:var(--op-green-border); }
+.op-report .pt-badge.sku-badge-warn{ background:var(--op-warn-soft); color:var(--op-warn-ink); border-color:var(--op-warn-border); }
+.op-report .pt-badge.sku-badge-bad{ background:var(--op-red-soft); color:var(--op-red); border-color:var(--op-red-border); }
+.op-report .rl-table th.pt-sorted{ color:#BBD6EE; }
+.op-report .rl-seg-title{ color:var(--op-ink); }
+.op-report .rl-seg-sub,.op-report .rl-seg-share{ color:var(--op-ink-3); }
+.op-report .rl-seg-val{ color:var(--op-ink); }
+.op-report .rl-seg-key{ color:var(--op-ink-2); }
+.op-report .rl-seg-bar{ background:#EDF0F2; }
+.op-report .rl-drill-cell{ background:#F6F8FA; }
+.op-report .rl-drill h4{ color:var(--op-ink-3); }
+.op-report .rl-dl-row span{ color:var(--op-ink-2); }
+.op-report .rl-dl-row b{ color:var(--op-ink); }
+.op-report .rl-fresh-row{ border-bottom-color:var(--op-hair); }
+.op-report .rl-fresh-row span{ color:var(--op-ink-3); }
+.op-report .rl-fresh-row b{ color:var(--op-ink); }
+.op-report .rl-expand-btn:hover{ color:var(--op-steel); }
 `;
 
 /* Chart colours, exported so recharts series stay in step with the CSS tokens
