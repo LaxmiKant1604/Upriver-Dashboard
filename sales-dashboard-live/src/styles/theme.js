@@ -2031,6 +2031,38 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .op-report .rl-fresh-row span{ color:var(--op-ink-3); }
 .op-report .rl-fresh-row b{ color:var(--op-ink); }
 .op-report .rl-expand-btn:hover{ color:var(--op-steel); }
+
+/* ---- FBA SHIPMENT PLAN (.plan-page) ------------------------------------ */
+/* Grouped header band (Identity / Sales / Forecast / Inventory / ...). Not sticky
+   vertically (the sortable row below stays pinned); its identity cell is sticky
+   left so it tracks the sticky identity column on horizontal scroll. */
+.op-report .plan-table .plan-group-row th{ background:var(--op-navy-2); color:rgba(233,238,242,.62); font-size:9px; font-weight:800; letter-spacing:.1em; text-transform:uppercase; text-align:center; padding:6px 10px; border-bottom:1px solid rgba(0,0,0,.28); }
+.op-report .plan-table .plan-group-th + .plan-group-th{ box-shadow:inset 1px 0 0 rgba(255,255,255,.07); }
+.op-report .plan-table .plan-group-th.plan-group-id{ position:sticky; left:0; z-index:2; background:var(--op-navy-2); text-align:left; }
+/* Planning settings + controls -> op surfaces, steel active, amber-hover tools. */
+.op-report .plan-settings{ background:#FBFCFD; border-color:var(--op-border-2); border-radius:10px; }
+.op-report .plan-field-label{ color:var(--op-ink-3); }
+.op-report .plan-set-group select,.op-report .plan-set-group input[type=number],.op-report .plan-field select,.op-report .plan-field input[type=number]{ border-color:var(--op-border); border-radius:8px; color:var(--op-ink); }
+.op-report .plan-seg-btn{ border-color:var(--op-border); background:#fff; color:var(--op-ink-2); border-radius:8px; }
+.op-report .plan-seg-btn.active{ background:var(--op-steel); border-color:transparent; color:#fff; }
+.op-report .plan-seg-custom.active{ border-color:var(--op-steel); box-shadow:inset 0 0 0 1px #CFE0EE; }
+.op-report .plan-search-wrap{ border-color:var(--op-border); border-radius:8px; }
+.op-report .plan-search-wrap:focus-within{ border-color:var(--op-orange); box-shadow:0 0 0 3px rgba(255,153,0,.16); }
+.op-report .plan-export-btn:hover:not(:disabled),.op-report .plan-tool-btn:hover:not(:disabled){ border-color:var(--op-orange); color:var(--op-orange-dark); background:var(--op-orange-soft); }
+.op-report .plan-wh-btn:hover{ border-color:var(--op-steel); color:var(--op-steel); background:#E9F1F8; }
+.op-report .plan-cols-pop{ border-color:var(--op-border); border-radius:10px; }
+.op-report .plan-cols-group-title{ color:var(--op-ink-3); }
+/* Restock highlight -> amber (was coral brand); totals + identity metadata op. */
+.op-report .plan-table tr.plan-restock td{ background:var(--op-warn-soft); }
+.op-report .plan-table tr.plan-restock td.pt-id{ background:#FBF0DA; box-shadow:inset 3px 0 0 var(--op-orange); }
+.op-report .plan-table tr.plan-restock:hover td{ background:#F8EDD6; }
+.op-report .plan-table tfoot td{ background:#EEF1F3; border-top-color:var(--op-border); }
+.op-report .plan-table tfoot td.pt-id{ background:#EEF1F3; }
+.op-report .plan-table tr.plan-wh-only td{ background:#FBFCFD; }
+.op-report .pt-name{ color:var(--op-ink); }
+.op-report .pt-meta{ color:var(--op-ink-3); }
+.op-report .pt-brand{ color:var(--op-steel); }
+.op-report .plan-table td.pt-strong{ color:var(--op-ink); }
 `;
 
 /* Chart colours, exported so recharts series stay in step with the CSS tokens

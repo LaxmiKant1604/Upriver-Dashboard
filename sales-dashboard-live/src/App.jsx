@@ -3042,6 +3042,17 @@ function DashboardApp({ session, access, onSignOut }) {
     () => planColumns.filter((c) => (c.locked || !planHiddenCols.has(c.id)) && (planData?.isUS || !c.awd)),
     [planColumns, planHiddenCols, planData?.isUS]
   );
+  // Presentation-only: consecutive same-group runs of the visible columns, for a
+  // clear grouped header row (Identity / Sales / Forecast / Inventory / ...).
+  const planGroupSpans = useMemo(() => {
+    const runs = [];
+    for (const c of planVisibleColumns) {
+      const g = c.group || "";
+      if (runs.length && runs[runs.length - 1].group === g) runs[runs.length - 1].span += 1;
+      else runs.push({ group: g, span: 1 });
+    }
+    return runs;
+  }, [planVisibleColumns]);
   // Grouped, ordered column list for the chooser (preserves model order within each group).
   const planColumnGroups = useMemo(() => {
     const order = []; const byGroup = new Map();
@@ -3778,7 +3789,7 @@ function DashboardApp({ session, access, onSignOut }) {
 
         <div className={"main-area"
           + (view === "dashboard" && dashboardMode === "account" ? " dash-workspace" : "")
-          + ((view === "brandview" || view === "daily" || view === "returns" || (view === "dashboard" && dashboardMode === "brand")) ? " op-workspace" : "")}>
+          + ((view === "brandview" || view === "daily" || view === "returns" || view === "fbaplan" || (view === "dashboard" && dashboardMode === "brand")) ? " op-workspace" : "")}>
           {/* Isolated fluid-motion background, only behind the account Dashboard.
               It self-disables under reduced motion / low-power / no-WebGL and
               falls back to the static CSS wash, so nothing here can block or
@@ -4327,7 +4338,7 @@ function DashboardApp({ session, access, onSignOut }) {
       )}
 
       {view === "fbaplan" && (
-      <div className="container">
+      <div className="container plan-page op-report">
         <div className="controls-bar">
           <div>
             <div className="page-title">FBA Shipment Plan</div>
@@ -4408,6 +4419,15 @@ function DashboardApp({ session, access, onSignOut }) {
             <div className="plan-scroll">
               <table className="plan-table">
                 <thead>
+                  {/* Presentation-only group band: Identity / Sales / Forecast / Inventory / ... */}
+                  <tr className="plan-group-row" aria-hidden="true">
+                    {planGroupSpans.map((g, i) => (
+                      <th key={g.group + i} colSpan={g.span}
+                        className={"plan-group-th plan-group-" + g.group.toLowerCase().replace(/[^a-z]+/g, "-") + (i === 0 ? " plan-group-id" : "")}>
+                        {g.group === "Identity" ? "" : g.group}
+                      </th>
+                    ))}
+                  </tr>
                   <tr>
                     {planVisibleColumns.map((c) => (
                       c.sortKey
