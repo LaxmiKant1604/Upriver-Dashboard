@@ -1831,6 +1831,133 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
       radial-gradient(1100px 560px at 84% -8%, rgba(94,156,214,.14), transparent 60%),
       linear-gradient(180deg,#EDF1F5,#F1F4F6); }
 }
+
+/* ========================================================================
+   PREMIUM REPORT LAYER (.op-report) — the five redesigned reports
+   ------------------------------------------------------------------------
+   Scoped ENTIRELY under \`.op-report\`, a class added ONLY to Brand View, Daily
+   Reporting, Returns & Refund Leakage, FBA Shipment Plan and SKU Movement, so
+   these rules can NEVER leak into any other report (several of which share
+   .panel / .data-table / .skupl-page). Re-skins the SHARED primitives to the
+   Amazon-inspired operational system used by the Sales Dashboard (pearl
+   surfaces, cool-neutral workspace, deep-navy table headers, steel-blue accents,
+   emerald/coral semantics, 8px radius, tabular numerals). Presentation only.
+   ======================================================================== */
+
+/* Cool-neutral workspace + a subtle, STATIC atmosphere painted as a background
+   gradient DIRECTLY on .main-area (no pseudo-element, no positioning) so it can
+   never affect layout width or a flex scroll container's shrink -- and never
+   sits above the content (the pearl cards are opaque and cover it; it only shows
+   in the open gutters, never behind a table). Added to .main-area for these
+   views only, so no other report's workspace is affected. */
+.main-area.op-workspace{
+  background:
+    radial-gradient(1200px 620px at 84% -6%, rgba(94,156,214,.14), transparent 60%),
+    radial-gradient(900px 520px at 0% 106%, rgba(28,84,146,.08), transparent 58%),
+    var(--op-bg);
+  background-attachment:fixed, fixed, scroll;
+}
+
+/* Titles / sub / footer. */
+.op-report .page-title{ color:var(--op-ink); letter-spacing:-.01em; }
+.op-report .page-sub{ color:var(--op-ink-2); }
+.op-report .section-label{ color:var(--op-ink-3); }
+.op-report .footer-note{ color:var(--op-ink-2); border-top-color:var(--op-border-2); font-size:11.5px; line-height:1.7; }
+.op-report .footer-note code{ color:var(--op-ink); background:#EEF1F3; }
+.op-report .footer-note strong{ color:var(--op-ink); }
+
+/* Surfaces: pearl white, thin op border, 8px, controlled shadow. */
+.op-report .panel,
+.op-report .chart-card{
+  background:var(--op-card); border:1px solid var(--op-border); border-radius:8px;
+  box-shadow:0 1px 2px rgba(15,17,17,.05), 0 12px 30px -22px rgba(15,23,32,.30);
+}
+.op-report .panel-title,.op-report .chart-card-title{ color:var(--op-ink); font-weight:800; }
+.op-report .chart-card-head{ border-bottom-color:var(--op-hair); background:none; }
+.op-report .chart-card-sub{ color:var(--op-ink-3); }
+
+/* Controls: op borders, steel-blue active, amber focus. */
+.op-report .segmented,.op-report .seg,.op-report .report-tabs{ background:#EEF1F3; border:1px solid var(--op-border); box-shadow:inset 0 1px 2px rgba(15,17,17,.03); border-radius:9px; }
+.op-report .segmented button,.op-report .seg button,.op-report .report-tabs button{ color:var(--op-ink-2); font-weight:750; }
+.op-report .segmented button:hover:not(.active),.op-report .seg button:hover:not(.active),.op-report .report-tabs button:hover:not(.active){ color:var(--op-ink); background:rgba(255,255,255,.75); }
+.op-report .segmented button.active,.op-report .seg button.active,.op-report .report-tabs button.active{ color:var(--op-steel); background:#FFFFFF; box-shadow:0 1px 3px rgba(15,17,17,.12); }
+.op-report .segmented button:focus-visible,.op-report .seg button:focus-visible,.op-report .report-tabs button:focus-visible{ outline:2px solid var(--op-orange); outline-offset:1px; }
+.op-report .chip{ border:1px solid var(--op-border); background:#fff; color:var(--op-ink-2); }
+.op-report .chip:hover{ border-color:#B9C0C5; color:var(--op-ink); }
+.op-report .chip.active{ border-color:var(--op-steel); background:#E9F1F8; color:var(--op-steel); }
+.op-report .plan-export-btn,.op-report .plan-tool-btn{ border-radius:8px; }
+
+/* Notices / freshness / observed-units: quiet premium. */
+.op-report .alert{ border-radius:9px; }
+.op-report .alert.info{ background:#EFF5FA; border-color:#CFE0EE; color:#1B4E76; }
+.op-report .alert.warning{ background:#FBF5E7; border-color:#E7D19A; color:var(--op-warn-ink); }
+.op-report .alert.error{ background:var(--op-red-soft); border-color:var(--op-red-border); color:#8A2D17; }
+.op-report .recon-freshness,.op-report .plan-freshness{ background:#FBFCFD; border:1px solid var(--op-border-2); color:var(--op-ink-3); border-radius:9px; }
+.op-report .recon-freshness strong,.op-report .plan-freshness strong{ color:var(--op-ink); }
+.op-report .obs-units{ border:1px solid var(--op-border-2); border-radius:10px; background:#FBFCFD; }
+.op-report .obs-units-title{ color:var(--op-ink); }
+.op-report .obs-units-total,.op-report .obs-units-note{ color:var(--op-ink-3); }
+
+/* Generic KPI surfaces (metric/plan/recon/skupl) -> pearl premium. */
+.op-report .metric-card,.op-report .cmp-card,.op-report .plan-stat,.op-report .recon-kpi,.op-report .skupl-kpi{ background:var(--op-card); border:1px solid var(--op-border); border-radius:8px; box-shadow:0 1px 2px rgba(15,17,17,.05); }
+.op-report .metric-card:hover,.op-report .plan-stat:hover,.op-report .recon-kpi:hover,.op-report .skupl-kpi:hover{ border-color:#C3CACE; box-shadow:0 10px 26px -12px rgba(15,23,32,.28); }
+.op-report .plan-stat-label,.op-report .recon-kpi-label,.op-report .skupl-kpi-label,.op-report .metric-label,.op-report .cmp-label{ color:var(--op-ink-2); }
+.op-report .plan-stat-value,.op-report .recon-kpi-value,.op-report .skupl-kpi-value,.op-report .metric-value{ color:var(--op-ink); }
+
+/* Tables: deep-navy sticky header, op borders, tabular, calm hover, sticky id. */
+.op-report .data-table thead th,
+.op-report .plan-table thead th,
+.op-report .daily-table thead th,
+.op-report .bv-table th{
+  background:var(--op-navy); color:rgba(233,238,242,.82);
+  border-bottom:1px solid rgba(0,0,0,.20); text-transform:uppercase; letter-spacing:.06em;
+}
+.op-report .bv-table th.bv-first{ color:#FFFFFF; }
+.op-report .plan-table thead th.pt-id,.op-report .daily-table thead th.dt-metric{ color:#FFFFFF; }
+.op-report .data-table td,.op-report .plan-table td,.op-report .daily-table td,.op-report .bv-table td{ border-color:var(--op-hair); color:var(--op-ink); }
+.op-report .bv-table td.bv-first{ color:var(--op-ink); }
+.op-report .plan-table td.pt-id{ background:var(--op-card); }
+.op-report .data-table tbody tr:hover td,.op-report .plan-table tbody tr:hover td,.op-report .bv-table tbody tr:hover td{ background:#F3F6F8; }
+.op-report .plan-table tbody tr:hover td.pt-id{ background:#EEF2F5; }
+
+/* Badges + trend -> op semantics (emerald / coral / amber / steel). */
+.op-report .status-badge.good,.op-report .pt-badge.plan-prio-ok{ background:var(--op-green-soft); color:var(--op-green); border-color:var(--op-green-border); }
+.op-report .status-badge.bad,.op-report .pt-badge.plan-prio-critical{ background:var(--op-red-soft); color:var(--op-red); border-color:var(--op-red-border); }
+.op-report .status-badge.warn,.op-report .pt-badge.plan-prio-high{ background:var(--op-warn-soft); color:var(--op-warn-ink); border-color:var(--op-warn-border); }
+.op-report .pt-badge.plan-prio-medium{ background:#E9F1F8; color:var(--op-steel); border-color:#CFE0EE; }
+.op-report .trend.up,.op-report .cmp-value.up,.op-report .sku-pos{ color:var(--op-green); }
+.op-report .trend.down,.op-report .cmp-value.down,.op-report .sku-neg{ color:var(--op-red); }
+.op-report .cell-share{ color:var(--op-ink-3); }
+
+/* ---- BRAND VIEW (.bv-page) ---------------------------------------------- */
+.op-report .bv-select{ border-color:var(--op-border); border-radius:8px; color:var(--op-ink); }
+.op-report .bv-select:hover:not(:disabled){ border-color:#B9C0C5; }
+.op-report .bv-field-label{ color:var(--op-ink-3); }
+.op-report .bv-menu{ border-color:var(--op-border); border-radius:9px; }
+.op-report .bv-menu button:hover{ background:#E9F1F8; color:var(--op-steel); }
+/* KPI tiles: neutralise the inline gradient (rvkpi) -> pearl + restrained key. */
+.op-report .rvkpi{ background:var(--op-card)!important; color:var(--op-ink)!important; border:1px solid var(--op-border); border-radius:8px; box-shadow:0 1px 2px rgba(15,17,17,.05); }
+.op-report .rvkpi-label,.op-report .rvkpi-sub{ color:var(--op-ink-3)!important; }
+.op-report .rvkpi-value{ color:var(--op-ink)!important; }
+.op-report .rvkpi-hint button,.op-report .rvkpi-hint svg{ color:var(--op-ink-3)!important; }
+.op-report .rvkpi-pos{ color:var(--op-green)!important; } .op-report .rvkpi-neg{ color:var(--op-red)!important; }
+.op-report .bv-kpis .rvkpi:nth-child(1){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--dash-primary); }
+.op-report .bv-kpis .rvkpi:nth-child(2){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-steel-2); }
+.op-report .bv-kpis .rvkpi:nth-child(3){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-green); }
+.op-report .bv-kpis .rvkpi:nth-child(4){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-orange-dark); }
+/* bv-table column accents -> op palette; totals/bands/sections premium. */
+.op-report .bv-table .bv-col-positive{ color:var(--op-green); }
+.op-report .bv-table th.bv-col-positive{ color:#9FE3C4; }
+.op-report .bv-table .bv-col-accent{ color:var(--op-steel); }
+.op-report .bv-table th.bv-col-accent{ color:#BBD6EE; }
+.op-report .bv-table .bv-col-latest,.op-report .bv-table .bv-col-total{ background:#EAF1F8; color:var(--op-ink); }
+.op-report .bv-table th.bv-col-latest,.op-report .bv-table th.bv-col-total{ color:#FFD9A6; box-shadow:inset 0 -2px 0 var(--op-orange); }
+.op-report .bv-table tbody tr:hover td.bv-col-latest,.op-report .bv-table tbody tr:hover td.bv-col-total{ background:#DEEAF5; }
+.op-report .bv-table .bv-total td{ background:#F1F4F6; }
+.op-report .bv-table .bv-total td.bv-first{ background:#EAF1F8; color:var(--op-steel); }
+.op-report .bv-table .bv-total .cell-share{ color:var(--op-steel); }
+.op-report .bv-table .bv-band td{ background:#F6F8FA; color:var(--op-ink-2); }
+.op-report .bv-table .bv-section td{ color:var(--op-ink-3); }
 `;
 
 /* Chart colours, exported so recharts series stay in step with the CSS tokens

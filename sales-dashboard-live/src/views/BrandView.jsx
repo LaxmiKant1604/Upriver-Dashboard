@@ -263,7 +263,7 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
   );
 
   return (
-    <div className="container bv-page">
+    <div className="container bv-page op-report">
       <div className="page-head">
         <div>
           <div className="page-title">Brand View</div>

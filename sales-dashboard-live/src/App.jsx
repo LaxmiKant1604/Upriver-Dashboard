@@ -3776,7 +3776,9 @@ function DashboardApp({ session, access, onSignOut }) {
 
         {mobileOpen && <div className="sb-backdrop" onClick={() => setMobileOpen(false)} />}
 
-        <div className={"main-area" + (view === "dashboard" && dashboardMode === "account" ? " dash-workspace" : "")}>
+        <div className={"main-area"
+          + (view === "dashboard" && dashboardMode === "account" ? " dash-workspace" : "")
+          + ((view === "brandview" || (view === "dashboard" && dashboardMode === "brand")) ? " op-workspace" : "")}>
           {/* Isolated fluid-motion background, only behind the account Dashboard.
               It self-disables under reduced motion / low-power / no-WebGL and
               falls back to the static CSS wash, so nothing here can block or

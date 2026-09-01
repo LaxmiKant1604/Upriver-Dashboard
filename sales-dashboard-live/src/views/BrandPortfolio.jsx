@@ -297,7 +297,7 @@ export default function BrandPortfolio({
   const accountCount = model?.accounts?.length || 0;
 
   return (
-    <div className="container bv-page">
+    <div className="container bv-page op-report">
       <div className="page-head">
         <div>
           <div className="page-title">Brand View</div>
