@@ -1,0 +1,60 @@
+name: regional-dry-run
+
+# READ-ONLY, MANUAL-ONLY regional scheduler dry-run. Discovers accounts from the DataDoe directory (ZERO tokens),
+# routes them into india / europe-au / us-ca, forms deterministic <=5-seller batches, and prints the per-region
+# OLI + Campaign + shared-Catalog export/token plan against the live balance. It NEVER creates an export, opens a
+# control, or writes a cycle. Use it to prove the plan + balance before the cron cutover (and any time thereafter).
+#
+# Required repository secrets (never printed): DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if configured),
+# SUPABASE_URL (or VITE_SUPABASE_URL), SUPABASE_SERVICE_ROLE_KEY, POSTGRES_URL.
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "all | india | europe-au | us-ca"
+        required: false
+        default: "all"
+
+concurrency:
+  group: regional-dry-run
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Verify required secrets present (fail fast, never print values)
+        run: |
+          set -uo pipefail
+          missing=""
+          for v in DATADOE_API_KEY; do
+            if [ -z "${!v:-}" ]; then missing="$missing $v"; fi
+          done
+          if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
+          echo "Required secrets present."
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Regional dry-run (ZERO creates, ZERO writes)
+        run: node scripts/release/regional-scheduler-dry-run.mjs --region=${{ github.event.inputs.region }}
