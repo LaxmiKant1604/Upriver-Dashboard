@@ -29,6 +29,8 @@ import {
   claimRefreshLock,
   deleteReportSnapshotByKey,
   getAsinAdsDailyRows,
+  getActiveAdsDailyRows,
+  getCampaignBrandMappings,
   getDashboardAccess,
   getDailyAdsCoverage,
   getLatestReportSnapshot,
@@ -128,6 +130,14 @@ function oliCompletenessAugmentPortfolio(accountIds) {
   const fp = primaryOrgFingerprintOrNull();
   return fp ? makePortfolioCompletenessAugment({ organizationFingerprint: fp, connectionId: "primary", accountIds, read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows, readEstimates: getSourceOliSalesEstimateRows }) : null;
 }
+// The live campaign->brand mapping reader Brand View uses (post ASIN->Campaign cutover) to attribute campaign ad rows
+// to a brand. Returns [] when there is no primary connection or on any read failure, so brand ad attribution is
+// honestly empty (never fabricated, never ASIN) rather than erroring. Until campaigns are mapped it returns no
+// mappings -> every brand's campaign ad spend is 0 where campaign data exists.
+function campaignMappingsReader() {
+  const fp = primaryOrgFingerprintOrNull();
+  return async ({ accountId }) => (fp ? getCampaignBrandMappings({ organizationFingerprint: fp, connectionId: "primary", accountId }).catch(() => []) : []);
+}
 import { makeRouteDeadline } from "../lib/server/sync/source-bucket-sync-runtime.js";
 import { isCancelledStatus } from "../lib/server/sync/oli-order-rules.js";
 import { getEnrichedOliHistoryRows } from "../lib/server/sync/oli-enriched-history.js";
@@ -160,7 +170,7 @@ import {
   selectorBrandsForAccount, buildBrandAccountMembership, brandKey, brandDisplay,
   serialiseBrandAccountMembership, membershipFingerprint, primaryAccountIdsOnly,
 } from "../lib/server/reports/brand-membership.js";
-import { aggregateAsinAdsDailyRows } from "../lib/server/reports/asin-ads-aggregation.js";
+import { canonicalizeAdRows } from "../lib/server/sync/daily-ads-loader.js";
 import { refreshCorrectedBrandSalesForAccount } from "../lib/server/reports/brand-sales-live.js";
 import { summarizeExplicitZeroOli, brandByAsinFromCatalog } from "../lib/server/reports/oli-quality.js";
 import { rederiveDailyV2, latestProvenDailyTo, DAILY_OLI_SOURCE_KEY } from "../lib/server/reports/daily-durable-rederive.js";
@@ -2856,6 +2866,7 @@ async function handleDataDoe(req, res) {
           account: accountMeta,
           getSnapshot: getLatestReportSnapshotHydrated,
           getAdsRows: getAdsDailySourceRows,
+          getCampaignMappings: campaignMappingsReader(),
         }),
       });
       return;
@@ -2930,6 +2941,7 @@ async function handleDataDoe(req, res) {
         getAdsRows: getAdsDailySourceRows,
         getCatalogRows: getBrandViewCatalogRows,
         deadline: portfolioDeadline,
+        getCampaignMappings: campaignMappingsReader(),
       });
       await serveSharedReport({
         res,
@@ -3053,7 +3065,7 @@ async function handleDataDoe(req, res) {
             // serves the SAME Total Sales as the scheduler-published snapshot (one canonical calculation).
             readOliHistory: getEnrichedOliHistoryRows,
             readOliCoverage: getSourceCoverageWindows,
-            readAsinAds: getAsinAdsDailyRows,
+            readAsinAds: getActiveAdsDailyRows,
             readAdsCoverage: getDailyAdsCoverage,
             readCatalogSnapshot: getSourceSnapshot,
             loadCatalogPayload: getSourceSnapshotPayload,
@@ -3388,28 +3400,16 @@ async function handleDataDoe(req, res) {
       const salesRaw = await fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to);
       const rows = normalizeDailySalesRows(rollupSupersetToDaily(salesRaw));
       for (const r of rows) r.total_units_sold = r.total_units;
-      // The scheduled Ads worker owns the durable ASIN Ads dataset (asin-performance-v1, the SINGLE reusable
-      // advertising source Daily shares with Brand View). Reading its saved rows avoids another DataDoe export
-      // whenever a user opens or refreshes Daily Reporting. The shared aggregation folds every ASIN into per-
-      // (date, currency) totals (ad_sales_same_sku -> ad_sales; no campaign halo), stamped with the same seller
-      // key the campaign path used so mergeSalesAndAds behaves identically. Keep a REST fallback until the first
-      // scheduled seed has completed for an existing deployment.
-      let ads;
+      // The scheduled Ads worker owns the durable ACTIVE Ads dataset. After the ASIN->Campaign cutover Daily reads the
+      // durable CAMPAIGN grain (campaign-performance-v1) -- its total ad_sales (ACoS/TACoS/ROI now mean total-attributed,
+      // not same-SKU) -- via the same active reader + dispatcher Brand View shares (rollback flips both back to ASIN).
+      // canonicalizeAdRows folds to per-(date, currency) totals stamped with the authoritative seller key so
+      // mergeSalesAndAds behaves identically. Post-cutover there is NO live ASIN fallback: when the durable store is
+      // unavailable, ads are reported unavailable (honest) rather than read from the retired ASIN source.
+      let ads = [];
       if (isSupabaseConfigured()) {
-        const asinRows = await getAsinAdsDailyRows(accountScope.accountIds[0], from, to);
-        ads = normalizeAdRows(aggregateAsinAdsDailyRows(asinRows, { rawSellerId: accountScope.accountIds[0] }));
-      } else {
-        const adRaw = await fetchExportRows(
-          apiKey,
-          ADS_SOURCE_ID,
-          ADS_COLUMNS,
-          sellerOrVendorIds,
-          from,
-          to,
-          DAILY_ROW_LIMIT,
-          { groupBy: ADS_GROUP_BY, aggregations: ADS_AGGREGATIONS }
-        );
-        ads = normalizeAdRows(adRaw);
+        const adDurableRows = await getActiveAdsDailyRows(accountScope.accountIds[0], from, to);
+        ads = normalizeAdRows(canonicalizeAdRows(adDurableRows, accountScope.accountIds[0]));
       }
       mergeSalesAndAds(rows, ads);
       await sendLegacyPayload({ rows, brandFiltered: false });

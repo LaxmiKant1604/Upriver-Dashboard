@@ -11,10 +11,11 @@ import { OLI_SOURCE_KEY, ORGANIZATION_SCOPE_KEY, windowsProve } from "./source-d
 
 export const OLI_TOKENS_PER_CREATE = 2; // one STANDARD DataDoe export
 
-// The ONLY source families the automatic scheduler runs: canonical OLI, the org-wide Catalog, and ASIN Ads
-// (ads-asin-date). These show schedule_enabled=true + paused=false in source_controls; every other family --
-// INCLUDING Campaign Ads (ads-campaign-date) and FBA -- stays schedule-disabled.
-export const SCHEDULED_ENABLED_SOURCE_KEYS = Object.freeze(["order-line-items", "product-catalog", "ads-asin-date"]);
+// The ONLY source families the automatic scheduler runs: canonical OLI, the org-wide Catalog, and (post
+// ASIN->Campaign cutover) CAMPAIGN Ads (ads-campaign-date). These show schedule_enabled=true + paused=false in
+// source_controls; every other family -- INCLUDING the now-retired ASIN Ads (ads-asin-date) and FBA -- stays
+// schedule-disabled (ASIN exports are additionally hard-blocked in ads-sync.js; its durable history is retained).
+export const SCHEDULED_ENABLED_SOURCE_KEYS = Object.freeze(["order-line-items", "product-catalog", "ads-campaign-date"]);
 
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";

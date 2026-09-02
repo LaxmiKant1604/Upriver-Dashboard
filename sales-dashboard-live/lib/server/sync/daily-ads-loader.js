@@ -19,12 +19,14 @@
 
 import { resolveDataDoeAccountIds } from "../datadoe-connections.js";
 import { aggregateAsinAdsDailyRows } from "../reports/asin-ads-aggregation.js";
+import { aggregateCampaignAdsDailyRows } from "../reports/campaign-ads-aggregation.js";
+import { ACTIVE_ADS_SOURCE_KEY } from "../active-ads-source.js";
 
-// The ONE Ads source Daily Reporting reads: the durable ASIN grain (asin-performance-v1, in
-// ads_daily_source_rows) -- the SINGLE reusable advertising source it shares with Brand View. Its attributed
-// sales is ad_sales_same_sku (same-SKU only; no campaign halo). The overlapping campaign grain is NEVER summed
-// with it. (Historically Daily read the aggregated campaign table ad_daily_metrics; that grain is now PPC-only.)
-export const DAILY_ADS_SOURCE_KEY = "asin-performance-v1";
+// The ONE Ads source Daily Reporting reads. After the ASIN->Campaign cutover this is the durable CAMPAIGN grain
+// (campaign-performance-v1) -- its attributed sales is the campaign contract's total ad_sales (ACoS/TACoS/ROI now
+// mean total-attributed, not same-SKU). Rollback flips ACTIVE_ADS_SOURCE_KEY back to asin-performance-v1. The ASIN
+// and campaign grains OVERLAP and are NEVER summed together (only the ACTIVE one is read).
+export const DAILY_ADS_SOURCE_KEY = ACTIVE_ADS_SOURCE_KEY;
 
 /**
  * Canonicalize durable ASIN-Ads rows (ads_daily_source_rows, source asin-performance-v1) into merge-ready Daily
@@ -34,8 +36,10 @@ export const DAILY_ADS_SOURCE_KEY = "asin-performance-v1";
  * ad_sales_same_sku -> ad_sales. The seller id is the AUTHORITATIVE raw seller/vendor id (never a row's) so rows
  * match the sales rows and can be validated per account. Pure.
  */
-export function canonicalizeAdRows(asinRows, rawSellerId) {
-  return aggregateAsinAdsDailyRows(asinRows, { rawSellerId });
+export function canonicalizeAdRows(adRows, rawSellerId) {
+  return ACTIVE_ADS_SOURCE_KEY === "asin-performance-v1"
+    ? aggregateAsinAdsDailyRows(adRows, { rawSellerId })
+    : aggregateCampaignAdsDailyRows(adRows, { rawSellerId });
 }
 
 /**

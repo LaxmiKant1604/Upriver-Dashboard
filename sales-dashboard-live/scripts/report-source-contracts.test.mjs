@@ -428,9 +428,9 @@ test("daily-reporting catalog matches PRODUCT_CATALOG_COLUMNS + CATALOG_ROW_LIMI
   // No per-brand and no compact all-brand export: exactly two owned exports.
   assert.equal(daily.length, 2);
   assert.deepEqual(daily.map((x) => x.requestKey), ["daily-reporting:oli-sales", "daily-reporting:catalog"]);
-  // Ads remain a derived dependency, not an owned export -- now the ASIN grain (single reusable Ads source).
-  assert.ok((REPORT_DERIVED_SOURCE_KEYS["daily-reporting"] || []).includes("ads-asin-date"));
-  assert.ok(!(REPORT_DERIVED_SOURCE_KEYS["daily-reporting"] || []).includes("ads-campaign-date"), "campaign grain is PPC-only now");
+  // Ads remain a derived dependency, not an owned export -- post ASIN->Campaign cutover it is the CAMPAIGN grain.
+  assert.ok((REPORT_DERIVED_SOURCE_KEYS["daily-reporting"] || []).includes("ads-campaign-date"));
+  assert.ok(!(REPORT_DERIVED_SOURCE_KEYS["daily-reporting"] || []).includes("ads-asin-date"), "ASIN grain retired from Daily (PPC-only, history retained)");
 });
 test("daily-reporting derivation strategy derives all-brand + named-brand from the superset (no per-brand export)", () => {
   const d = REPORT_DERIVATION["daily-reporting"];

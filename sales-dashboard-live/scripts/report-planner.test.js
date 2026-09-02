@@ -182,18 +182,19 @@ const PL_SUPERSET = [
 ];
 const PL_CATALOG = [{ child_asin: "ASIN000001", product_brand: "Acme" }, { child_asin: "ASIN000002", product_brand: "Beta" }];
 const plMetric = (d, over = {}) => ({ metric_date: d, campaign_id: "c1", campaign_type: "SP", currency: "USD", ad_sales: 10, ad_spend: 5, ad_clicks: 3, ...over });
-// A durable ASIN-Ads row (ads_daily_source_rows, asin-performance-v1) -- Daily now reads THIS grain. Its metrics
-// live in a JSONB; the loader folds every ASIN per (date, currency): ad_sales_same_sku -> ad_sales. Each row
-// carries a UNIQUE dimension_key so two ASINs on one day are not deduplicated away before the fold.
+// A durable CAMPAIGN-Ads row (ads_daily_source_rows, campaign-performance-v1) -- post ASIN->Campaign cutover Daily
+// reads THIS grain. Its metrics live in a JSONB; the loader folds every campaign per (date, currency) using the
+// campaign contract's total ad_sales. Each row carries a UNIQUE dimension_key so two campaigns on one day are not
+// deduplicated away before the fold.
 let plAsinSeq = 0;
 const asinAdRow = (d, over = {}) => ({
   metric_date: d,
   marketplace_country_code: over.country || "US",
   dimension_key: over.dim || ("dk-" + (plAsinSeq += 1)),
   currency: over.currency === undefined ? "USD" : over.currency,
-  child_asin: over.child_asin ?? "B0A",
+  campaign_id: over.campaign_id ?? "c" + plAsinSeq,
   updated_at: over.updated_at || "2026-03-06T00:00:00Z",
-  metrics: over.metrics || { ad_sales_same_sku: over.ad_sales ?? 10, ad_spend: over.ad_spend ?? 5, ad_clicks: over.ad_clicks ?? 3 },
+  metrics: over.metrics || { ad_sales: over.ad_sales ?? 10, ad_spend: over.ad_spend ?? 5, ad_clicks: over.ad_clicks ?? 3 },
 });
 const plDailyRequest = (accountId, country, currency) => planDailyReporting({ accountId, country, currency, connections: PL_CONN, asOf: PL_AS_OF });
 
@@ -405,12 +406,12 @@ test("planner: loader reads the ASIN grain ONLY (not overlapping raw Ads tables)
 });
 
 test("planner: canonical rows stamp the raw seller id + fold every ASIN per (date, currency)", async () => {
-  const rows = canonicalizeAdRows([asinAdRow("2026-03-05"), asinAdRow("2026-03-05", { child_asin: "B0B", ad_sales: 4 })], "A1");
-  assert.equal(rows.length, 1, "two ASINs on one date+currency fold to ONE canonical row (ad_sales_same_sku -> ad_sales)");
+  const rows = canonicalizeAdRows([asinAdRow("2026-03-05"), asinAdRow("2026-03-05", { campaign_id: "c9", ad_sales: 4 })], "A1");
+  assert.equal(rows.length, 1, "two campaigns on one date+currency fold to ONE canonical row (campaign ad_sales)");
   assert.deepEqual(rows[0], { date: "2026-03-05", seller_or_vendor_id: "A1", currency: "USD", ad_sales: 14, ad_spend: 10, ad_clicks: 6 });
   assert.ok(rows.every((r) => r.seller_or_vendor_id === "A1"));
   // A present-but-corrupt metric poisons the total to NaN so the coverage validator BLOCKS it (never coerced to 0).
-  assert.ok(Number.isNaN(canonicalizeAdRows([asinAdRow("2026-03-05", { metrics: { ad_sales_same_sku: "oops" } })], "A1")[0].ad_sales));
+  assert.ok(Number.isNaN(canonicalizeAdRows([asinAdRow("2026-03-05", { metrics: { ad_sales: "oops" } })], "A1")[0].ad_sales));
 });
 
 test("planner: availability -- validated / new-account partial / stale / unavailable / failed", async () => {

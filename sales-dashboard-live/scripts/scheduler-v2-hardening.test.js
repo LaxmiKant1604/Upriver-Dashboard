@@ -114,10 +114,11 @@ test("10. the release is --strict-d1 and its clamp gate is coverage-based (provi
   assert.match(release, /strictD1 && rollup\.derived && rollup\.derived\.asOfClamped === true/, "clamp gate is the bucket-wide effectivePublishAsOf, not per-account sales date");
 });
 
-/* 18/19. controls always safe-close; Campaign Ads / FBA never create exports */
-test("18/19. controls safe-close ALWAYS; the scheduler never runs Campaign Ads / FBA export steps", () => {
+/* 18/19. controls always safe-close; post ASIN->Campaign cutover the scheduler refreshes Campaign Ads (active), never ASIN/FBA */
+test("18/19. controls safe-close ALWAYS; the scheduler refreshes the active Campaign Ads grain, never the retired ASIN Ads or FBA", () => {
   assert.match(yml, /if:\s*always\(\) && \(steps\.cfg\.outputs\.bucket != 'us' \|\| steps\.us_guard\.outputs\.run_required == 'true'\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS when a pipeline run could have opened controls");
-  assert.doesNotMatch(yml, /campaign-ads|fba-refresh|campaign_ads/i, "no Campaign Ads / FBA export step in the scheduler");
+  assert.match(yml, /scheduled-campaign-ads-refresh\.mjs/, "the scheduler refreshes the ACTIVE Campaign Ads grain");
+  assert.doesNotMatch(yml, /scheduled-asin-ads-refresh|fba-refresh/i, "no retired ASIN Ads / FBA export step in the scheduler");
 });
 
 test("US duplicate guard selects only exact D-1 identities for every account x three reports", () => {
@@ -158,7 +159,7 @@ test("US duplicate guard runs before production I/O and every later write/create
   assert.ok(guardIdx > 0 && guardIdx < preflightIdx, "US proof runs before cycle/token/create/control I/O");
   assert.match(yml, /id:\s*us_guard[\s\S]*?if:\s*steps\.cfg\.outputs\.bucket == 'us'/, "the duplicate guard is US-only");
   assert.match(yml, /ALREADY_PUBLISHED_US_D1 -- exact live read-backs passed; zero creates, zero controls, zero tokens/, "the green no-op is explicit");
-  for (const command of ["scheduled-cycle-preflight.mjs", "confirm-token-budget.mjs", "oli-refresh-d1.mjs", "scheduled-asin-ads-refresh.mjs", "priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
+  for (const command of ["scheduled-cycle-preflight.mjs", "confirm-token-budget.mjs", "oli-refresh-d1.mjs", "scheduled-campaign-ads-refresh.mjs", "priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
     const at = yml.indexOf(command);
     assert.ok(at > 0, "workflow command missing: " + command);
     const before = yml.slice(Math.max(0, at - 420), at);

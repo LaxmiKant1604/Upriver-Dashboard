@@ -31,13 +31,18 @@
 // asinOf canonicalizes child_asin; asinAdsMetricsFromRow extracts ONLY the metrics the contract supplied
 // (a present ad_spend counts, an absent one is never invented as 0). Both reports derive ASIN Ads identically.
 import { asinOf, asinAdsMetricsFromRow } from "./asin-ads-aggregation.js";
+import { campaignIdentityOfRow, campaignAdsMetricsFromRow, campaignBrandMap } from "./campaign-ads-aggregation.js";
+import { brandKey } from "./brand-membership.js";
+import { ACTIVE_ADS_SOURCE_KEY } from "../active-ads-source.js";
 
 // ---------------------------------------------------------------- identifiers
 
 export const BRAND_VIEW_REPORT_KEY = "brand-view";
 // Bump when a formula or the payload shape changes, so a snapshot saved by an
 // older definition can never be presented as this one.
-export const BRAND_VIEW_VERSION = "brand-view-account-scoped-v1";
+// v2: ASIN->Campaign cutover -- ad columns now come from the campaign grain, attributed via the campaign->brand
+// mapping (empty until campaigns are mapped). Bumped so ASIN-based v1 snapshots re-derive instead of serving stale.
+export const BRAND_VIEW_VERSION = "brand-view-account-scoped-v2";
 
 export const BRAND_VIEW_BRANDS_REPORT_KEY = "brand-view-brands";
 export const BRAND_VIEW_BRANDS_VERSION = "brand-view-brands-v1";
@@ -56,8 +61,10 @@ export const PORTFOLIO_SLICE_CONCURRENCY = 4;
 export const BRAND_INVENTORY_SNAPSHOT_KEY = "brand-inventory";
 export const BRAND_INVENTORY_REPORT_VERSION = "brand-inventory-shared-v1";
 
-// The ASIN-level Ads history maintained by the scheduled worker.
-export const BRAND_VIEW_ADS_SOURCE_KEY = "asin-performance-v1";
+// The ACTIVE durable Ads grain maintained by the scheduled worker. After the ASIN->Campaign cutover this is the
+// campaign grain (campaign-performance-v1), attributed to brands via the manual campaign->brand mapping; rollback
+// flips ACTIVE_ADS_SOURCE_KEY back to asin-performance-v1 (attributed via the ASIN->brand catalog map).
+export const BRAND_VIEW_ADS_SOURCE_KEY = ACTIVE_ADS_SOURCE_KEY;
 
 // Saved snapshots that carry a usable brand name for one account, in preference
 // order. `brand-sales` is first because it is the only one whose brands are
@@ -331,6 +338,39 @@ export function aggregateBrandAds(adRows, asinBrand, brand) {
 }
 
 /**
+ * CAMPAIGN-grain equivalent of aggregateBrandAds for the ASIN->Campaign cutover: attribute each campaign row to a
+ * brand via the campaign identity -> brand-key map (campaign_brand_mapping) instead of child_asin -> brand, and fold
+ * the matched brand's ad_spend per (country, date). Same return shape as aggregateBrandAds. `brandKeyWanted` is the
+ * canonical key of the selected brand. An UNMAPPED campaign (absent from the map) still contributes to
+ * adCountries/coverage but NEVER to a brand's spend -- so until campaigns are mapped every brand honestly shows 0
+ * spend where campaign data exists (a real synced 0), never a fabricated value and never ASIN spend.
+ */
+export function aggregateBrandCampaignAdsSpend(adRows, campaignIdentityBrandKey, brandKeyWanted) {
+  const spendByKey = new Map();
+  const adCountries = new Set();
+  const coverageByCountry = new Map();
+  let matchedRows = 0;
+  const map = campaignIdentityBrandKey instanceof Map ? campaignIdentityBrandKey : new Map();
+  for (const row of adRows || []) {
+    const date = trimmed(row?.metric_date);
+    if (!parseDateStr(date)) continue;
+    const country = trimmed(row?.marketplace_country_code).toUpperCase();
+    adCountries.add(country);
+    const coverage = coverageByCountry.get(country) || { from: date, to: date };
+    if (date < coverage.from) coverage.from = date;
+    if (date > coverage.to) coverage.to = date;
+    coverageByCountry.set(country, coverage);
+    const id = campaignIdentityOfRow(row);
+    if (!id || map.get(id) !== brandKeyWanted) continue;
+    matchedRows += 1;
+    const key = seriesKey(country, date);
+    const spend = campaignAdsMetricsFromRow(row).spend;
+    spendByKey.set(key, (spendByKey.get(key) || 0) + (spend || 0));
+  }
+  return { spendByKey, adCountries: [...adCountries], coverageByCountry, matchedRows };
+}
+
+/**
  * Per-country FBA available units for ONE brand, from the saved fba-plan payload.
  *
  * `inventoryByBrandCountry` is the additive field the FBA Shipment Plan builder
@@ -588,7 +628,7 @@ export async function buildBrandViewBrandDirectory({ accountId, getSnapshot }) {
  * Returns null when this account has nothing for the brand, so the portfolio
  * build can skip it without treating it as an error.
  */
-export async function buildAccountBrandSlice({ accountId, brand, asOf, account, getSnapshot, getAdsRows, catalogRows = null, required = true }) {
+export async function buildAccountBrandSlice({ accountId, brand, asOf, account, getSnapshot, getAdsRows, catalogRows = null, required = true, getCampaignMappings = async () => [] }) {
   const salesSnapshot = await getSnapshot({ reportKey: "brand-sales", accountId });
   const salesPayload = salesSnapshot?.payload;
   if (!salesPayload?.rows?.length) {
@@ -640,20 +680,25 @@ export async function buildAccountBrandSlice({ accountId, brand, asOf, account, 
   const adsRequestFrom = monthBack(asOf, 5)?.from || monthStart(asOf);
   let adsError = null;
   let adRows = [];
-  if (asinBrand.size) {
+  let ads;
+  const readAdRows = async () => {
     try {
-      adRows = await getAdsRows({
-        accountId,
-        sourceKeys: [BRAND_VIEW_ADS_SOURCE_KEY],
-        from: adsRequestFrom,
-        to: asOf,
-        maxRows: ADS_MAX_ROWS,
-      });
-    } catch (error) {
-      adsError = error instanceof Error ? error.message : String(error);
-    }
+      adRows = await getAdsRows({ accountId, sourceKeys: [BRAND_VIEW_ADS_SOURCE_KEY], from: adsRequestFrom, to: asOf, maxRows: ADS_MAX_ROWS });
+    } catch (error) { adsError = error instanceof Error ? error.message : String(error); }
+  };
+  if (ACTIVE_ADS_SOURCE_KEY === "asin-performance-v1") {
+    // ASIN grain (rollback): attribute ad rows to a brand via the child_asin -> brand catalog map.
+    if (asinBrand.size) await readAdRows();
+    ads = aggregateBrandAds(adRows, asinBrand, brand);
+  } else {
+    // CAMPAIGN grain (post-cutover): attribute via the manual campaign -> brand mapping. The map is empty until
+    // campaigns are mapped -> every brand honestly shows 0 spend where campaign data exists, never fabricated,
+    // never ASIN. Always read campaign rows so adCountries reflects synced markets (real 0 vs unavailable).
+    let campaignMap = new Map();
+    try { const mrows = await getCampaignMappings({ accountId }); campaignMap = campaignBrandMap(mrows || [], (m) => m.brandKey); } catch { campaignMap = new Map(); }
+    await readAdRows();
+    ads = aggregateBrandCampaignAdsSpend(adRows, campaignMap, brandKey(brand));
   }
-  const ads = aggregateBrandAds(adRows, asinBrand, brand);
 
   // Inventory source: a VALID compact brand-inventory snapshot is AUTHORITATIVE. Once
   // it exists (correct report version + compact shape), it is used EXCLUSIVELY, even
@@ -980,9 +1025,9 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
 /**
  * The account-scoped Brand View report snapshot: exactly one account.
  */
-export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, getSnapshot, getAdsRows, getCatalogRows = null }) {
+export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, getSnapshot, getAdsRows, getCatalogRows = null, getCampaignMappings = async () => [] }) {
   const catalogRows = typeof getCatalogRows === "function" ? await getCatalogRows().catch(() => null) : null;
-  const slice = await buildAccountBrandSlice({ accountId, brand, asOf, account, getSnapshot, getAdsRows, catalogRows, required: true });
+  const slice = await buildAccountBrandSlice({ accountId, brand, asOf, account, getSnapshot, getAdsRows, catalogRows, required: true, getCampaignMappings });
   return assembleBrandViewPayload({ slices: [slice], brand, asOf, scope: "account" });
 }
 
@@ -994,7 +1039,7 @@ export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, 
  * can return a multi-megabyte saved Dashboard payload, and a serverless function
  * holding a dozen of those at once is how this route would run out of memory.
  */
-export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf, accountsById, getSnapshot, getAdsRows, getCatalogRows = null, deadline = null }) {
+export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf, accountsById, getSnapshot, getAdsRows, getCatalogRows = null, deadline = null, getCampaignMappings = async () => [] }) {
   // The reusable Product Catalog is org-scoped, so read it ONCE and reuse across every account slice (child_asin
   // -> product_brand is what maps each account's ad ASINs to this brand).
   const catalogRows = typeof getCatalogRows === "function" ? await getCatalogRows().catch(() => null) : null;
@@ -1016,6 +1061,7 @@ export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf,
       getAdsRows,
       catalogRows,
       required: false,
+      getCampaignMappings,
     })));
     for (let j = 0; j < built.length; j += 1) slices[i + j] = built[j];
   }

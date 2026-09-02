@@ -45,13 +45,14 @@ import {
   deriveDurableDashboardSnapshots, DAILY_ADS_GRAIN, BRAND_VIEW_ADS_GRAIN,
   dailyReportingReadiness, brandViewReadiness,
 } from "./durable-dashboards.js";
+import { ACTIVE_ADS_SOURCE_KEY } from "../active-ads-source.js";
 import { shadowSnapshotKey, REPORT_DERIVATIONS } from "./report-derivation.js";
 import { buildBrandInventorySnapshot, BRAND_INVENTORY_SNAPSHOT_KEY, BRAND_INVENTORY_REPORT_VERSION } from "../reports/brand-view.js";
 import {
   getSourceControls, getSourceCoverageWindows, getSourceSnapshot,
   recordSourceSnapshot, upsertSourceRunStatus,
   replaceOliHistoryWindow, replaceOliDimensionalWindow, recordOliCompleteness, saveSourceSnapshotPayload, getSourceSnapshotPayload,
-  getSourceOliHistoryRows, getDailyAdsCoverage, getAsinAdsDailyRows,
+  getSourceOliHistoryRows, getDailyAdsCoverage, getAsinAdsDailyRows, getActiveAdsDailyRows,
   getSourceOliOperationalUnitRows, getSourceOliDimensionalUnitRows, getSourceOliSalesEstimateRows, replaceOliSalesEstimatesWindow, getOliSkuAsinResolutionRows,
   listSourceBatchMembership, assignSourceAccountBatch,
   getReportSyncSettings, getSchedulerAccountRollout,
@@ -265,7 +266,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     readAdsCoverage = getDailyAdsCoverage,
     // Daily Reporting reads the durable ASIN grain (asin-performance-v1) -- the SINGLE reusable Ads source,
     // shared with Brand View. (Was getAdDailyMetrics / the campaign grain, now PPC-only.)
-    readAdMetrics = getAsinAdsDailyRows,
+    readAdMetrics = getActiveAdsDailyRows,
     readBatchMembership = listSourceBatchMembership,
     assignBatchMembership = assignSourceAccountBatch,
     readSettings = getReportSyncSettings,
@@ -528,12 +529,16 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       campaignCoverageStateByAccountId[a.accountId] = camp;
       campaignWindows[a.accountId] = camp.read === "ok" ? camp.windows : null;
       if (camp.read !== "ok") readBlockers.push({ sourceKey: "ads-campaign-date", accountId: a.accountId, reason: "ads-coverage-" + camp.read, blocksSales: false });
-      // ASIN-grain coverage is the AUTHORITATIVE Daily + Brand View Ads coverage (the single reusable source).
+      // ASIN-grain coverage is retained for rollback + PPC diagnostics. After the ASIN->Campaign cutover the campaign
+      // grain (above) is the AUTHORITATIVE Daily + Brand View Ads coverage; the ASIN read below gates Daily/Brand ONLY
+      // when ASIN is the ACTIVE grain (rollback) -- otherwise a retired-ASIN coverage gap never blocks a publish.
       const asin = await call("ads-coverage-read", (signal) => readAdsCoverage(a.accountId, "asin-performance-v1", { signal }));
       asinCoverageStateByAccountId[a.accountId] = asin;
       asinWindows[a.accountId] = asin.read === "ok" ? asin.windows : null;
-      if (asin.read !== "ok") readBlockers.push({ sourceKey: "ads-asin-date", accountId: a.accountId, reason: "ads-coverage-" + asin.read, blocksSales: false });
+      if (asin.read !== "ok" && ACTIVE_ADS_SOURCE_KEY === "asin-performance-v1") readBlockers.push({ sourceKey: "ads-asin-date", accountId: a.accountId, reason: "ads-coverage-" + asin.read, blocksSales: false });
     }
+    // The Daily/Brand readiness ads input uses the ACTIVE grain's coverage windows (campaign post-cutover, asin on rollback).
+    const activeAdsWindows = ACTIVE_ADS_SOURCE_KEY === "asin-performance-v1" ? asinWindows : campaignWindows;
     return {
       readBlockers, oliCoverageByAccountId,
       catalogSnapshot: catalog.snapshot,
@@ -543,7 +548,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       campaignCoverageStateByAccountId,
       asinCoverageStateByAccountId,
       campaignAds: { grain: "campaign-performance-v1", read: "ok", windowsByAccountId: Object.fromEntries(Object.entries(campaignWindows).map(([k, v]) => [k, v || []])) },
-      asinAds: { grain: BRAND_VIEW_ADS_GRAIN, read: "ok", windowsByAccountId: Object.fromEntries(Object.entries(asinWindows).map(([k, v]) => [k, v || []])) },
+      asinAds: { grain: BRAND_VIEW_ADS_GRAIN, read: "ok", windowsByAccountId: Object.fromEntries(Object.entries(activeAdsWindows).map(([k, v]) => [k, v || []])) },
     };
   };
 

@@ -18,11 +18,13 @@ import { windowsProve } from "./source-durable-model.js";
 import { REPORT_DERIVATIONS, shadowSnapshotKey } from "./report-derivation.js";
 import { buildDailyAdsCoverage } from "./daily-ads-loader.js";
 import { canonicalOliSlices } from "../date-windows.js";
+import { ACTIVE_ADS_SOURCE_KEY, ACTIVE_ADS_REGISTRY_KEY } from "../active-ads-source.js";
 
-// Daily Reporting and Brand View now BOTH read the durable ASIN grain (asin-performance-v1) -- the SINGLE
-// reusable advertising source. The campaign grain (campaign-performance-v1) is PPC-only and never fed here.
-export const DAILY_ADS_GRAIN = "asin-performance-v1";
-export const BRAND_VIEW_ADS_GRAIN = "asin-performance-v1";
+// Daily Reporting and Brand View both read the ACTIVE durable Ads grain. After the ASIN->Campaign cutover that is
+// the campaign grain (campaign-performance-v1); rollback flips ACTIVE_ADS_SOURCE_KEY back to asin-performance-v1.
+// The two grains OVERLAP (same spend/sales at different grains) and are NEVER summed -- only the active one is fed here.
+export const DAILY_ADS_GRAIN = ACTIVE_ADS_SOURCE_KEY;
+export const BRAND_VIEW_ADS_GRAIN = ACTIVE_ADS_SOURCE_KEY;
 
 const isDateStr = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
@@ -188,12 +190,12 @@ export function dailyReportingReadiness({ oliCoverageByAccountId = {}, accounts 
   }
   const grainError = requireGrain(asinAds, DAILY_ADS_GRAIN, "dailyReportingReadiness");
   if (grainError) {
-    blockedBy.push({ sourceKey: "ads-asin-date", reason: grainError.reason, blocksSales: false });
+    blockedBy.push({ sourceKey: ACTIVE_ADS_REGISTRY_KEY, reason: grainError.reason, blocksSales: false });
   } else {
     const proof = adsCoverageProof(asinAds, from, to, accounts);
-    for (const gap of proof.gaps) blockedBy.push({ sourceKey: "ads-asin-date", reason: gap.reason, accountId: gap.accountId ?? undefined, blocksSales: false });
+    for (const gap of proof.gaps) blockedBy.push({ sourceKey: ACTIVE_ADS_REGISTRY_KEY, reason: gap.reason, accountId: gap.accountId ?? undefined, blocksSales: false });
   }
-  return { ready: blockedBy.filter((b) => b.blocksSales).length === 0, adsReady: !blockedBy.some((b) => b.sourceKey === "ads-asin-date"), blockedBy };
+  return { ready: blockedBy.filter((b) => b.blocksSales).length === 0, adsReady: !blockedBy.some((b) => b.sourceKey === ACTIVE_ADS_REGISTRY_KEY), blockedBy };
 }
 
 /**
@@ -219,10 +221,10 @@ export function brandViewReadiness({ oliCoverageByAccountId = {}, accounts = [],
   }
   const grainError = requireGrain(asinAds, BRAND_VIEW_ADS_GRAIN, "brandViewReadiness");
   if (grainError) {
-    blockedBy.push({ sourceKey: "ads-asin-date", reason: grainError.reason, blocksSales: false });
+    blockedBy.push({ sourceKey: ACTIVE_ADS_REGISTRY_KEY, reason: grainError.reason, blocksSales: false });
   } else {
     const proof = adsCoverageProof(asinAds, from, to, accounts);
-    for (const gap of proof.gaps) blockedBy.push({ sourceKey: "ads-asin-date", reason: gap.reason, accountId: gap.accountId ?? undefined, blocksSales: false });
+    for (const gap of proof.gaps) blockedBy.push({ sourceKey: ACTIVE_ADS_REGISTRY_KEY, reason: gap.reason, accountId: gap.accountId ?? undefined, blocksSales: false });
   }
   for (const accountId of accounts) {
     const snap = fbaSnapshotsByAccount[accountId];
@@ -230,7 +232,7 @@ export function brandViewReadiness({ oliCoverageByAccountId = {}, accounts = [],
       blockedBy.push({ sourceKey: "fba-inventory-health", reason: "no-validated-snapshot", accountId, blocksSales: false });
     }
   }
-  return { ready: blockedBy.filter((b) => b.blocksSales).length === 0, adsReady: !blockedBy.some((b) => b.sourceKey === "ads-asin-date"), blockedBy };
+  return { ready: blockedBy.filter((b) => b.blocksSales).length === 0, adsReady: !blockedBy.some((b) => b.sourceKey === ACTIVE_ADS_REGISTRY_KEY), blockedBy };
 }
 
 /* --------------- durable shadow snapshot derivation through the EXISTING contracts --------------- */

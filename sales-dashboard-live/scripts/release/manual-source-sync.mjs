@@ -1,7 +1,7 @@
 // TRUSTED manual source-sync OPERATOR -- the Data Sync Center "Sync source" flow as a controlled CLI, running the
 // SAME shared orchestration the API route uses (lib/server/sync/source-sync-operation.js):
 //
-//   node scripts/release/manual-source-sync.mjs --bucket=us|non-us --source=order-line-items|ads-asin-date|product-catalog [--as-of=YYYY-MM-DD]
+//   node scripts/release/manual-source-sync.mjs --bucket=us|non-us --source=order-line-items|ads-campaign-date|product-catalog [--as-of=YYYY-MM-DD]
 //
 // Flow: validate frozen identifiers -> sync ONLY the selected source (bounded, resumable) -> derive EVERY affected
 // dashboard from the SAME persisted evidence -> finalize -> preflight-all -> publish via freshness CAS inside an
@@ -26,7 +26,7 @@ log("validated (origin=admin-manual, operationKey=" + request.operationKey + ")"
 
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
 const { getSyncSourceJobs } = await import("../../lib/server/supabase.js");
-const { runAsinAdsBucketSlice } = await import("../../lib/server/sync/scheduled-asin-ads-runner.js");
+const { runCampaignAdsBucketSlice } = await import("../../lib/server/sync/scheduled-campaign-ads-runner.js");
 const { buildPriorityDashboardsRelease } = await import("../../lib/server/sync/source-priority-dashboards.js");
 const { buildLiveReadback } = await import("../../lib/server/sync/source-priority-release-runner.js");
 const { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } = await import("../../lib/server/sync/report-publisher.js");
@@ -42,16 +42,17 @@ const startedAt = Date.now();
 const outOfTime = () => Date.now() - startedAt > BUDGET_MS;
 
 // ---------------- Stage 1: sync ONLY the selected source ----------------
-if (request.sourceKey === "ads-asin-date") {
-  // The durable Ads architecture (coverage mode): connection pre-flight excludes disconnected accounts (typed
-  // unavailable, never blocking the rest); coverage pre-filter needs zero creates for covered accounts.
+if (request.sourceKey === "ads-campaign-date") {
+  // The durable Ads architecture (coverage mode) for the CAMPAIGN grain across the bucket's regions: connection
+  // pre-flight excludes disconnected accounts (typed unavailable, never blocking the rest); coverage pre-filter
+  // needs zero creates for covered accounts. ASIN Ads exports are retired (hard-blocked in ads-sync.js).
   let passes = 0;
   for (;;) {
     passes += 1;
-    const res = await runAsinAdsBucketSlice({ bucket: request.bucket, asOf: request.asOf, log });
-    if (res.phase === "complete") { log("ads sync complete: creates=" + res.creates + " tokens=" + res.tokens + " covered=" + res.covered + " disconnected=" + res.incompatible); break; }
-    if (res.continuationRequired === true) { if (outOfTime() || passes > 40) { console.error("STOP ads sync exhausted the operator budget"); process.exit(1); } continue; }
-    console.error("STOP ads sync failed: " + JSON.stringify(res.problems || [])); process.exit(1);
+    const res = await runCampaignAdsBucketSlice({ bucket: request.bucket, asOf: request.asOf, runKind: "daily", log });
+    if (res.phase === "complete") { log("campaign ads sync complete: creates=" + res.creates + " tokens=" + res.tokens + " covered=" + res.covered + " disconnected=" + res.incompatible); break; }
+    if (res.continuationRequired === true) { if (outOfTime() || passes > 40) { console.error("STOP campaign ads sync exhausted the operator budget"); process.exit(1); } continue; }
+    console.error("STOP campaign ads sync failed: " + JSON.stringify(res.problems || [])); process.exit(1);
   }
 } else {
   // OLI / Catalog through the bucket source runtime (single-family drain; other families untouched).

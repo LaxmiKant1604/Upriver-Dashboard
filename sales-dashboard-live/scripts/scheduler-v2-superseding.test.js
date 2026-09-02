@@ -129,10 +129,11 @@ async function main() {
     assert.match(rb, /addDays\(requestedAsOf, -20\)/, "ads window starts 20 days before D-1 (21 inclusive days)");
   });
 
-  test("18/19. Campaign Ads / FBA are never force-fetched; Non-US crons stay unchanged and US has one GitHub primary", () => {
+  test("18/19. force-fetch is OLI-only; the scheduler refreshes the active Campaign grain (no FBA step); Non-US crons unchanged; US one GitHub primary", () => {
     const rt = readFileSync(resolve(HERE, "..", "lib", "server", "sync", "source-bucket-sync-runtime.js"), "utf8");
     assert.match(rt, /forceFreshOli === true && sourceKey === "order-line-items"/, "force-fresh is OLI-only");
-    assert.doesNotMatch(yml, /node scripts\/[^\n]*(campaign|fba)/i, "no campaign/fba workflow step");
+    // Post ASIN->Campaign cutover the workflow refreshes Campaign Ads (the active source); FBA is still absent.
+    assert.doesNotMatch(yml, /node scripts\/[^\n]*fba/i, "no FBA workflow step");
     const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
     assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *"]);
   });

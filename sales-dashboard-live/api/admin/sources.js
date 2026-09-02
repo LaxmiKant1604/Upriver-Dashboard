@@ -273,10 +273,10 @@ export default async function handler(req, res) {
         const request = validateSourceSyncRequest({ bucket, sourceKey: onlySourceKey, origin: "admin-manual", asOf, refreshMode: body.refreshMode == null ? "normal" : String(body.refreshMode) });
         let syncDone = requestedPhase === "release";
         if (!syncDone) {
-          if (onlySourceKey === "ads-asin-date") {
-            const { runAsinAdsBucketSlice } = await import("../../lib/server/sync/scheduled-asin-ads-runner.js");
-            const ads = await runAsinAdsBucketSlice({
-              bucket, asOf,
+          if (onlySourceKey === "ads-campaign-date") {
+            const { runCampaignAdsBucketSlice } = await import("../../lib/server/sync/scheduled-campaign-ads-runner.js");
+            const ads = await runCampaignAdsBucketSlice({
+              bucket, asOf, runKind: "daily",
               deps: { workerDeps: { workBudgetMs: Math.min(remainingMs() - 4000, 35_000) } },
             });
             if (ads.phase !== "complete") {

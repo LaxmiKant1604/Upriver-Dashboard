@@ -13,9 +13,9 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 const test = (name, fn) => { try { fn(); passed += 1; out("  ok  " + name); } catch (e) { out("FAIL  " + name); out(String(e && e.stack ? e.stack : e)); process.exitCode = 1; } };
 const testAsync = async (name, fn) => { try { await fn(); passed += 1; out("  ok  " + name); } catch (e) { out("FAIL  " + name); out(String(e && e.stack ? e.stack : e)); process.exitCode = 1; } };
 
-test("frozen registries: exactly OLI + ads-asin-date + product-catalog; Campaign Ads / FBA structurally absent; deps immutable", () => {
-  assert.deepEqual([...ORCHESTRATED_SOURCE_KEYS].sort(), ["ads-asin-date", "order-line-items", "product-catalog"]);
-  assert.ok(!ORCHESTRATED_SOURCE_KEYS.includes("ads-campaign-date"), "Campaign Ads never orchestrated");
+test("frozen registries: exactly OLI + ads-campaign-date + product-catalog (post ASIN->Campaign cutover); FBA absent; deps immutable", () => {
+  assert.deepEqual([...ORCHESTRATED_SOURCE_KEYS].sort(), ["ads-campaign-date", "order-line-items", "product-catalog"]);
+  assert.ok(!ORCHESTRATED_SOURCE_KEYS.includes("ads-asin-date"), "ASIN Ads retired from orchestration (exports blocked; history retained)");
   assert.ok(!ORCHESTRATED_SOURCE_KEYS.includes("fba-inventory-health"), "FBA never orchestrated");
   for (const k of ORCHESTRATED_SOURCE_KEYS) {
     const d = SOURCE_DASHBOARD_DEPENDENCIES[k];
@@ -23,7 +23,7 @@ test("frozen registries: exactly OLI + ads-asin-date + product-catalog; Campaign
     assert.ok(Object.isFrozen(d) && Object.isFrozen(d.reports), k + " dependency entry is immutable");
   }
   assert.equal(SOURCE_DASHBOARD_DEPENDENCIES["product-catalog"].membership, true, "catalog changes membership/attribution");
-  assert.equal(SOURCE_DASHBOARD_DEPENDENCIES["ads-asin-date"].adsRepublish, true, "ads evidence republishes the ads surfaces");
+  assert.equal(SOURCE_DASHBOARD_DEPENDENCIES["ads-campaign-date"].adsRepublish, true, "campaign ads evidence republishes the ads surfaces");
   assert.ok(Object.isFrozen(ORCHESTRATED_SOURCE_KEYS) && Object.isFrozen(SOURCE_DASHBOARD_DEPENDENCIES) && Object.isFrozen(OPERATION_ORIGINS));
 });
 
@@ -33,7 +33,7 @@ test("validateSourceSyncRequest: only reviewed enums pass; every out-of-enum inp
   assert.deepEqual([...ok.dependencies.reports], ["daily-reporting", "brand-sales", "brand-inventory"]);
   const bad = [
     [{ bucket: "eu", sourceKey: "order-line-items", origin: "scheduled", asOf: "2026-08-25" }, "SOURCE_SYNC_BAD_BUCKET"],
-    [{ bucket: "us", sourceKey: "ads-campaign-date", origin: "scheduled", asOf: "2026-08-25" }, "SOURCE_SYNC_BAD_SOURCE"],
+    [{ bucket: "us", sourceKey: "ads-asin-date", origin: "scheduled", asOf: "2026-08-25" }, "SOURCE_SYNC_BAD_SOURCE"],
     [{ bucket: "us", sourceKey: "fba-inventory-health", origin: "scheduled", asOf: "2026-08-25" }, "SOURCE_SYNC_BAD_SOURCE"],
     [{ bucket: "us", sourceKey: "order-line-items", origin: "cron", asOf: "2026-08-25" }, "SOURCE_SYNC_BAD_ORIGIN"],
     [{ bucket: "us", sourceKey: "order-line-items", origin: "scheduled", asOf: "yesterday" }, "SOURCE_SYNC_BAD_ASOF"],

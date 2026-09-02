@@ -33,6 +33,12 @@ const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
 const VALID_REGIONS = Object.freeze([REGIONS.INDIA, REGIONS.EUROPE_AU, REGIONS.US_CA]);
 
+// The existing Scheduler-v2 runs in TWO buckets (us / non-us); a bucket is the set of the 3 regions whose accounts
+// fall in it. This lets the 2-bucket scheduler refresh Campaign Ads per bucket (keeping Daily/Brand fresh at publish)
+// while the dedicated regional schedules cover the 3-region cadence -- the coverage pre-filter makes any overlap free.
+export const BUCKET_REGIONS = Object.freeze({ "non-us": [REGIONS.INDIA, REGIONS.EUROPE_AU], us: [REGIONS.US_CA] });
+export function regionsForBucket(bucket) { return BUCKET_REGIONS[S(bucket)] || []; }
+
 /**
  * The Campaign Ads window ending at `asOf` (strict YYYY-MM-DD): initial 56 / daily 21 / monthly-correction 49
  * inclusive days, matching the source spec + ads-sync.js ADS_SOURCES. Coverage mode fetches only the dates the
@@ -209,6 +215,29 @@ export function assessCampaignAdsRegionCycle({ region, discoveredAccounts, batch
   const tokens = createsN * CAMPAIGN_ADS_TOKENS_PER_CREATE;
   if (createsN > ceilingCreates) push("creates-over-ceiling:" + createsN + ">" + ceilingCreates);
   return { ok: problems.length === 0, problems, creates: createsN, tokens, batches: results.length, ceilingCreates, ceilingTokens: ceilingCreates * CAMPAIGN_ADS_TOKENS_PER_CREATE };
+}
+
+/**
+ * Run ONE bounded Campaign Ads pass for a whole Scheduler-v2 BUCKET (the regions in that bucket), aggregating the
+ * per-region results. Used by the Data Sync Center manual "Sync source" action + the scheduled bucket operator so the
+ * scheduled + manual paths share one implementation. Returns a DSC-compatible typed result
+ * ({ phase:"complete", creates, tokens, covered } | { phase:"sync", continuationRequired } | { phase:"sync", ok:false, problems }).
+ */
+export async function runCampaignAdsBucketSlice({ bucket, asOf, runKind = "daily", maxCreates = null, deps = {}, log = () => {} } = {}) {
+  const regions = regionsForBucket(bucket);
+  if (!regions.length) return { phase: "sync", ok: false, problems: ["bad-bucket:" + S(bucket)], creates: 0, tokens: 0 };
+  let creates = 0; let tokens = 0; let covered = 0; let incompatible = 0;
+  for (const region of regions) {
+    const plan = await planCampaignAdsRegionRun({ region, asOf, runKind, deps });
+    const r = await runCampaignAdsRegionSlice({ region, asOf, runKind, plan, maxCreates, deps, log });
+    creates += r.creates || 0; tokens += r.tokens || 0;
+    if (r.phase !== "complete") {
+      if (r.continuationRequired === true) return { phase: "sync", continuationRequired: true, creates, tokens };
+      return { phase: "sync", ok: false, problems: r.problems || [], creates, tokens };
+    }
+    covered += r.covered || 0; incompatible += r.incompatible || 0;
+  }
+  return { phase: "complete", creates, tokens, covered, incompatible };
 }
 
 /**

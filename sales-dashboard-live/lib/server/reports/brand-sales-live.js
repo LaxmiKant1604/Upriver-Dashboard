@@ -31,7 +31,7 @@ const DURABLE_READERS = {
   // the scheduler-published Brand Sales snapshot uses), so the live refresh serves the SAME Total Sales.
   readOliHistory: getEnrichedOliHistoryRows,
   readOliCoverage: sb.getSourceCoverageWindows,
-  readAsinAds: sb.getAsinAdsDailyRows,
+  readAsinAds: sb.getActiveAdsDailyRows,
   readAdsCoverage: sb.getDailyAdsCoverage,
   readCatalogSnapshot: sb.getSourceSnapshot,
   loadCatalogPayload: sb.getSourceSnapshotPayload,

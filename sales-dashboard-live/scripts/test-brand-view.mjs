@@ -42,6 +42,7 @@ const {
 } = await import("../lib/server/reports/brand-view.js");
 
 const { assertAdmin, DashboardAccessError } = await import("../lib/server/supabase.js");
+const { brandKey: bvBrandKey } = await import("../lib/server/reports/brand-membership.js");
 
 const {
   CURRENCY_OPTIONS,
@@ -244,8 +245,27 @@ const AD_ROWS = [
   { metric_date: "2026-07-27", marketplace_country_code: "IT", child_asin: "B00NORD001", currency: "EUR", metrics: { ad_spend: 25 } },
 ];
 
+// Post ASIN->Campaign cutover, Brand View reads the durable CAMPAIGN grain and attributes to a brand via the manual
+// campaign->brand mapping (NOT the child_asin->brand catalog map). Same spend/marketplaces as AD_ROWS above, but
+// keyed by campaign identity + a mapping fixture. (AD_ROWS stays for the retained aggregateBrandAds unit test.)
+const CAMPAIGN_AD_ROWS = [
+  { metric_date: "2026-07-27", marketplace_country_code: "UK", campaign_id: "CBEBI1", currency: "GBP", metrics: { ad_spend: 0.54 } },
+  { metric_date: "2026-07-26", marketplace_country_code: "UK", campaign_id: "CBEBI2", currency: "GBP", metrics: { ad_spend: 3.18 } },
+  { metric_date: "2026-07-27", marketplace_country_code: "UK", campaign_id: "CNORD1", currency: "GBP", metrics: { ad_spend: 500 } }, // Nordfell -> excluded from Bebi Born
+  { metric_date: "2026-07-27", marketplace_country_code: "IT", campaign_id: "CNORD2", currency: "EUR", metrics: { ad_spend: 25 } },  // IT has ads but none for Bebi Born -> a real zero
+];
+// The saved campaign->brand mapping rows (getCampaignBrandMappings shape). Both sides normalize the marketplace the
+// same way, so "UK" here matches "UK" on the rows.
+const CAMPAIGN_MAPPINGS = [
+  { marketplace: "UK", ads_profile_id: "", ad_campaign_id: "CBEBI1", canonical_brand_key: bvBrandKey("Bebi Born"), brand_display_name: "Bebi Born" },
+  { marketplace: "UK", ads_profile_id: "", ad_campaign_id: "CBEBI2", canonical_brand_key: bvBrandKey("Bebi Born"), brand_display_name: "Bebi Born" },
+  { marketplace: "UK", ads_profile_id: "", ad_campaign_id: "CNORD1", canonical_brand_key: bvBrandKey("Nordfell"), brand_display_name: "Nordfell" },
+  { marketplace: "IT", ads_profile_id: "", ad_campaign_id: "CNORD2", canonical_brand_key: bvBrandKey("Nordfell"), brand_display_name: "Nordfell" },
+];
+const getCampaignMappingsFake = async () => CAMPAIGN_MAPPINGS;
+
 function fakeGetAdsRows() {
-  return Promise.resolve(AD_ROWS);
+  return Promise.resolve(CAMPAIGN_AD_ROWS);
 }
 
 /* =================================================== 1. account-scoped brands */
@@ -525,7 +545,7 @@ const compactSnap = (inventoryByBrandCountry, over = {}) => ({
 });
 const sliceFor = (getSnapshot) => buildAccountBrandSlice({
   accountId: ACCOUNT_A, brand: "Bebi Born", asOf: "2026-07-28",
-  account: { name: "Bebi EU", country: "IT" }, getSnapshot, getAdsRows: fakeGetAdsRows,
+  account: { name: "Bebi EU", country: "IT" }, getSnapshot, getAdsRows: fakeGetAdsRows, getCampaignMappings: getCampaignMappingsFake,
 });
 
 test("isCompactInventorySnapshot validates the report version + compact shape", () => {
@@ -569,22 +589,18 @@ await asyncTest("10. with NO compact snapshot the temporary legacy fba-plan fall
   assert.equal(slice2.inventory.byCountry.get("IT"), 883, "a wrong-version compact snapshot is not authoritative; legacy fallback applies");
 });
 
-await asyncTest("Catalog drives ASIN->brand: an account with NO fba-plan/sku-pl snapshot still attributes Ads via the Catalog", async () => {
-  // brand-sales exists (required for the slice) but NONE of the ASIN_BRAND_SNAPSHOT_KEYS reports do, so the only
-  // ASIN->brand source is the reusable Product Catalog (child_asin -> product_brand).
+await asyncTest("Campaign->brand mapping drives Brand View ad attribution (not the catalog); brand isolation holds", async () => {
+  // Post ASIN->Campaign cutover, Brand View ad attribution is via the manual campaign->brand mapping, NOT the
+  // child_asin->brand catalog. With NO mapping every brand is honestly empty (never fabricated); with the mapping
+  // only THIS brand's campaigns attribute, and another brand's campaign spend is excluded (brand isolation).
   const salesOnly = ({ reportKey, accountId }) => Promise.resolve(reportKey === "brand-sales" ? (SNAPSHOTS[`brand-sales|${accountId}`] || null) : null);
-  const catalogRows = [
-    { child_asin: "B00BEBI001", product_brand: "Bebi Born" },
-    { child_asin: "B00BEBI002", product_brand: "Bebi Born" },
-    { child_asin: "B00NORD001", product_brand: "Nordfell" }, // another brand -> its spend must be excluded
-  ];
   const common = { accountId: ACCOUNT_A, brand: "Bebi Born", asOf: "2026-07-28", account: { name: "Bebi EU", country: "IT" }, getSnapshot: salesOnly, getAdsRows: fakeGetAdsRows, required: false };
-  const noCat = await buildAccountBrandSlice(common);
-  assert.equal(noCat.ads.matchedRows, 0, "with no ASIN->brand source at all, Ads cannot attribute (matchedRows 0)");
-  const withCat = await buildAccountBrandSlice({ ...common, catalogRows });
-  assert.equal(withCat.ads.matchedRows, 2, "the Catalog maps the two Bebi Born ASINs -> Ads attributed");
-  let spend = 0; for (const v of withCat.ads.spendByKey.values()) spend += v;
-  assert.ok(Math.abs(spend - 3.72) < 1e-9, "only Bebi Born ad spend (0.54+3.18); Nordfell's 500 is excluded (brand isolation via Catalog)");
+  const noMap = await buildAccountBrandSlice(common); // default getCampaignMappings -> [] (all campaigns unmapped)
+  assert.equal(noMap.ads.matchedRows, 0, "with NO campaign->brand mapping, Ads cannot attribute (matchedRows 0; honest empty)");
+  const withMap = await buildAccountBrandSlice({ ...common, getCampaignMappings: getCampaignMappingsFake });
+  assert.equal(withMap.ads.matchedRows, 2, "the mapping attributes the two Bebi Born campaigns -> Ads attributed");
+  let spend = 0; for (const v of withMap.ads.spendByKey.values()) spend += v;
+  assert.ok(Math.abs(spend - 3.72) < 1e-9, "only Bebi Born campaign spend (0.54+3.18); Nordfell's 500 is excluded (brand isolation via the mapping)");
 });
 
 await asyncTest("14. a Brand View portfolio rebuild reads only saved snapshots (zero DataDoe exports)", async () => {
@@ -611,6 +627,7 @@ const SNAPSHOT = await buildBrandViewSnapshot({
   account: { name: "Bebi EU", country: "IT" },
   getSnapshot: fakeGetSnapshot,
   getAdsRows: fakeGetAdsRows,
+  getCampaignMappings: getCampaignMappingsFake,
 });
 
 test("the built snapshot is compact, brand-scoped and records its own coverage", () => {

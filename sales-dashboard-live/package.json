@@ -47,6 +47,7 @@
     "test:campaign-map-capability-admin": "node scripts/campaign-map-capability-admin.test.js",
     "test:campaign-ads": "node scripts/campaign-ads.test.js",
     "test:campaign-ads-golive": "node scripts/campaign-ads-golive.test.js",
+    "test:campaign-ads-aggregation": "node scripts/campaign-ads-aggregation.test.js",
     "test:sku-movement-import": "node scripts/sku-movement-import.test.js",
     "test:sku-movement-rederive": "node scripts/sku-movement-v2-rederive.test.js",
     "test:brand-authorization": "node scripts/brand-authorization.test.js",

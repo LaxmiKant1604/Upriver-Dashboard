@@ -367,9 +367,9 @@ test("(7)(10)(13) Daily + Brand View reuse the SAME evidence; brand rules hold; 
   assert.equal(dailyTotal, bvTotal, "(7) one OLI/catalog evidence set, two dashboards, identical totals");
   // (13): the wrong grain THROWS in both directions.
   const base = { accounts: ["A01"], oliCoverageByAccountId: { A01: [{ from: "2025-06-01", to: ASOF }] }, catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" }, from: win.from, to: win.to };
-  // Daily now requires the ASIN grain (the single reusable Ads source), so feeding it the campaign grain throws.
-  assert.throws(() => dash.dailyReportingReadiness({ ...base, asinAds: { grain: "campaign-performance-v1", read: "ok", windows: [] } }), /never mix/);
-  assert.throws(() => dash.brandViewReadiness({ ...base, asinAds: { grain: "campaign-performance-v1", read: "ok", windows: [] } }), /never mix/);
+  // Post ASIN->Campaign cutover, Daily requires the CAMPAIGN grain, so feeding it the retired ASIN grain throws.
+  assert.throws(() => dash.dailyReportingReadiness({ ...base, asinAds: { grain: "asin-performance-v1", read: "ok", windows: [] } }), /never mix/);
+  assert.throws(() => dash.brandViewReadiness({ ...base, asinAds: { grain: "asin-performance-v1", read: "ok", windows: [] } }), /never mix/);
 });
 
 test("(11) initial backfill then the NEXT daily run requests ONLY missing/rolling coverage", () => {
@@ -442,7 +442,7 @@ test("(16) a source failure prevents dependent publication and preserves LKG", a
   // Dependent readiness reports the blockage -- a dependent dashboard can never publish from this state.
   const readiness = dash.dailyReportingReadiness({
     accounts: ["A01"], oliCoverageByAccountId: { A01: [] }, catalogSnapshot: null,
-    asinAds: { grain: "asin-performance-v1", read: "ok", windows: [] },
+    asinAds: { grain: "campaign-performance-v1", read: "ok", windows: [] },
     from: "2026-08-10", to: "2026-08-14",
   });
   assert.equal(readiness.ready, false, "(16) the dependent dashboard is blocked, LKG serves instead");

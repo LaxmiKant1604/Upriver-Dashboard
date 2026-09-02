@@ -198,32 +198,26 @@ test("the Campaign/PPC source contract is UNCHANGED: raw dimensions+metrics colu
   assert.deepEqual(body.columns, [...camp.dimensions, ...camp.metrics], "campaign columns unchanged (dims + metrics)");
 });
 
-test("persist maps the aggregated _sum aliases back to canonical metric names (downstream readers unchanged)", async () => {
-  // A single aggregated ASIN row (grain dims + _sum aliases) persists metrics under the CANONICAL names.
-  const aggRow = { seller_or_vendor_id: G6_US, marketplace_country_code: "US", date: REQ.to, child_asin: "B0AGG", ad_sales_same_sku_sum: 275.1, ad_clicks_sum: 64, ad_impressions_sum: 7837, ad_spend_sum: 29.38, ad_units_sold_same_sku_sum: 7, ad_orders_same_sku_sum: 6 };
-  const { deps, calls } = makeDeps({ rowsFor: () => [aggRow] });
-  const res = await runAdsSyncWithDeps(deps, ["US"], [ASIN], { accountIds: [G6_US], requiredCoverage: REQ });
-  assert.equal(res.status, "completed");
-  const saved = (calls.upsertRowsData || [])[0];
-  assert.equal(saved.child_asin, "B0AGG");
-  assert.equal(saved.metrics.ad_sales_same_sku, 275.1, "ad_sales_same_sku_sum -> ad_sales_same_sku");
-  assert.equal(saved.metrics.ad_spend, 29.38, "ad_spend_sum -> ad_spend");
-  assert.equal(saved.metrics.ad_clicks, 64);
-  assert.equal(saved.currency, "USD", "currency is marketplace-derived (grain has no currency column)");
-  assert.equal(saved.dimension_key, JSON.stringify(["B0AGG"]), "dimension_key is the ASIN grain (child_asin only)");
+test("ASIN Ads EXPORT RETIREMENT: runAdsSyncWithDeps hard-REFUSES the ASIN grain (create impossibility) with ZERO I/O; history retained", async () => {
+  // Post ASIN->Campaign cutover, creating a new ASIN Ads export is disabled at the single chokepoint every entry
+  // point flows through -- BEFORE any lock / discovery / DataDoe / Supabase call. The durable asin-performance-v1
+  // history + the ASIN reshape/persist code are retained (reachable again only if ADS_ACTIVE_SOURCE rolls back).
+  const { deps, calls } = makeDeps({ rowsFor: () => [] });
+  await assert.rejects(
+    () => runAdsSyncWithDeps(deps, ["US"], [ASIN], { accountIds: [G6_US], requiredCoverage: REQ }),
+    /ASIN_ADS_EXPORT_RETIRED/,
+  );
+  assert.equal((calls.creates || []).length, 0, "no export created");
+  assert.equal((calls.upsertRowsData || []).length, 0, "no rows persisted");
+  assert.equal((calls.deletes || []).length, 0, "no delete-replace performed (guard is before any I/O)");
 });
 
-test("aggregated ASIN source CLEAN-REPLACES the window (delete per account before insert); Campaign does NOT delete", async () => {
-  const aggRows = ({ ids }) => ids.map((id) => ({ seller_or_vendor_id: id, marketplace_country_code: id === G6_IN ? "IN" : "US", date: REQ.to, child_asin: "B0X", ad_sales_same_sku_sum: 5 }));
-  const a = makeDeps({ rowsFor: aggRows });
-  await runAdsSyncWithDeps(a.deps, ["US", "IN"], [ASIN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
-  assert.equal(a.calls.deletes.length, 2, "one delete per account being persisted (clean window replace)");
-  assert.ok(a.calls.deletes.every((d) => d.sourceKey === ASIN && d.from === REQ.from && d.to === REQ.to), "delete scoped to the exact source + window");
-  assert.deepEqual(a.calls.deletes.map((d) => d.accountId).sort(), [G6_US, G6_IN].sort());
-  // Campaign source (no aggregations) must NOT delete -- its upsert-only contract is unchanged.
+test("Campaign (the active grain) persists correctly and does NOT delete-replace; ASIN clean-replace path is retired", async () => {
+  // Campaign source (no aggregations) is upsert-only -- it never delete-replaces (contract unchanged).
   const b = makeDeps({ rowsFor: () => [row(G6_US, "US")] });
   await runAdsSyncWithDeps(b.deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
   assert.equal(b.calls.deletes.length, 0, "campaign-grain source never delete-replaces (contract unchanged)");
+  // The ASIN aggregated clean-replace path is retired (its grain is refused above), so it can never run now.
 });
 
 test("inclusiveDaySpan: strict UTC calendar arithmetic across leap day + year boundary", () => {
@@ -316,7 +310,8 @@ test("unrelated US/IN and dd-secondary accounts receive ZERO exports/writes", as
 });
 
 test("requiredCoverage rejects ZERO or MULTIPLE source keys BEFORE the lock (zero lock/discovery/export/write)", async () => {
-  for (const keys of [[CAMPAIGN, ASIN], [], [CAMPAIGN, "unknown-source"]]) {
+  // Two SUPPORTED, non-retired keys (ASIN is retired -> its own guard fires first, tested separately above).
+  for (const keys of [[CAMPAIGN, "keyword-targeting-performance-v1"], [], [CAMPAIGN, "unknown-source"]]) {
     const { deps, calls } = makeDeps();
     await assert.rejects(() => runAdsSyncWithDeps(deps, ["US"], keys, { accountIds: [G6_US], requiredCoverage: REQ }), /EXACTLY one supported sourceKey|No supported Ads source/);
     assert.equal(calls.claim, 0, `no lock for sourceKeys ${JSON.stringify(keys)}`);
@@ -372,9 +367,9 @@ test("requiredCoverage PRESERVES cadence timestamps (not a normal initial/daily/
 
 /* ============================= recorded window proves the PPC coverage gate ============================= */
 
-test("recorded campaign + ASIN exact 30-day windows make evaluateSourceCoverage(..).proven === true; optional sources independent", async () => {
-  // One source per invocation (Fix 1): run campaign, then ASIN, as separate invocations.
-  for (const key of [CAMPAIGN, ASIN]) {
+test("a recorded campaign exact 30-day window makes evaluateSourceCoverage(..).proven === true; optional sources independent", async () => {
+  // One source per invocation. Campaign is the active grain; ASIN is retired (its export is refused, tested above).
+  for (const key of [CAMPAIGN]) {
     const { deps, calls } = makeDeps();
     await runAdsSyncWithDeps(deps, ["US"], [key], { accountIds: [G6_US], requiredCoverage: REQ });
     const recorded = calls.coverage.flat().filter((c) => c.sourceKey === key && c.accountId === G6_US);
@@ -482,11 +477,11 @@ test("rows for BOTH selected accounts in one batch succeed (per-row marketplace 
   assert.deepEqual(res.sources[CAMPAIGN].failedAccounts, []);
 });
 
-test("persist stamps the AUTHORITATIVE marketplace currency when the ASIN payload omits it (no '' stored -> not blocked downstream)", async () => {
-  // Raw ASIN rows carry a marketplace but NO currency field (the real asin-performance shape). rowRecord must
-  // persist the marketplace currency (US->USD, IN->INR), NOT "" -- otherwise adRowBlockStatus blocks them.
+test("persist stamps the AUTHORITATIVE marketplace currency when the payload omits it (no '' stored -> not blocked downstream)", async () => {
+  // Raw campaign rows carry a marketplace but NO currency field. rowRecord must persist the marketplace currency
+  // (US->USD, IN->INR), NOT "" -- otherwise adRowBlockStatus blocks them. (Grain-agnostic; ASIN is retired.)
   const { deps, calls } = makeDeps({ rowsFor: ({ ids }) => ids.map((id) => row(id, id === G6_IN ? "IN" : "US")) });
-  const res = await runAdsSyncWithDeps(deps, ["US", "IN"], [ASIN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
+  const res = await runAdsSyncWithDeps(deps, ["US", "IN"], [CAMPAIGN], { accountIds: [G6_US, G6_IN], requiredCoverage: REQ });
   assert.equal(res.status, "completed");
   const persisted = calls.upsertRowsData || [];
   assert.ok(persisted.length >= 2, "rows persisted");
@@ -497,7 +492,7 @@ test("persist stamps the AUTHORITATIVE marketplace currency when the ASIN payloa
 
 test("persist keeps an EXPLICIT payload currency over the marketplace default (explicit wins)", async () => {
   const { deps, calls } = makeDeps({ rowsFor: () => [{ seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US", currency: "CAD" }] });
-  const res = await runAdsSyncWithDeps(deps, ["US"], [ASIN], { accountIds: [G6_US], requiredCoverage: REQ });
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
   assert.equal(res.status, "completed");
   assert.equal((calls.upsertRowsData || [])[0].currency, "CAD", "an explicit row currency is preserved, not overwritten by the marketplace");
 });
@@ -662,16 +657,16 @@ test("SKIP-PAGINATION fails closed when a page's rowCount disagrees with its raw
 });
 
 test("SKIP-PAGINATION dedups rows repeated across pages by the complete natural grain (persist once)", async () => {
-  // page 0 fills to 5000 with a repeated row; page 1 (short) repeats one of them -> the duplicate is collapsed.
-  const dup = { seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US", child_asin: "B0DUP", sku: "S1", ad_campaign_id: "C1", ad_group_id: "G1", ad_id: "A1", ad_campaign_type: "SP" };
-  const filler = (i) => ({ seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US", child_asin: "B0F" + i, sku: "S", ad_campaign_id: "C", ad_group_id: "G", ad_id: "A", ad_campaign_type: "SP" });
+  // Campaign grain (the active source): page 0 fills to EXPORT_LIMIT with unique campaigns; page 1 (short) repeats
+  // one of them -> the duplicate collapses by the campaign natural grain (ad_campaign_id + ad_campaign_type).
+  const dup = { seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US", ad_campaign_id: "CDUP", ad_campaign_type: "SP" };
+  const filler = (i) => ({ seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US", ad_campaign_id: "C" + i, ad_campaign_type: "SP" });
   const page0 = [dup, ...Array.from({ length: EXPORT_LIMIT - 1 }, (_, i) => filler(i))]; // a FULL page -> triggers page 1
   const { deps, calls } = makeDeps({ rowsFor: ({ skip }) => (skip === 0 ? page0 : [dup]) }); // page1 repeats dup
-  const res = await runAdsSyncWithDeps(deps, ["US"], [ASIN], { accountIds: [G6_US], requiredCoverage: REQ });
+  const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
   assert.equal(res.status, "completed");
   const persisted = calls.upsertRowsData || [];
-  const dupCount = persisted.filter((r) => r.child_asin === "B0DUP").length;
-  assert.equal(dupCount, 1, "the row repeated across pages is deduped to a single persisted row (natural grain)");
+  assert.equal(persisted.length, EXPORT_LIMIT, "the row repeated across pages is deduped (EXPORT_LIMIT unique campaigns persisted, not EXPORT_LIMIT+1)");
 });
 
 /* ============================= FIX (this round): durable idempotent completion ============================= */

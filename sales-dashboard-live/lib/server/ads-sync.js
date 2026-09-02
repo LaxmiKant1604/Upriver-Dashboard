@@ -19,6 +19,11 @@ import { evaluateSourceCoverage } from "./sync/ppc-ads-loader.js";
 // fail closed as ads-currency-missing).
 import { resolveAdRowCurrency } from "./reports/asin-ads-aggregation.js";
 import { marketplaceProfile } from "../marketplaces.js";
+// The single active-Ads-source switch: after the ASIN->Campaign cutover, creating a NEW ASIN Ads export is disabled
+// (Campaign is the only active Ads source). Durable ASIN history + all reader code stay untouched; only the EXPORT
+// path is blocked here at the one chokepoint every entry point (scheduler, watchdog, DSC, manual CLI, cron) flows
+// through. Rolling ADS_ACTIVE_SOURCE back to "asin" clears the retirement.
+import { isAdsExportRetiredFor } from "./active-ads-source.js";
 
 // Two marketplace codes identify the SAME marketplace when they are equal, or when both are CONFIGURED
 // marketplaces resolving to the same country -- Amazon returns the ISO "GB" for the UK while the account
@@ -711,6 +716,16 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
   const scope = countries === "OTHER" ? "OTHER" : [...countries].sort().join(",");
   const selectedSources = ADS_SOURCES.filter((source) => sourceKeys.includes(source.key));
   if (!selectedSources.length) throw new Error("No supported Ads source was requested.");
+
+  // ASIN Ads EXPORT-RETIREMENT guard (hard, BEFORE any lock / discovery / DataDoe / Supabase I/O). After the
+  // ASIN->Campaign cutover the ASIN grain can never create a new export from ANY entry point; the durable
+  // asin-performance-v1 history + every reader stay intact (reads never call this function). Fail closed.
+  const retiredRequested = selectedSources.map((s) => s.key).filter((k) => isAdsExportRetiredFor(k));
+  if (retiredRequested.length) {
+    const e = new Error("ASIN_ADS_EXPORT_RETIRED: creating ASIN Ads exports is disabled (Campaign Ads is the only active Ads source); the durable history is retained read-only. Blocked source(s): " + retiredRequested.join(","));
+    e.code = "ASIN_ADS_EXPORT_RETIRED";
+    throw e;
+  }
 
   // Validate the BASIC option shape BEFORE claiming the lock (a bad request never holds a lock).
   const { accountIds, requiredCoverage } = validateAdsSyncOptions(options, to);

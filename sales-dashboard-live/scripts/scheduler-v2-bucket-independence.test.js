@@ -252,12 +252,15 @@ async function main() {
     assert.match(yml, /already_published == 'true'[\s\S]*zero creates, zero controls, zero tokens/i, "the verified US duplicate is explicitly zero-write");
   });
 
-  test("15. Campaign Ads / FBA can never publish or create: not schedule-enabled, not a control, not a workflow step, and the Catalog guard refuses any non-catalog create", async () => {
-    assert.ok(!SCHEDULED_ENABLED_SOURCE_KEYS.includes("ads-campaign-date"), "Campaign Ads is not schedule-enabled");
+  test("15. Post ASIN->Campaign cutover: Campaign Ads is the scheduled active source but never a priority-published report/control; ASIN Ads is retired; FBA never publishes; the Catalog release guard refuses any non-catalog create", async () => {
+    assert.ok(SCHEDULED_ENABLED_SOURCE_KEYS.includes("ads-campaign-date"), "Campaign Ads is schedule-enabled (the active Ads source)");
+    assert.ok(!SCHEDULED_ENABLED_SOURCE_KEYS.includes("ads-asin-date"), "ASIN Ads is retired (not schedule-enabled)");
     assert.ok(!SCHEDULED_ENABLED_SOURCE_KEYS.some((k) => /fba/i.test(k)), "no FBA source is schedule-enabled");
-    assert.ok(!PRIORITY_DISPATCH_ENABLED.some((k) => /campaign|fba/i.test(k)), "no campaign/fba dispatch control");
+    assert.ok(!PRIORITY_DISPATCH_ENABLED.some((k) => /campaign|fba/i.test(k)), "campaign/fba are never a priority-published dispatch control");
     assert.ok(!/campaign|fba/i.test(PRIORITY_PROMOTED_ENABLED), "the promoted control is brand-inventory, not campaign/fba");
-    assert.doesNotMatch(yml, /node scripts\/[^\n]*(campaign|fba)/i, "no workflow step invokes a campaign/fba script");
+    assert.doesNotMatch(yml, /node scripts\/[^\n]*fba/i, "no workflow step invokes an FBA script");
+    // The Catalog release guard still forbids a campaign create THROUGH the priority release (campaign is refreshed in
+    // its own dedicated step, never as a release-owned export).
     const guard = makeDurableCatalogGuard({ inner: { create: async () => ({ exportId: "x" }), poll: async () => ({}), download: async () => ({}) }, reservation: { reserve: async () => ({ disposition: "reserved" }), recordExport: async () => ({ disposition: "recorded" }), get: async () => null }, operationKey: "priority-dashboards/scheduled/2026-08-26" });
     await assert.rejects(() => guard.create({ sourceKey: "ads-campaign-date", requestHash: "X" }), /PRIORITY_FORBIDDEN_CREATE/);
   });

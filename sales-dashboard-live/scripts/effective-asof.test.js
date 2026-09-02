@@ -177,7 +177,8 @@ test("D2. Ads/catalog degradation is separable: a missing catalog blocks sales, 
     from: "2026-03-24", to: eff.effectiveAsOf,
   });
   assert.equal(ready.ready, true, "an Ads gap never blocks the sales half");
-  assert.ok(ready.blockedBy.some((b) => b.sourceKey === "ads-asin-date" && b.blocksSales === false));
+  // Post ASIN->Campaign cutover the active Ads grain is campaign, so the (non-sales-blocking) ads blocker names it.
+  assert.ok(ready.blockedBy.some((b) => b.sourceKey === "ads-campaign-date" && b.blocksSales === false));
   // a missing catalog DOES block sales
   const noCatalog = dailyReportingReadiness({
     accounts: ["a"], oliCoverageByAccountId: coverage, catalogSnapshot: null, asinAds: null,

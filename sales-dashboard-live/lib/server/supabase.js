@@ -8,6 +8,7 @@ import { sourceJobOwnerId } from "./source-identity.js";
 import { normalizeFulfillmentChannel } from "./sync/oli-order-rules.js";
 import { resolveActiveCycleHead } from "./sync/source-cycle-attempts.js";
 import { membershipBrandsForAccount } from "./reports/brand-membership.js";
+import { ACTIVE_ADS_SOURCE_KEY } from "./active-ads-source.js";
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 // Vercel Marketplace projects can expose either the legacy service-role JWT or
@@ -3989,6 +3990,22 @@ export async function getAsinAdsDailyRows(accountId, from, to, { signal = null }
   return getAdsDailySourceRows({
     accountId, sourceKeys: ["asin-performance-v1"], from, to, maxRows: AD_DAILY_METRICS_MAX_ROWS, signal,
   });
+}
+
+// Daily/Brand durable CAMPAIGN-Ads reader: the raw campaign-performance-v1 rows for one account/window. Same
+// signature + row-ceiling behaviour as getAsinAdsDailyRows so it drops into the same readAdMetrics binding.
+export async function getCampaignAdsDailyRows(accountId, from, to, { signal = null } = {}) {
+  return getAdsDailySourceRows({
+    accountId, sourceKeys: ["campaign-performance-v1"], from, to, maxRows: AD_DAILY_METRICS_MAX_ROWS, signal,
+  });
+}
+
+// The ACTIVE Ads durable reader after the ASIN->Campaign cutover (campaign; rollback flips to asin via
+// ACTIVE_ADS_SOURCE_KEY). One binding switches every Daily/Brand/Dashboard durable ad read through the single seam.
+export async function getActiveAdsDailyRows(accountId, from, to, opts = {}) {
+  return ACTIVE_ADS_SOURCE_KEY === "asin-performance-v1"
+    ? getAsinAdsDailyRows(accountId, from, to, opts)
+    : getCampaignAdsDailyRows(accountId, from, to, opts);
 }
 
 /* ============================== EXCHANGE RATES ==============================

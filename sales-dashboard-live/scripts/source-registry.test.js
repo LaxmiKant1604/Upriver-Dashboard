@@ -6,8 +6,8 @@
 //   B. the PRIORITY-TRANCHE downstream mappings required by the reviewed mission are present verbatim:
 //      OLI -> Daily Reporting, Brand Sales/Brand View, FBA Plan, PPC denominator, Buy Box Loss, Returns
 //      Leakage; Product Catalog -> Daily Reporting, Brand Sales/Brand View + catalog-dependent dashboards;
-//      campaign-performance-v1 (ads-campaign-date) -> Daily Reporting (and NEVER Brand View);
-//      asin-performance-v1 (ads-asin-date) -> Brand View + PPC Performance;
+//      campaign-performance-v1 (ads-campaign-date) -> Daily Reporting + Brand View + PPC (the ACTIVE Ads grain);
+//      asin-performance-v1 (ads-asin-date) -> PPC Performance ONLY (retired from Daily/Brand; history retained);
 //      FBA Inventory Health -> Brand View, FBA Plan, Buy Box Loss, Listing Health, Sales Movers.
 //   C. DataDoe token classes -- premium is EXACTLY {profit-by-sku-date, listings, fba-inventory-health}
 //      (5 tokens); every other family standard (2); pricing reads fail closed on an unregistered family.
@@ -91,18 +91,18 @@ test("Product Catalog feeds Daily Reporting, Brand Sales/Brand View and the cata
   assert.equal(expected.length, 12, "catalog has 12 direct consumers");
 });
 
-test("campaign-performance-v1 (ads-campaign-date) is PPC-only -- NEVER Daily Reporting or Brand View", () => {
+test("ASIN->Campaign CUTOVER: campaign-performance-v1 (ads-campaign-date) is the ACTIVE Ads grain -- Daily + Brand View + PPC", () => {
   const d = reg.dashboardsUsingSource("ads-campaign-date");
   assert.ok(d.includes("ppc-performance"), "PPC reads the campaign grain");
-  assert.ok(!d.includes("daily-reporting"), "Daily Reporting moved to the ASIN grain (no longer the campaign grain)");
-  assert.ok(!d.includes("brand-view"), "Brand View NEVER reads the campaign grain (overlapping Ads grains are never mixed)");
+  assert.ok(d.includes("daily-reporting"), "Daily Reporting reads the campaign grain (account-level) post-cutover");
+  assert.ok(d.includes("brand-view"), "Brand View reads the campaign grain (brand-level, via campaign->brand mapping) post-cutover");
 });
 
-test("asin-performance-v1 (ads-asin-date) is the SINGLE reusable Ads grain -- Daily Reporting + Brand View + PPC", () => {
+test("ASIN->Campaign CUTOVER: asin-performance-v1 (ads-asin-date) is RETIRED from Daily/Brand -- PPC-only (history retained)", () => {
   const d = reg.dashboardsUsingSource("ads-asin-date");
-  assert.ok(d.includes("daily-reporting"), "Daily Reporting reads the ASIN grain (account-level)");
-  assert.ok(d.includes("brand-view"), "Brand View reads the ASIN grain (brand-level)");
-  assert.ok(d.includes("ppc-performance"), "PPC reads the ASIN grain");
+  assert.ok(!d.includes("daily-reporting"), "Daily Reporting no longer reads the ASIN grain (retired)");
+  assert.ok(!d.includes("brand-view"), "Brand View no longer reads the ASIN grain (retired)");
+  assert.ok(d.includes("ppc-performance"), "ASIN grain remains a PPC-only input (durable history retained, exports blocked)");
 });
 
 test("FBA Inventory Health feeds Brand View, FBA Plan, Buy Box Loss, Listing Health, Sales Movers", () => {

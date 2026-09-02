@@ -40,10 +40,11 @@ const CATALOG = [
   { child_asin: "B0A", sku: "SKU-A", parent_asin: "P", product_name: "A", product_brand: "Acme" },
   { child_asin: "B0B", sku: "SKU-B", parent_asin: "P", product_name: "B", product_brand: "Bolt" },
 ];
-// The EXACT durable ASIN-Ads reader row shape (ads_daily_source_rows, asin-performance-v1): metrics live in a
-// JSONB and canonicalizeAdRows folds them per (date, currency) -- ad_sales_same_sku -> ad_sales (same-SKU only).
+// The EXACT durable CAMPAIGN-Ads reader row shape (ads_daily_source_rows, campaign-performance-v1) post
+// ASIN->Campaign cutover: metrics live in a JSONB and canonicalizeAdRows folds them per (date, currency) using the
+// campaign contract's total ad_sales.
 const AD_ROWS = [
-  { metric_date: "2026-08-10", marketplace_country_code: "US", dimension_key: "d1", currency: "USD", child_asin: "B0A", updated_at: "2026-08-11T00:00:00Z", metrics: { ad_sales_same_sku: 40, ad_spend: 12, ad_clicks: 8 } },
+  { metric_date: "2026-08-10", marketplace_country_code: "US", dimension_key: "d1", currency: "USD", campaign_id: "c1", updated_at: "2026-08-11T00:00:00Z", metrics: { ad_sales: 40, ad_spend: 12, ad_clicks: 8 } },
 ];
 const COVERAGE_STATE = { windows: [{ from: "2026-08-01", to: ASOF }], status: "succeeded", latestMetricDate: "2026-08-10", read: "ok", error: null };
 const fullEvidence = () => ({
@@ -51,7 +52,8 @@ const fullEvidence = () => ({
   catalogSnapshot: { validated_at: ASOF + "T01:00:00Z", object_path: "x", row_count: 2 },
   fbaSnapshotsByAccount: { A01: { validated_at: ASOF + "T01:00:00Z" } },
   campaignAds: { grain: "campaign-performance-v1", read: "ok", windowsByAccountId: { A01: [{ from: "2025-06-01", to: ASOF }] } },
-  asinAds: { grain: "asin-performance-v1", read: "ok", windowsByAccountId: { A01: [{ from: "2025-06-01", to: ASOF }] } },
+  // Post ASIN->Campaign cutover the Daily/Brand readiness ads input carries the ACTIVE (campaign) grain.
+  asinAds: { grain: "campaign-performance-v1", read: "ok", windowsByAccountId: { A01: [{ from: "2025-06-01", to: ASOF }] } },
 });
 
 function derive() {
@@ -76,7 +78,7 @@ test("Non-US shape: complete OLI + Catalog + FAILED ASIN Ads -> daily + brand-sa
     catalogSnapshot: ev.catalogSnapshot,
     fbaSnapshotsByAccount: {}, // no FBA
     campaignAds: ev.campaignAds,
-    asinAds: { grain: "asin-performance-v1", read: "read-failed", windowsByAccountId: { A01: [] } }, // FAILED Ads
+    asinAds: { grain: "campaign-performance-v1", read: "read-failed", windowsByAccountId: { A01: [] } }, // FAILED (active) Ads
     adMetricsByAccountId: { A01: { rows: [], metricsRead: "read-failed" } },
     adsCoverageStateByAccountId: { A01: { windows: [], status: "failed", latestMetricDate: null, read: "read-failed" } },
     dailyWindow: { from: DAILY_FROM, to: ASOF },

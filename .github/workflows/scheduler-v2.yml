@@ -181,10 +181,14 @@ jobs:
         if: (steps.cfg.outputs.bucket != 'us' || steps.us_guard.outputs.run_required == 'true') && steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/oli-refresh-d1.mjs --bucket=${{ steps.cfg.outputs.bucket }} --requested-as-of=${{ steps.cfg.outputs.asof }} --refresh-mode=${{ steps.cfg.outputs.mode }} --run-id=${{ github.run_id }}
 
-      # (step 4) Refresh ASIN Ads for THIS bucket only (coverage mode, 21-day rolling window).
-      - name: Refresh ASIN Ads (this bucket only; coverage mode, 21-day rolling window)
+      # (step 4) Refresh CAMPAIGN Ads for THIS bucket only (coverage mode, 21-day rolling window). Post ASIN->Campaign
+      # cutover, Campaign is the ONLY active Ads source: this keeps Daily Reporting + Brand View ad data fresh at
+      # publish. Idempotent (already-covered accounts create nothing); the dedicated regional Campaign schedules cover
+      # the 3-region cadence and any overlap is a zero-token no-op. ASIN Ads exports are retired (a hard guard in
+      # ads-sync.js refuses them from every entry point; the durable ASIN history + reader code are retained).
+      - name: Refresh Campaign Ads (this bucket only; coverage mode, 21-day rolling window)
         if: (steps.cfg.outputs.bucket != 'us' || steps.us_guard.outputs.run_required == 'true') && steps.tokengate.outputs.proceed == 'true'
-        run: node scripts/release/scheduled-asin-ads-refresh.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.cfg.outputs.asof }}
+        run: node scripts/release/scheduled-campaign-ads-refresh.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.cfg.outputs.asof }}
 
       # (step 5) STRICT D-1 readiness proof (read-only). Publication requires EVERY account gapless through the EXACT
       # requestedAsOf (D-1). A settlement tail (proven only through D-2), interior gap, blank provenance, or unreadable

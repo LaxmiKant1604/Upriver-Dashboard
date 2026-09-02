@@ -18,7 +18,7 @@ const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(S(v));
 
 // The FROZEN orchestrated source set for this release. Campaign Ads, FBA, and every other family are refused --
 // they stay paused and are never scheduled or created by this operation.
-export const ORCHESTRATED_SOURCE_KEYS = Object.freeze(["order-line-items", "ads-asin-date", "product-catalog"]);
+export const ORCHESTRATED_SOURCE_KEYS = Object.freeze(["order-line-items", "ads-campaign-date", "product-catalog"]);
 
 // The EXPLICIT immutable source -> dashboard dependency registry. One source sync derives EVERY affected report
 // from the same persisted evidence. daily/brand-sales/brand-inventory are the release engine's frozen priority
@@ -29,9 +29,9 @@ export const SOURCE_DASHBOARD_DEPENDENCIES = Object.freeze({
     adsRepublish: false,  // OLI changes are carried by the release derive itself
     membership: true,     // fresh brand-sales evidence can change Brand View membership
   }),
-  "ads-asin-date": Object.freeze({
+  "ads-campaign-date": Object.freeze({
     reports: Object.freeze(["daily-reporting", "brand-sales", "brand-inventory"]),
-    adsRepublish: true,   // Daily v2 ads-provenance republish + Brand View portfolio ads from the same rows
+    adsRepublish: true,   // Daily v2 ads-provenance republish + Brand View portfolio ads from the same campaign rows
     membership: false,    // ads never change brand-sales membership
   }),
   "product-catalog": Object.freeze({

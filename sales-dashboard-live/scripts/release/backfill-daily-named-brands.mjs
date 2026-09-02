@@ -71,7 +71,7 @@ async function loadNamedBrandPairs() {
 const readers = {
   readOliHistory: getEnrichedOliHistoryRows, // ordered units + actual-plus-estimated sales (the canonical seam)
   readOliCoverage: sb.getSourceCoverageWindows,
-  readAsinAds: sb.getAsinAdsDailyRows,
+  readAsinAds: sb.getActiveAdsDailyRows,
   readAdsCoverage: sb.getDailyAdsCoverage,
   readCatalogSnapshot: sb.getSourceSnapshot,
   loadCatalogPayload: sb.getSourceSnapshotPayload,

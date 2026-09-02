@@ -184,8 +184,8 @@ async function main() {
   /* ---- structural: campaign/fba, summary distinction, schedules, activation guard ---- */
   group("structural: no campaign/fba, D-1-vs-lag summary, schedules, activation guard");
 
-  test("11. Campaign Ads / FBA are never force-fetched: forceFreshOli is OLI-only + they are not schedule-enabled", () => {
-    assert.ok(!SCHEDULED_ENABLED_SOURCE_KEYS.includes("ads-campaign-date"));
+  test("11. force-fetch (forceFreshOli) is OLI-only: Campaign Ads (the active source) + FBA are never force-fetched; retired ASIN Ads is not schedule-enabled", () => {
+    assert.ok(!SCHEDULED_ENABLED_SOURCE_KEYS.includes("ads-asin-date"), "ASIN Ads retired (not schedule-enabled)");
     assert.ok(!SCHEDULED_ENABLED_SOURCE_KEYS.some((k) => /fba/i.test(k)));
     // the runtime authorizes forceFreshOli ONLY for order-line-items (guarded in runSourceCardAction).
     const rt = readFileSync(resolve(HERE, "..", "lib", "server", "sync", "source-bucket-sync-runtime.js"), "utf8");

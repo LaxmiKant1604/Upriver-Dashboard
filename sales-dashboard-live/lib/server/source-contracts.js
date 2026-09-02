@@ -182,7 +182,7 @@ export const SOURCE_CONTRACTS = [
 // the upstream report/source they read instead of inventing another export.
 export const REPORT_SOURCE_REQUIREMENTS = Object.freeze({
   "brand-sales": ["order-line-items", "product-catalog"],
-  "daily-reporting": ["order-line-items", "product-catalog", "ads-asin-date"],
+  "daily-reporting": ["order-line-items", "product-catalog", "ads-campaign-date"],
   reconciliation: ["order-line-items", "settlements", "product-catalog"],
   "fba-plan": ["order-line-items", "product-catalog", "fba-inventory-health", "listings"],
   "sku-pl": ["profit-by-sku-date"],
@@ -194,7 +194,7 @@ export const REPORT_SOURCE_REQUIREMENTS = Object.freeze({
   "returns-leakage": ["returns", "settlements", "order-line-items", "product-catalog"],
   "ppc-performance": ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date", "order-line-items", "product-catalog"],
   "listing-optimizer": ["sqp-weekly", "product-catalog"],
-  "brand-view": ["brand-sales", "ads-asin-date", "fba-plan"],
+  "brand-view": ["brand-sales", "ads-campaign-date", "fba-plan"],
   "priority-feed": ["sales-movers", "listing-health", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer"],
 });
 

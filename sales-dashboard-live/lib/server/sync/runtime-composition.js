@@ -22,7 +22,7 @@ import { schedulerV2ReportControlCatalog, CONTROLLED_REPORT_KEYS, SCHEDULER_V2_R
 import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "./report-publisher.js";
 import { runSchedulerV2Shadow } from "./sync-dispatch.js";
 import { makeSourceTranche, isSourceTranche } from "./source-tranche.js";
-import { getAsinAdsDailyRows, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings, getSchedulerAccountRollout, getSourceCoverageWindows, getSourceOliHistoryRows, getSourceSnapshot, getSourceSnapshotPayload } from "../supabase.js";
+import { getAsinAdsDailyRows, getActiveAdsDailyRows, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings, getSchedulerAccountRollout, getSourceCoverageWindows, getSourceOliHistoryRows, getSourceSnapshot, getSourceSnapshotPayload } from "../supabase.js";
 import { auditSchemaContract, schedulerV2SchemaObjects, REQUIRED_WRAPPER_EXPORTS } from "./schema-contract.js";
 
 // The complete set of Supabase wrappers the composed runtime depends on. Re-exported from the schema contract
@@ -146,7 +146,7 @@ export function buildSchedulerV2Runtime(overrides = {}) {
     getReportSyncSettings: readReportSyncSettings = getReportSyncSettings, // DURABLE scheduled-control source
     getAccountRollout = getSchedulerAccountRollout, // DURABLE account-rollout source (Gate-7; fail-closed typed reader)
     // Ads readers -- ALL Supabase, cache-only; NEVER a DataDoe export:
-    getAdMetrics = getAsinAdsDailyRows,           // Daily Reporting durable ASIN Ads reader (single reusable source)
+    getAdMetrics = getActiveAdsDailyRows,         // Daily Reporting durable Ads reader (ACTIVE grain: campaign post-cutover, asin on rollback)
     getCoverageState = getDailyAdsCoverage,        // Daily durable ads_sync_coverage reader
     getAdsDailySourceRows: ppcRows = getAdsDailySourceRows,   // PPC persisted Ads rows reader
     getAdsSyncStates: ppcStates = getAdsSyncStates,           // PPC ads_sync_state reader

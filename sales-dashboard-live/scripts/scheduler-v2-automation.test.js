@@ -108,19 +108,19 @@ test("B4. dd-secondary / colon-scoped accounts are excluded from the primary OLI
   assert.equal(plan.expectedBatches, 1, "only the 3 primary accounts are batched");
 });
 
-test("B5. durable source_controls target: ONLY order-line-items + product-catalog + ads-asin-date are schedule-enabled + unpaused; Campaign Ads / FBA / every other source stays schedule-disabled", () => {
+test("B5. durable source_controls target (post ASIN->Campaign cutover): ONLY order-line-items + product-catalog + ads-campaign-date are schedule-enabled + unpaused; ASIN Ads / FBA / every other source stays schedule-disabled", () => {
   const allKeys = ["order-line-items", "product-catalog", "ads-asin-date", "ads-campaign-date", "settlements", "returns", "fba-inventory-health", "listings", "content-changes"];
   const plan = scheduledSourceControlPlan(allKeys);
   const enabled = plan.filter((p) => p.scheduleEnabled === true).map((p) => p.sourceKey).sort();
-  assert.deepEqual(enabled, [...SCHEDULED_ENABLED_SOURCE_KEYS].sort(), "exactly OLI + catalog + ASIN Ads enabled");
-  assert.ok(enabled.includes("ads-asin-date"), "ASIN Ads is scheduled");
+  assert.deepEqual(enabled, [...SCHEDULED_ENABLED_SOURCE_KEYS].sort(), "exactly OLI + catalog + Campaign Ads enabled");
+  assert.ok(enabled.includes("ads-campaign-date"), "Campaign Ads is scheduled (the active Ads source)");
   for (const p of plan) {
     if (SCHEDULED_ENABLED_SOURCE_KEYS.includes(p.sourceKey)) { assert.equal(p.scheduleEnabled, true); assert.equal(p.paused, false, p.sourceKey + " unpaused"); }
     else { assert.equal(p.scheduleEnabled, false, p.sourceKey + " schedule-disabled"); assert.equal(p.paused, undefined, p.sourceKey + " paused state left untouched"); }
   }
-  // Campaign Ads / FBA / settlements / returns are NEVER schedule-enabled by this scheduler.
-  for (const forbidden of ["ads-campaign-date", "fba-inventory-health", "settlements", "returns"]) {
-    assert.ok(!enabled.includes(forbidden), forbidden + " must never be scheduled (Campaign Ads stays paused)");
+  // ASIN Ads (retired) / FBA / settlements / returns are NEVER schedule-enabled by this scheduler.
+  for (const forbidden of ["ads-asin-date", "fba-inventory-health", "settlements", "returns"]) {
+    assert.ok(!enabled.includes(forbidden), forbidden + " must never be scheduled (ASIN Ads retired; exports blocked)");
   }
 });
 
@@ -207,8 +207,8 @@ test("D2. workflow shape: INDEPENDENT per-bucket ordered pipeline -- token ceili
   assert.ok(idx("npm ci") < idx("scheduled-cycle-preflight.mjs"), "npm ci before cycle preflight");
   assert.ok(idx("scheduled-cycle-preflight.mjs") < idx("confirm-token-budget.mjs"), "cycle preflight before token gate");
   assert.ok(idx("confirm-token-budget.mjs") < idx("oli-refresh-d1.mjs"), "token gate before OLI");
-  assert.ok(idx("oli-refresh-d1.mjs") < idx("scheduled-asin-ads-refresh.mjs"), "OLI before ASIN Ads");
-  assert.ok(idx("scheduled-asin-ads-refresh.mjs") < idx("verify-bucket-readiness.mjs"), "Ads before the readiness proof");
+  assert.ok(idx("oli-refresh-d1.mjs") < idx("scheduled-campaign-ads-refresh.mjs"), "OLI before ASIN Ads");
+  assert.ok(idx("scheduled-campaign-ads-refresh.mjs") < idx("verify-bucket-readiness.mjs"), "Ads before the readiness proof");
   assert.ok(idx("verify-bucket-readiness.mjs") < idx("priority-control-package.mjs --apply"), "readiness/effectivePublishAsOf BEFORE opening controls");
   assert.ok(idx("priority-control-package.mjs --apply") < idx("priority-dashboards-release.mjs"), "open controls before release");
   assert.ok(idx("priority-dashboards-release.mjs") < idx("rebuild-brand-membership.mjs"), "release before membership rebuild");
@@ -222,7 +222,7 @@ test("D2. workflow shape: INDEPENDENT per-bucket ordered pipeline -- token ceili
   assert.match(yml, /verify-bucket-readiness\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\} --requested-as-of=\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "readiness proves the bucket at the requestedAsOf");
   assert.match(yml, /priority-dashboards-release\.mjs --bucket=[^\n]*--as-of=\$\{\{ steps\.readiness\.outputs\.effective_asof \}\}/, "release publishes at the HONEST effectivePublishAsOf, not the requestedAsOf");
   // every create/control step (incl. readiness) is gated on the token-gate proceed output (typed skip => nothing).
-  for (const step of ["oli-refresh-d1.mjs", "scheduled-asin-ads-refresh.mjs", "verify-bucket-readiness.mjs", "priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
+  for (const step of ["oli-refresh-d1.mjs", "scheduled-campaign-ads-refresh.mjs", "verify-bucket-readiness.mjs", "priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
     const at = idx(step); const before = yml.slice(Math.max(0, at - 260), at);
     assert.match(before, /steps\.tokengate\.outputs\.proceed == 'true'/, step + " is gated on the token-gate proceed");
   }
@@ -232,8 +232,10 @@ test("D2. workflow shape: INDEPENDENT per-bucket ordered pipeline -- token ceili
   // date-scoped operation key uses the requestedAsOf (shared Catalog reservation across both buckets on a date).
   assert.match(yml, /--operation-key=priority-dashboards\/scheduled\/\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "date-scoped (requestedAsOf) operation key");
   assert.match(yml, /timeout-minutes:\s*(1[0-9][0-9]|[2-9][0-9])/, "job timeout covers OLI+Ads+publication");
-  // Campaign Ads / FBA / unrelated reports structurally ABSENT: no run command invokes a campaign/fba/cron script.
-  assert.doesNotMatch(yml, /node scripts\/[^\n]*(campaign|fba)/i, "no run step invokes a Campaign Ads / FBA script");
+  // Post ASIN->Campaign cutover the scheduler DOES refresh Campaign Ads (the active source); FBA + the deprecated
+  // Vercel cron endpoint remain structurally ABSENT, and the retired ASIN refresh operator is never invoked.
+  assert.doesNotMatch(yml, /node scripts\/[^\n]*fba/i, "no run step invokes an FBA script");
+  assert.doesNotMatch(yml, /scheduled-asin-ads-refresh/, "the retired ASIN Ads refresh operator is never invoked");
   assert.doesNotMatch(yml, /api\/cron\/sync/, "never drives the deprecated Vercel cron endpoint");
 });
 

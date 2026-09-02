@@ -48,7 +48,7 @@ if (accounts.length !== 30) console.warn(`WARNING: expected 30 primary accounts,
 const readers = {
   readOliHistory: getEnrichedOliHistoryRows, // priced rollup + internal missing/zero-price estimates (canonical)
   readOliCoverage: sb.getSourceCoverageWindows,
-  readAsinAds: sb.getAsinAdsDailyRows,
+  readAsinAds: sb.getActiveAdsDailyRows,
   readAdsCoverage: sb.getDailyAdsCoverage,
   readCatalogSnapshot: sb.getSourceSnapshot,
   loadCatalogPayload: sb.getSourceSnapshotPayload,

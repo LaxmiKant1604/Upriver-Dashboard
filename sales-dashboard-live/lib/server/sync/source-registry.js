@@ -266,11 +266,11 @@ export const SOURCE_REGISTRY = Object.freeze([
     // regions and batches them <=5. Corrected from the old per-account/1 declaration (which contradicted that
     // runtime and the <=5-seller token budget), exactly as ads-asin-date was.
     batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
-    usedByReports: ["ppc-performance"],
-    // The campaign and ASIN grains OVERLAP (same spend/sales at different grains) and are NEVER summed together.
-    // usedByReports adds brand-view + daily-reporting at the ASIN->Campaign cutover (a later stage), in lockstep with
-    // REPORT_SOURCE_REQUIREMENTS; until then this family is PPC-only.
-    usedByDashboards: ["ppc-performance", "priority-feed"],
+    // ASIN->Campaign CUTOVER: Campaign is now the ACTIVE Ads source for Daily Reporting + Brand View (account totals
+    // = all campaigns; named-brand = campaigns mapped to that brand via campaign_brand_mapping) as well as PPC. Kept
+    // in lockstep with REPORT_SOURCE_REQUIREMENTS. The campaign and ASIN grains OVERLAP and are NEVER summed together.
+    usedByReports: ["brand-view", "daily-reporting", "ppc-performance"],
+    usedByDashboards: ["brand-view", "daily-reporting", "ppc-performance", "priority-feed"],
     initialBackfill: { kind: "window-days", days: 56 },
     incrementalRefresh: { kind: "rolling-window-days", days: 21, upsert: "replace-matching-rows" },
     tokenClass: "standard",
@@ -290,11 +290,11 @@ export const SOURCE_REGISTRY = Object.freeze([
     // batches). Corrected to stable-batch/5 to match reality. Durable-ads families batch via that architecture,
     // not a source-job SELLER_SCOPED_REQUEST_KEYS contract (validator 6 exempts durable-ads accordingly).
     batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
-    usedByReports: ["brand-view", "daily-reporting", "ppc-performance"],
-    // The SINGLE reusable Ads grain (asin-performance-v1): Daily Reporting (account-level) + Brand View
-    // (brand-level) + PPC all read it. ONE saved dataset feeds every consumer. The campaign and ASIN grains
-    // OVERLAP and are never summed together.
-    usedByDashboards: ["brand-view", "daily-reporting", "ppc-performance", "priority-feed"],
+    // ASIN->Campaign CUTOVER: ASIN Ads is RETIRED from Daily Reporting + Brand View (new exports blocked; durable
+    // history + reader code retained). It remains ONLY a PPC input (PPC reads both grains and never sums them). Kept
+    // in lockstep with REPORT_SOURCE_REQUIREMENTS.
+    usedByReports: ["ppc-performance"],
+    usedByDashboards: ["ppc-performance", "priority-feed"],
     initialBackfill: { kind: "window-days", days: 60 },
     incrementalRefresh: { kind: "rolling-window-days", days: 21, upsert: "replace-matching-rows" },
     tokenClass: "standard",

@@ -614,8 +614,8 @@ test("F2. readiness blocks on missing OLI coverage / catalog; an Ads gap degrade
     catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" },
     from: "2026-08-10", to: "2026-08-14",
   };
-  // Daily now reads the ASIN grain (the single reusable Ads source, shared with Brand View).
-  const readyAds = { grain: "asin-performance-v1", read: "ok", windows: [{ from: "2026-08-01", to: "2026-08-15" }] };
+  // Post ASIN->Campaign cutover, Daily reads the CAMPAIGN grain (the active Ads source, shared with Brand View).
+  const readyAds = { grain: "campaign-performance-v1", read: "ok", windows: [{ from: "2026-08-01", to: "2026-08-15" }] };
   const r1 = dash.dailyReportingReadiness({ ...base, asinAds: readyAds });
   assert.equal(r1.ready, true); assert.equal(r1.adsReady, true);
   const r2 = dash.dailyReportingReadiness({ ...base, oliCoverageByAccountId: { A01: base.oliCoverageByAccountId.A01, A02: [] }, asinAds: readyAds });
@@ -623,7 +623,7 @@ test("F2. readiness blocks on missing OLI coverage / catalog; an Ads gap degrade
   assert.ok(r2.blockedBy.some((b) => b.sourceKey === "order-line-items" && b.accountId === "A02"));
   const r3 = dash.dailyReportingReadiness({ ...base, catalogSnapshot: null, asinAds: readyAds });
   assert.equal(r3.ready, false, "a missing validated catalog blocks Daily");
-  const gapAds = { grain: "asin-performance-v1", read: "ok", windows: [{ from: "2026-08-01", to: "2026-08-12" }] };
+  const gapAds = { grain: "campaign-performance-v1", read: "ok", windows: [{ from: "2026-08-01", to: "2026-08-12" }] };
   const r4 = dash.dailyReportingReadiness({ ...base, asinAds: gapAds });
   assert.equal(r4.ready, true, "an ads gap never blocks sales");
   assert.equal(r4.adsReady, false, "but the ads half is not ready");
@@ -637,16 +637,16 @@ test("F3. the WRONG Ads grain THROWS (overlapping grains are never mixed); Brand
     fbaSnapshotsByAccount: { A01: { validated_at: TODAY + "T01:00:00Z" } },
     from: "2026-08-10", to: "2026-08-14",
   };
-  // Daily now requires the ASIN grain, so feeding it the CAMPAIGN grain is the wrong-grain hard failure.
+  // Post-cutover Daily requires the CAMPAIGN grain, so feeding it the retired ASIN grain is the wrong-grain hard failure.
   assert.throws(
-    () => dash.dailyReportingReadiness({ ...base, asinAds: { grain: "campaign-performance-v1", read: "ok", windows: [] } }),
+    () => dash.dailyReportingReadiness({ ...base, asinAds: { grain: "asin-performance-v1", read: "ok", windows: [] } }),
     /never mix overlapping Ads grains/,
   );
   assert.throws(
-    () => dash.brandViewReadiness({ ...base, asinAds: { grain: "campaign-performance-v1", read: "ok", windows: [] } }),
+    () => dash.brandViewReadiness({ ...base, asinAds: { grain: "asin-performance-v1", read: "ok", windows: [] } }),
     /never mix overlapping Ads grains/,
   );
-  const bv = dash.brandViewReadiness({ ...base, asinAds: { grain: "asin-performance-v1", read: "ok", windows: [{ from: "2026-08-01", to: "2026-08-15" }] } });
+  const bv = dash.brandViewReadiness({ ...base, asinAds: { grain: "campaign-performance-v1", read: "ok", windows: [{ from: "2026-08-01", to: "2026-08-15" }] } });
   assert.equal(bv.ready, true, "Brand View is ready on the SAME OLI/catalog evidence Daily used (one evidence set, two dashboards)");
   assert.equal(bv.adsReady, true);
 });

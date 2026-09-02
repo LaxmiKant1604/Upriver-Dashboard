@@ -35,7 +35,7 @@ import {
   useBrandCurrency, useBrandExport, useBrandRange, useFxRates,
 } from "./brand-controls.jsx";
 
-const REPORT_VERSION = "brand-view-account-scoped-v1";
+const REPORT_VERSION = "brand-view-account-scoped-v2";
 const BRANDS_VERSION = "brand-view-brands-v1";
 
 export default function BrandView({ accounts, accountsLoading, accountsError, loadReport, refreshReport }) {
