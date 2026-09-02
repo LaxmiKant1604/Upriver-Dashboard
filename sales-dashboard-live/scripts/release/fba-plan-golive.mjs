@@ -6,18 +6,23 @@
 // OLI/catalog derive), the four-gate CAS publisher, the guarded fba-plan control package, an apply-gates ->
 // publish -> read-back -> ownership -> ALWAYS-safe-close envelope, bounded by a hard token ceiling.
 //
-//   node scripts/release/fba-plan-golive.mjs --mode=dry-run   [--as-of=YYYY-MM-DD] [--max-blocked=2] [--bucket=us|non-us|both]
-//   node scripts/release/fba-plan-golive.mjs --mode=go-live   [--as-of=YYYY-MM-DD] [--max-tokens=80] [--max-blocked=2] [--bucket=...]
+//   node scripts/release/fba-plan-golive.mjs --mode=dry-run   [--as-of=YYYY-MM-DD] [--max-blocked=2] [--region=india|europe-au|us-ca|all] [--bucket=us|non-us|both]
+//   node scripts/release/fba-plan-golive.mjs --mode=go-live   [--as-of=YYYY-MM-DD] [--max-tokens=80] [--max-blocked=2] [--region=...] [--bucket=...]
 //
+// SCOPE: `--region` (a region india|europe-au|us-ca, or `all`) is the ACTIVE routing used by the regional
+// coordinator -- it takes precedence when present and runs exactly that region (or all three). `--bucket`
+// (us|non-us|both) is the legacy scope retained for manual runs + rollback. Either way FBA routes by
+// scope-membership; AWD stays US-only per-account (country === "US"), orthogonal to the region.
 // dry-run: ZERO creates, ZERO control changes -- resolves the coverage-maximizing as-of, builds the exact batched
 //   plan, proves how much is already adoptable from cache, and prints the create/token cost vs the ceiling.
-// go-live: refuses to start if the plan exceeds --max-tokens; otherwise, PER SELECTED BUCKET, runs the shared
+// go-live: refuses to start if the plan exceeds --max-tokens; otherwise, PER SELECTED SCOPE, runs the shared
 //   bounded pass to completion (fetch -> derive -> finalize -> open gates -> publish -> read-back -> ownership ->
-//   ALWAYS safe-close). Buckets run INDEPENDENTLY. Genuinely-stale-OLI accounts fail closed (never fabricated) and
-//   publish on a later run once their OLI catches up. The dedicated cycle (bucket-fba, as-of) makes a replay
-//   (fallback cron / retry) a zero-create idempotent no-op.
+//   ALWAYS safe-close). Scopes run INDEPENDENTLY. Genuinely-stale-OLI accounts fail closed (never fabricated) and
+//   publish on a later run once their OLI catches up. The dedicated cycle (scope-fba, as-of) makes a replay
+//   (watchdog / retry) a zero-create idempotent no-op.
 
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
+import { REGION_SCOPES, isRegionScope } from "../../lib/server/sync/scheduler-scope.js";
 loadReleaseEnv();
 
 const argOf = (name) => { const a = process.argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.split("=").slice(1).join("=") : null; };
@@ -26,10 +31,20 @@ if (mode !== "dry-run" && mode !== "go-live") { console.error("STOP --mode must 
 const asOfArg = argOf("as-of");
 const maxTokens = Number(argOf("max-tokens") || 80);
 const maxBlocked = Number(argOf("max-blocked") || 2);
+const regionArg = (argOf("region") || "").toLowerCase();
 const bucketArg = (argOf("bucket") || "both").toLowerCase();
-if (!["us", "non-us", "both"].includes(bucketArg)) { console.error("STOP --bucket must be us | non-us | both"); process.exit(2); }
-const wantBucket = (b) => bucketArg === "both" || bucketArg === b;
-const log = (m) => console.log("fba-golive[" + mode + (bucketArg === "both" ? "" : "/" + bucketArg) + "]: " + m);
+// Region takes precedence (the active regional path); fall back to the legacy bucket scope otherwise.
+let selectedScopes;
+if (regionArg) {
+  if (regionArg === "all") selectedScopes = [...REGION_SCOPES];
+  else if (isRegionScope(regionArg)) selectedScopes = [regionArg];
+  else { console.error("STOP --region must be india | europe-au | us-ca | all"); process.exit(2); }
+} else {
+  if (!["us", "non-us", "both"].includes(bucketArg)) { console.error("STOP --bucket must be us | non-us | both"); process.exit(2); }
+  selectedScopes = ["us", "non-us"].filter((b) => bucketArg === "both" || bucketArg === b);
+}
+const scopeLabel = regionArg ? (regionArg === "all" ? "all-regions" : regionArg) : (bucketArg === "both" ? "" : bucketArg);
+const log = (m) => console.log("fba-golive[" + mode + (scopeLabel ? "/" + scopeLabel : "") + "]: " + m);
 
 const { buildFbaPlanRelease } = await import("../../lib/server/sync/fba-plan-release-composition.js");
 const {
@@ -53,17 +68,16 @@ log("go-live as-of = " + asOf + " (ceiling D-1 = " + CEILING + "); included=" + 
 if (scope.blocked.length) log("  blocked (publish later once OLI catches up): " + scope.blocked.map((b) => b.accountId.slice(0, 6) + "(" + (b.provenTo || "none") + ")").join(", "));
 
 // ---------------- Stage 2: build the exact batched plan + prove the token cost (ZERO creates, SHARED core) ----
-const selectedBuckets = ["us", "non-us"].filter(wantBucket);
 const bucketPlan = new Map();
 let totalCreates = 0; let totalTokens = 0; let totalBatches = 0;
-for (const bucket of selectedBuckets) {
+for (const bucket of selectedScopes) {
   const bucketAccounts = fbaBucketAccounts(accounts, bucket);
   const { plan, cost } = await planFbaBucketCost({ bucketAccounts, connections: release.connections, asOf, getSourceExportCache: release.getSourceExportCache });
   bucketPlan.set(bucket, { bucketAccounts, plan, cost });
   totalCreates += Number(cost.creates || 0); totalTokens += Number(cost.tokens || 0); totalBatches += plan.sourceJobs.length;
   log("PLAN " + bucket + ": " + plan.sourceJobs.length + " batched exports; creates=" + cost.creates + " tokens=" + cost.tokens + " byFamily=" + JSON.stringify(cost.byFamily));
 }
-log("PLAN TOTAL: " + totalBatches + " batched exports across " + selectedBuckets.join("+") + " => " + totalCreates + " creates / " + totalTokens + " tokens (ceiling " + maxTokens + " -> " + (totalTokens <= maxTokens ? "WITHIN budget" : "EXCEEDS budget") + ")");
+log("PLAN TOTAL: " + totalBatches + " batched exports across " + selectedScopes.join("+") + " => " + totalCreates + " creates / " + totalTokens + " tokens (ceiling " + maxTokens + " -> " + (totalTokens <= maxTokens ? "WITHIN budget" : "EXCEEDS budget") + ")");
 
 if (mode === "dry-run") { log("DRY-RUN complete: ZERO creates, ZERO control changes."); process.exit(0); }
 
@@ -73,7 +87,7 @@ if (totalTokens > maxTokens) { console.error("STOP the plan costs " + totalToken
 // ---------------- go-live: run each SELECTED bucket to completion via the SHARED bounded pass ----------------
 let anyPublished = 0; let anyFailure = false;
 try {
-  for (const bucket of selectedBuckets) {
+  for (const bucket of selectedScopes) {
     const { bucketAccounts, cost } = bucketPlan.get(bucket);
     if (!bucketAccounts.length) { log(bucket + ": no accounts in this bucket -- skipping."); continue; }
     const includedIds = scope.included.filter((id) => bucketAccounts.some((a) => a.accountId === id));

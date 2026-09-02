@@ -11,6 +11,7 @@
 
 import pg from "pg";
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
+import { isRoutingScope } from "../../lib/server/sync/scheduler-scope.js";
 
 loadReleaseEnv(); // portable: loads <repoRoot>/.env.local when present, maps SUPABASE_URL, never overrides CI env
 
@@ -34,8 +35,8 @@ if (asOfArg) console.log("priority-release: asOf pinned to " + asOfArg + " (deri
 // US+Non-US release (both buckets published together). The account scope is discovered + verified INTERNALLY by
 // the composition (deriveBucket/finalizeBucket) -- never accepted from this flag beyond the bucket name.
 const bucketArg = (process.argv.find((a) => a.startsWith("--bucket=")) || "").split("=")[1] || null;
-if (bucketArg != null && bucketArg !== "us" && bucketArg !== "non-us") { console.error("STOP --bucket must be us|non-us (got: " + bucketArg + ")"); process.exit(2); }
-if (bucketArg) console.log("priority-release: bucket scope = " + bucketArg + " ONLY (the other bucket's snapshots are preserved untouched).");
+if (bucketArg != null && !isRoutingScope(bucketArg)) { console.error("STOP --bucket must be a routing scope (india|europe-au|us-ca|us|non-us; got: " + bucketArg + ")"); process.exit(2); }
+if (bucketArg) console.log("priority-release: scope = " + bucketArg + " ONLY (every other scope's snapshots are preserved untouched).");
 
 // --strict-d1: FAIL CLOSED (DATADOE_D1_NOT_READY, never publish) if the derive clamps effectivePublishAsOf below the
 // requested D-1 (--as-of). The scheduler passes it so a lagged/regressed bucket keeps its LKG instead of publishing D-2.

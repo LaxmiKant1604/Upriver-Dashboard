@@ -8,6 +8,7 @@
 
 import { assignAccountBatches, MAX_ACCOUNTS_PER_BATCH } from "./source-batching.js";
 import { OLI_SOURCE_KEY, ORGANIZATION_SCOPE_KEY, windowsProve } from "./source-durable-model.js";
+import { isRoutingScope } from "./scheduler-scope.js";
 
 export const OLI_TOKENS_PER_CREATE = 2; // one STANDARD DataDoe export
 
@@ -62,7 +63,7 @@ export function oliBucketPlan(accounts, existingMembership = new Map()) {
 export function assessScheduledOliCycle({ bucket, discoveredAccounts, sourceJobs, owners, open } = {}) {
   const problems = [];
   const push = (p) => problems.push(p);
-  if (bucket !== "us" && bucket !== "non-us") return { ok: false, problems: ["bad-bucket"], creates: 0, tokens: 0, batches: 0, ceilingCreates: 0, ceilingTokens: 0 };
+  if (!isRoutingScope(bucket)) return { ok: false, problems: ["bad-bucket"], creates: 0, tokens: 0, batches: 0, ceilingCreates: 0, ceilingTokens: 0 };
   const discovered = [...new Set((discoveredAccounts || []).map((a) => S(a && (a.accountId ?? a)).trim()).filter(Boolean))].sort();
   if (!discovered.length) return { ok: false, problems: ["no-discovered-accounts"], creates: 0, tokens: 0, batches: 0, ceilingCreates: 0, ceilingTokens: 0 };
   const discoveredSet = new Set(discovered);

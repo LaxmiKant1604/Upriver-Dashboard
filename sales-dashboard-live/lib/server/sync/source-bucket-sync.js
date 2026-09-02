@@ -30,6 +30,7 @@ import { sourceContractForKey } from "../source-contracts.js";
 import { addDaysStr } from "../date-windows.js";
 import { REPORT_SOURCE_CONTRACTS, sourceScopeForContract } from "./report-source-contracts.js";
 import { assignAccountBatches, MAX_ACCOUNTS_PER_BATCH } from "./source-batching.js";
+import { isRoutingScope } from "./scheduler-scope.js";
 import { plannedSourceJob, plannedBatchSourceJobs } from "./source-sync-driver.js";
 import { runSourceJobs } from "./source-worker.js";
 import { makeSourceTranche } from "./source-tranche.js";
@@ -235,7 +236,7 @@ export function planBucketSourceSync({
   // when warm) Catalog job gives that path a drainable cycle without any OLI/Ads/FBA fetch.
   forceCatalogRefresh = false,
 } = {}) {
-  if (bucket !== "us" && bucket !== "non-us") throw new Error(`planBucketSourceSync requires bucket 'us'|'non-us' (got "${bucket}").`);
+  if (!isRoutingScope(bucket)) throw new Error(`planBucketSourceSync requires a routing scope (india|europe-au|us-ca|us|non-us; got "${bucket}").`);
   if (!Array.isArray(accounts) || accounts.length === 0) throw new Error("planBucketSourceSync requires this bucket's non-empty account list (fail closed).");
   if (!isDateStr(asOf) || !isDateStr(today)) throw new Error("planBucketSourceSync requires YYYY-MM-DD asOf + today (fail closed).");
   for (const a of accounts) {

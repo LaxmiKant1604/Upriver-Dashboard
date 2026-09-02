@@ -213,7 +213,7 @@ test("C2. a durably PAUSED source cannot be force-synced (typed 409); unknown so
   );
   const { runtime: r2 } = makeComposition();
   await assert.rejects(() => r2.run({ bucket: "us", onlySourceKey: "no-such-source" }), /UNREGISTERED_SOURCE/);
-  await assert.rejects(() => r2.run({ bucket: "eu" }), /'us'\|'non-us'/);
+  await assert.rejects(() => r2.run({ bucket: "eu" }), /routing scope/); // "eu" is not a valid region OR legacy scope
 });
 
 test("C3. a missing primary connection fails closed BEFORE any discovery (controls are read first, fail-closed)", async () => {

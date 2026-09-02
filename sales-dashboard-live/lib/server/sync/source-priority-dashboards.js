@@ -34,7 +34,12 @@ export const PRIORITY_DASHBOARDS = Object.freeze({
   // Publish brand-sales BEFORE brand-inventory so Brand View can never combine stale sales with fresh inventory.
   publishOrder: Object.freeze(["daily-reporting", "brand-sales", "brand-inventory"]),
   catalogSourceKey: "product-catalog",
-  buckets: Object.freeze(["us", "non-us"]),
+  // Every account-routing scope this path may derive/finalize/publish: the three ACTIVE regions plus the legacy
+  // revenue buckets (retained for historical cycles + one-flag rollback). deriveBucket/finalizeBucket + the release
+  // runner validate against this list, so adding the regions here is the single lever that region-enables the
+  // priority (Dashboard/Daily/Brand View) publish path. The shared date-only Catalog operation key still caps the
+  // Catalog at ONE create per day across ALL scopes (the first region to run creates it; the rest reuse it).
+  buckets: Object.freeze(["us", "non-us", "india", "europe-au", "us-ca"]),
   maxCatalogCreates: 1,
   maxTokens: 2,
   catalogTokenCost: 2, // one STANDARD Catalog export

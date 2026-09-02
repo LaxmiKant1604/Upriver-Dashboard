@@ -5,6 +5,7 @@
 // with fully green durable evidence, a missing/non-scheduled-shape cycle (manual run, adopted export) is a note.
 
 import { resolveEffectivePublishAsOf, MAX_PUBLISH_TAIL_LAG_DAYS } from "./source-durable-model.js";
+import { isRoutingScope } from "./scheduler-scope.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
@@ -108,7 +109,7 @@ export function assessBucketPublishReadiness({
   const problems = [];
   const notes = [];
   const fail = (p) => ({ ok: false, bucket, requestedAsOf, effectiveAsOf: null, tailLagDays: null, status: "blocked", accounts: 0, problems: [p], notes, d1: requireD1 ? { requestedAsOf: S(requestedAsOf), provenThrough: null, missingAccounts: [], missingCount: null, reason: p } : null });
-  if (bucket !== "us" && bucket !== "non-us") return fail("bad-bucket:" + S(bucket));
+  if (!isRoutingScope(bucket)) return fail("bad-bucket:" + S(bucket));
   const at = S(requestedAsOf);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(at)) return fail("bad-requested-asof:" + at);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(S(from))) return fail("bad-from:" + S(from));

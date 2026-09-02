@@ -29,7 +29,7 @@ import { schedulerV2ReportControlCatalog } from "./report-controls.js";
 import { DERIVED_ONLY_REPORT_KEYS } from "./report-derivation.js";
 import { isValidCalendarDate } from "./report-source-contracts.js";
 import { classifyDirectoryAccounts } from "../datadoe-connections.js";
-import { bucketForCountry } from "./registry.js";
+import { accountInScope, isRoutingScope } from "./scheduler-scope.js";
 
 // The planner/organization-registry connection id ("primary" | "secondary") -> the source driver's
 // fail-closed connection id ("primary" | "dd-secondary") that plannedSourceJob validates.
@@ -186,8 +186,8 @@ export async function runSchedulerV2Shadow({
   // the one-attempt-per-hash claim still bounds every one of their creates. null => byte-identical behavior.
   budgetPlanner = null,
 }) {
-  if (bucket !== "us" && bucket !== "non-us") {
-    throw new Error(`runSchedulerV2Shadow requires an explicit cycle bucket of 'us' or 'non-us' (got "${bucket}").`);
+  if (!isRoutingScope(bucket)) {
+    throw new Error(`runSchedulerV2Shadow requires an explicit cycle scope (region india|europe-au|us-ca or legacy us|non-us; got "${bucket}").`);
   }
   if (typeof discoverAccounts !== "function") {
     throw new Error("runSchedulerV2Shadow requires an injected discoverAccounts() provider for dynamic primary-account discovery.");
@@ -283,7 +283,7 @@ export async function runSchedulerV2Shadow({
   const { active, unavailable } = classifyDirectoryAccounts(directoryRows, connections);
   let bucketAccounts = active
     .map((a) => ({ accountId: a.accountId ?? a.id, country: a.country, currency: a.currency, name: a.name }))
-    .filter((a) => a.accountId && bucketForCountry(a.country) === bucket);
+    .filter((a) => a.accountId && accountInScope(bucket, a.country));
 
   // Gate-7 rollout FILTER (EVERY dispatch, scheduled AND manual; applied BEFORE any cycle/source planning):
   // keep exactly the discovered primary accounts the durable state selects -- allowlist rows by EXACT public

@@ -1,23 +1,24 @@
 // TRUSTED, READ-ONLY cycle-identity preflight. Usage (run from sales-dashboard-live/, before the token gate):
 //   node scripts/release/scheduled-cycle-preflight.mjs --bucket=us|non-us
 //
-// Classifies the (bucket, today) cycle BEFORE any token read or create, so a same-date terminal collision fails
-// EARLY and clearly. Discovers the bucket's primary accounts via the DataDoe directory (zero tokens) -- NOT the
-// heavy source runtime. Exit 0 = runnable (absent/running/already-complete); 1 = terminal-non-OLI collision or
-// ambiguous cycle identity (the run must not proceed). Prints counts/dates/prefixes only.
+// Classifies the (scope, today) cycle BEFORE any token read or create, so a same-date terminal collision fails
+// EARLY and clearly. Discovers the scope's primary accounts via the DataDoe directory (zero tokens) -- NOT the
+// heavy source runtime. `--bucket` accepts a region (india|europe-au|us-ca) or a legacy bucket (us|non-us).
+// Exit 0 = runnable (absent/running/already-complete); 1 = terminal-non-OLI collision or ambiguous cycle identity
+// (the run must not proceed). Prints counts/dates/prefixes only.
 
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
+import { accountInScope, isRoutingScope } from "../../lib/server/sync/scheduler-scope.js";
 
 loadReleaseEnv();
 
 const argOf = (name) => { const a = process.argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.split("=").slice(1).join("=") : null; };
 const bucket = argOf("bucket");
-if (bucket !== "us" && bucket !== "non-us") { console.error("STOP --bucket must be us|non-us (got: " + bucket + ")"); process.exit(2); }
+if (!isRoutingScope(bucket)) { console.error("STOP --bucket must be a routing scope (india|europe-au|us-ca|us|non-us; got: " + bucket + ")"); process.exit(2); }
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 const { fetchAccounts } = await import("../../lib/server/datadoe.js");
-const { bucketForCountry } = await import("../../lib/server/sync/registry.js");
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows } = await import("../../lib/server/supabase.js");
 const { classifyScheduledOliCycle, assessDurableOliCoverageComplete } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
@@ -31,7 +32,7 @@ const rows = (await fetchAccounts(primaryConn.apiKey)) || [];
 const { active } = classifyDirectoryAccounts(rows, connections);
 const seen = new Set();
 const discovered = [];
-for (const a of active) { const id = String((a && (a.accountId ?? a.id)) || "").trim(); const country = String((a && a.country) || "").toUpperCase(); if (!id || id.includes(":") || seen.has(id)) continue; if (bucketForCountry(country) !== bucket) continue; seen.add(id); discovered.push({ accountId: id }); }
+for (const a of active) { const id = String((a && (a.accountId ?? a.id)) || "").trim(); const country = String((a && a.country) || "").toUpperCase(); if (!id || id.includes(":") || seen.has(id)) continue; if (!accountInScope(bucket, country)) continue; seen.add(id); discovered.push({ accountId: id }); }
 if (!discovered.length) { console.error("STOP no discovered " + bucket + " primary accounts"); process.exit(1); }
 
 let cycle = null;

@@ -19,6 +19,7 @@
 import { organizationFingerprint } from "../source-identity.js";
 import { buildShadowReportPlan } from "./report-planner.js";
 import { resolveGoLiveAsOf, fbaGoLiveTokenCost } from "./fba-plan-golive-plan.js";
+import { accountInScope } from "./scheduler-scope.js";
 
 const OLI_SOURCE_KEY = "order-line-items";
 const S = (v) => (v == null ? "" : String(v));
@@ -95,9 +96,14 @@ export function partitionFbaBucketAccounts(accounts) {
   }
   return { us, nonUs };
 }
+// Accounts belonging to a routing scope (region india|europe-au|us-ca or legacy us|non-us). Drops non-primary
+// (":" in id) + missing-marketplace accounts (defense-in-depth). Region scopes route by marketplace; legacy buckets
+// by the us/non-us rule -- so a us-ca run includes US + CA accounts, and AWD (US-only) is still decided per-account
+// (country === "US") inside the pipeline, orthogonal to the region.
 export function fbaBucketAccounts(accounts, bucket) {
-  const { us, nonUs } = partitionFbaBucketAccounts(accounts);
-  return bucket === "us" ? us : nonUs;
+  return (accounts || []).filter(
+    (a) => a && a.accountId && !String(a.accountId).includes(":") && S(a.country).trim() && accountInScope(bucket, a.country),
+  );
 }
 
 /**

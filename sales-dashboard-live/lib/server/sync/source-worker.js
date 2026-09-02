@@ -36,6 +36,7 @@
 import { isDataDoeDeadlineError, isDataDoePollPendingError, isSourceDisabledError, withDataDoeDeadline } from "../datadoe.js";
 import { sourceJobOwnerId } from "../source-identity.js";
 import { validateBatchSourcePayload } from "./source-account-isolation.js";
+import { isRoutingScope } from "./scheduler-scope.js";
 
 const DEFAULT_RESERVE_MS = 3_000; // stop before the server cap so status/locks persist
 
@@ -508,7 +509,7 @@ export async function runSourceJobs({
   // real `bucket`; ONLY the cycle key (getCycleByBucketDate + openCycle) is namespaced.
   cycleBucket = null,
 }) {
-  if (bucket !== "us" && bucket !== "non-us") throw new Error("bucket must be 'us' or 'non-us'.");
+  if (!isRoutingScope(bucket)) throw new Error("bucket must be a routing scope (india|europe-au|us-ca|us|non-us).");
   const progress = {
     cycleId: null, claimedCycle: false, alreadyFinished: false,
     planned: 0, processed: 0, succeeded: 0, failed: 0, skipped: 0, attemptsWon: 0, deferred: 0,

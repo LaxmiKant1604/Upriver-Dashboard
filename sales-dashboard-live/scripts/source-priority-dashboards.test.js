@@ -142,7 +142,8 @@ test("P2b. frozen scope constants are exactly the reviewed values; brand-sales p
   assert.deepEqual([...C.reportKeys], ["daily-reporting", "brand-sales", "brand-inventory"]);
   assert.deepEqual([...C.publishOrder], ["daily-reporting", "brand-sales", "brand-inventory"]);
   assert.ok(C.publishOrder.indexOf("brand-sales") < C.publishOrder.indexOf("brand-inventory"));
-  assert.deepEqual([...C.buckets], ["us", "non-us"]);
+  assert.deepEqual([...C.buckets], ["us", "non-us", "india", "europe-au", "us-ca"]); // legacy buckets + the 3 active regions
+
   assert.equal(C.catalogSourceKey, CATALOG); assert.equal(C.maxCatalogCreates, 1); assert.equal(C.maxTokens, 2);
   assert.ok(typeof C.operationKey === "string" && C.operationKey.length > 0);
   assert.ok(Object.isFrozen(C));

@@ -166,7 +166,8 @@ test("US duplicate guard runs before production I/O and every later write/create
     assert.match(before, /steps\.cfg\.outputs\.bucket != 'us' \|\| steps\.us_guard\.outputs\.run_required == 'true'/, command + " is skipped by a completed US proof while Non-US remains unchanged");
   }
   const cli = readFileSync(resolve(ROOT, "scripts", "release", "verify-us-d1-published.mjs"), "utf8");
-  assert.match(cli, /bucket !== "us"/, "the production guard refuses any Non-US invocation");
+  assert.match(cli, /isRoutingScope\(bucket\)/, "the production guard validates a routing scope (region india|europe-au|us-ca or legacy us|non-us) and fails closed on anything else");
+  assert.match(cli, /accountInScope\(bucket, country\)/, "the guard discovers ONLY the requested scope's accounts (region-aware, not hardcoded US)");
   assert.match(cli, /buildLiveReadback/, "the production guard uses the real storage-first frontend payload read-back");
 });
 

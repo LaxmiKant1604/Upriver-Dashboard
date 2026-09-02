@@ -4,10 +4,13 @@
 // Brand View ad data fresh by refreshing the CAMPAIGN grain for the bucket's regions in coverage mode (21-day rolling
 // window), <=5-seller batches, zero-token connection pre-flight + durable-coverage pre-filter (already-covered
 // accounts create nothing -> replay adopts completed work), and a guarded create ceiling. Usage (from sales-dashboard-live/):
-//   node scripts/release/scheduled-campaign-ads-refresh.mjs --bucket=us|non-us [--as-of=YYYY-MM-DD] [--max-creates=N]
-// Never prints an api key or a seller/account/export id.
+//   node scripts/release/scheduled-campaign-ads-refresh.mjs --bucket=india|europe-au|us-ca|us|non-us [--as-of=YYYY-MM-DD] [--max-creates=N]
+// `--bucket` accepts a REGION (the regional coordinator passes exactly one region -> that one region refreshes) or a
+// legacy bucket (fans out to its member regions, for the pre-cutover compat window). Never prints an api key or a
+// seller/account/export id.
 
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
+import { isRegionScope, isRoutingScope } from "../../lib/server/sync/scheduler-scope.js";
 
 loadReleaseEnv();
 
@@ -15,15 +18,17 @@ const argOf = (name) => { const a = process.argv.find((x) => x.startsWith(`--${n
 const bucket = argOf("bucket");
 const asOf = argOf("as-of") || (() => { const d = new Date(); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); })();
 const maxCreatesArg = argOf("max-creates");
-if (bucket !== "us" && bucket !== "non-us") { console.error("STOP --bucket must be us|non-us (got: " + bucket + ")"); process.exit(2); }
+if (!isRoutingScope(bucket)) { console.error("STOP --bucket must be a routing scope (india|europe-au|us-ca|us|non-us; got: " + bucket + ")"); process.exit(2); }
 if (!/^\d{4}-\d{2}-\d{2}$/.test(asOf)) { console.error("STOP --as-of must be YYYY-MM-DD (got: " + asOf + ")"); process.exit(2); }
 
 const { regionsForBucket, planCampaignAdsRegionRun, runCampaignAdsRegionSlice } = await import("../../lib/server/sync/scheduled-campaign-ads-runner.js");
 const { REGION_SCHEDULE } = await import("../../lib/server/sync/campaign-region-routing.js");
 const log = (m) => console.log("scheduled-campaign-ads[" + bucket + "@" + asOf + "]: " + m);
 
-const regions = regionsForBucket(bucket);
-if (!regions.length) { console.error("STOP no regions for bucket " + bucket); process.exit(2); }
+// A region scope refreshes EXACTLY that region (the regional coordinator's one-region path); a legacy bucket fans out
+// to its member regions (compat). Either way Campaign Ads runs ONCE per region -- one automatic owner, no double-refresh.
+const regions = isRegionScope(bucket) ? [bucket] : regionsForBucket(bucket);
+if (!regions.length) { console.error("STOP no regions for scope " + bucket); process.exit(2); }
 
 const MAX_PASSES = Number(process.env.SCHEDULED_CAMPAIGN_ADS_MAX_ITERS || 40);
 let totalCreates = 0; let totalTokens = 0; let totalCovered = 0;

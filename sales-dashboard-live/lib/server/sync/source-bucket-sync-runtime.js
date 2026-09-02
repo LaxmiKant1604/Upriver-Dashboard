@@ -29,7 +29,7 @@ import { fetchAccounts as fetchDataDoeAccounts } from "../datadoe.js";
 import { organizationFingerprint } from "../source-identity.js";
 import { addDaysStr, monthBackStr } from "../date-windows.js";
 import { sourceContractForKey } from "../source-contracts.js";
-import { bucketForCountry } from "./registry.js";
+import { accountInScope, isRoutingScope } from "./scheduler-scope.js";
 import { makeSupabaseSourceStore, makeDataDoeAdapter } from "./source-sync-driver.js";
 import { makeShadowSnapshotSaver } from "./report-snapshot-store.js";
 import { buildSchedulerV2SourceTrancheRuntime } from "./runtime-composition.js";
@@ -188,7 +188,7 @@ export function bindPrimaryBucketAccounts(activeAccounts, bucket) {
     if (!accountId) continue;
     if (accountId.includes(":")) { excluded.push({ accountId, reason: "non-primary-connection" }); continue; }
     if (!country) { excluded.push({ accountId, reason: "missing-marketplace-country" }); continue; }
-    if (bucketForCountry(country) !== bucket) continue; // the other bucket's account, not an exclusion
+    if (!accountInScope(bucket, country)) continue; // another scope's account (region or legacy), not an exclusion
     accounts.push({ accountId, rawSellerId: accountId, country, name: String((a && a.name) || accountId), currency: String((a && a.currency) || "") || null });
   }
   return { accounts, excluded };
@@ -553,8 +553,8 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
   };
 
   const run = async ({ bucket, asOf = null, today = null, cycleDate = null, reuseOnly = false, onlySourceKey = null, deadline = null, preflight = null, forceFreshOli = false } = {}) => {
-    if (bucket !== "us" && bucket !== "non-us") {
-      throw new Error(`buildBucketSourceSyncRuntime.run requires bucket 'us'|'non-us' (got "${bucket}").`);
+    if (!isRoutingScope(bucket)) {
+      throw new Error(`buildBucketSourceSyncRuntime.run requires a routing scope (region india|europe-au|us-ca or legacy us|non-us; got "${bucket}").`);
     }
     // Priority mode is BOUND AT BUILD TIME only (see priorityMode above) -- never a run() argument, so no
     // ordinary caller can activate the derive-off-durable + non-catalog-pause behaviour by passing a flag.
@@ -1497,8 +1497,8 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     // FORCE-FRESH-OLI is authorized ONLY for the order-line-items family (the D-1 "force latest" re-fetch). It is a
     // trusted operator/composition argument (the admin DSC + the GitHub force-latest job), never an ordinary read.
     const freshOli = forceFreshOli === true && sourceKey === "order-line-items";
-    if (bucket !== "us" && bucket !== "non-us") {
-      throw new Error(`runSourceCardAction requires bucket 'us'|'non-us' (got "${bucket}").`);
+    if (!isRoutingScope(bucket)) {
+      throw new Error(`runSourceCardAction requires a routing scope (region india|europe-au|us-ca or legacy us|non-us; got "${bucket}").`);
     }
     // Round-5 blockers 3+4: ONE route-owned deadline (created by the route BEFORE preflight when this is
     // endpoint-driven) and ONE memoized preflight. A caller that already preflighted passes the bundle
@@ -1570,7 +1570,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
   };
 
   const gatherDurableReadiness = async ({ bucket, accounts, asOf = null } = {}) => {
-    if (bucket !== "us" && bucket !== "non-us") throw new Error("gatherDurableReadiness requires bucket 'us'|'non-us' (fail closed).");
+    if (!isRoutingScope(bucket)) throw new Error("gatherDurableReadiness requires a routing scope (region india|europe-au|us-ca or legacy us|non-us; fail closed).");
     const bound = (accounts || []).filter((a) => a && a.accountId && !String(a.accountId).includes(":"));
     const ids = bound.map((a) => String(a.accountId));
     const { orgFingerprint } = resolvePrimary();

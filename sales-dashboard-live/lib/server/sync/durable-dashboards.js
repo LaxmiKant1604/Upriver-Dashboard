@@ -19,6 +19,7 @@ import { REPORT_DERIVATIONS, shadowSnapshotKey } from "./report-derivation.js";
 import { buildDailyAdsCoverage } from "./daily-ads-loader.js";
 import { canonicalOliSlices } from "../date-windows.js";
 import { ACTIVE_ADS_SOURCE_KEY, ACTIVE_ADS_REGISTRY_KEY } from "../active-ads-source.js";
+import { isRoutingScope } from "./scheduler-scope.js";
 
 // Daily Reporting and Brand View both read the ACTIVE durable Ads grain. After the ASIN->Campaign cutover that is
 // the campaign grain (campaign-performance-v1); rollback flips ACTIVE_ADS_SOURCE_KEY back to asin-performance-v1.
@@ -331,7 +332,7 @@ export function deriveDurableDashboardSnapshots({
   adMetricsByAccountId = {}, adsCoverageStateByAccountId = {},
   dailyWindow, brandViewWindow,
 } = {}) {
-  if (bucket !== "us" && bucket !== "non-us") throw new Error("deriveDurableDashboardSnapshots requires bucket 'us'|'non-us' (fail closed).");
+  if (!isRoutingScope(bucket)) throw new Error("deriveDurableDashboardSnapshots requires a routing scope (india|europe-au|us-ca|us|non-us; fail closed).");
   if (!Array.isArray(catalogRows)) throw new Error("deriveDurableDashboardSnapshots requires the hydrated catalog rows (fail closed).");
   const accountIds = accounts.map((a) => String(a.accountId));
 

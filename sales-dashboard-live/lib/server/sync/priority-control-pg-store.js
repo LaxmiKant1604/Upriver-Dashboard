@@ -9,20 +9,20 @@
 import pg from "pg";
 import { getDataDoeConnections, classifyDirectoryAccounts } from "../datadoe-connections.js";
 import { fetchAccounts as fetchDataDoeAccounts } from "../datadoe.js";
-import { bucketForCountry } from "./registry.js";
+import { accountInScope, isRoutingScope } from "./scheduler-scope.js";
 
 export const PRIORITY_CONTROL_ADVISORY_LOCK = Object.freeze([20260825, 2]);
 
 // Fresh PRIMARY discovery -- the exact account set the publisher's rollout resolves against. Only apply/dry-run
 // need it; a rollback (safe-close) is discovery-independent and must work with DataDoe down.
 //
-// `bucket` ("us" | "non-us") restricts discovery to ONLY that bucket's primary accounts (Scheduler v2 independent
-// buckets): the control apply then opens controls for exactly that bucket, and the transaction's exact-set POST
-// reconciles the OTHER bucket's rollout/approvals OFF (transient controls only -- snapshots are never touched, so
-// the other bucket's latest-known-good publication stays byte-identical). Omitted => ALL primary accounts (the
-// legacy combined go-live). A bad bucket fails closed.
+// `bucket` (a routing scope: region india|europe-au|us-ca, or legacy us|non-us) restricts discovery to ONLY that
+// scope's primary accounts (independent scopes): the control apply then opens controls for exactly that scope, and
+// the transaction's exact-set POST reconciles the OTHER scopes' rollout/approvals OFF (transient controls only --
+// snapshots are never touched, so every other scope's latest-known-good publication stays byte-identical). Omitted
+// => ALL primary accounts (the legacy combined go-live). A bad scope fails closed.
 export async function discoverPrimaryAccountIds(bucket = null) {
-  if (bucket != null && bucket !== "us" && bucket !== "non-us") throw new Error(`discoverPrimaryAccountIds bucket must be us|non-us (got "${bucket}") (fail closed).`);
+  if (bucket != null && !isRoutingScope(bucket)) throw new Error(`discoverPrimaryAccountIds bucket must be a routing scope (india|europe-au|us-ca|us|non-us; got "${bucket}") (fail closed).`);
   const connections = getDataDoeConnections();
   const primaryConn = connections.find((c) => c.id === "primary");
   const rows = (await fetchDataDoeAccounts(primaryConn.apiKey)) || [];
@@ -31,7 +31,7 @@ export async function discoverPrimaryAccountIds(bucket = null) {
   for (const a of active) {
     const id = String((a && (a.accountId ?? a.id)) || "").trim();
     if (!id || id.startsWith("dd-secondary:")) continue;
-    if (bucket && bucketForCountry(String((a && a.country) || "").toUpperCase()) !== bucket) continue;
+    if (bucket && !accountInScope(bucket, String((a && a.country) || ""))) continue;
     ids.push(id);
   }
   return ids;

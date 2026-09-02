@@ -17,12 +17,13 @@
 import { appendFileSync } from "node:fs";
 import pg from "pg";
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
+import { accountInScope, isRoutingScope } from "../../lib/server/sync/scheduler-scope.js";
 
 loadReleaseEnv();
 
 const argOf = (name) => { const a = process.argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.split("=").slice(1).join("=") : null; };
 const bucket = argOf("bucket");
-if (bucket !== "us" && bucket !== "non-us") { console.error("STOP --bucket must be us|non-us (got: " + bucket + ")"); process.exit(2); }
+if (!isRoutingScope(bucket)) { console.error("STOP --bucket must be a routing scope (india|europe-au|us-ca|us|non-us; got: " + bucket + ")"); process.exit(2); }
 const requestedAsOf = argOf("requested-as-of") || argOf("as-of") || (() => { const d = new Date(); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); })();
 if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedAsOf)) { console.error("STOP --requested-as-of must be YYYY-MM-DD (got: " + requestedAsOf + ")"); process.exit(2); }
 const addDays = (ymd, n) => { const d = new Date(`${ymd}T00:00:00.000Z`); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
@@ -32,7 +33,6 @@ const adsFrom = addDays(requestedAsOf, -20); const adsTo = requestedAsOf;
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccounts, fetchCompatibleSourceNames } = await import("../../lib/server/datadoe.js");
 const { ASIN_ADS_SOURCE_NAME } = await import("../../lib/server/sync/scheduled-asin-ads-runner.js");
-const { bucketForCountry } = await import("../../lib/server/sync/registry.js");
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, getOliCompleteness } = await import("../../lib/server/supabase.js");
 const { assessScheduledOliCycle } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { assessBucketPublishReadiness } = await import("../../lib/server/sync/source-scheduled-prerequisites.js");
@@ -50,7 +50,7 @@ const rows = (await fetchAccounts(primaryConn.apiKey)) || [];
 const { active } = classifyDirectoryAccounts(rows, connections);
 const seen = new Set();
 const discovered = [];
-for (const a of active) { const id = String((a && (a.accountId ?? a.id)) || "").trim(); const country = String((a && a.country) || "").toUpperCase(); if (!id || id.includes(":") || seen.has(id)) continue; if (bucketForCountry(country) !== bucket) continue; seen.add(id); discovered.push({ accountId: id }); }
+for (const a of active) { const id = String((a && (a.accountId ?? a.id)) || "").trim(); const country = String((a && a.country) || "").toUpperCase(); if (!id || id.includes(":") || seen.has(id)) continue; if (!accountInScope(bucket, country)) continue; seen.add(id); discovered.push({ accountId: id }); }
 if (!discovered.length) { console.error("STOP no discovered " + bucket + " primary accounts"); process.exit(1); }
 const ids = discovered.map((a) => a.accountId);
 log(discovered.length + " primary accounts; ASIN-Ads window [" + adsFrom + ".." + adsTo + "]; cycle date " + cycleDate);

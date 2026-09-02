@@ -77,6 +77,7 @@ const SUITES = [
   "test:zero-export-rehearsal",
   "test:source-production-hardening",
   "test:source-priority-dashboards",
+  "test:scheduler-scope",
   "test:scheduler-automation",
   "test:scheduler-bucket-independence",
   "test:scheduler-d1-freshness",

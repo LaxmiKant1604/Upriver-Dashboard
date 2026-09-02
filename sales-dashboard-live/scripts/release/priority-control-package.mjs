@@ -16,15 +16,17 @@ import { CONTROLLED_REPORT_KEYS } from "../../lib/server/sync/report-controls.js
 // The reviewed pg store + primary discovery moved VERBATIM into the shared lib (one implementation for the CLI,
 // the manual source-sync operator, and any other trusted caller -- no drift).
 import { connectPriorityControlStore, discoverPrimaryAccountIds } from "../../lib/server/sync/priority-control-pg-store.js";
+import { isRoutingScope } from "../../lib/server/sync/scheduler-scope.js";
 
 loadReleaseEnv(); // portable: loads <repoRoot>/.env.local when present, maps SUPABASE_URL, never overrides CI env
 
 const MODE = process.argv.includes("--apply") ? "apply" : process.argv.includes("--rollback") ? "rollback" : "dry-run";
 const OPERATOR = process.env.PRIORITY_OPERATOR || "laxmikant@superboring.in";
-// Optional --bucket=us|non-us: open controls for EXACTLY that bucket's primary accounts (Scheduler v2 independent
-// buckets). Omitted => ALL primary accounts (legacy combined). --rollback ignores it (the safe-close is global).
+// Optional --bucket: open controls for EXACTLY that routing scope's primary accounts (region india|europe-au|us-ca
+// or legacy us|non-us; independent scopes). Omitted => ALL primary accounts (legacy combined). --rollback ignores
+// it (the safe-close is global).
 const BUCKET = (process.argv.find((a) => a.startsWith("--bucket=")) || "").split("=")[1] || null;
-if (BUCKET != null && BUCKET !== "us" && BUCKET !== "non-us") { console.error("STOP --bucket must be us|non-us (got: " + BUCKET + ")"); process.exit(2); }
+if (BUCKET != null && !isRoutingScope(BUCKET)) { console.error("STOP --bucket must be a routing scope (india|europe-au|us-ca|us|non-us; got: " + BUCKET + ")"); process.exit(2); }
 
 console.log("CONTROL-PACKAGE mode=" + MODE + " operator=" + OPERATOR + (BUCKET ? " bucket=" + BUCKET : ""));
 console.log("  dispatch enabled: " + PRIORITY_DISPATCH_ENABLED.join(", ") + "; promoted enabled: " + PRIORITY_PROMOTED_ENABLED + "; all_primary=false; unrelated reports paused; no cron.");

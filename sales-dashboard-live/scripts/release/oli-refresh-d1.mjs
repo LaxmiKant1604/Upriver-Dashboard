@@ -16,6 +16,7 @@
 
 import pg from "pg";
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
+import { accountInScope, isRoutingScope } from "../../lib/server/sync/scheduler-scope.js";
 
 loadReleaseEnv();
 
@@ -24,12 +25,11 @@ const bucket = argOf("bucket");
 const requestedAsOf = argOf("requested-as-of") || argOf("as-of");
 const refreshMode = argOf("refresh-mode") || "normal";
 const runId = argOf("run-id");
-if (bucket !== "us" && bucket !== "non-us") { console.error("STOP --bucket must be us|non-us (got: " + bucket + ")"); process.exit(2); }
+if (!isRoutingScope(bucket)) { console.error("STOP --bucket must be a routing scope (india|europe-au|us-ca|us|non-us; got: " + bucket + ")"); process.exit(2); }
 if (!requestedAsOf || !/^\d{4}-\d{2}-\d{2}$/.test(requestedAsOf)) { console.error("STOP --requested-as-of must be YYYY-MM-DD (got: " + requestedAsOf + ")"); process.exit(2); }
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccounts } = await import("../../lib/server/datadoe.js");
-const { bucketForCountry } = await import("../../lib/server/sync/registry.js");
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, openSupersedingSyncCycle, reserveOliFreshnessCreate, recordOliFreshnessExport, getOliCompleteness } = await import("../../lib/server/supabase.js");
 const { OLI_SOURCE_KEY, windowsProve } = await import("../../lib/server/sync/source-durable-model.js");
@@ -56,7 +56,7 @@ const primaryConn = connections.find((c) => c.id === "primary");
 const rows = (await fetchAccounts(primaryConn.apiKey)) || [];
 const { active } = classifyDirectoryAccounts(rows, connections);
 const seen = new Set(); const discovered = [];
-for (const a of active) { const id = String((a && (a.accountId ?? a.id)) || "").trim(); const country = String((a && a.country) || "").toUpperCase(); if (!id || id.includes(":") || seen.has(id)) continue; if (bucketForCountry(country) !== bucket) continue; seen.add(id); discovered.push({ accountId: id }); }
+for (const a of active) { const id = String((a && (a.accountId ?? a.id)) || "").trim(); const country = String((a && a.country) || "").toUpperCase(); if (!id || id.includes(":") || seen.has(id)) continue; if (!accountInScope(bucket, country)) continue; seen.add(id); discovered.push({ accountId: id }); }
 if (!discovered.length) { console.error("STOP no discovered " + bucket + " primary accounts"); process.exit(1); }
 const ids = discovered.map((a) => a.accountId);
 const oliStart = sourceRegistryEntry(OLI).initialBackfill.start;

@@ -10,9 +10,16 @@
 //                     run_id may re-attempt the still-missing window.
 // Only workflow_dispatch may select force-latest; a scheduled event is ALWAYS normal (enforced by the workflow).
 
+import { ROUTING_SCOPES } from "./scheduler-scope.js";
+
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
-const BUCKETS = Object.freeze(["us", "non-us"]);
+// The scopes a freshness op-key may name: the three regions + the legacy revenue buckets (NOT the -fba namespace
+// twins -- OLI/freshness cycles are region/legacy only). One source of truth = scheduler-scope.ROUTING_SCOPES.
+const BUCKETS = Object.freeze([...ROUTING_SCOPES]);
+// Longest-first alternation so 'europe-au'/'non-us'/'us-ca' win over 'us' without relying on regex backtracking;
+// hyphens are literal outside a character class, so no escaping is needed.
+const SCOPE_ALT = [...ROUTING_SCOPES].sort((a, b) => b.length - a.length).join("|");
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RUN_ID_RE = /^[A-Za-z0-9_-]{1,64}$/; // github.run_id is a positive integer; accept an id-safe token, no slashes
 
@@ -20,8 +27,8 @@ export const REFRESH_MODES = Object.freeze(["normal", "force-latest"]);
 export const SCHEDULED_FRESH_PREFIX = "scheduled-fresh/";
 export const MANUAL_FORCE_PREFIX = "manual-force/";
 
-const SCHEDULED_FRESH_RE = /^scheduled-fresh\/(us|non-us)\/(\d{4})-(\d{2})-(\d{2})$/;
-const MANUAL_FORCE_RE = /^manual-force\/(us|non-us)\/(\d{4})-(\d{2})-(\d{2})\/([A-Za-z0-9_-]{1,64})$/;
+const SCHEDULED_FRESH_RE = new RegExp(`^scheduled-fresh\\/(${SCOPE_ALT})\\/(\\d{4})-(\\d{2})-(\\d{2})$`);
+const MANUAL_FORCE_RE = new RegExp(`^manual-force\\/(${SCOPE_ALT})\\/(\\d{4})-(\\d{2})-(\\d{2})\\/([A-Za-z0-9_-]{1,64})$`);
 
 export function assertRefreshMode(mode) {
   const m = S(mode);
