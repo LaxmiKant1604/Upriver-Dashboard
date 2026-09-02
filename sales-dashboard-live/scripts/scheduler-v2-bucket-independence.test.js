@@ -243,13 +243,13 @@ async function main() {
   /* ============ 14-16: failure safety + no campaign/fba + manual dispatch parity (workflow shape) ============ */
   group("workflow: always-safe-close, no Campaign Ads/FBA, manual dispatch parity");
 
-  test("14. EVERY real pipeline failure safe-closes controls; the verified US duplicate no-op stays zero-write", () => {
+  test("14. EVERY real pipeline failure safe-closes controls; the verified duplicate no-op stays zero-write", () => {
     assert.match(
       yml,
-      /if:\s*always\(\)\s*&&\s*\(steps\.cfg\.outputs\.bucket != 'us' \|\| steps\.us_guard\.outputs\.run_required == 'true'\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/,
-      "Non-US and every non-no-op US pipeline attempt safe-close",
+      /if:\s*always\(\)\s*&&\s*steps\.guard\.outputs\.run_required == 'true'\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/,
+      "every non-no-op region pipeline attempt safe-closes",
     );
-    assert.match(yml, /already_published == 'true'[\s\S]*zero creates, zero controls, zero tokens/i, "the verified US duplicate is explicitly zero-write");
+    assert.match(yml, /already_published == 'true'[\s\S]*zero creates, zero controls, zero tokens/i, "the verified duplicate is explicitly zero-write");
   });
 
   test("15. Post ASIN->Campaign cutover: Campaign Ads is the scheduled active source but never a priority-published report/control; ASIN Ads is retired; FBA never publishes; the Catalog release guard refuses any non-catalog create", async () => {
@@ -258,19 +258,22 @@ async function main() {
     assert.ok(!SCHEDULED_ENABLED_SOURCE_KEYS.some((k) => /fba/i.test(k)), "no FBA source is schedule-enabled");
     assert.ok(!PRIORITY_DISPATCH_ENABLED.some((k) => /campaign|fba/i.test(k)), "campaign/fba are never a priority-published dispatch control");
     assert.ok(!/campaign|fba/i.test(PRIORITY_PROMOTED_ENABLED), "the promoted control is brand-inventory, not campaign/fba");
-    assert.doesNotMatch(yml, /node scripts\/[^\n]*fba/i, "no workflow step invokes an FBA script");
+    // FBA runs ONLY in the isolated fba job (its own snapshot), NEVER inside the priority publish job.
+    const runJob = yml.slice(yml.indexOf("jobs:"), yml.indexOf("\n  fba:"));
+    assert.doesNotMatch(runJob, /fba-plan-golive\.mjs/, "the priority publish job never invokes FBA");
+    assert.match(yml, /\n\s{2}fba:\n[\s\S]*fba-plan-golive\.mjs --mode=go-live --region=/, "FBA runs in its isolated job with regional routing");
     // The Catalog release guard still forbids a campaign create THROUGH the priority release (campaign is refreshed in
     // its own dedicated step, never as a release-owned export).
     const guard = makeDurableCatalogGuard({ inner: { create: async () => ({ exportId: "x" }), poll: async () => ({}), download: async () => ({}) }, reservation: { reserve: async () => ({ disposition: "reserved" }), recordExport: async () => ({ disposition: "recorded" }), get: async () => null }, operationKey: "priority-dashboards/scheduled/2026-08-26" });
     await assert.rejects(() => guard.create({ sourceKey: "ads-campaign-date", requestHash: "X" }), /PRIORITY_FORBIDDEN_CREATE/);
   });
 
-  test("16. manual workflow_dispatch follows the SAME bucket-scoped pipeline as the cron", () => {
+  test("16. manual workflow_dispatch follows the SAME region-scoped pipeline as the cron", () => {
     assert.match(yml, /workflow_dispatch:/);
-    assert.match(yml, /bucket="\$\{\{ github\.event\.inputs\.bucket \}\}"/, "dispatch resolves the bucket from the input");
-    // both triggers feed the SAME steps.cfg.outputs.bucket into the bucket-scoped control apply + release.
-    assert.match(yml, /priority-control-package\.mjs --apply --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\}/);
-    assert.match(yml, /priority-dashboards-release\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\}/);
+    assert.match(yml, /region="\$\{\{ github\.event\.inputs\.region \}\}"/, "dispatch resolves the region from the input");
+    // both triggers feed the SAME steps.cfg.outputs.region into the region-scoped control apply + release.
+    assert.match(yml, /priority-control-package\.mjs --apply --bucket=\$\{\{ steps\.cfg\.outputs\.region \}\}/);
+    assert.match(yml, /priority-dashboards-release\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.region \}\}/);
   });
 
   /* ============ 17-18: shared manual OLI persistence + Order-ID capture unchanged ============ */

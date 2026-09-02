@@ -78,6 +78,7 @@ const SUITES = [
   "test:source-production-hardening",
   "test:source-priority-dashboards",
   "test:scheduler-scope",
+  "test:scheduler-regional-workflow",
   "test:scheduler-automation",
   "test:scheduler-bucket-independence",
   "test:scheduler-d1-freshness",

@@ -200,16 +200,16 @@ async function main() {
     assert.match(cli, /D1_FINAL/, "a fully-itemized D-1 success summary");
     assert.match(cli, /DATADOE_D1_NOT_READY/, "a distinct lagged/gapped-LKG summary still exists for interior gaps");
     assert.match(cli, /requireD1:\s*true/, "the CLI still gates the NON-defect accounts strictly on the D-1 window");
-    assert.match(yml, /if:\s*always\(\) && \(steps\.cfg\.outputs\.bucket != 'us' \|\| steps\.us_guard\.outputs\.run_required == 'true'\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS for a pipeline execution");
+    assert.match(yml, /if:\s*always\(\) && steps\.guard\.outputs\.run_required == 'true'\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS for a pipeline execution");
   });
 
-  test("14. schedules: Non-US primary/fallback unchanged; US GitHub primary with an external watchdog backup", () => {
+  test("14. schedules: the three regional primaries; each cron deterministically maps to one region; SHA/event/cron in the summary", () => {
     const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-    assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *"]);
-    assert.match(yml, /"0 2 \* \* \*"\)\s*bucket="non-us"/); assert.match(yml, /"0 3 \* \* \*"\)\s*bucket="non-us"/);
-    assert.match(yml, /"30 10 \* \* \*"\)\s*bucket="us"/); assert.doesNotMatch(yml, /30 11 \* \* \*/);
-    // run_kind is recorded (primary vs fallback) and the summary prints immutable metadata (SHA + event + cron).
-    assert.match(yml, /run_kind=/); assert.match(yml, /head\/workflow SHA/); assert.match(yml, /github\.sha/);
+    assert.deepEqual(crons, ["0 3 * * *", "30 16 * * *", "30 8 * * *"].sort());
+    assert.match(yml, /"0 3 \* \* \*"\)\s*region="india"/); assert.match(yml, /"30 8 \* \* \*"\)\s*region="europe-au"/);
+    assert.match(yml, /"30 16 \* \* \*"\)\s*region="us-ca"/); assert.doesNotMatch(yml, /30 10 \* \* \*/);
+    // the summary prints immutable metadata (SHA + event + cron) for provenance.
+    assert.match(yml, /head\/workflow SHA/); assert.match(yml, /github\.sha/); assert.match(yml, /github\.event\.schedule/);
   });
 
   test("15. force-latest cannot be activated by a scheduled event or an ordinary read (dispatch-only + run_id required + typed key)", () => {

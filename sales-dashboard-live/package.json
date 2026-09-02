@@ -65,6 +65,7 @@
     "test:source-production-hardening": "node scripts/source-production-hardening.test.js",
     "test:source-priority-dashboards": "node scripts/source-priority-dashboards.test.js",
     "test:scheduler-scope": "node scripts/scheduler-scope.test.js",
+    "test:scheduler-regional-workflow": "node scripts/scheduler-regional-workflow.test.js",
     "test:scheduler-automation": "node scripts/scheduler-v2-automation.test.js",
     "test:scheduler-bucket-independence": "node scripts/scheduler-v2-bucket-independence.test.js",
     "test:scheduler-d1-freshness": "node scripts/scheduler-v2-d1-freshness.test.js",

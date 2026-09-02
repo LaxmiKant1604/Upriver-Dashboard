@@ -23,26 +23,27 @@ const test = (name, fn) => { try { fn(); passed += 1; out("  ok  " + name); } ca
 /* External coordinator identity: the watchdog can identify the exact bucket/date workflow run without reading
    production data, while ordinary manual dispatches retain the safe "manual" default. */
 test("external dispatches have a unique run title and a non-forgeable-by-schedule dispatch_id input", () => {
-  assert.match(yml, /^run-name:\s*scheduler-v2 \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.dispatch_id \|\| github\.event\.schedule \}\}/m);
+  assert.match(yml, /^run-name:\s*scheduler-v2 \$\{\{ github\.event_name == 'workflow_dispatch' && format\('\{0\}\/\{1\}', inputs\.region, inputs\.dispatch_id\) \|\| github\.event\.schedule \}\}/m);
   assert.match(yml, /^\s{6}dispatch_id:\s*$/m, "workflow_dispatch exposes dispatch_id");
   assert.match(yml, /^\s{8}default:\s*"manual"\s*$/m, "ordinary manual runs use a harmless manual identity");
   assert.match(yml, /dispatch identity:.*inputs\.dispatch_id/, "the immutable summary prints the dispatch identity");
 });
 
-/* 12/13. correct cron -> correct bucket; unknown cron fails BEFORE any production I/O */
-test("12/13. Non-US schedules stay unchanged; US has one GitHub primary plus external watchdog; unknown cron fails closed", () => {
+/* 12/13. correct cron -> correct region; unknown cron fails BEFORE any production I/O */
+test("12/13. the three regional crons each map deterministically to one region; unknown cron fails closed; +20min Cloudflare watchdog documented", () => {
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *"]);
-  assert.match(yml, /"0 2 \* \* \*"\)\s*bucket="non-us";\s*run_kind="primary"/);
-  assert.match(yml, /"0 3 \* \* \*"\)\s*bucket="non-us";\s*run_kind="fallback"/);
-  assert.match(yml, /"30 10 \* \* \*"\)\s*bucket="us";\s*run_kind="primary"/);
-  assert.doesNotMatch(yml, /30 11 \* \* \*/, "the duplicate US GitHub fallback is removed");
-  assert.match(yml, /Cloudflare watchdog dispatches the same workflow at 10:50 UTC/, "the external US backup is documented");
+  assert.deepEqual(crons, ["0 3 * * *", "30 16 * * *", "30 8 * * *"].sort());
+  assert.match(yml, /"0 3 \* \* \*"\)\s*region="india"/);
+  assert.match(yml, /"30 8 \* \* \*"\)\s*region="europe-au"/);
+  assert.match(yml, /"30 16 \* \* \*"\)\s*region="us-ca"/);
+  assert.doesNotMatch(yml, /30 10 \* \* \*/, "the legacy US GitHub primary is removed");
+  assert.match(yml, /Cloudflare watchdog 03:20 UTC/, "the +20min india watchdog is documented");
+  assert.match(yml, /Cloudflare watchdog 16:50 UTC/, "the +20min us-ca watchdog is documented");
   assert.match(yml, /Unknown cron[^\n]*refusing \(fail closed\)/);
   // the unknown-cron guard is in the SAME cfg step, before install/preflight/token/fetch.
-  const cfgIdx = yml.indexOf("Resolve bucket + requestedAsOf");
+  const cfgIdx = yml.indexOf("Resolve region + requestedAsOf");
   const npmIdx = yml.indexOf("npm ci");
-  assert.ok(cfgIdx > 0 && cfgIdx < npmIdx, "bucket resolution + unknown-cron guard run before npm ci / any I/O");
+  assert.ok(cfgIdx > 0 && cfgIdx < npmIdx, "region resolution + unknown-cron guard run before npm ci / any I/O");
 });
 
 /* 1/3/6. requestedAsOf is the PREVIOUS UTC DAY (D-1) -- computed once, UTC, from the calendar, never the clock/bucket */
@@ -73,15 +74,15 @@ test("scheduled events are ALWAYS normal mode (force-latest is dispatch-only; no
 });
 
 /* 14. every run prints IMMUTABLE metadata (event, cron, bucket, SHA, run id, asOf, mode, opkey, contract, ceiling) */
-test("14. the summary prints immutable run metadata (event/cron/dispatch/bucket/SHA/asOf/mode/opkey/contract/ceiling)", () => {
-  for (const token of ["github.event_name", "github.event.schedule", "dispatch identity", "inputs.dispatch_id", "resolved bucket", "github.sha", "github.run_id", "requestedAsOf", "refresh_mode", "operation key", "source contract", "token ceiling", "run_kind="]) {
+test("14. the summary prints immutable run metadata (event/cron/dispatch/region/SHA/asOf/mode/opkey/token-floor)", () => {
+  for (const token of ["github.event_name", "github.event.schedule", "dispatch identity", "inputs.dispatch_id", "resolved region", "github.sha", "github.run_id", "requestedAsOf", "refresh_mode", "operation key", "token floor"]) {
     assert.ok(yml.includes(token), "summary/metadata missing: " + token);
   }
 });
 
-/* fallback shares ONE durable operation identity (bucket + requestedAsOf, NOT the cron) */
-test("all repeated dispatches share one durable operation key (bucket + requestedAsOf, never the cron string)", () => {
-  assert.match(yml, /opkey="scheduled-fresh\/\$bucket\/\$asof"/, "operation key is bucket + requestedAsOf");
+/* the primary + the +20min watchdog share ONE durable operation identity (region + requestedAsOf, NOT the cron) */
+test("all repeated dispatches share one durable operation key (region + requestedAsOf, never the cron string)", () => {
+  assert.match(yml, /opkey="scheduled-fresh\/\$region\/\$asof"/, "operation key is region + requestedAsOf");
   assert.doesNotMatch(yml, /opkey="[^"]*\* \*/, "the operation key never embeds a cron expression");
 });
 
@@ -115,10 +116,10 @@ test("10. the release is --strict-d1 and its clamp gate is coverage-based (provi
 });
 
 /* 18/19. controls always safe-close; post ASIN->Campaign cutover the scheduler refreshes Campaign Ads (active), never ASIN/FBA */
-test("18/19. controls safe-close ALWAYS; the scheduler refreshes the active Campaign Ads grain, never the retired ASIN Ads or FBA", () => {
-  assert.match(yml, /if:\s*always\(\) && \(steps\.cfg\.outputs\.bucket != 'us' \|\| steps\.us_guard\.outputs\.run_required == 'true'\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS when a pipeline run could have opened controls");
+test("18/19. controls safe-close ALWAYS; the scheduler refreshes the active Campaign Ads grain, never the retired ASIN Ads", () => {
+  assert.match(yml, /if:\s*always\(\) && steps\.guard\.outputs\.run_required == 'true'\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS when a pipeline run could have opened controls");
   assert.match(yml, /scheduled-campaign-ads-refresh\.mjs/, "the scheduler refreshes the ACTIVE Campaign Ads grain");
-  assert.doesNotMatch(yml, /scheduled-asin-ads-refresh|fba-refresh/i, "no retired ASIN Ads / FBA export step in the scheduler");
+  assert.doesNotMatch(yml, /scheduled-asin-ads-refresh/i, "no retired ASIN Ads export step in the scheduler");
 });
 
 test("US duplicate guard selects only exact D-1 identities for every account x three reports", () => {
@@ -153,17 +154,19 @@ test("US duplicate guard selects only exact D-1 identities for every account x t
   assert.equal(selectPublishedUsD1Identities({ accountIds, requestedAsOf, rows: missing, liveContracts, computeHash }).complete, false, "one missing identity requires the normal US run");
 });
 
-test("US duplicate guard runs before production I/O and every later write/create path is skipped on a complete read-back", () => {
+test("per-region duplicate guard runs before production I/O and every later write/create path is skipped on a complete read-back", () => {
   const guardIdx = yml.indexOf("verify-us-d1-published.mjs");
   const preflightIdx = yml.indexOf("scheduled-cycle-preflight.mjs");
-  assert.ok(guardIdx > 0 && guardIdx < preflightIdx, "US proof runs before cycle/token/create/control I/O");
-  assert.match(yml, /id:\s*us_guard[\s\S]*?if:\s*steps\.cfg\.outputs\.bucket == 'us'/, "the duplicate guard is US-only");
-  assert.match(yml, /ALREADY_PUBLISHED_US_D1 -- exact live read-backs passed; zero creates, zero controls, zero tokens/, "the green no-op is explicit");
+  assert.ok(guardIdx > 0 && guardIdx < preflightIdx, "the region proof runs before cycle/token/create/control I/O");
+  // the guard runs for EVERY region (id: guard, no bucket=='us' special-case) so a watchdog re-dispatch no-ops.
+  assert.match(yml, /id:\s*guard\n/, "the duplicate guard step has id: guard");
+  assert.ok(!/steps\.cfg\.outputs\.bucket == 'us'/.test(yml), "the guard is not US-only any more");
+  assert.match(yml, /ALREADY_PUBLISHED_D1 -- exact live read-backs passed for \$\{\{ steps\.cfg\.outputs\.region \}\}; zero creates, zero controls, zero tokens/, "the green no-op is explicit + region-scoped");
   for (const command of ["scheduled-cycle-preflight.mjs", "confirm-token-budget.mjs", "oli-refresh-d1.mjs", "scheduled-campaign-ads-refresh.mjs", "priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
     const at = yml.indexOf(command);
     assert.ok(at > 0, "workflow command missing: " + command);
     const before = yml.slice(Math.max(0, at - 420), at);
-    assert.match(before, /steps\.cfg\.outputs\.bucket != 'us' \|\| steps\.us_guard\.outputs\.run_required == 'true'/, command + " is skipped by a completed US proof while Non-US remains unchanged");
+    assert.match(before, /steps\.guard\.outputs\.run_required == 'true'/, command + " is skipped by a completed region proof");
   }
   const cli = readFileSync(resolve(ROOT, "scripts", "release", "verify-us-d1-published.mjs"), "utf8");
   assert.match(cli, /isRoutingScope\(bucket\)/, "the production guard validates a routing scope (region india|europe-au|us-ca or legacy us|non-us) and fails closed on anything else");
@@ -171,9 +174,11 @@ test("US duplicate guard runs before production I/O and every later write/create
   assert.match(cli, /buildLiveReadback/, "the production guard uses the real storage-first frontend payload read-back");
 });
 
-/* token ceilings unchanged (Non-US 20 / US 10), operation-wide across primary + fallback */
-test("token ceilings remain Non-US 20 / US 10 (shared operation-wide across primary + fallback)", () => {
-  assert.match(yml, /if \[ "\$bucket" = "non-us" \]; then tokenmin=20; else tokenmin=10; fi/);
+/* per-region balance floor for the token gate (india 10 / europe-au 20 / us-ca 10) */
+test("token gate uses a per-region balance floor (india 10 / europe-au 20 / us-ca 10)", () => {
+  assert.match(yml, /"india"\)\s*tokenmin=10/);
+  assert.match(yml, /"europe-au"\)\s*tokenmin=20/);
+  assert.match(yml, /"us-ca"\)\s*tokenmin=10/);
   assert.match(yml, /confirm-token-budget\.mjs --min=\$\{\{ steps\.cfg\.outputs\.tokenmin \}\}/);
 });
 

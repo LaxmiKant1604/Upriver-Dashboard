@@ -173,81 +173,84 @@ test("C3. rejects every violation: not-drained, non-OLI source, failed job, batc
 
 group("D. GitHub Actions workflow: INDEPENDENT per-bucket publish + always-safe-close shape");
 
-test("D1. scheduler-v2.yml: cron ACTIVE at exactly 02:00 UTC (non-us) + 10:30 UTC (us), bucket resolved FROM the fired cron, dispatch kept, concurrency, Node 24, >=90-min timeout", () => {
+test("D1. scheduler-v2.yml: the THREE regional crons (0 3 india / 30 8 europe-au / 30 16 us-ca), region resolved FROM the fired cron, dispatch kept, concurrency, Node 24, >=90-min timeout", () => {
   const yml = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-v2.yml"), "utf8");
   assert.match(yml, /workflow_dispatch:/, "manual dispatch kept");
-  // Non-US keeps PRIMARY + FALLBACK (02:00/03:00 UTC); US keeps one GitHub primary (10:30 UTC) and uses the
-  // independent Cloudflare workflow_dispatch watchdog as its backup.
+  // The three GitHub primary crons -- one per region; the +20-min Cloudflare watchdog dispatches the same workflow.
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *"], "Non-US primary/fallback + one US GitHub primary");
-  // The bucket comes from WHICH cron fired -- deterministic mapping, never inferred from the clock. Primary AND
-  // fallback of a bucket map to the SAME bucket.
-  assert.match(yml, /"0 2 \* \* \*"\)\s*bucket="non-us"/, "02:00 UTC (primary) maps to non-us");
-  assert.match(yml, /"0 3 \* \* \*"\)\s*bucket="non-us"/, "03:00 UTC (fallback) maps to non-us");
-  assert.match(yml, /"30 10 \* \* \*"\)\s*bucket="us"/, "10:30 UTC (primary) maps to us");
-  assert.doesNotMatch(yml, /30 11 \* \* \*/, "the duplicate US GitHub fallback is removed");
+  assert.deepEqual(crons, ["0 3 * * *", "30 16 * * *", "30 8 * * *"].sort(), "exactly the three regional primaries");
+  // The region comes from WHICH cron fired -- deterministic mapping, never inferred from the clock.
+  assert.match(yml, /"0 3 \* \* \*"\)\s*region="india"/, "03:00 UTC maps to india");
+  assert.match(yml, /"30 8 \* \* \*"\)\s*region="europe-au"/, "08:30 UTC maps to europe-au");
+  assert.match(yml, /"30 16 \* \* \*"\)\s*region="us-ca"/, "16:30 UTC maps to us-ca");
+  // The old 2-bucket crons are entirely gone.
+  for (const legacy of ["0 2 * * *", "30 10 * * *"]) assert.ok(!crons.includes(legacy), "legacy cron removed: " + legacy);
   assert.match(yml, /Unknown cron[^\n]*refusing/, "an unknown cron fails closed");
-  assert.doesNotMatch(yml, /only workflow_dispatch is accepted/, "the pause-era dispatch-only gate is gone");
-  assert.match(yml, /concurrency:\s*\n\s*group:\s*scheduler-v2/, "single-run concurrency group");
+  assert.match(yml, /group:\s*scheduler-v2-\$\{\{ github\.event\.schedule \|\| inputs\.region \}\}/, "per-region concurrency group");
   assert.match(yml, /cancel-in-progress:\s*false/, "runs serialize, never overlap");
   assert.match(yml, /node-version:\s*"24"/, "Node 24");
   const tm = /timeout-minutes:\s*(\d+)/.exec(yml);
   assert.ok(tm && Number(tm[1]) >= 90, "timeout >= 90 minutes");
 });
 
-test("D2. workflow shape: INDEPENDENT per-bucket ordered pipeline -- token ceilings, cycle preflight, per-bucket readiness/effectivePublishAsOf, bucket-scoped controls+release, token-gate skip conditionals, and BOTH-bucket always-safe-close", () => {
+test("D2. workflow shape: INDEPENDENT per-region ordered pipeline -- per-region token floor, cycle preflight, per-region readiness/effectivePublishAsOf, region-scoped controls+release, token-gate skip conditionals, always-safe-close, + the ISOLATED FBA job", () => {
   const yml = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-v2.yml"), "utf8");
   const idx = (s) => yml.indexOf(s);
-  // per-run token ceiling (20 Non-US / 10 US) resolved + passed as --min. NOT increased.
-  assert.match(yml, /if \[ "\$bucket" = "non-us" \]; then tokenmin=20; else tokenmin=10; fi/, "per-run ceilings 20/10");
-  assert.match(yml, /confirm-token-budget\.mjs --min=\$\{\{ steps\.cfg\.outputs\.tokenmin \}\} --bucket=/, "token gate uses the per-run min");
-  // exact order: secrets -> resolve -> npm ci -> cycle preflight -> token gate -> OLI -> ASIN Ads -> readiness ->
-  // control apply -> release -> membership rebuild.
-  assert.ok(idx("Verify required secrets") < idx("Resolve bucket"), "secrets before resolve");
+  // per-region balance FLOOR resolved via a case + passed as --min (india 10 / europe-au 20 / us-ca 10).
+  assert.match(yml, /"india"\)\s*tokenmin=10/, "india floor");
+  assert.match(yml, /"europe-au"\)\s*tokenmin=20/, "europe-au floor");
+  assert.match(yml, /"us-ca"\)\s*tokenmin=10/, "us-ca floor");
+  assert.match(yml, /confirm-token-budget\.mjs --min=\$\{\{ steps\.cfg\.outputs\.tokenmin \}\} --bucket=/, "token gate uses the per-region min");
+  // exact order: secrets -> resolve -> npm ci -> guard -> cycle preflight -> token gate -> OLI -> Campaign -> readiness
+  // -> control apply -> release -> membership rebuild.
+  assert.ok(idx("Verify required secrets") < idx("Resolve region"), "secrets before resolve");
   assert.ok(idx("npm ci") < idx("scheduled-cycle-preflight.mjs"), "npm ci before cycle preflight");
+  assert.ok(idx("verify-us-d1-published.mjs") < idx("scheduled-cycle-preflight.mjs"), "duplicate guard before cycle preflight");
   assert.ok(idx("scheduled-cycle-preflight.mjs") < idx("confirm-token-budget.mjs"), "cycle preflight before token gate");
   assert.ok(idx("confirm-token-budget.mjs") < idx("oli-refresh-d1.mjs"), "token gate before OLI");
-  assert.ok(idx("oli-refresh-d1.mjs") < idx("scheduled-campaign-ads-refresh.mjs"), "OLI before ASIN Ads");
-  assert.ok(idx("scheduled-campaign-ads-refresh.mjs") < idx("verify-bucket-readiness.mjs"), "Ads before the readiness proof");
+  assert.ok(idx("oli-refresh-d1.mjs") < idx("scheduled-campaign-ads-refresh.mjs"), "OLI before Campaign Ads");
+  assert.ok(idx("scheduled-campaign-ads-refresh.mjs") < idx("verify-bucket-readiness.mjs"), "Campaign before the readiness proof");
   assert.ok(idx("verify-bucket-readiness.mjs") < idx("priority-control-package.mjs --apply"), "readiness/effectivePublishAsOf BEFORE opening controls");
   assert.ok(idx("priority-control-package.mjs --apply") < idx("priority-dashboards-release.mjs"), "open controls before release");
   assert.ok(idx("priority-dashboards-release.mjs") < idx("rebuild-brand-membership.mjs"), "release before membership rebuild");
-  // The US path NO LONGER depends on the same-day Non-US run -- the old prerequisite gate is gone entirely.
-  assert.doesNotMatch(yml, /verify-scheduled-prerequisites/, "US-depends-on-Non-US prerequisite gate removed");
-  // Controls + release are BUCKET-SCOPED (no cross-bucket publish): both carry --bucket=<the fired bucket>.
-  assert.match(yml, /priority-control-package\.mjs --apply --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\}/, "control apply is bucket-scoped");
-  assert.match(yml, /priority-dashboards-release\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\}/, "release is bucket-scoped");
-  // Readiness has its own id and computes the honest effectivePublishAsOf, which the release consumes as --as-of.
+  assert.doesNotMatch(yml, /verify-scheduled-prerequisites/, "no cross-scope prerequisite gate -- regions are independent");
+  // Controls + release are REGION-SCOPED (no cross-region publish): both carry --bucket=<the fired region>.
+  assert.match(yml, /priority-control-package\.mjs --apply --bucket=\$\{\{ steps\.cfg\.outputs\.region \}\}/, "control apply is region-scoped");
+  assert.match(yml, /priority-dashboards-release\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.region \}\}/, "release is region-scoped");
   assert.match(yml, /id:\s*readiness/, "readiness step exposes an id");
-  assert.match(yml, /verify-bucket-readiness\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.bucket \}\} --requested-as-of=\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "readiness proves the bucket at the requestedAsOf");
-  assert.match(yml, /priority-dashboards-release\.mjs --bucket=[^\n]*--as-of=\$\{\{ steps\.readiness\.outputs\.effective_asof \}\}/, "release publishes at the HONEST effectivePublishAsOf, not the requestedAsOf");
-  // every create/control step (incl. readiness) is gated on the token-gate proceed output (typed skip => nothing).
+  assert.match(yml, /verify-bucket-readiness\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.region \}\} --requested-as-of=\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "readiness proves the region at the requestedAsOf");
+  assert.match(yml, /priority-dashboards-release\.mjs --bucket=[^\n]*--as-of=\$\{\{ steps\.readiness\.outputs\.effective_asof \}\}/, "release publishes at the HONEST effectivePublishAsOf");
+  // every create/control step is gated on the token-gate proceed output (typed skip => nothing).
   for (const step of ["oli-refresh-d1.mjs", "scheduled-campaign-ads-refresh.mjs", "verify-bucket-readiness.mjs", "priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
     const at = idx(step); const before = yml.slice(Math.max(0, at - 260), at);
     assert.match(before, /steps\.tokengate\.outputs\.proceed == 'true'/, step + " is gated on the token-gate proceed");
   }
   assert.match(yml, /SKIPPED_INSUFFICIENT_TOKENS/, "the run visibly reports the insufficient-tokens skip");
-  // safe-close ALWAYS after any pipeline execution; the read-only US duplicate no-op skips this write entirely.
-  assert.match(yml, /if:\s*always\(\) && \(steps\.cfg\.outputs\.bucket != 'us' \|\| steps\.us_guard\.outputs\.run_required == 'true'\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS after a pipeline execution");
-  // date-scoped operation key uses the requestedAsOf (shared Catalog reservation across both buckets on a date).
+  // safe-close ALWAYS after any pipeline execution (all regions), gated only by the duplicate guard's run_required.
+  assert.match(yml, /if:\s*always\(\) && steps\.guard\.outputs\.run_required == 'true'\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS after a pipeline execution");
+  // date-scoped operation key uses the requestedAsOf (shared Catalog reservation across ALL regions on a date).
   assert.match(yml, /--operation-key=priority-dashboards\/scheduled\/\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "date-scoped (requestedAsOf) operation key");
-  assert.match(yml, /timeout-minutes:\s*(1[0-9][0-9]|[2-9][0-9])/, "job timeout covers OLI+Ads+publication");
-  // Post ASIN->Campaign cutover the scheduler DOES refresh Campaign Ads (the active source); FBA + the deprecated
-  // Vercel cron endpoint remain structurally ABSENT, and the retired ASIN refresh operator is never invoked.
-  assert.doesNotMatch(yml, /node scripts\/[^\n]*fba/i, "no run step invokes an FBA script");
+  // FBA now runs as an ISOLATED, needs-gated job (independent failure boundary) -- NOT a step of the publish job.
+  assert.match(yml, /\n\s{2}fba:\n[\s\S]*needs:\s*run/, "an isolated fba job depends on the run job");
+  assert.match(yml, /if:\s*always\(\) && needs\.run\.outputs\.oli_ready == 'true'/, "the fba job runs iff OLI evidence is ready, independent of the publish outcome");
+  assert.match(yml, /fba-plan-golive\.mjs --mode=go-live --region=\$\{\{ needs\.run\.outputs\.region \}\}/, "the fba job uses the SAME regional routing");
+  // The publish (run) job itself never invokes an FBA script (the isolation boundary); ASIN + Vercel-cron stay absent.
+  const runJob = yml.slice(idx("jobs:"), idx("\n  fba:"));
+  assert.doesNotMatch(runJob, /fba-plan-golive\.mjs/, "the publish job never runs FBA (kept in the isolated job)");
   assert.doesNotMatch(yml, /scheduled-asin-ads-refresh/, "the retired ASIN Ads refresh operator is never invoked");
   assert.doesNotMatch(yml, /api\/cron\/sync/, "never drives the deprecated Vercel cron endpoint");
 });
 
-test("D3. exactly TWO reviewed scheduled workflows remain: scheduler-v2 (OLI/Ads) + DECOUPLED fba-plan-golive (FBA); Returns & Refund Leakage is MANUAL-ONLY (its automatic schedule was disabled 2026-09-01)", () => {
+test("D3. exactly ONE reviewed scheduled workflow remains: scheduler-v2 (the 3-region coordinator). FBA now runs as its ISOLATED job; campaign-ads-golive + returns-leakage are MANUAL-ONLY", () => {
   const files = readdirSync(WORKFLOWS_DIR).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
   const scheduled = files.filter((f) => /\n\s*schedule:\s*\n/.test(readFileSync(resolve(WORKFLOWS_DIR, f), "utf8"))).sort();
-  // scheduler-v2 (OLI/Ads) and the DECOUPLED FBA Shipment Plan (us-fba / non-us-fba) are the ONLY automatic
-  // schedulers and are UNCHANGED. Returns & Refund Leakage had its four cron rows removed on 2026-09-01 -- it now
-  // runs ONLY on demand via workflow_dispatch, so it MUST NOT appear in the scheduled set. No OTHER workflow may
-  // declare a schedule (an accidental new schedule -- or a re-added Returns cron -- still fails this pin).
-  assert.deepEqual(scheduled, ["fba-plan-golive.yml", "scheduler-v2.yml"], "exactly the two remaining scheduled workflows; got " + JSON.stringify(scheduled));
-  assert.ok(files.includes("returns-leakage.yml"), "the Returns workflow file still exists (manual-only) -- only its schedule was removed");
+  // scheduler-v2 is the SOLE automatic scheduler (the ONE owner of every paid source). FBA moved from its own
+  // scheduled workflow into scheduler-v2's isolated fba job, so fba-plan-golive.yml is now manual-only. Campaign
+  // (campaign-ads-golive) + Returns (returns-leakage) are manual-only. No OTHER workflow may declare a schedule.
+  assert.deepEqual(scheduled, ["scheduler-v2.yml"], "exactly one scheduled workflow; got " + JSON.stringify(scheduled));
+  for (const f of ["returns-leakage.yml", "campaign-ads-golive.yml", "fba-plan-golive.yml"]) {
+    assert.ok(files.includes(f), f + " still exists (manual-only)");
+  }
 });
 
 test("D3b. returns-leakage.yml is MANUAL-ONLY: automatic schedule/cron REMOVED (disabled 2026-09-01), workflow_dispatch retained, own concurrency group unchanged, dry-run/go-live modes, Node 24, still runs the dedicated operator", () => {
@@ -289,9 +292,9 @@ test("D4. previous-day (D-1) freshness shape: refresh_mode input, scheduled-alwa
   assert.doesNotMatch(yml, /oli-force-latest\.mjs/, "the separate force-latest step is merged into the one D-1 OLI step");
   // the readiness proof is STRICT D-1 and the publish carries --strict-d1 (never publish a clamped D-2).
   assert.match(yml, /priority-dashboards-release\.mjs[^\n]*--strict-d1/, "release fails closed below D-1");
-  // schedules: Non-US primary/fallback + US primary; Cloudflare is the independent US backup.
+  // schedules: the three regional primaries; the +20-min Cloudflare watchdog dispatches the same workflow per region.
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *"], "02:00/03:00 non-us + 10:30 us");
+  assert.deepEqual(crons, ["0 3 * * *", "30 16 * * *", "30 8 * * *"].sort(), "india 03:00 + europe-au 08:30 + us-ca 16:30");
 });
 
 group("E. DataDoe token-confirmation gate (read-only balance from usage-logs; fail-closed)");

@@ -80,10 +80,10 @@ test("automatic timing: GitHub Actions scheduler-v2 is the SINGLE scheduler (exa
   const vercel = JSON.parse(readFileSync(fileURLToPath(new URL("../vercel.json", import.meta.url)), "utf8"));
   assert.equal((vercel.crons || []).length, 0, "Vercel must not invoke DataDoe automatically");
   const workflow = readFileSync(fileURLToPath(new URL("../../.github/workflows/scheduler-v2.yml", import.meta.url)), "utf8");
-  // Cron is ACTIVE: Non-US PRIMARY + FALLBACK at 02:00/03:00 UTC and one US GitHub primary at 10:30 UTC.
-  // The independent Cloudflare workflow_dispatch is the US backup and the exact-live guard makes repeats no-ops.
+  // Cron is ACTIVE + REGIONAL: india 03:00 + europe-au 08:30 + us-ca 16:30 UTC, one GitHub primary per region.
+  // The independent Cloudflare workflow_dispatch (+20 min per region) is the backup; the exact-live guard makes repeats no-ops.
   const crons = [...workflow.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["0 2 * * *", "0 3 * * *", "30 10 * * *"], "Non-US primary/fallback + US GitHub primary");
+  assert.deepEqual(crons, ["0 3 * * *", "30 16 * * *", "30 8 * * *"].sort(), "the three regional primaries (india / europe-au / us-ca)");
   assert.match(workflow, /^\s*workflow_dispatch\s*:/m, "manual dispatch remains available");
   assert.match(workflow, /^run-name:\s*scheduler-v2 .*inputs\.dispatch_id/m, "external coordinator runs are identifiable by dispatch_id");
   assert.match(workflow, /^\s{6}dispatch_id:\s*$/m, "workflow_dispatch accepts the coordinator dispatch_id");

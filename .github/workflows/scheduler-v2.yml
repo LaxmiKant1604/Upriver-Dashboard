@@ -1,44 +1,46 @@
 name: scheduler-v2
-run-name: scheduler-v2 ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_id || github.event.schedule }}
+run-name: scheduler-v2 ${{ github.event_name == 'workflow_dispatch' && format('{0}/{1}', inputs.region, inputs.dispatch_id) || github.event.schedule }}
 
-# TRUSTED refresh + publish workflow for Daily Reporting + Brand View (Scheduler v2) -- the ONLY automatic scheduler
-# (no pg_cron, no Vercel cron; the full source-refresh + derive + publish flow exceeds Vercel's 60s route cap).
+# TRUSTED regional refresh + publish coordinator for the whole active dashboard pipeline (Scheduler v2) -- the ONLY
+# automatic scheduler (no pg_cron, no Vercel cron; the full source-refresh + derive + publish flow exceeds Vercel's
+# 60s route cap). It is ALSO the ONE automatic owner of every paid source (OLI, Product Catalog reuse, Campaign Ads):
+# campaign-ads-golive.yml carries no cron, so Campaign Ads can never be refreshed by two schedulers.
 #
-# The two buckets publish INDEPENDENTLY -- neither waits for nor blocks the other, and neither ever touches the
-# other's snapshots. Each run: cycle preflight -> token gate -> OLI refresh -> ASIN Ads refresh -> compute this
-# bucket's HONEST effectivePublishAsOf (bounded 2-day settlement tail; interior gap / lag>2 fail closed) -> open
-# controls for ONLY this bucket -> Catalog + derive + preflight + publish this bucket's accounts x3 + live read-back
-# -> rebuild Brand View membership (this bucket's fresh brand-sales + the other bucket's latest-known-good) -> ALWAYS
-# safe-close controls. Publication is all-or-nothing WITHIN a bucket (preflight every account before the first write).
+# THREE REGIONS publish INDEPENDENTLY -- none waits for nor blocks another, and none ever touches another's snapshots.
+# Each cron maps DETERMINISTICALLY to exactly one region (resolved from github.event.schedule, NEVER the wall clock);
+# accounts are discovered + routed every run by trusted stored marketplace evidence, so a newly connected seller
+# auto-joins its region with no config change:
+#   - india     @ 03:00 UTC (08:30 IST): IN accounts.                              Cloudflare watchdog 03:20 UTC.
+#   - europe-au @ 08:30 UTC (14:00 IST): European marketplaces incl GB/UK + AU.    Cloudflare watchdog 08:50 UTC.
+#   - us-ca     @ 16:30 UTC (22:00 IST): US + CA accounts.                          Cloudflare watchdog 16:50 UTC.
 #
-#   - non-us @ 02:00 UTC (07:30 IST): publishes the 22 Non-US accounts; visible ~08:00-09:00 IST. Never touches US.
-#   - us     @ 10:30 UTC (16:00 IST): publishes the 8 US accounts; visible ~16:30-17:30 IST. Never touches Non-US,
-#     and does NOT require the same-day Non-US run to have completed.
+# Each region run: read-only duplicate guard (a delayed/repeated trigger -- e.g. the watchdog -- is a zero-write no-op
+# once the exact D-1 is already live) -> cycle preflight -> token gate -> OLI refresh to D-1 -> Campaign Ads refresh
+# (once, this region) -> HONEST effectivePublishAsOf (bounded 2-day tail; interior gap / lag>2 fail closed) -> open
+# controls for ONLY this region -> Catalog reuse + derive + preflight + publish this region's accounts x3 + live
+# read-back -> rebuild Brand View membership -> ALWAYS safe-close controls. FBA Shipment Plan runs as a SEPARATE,
+# isolated job (its own runner + its own safe-close) AFTER this region's OLI evidence is ready, so an FBA failure can
+# never undo/block a validated Daily/Dashboard/Brand publication and a publish failure can never block FBA.
 #
-# Insufficient tokens is a TYPED SAFE SKIP (SKIPPED_INSUFFICIENT_TOKENS): the token gate sets proceed=false, every
-# create/control step is skipped, and the run reports the skip -- no creates, no controls, LKG unchanged. An
-# UNREADABLE balance hard-fails. A same-date terminal cycle collision fails at the preflight before any token read.
-# A bucket that cannot publish honestly (interior OLI gap, blank provenance, tail lag > 2 days, unreadable coverage)
-# fails closed at the readiness proof BEFORE any control is opened -- the OTHER bucket's snapshots stay untouched.
+# Insufficient tokens is a TYPED SAFE SKIP (SKIPPED_INSUFFICIENT_TOKENS). An UNREADABLE balance hard-fails. A
+# same-date terminal cycle collision fails at the preflight before any token read. A region that cannot publish
+# honestly fails closed at the readiness proof BEFORE any control is opened -- every other region stays untouched.
 #
 # Required repository secrets (never printed): POSTGRES_URL, SUPABASE_URL (or VITE_SUPABASE_URL),
 # SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if a secondary connection is configured).
 
 on:
   schedule:
-    # Each cron maps DETERMINISTICALLY to exactly one bucket (resolved from github.event.schedule, never the clock).
-    # Non-US keeps its existing GitHub primary + fallback unchanged. US has one GitHub primary; its independent
-    # Cloudflare watchdog dispatches the same workflow at 10:50 UTC if needed. A read-only US publication guard below
-    # makes any delayed/repeated US trigger a zero-write/zero-token no-op after the exact D-1 is already live.
-    - cron: "0 2 * * *"    # Non-US PRIMARY  -- 02:00 UTC / 07:30 IST
-    - cron: "0 3 * * *"    # Non-US FALLBACK -- 03:00 UTC / 08:30 IST
-    - cron: "30 10 * * *"  # US PRIMARY      -- 10:30 UTC / 16:00 IST
+    # Each cron maps DETERMINISTICALLY to exactly one region (resolved from github.event.schedule, never the clock).
+    - cron: "0 3 * * *"    # india     PRIMARY -- 03:00 UTC / 08:30 IST
+    - cron: "30 8 * * *"   # europe-au PRIMARY -- 08:30 UTC / 14:00 IST
+    - cron: "30 16 * * *"  # us-ca     PRIMARY -- 16:30 UTC / 22:00 IST
   workflow_dispatch:
     inputs:
-      bucket:
-        description: "Bucket to run + publish (us | non-us). Publishes ONLY that bucket's accounts."
+      region:
+        description: "Region to run + publish (india | europe-au | us-ca). Publishes ONLY that region's accounts."
         required: true
-        default: "non-us"
+        default: "india"
       refresh_mode:
         description: "normal | force-latest. force-latest makes a FRESH bounded DataDoe re-fetch of the still-missing D-1 window (bypasses stale cache). Scheduled events are ALWAYS normal."
         required: false
@@ -48,12 +50,13 @@ on:
           - normal
           - force-latest
       dispatch_id:
-        description: "External scheduler identity used by the watchdog (external/<bucket>/<D-1>); ordinary manual runs may keep 'manual'."
+        description: "External scheduler identity used by the Cloudflare watchdog (external/<region>/<D-1>); ordinary manual runs may keep 'manual'."
         required: false
         default: "manual"
 
 concurrency:
-  group: scheduler-v2
+  # One in-flight run PER REGION (regions are independent); a re-dispatch of the same region queues behind its own run.
+  group: scheduler-v2-${{ github.event.schedule || inputs.region }}
   cancel-in-progress: false
 
 permissions:
@@ -66,6 +69,11 @@ jobs:
     defaults:
       run:
         working-directory: sales-dashboard-live
+    outputs:
+      region: ${{ steps.cfg.outputs.region }}
+      asof: ${{ steps.cfg.outputs.asof }}
+      oli_ready: ${{ steps.guard.outputs.already_published == 'true' || steps.readiness.outputs.proceed == 'true' }}
+      effective_asof: ${{ steps.readiness.outputs.effective_asof }}
     env:
       POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -92,138 +100,166 @@ jobs:
           if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
           echo "All required secrets present."
 
-      - name: Resolve bucket + requestedAsOf (previous UTC date, = D-1) + refresh_mode + per-run token ceiling
+      - name: Resolve region + requestedAsOf (previous UTC date, = D-1) + refresh_mode + per-region token floor
         id: cfg
         run: |
           set -euo pipefail
-          run_kind="primary"
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            # Resolve the bucket from WHICH cron fired -- deterministic, never inferred from the wall clock. Primary
-            # Non-US primary/fallback and the US primary map deterministically; an unknown cron fails closed BEFORE
-            # any I/O. The US backup is an external Cloudflare workflow_dispatch, so it carries bucket=us directly.
+            # Resolve the region from WHICH cron fired -- deterministic, never inferred from the wall clock.
             case "${{ github.event.schedule }}" in
-              "0 2 * * *")   bucket="non-us"; run_kind="primary"  ;;
-              "0 3 * * *")   bucket="non-us"; run_kind="fallback" ;;
-              "30 10 * * *") bucket="us";     run_kind="primary"  ;;
+              "0 3 * * *")   region="india"     ;;
+              "30 8 * * *")  region="europe-au" ;;
+              "30 16 * * *") region="us-ca"     ;;
               *) echo "Unknown cron '${{ github.event.schedule }}' -- refusing (fail closed)." >&2; exit 1 ;;
             esac
-            # A SCHEDULED event is ALWAYS normal mode -- force-latest can be selected ONLY by workflow_dispatch (a
-            # scheduled event carries no inputs, so injection is impossible).
+            # A SCHEDULED event is ALWAYS normal mode -- force-latest can be selected ONLY by workflow_dispatch.
             mode="normal"
           else
-            bucket="${{ github.event.inputs.bucket }}"
+            region="${{ github.event.inputs.region }}"
             mode="${{ github.event.inputs.refresh_mode }}"
             if [ -z "$mode" ]; then mode="normal"; fi
           fi
-          if [ "$bucket" != "us" ] && [ "$bucket" != "non-us" ]; then echo "Invalid bucket '$bucket'." >&2; exit 1; fi
+          if [ "$region" != "india" ] && [ "$region" != "europe-au" ] && [ "$region" != "us-ca" ]; then echo "Invalid region '$region'." >&2; exit 1; fi
           if [ "$mode" != "normal" ] && [ "$mode" != "force-latest" ]; then echo "Invalid refresh_mode '$mode'." >&2; exit 1; fi
-          if [ "$bucket" = "non-us" ]; then tokenmin=20; else tokenmin=10; fi
+          # Per-region balance FLOOR for the token gate (worst-case dry-run: india ~10, europe-au ~16, us-ca ~8 tokens).
+          case "$region" in
+            "india")     tokenmin=10 ;;
+            "europe-au") tokenmin=20 ;;
+            "us-ca")     tokenmin=10 ;;
+          esac
           asof="$(date -u -d 'yesterday' +%Y-%m-%d)"
-          # Durable operation identity is bucket + requestedAsOf (NOT the cron) so primary + fallback share ONE
-          # operation + one durable token/create budget.
-          opkey="scheduled-fresh/$bucket/$asof"
-          contract="oli-sales:item_status-v1"  # the canonical OLI fragment carries item_status (provisional/final)
-          echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
+          # Durable operation identity is region + requestedAsOf (NOT the cron) so the primary + the watchdog share ONE
+          # operation + one durable token/create budget (idempotent adoption).
+          opkey="scheduled-fresh/$region/$asof"
+          echo "region=$region" >> "$GITHUB_OUTPUT"
           echo "asof=$asof" >> "$GITHUB_OUTPUT"
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "tokenmin=$tokenmin" >> "$GITHUB_OUTPUT"
-          echo "run_kind=$run_kind" >> "$GITHUB_OUTPUT"
           echo "opkey=$opkey" >> "$GITHUB_OUTPUT"
-          # IMMUTABLE run metadata in EVERY summary -- so any future run's version + bucket are provable from the
-          # summary alone (no gh CLI needed): event, cron, dispatch identity, resolved bucket, run kind,
-          # head/workflow SHA, run id, requestedAsOf, refresh mode, operation key, source contract, token ceiling.
           {
-            echo "### scheduler-v2 run";
-            echo "- event: ${{ github.event_name }} · cron: \`${{ github.event.schedule }}\` · dispatch identity: \`${{ inputs.dispatch_id }}\` · run kind: $run_kind";
-            echo "- resolved bucket: **$bucket** (publishes ONLY this bucket; the other bucket is untouched)";
-            echo "- head/workflow SHA: \`${{ github.sha }}\` · ref: \`${{ github.ref }}\` · run id: ${{ github.run_id }} (attempt ${{ github.run_attempt }})";
-            echo "- requestedAsOf (D-1): $asof · refresh_mode: $mode · operation key: \`$opkey\`";
-            echo "- source contract: $contract · token ceiling: $tokenmin";
+            echo "### scheduler-v2 run (regional)";
+            echo "- event: ${{ github.event_name }} · cron: \`${{ github.event.schedule }}\` · dispatch identity: \`${{ inputs.dispatch_id }}\`";
+            echo "- resolved region: **$region** (publishes ONLY this region; every other region is untouched)";
+            echo "- head/workflow SHA: \`${{ github.sha }}\` · run id: ${{ github.run_id }} (attempt ${{ github.run_attempt }})";
+            echo "- requestedAsOf (D-1): $asof · refresh_mode: $mode · operation key: \`$opkey\` · token floor: $tokenmin";
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "Resolved event=${{ github.event_name }} cron='${{ github.event.schedule }}' bucket=$bucket run_kind=$run_kind sha=${{ github.sha }} requestedAsOf=$asof mode=$mode opkey=$opkey tokenmin=$tokenmin"
+          echo "Resolved event=${{ github.event_name }} cron='${{ github.event.schedule }}' region=$region requestedAsOf=$asof mode=$mode opkey=$opkey tokenmin=$tokenmin"
 
       - name: Install dependencies
         run: npm ci
 
-      # US-ONLY whole-workflow duplicate guard. A delayed GitHub cron and the 10:50 UTC Cloudflare watchdog can both
-      # dispatch the same D-1. Before cycle/token/control I/O, prove the exact current 8-US-account x 3-report live
-      # identities through the real storage-first frontend payload read-back. Complete => green no-op with ZERO
-      # creates/writes/tokens. Incomplete => continue through the unchanged fail-closed US pipeline. Non-US never runs
-      # this guard and retains its existing execution path byte-for-byte below.
-      - name: Prove US D-1 is not already fully published (read-only duplicate guard)
-        id: us_guard
-        if: steps.cfg.outputs.bucket == 'us'
-        run: node scripts/release/verify-us-d1-published.mjs --bucket=us --requested-as-of=${{ steps.cfg.outputs.asof }}
+      # Per-REGION whole-workflow duplicate guard. A delayed GitHub cron and the +20min Cloudflare watchdog can both
+      # dispatch the same region D-1. Before cycle/token/control I/O, prove the exact current region-account x 3-report
+      # live identities through the real storage-first frontend payload read-back. Complete => green no-op with ZERO
+      # creates/writes/tokens. Incomplete => continue through the unchanged fail-closed pipeline.
+      - name: Prove this region's D-1 is not already fully published (read-only duplicate guard)
+        id: guard
+        run: node scripts/release/verify-us-d1-published.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }}
 
-      - name: Report US already-published no-op
-        if: steps.cfg.outputs.bucket == 'us' && steps.us_guard.outputs.already_published == 'true'
-        run: echo "ALREADY_PUBLISHED_US_D1 -- exact live read-backs passed; zero creates, zero controls, zero tokens."
+      - name: Report already-published no-op
+        if: steps.guard.outputs.already_published == 'true'
+        run: echo "ALREADY_PUBLISHED_D1 -- exact live read-backs passed for ${{ steps.cfg.outputs.region }}; zero creates, zero controls, zero tokens."
 
       # (step 1) cycle-identity preflight: a same-date terminal collision fails EARLY, before any token read.
-      - name: Cycle-identity preflight (this bucket)
-        if: steps.cfg.outputs.bucket != 'us' || steps.us_guard.outputs.run_required == 'true'
-        run: node scripts/release/scheduled-cycle-preflight.mjs --bucket=${{ steps.cfg.outputs.bucket }}
+      - name: Cycle-identity preflight (this region)
+        if: steps.guard.outputs.run_required == 'true'
+        run: node scripts/release/scheduled-cycle-preflight.mjs --bucket=${{ steps.cfg.outputs.region }}
 
-      # (step 2) Token gate: exact per-run ceiling. Unreadable balance hard-fails; insufficient tokens is a typed safe
-      # skip (proceed=false) so every create/control step below is skipped.
-      - name: Confirm token budget (>=20 Non-US / >=10 US, before any create)
+      # (step 2) Token gate: per-region balance floor. Unreadable balance hard-fails; insufficient tokens is a typed
+      # safe skip (proceed=false) so every create/control step below is skipped.
+      - name: Confirm token budget (per-region floor, before any create)
         id: tokengate
-        if: steps.cfg.outputs.bucket != 'us' || steps.us_guard.outputs.run_required == 'true'
-        run: node scripts/release/confirm-token-budget.mjs --min=${{ steps.cfg.outputs.tokenmin }} --bucket=${{ steps.cfg.outputs.bucket }}
+        if: steps.guard.outputs.run_required == 'true'
+        run: node scripts/release/confirm-token-budget.mjs --min=${{ steps.cfg.outputs.tokenmin }} --bucket=${{ steps.cfg.outputs.region }}
 
-      # (step 3) Refresh OLI to D-1 for THIS bucket. Decouples cycle-completion from source-freshness: a running/fresh
-      # cycle drains normally; a TERMINAL cycle whose durable coverage is below D-1 is STALE evidence -> a durable
-      # SUPERSEDING running attempt is opened (the terminal cycle stays immutable) and OLI is re-fetched FRESH
-      # (forceFreshOli bypasses the 20h stale cache). After the drain it auto-escalates ONE bounded fresh re-fetch of
-      # only the still-missing <=5-seller batches, within the per-bucket create/token ceiling. normal mode uses the
-      # scheduled-fresh operation identity; force-latest uses manual-force/<bucket>/<D-1>/<github.run_id>.
+      # (step 3) Refresh OLI to D-1 for THIS region (supersede a stale terminal cycle + auto-escalate a fresh fetch of
+      # the still-missing <=5-seller batches, within the region's derived create/token ceiling).
       - name: Refresh OLI to D-1 (supersede stale terminal cycle + auto-escalate fresh fetch)
-        if: (steps.cfg.outputs.bucket != 'us' || steps.us_guard.outputs.run_required == 'true') && steps.tokengate.outputs.proceed == 'true'
-        run: node scripts/release/oli-refresh-d1.mjs --bucket=${{ steps.cfg.outputs.bucket }} --requested-as-of=${{ steps.cfg.outputs.asof }} --refresh-mode=${{ steps.cfg.outputs.mode }} --run-id=${{ github.run_id }}
+        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true'
+        run: node scripts/release/oli-refresh-d1.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }} --refresh-mode=${{ steps.cfg.outputs.mode }} --run-id=${{ github.run_id }}
 
-      # (step 4) Refresh CAMPAIGN Ads for THIS bucket only (coverage mode, 21-day rolling window). Post ASIN->Campaign
-      # cutover, Campaign is the ONLY active Ads source: this keeps Daily Reporting + Brand View ad data fresh at
-      # publish. Idempotent (already-covered accounts create nothing); the dedicated regional Campaign schedules cover
-      # the 3-region cadence and any overlap is a zero-token no-op. ASIN Ads exports are retired (a hard guard in
-      # ads-sync.js refuses them from every entry point; the durable ASIN history + reader code are retained).
-      - name: Refresh Campaign Ads (this bucket only; coverage mode, 21-day rolling window)
-        if: (steps.cfg.outputs.bucket != 'us' || steps.us_guard.outputs.run_required == 'true') && steps.tokengate.outputs.proceed == 'true'
-        run: node scripts/release/scheduled-campaign-ads-refresh.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.cfg.outputs.asof }}
+      # (step 4) Refresh CAMPAIGN Ads for THIS region ONCE (coverage mode, 21-day rolling window). Campaign is the ONLY
+      # active Ads source and scheduler-v2 is its ONE automatic owner. Idempotent (already-covered => zero creates).
+      # ASIN Ads exports are retired (a hard guard in ads-sync.js refuses them from every entry point).
+      - name: Refresh Campaign Ads (this region only; coverage mode, 21-day rolling window)
+        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true'
+        run: node scripts/release/scheduled-campaign-ads-refresh.mjs --bucket=${{ steps.cfg.outputs.region }} --as-of=${{ steps.cfg.outputs.asof }}
 
       # (step 5) STRICT D-1 readiness proof (read-only). Publication requires EVERY account gapless through the EXACT
       # requestedAsOf (D-1). A settlement tail (proven only through D-2), interior gap, blank provenance, or unreadable
-      # coverage is a typed DATADOE_D1_NOT_READY: this step fails closed BEFORE any control is opened, the publish steps
-      # below are skipped (success()-gated), the LKG is retained, and the summary distinguishes it from a D-1 success.
-      - name: Prove previous-day (D-1) readiness for this bucket (read-only; strict)
+      # coverage is a typed DATADOE_D1_NOT_READY: fail closed BEFORE any control is opened, publish steps skipped, LKG retained.
+      - name: Prove previous-day (D-1) readiness for this region (read-only; strict)
         id: readiness
-        if: (steps.cfg.outputs.bucket != 'us' || steps.us_guard.outputs.run_required == 'true') && steps.tokengate.outputs.proceed == 'true'
-        run: node scripts/release/verify-bucket-readiness.mjs --bucket=${{ steps.cfg.outputs.bucket }} --requested-as-of=${{ steps.cfg.outputs.asof }}
+        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true'
+        run: node scripts/release/verify-bucket-readiness.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }}
 
-      # (step 7) Open publication controls for ONLY this bucket's accounts x 3 keys (all_primary stays false).
-      - name: Open publication controls (this bucket only)
-        if: (steps.cfg.outputs.bucket != 'us' || steps.us_guard.outputs.run_required == 'true') && steps.tokengate.outputs.proceed == 'true'
-        run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.bucket }}
+      # (step 7) Open publication controls for ONLY this region's accounts x 3 keys (all_primary stays false).
+      - name: Open publication controls (this region only)
+        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true'
+        run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.region }}
 
-      # (steps 6/8/9/10) Catalog reuse/refresh (one create/day shared across buckets) + derive + preflight EVERY
-      # account in this bucket + publish this bucket x3 + live read-back. Reached ONLY after the strict D-1 proof, so
-      # --as-of is the requestedAsOf (D-1); --strict-d1 is a belt-and-suspenders that FAILS CLOSED (never publishes)
-      # if the derive would clamp below D-1. The operation key is the requestedAsOf so BOTH buckets share one Catalog.
-      - name: Refresh Catalog + derive/preflight/publish this bucket at D-1 + live read-back
-        if: (steps.cfg.outputs.bucket != 'us' || steps.us_guard.outputs.run_required == 'true') && steps.tokengate.outputs.proceed == 'true'
-        run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.bucket }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }} --strict-d1
+      # (steps 6/8/9/10) Catalog reuse/refresh (ONE create/day shared across ALL regions via the date-only operation
+      # key) + derive + preflight EVERY account in this region + publish this region x3 + live read-back. Reached ONLY
+      # after the strict D-1 proof; --strict-d1 fails closed (never publishes) if the derive would clamp below D-1.
+      - name: Refresh Catalog + derive/preflight/publish this region at D-1 + live read-back
+        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true'
+        run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.region }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }} --strict-d1
 
-      # (step 11) Rebuild + verify Brand View membership from ALL current brand-sales snapshots (this bucket's fresh
-      # snapshots + the OTHER bucket's latest-known-good) -- Supabase-only, zero tokens.
-      - name: Rebuild + verify Brand View membership (this bucket's fresh + other bucket's LKG; Supabase-only)
-        if: (steps.cfg.outputs.bucket != 'us' || steps.us_guard.outputs.run_required == 'true') && steps.tokengate.outputs.proceed == 'true'
+      # (step 11) Rebuild + verify Brand View membership from ALL current brand-sales snapshots (this region's fresh +
+      # every other region's latest-known-good) -- Supabase-only, zero tokens.
+      - name: Rebuild + verify Brand View membership (this region's fresh + others' LKG; Supabase-only)
+        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/rebuild-brand-membership.mjs
 
-      # (step 12) Safe-close publication controls after every real pipeline attempt, idempotent +
-      # discovery-independent. The exact-readback US duplicate no-op never opens controls and stays zero-write.
+      # (step 12) Safe-close publication controls after every real pipeline attempt, idempotent + discovery-independent.
       - name: Safe-close publication controls (ALWAYS, idempotent)
-        if: always() && (steps.cfg.outputs.bucket != 'us' || steps.us_guard.outputs.run_required == 'true')
+        if: always() && steps.guard.outputs.run_required == 'true'
         run: node scripts/release/priority-control-package.mjs --rollback
 
       - name: Report insufficient-tokens skip
-        if: always() && (steps.cfg.outputs.bucket != 'us' || steps.us_guard.outputs.run_required == 'true') && steps.tokengate.outputs.proceed != 'true' && steps.tokengate.outcome == 'success'
-        run: echo "SKIPPED_INSUFFICIENT_TOKENS -- no creates, no controls, LKG unchanged (bucket=${{ steps.cfg.outputs.bucket }} requestedAsOf=${{ steps.cfg.outputs.asof }})."
+        if: always() && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed != 'true' && steps.tokengate.outcome == 'success'
+        run: echo "SKIPPED_INSUFFICIENT_TOKENS -- no creates, no controls, LKG unchanged (region=${{ steps.cfg.outputs.region }} requestedAsOf=${{ steps.cfg.outputs.asof }})."
+
+  # FBA Shipment Plan + (US-only) AWD -- ISOLATED job, its OWN runner + its OWN always-safe-close. It runs ONLY after
+  # this region's OLI evidence is ready (needs.run.outputs.oli_ready) and is gated by always() so a Daily/Dashboard/
+  # Brand publish failure in the coordinator can never block it; conversely, an FBA failure here is contained to this
+  # job and can never undo the coordinator's already-validated publication. FBA uses the SAME regional routing and its
+  # dedicated <region>-fba cycle namespace; AWD stays US-only per-account (country === "US"), orthogonal to the region.
+  fba:
+    needs: run
+    if: always() && needs.run.outputs.oli_ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+      PRIORITY_OPERATOR: laxmikant@superboring.in
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install dependencies
+        run: npm ci
+      - name: Resolve FBA per-region token ceiling
+        id: fcfg
+        run: |
+          set -euo pipefail
+          region="${{ needs.run.outputs.region }}"
+          case "$region" in
+            "india")     maxtok=30 ;;
+            "europe-au") maxtok=60 ;;
+            "us-ca")     maxtok=40 ;;
+            *) echo "Unknown region '$region' for FBA -- refusing (fail closed)." >&2; exit 1 ;;
+          esac
+          echo "maxtok=$maxtok" >> "$GITHUB_OUTPUT"
+          echo "FBA region=$region ceiling=$maxtok"
+      - name: FBA go-live for this region (batched fetch -> derive -> publish -> ownership -> ALWAYS safe-close)
+        run: node scripts/release/fba-plan-golive.mjs --mode=go-live --region=${{ needs.run.outputs.region }} --max-tokens=${{ steps.fcfg.outputs.maxtok }}

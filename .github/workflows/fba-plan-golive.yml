@@ -1,20 +1,17 @@
 name: fba-plan-golive
-run-name: fba-plan-golive ${{ github.event_name == 'workflow_dispatch' && inputs.mode || github.event.schedule }} ${{ inputs.dispatch_id }}
+run-name: fba-plan-golive ${{ inputs.mode }} ${{ inputs.region }} ${{ inputs.dispatch_id }}
 
-# TRUSTED FBA Shipment Plan refresh + publish workflow. It runs the SAME reviewed shadow-dispatcher /
-# durable-OLI+Catalog derive / four-gate CAS publisher / safe-close architecture as scheduler-v2, in GitHub Actions
-# where the production secrets live, and is DECOUPLED from scheduler-v2: fba-plan uses its OWN dedicated cycle
-# namespace (us-fba / non-us-fba), so an FBA failure NEVER blocks Daily Reporting / Brand View, and the scheduler-v2
-# OLI/Ads schedules are untouched.
+# TRUSTED FBA Shipment Plan refresh + publish operator -- MANUAL dry-run / go-live ONLY.
 #
-# AUTOMATIC (schedule): once daily per bucket, AFTER the scheduler-v2 OLI refresh completes (fba-plan derives from
-# the DURABLE Order Line Items history, which must be D-1 fresh; DataDoe's own FBA Inventory Health refresh is ~2am
-# seller-local -- well before these times, and the binding constraint is durable-OLI freshness). scheduler-v2 OLI:
-# non-us 02:00-03:00 UTC, us 10:30-11:30 UTC -> FBA follows, PRIMARY + a bounded FALLBACK ~1h later per bucket. The
-# durable operation identity is the DEDICATED cycle (bucket-fba, as-of=D-1), so a fallback (or any replay) whose
-# primary already finished is a ZERO-create idempotent no-op (skips the dispatch, publishes already-current).
-#   - non-us @ 04:00 UTC (09:30 IST) primary, 05:00 UTC (10:30 IST) fallback
-#   - us     @ 12:30 UTC (18:00 IST) primary, 13:30 UTC (19:00 IST) fallback
+# It runs the SAME reviewed shadow-dispatcher / durable-OLI+Catalog derive / four-gate CAS publisher / safe-close
+# architecture as scheduler-v2, in GitHub Actions where the production secrets live, and is DECOUPLED via its OWN
+# dedicated cycle namespace (<scope>-fba), so an FBA failure NEVER blocks Daily Reporting / Brand View.
+#
+# AUTOMATIC FBA refresh is NO LONGER owned here: the scheduler-v2 regional coordinator runs FBA per region as an
+# ISOLATED job (its own runner + own safe-close) after that region's OLI evidence is ready. This workflow therefore
+# carries NO crons -- FBA can never be double-refreshed, and there is no wall-clock-inferred bucket. It remains the
+# MANUAL surface for an operator-driven preflight / cost dry-run / go-live dry-run / bounded go-live, optionally
+# scoped to one region (or the legacy us/non-us buckets for rollback).
 #
 # MANUAL (workflow_dispatch) modes: preflight / dry-run-cost / golive-dry-run (all READ-ONLY, zero tokens) and golive.
 #
@@ -22,12 +19,8 @@ run-name: fba-plan-golive ${{ github.event_name == 'workflow_dispatch' && inputs
 # SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY.
 
 on:
-  schedule:
-    # Each cron maps DETERMINISTICALLY to exactly one bucket (resolved from github.event.schedule, never the clock).
-    - cron: "0 4 * * *"    # Non-US PRIMARY  -- 04:00 UTC / 09:30 IST (after non-us OLI refresh)
-    - cron: "0 5 * * *"    # Non-US FALLBACK -- 05:00 UTC / 10:30 IST
-    - cron: "30 12 * * *"  # US PRIMARY      -- 12:30 UTC / 18:00 IST (after us OLI refresh)
-    - cron: "30 13 * * *"  # US FALLBACK     -- 13:30 UTC / 19:00 IST
+  # MANUAL-ONLY. Automatic FBA is owned by the scheduler-v2 regional coordinator's isolated fba job (ONE owner),
+  # so this workflow no longer carries crons -- FBA can never be refreshed by two schedulers.
   workflow_dispatch:
     inputs:
       mode:
@@ -40,6 +33,10 @@ on:
           - dry-run-cost
           - golive-dry-run
           - golive
+      region:
+        description: "Scope for golive / golive-dry-run: all | india | europe-au | us-ca (regions), or us | non-us (legacy rollback)."
+        required: false
+        default: "all"
       as_of:
         description: "Optional YYYY-MM-DD go-live as-of (blank = coverage-maximizing auto). Accounts short of it fail closed."
         required: false
@@ -93,34 +90,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # ---------------- AUTOMATIC (schedule) ----------------
-      - name: Resolve scheduled bucket + per-bucket token ceiling (deterministic from the cron, never the clock)
-        id: sched
-        if: ${{ github.event_name == 'schedule' }}
+      - name: Resolve the manual scope flag (region takes precedence; 'all' scopes all three regions)
+        id: cfg
         run: |
           set -euo pipefail
-          case "${{ github.event.schedule }}" in
-            "0 4 * * *")   bucket="non-us"; kind="primary";  maxtok=70 ;;
-            "0 5 * * *")   bucket="non-us"; kind="fallback"; maxtok=70 ;;
-            "30 12 * * *") bucket="us";     kind="primary";  maxtok=30 ;;
-            "30 13 * * *") bucket="us";     kind="fallback"; maxtok=30 ;;
-            *) echo "Unknown cron '${{ github.event.schedule }}' -- refusing (fail closed)." >&2; exit 1 ;;
+          region="${{ inputs.region }}"
+          if [ -z "$region" ]; then region="all"; fi
+          case "$region" in
+            all|india|europe-au|us-ca) scopeflag="--region=$region" ;;
+            us|non-us)                 scopeflag="--bucket=$region" ;;
+            *) echo "Invalid region '$region' (all|india|europe-au|us-ca|us|non-us)." >&2; exit 1 ;;
           esac
-          echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
-          echo "maxtok=$maxtok" >> "$GITHUB_OUTPUT"
-          {
-            echo "### fba-plan scheduled refresh";
-            echo "- cron: \`${{ github.event.schedule }}\` -> bucket: **$bucket** ($kind); per-bucket token ceiling: $maxtok";
-            echo "- head SHA: \`${{ github.sha }}\` -> run id: ${{ github.run_id }} (attempt ${{ github.run_attempt }})";
-            echo "- durable operation identity: dedicated cycle (\`$bucket-fba\`, as-of=D-1) -> a fallback whose primary already finished is a zero-create idempotent no-op.";
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "Scheduled fba-plan refresh: cron='${{ github.event.schedule }}' bucket=$bucket kind=$kind maxtok=$maxtok sha=${{ github.sha }}"
-
-      - name: FBA scheduled refresh (this bucket only; batched fetch -> derive -> publish -> ownership -> ALWAYS safe-close)
-        if: ${{ github.event_name == 'schedule' }}
-        env:
-          PRIORITY_OPERATOR: laxmikant@superboring.in
-        run: node scripts/release/fba-plan-golive.mjs --mode=go-live --bucket=${{ steps.sched.outputs.bucket }} --max-tokens=${{ steps.sched.outputs.maxtok }}
+          echo "scopeflag=$scopeflag" >> "$GITHUB_OUTPUT"
+          echo "Resolved manual scope flag: $scopeflag"
 
       # ---------------- MANUAL (workflow_dispatch) ----------------
       - name: FBA source preflight (READ ONLY -- balance + source column metadata; zero tokens)
@@ -135,10 +117,10 @@ jobs:
         if: ${{ inputs.mode == 'golive-dry-run' }}
         env:
           PRIORITY_OPERATOR: laxmikant@superboring.in
-        run: node scripts/release/fba-plan-golive.mjs --mode=dry-run ${{ inputs.as_of != '' && format('--as-of={0}', inputs.as_of) || '' }}
+        run: node scripts/release/fba-plan-golive.mjs --mode=dry-run ${{ steps.cfg.outputs.scopeflag }} ${{ inputs.as_of != '' && format('--as-of={0}', inputs.as_of) || '' }}
 
       - name: FBA GO-LIVE (bounded refresh + derive + publish + always-safe-close; hard token ceiling)
         if: ${{ inputs.mode == 'golive' }}
         env:
           PRIORITY_OPERATOR: laxmikant@superboring.in
-        run: node scripts/release/fba-plan-golive.mjs --mode=go-live --max-tokens=${{ inputs.max_tokens }} ${{ inputs.as_of != '' && format('--as-of={0}', inputs.as_of) || '' }}
+        run: node scripts/release/fba-plan-golive.mjs --mode=go-live ${{ steps.cfg.outputs.scopeflag }} --max-tokens=${{ inputs.max_tokens }} ${{ inputs.as_of != '' && format('--as-of={0}', inputs.as_of) || '' }}
