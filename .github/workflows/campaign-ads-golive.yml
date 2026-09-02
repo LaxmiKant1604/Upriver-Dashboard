@@ -1,22 +1,35 @@
 name: campaign-ads-golive
 run-name: campaign-ads-golive ${{ github.event.inputs.mode }}/${{ github.event.inputs.run_kind }} ${{ github.event.inputs.region }}
 
-# Campaign Ads (campaign-performance-v1) go-live operator -- the zero-create DRY-RUN gate and the bounded APPLY
-# backfill for "Ad Performance by Campaign & Date". Manual-only (workflow_dispatch) for the go-live; the three
-# regional PRIMARY + watchdog schedules are added in a later stage (SAFE CUTOVER ORDER), only after the initial
-# backfill + cutover are verified. Runs in GitHub Actions with the repository secrets (never a local Vercel pull);
-# never prints an api key or a seller/account/export id.
+# Campaign Ads (campaign-performance-v1) go-live operator + the THREE REGIONAL daily refresh schedules.
 #
+# workflow_dispatch: the zero-create DRY-RUN gate and the bounded APPLY backfill for "Ad Performance by Campaign &
+#   Date" (the go-live).
 #   - mode=dry-run : ZERO creates. Discovers + routes accounts into the 3 regions, deterministic <=5-seller batches,
 #                    exports/source, token price, worst-case cost, current balance, and a create_authorized decision.
 #   - mode=apply   : re-runs the dry-run gate and REFUSES unless create_authorized (price known AND cost <= max_tokens
 #                    AND balance >= cost); then runs the region slices (coverage pre-filter -> already-covered
 #                    accounts create nothing; replay adopts completed exports = zero duplicate tokens).
 #
+# schedule: three REGIONAL daily refreshes (mode=apply, run-kind=daily), each with a WATCHDOG cron +20 min. The
+#   watchdog is NOT a blind re-export: the operator's zero-token coverage pre-filter means an already-covered region
+#   creates nothing, so a watchdog re-run after a successful primary spends ZERO duplicate tokens and only fetches
+#   still-missing work. India 03:00/03:20, Europe+UK+AU 08:30/08:50, US+CA 16:30/16:50 UTC (the region schedule from
+#   campaign-region-routing.js). These are decoupled from the scheduler-v2 per-bucket campaign refresh (which keeps
+#   Daily/Brand fresh at publish); any overlap is a zero-token no-op via the same coverage pre-filter.
+#
 # Required repository secrets (never printed): POSTGRES_URL, SUPABASE_URL (or VITE_SUPABASE_URL),
 # SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if a secondary connection is configured).
 
 on:
+  schedule:
+    # Each cron maps DETERMINISTICALLY to exactly one region + role (resolved from github.event.schedule below).
+    - cron: "0 3 * * *"    # India          PRIMARY  -- 03:00 UTC / 08:30 IST
+    - cron: "20 3 * * *"   # India          WATCHDOG -- 03:20 UTC
+    - cron: "30 8 * * *"   # Europe+UK+AU   PRIMARY  -- 08:30 UTC / 14:00 IST
+    - cron: "50 8 * * *"   # Europe+UK+AU   WATCHDOG -- 08:50 UTC
+    - cron: "30 16 * * *"  # US+Canada      PRIMARY  -- 16:30 UTC / 22:00 IST
+    - cron: "50 16 * * *"  # US+Canada      WATCHDOG -- 16:50 UTC
   workflow_dispatch:
     inputs:
       mode:
@@ -94,21 +107,41 @@ jobs:
           if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
           echo "All required secrets present."
 
-      - name: Resolve inputs (max_tokens hard-capped at 40 for the authorized backfill)
+      - name: Resolve mode/region/run-kind (from the cron for a scheduled run; from inputs for a manual dispatch)
         id: cfg
         run: |
           set -euo pipefail
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # A SCHEDULED run is ALWAYS a bounded daily apply for exactly ONE region, resolved from WHICH cron fired
+            # (never the wall clock). The +20m watchdog fires the SAME region -- idempotent via the coverage pre-filter.
+            mode="apply"; runkind="daily"
+            case "${{ github.event.schedule }}" in
+              "0 3 * * *")   region="india";     role="primary"  ;;
+              "20 3 * * *")  region="india";     role="watchdog" ;;
+              "30 8 * * *")  region="europe-au"; role="primary"  ;;
+              "50 8 * * *")  region="europe-au"; role="watchdog" ;;
+              "30 16 * * *") region="us-ca";     role="primary"  ;;
+              "50 16 * * *") region="us-ca";     role="watchdog" ;;
+              *) echo "Unknown cron '${{ github.event.schedule }}' -- refusing (fail closed)." >&2; exit 1 ;;
+            esac
+          else
+            mode="${{ github.event.inputs.mode }}"; runkind="${{ github.event.inputs.run_kind }}"; region="${{ github.event.inputs.region }}"; role="manual"
+          fi
           asof="${{ github.event.inputs.as_of }}"
           if [ -z "$asof" ]; then asof="$(date -u -d 'yesterday' +%Y-%m-%d)"; fi
           maxt="${{ github.event.inputs.max_tokens }}"
           if [ -z "$maxt" ]; then maxt=40; fi
           if [ "$maxt" -gt 40 ]; then echo "max_tokens $maxt exceeds the authorized 40 -- capping at 40."; maxt=40; fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "runkind=$runkind" >> "$GITHUB_OUTPUT"
+          echo "region=$region" >> "$GITHUB_OUTPUT"
+          echo "role=$role" >> "$GITHUB_OUTPUT"
           echo "asof=$asof" >> "$GITHUB_OUTPUT"
           echo "maxt=$maxt" >> "$GITHUB_OUTPUT"
-          echo "Resolved mode=${{ github.event.inputs.mode }} run_kind=${{ github.event.inputs.run_kind }} region=${{ github.event.inputs.region }} as_of=$asof max_tokens=$maxt"
+          echo "Resolved event=${{ github.event_name }} mode=$mode run_kind=$runkind region=$region role=$role as_of=$asof max_tokens=$maxt"
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Campaign Ads ${{ github.event.inputs.mode }}
-        run: node scripts/release/campaign-ads-golive.mjs --mode=${{ github.event.inputs.mode }} --run-kind=${{ github.event.inputs.run_kind }} --region=${{ github.event.inputs.region }} --as-of=${{ steps.cfg.outputs.asof }} --max-tokens=${{ steps.cfg.outputs.maxt }}
+      - name: Campaign Ads ${{ steps.cfg.outputs.mode }} (${{ steps.cfg.outputs.region }} ${{ steps.cfg.outputs.role }})
+        run: node scripts/release/campaign-ads-golive.mjs --mode=${{ steps.cfg.outputs.mode }} --run-kind=${{ steps.cfg.outputs.runkind }} --region=${{ steps.cfg.outputs.region }} --as-of=${{ steps.cfg.outputs.asof }} --max-tokens=${{ steps.cfg.outputs.maxt }}
