@@ -1,35 +1,25 @@
 name: campaign-ads-golive
 run-name: campaign-ads-golive ${{ github.event.inputs.mode }}/${{ github.event.inputs.run_kind }} ${{ github.event.inputs.region }}
 
-# Campaign Ads (campaign-performance-v1) go-live operator + the THREE REGIONAL daily refresh schedules.
+# Campaign Ads (campaign-performance-v1) go-live operator -- MANUAL dry-run / backfill ONLY.
 #
-# workflow_dispatch: the zero-create DRY-RUN gate and the bounded APPLY backfill for "Ad Performance by Campaign &
-#   Date" (the go-live).
+# Automatic regional Campaign refresh is owned by the scheduler-v2 regional coordinator (the ONE scheduled owner for
+# paid sources), so this workflow carries NO crons -- Campaign Ads can never be refreshed by two schedulers.
+#
+# workflow_dispatch: the zero-create DRY-RUN gate and the bounded APPLY backfill for "Ad Performance by Campaign & Date".
 #   - mode=dry-run : ZERO creates. Discovers + routes accounts into the 3 regions, deterministic <=5-seller batches,
 #                    exports/source, token price, worst-case cost, current balance, and a create_authorized decision.
 #   - mode=apply   : re-runs the dry-run gate and REFUSES unless create_authorized (price known AND cost <= max_tokens
 #                    AND balance >= cost); then runs the region slices (coverage pre-filter -> already-covered
 #                    accounts create nothing; replay adopts completed exports = zero duplicate tokens).
 #
-# schedule: three REGIONAL daily refreshes (mode=apply, run-kind=daily), each with a WATCHDOG cron +20 min. The
-#   watchdog is NOT a blind re-export: the operator's zero-token coverage pre-filter means an already-covered region
-#   creates nothing, so a watchdog re-run after a successful primary spends ZERO duplicate tokens and only fetches
-#   still-missing work. India 03:00/03:20, Europe+UK+AU 08:30/08:50, US+CA 16:30/16:50 UTC (the region schedule from
-#   campaign-region-routing.js). These are decoupled from the scheduler-v2 per-bucket campaign refresh (which keeps
-#   Daily/Brand fresh at publish); any overlap is a zero-token no-op via the same coverage pre-filter.
-#
 # Required repository secrets (never printed): POSTGRES_URL, SUPABASE_URL (or VITE_SUPABASE_URL),
 # SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if a secondary connection is configured).
 
 on:
-  schedule:
-    # Each cron maps DETERMINISTICALLY to exactly one region + role (resolved from github.event.schedule below).
-    - cron: "0 3 * * *"    # India          PRIMARY  -- 03:00 UTC / 08:30 IST
-    - cron: "20 3 * * *"   # India          WATCHDOG -- 03:20 UTC
-    - cron: "30 8 * * *"   # Europe+UK+AU   PRIMARY  -- 08:30 UTC / 14:00 IST
-    - cron: "50 8 * * *"   # Europe+UK+AU   WATCHDOG -- 08:50 UTC
-    - cron: "30 16 * * *"  # US+Canada      PRIMARY  -- 16:30 UTC / 22:00 IST
-    - cron: "50 16 * * *"  # US+Canada      WATCHDOG -- 16:50 UTC
+  # MANUAL-ONLY (dry-run / backfill). Automatic regional Campaign refresh is owned by the scheduler-v2 regional
+  # coordinator (ONE scheduled owner for paid sources) -- campaign-ads-golive no longer carries its own crons, so
+  # Campaign Ads can never be refreshed by two schedulers (no duplicate refresh, no regional pre-emption).
   workflow_dispatch:
     inputs:
       mode:
@@ -107,26 +97,11 @@ jobs:
           if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
           echo "All required secrets present."
 
-      - name: Resolve mode/region/run-kind (from the cron for a scheduled run; from inputs for a manual dispatch)
+      - name: Resolve inputs (manual dispatch only; max_tokens hard-capped at 40 for the authorized backfill)
         id: cfg
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            # A SCHEDULED run is ALWAYS a bounded daily apply for exactly ONE region, resolved from WHICH cron fired
-            # (never the wall clock). The +20m watchdog fires the SAME region -- idempotent via the coverage pre-filter.
-            mode="apply"; runkind="daily"
-            case "${{ github.event.schedule }}" in
-              "0 3 * * *")   region="india";     role="primary"  ;;
-              "20 3 * * *")  region="india";     role="watchdog" ;;
-              "30 8 * * *")  region="europe-au"; role="primary"  ;;
-              "50 8 * * *")  region="europe-au"; role="watchdog" ;;
-              "30 16 * * *") region="us-ca";     role="primary"  ;;
-              "50 16 * * *") region="us-ca";     role="watchdog" ;;
-              *) echo "Unknown cron '${{ github.event.schedule }}' -- refusing (fail closed)." >&2; exit 1 ;;
-            esac
-          else
-            mode="${{ github.event.inputs.mode }}"; runkind="${{ github.event.inputs.run_kind }}"; region="${{ github.event.inputs.region }}"; role="manual"
-          fi
+          mode="${{ github.event.inputs.mode }}"; runkind="${{ github.event.inputs.run_kind }}"; region="${{ github.event.inputs.region }}"; role="manual"
           asof="${{ github.event.inputs.as_of }}"
           if [ -z "$asof" ]; then asof="$(date -u -d 'yesterday' +%Y-%m-%d)"; fi
           maxt="${{ github.event.inputs.max_tokens }}"

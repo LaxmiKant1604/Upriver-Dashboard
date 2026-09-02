@@ -211,15 +211,10 @@ test("OP1. operator refuses apply unless the dry-run gate authorized the create"
   passed += 1;
 });
 
-test("OP2. workflow has the 3 regional PRIMARY + WATCHDOG schedules (+20m), a cron->region resolver, dispatch, and a 40-token cap", () => {
+test("OP2. workflow is MANUAL-ONLY (no crons; the scheduler-v2 regional coordinator owns automatic Campaign refresh), caps max_tokens at 40, runs the operator", () => {
   assert.ok(/workflow_dispatch/.test(WF));
-  // The 3 regional primaries + their +20m watchdogs (the campaign-region-routing schedule).
-  for (const cron of ['"0 3 \\* \\* \\*"', '"20 3 \\* \\* \\*"', '"30 8 \\* \\* \\*"', '"50 8 \\* \\* \\*"', '"30 16 \\* \\* \\*"', '"50 16 \\* \\* \\*"']) {
-    assert.ok(new RegExp("cron:\\s*" + cron).test(WF), "regional cron present: " + cron);
-  }
-  // A scheduled run resolves ONE region + role deterministically from the cron (never the wall clock).
-  assert.ok(/github\.event\.schedule/.test(WF) && /region="india"/.test(WF) && /region="us-ca"/.test(WF), "cron->region resolver");
-  assert.ok(/mode="apply"; runkind="daily"/.test(WF), "scheduled runs are a bounded daily apply");
+  assert.ok(!/cron:/.test(WF), "campaign-ads-golive carries NO automatic crons (one scheduled owner = scheduler-v2; no duplicate Campaign refresh)");
+  assert.ok(!/github\.event\.schedule/.test(WF), "no scheduled-event handling remains");
   assert.ok(/exceeds the authorized 40 -- capping at 40/.test(WF), "max_tokens hard-capped at 40");
   assert.ok(/campaign-ads-golive\.mjs/.test(WF));
   passed += 1;
