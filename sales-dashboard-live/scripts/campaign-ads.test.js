@@ -190,8 +190,8 @@ const APP = readFileSync(join(ROOT, "src/App.jsx"), "utf8");
 const APIVIEW = readFileSync(join(ROOT, "api/campaign-brand-mapping.js"), "utf8"); // VIEW consolidated here (?action=view)
 const SRC = readFileSync(join(ROOT, "src/lib/daily-metrics.js"), "utf8");
 
-test("FE1. the tab is DORMANT: flag defaults false; nav + render both gate on it", () => {
-  assert.ok(/CAMPAIGN_ADS_TAB = false/.test(FLAGS), "flag default false");
+test("FE1. the tab is LIVE (go-live): flag ON; nav + render still gate on the flag", () => {
+  assert.ok(/CAMPAIGN_ADS_TAB = true/.test(FLAGS), "flag ON at go-live");
   assert.ok(/CAMPAIGN_ADS_TAB \? \[\{ view: "campaign-ads"/.test(SHELL), "nav item flag-gated");
   assert.ok(/view === "campaign-ads" && CAMPAIGN_ADS_TAB &&/.test(APP), "render flag-gated");
   passed += 1;
