@@ -50,7 +50,15 @@ try {
     )
   `);
 
-  const files = (await readdir(migrationDir)).filter((name) => name.endsWith(".sql")).sort();
+  // Optional MIGRATE_ONLY=<exact filename>: apply ONLY that migration (still ledger-guarded + idempotent), so a
+  // supervised production run can widen exactly the intended migration without touching any already-applied one.
+  const onlyFilter = process.env.MIGRATE_ONLY ? process.env.MIGRATE_ONLY.trim() : null;
+  let files = (await readdir(migrationDir)).filter((name) => name.endsWith(".sql")).sort();
+  if (onlyFilter) {
+    if (!files.includes(onlyFilter)) throw new Error(`MIGRATE_ONLY="${onlyFilter}" is not a migration file under supabase/migrations (fail closed).`);
+    console.log(`MIGRATE_ONLY set -> applying ONLY ${onlyFilter} (every other migration is left untouched).`);
+    files = [onlyFilter];
+  }
   for (const filename of files) {
     const alreadyApplied = await client.query(
       "select 1 from public.app_schema_migrations where filename = $1",

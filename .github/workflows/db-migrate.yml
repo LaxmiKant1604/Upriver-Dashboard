@@ -1,0 +1,62 @@
+name: db-migrate
+
+# TIGHTLY-SCOPED, MANUAL-ONLY production migration runner. It applies EXACTLY ONE migration (MIGRATE_ONLY),
+# ledger-guarded + idempotent, then PROVES the result and re-runs to prove the no-op. It NEVER applies any other
+# migration, rewrites history, deletes data, or prints a secret value. Used to land the additive regional-scope
+# widening (20260917) on production before the cron cutover.
+#
+# Required repository secret (never printed): POSTGRES_URL.
+
+on:
+  workflow_dispatch:
+    inputs:
+      migration:
+        description: "Exact migration filename under supabase/migrations to apply (ledger-guarded, idempotent)."
+        required: true
+        default: "20260917_scheduler_regional_scope.sql"
+
+concurrency:
+  group: db-migrate
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Verify POSTGRES_URL present (fail fast, never print value)
+        run: |
+          set -uo pipefail
+          if [ -z "${POSTGRES_URL:-}" ]; then echo "STOP missing POSTGRES_URL secret" >&2; exit 1; fi
+          echo "POSTGRES_URL present."
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Ledger status BEFORE (read-only)
+        run: node scripts/migration-ledger-status.mjs
+
+      - name: Apply ONLY the requested migration (ledger-guarded, idempotent, one transaction)
+        run: MIGRATE_ONLY="${{ github.event.inputs.migration }}" npm run db:migrate
+
+      - name: Verify the regional-scope widening (constraints + RPC guards + grants + RLS + legacy readable)
+        run: node scripts/verify-regional-migration.mjs
+
+      - name: Prove idempotency (re-run applies nothing -- "already applied")
+        run: MIGRATE_ONLY="${{ github.event.inputs.migration }}" npm run db:migrate
+
+      - name: Ledger status AFTER (read-only)
+        run: node scripts/migration-ledger-status.mjs
