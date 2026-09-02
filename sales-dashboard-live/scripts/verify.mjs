@@ -59,6 +59,7 @@ const SUITES = [
   "test:campaign-brand-mapping",
   "test:campaign-map-capability-admin",
   "test:campaign-ads",
+  "test:campaign-ads-golive",
   "test:sku-movement-import",
   "test:sku-movement-rederive",
   "test:brand-authorization",

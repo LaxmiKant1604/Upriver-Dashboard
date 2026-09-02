@@ -1,0 +1,114 @@
+name: campaign-ads-golive
+run-name: campaign-ads-golive ${{ github.event.inputs.mode }}/${{ github.event.inputs.run_kind }} ${{ github.event.inputs.region }}
+
+# Campaign Ads (campaign-performance-v1) go-live operator -- the zero-create DRY-RUN gate and the bounded APPLY
+# backfill for "Ad Performance by Campaign & Date". Manual-only (workflow_dispatch) for the go-live; the three
+# regional PRIMARY + watchdog schedules are added in a later stage (SAFE CUTOVER ORDER), only after the initial
+# backfill + cutover are verified. Runs in GitHub Actions with the repository secrets (never a local Vercel pull);
+# never prints an api key or a seller/account/export id.
+#
+#   - mode=dry-run : ZERO creates. Discovers + routes accounts into the 3 regions, deterministic <=5-seller batches,
+#                    exports/source, token price, worst-case cost, current balance, and a create_authorized decision.
+#   - mode=apply   : re-runs the dry-run gate and REFUSES unless create_authorized (price known AND cost <= max_tokens
+#                    AND balance >= cost); then runs the region slices (coverage pre-filter -> already-covered
+#                    accounts create nothing; replay adopts completed exports = zero duplicate tokens).
+#
+# Required repository secrets (never printed): POSTGRES_URL, SUPABASE_URL (or VITE_SUPABASE_URL),
+# SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if a secondary connection is configured).
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry-run (zero creates, prove the plan + balance) | apply (bounded backfill after the gate passes)"
+        required: true
+        default: "dry-run"
+        type: choice
+        options:
+          - dry-run
+          - apply
+      run_kind:
+        description: "initial (56-day backfill) | daily (21-day) | monthly (49-day correction)"
+        required: false
+        default: "initial"
+        type: choice
+        options:
+          - initial
+          - daily
+          - monthly
+      region:
+        description: "all | india | europe-au | us-ca"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - india
+          - europe-au
+          - us-ca
+      as_of:
+        description: "Window end date YYYY-MM-DD (default: yesterday UTC / D-1)"
+        required: false
+        default: ""
+      max_tokens:
+        description: "Hard token ceiling for this run (the one-time initial backfill is authorized up to 40)"
+        required: false
+        default: "40"
+
+concurrency:
+  group: campaign-ads-golive
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Verify required secrets are present (fail fast, never print values)
+        run: |
+          set -uo pipefail
+          missing=""
+          for v in POSTGRES_URL SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY; do
+            if [ -z "${!v:-}" ]; then missing="$missing $v"; fi
+          done
+          if [ -z "${SUPABASE_URL:-}" ] && [ -z "${VITE_SUPABASE_URL:-}" ]; then missing="$missing SUPABASE_URL|VITE_SUPABASE_URL"; fi
+          if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
+          echo "All required secrets present."
+
+      - name: Resolve inputs (max_tokens hard-capped at 40 for the authorized backfill)
+        id: cfg
+        run: |
+          set -euo pipefail
+          asof="${{ github.event.inputs.as_of }}"
+          if [ -z "$asof" ]; then asof="$(date -u -d 'yesterday' +%Y-%m-%d)"; fi
+          maxt="${{ github.event.inputs.max_tokens }}"
+          if [ -z "$maxt" ]; then maxt=40; fi
+          if [ "$maxt" -gt 40 ]; then echo "max_tokens $maxt exceeds the authorized 40 -- capping at 40."; maxt=40; fi
+          echo "asof=$asof" >> "$GITHUB_OUTPUT"
+          echo "maxt=$maxt" >> "$GITHUB_OUTPUT"
+          echo "Resolved mode=${{ github.event.inputs.mode }} run_kind=${{ github.event.inputs.run_kind }} region=${{ github.event.inputs.region }} as_of=$asof max_tokens=$maxt"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Campaign Ads ${{ github.event.inputs.mode }}
+        run: node scripts/release/campaign-ads-golive.mjs --mode=${{ github.event.inputs.mode }} --run-kind=${{ github.event.inputs.run_kind }} --region=${{ github.event.inputs.region }} --as-of=${{ steps.cfg.outputs.asof }} --max-tokens=${{ steps.cfg.outputs.maxt }}

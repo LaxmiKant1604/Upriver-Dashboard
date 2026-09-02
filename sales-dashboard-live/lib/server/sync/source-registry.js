@@ -260,10 +260,16 @@ export const SOURCE_REGISTRY = Object.freeze([
     dataDoeSourceId: "08cdc77d3d",
     scope: "seller",
     grain: "dated",
-    batching: { mode: "per-account", maxAccountsPerExport: 1, marketplaceSafe: true },
+    // Fetched by the durable Ads architecture in STABLE <=5-seller batches (ads-sync.js source.batchSize = 5;
+    // validateExportBatchRows PROVES per-seller isolation, and mixed marketplaces may share one export -- explicitly
+    // approved). The region-aware go-live operator (scheduled-campaign-ads-runner.js) routes accounts into the three
+    // regions and batches them <=5. Corrected from the old per-account/1 declaration (which contradicted that
+    // runtime and the <=5-seller token budget), exactly as ads-asin-date was.
+    batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
     usedByReports: ["ppc-performance"],
-    // PPC-only now. Daily Reporting moved to the ASIN grain (ads-asin-date); Brand View never read this family.
-    // The campaign grain stays PAUSED (never exported) -- it and the ASIN grain OVERLAP and are never summed.
+    // The campaign and ASIN grains OVERLAP (same spend/sales at different grains) and are NEVER summed together.
+    // usedByReports adds brand-view + daily-reporting at the ASIN->Campaign cutover (a later stage), in lockstep with
+    // REPORT_SOURCE_REQUIREMENTS; until then this family is PPC-only.
     usedByDashboards: ["ppc-performance", "priority-feed"],
     initialBackfill: { kind: "window-days", days: 56 },
     incrementalRefresh: { kind: "rolling-window-days", days: 21, upsert: "replace-matching-rows" },
