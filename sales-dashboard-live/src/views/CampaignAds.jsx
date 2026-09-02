@@ -1,6 +1,6 @@
 // Ad Performance by Campaign -- premium operational tab (DORMANT behind CAMPAIGN_ADS_TAB; ASIN Ads stays live).
-// Reads /api/campaign-ads (VIEWING = account+brand authz). Editing (inline + bulk mapping) additionally requires the
-// can_manage_campaign_brand_mapping capability and goes through /api/campaign-brand-mapping. Campaign ID is identity;
+// Reads /api/campaign-brand-mapping?action=view (VIEWING = account+brand authz). Editing (inline + bulk mapping)
+// additionally requires the can_manage_campaign_brand_mapping capability (same endpoint). Campaign ID is identity;
 // names/status may change without losing a mapping. New campaigns appear as Unmapped; Unmapped spend/sales is shown,
 // never silently assigned or dropped. Currencies are never combined. Self-contained; App.jsx only routes to it.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -40,8 +40,8 @@ export default function CampaignAds({ accountId, accountName, selectedBrand = "A
     const my = ++reqRef.current;
     setLoading(true); setError(null);
     try {
-      const q = new URLSearchParams({ accountId }); if (brandParam) q.set("brand", brandParam);
-      const r = await authFetch(`/api/campaign-ads?${q}`, accessToken);
+      const q = new URLSearchParams({ action: "view", accountId }); if (brandParam) q.set("brand", brandParam);
+      const r = await authFetch(`/api/campaign-brand-mapping?${q}`, accessToken);
       if (my !== reqRef.current) return; // stale-response guard
       if (!r.ok) { const b = await r.json().catch(() => ({})); throw new Error(b.error || `Request failed (${r.status})`); }
       const body = await r.json();

@@ -7,7 +7,9 @@ import { writeSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { assertAccountAccess } from "../lib/server/supabase.js";
-import { handler } from "../api/campaign-ads.js";
+// VIEWING was consolidated into the campaign-brand-mapping function (GET ?action=view) to stay within the Vercel
+// serverless-function budget; it keeps its own account+brand authz, distinct from the capability-gated write actions.
+import { handler } from "../api/campaign-brand-mapping.js";
 import {
   regionForMarketplace, routeAccounts, batchAccounts, planCampaignRun, REGIONS, REGION_SCHEDULE, CAMPAIGN_WINDOWS,
 } from "../lib/server/sync/campaign-region-routing.js";
@@ -147,14 +149,14 @@ function apiDeps(over = {}) {
 
 test("API1. no account access -> 403", async () => {
   const res = fakeRes();
-  await handler({ method: "GET", query: { accountId: "B" } }, res, apiDeps({ access: { userId: "u1", role: "member", accountIds: ["A"], accountGrants: {} } }));
+  await handler({ method: "GET", query: { accountId: "B", action: "view" } }, res, apiDeps({ access: { userId: "u1", role: "member", accountIds: ["A"], accountGrants: {} } }));
   assert.equal(res.statusCode, 403);
   passed += 1;
 });
 
 test("API2. viewing needs NO mapping capability: an account+brand user (no capability) sees the account view", async () => {
   const res = fakeRes();
-  await handler({ method: "GET", query: { accountId: "A" } }, res, apiDeps());
+  await handler({ method: "GET", query: { accountId: "A", action: "view" } }, res, apiDeps());
   assert.equal(res.statusCode, 200); assert.equal(res.body.restricted, false);
   assert.equal(res.body.campaigns.length, 4); assert.equal(res.body.summary.byCurrency.USD.account.spend, 430);
   assert.equal(res.body.summary.byCurrency.USD.conservationOk, true);
@@ -163,7 +165,7 @@ test("API2. viewing needs NO mapping capability: an account+brand user (no capab
 
 test("API3. SELECTED_BRANDS viewer sees ONLY permitted-brand campaigns; no Unmapped/other-brand leak", async () => {
   const res = fakeRes();
-  await handler({ method: "GET", query: { accountId: "A" } }, res, apiDeps({ access: { userId: "u2", role: "member", accountIds: ["A"], accountGrants: { A: { mode: "SELECTED_BRANDS", brandKeys: ["acme"] } } } }));
+  await handler({ method: "GET", query: { accountId: "A", action: "view" } }, res, apiDeps({ access: { userId: "u2", role: "member", accountIds: ["A"], accountGrants: { A: { mode: "SELECTED_BRANDS", brandKeys: ["acme"] } } } }));
   assert.equal(res.statusCode, 200); assert.equal(res.body.restricted, true);
   assert.deepEqual(res.body.campaigns.map((c) => c.campaignId), ["C1"]);
   assert.equal(res.body.summary.byCurrency.USD.account.spend, 150, "scoped account total = permitted only (no leak)");
@@ -173,7 +175,7 @@ test("API3. SELECTED_BRANDS viewer sees ONLY permitted-brand campaigns; no Unmap
 
 test("API4. empty history -> hasData false, empty campaigns (no fabrication)", async () => {
   const res = fakeRes();
-  await handler({ method: "GET", query: { accountId: "A" } }, res, apiDeps({ durable: [], maps: [] }));
+  await handler({ method: "GET", query: { accountId: "A", action: "view" } }, res, apiDeps({ durable: [], maps: [] }));
   assert.equal(res.statusCode, 200); assert.equal(res.body.hasData, false); assert.deepEqual(res.body.campaigns, []);
   passed += 1;
 });
@@ -185,7 +187,7 @@ const FLAGS = readFileSync(join(ROOT, "src/lib/feature-flags.js"), "utf8");
 const VIEW = readFileSync(join(ROOT, "src/views/CampaignAds.jsx"), "utf8");
 const SHELL = readFileSync(join(ROOT, "src/components/shell.jsx"), "utf8");
 const APP = readFileSync(join(ROOT, "src/App.jsx"), "utf8");
-const APIVIEW = readFileSync(join(ROOT, "api/campaign-ads.js"), "utf8");
+const APIVIEW = readFileSync(join(ROOT, "api/campaign-brand-mapping.js"), "utf8"); // VIEW consolidated here (?action=view)
 const SRC = readFileSync(join(ROOT, "src/lib/daily-metrics.js"), "utf8");
 
 test("FE1. the tab is DORMANT: flag defaults false; nav + render both gate on it", () => {
@@ -201,9 +203,14 @@ test("FE2. campaign rows keyed by STABLE identity + stale-response guard (no bli
   passed += 1;
 });
 
-test("FE3. viewing serving path does NOT require the mapping capability + never calls DataDoe", () => {
-  assert.ok(!/getCampaignMappingCapability/.test(APIVIEW), "viewing is not capability-gated");
-  assert.ok(/assertAccountAccess/.test(APIVIEW), "viewing requires account access");
+test("FE3. the VIEW action is dispatched BEFORE (and independent of) the mapping-capability gate + never calls DataDoe", () => {
+  // The view lives in the same function as the capability-gated write actions, so instead of asserting the capability
+  // is absent we assert the VIEW branch runs BEFORE the capability gate -- structurally proving viewing never depends
+  // on it (API2/API4 also prove this behaviourally, with deps that omit getCampaignMappingCapability entirely).
+  const viewAt = APIVIEW.indexOf('=== "view"');
+  const gateAt = APIVIEW.indexOf("await assertCampaignCapability");
+  assert.ok(viewAt > 0 && gateAt > 0 && viewAt < gateAt, "view branch runs before the capability gate");
+  assert.ok(/deps\.assertAccountAccess\(access, \[accountId\]\)/.test(APIVIEW), "viewing requires account access");
   const code = APIVIEW.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
   assert.ok(!/from "\.\.\/lib\/server\/datadoe\.js"|createExport|runExport|runAdsSync/.test(code), "no DataDoe export path");
   passed += 1;

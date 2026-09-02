@@ -9,6 +9,10 @@
 // AUTHORIZATION: every action requires the per-account capability `can_manage_campaign_brand_mapping` (admins bypass).
 // The capability grants ONLY campaign-mapping ability for that one account -- never any report, account, or brand.
 //
+// GET  ?action=view&accountId=&from=&to=&brand=  -> the Ad Performance by Campaign VIEW model (per-campaign metrics +
+//      KPIs + per-currency summary). This ONE action is gated on account + brand authorization ONLY (NOT the mapping
+//      capability), so any authorized viewer can read it; it reads durable data only and never calls DataDoe. Every
+//      other action below additionally requires the per-account can_manage_campaign_brand_mapping capability.
 // GET  ?action=campaigns&accountId=  -> the campaign directory (durable info + current mapping) for the account.
 // GET  ?action=mappings&accountId=   -> current campaign->brand mappings only.
 // GET  ?action=brands&accountId=     -> the account's trusted brands available for mapping.
@@ -24,10 +28,14 @@ import {
   buildCampaignDirectory, buildCampaignAuthority, campaignIdentityKey,
   canonicalMarketplace, normalizeAdsProfile, resolveTrustedBrand,
 } from "../lib/server/reports/campaign-directory.js";
+import { buildCampaignAdsView, summarizeCampaignAds, projectCampaignsForScope } from "../lib/server/reports/campaign-ads.js";
+import { brandKey } from "../lib/server/reports/brand-membership.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const MAX_NOTE = 500;
 const MAX_BULK = 5000;
+const ALL_TOKENS = new Set(["", "all", "all brands", "all permitted", "all permitted brands"]);
+const isAll = (b) => ALL_TOKENS.has(S(b).trim().toLowerCase());
 
 function bodyOf(req) {
   if (!req.body) return {};
@@ -67,6 +75,67 @@ async function assertCampaignCapability(deps, access, { organization_fingerprint
   if (!ok) throw new DashboardAccessError("You do not have permission to manage campaign brand mappings for this account.", 403);
 }
 
+// ---- VIEWING (Ad Performance by Campaign) -------------------------------------------------------------------------
+// Resolve the viewer's brand scope for this account WITHOUT touching the shared report-authorization registry (dormant
+// feature, minimal blast radius). Canonical rule: admin / ALL_BRANDS -> full; SELECTED_BRANDS -> granted brands
+// intersected with the account's TRUSTED membership. Fails closed (403) with no info leak.
+async function resolveScope(deps, access, accountId, requestedBrand) {
+  if (access.role === "admin") {
+    return isAll(requestedBrand) ? { mode: "ALL" } : { mode: "NAMED", requestedKey: brandKey(requestedBrand) };
+  }
+  const grant = access.accountGrants ? access.accountGrants[accountId] : null;
+  const mode = grant && grant.mode === "SELECTED_BRANDS" ? "SELECTED_BRANDS" : "ALL_BRANDS";
+  if (mode === "ALL_BRANDS") {
+    return isAll(requestedBrand) ? { mode: "ALL" } : { mode: "NAMED", requestedKey: brandKey(requestedBrand) };
+  }
+  const trusted = await deps.getTrustedAccountBrands({ accountId });
+  const trustedKeys = new Set((Array.isArray(trusted) ? trusted : []).map((b) => b.key));
+  const permitted = [...new Set((grant.brandKeys || []).map((k) => brandKey(k)).filter(Boolean))].filter((k) => trustedKeys.has(k));
+  if (!permitted.length) throw new DashboardAccessError("You have no permitted brands for this account.", 403);
+  if (isAll(requestedBrand)) return { mode: "ALL_PERMITTED", permittedKeys: permitted };
+  const rk = brandKey(requestedBrand);
+  if (!rk || !permitted.includes(rk)) throw new DashboardAccessError("You do not have access to the requested brand.", 403);
+  return { mode: "NAMED", permittedKeys: permitted, requestedKey: rk };
+}
+
+// GET ?action=view -- the VIEW model. Account + brand authorization ONLY (never the mapping capability); reads durable
+// data + saved mappings, projects to the viewer's brand scope, and scopes the summary so a restricted viewer never
+// sees another brand's or Unmapped spend. An empty history -> empty view. Currencies are never combined.
+async function handleView(req, res, deps, access, accountId) {
+  deps.assertAccountAccess(access, [accountId]); // account authorization first (admins bypass)
+  const from = S(req.query.from).trim() || null;
+  const to = S(req.query.to).trim() || null;
+  const scope = await resolveScope(deps, access, accountId, req.query.brand);
+  // The org fingerprint is required only to JOIN saved mappings; a missing connection yields Unmapped-only, never a 500.
+  let org = "";
+  try { org = deps.orgFingerprint(); } catch (_e) { org = ""; }
+  let durableRows, mappingRows;
+  try {
+    [durableRows, mappingRows] = await Promise.all([
+      deps.getCampaignPerformanceRows({ accountId }),
+      org ? deps.getCampaignBrandMappings({ organizationFingerprint: org, connectionId: "primary", accountId }).catch(() => []) : [],
+    ]);
+  } catch (_e) { throw new DashboardAccessError("Campaign Ads evidence is temporarily unavailable; please retry.", 503); }
+
+  const view = buildCampaignAdsView({ durableRows: durableRows || [], mappingRows: mappingRows || [], from, to });
+  const projected = projectCampaignsForScope(view.campaigns, scope);
+  // Full summary for an unrestricted view; scoped to the projected (permitted) campaigns for a restricted viewer so
+  // account/Unmapped totals never leak another brand's spend.
+  let summaryView = view;
+  if (scope.mode !== "ALL") {
+    const keep = new Set(projected.map((c) => `${c.campaignId}|${c.marketplace}|${c.adsProfileId}`));
+    summaryView = { _internal: (view._internal || []).filter((r) => keep.has(`${r.campaignId}|${r.marketplace}|${r.adsProfileId}`)) };
+  }
+  res.status(200).json({
+    accountId, from, to,
+    restricted: scope.mode !== "ALL",
+    brandScope: scope.mode,
+    campaigns: projected,
+    summary: summarizeCampaignAds(summaryView),
+    hasData: (durableRows || []).length > 0,
+  });
+}
+
 // The account's durable campaign identity authority + trusted brands (both server-derived; never trusted from the browser).
 async function accountCampaignContext(deps, { organization_fingerprint, connectionId, accountId }) {
   let durableRows, mappingRows, trusted;
@@ -86,6 +155,11 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
     const q = req.method === "GET" ? (req.query || {}) : bodyOf(req);
     const accountId = S(q.accountId).trim();
     if (!accountId) { res.status(400).json({ error: "accountId is required." }); return; }
+
+    // VIEWING (Ad Performance by Campaign) branches FIRST: account + brand authorization ONLY, never the mapping
+    // capability, and before the strict org-fingerprint requirement so any authorized viewer can read the report.
+    if (req.method === "GET" && S(req.query.action).trim() === "view") { await handleView(req, res, deps, access, accountId); return; }
+
     const organization_fingerprint = deps.orgFingerprint();
     const connectionId = "primary";
     await assertCampaignCapability(deps, access, { organization_fingerprint, connectionId, accountId });
