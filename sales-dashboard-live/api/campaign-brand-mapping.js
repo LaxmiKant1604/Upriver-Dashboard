@@ -14,7 +14,7 @@
 // GET  ?action=brands&accountId=     -> the account's trusted brands available for mapping.
 // POST { accountId, kind:'assign'|'clear'|'bulk', ... } -> assign/change one, clear one, or apply many atomically.
 import {
-  DashboardAccessError, getDashboardAccess,
+  DashboardAccessError, getDashboardAccess, assertAccountAccess,
   getCampaignPerformanceRows, getCampaignBrandMappings, getCampaignMappingCapability,
   recordCampaignBrandMapping, recordCampaignBrandMappingBulk, getTrustedAccountBrands, insertAuditLog,
 } from "../lib/server/supabase.js";
@@ -48,15 +48,21 @@ function cleanNote(v) {
 }
 
 const DEFAULT_DEPS = {
-  getDashboardAccess,
+  getDashboardAccess, assertAccountAccess,
   getCampaignPerformanceRows, getCampaignBrandMappings, getCampaignMappingCapability,
   recordCampaignBrandMapping, recordCampaignBrandMappingBulk, getTrustedAccountBrands, insertAuditLog, orgFingerprint,
 };
 
-// The single authorization gate for EVERY action: admin OR an explicit per-account capability grant. Fails closed
-// with a 403 that never reveals whether the account exists.
+// The single authorization gate for EVERY action. A capability NEVER replaces normal account access: a non-admin must
+// hold BOTH (1) canonical account access via getDashboardAccess (assertAccountAccess), so revoking a user's account
+// access immediately blocks campaign access even if a stale capability row lingers, AND (2) an explicit active
+// can_manage_campaign_brand_mapping grant for that SAME account. Admins bypass, per the project's admin pattern.
+// Fails closed with a 403 that never reveals whether the account exists.
 async function assertCampaignCapability(deps, access, { organization_fingerprint, connectionId, accountId }) {
   if (access && access.role === "admin") return;
+  // (1) canonical account access is REQUIRED first (defence: a capability alone can never grant campaign access).
+  deps.assertAccountAccess(access, [accountId]);
+  // (2) the explicit per-account capability for the same account.
   const ok = await deps.getCampaignMappingCapability({ organizationFingerprint: organization_fingerprint, connectionId, accountId, userId: access.userId });
   if (!ok) throw new DashboardAccessError("You do not have permission to manage campaign brand mappings for this account.", 403);
 }

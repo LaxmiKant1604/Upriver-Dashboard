@@ -9,6 +9,10 @@ import {
   getUserAccountBrandScopes,
   getTrustedAccountBrands,
   replaceAccountBrandScope,
+  getAccountDirectorySnapshotAccounts,
+  getUserCampaignMappingCapabilities,
+  setCampaignMappingCapability,
+  insertAuditLog,
 } from "../lib/server/supabase.js";
 import { getDataDoeConnections } from "../lib/server/datadoe-connections.js";
 import { organizationFingerprint } from "../lib/server/source-identity.js";
@@ -34,7 +38,15 @@ const DEFAULT_DEPS = {
   getInitialAdminBootstrapStatus, getDashboardAccess, assertAdmin, listDashboardUsers,
   inviteDashboardUser, updateDashboardUser, getUserAccountBrandScopes, getTrustedAccountBrands,
   replaceAccountBrandScope, primaryOrgFingerprint,
+  getAccountDirectorySnapshotAccounts, getUserCampaignMappingCapabilities, setCampaignMappingCapability, insertAuditLog,
 };
+
+// Whether ONE account id is present in the organization's trusted account directory (server-derived; never trusted
+// from the browser). Fail-closed: a directory read error throws (the caller returns 5xx before any write).
+async function accountInTrustedDirectory(deps, accountId) {
+  const accounts = await deps.getAccountDirectorySnapshotAccounts();
+  return (Array.isArray(accounts) ? accounts : []).some((a) => String(a.accountId) === String(accountId));
+}
 
 export async function handler(req, res, deps = DEFAULT_DEPS) {
   try {
@@ -131,6 +143,41 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
         correlationId: String((req.headers && req.headers["x-request-id"]) || req.query.correlationId || ""),
       });
       res.status(200).json({ ok: true, userId, accountId, mode, result });
+      return;
+    }
+
+    // ---- Campaign-mapping capability administration (admin only) ----------------------------------------------
+    // A capability grants ONLY the ability to manage campaign->brand mappings for ONE account it is granted for. It
+    // NEVER creates account access (the target user must already have it) and NEVER creates/changes brand access; it
+    // never touches account_permissions or account_brand_grant. All writes go through the SECURITY DEFINER RPC.
+    if (req.method === "GET" && action === "campaign-map-caps") {
+      const userId = String(req.query.userId || "").trim();
+      if (!userId) { res.status(400).json({ error: "A userId is required." }); return; }
+      const capabilities = await deps.getUserCampaignMappingCapabilities({ userId, organizationFingerprint: deps.primaryOrgFingerprint(), connectionId: "primary" });
+      res.status(200).json({ userId, capabilities: capabilities.map((c) => ({ accountId: c.accountId })) });
+      return;
+    }
+
+    if (req.method === "POST" && (action === "campaign-map-grant" || action === "campaign-map-revoke")) {
+      const grant = action === "campaign-map-grant";
+      const userId = String(body.userId || "").trim();
+      const accountId = String(body.accountId || "").trim();
+      if (!userId || !accountId) { res.status(400).json({ error: "A user and account are required." }); return; }
+      // The account must exist in the org's trusted directory (both grant and revoke reference a real account).
+      if (!(await accountInTrustedDirectory(deps, accountId))) { res.status(404).json({ error: "Unknown account." }); return; }
+      // A GRANT additionally requires the target user to ALREADY hold normal account access -- a capability can never
+      // create account access. (A REVOKE is always allowed and idempotent.)
+      if (grant) {
+        const scopes = await deps.getUserAccountBrandScopes(userId);
+        const hasAccess = (Array.isArray(scopes) ? scopes : []).some((s) => String(s.accountId) === accountId);
+        if (!hasAccess) { res.status(403).json({ error: "The user does not have access to that account; grant account access first." }); return; }
+      }
+      const result = await deps.setCampaignMappingCapability({
+        organizationFingerprint: deps.primaryOrgFingerprint(), connectionId: "primary", accountId, userId, enabled: grant,
+        actor: access.userId, actorEmail: access.email || "", correlationId: String((req.headers && req.headers["x-request-id"]) || body.correlationId || ""),
+      });
+      await deps.insertAuditLog({ actorUserId: access.userId, action: grant ? "campaign-map-capability.grant" : "campaign-map-capability.revoke", target: { userId, accountId } });
+      res.status(200).json({ ok: true, userId, accountId, enabled: grant, result });
       return;
     }
 

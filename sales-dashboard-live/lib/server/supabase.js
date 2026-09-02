@@ -974,6 +974,34 @@ export async function recordCampaignBrandMappingBulk({ organizationFingerprint, 
   return Array.isArray(body) ? body[0] : body;
 }
 
+// List ONE user's campaign-mapping capability grants (admin view). Returns [{accountId, canManage, updatedAt}].
+// Account-scope-agnostic read of the user's own grant rows. Fail-soft: schema-missing => [].
+export async function getUserCampaignMappingCapabilities({ userId, organizationFingerprint = null, connectionId = null, signal = null } = {}) {
+  if (!userId) return [];
+  const params = { user_id: `eq.${userId}`, can_manage_campaign_brand_mapping: "eq.true", select: "account_id,can_manage_campaign_brand_mapping,updated_at", order: "account_id.asc" };
+  if (organizationFingerprint) params.organization_fingerprint = `eq.${organizationFingerprint}`;
+  if (connectionId) params.connection_id = `eq.${connectionId}`;
+  try {
+    const rows = await request(`/rest/v1/account_campaign_map_grant?${new URLSearchParams(params)}`, { signal });
+    return (Array.isArray(rows) ? rows : []).map((r) => ({ accountId: r.account_id, canManage: r.can_manage_campaign_brand_mapping === true, updatedAt: r.updated_at }));
+  } catch (e) { if (isSchemaMissingError(e)) return []; throw e; }
+}
+
+// Admin GRANT (enabled=true) / REVOKE (enabled=false) of ONE (user, account) campaign-mapping capability via the
+// SECURITY DEFINER RPC (atomic + audited). The admin api/ layer authorizes the caller + proves the target user's
+// account access BEFORE calling this; the RPC never creates account or brand access. Idempotent both ways.
+export async function setCampaignMappingCapability({ organizationFingerprint, connectionId = "primary", accountId, userId, enabled, actor = null, actorEmail = "", correlationId = "" }) {
+  if (!userId || !accountId) throw new DashboardAccessError("A user and account are required.", 400);
+  const body = await request("/rest/v1/rpc/set_campaign_map_capability", {
+    method: "POST",
+    body: {
+      p_organization_fingerprint: String(organizationFingerprint || ""), p_connection_id: connectionId, p_account_id: String(accountId),
+      p_user_id: userId, p_enabled: Boolean(enabled), p_actor: actor, p_actor_email: String(actorEmail || ""), p_correlation_id: String(correlationId || ""),
+    },
+  });
+  return Array.isArray(body) ? body[0] : body;
+}
+
 const ADS_ROW_CONFLICT_KEY = "source_key,account_id,marketplace_country_code,metric_date,dimension_key";
 
 export async function getAdsSyncStates(accountIds) {

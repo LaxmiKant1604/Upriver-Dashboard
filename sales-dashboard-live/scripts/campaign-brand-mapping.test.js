@@ -17,6 +17,7 @@ import { writeSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { handler } from "../api/campaign-brand-mapping.js";
+import { assertAccountAccess } from "../lib/server/supabase.js";
 import {
   buildCampaignDirectory, buildCampaignAuthority, campaignIdentityKey,
   canonicalMarketplace, normalizeAdsProfile, resolveTrustedBrand,
@@ -53,7 +54,8 @@ function makeDeps(over = {}) {
   const mappings = over.mappings || { A: [] };
   const trusted = over.trusted || { A: trustedA() };
   const deps = {
-    getDashboardAccess: async () => over.access || { userId: "u1", email: "u@x.com", role: "member" },
+    getDashboardAccess: async () => over.access || { userId: "u1", email: "u@x.com", role: "member", accountIds: over.accountIds || ["A"] },
+    assertAccountAccess, // the REAL canonical gate (checks access.accountIds / admin)
     orgFingerprint: () => "org-fp",
     getCampaignMappingCapability: async ({ accountId, userId }) => Boolean(caps[userId] && caps[userId].has(accountId)),
     getCampaignPerformanceRows: async ({ accountId }) => { if (over.durableThrows) throw new Error("db"); return durable[accountId] || []; },
@@ -158,6 +160,35 @@ test("R7. a brand-restricted viewer without the capability CANNOT list campaigns
   const res = fakeRes();
   await handler({ method: "GET", query: { action: "campaigns", accountId: "A" } }, res, deps);
   assert.equal(res.statusCode, 403, "campaign listing is capability-gated");
+  passed += 1;
+});
+
+test("R11a. account access WITHOUT the capability -> 403 + zero writes", async () => {
+  const { deps, calls } = makeDeps({ caps: {}, accountIds: ["A"] }); // has account access, no capability
+  const res = fakeRes();
+  await handler({ method: "POST", body: { accountId: "A", kind: "assign", marketplace: "US", adsProfileId: "P1", campaignId: "C1", brand: "Acme" } }, res, deps);
+  assert.equal(res.statusCode, 403); noWrites(calls, "access-without-capability");
+  passed += 1;
+});
+
+test("R12/R13. a STALE capability WITHOUT current account access -> 403 (list AND assign)", async () => {
+  // The user still has a capability row for A but their canonical account access to A was revoked (accountIds omits A).
+  const capOnly = () => makeDeps({ caps: { u1: new Set(["A"]) }, accountIds: [] });
+  let m = capOnly(); let res = fakeRes();
+  await handler({ method: "GET", query: { action: "campaigns", accountId: "A" } }, res, m.deps);
+  assert.equal(res.statusCode, 403, "revoked account access blocks campaign LISTING even with a stale capability");
+  m = capOnly(); res = fakeRes();
+  await handler({ method: "POST", body: { accountId: "A", kind: "assign", marketplace: "US", adsProfileId: "P1", campaignId: "C1", brand: "Acme" } }, res, m.deps);
+  assert.equal(res.statusCode, 403, "revoked account access blocks MAPPING even with a stale capability");
+  noWrites(m.calls, "stale-capability");
+  passed += 1;
+});
+
+test("R11. BOTH account access AND capability are required (both present -> 200)", async () => {
+  const { deps, calls } = makeDeps({ caps: { u1: new Set(["A"]) }, accountIds: ["A"] });
+  const res = fakeRes();
+  await handler({ method: "POST", body: { accountId: "A", kind: "assign", marketplace: "US", adsProfileId: "P1", campaignId: "C1", brand: "Acme" } }, res, deps);
+  assert.equal(res.statusCode, 200); assert.equal(calls.record.length, 1);
   passed += 1;
 });
 
