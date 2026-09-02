@@ -41,6 +41,8 @@ import ListingHealth from "./views/ListingHealth.jsx";
 import BuyBoxLoss from "./views/BuyBoxLoss.jsx";
 import ReturnsLeakage from "./views/ReturnsLeakage.jsx";
 import PpcPerformance from "./views/PpcPerformance.jsx";
+import CampaignAds from "./views/CampaignAds.jsx";
+import { CAMPAIGN_ADS_TAB } from "./lib/feature-flags.js";
 import ListingOptimizer from "./views/ListingOptimizer.jsx";
 import PriorityFeed from "./views/PriorityFeed.jsx";
 // Account-scoped Brand View (Account -> Brand -> Brand Reports). Deliberately a
@@ -1085,12 +1087,27 @@ function BrandScopeManager({ accessToken, userId, grantedAccountIds, accounts })
   const [err, setErr] = useState("");
   const nameOf = (id) => { const a = accounts.find((x) => String(x.id) === String(id)); return a ? `${FLAGS[a.country] || ""} ${a.name}` : id; };
 
+  const [caps, setCaps] = useState(() => new Set()); // accounts where this user may manage campaign->brand mapping
   const loadScopes = useCallback(async () => {
     if (!userId) return;
     try { const r = await authFetch(`/api/access?action=user-scopes&userId=${encodeURIComponent(userId)}`, accessToken); const map = {}; for (const s of r.scopes || []) map[s.accountId] = s; setScopes(map); }
     catch (e) { setErr(e.message); }
+    try { const c = await authFetch(`/api/access?action=campaign-map-caps&userId=${encodeURIComponent(userId)}`, accessToken); setCaps(new Set((c.capabilities || []).map((x) => x.accountId))); }
+    catch { /* capability listing is best-effort; a failure just hides the toggle state */ }
   }, [accessToken, userId]);
   useEffect(() => { loadScopes(); setOpenAccount(""); }, [loadScopes]);
+
+  // Grant/revoke the campaign-brand-mapping capability for ONE account. A grant requires the user to already have
+  // account access (enforced server-side); it never widens account/report/brand access.
+  const toggleCap = async (accountId) => {
+    const grant = !caps.has(accountId);
+    setErr(""); setMsg("");
+    try {
+      await authFetch(`/api/access?action=${grant ? "campaign-map-grant" : "campaign-map-revoke"}`, accessToken, { method: "POST", body: JSON.stringify({ userId, accountId }) });
+      setCaps((cur) => { const n = new Set(cur); if (grant) n.add(accountId); else n.delete(accountId); return n; });
+      setMsg(grant ? "Campaign-mapping capability granted." : "Campaign-mapping capability revoked.");
+    } catch (e) { setErr(e.message || "Could not update the campaign-mapping capability."); }
+  };
 
   const openEditor = async (accountId) => {
     setOpenAccount(accountId); setErr(""); setMsg(""); setSearch("");
@@ -1135,6 +1152,9 @@ function BrandScopeManager({ accessToken, userId, grantedAccountIds, accounts })
         return <div key={id} className="access-scope-row" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "6px 0", borderBottom: "1px solid var(--border-default)", flexWrap: "wrap" }}>
           <span style={{ minWidth: 140, flex: "1 1 160px" }}>{nameOf(id)}</span>
           <span className={"access-role " + (isSel ? "role-viewer" : "role-editor")} style={{ whiteSpace: "nowrap" }}>{isSel ? `${(s.brandDisplays || s.brandKeys || []).length} brand${(s.brandDisplays || s.brandKeys || []).length === 1 ? "" : "s"}` : "All brands"}</span>
+          <label className="access-account-check" style={{ display: "inline-flex", gap: 6, whiteSpace: "nowrap", fontSize: 12 }} title="Allow this user to map campaigns to brands for this account. Never grants any account, report or brand access.">
+            <input type="checkbox" checked={caps.has(id)} onChange={() => toggleCap(id)} /><span>Campaign mapping</span>
+          </label>
           <button type="button" className="secondary-action" onClick={() => openEditor(id)} style={{ padding: "3px 10px" }}>Edit brands</button>
         </div>;
       })}
@@ -3789,7 +3809,7 @@ function DashboardApp({ session, access, onSignOut }) {
 
         <div className={"main-area"
           + (view === "dashboard" && dashboardMode === "account" ? " dash-workspace" : "")
-          + ((view === "brandview" || view === "daily" || view === "returns" || view === "fbaplan" || view === "skumovement" || (view === "dashboard" && dashboardMode === "brand")) ? " op-workspace" : "")}>
+          + ((view === "brandview" || view === "daily" || view === "returns" || view === "fbaplan" || view === "skumovement" || view === "campaign-ads" || (view === "dashboard" && dashboardMode === "brand")) ? " op-workspace" : "")}>
           {/* Isolated fluid-motion background, only behind the account Dashboard.
               It self-disables under reduced motion / low-power / no-WebGL and
               falls back to the static CSS wash, so nothing here can block or
@@ -4892,6 +4912,16 @@ function DashboardApp({ session, access, onSignOut }) {
           onSaveIdentifier={onSaveIdentifier}
           onBulkIdentifiers={onBulkIdentifiers}
           canEdit={!!session?.access_token && !!selectedAccountId}
+        />
+      )}
+
+      {view === "campaign-ads" && CAMPAIGN_ADS_TAB && (
+        <CampaignAds
+          accountId={selectedAccountId}
+          accountName={refreshScopeAccount?.name}
+          selectedBrand={selectedBrand}
+          accessToken={session?.access_token}
+          isAdmin={isAdmin}
         />
       )}
 

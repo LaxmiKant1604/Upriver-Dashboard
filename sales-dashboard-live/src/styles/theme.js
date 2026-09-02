@@ -2087,6 +2087,17 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .op-report .sku-mv-move-flat{ color:var(--op-ink-4); }
 .op-report .sku-mv-ident-view{ color:var(--op-ink); }
 .op-report .sku-mv-ident-view:hover{ color:var(--op-steel); }
+
+/* ---- AD PERFORMANCE BY CAMPAIGN (.campaign-ads-page) ------------------- */
+.op-report .ca-kpis{ grid-template-columns:repeat(auto-fit, minmax(128px, 1fr)); }
+.op-report .ca-kpis .metric-value{ font-size:20px; margin-top:8px; }
+.op-report .ca-search{ display:inline-flex; align-items:center; gap:7px; border:1px solid var(--op-border); border-radius:8px; background:#fff; padding:6px 10px; min-width:200px; }
+.op-report .ca-search:focus-within{ border-color:var(--op-orange); box-shadow:0 0 0 3px rgba(255,153,0,.16); }
+.op-report .ca-search svg{ color:var(--op-ink-4); flex:0 0 auto; }
+.op-report .ca-search input{ border:none; outline:none; background:transparent; font:600 12.5px inherit; color:var(--op-ink); width:100%; min-width:0; }
+.op-report .ca-map-select{ border:1px solid var(--op-border); border-radius:7px; background:#fff; color:var(--op-ink); font:600 12px inherit; padding:4px 6px; max-width:170px; }
+.op-report .ca-map-select:hover{ border-color:#B9C0C5; }
+.op-report .campaign-ads-table td{ font-variant-numeric:tabular-nums; }
 `;
 
 /* Chart colours, exported so recharts series stay in step with the CSS tokens

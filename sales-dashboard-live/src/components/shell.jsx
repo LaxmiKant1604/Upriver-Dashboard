@@ -12,6 +12,7 @@
    when items are regrouped or reordered.                                    */
 
 import React, { useEffect } from "react";
+import { CAMPAIGN_ADS_TAB } from "../lib/feature-flags.js";
 import {
   BellRing,
   Boxes,
@@ -82,6 +83,8 @@ export const NAV_GROUPS = [
       { view: "salesmovers", label: "Sales Movers", title: "Sales Movers — weekly ASIN gains and declines", icon: TrendingUp },
       { view: "skumovement", label: "SKU Movement", title: "SKU Movement — per-ASIN/SKU units, trend and month projection", icon: Activity },
       { view: "ppc", label: "PPC Performance", title: "PPC Performance & Wasted Spend", icon: Megaphone },
+      // Dormant until the Campaign Ads go-live (CAMPAIGN_ADS_TAB). Hidden entirely while OFF.
+      ...(CAMPAIGN_ADS_TAB ? [{ view: "campaign-ads", label: "Ad Performance by Campaign", title: "Ad Performance by Campaign — campaign metrics + brand mapping", icon: Megaphone }] : []),
       { view: "keywordrank", label: "Keyword Rank", title: "Keyword rank and share of query", icon: Tag },
       { view: "optimizer", label: "Listing Optimizer", title: "Listing & Search Optimizer — search-funnel and content gaps", icon: FileSearch },
     ],
