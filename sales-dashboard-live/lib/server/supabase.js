@@ -9,6 +9,7 @@ import { normalizeFulfillmentChannel } from "./sync/oli-order-rules.js";
 import { resolveActiveCycleHead } from "./sync/source-cycle-attempts.js";
 import { membershipBrandsForAccount } from "./reports/brand-membership.js";
 import { ACTIVE_ADS_SOURCE_KEY } from "./active-ads-source.js";
+import { isRoutingScope } from "./sync/scheduler-scope.js";
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 // Vercel Marketplace projects can expose either the legacy service-role JWT or
@@ -2780,8 +2781,8 @@ const SAFE_ERROR_MAX = 200;
 export async function upsertSourceRunStatus(entry, { signal = null } = {}) {
   const key = String(entry && entry.sourceKey || "").trim();
   const bucket = entry && entry.bucket;
-  if (!key || (bucket !== "us" && bucket !== "non-us")) {
-    throw new Error("upsertSourceRunStatus requires a nonblank sourceKey and a bucket of 'us'|'non-us' (fail closed).");
+  if (!key || !isRoutingScope(bucket)) {
+    throw new Error("upsertSourceRunStatus requires a nonblank sourceKey and a routing-scope bucket (india|europe-au|us-ca|us|non-us; fail closed).");
   }
   const body = { source_key: key, bucket };
   const setIf = (name, value) => { if (value !== undefined) body[name] = value; };

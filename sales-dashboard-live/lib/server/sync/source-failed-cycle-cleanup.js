@@ -10,6 +10,8 @@
 // performs one rollback and returns an ordinary failure (code 1); a lost/failed commit ack returns typed
 // COMMIT_UNKNOWN (code 3) with NO rollback and NO retry, demanding a read-only reconciliation.
 
+import { isRoutingScope } from "./scheduler-scope.js";
+
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
 
@@ -22,7 +24,7 @@ export function assessFailedCatalogCycle(cycleId, snap, { organizationScopeKey }
   const P = [];
   const cyc = snap && snap.cycle;
   if (!cyc || S(cyc.id) !== S(cycleId)) return ["cycle-not-found"];
-  if (cyc.bucket !== "us" && cyc.bucket !== "non-us") P.push("bad-bucket:" + S(cyc.bucket));
+  if (!isRoutingScope(cyc.bucket)) P.push("bad-bucket:" + S(cyc.bucket));
   if (S(cyc.status) !== "running") P.push("cycle-not-running:" + S(cyc.status)); // a terminal cycle is NEVER cleaned
   if (S(cyc.trigger) !== "manual") P.push("cycle-not-manual:" + S(cyc.trigger));
 

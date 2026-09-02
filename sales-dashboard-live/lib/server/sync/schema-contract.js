@@ -351,6 +351,10 @@ export const SCHEDULER_V2_SCHEMA_CONTRACT = Object.freeze([
         unique: [["source_key", "bucket"]],
         namedConstraints: [
           { name: "source_run_status_pk", kind: "primary key", columns: ["source_key", "bucket"] },
+          // Migration-tamper audit: this canonical matches the DEFINING migration (20260820) verbatim, which is
+          // unmutated. Migration 20260917 ADDITIVELY widens this CHECK to the regions (+ -fba twins) via a separate
+          // migration -- the live widened constraint is verified directly against the DB by verify-regional-migration.mjs
+          // (mirrors 20260906, which widened sync_cycles to the -fba twins without changing this migration-tamper contract).
           { name: "source_run_status_bucket_check", kind: "check", canonical: "bucket in ('us', 'non-us')" },
           { name: "source_run_status_last_status_check", kind: "check", canonical: "last_status in ('never', 'running', 'succeeded', 'partial', 'failed', 'paused')" },
         ],
