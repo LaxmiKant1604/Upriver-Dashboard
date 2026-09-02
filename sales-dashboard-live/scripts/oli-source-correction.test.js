@@ -177,9 +177,9 @@ test("(g) returns-leakage rate uses OLI ordered units as denominator and Returns
 
 /* ---------------------- (d) PPC TACoS sums OLI sales in the Ads currency; degrades on currency mismatch ---------------------- */
 
+// ASIN Ads retired from PPC: descriptors are [campaign, targeting, search] in canonical order.
 const PPC_DESC = [
   { syncKey: "campaign", label: "Campaign", coverage: "c", defaultDataset: true },
-  { syncKey: "asin", label: "ASIN", coverage: "a", defaultDataset: true },
   { syncKey: "targeting", label: "Targeting", coverage: "t", defaultDataset: false },
   { syncKey: "search", label: "Search", coverage: "s", defaultDataset: false },
 ];

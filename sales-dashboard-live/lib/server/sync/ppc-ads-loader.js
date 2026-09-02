@@ -29,16 +29,16 @@ import { adsCurrencySignal, failedAdsCurrencySignal } from "./source-signals.js"
 // of truth. derivation-core.js is an import-free pure leaf (no transport/storage), so this adds none.
 import { PPC_COVERAGE_REASON_CODES } from "../reports/derivation-core.js";
 
-// The four persisted Ads source_keys PPC reads -- byte-identical to the ADS_* syncKeys the live builder uses.
-// The two DEFAULT datasets (campaign + ASIN) are REQUIRED: their complete coverage gates the whole Ads
-// context. Targeting + search-terms are OPTIONAL: they fold only when independently covered.
+// The persisted Ads source_keys PPC reads -- byte-identical to the ADS_* syncKeys the live builder uses. ASIN Ads
+// is RETIRED from PPC (not loaded, aggregated, required or displayed); the durable ASIN history is retained for
+// rollback but never read here. Campaign is the sole REQUIRED default dataset; targeting + search-terms are
+// OPTIONAL independent sources that fold only when independently covered.
 export const PPC_SOURCE_KEYS = Object.freeze([
   "campaign-performance-v1",
-  "asin-performance-v1",
   "keyword-targeting-performance-v1",
   "search-terms-performance-v1",
 ]);
-export const PPC_REQUIRED_SOURCE_KEYS = Object.freeze(["campaign-performance-v1", "asin-performance-v1"]);
+export const PPC_REQUIRED_SOURCE_KEYS = Object.freeze(["campaign-performance-v1"]);
 export const PPC_OPTIONAL_SOURCE_KEYS = Object.freeze(["keyword-targeting-performance-v1", "search-terms-performance-v1"]);
 export const PPC_ADS_WINDOW_DAYS = 30;
 export const PPC_MAX_ADS_ROWS = 120000;

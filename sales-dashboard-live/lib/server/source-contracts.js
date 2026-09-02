@@ -192,7 +192,7 @@ export const REPORT_SOURCE_REQUIREMENTS = Object.freeze({
   "listing-health": ["listings", "listings-raw", "profit-by-sku-date", "fba-inventory-health", "product-catalog"],
   "buy-box-loss": ["order-line-items", "profit-by-sku-date", "fba-inventory-health", "product-catalog"],
   "returns-leakage": ["returns", "settlements", "order-line-items", "product-catalog"],
-  "ppc-performance": ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date", "order-line-items", "product-catalog"],
+  "ppc-performance": ["ads-campaign-date", "ads-targeting-date", "ads-search-terms-date", "order-line-items", "product-catalog"],
   "listing-optimizer": ["sqp-weekly", "product-catalog"],
   "brand-view": ["brand-sales", "ads-campaign-date", "fba-plan"],
   "priority-feed": ["sales-movers", "listing-health", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer"],

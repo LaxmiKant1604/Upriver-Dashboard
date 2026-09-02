@@ -855,10 +855,11 @@ export const REPORT_DERIVED_SOURCE_KEYS = Object.freeze({
   // campaign-performance-v1) -- the active advertising source it shares with Brand View. The ASIN grain is retired
   // from Daily/Brand (PPC-only). The two grains OVERLAP and are never summed.
   "daily-reporting": ["ads-campaign-date"],
-  // PPC Performance reads ALL advertising figures from the persisted Ads history the
-  // scheduled worker maintains (ads_daily_source_rows). Opening/refreshing PPC never
-  // runs an Amazon Ads export, so these four Ads sources are derived, not owned.
-  "ppc-performance": ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"],
+  // PPC Performance reads its advertising figures from the persisted Ads history the scheduled worker maintains
+  // (ads_daily_source_rows). Opening/refreshing PPC never runs an Amazon Ads export, so these Ads sources are
+  // derived, not owned. ASIN Ads (ads-asin-date) is RETIRED from PPC (not loaded/aggregated/displayed); campaign is
+  // the active grain and targeting + search-terms remain independent optional sources.
+  "ppc-performance": ["ads-campaign-date", "ads-targeting-date", "ads-search-terms-date"],
   // FBA Shipment Plan reads its Order Line Items sales + Product Catalog from ALREADY-persisted durable evidence
   // (source_oli_daily_history + the org Product Catalog snapshot the OLI/catalog scheduler maintains), NOT from an
   // owned fba-plan export -- so opening/refreshing/publishing fba-plan spends ZERO tokens on OLI/catalog. Only the

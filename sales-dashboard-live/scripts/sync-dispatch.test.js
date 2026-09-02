@@ -571,7 +571,7 @@ test("(daily+ppc integration) one dispatcher invocation derives + saves BOTH Dai
   assert.ok(saver.has("ppc-performance", "A1"), "PPC Performance derived + saved");
   // Daily consumed the seeded durable Ads coverage (validated); PPC folded the seeded campaign+ASIN rows.
   assert.equal(saver.saved.get("daily-reporting|A1").adsAvailability.status, "validated", "Daily resolved the seeded durable Ads coverage to validated");
-  assert.equal(saver.saved.get("ppc-performance|A1").adsRowCount, 2, "PPC folded the two seeded campaign+ASIN Ads rows");
+  assert.equal(saver.saved.get("ppc-performance|A1").adsRowCount, 1, "PPC folded ONLY the campaign row; the seeded ASIN row is IGNORED (ASIN retired from PPC)");
   // The derive-context loaders read from injected Supabase-style readers (NEVER DataDoe).
   assert.ok(daily.calls.metrics > 0 && daily.calls.coverage > 0, "the Daily loader read ad_daily_metrics + durable coverage");
   assert.ok(ppc.calls.rows > 0 && ppc.calls.coverage > 0, "the PPC loader read persisted Ads rows + durable coverage");

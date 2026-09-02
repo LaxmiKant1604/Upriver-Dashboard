@@ -26,7 +26,9 @@ import { isCancelledStatus } from "../sync/oli-order-rules.js";
 import { ADS_ASIN, ADS_CAMPAIGN, ADS_SEARCH_TERMS, ADS_TARGETING, OLI_ROW_LIMIT, ORDER_LINE_ITEMS, ROW_LIMITS } from "./sources.js";
 
 export const PPC_REPORT_KEY = "ppc-performance";
-export const PPC_VERSION = "ppc-performance-v1";
+// v2: ASIN Ads retired from PPC (no longer loaded/aggregated/displayed). Bumped so any stale v1 snapshot that still
+// carried the ASIN level re-derives instead of being served.
+export const PPC_VERSION = "ppc-performance-v2-campaign";
 
 const WINDOW_DAYS = 30;
 const MAX_ADS_ROWS = 120000;
@@ -34,9 +36,11 @@ const MAX_ADS_ROWS = 120000;
 // just a small sample. Matches the DataDoe watchdog blueprint.
 const MIN_CLICKS_FOR_WASTE = 10;
 
+// ASIN Ads (ADS_ASIN) is RETIRED from PPC: it is not loaded, aggregated, required or displayed. Campaign is the
+// active grain; targeting + search-terms remain OPTIONAL independent sources. The ASIN durable history is retained
+// (rollback), just never read here.
 const SOURCE_KEYS = [
   ADS_CAMPAIGN.syncKey,
-  ADS_ASIN.syncKey,
   ADS_TARGETING.syncKey,
   ADS_SEARCH_TERMS.syncKey,
 ];
@@ -154,7 +158,6 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
   }
 
   const campaignRows = bySource.get(ADS_CAMPAIGN.syncKey) || [];
-  const asinRows = bySource.get(ADS_ASIN.syncKey) || [];
   const targetingRows = bySource.get(ADS_TARGETING.syncKey) || [];
   const searchTermRows = bySource.get(ADS_SEARCH_TERMS.syncKey) || [];
 
@@ -174,18 +177,9 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
     { salesKey: "ad_sales", ordersKey: "ad_orders", unitsKey: "ad_units_sold" }
   );
 
-  // ASIN performance is same-SKU attributed in this source; the aliases make
-  // that explicit rather than presenting it as total attributed sales.
-  const asins = rollupPpcRows(
-    asinRows,
-    (row) => row.child_asin,
-    (row) => ({
-      asin: row.child_asin || null,
-      sku: row.dimensions?.sku || null,
-      productName: row.dimensions?.product_name || null,
-    }),
-    { salesKey: "ad_sales_same_sku", ordersKey: "ad_orders_same_sku", unitsKey: "ad_units_sold_same_sku" }
-  );
+  // ASIN Ads is retired from PPC: the per-ASIN level is no longer aggregated. `asins` stays an empty array so the
+  // payload contract shape is unchanged (the frontend no longer renders an ASIN tab).
+  const asins = [];
 
   const targets = rollupPpcRows(
     targetingRows,
@@ -293,12 +287,9 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
     }
   }
 
+  // Product Catalog is still read for catalogBrands (the brand list); the per-ASIN enrichment loop is gone with the
+  // retired ASIN level.
   const catalog = await fetchCatalogFn(apiKey, ids);
-  for (const row of asins) {
-    const meta = row.asin ? catalog.byAsin.get(row.asin) || {} : {};
-    row.productName = row.productName || meta.name || null;
-    row.brand = brandLabel(meta.brand);
-  }
 
   const latestMetricDate = adsRows.reduce(
     (latest, row) => (!latest || row.metric_date > latest ? row.metric_date : latest),
@@ -316,7 +307,6 @@ export async function buildPpcPerformance({ apiKey, ids, accountId: publicAccoun
     latestMetricDate,
     sourceAvailability: [
       { key: ADS_CAMPAIGN.syncKey, label: ADS_CAMPAIGN.label, coverage: "All campaign types present in the account", rows: campaignRows.length, sync: syncByKey.get(ADS_CAMPAIGN.syncKey) || null, defaultDataset: true },
-      { key: ADS_ASIN.syncKey, label: ADS_ASIN.label, coverage: "Same-SKU attributed metrics", rows: asinRows.length, sync: syncByKey.get(ADS_ASIN.syncKey) || null, defaultDataset: true },
       { key: ADS_TARGETING.syncKey, label: ADS_TARGETING.label, coverage: ADS_TARGETING.coverage, rows: targetingRows.length, sync: syncByKey.get(ADS_TARGETING.syncKey) || null, defaultDataset: false, enableHint: ADS_TARGETING.enableHint },
       { key: ADS_SEARCH_TERMS.syncKey, label: ADS_SEARCH_TERMS.label, coverage: ADS_SEARCH_TERMS.coverage, rows: searchTermRows.length, sync: syncByKey.get(ADS_SEARCH_TERMS.syncKey) || null, defaultDataset: false, enableHint: ADS_SEARCH_TERMS.enableHint },
     ],

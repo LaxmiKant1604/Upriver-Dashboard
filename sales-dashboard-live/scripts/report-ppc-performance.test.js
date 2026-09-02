@@ -103,23 +103,22 @@ const ts = (date, sales, units, currency = "USD") => ({ date, seller_or_vendor_i
 const sync = (key, o = {}) => ({ account_id: ID, source_key: key, initial_seeded_at: o.seeded ?? "2025-07-01T00:00:00Z", last_daily_sync_at: o.daily ?? "2025-08-10T00:00:00Z", last_monthly_sync_at: null, latest_metric_date: o.latest ?? "2025-08-02", last_status: o.status ?? "ok", last_error: o.error ?? null });
 
 // ---- hand-computed fixture ----
-const SYNCS = [sync(KEYS.campaign), sync(KEYS.asin), sync(KEYS.targeting, { seeded: "2025-07-05T00:00:00Z" }), sync(KEYS.search, { seeded: null, status: "missing", latest: null })];
+// ASIN Ads is RETIRED from PPC: no ASIN sync, no ASIN coverage, no ASIN rows loaded. Campaign is the sole REQUIRED
+// dataset; targeting + search-terms are OPTIONAL independent sources.
+const SYNCS = [sync(KEYS.campaign), sync(KEYS.targeting, { seeded: "2025-07-05T00:00:00Z" }), sync(KEYS.search, { seeded: null, status: "missing", latest: null })];
 const ADS_ROWS = () => [
   cmp("2025-08-01", "C1", "SP", { spend: 10, sales: 40, clicks: 100, impr: 1000, orders: 5, units: 6 }, { ad_campaign_name: "Camp 1", ad_campaign_status: "ENABLED", ad_portfolio_name: "Port A", ad_campaign_budget_amount: 50, ad_campaign_budget_type: "DAILY" }),
   cmp("2025-08-02", "C1", "SP", { spend: 5, sales: 20, clicks: 50, impr: 500, orders: 2, units: 3 }, { ad_campaign_name: "Camp 1", ad_campaign_status: "ENABLED", ad_portfolio_name: "Port A", ad_campaign_budget_amount: 50, ad_campaign_budget_type: "DAILY" }),
   cmp("2025-08-01", "C2", "SB", { spend: 8, sales: 0, clicks: 20, impr: 200, orders: 0, units: 0 }, { ad_campaign_name: "Camp 2", ad_campaign_status: "PAUSED" }),
-  asn("2025-08-01", "ASIN-1", "USD", { spend: 6, sales: 30, clicks: 40, impr: 400, orders: 3, units: 4 }, { sku: "SKU-1", product_name: "Ads Product 1" }),
-  asn("2025-08-02", "ASIN-2", "USD", { spend: 3, sales: 10, clicks: 15, impr: 150, orders: 1, units: 1 }, { sku: "SKU-2" }),
   tgt("2025-08-01", "T1", "C1", "SP", "USD", { spend: 4, sales: 12, clicks: 20, impr: 250, orders: 1, units: 1 }, { ad_targeting_text: "running shoes", ad_match_type: "BROAD", ad_keyword_status: "ENABLED", ad_campaign_name: "Camp 1", ad_group_name: "AG1", ad_group_id: "G1" }),
   stm("2025-08-01", "C1", "SP", "USD", { spend: 2, sales: 6, clicks: 10, impr: 120, orders: 1, units: 1 }, { ad_search_term: "buy running shoes", ad_keyword: "running shoes", ad_match_type: "BROAD", ad_campaign_name: "Camp 1", ad_group_name: "AG1", ad_group_id: "G1" }),
 ];
 const CATALOG = () => [cat("ASIN-1", "P1", "Catalog 1", "Acme"), cat("ASIN-2", "P2", "Catalog 2", "Beta")];
 const TOTAL_SALES = () => [ts("2025-08-01", 500, 50), ts("2025-08-02", 300, 30)];
-// The typed sourceCoverage a VALIDATED context carries (the derive re-enforces validatePpcSourceCoverage on
-// it): four unique keys, campaign+ASIN required+proven+folded, targeting+search optional with folded===proven.
+// The typed sourceCoverage a VALIDATED context carries (the derive re-enforces validatePpcSourceCoverage on it):
+// campaign required+proven+folded; targeting+search optional with folded===proven. ASIN is not a PPC source.
 const provenCoverage = () => [
   { sourceKey: KEYS.campaign, required: true, proven: true, reason: null, folded: true },
-  { sourceKey: KEYS.asin, required: true, proven: true, reason: null, folded: true },
   { sourceKey: KEYS.targeting, required: false, proven: true, reason: null, folded: true },
   { sourceKey: KEYS.search, required: false, proven: true, reason: null, folded: true },
 ];
@@ -142,12 +141,11 @@ const coverageReader = (mapByAccountSource) => async (accountId, sourceKey) => {
 const expectedPayload = () => ({
   accountId: "A1", asOf: "2025-08-10",
   window: { from: FROM, to: "2025-08-10", days: 30 },
-  adsSourceOrigin: ORIGIN, minClicksForWaste: 10, adsRowCount: 7, latestMetricDate: "2025-08-02",
+  adsSourceOrigin: ORIGIN, minClicksForWaste: 10, adsRowCount: 5, latestMetricDate: "2025-08-02",
   sourceAvailability: [
     { key: KEYS.campaign, label: "Ad Performance by Campaign & Date", coverage: "All campaign types present in the account", rows: 3, sync: SYNCS[0], defaultDataset: true, coverageProven: true, coverageFolded: true, coverageStatus: "validated", coverageUnavailableReason: null },
-    { key: KEYS.asin, label: "Ad Performance by ASIN & Date", coverage: "Same-SKU attributed metrics", rows: 2, sync: SYNCS[1], defaultDataset: true, coverageProven: true, coverageFolded: true, coverageStatus: "validated", coverageUnavailableReason: null },
-    { key: KEYS.targeting, label: "Keyword Targeting Performance", coverage: "SP + SB + SD", rows: 1, sync: SYNCS[2], defaultDataset: false, enableHint: "In DataDoe, open Settings > Data tables and enable Keyword Targeting Performance, then refresh this report again.", coverageProven: true, coverageFolded: true, coverageStatus: "validated", coverageUnavailableReason: null },
-    { key: KEYS.search, label: "Search Term Performance (Ads)", coverage: "SP + SB only (no Sponsored Display)", rows: 1, sync: SYNCS[3], defaultDataset: false, enableHint: "In DataDoe, open Settings > Data tables and enable Search Term Performance (Ads), then refresh this report again.", coverageProven: true, coverageFolded: true, coverageStatus: "validated", coverageUnavailableReason: null },
+    { key: KEYS.targeting, label: "Keyword Targeting Performance", coverage: "SP + SB + SD", rows: 1, sync: SYNCS[1], defaultDataset: false, enableHint: "In DataDoe, open Settings > Data tables and enable Keyword Targeting Performance, then refresh this report again.", coverageProven: true, coverageFolded: true, coverageStatus: "validated", coverageUnavailableReason: null },
+    { key: KEYS.search, label: "Search Term Performance (Ads)", coverage: "SP + SB only (no Sponsored Display)", rows: 1, sync: SYNCS[2], defaultDataset: false, enableHint: "In DataDoe, open Settings > Data tables and enable Search Term Performance (Ads), then refresh this report again.", coverageProven: true, coverageFolded: true, coverageStatus: "validated", coverageUnavailableReason: null },
   ],
   totalSales: 800, totalSalesUnavailable: null, totalSalesSourceLabel: TS_LABEL, totalSalesLagDays: 0,
   currencies: ["USD"],
@@ -159,10 +157,7 @@ const expectedPayload = () => ({
     { key: "USD|C1|SP", campaignId: "C1", campaignName: "Camp 1", campaignType: "SP", campaignStatus: "ENABLED", portfolioName: "Port A", budgetAmount: 50, budgetType: "DAILY", spend: 15, sales: 60, clicks: 150, impressions: 1500, orders: 7, units: 9, currencies: ["USD"], campaignTypes: ["SP"], activeDays: 2 },
     { key: "USD|C2|SB", campaignId: "C2", campaignName: "Camp 2", campaignType: "SB", campaignStatus: "PAUSED", portfolioName: null, budgetAmount: null, budgetType: null, spend: 8, sales: 0, clicks: 20, impressions: 200, orders: 0, units: 0, currencies: ["USD"], campaignTypes: ["SB"], activeDays: 1 },
   ],
-  asins: [
-    { key: "USD|ASIN-1", asin: "ASIN-1", sku: "SKU-1", productName: "Ads Product 1", spend: 6, sales: 30, clicks: 40, impressions: 400, orders: 3, units: 4, currencies: ["USD"], campaignTypes: [], activeDays: 1, brand: "Acme" },
-    { key: "USD|ASIN-2", asin: "ASIN-2", sku: "SKU-2", productName: "Catalog 2", spend: 3, sales: 10, clicks: 15, impressions: 150, orders: 1, units: 1, currencies: ["USD"], campaignTypes: [], activeDays: 1, brand: "Beta" },
-  ],
+  asins: [],
   targets: [
     { key: "USD|T1|C1|G1", targetText: "running shoes", matchType: "BROAD", keywordStatus: "ENABLED", campaignId: "C1", campaignName: "Camp 1", campaignType: "SP", adGroupName: "AG1", spend: 4, sales: 12, clicks: 20, impressions: 250, orders: 1, units: 1, currencies: ["USD"], campaignTypes: ["SP"], activeDays: 1 },
   ],
@@ -196,7 +191,8 @@ test("3. SP/SB/SD coverage labels are exact; search terms NEVER claim Sponsored 
   assert.equal(byKey(KEYS.targeting).coverage, "SP + SB + SD");
   assert.equal(byKey(KEYS.search).coverage, "SP + SB only (no Sponsored Display)");
   assert.ok(!byKey(KEYS.search).coverage.includes("SD"), "search-term coverage never mentions Sponsored Display (SD)");
-  assert.deepEqual([byKey(KEYS.campaign).coverage, byKey(KEYS.asin).coverage], ["All campaign types present in the account", "Same-SKU attributed metrics"]);
+  assert.equal(byKey(KEYS.campaign).coverage, "All campaign types present in the account");
+  assert.equal(byKey(KEYS.asin), undefined, "ASIN Ads is retired: no ASIN source availability entry");
 });
 
 test("4. campaign/ASIN/target/search-term money is currency-ISOLATED (never combined across currencies)", () => {
@@ -275,8 +271,10 @@ test("10. validated EMPTY Ads window => a valid, honestly-empty report (DISTINCT
   assert.equal(r.payload.adsRowCount, 0);
   assert.equal(r.payload.latestMetricDate, null, "empty Ads => latestMetricDate null");
   assert.equal(r.latestDataDate, null, "latestDataDate null for a validated empty Ads window");
-  // sourceAvailability still lists the four sources (rows 0) with their sync -- empty stays distinct from missing.
-  assert.equal(r.payload.sourceAvailability.length, 4);
+  // sourceAvailability lists the THREE active sources (campaign + targeting + search; ASIN retired) with rows 0 --
+  // empty stays distinct from missing.
+  assert.equal(r.payload.sourceAvailability.length, 3);
+  assert.ok(!r.payload.sourceAvailability.some((s) => /asin/i.test(s.key)), "no ASIN source in a valid empty PPC report");
 });
 
 test("11. catalog is REQUIRED: missing/failed catalog => unavailable, LKG preserved", () => {
@@ -340,10 +338,10 @@ test("18. loadPersistedPpcAds: validated success (rows) is status ok with sorted
   assert.equal(loaded.status, "ok");
   assert.deepEqual(loaded.currencies, ["USD"]);
   assert.equal(loaded.latestMetricDate, "2025-08-02");
-  assert.equal(loaded.adsRows.length, 7);
-  assert.equal(loaded.syncStates.length, 4, "only this account's allowed-source sync states are kept");
+  assert.equal(loaded.adsRows.length, 5);
+  assert.equal(loaded.syncStates.length, 3, "only this account's allowed-source sync states are kept (ASIN retired)");
   assert.ok(loaded.sourceCoverage.every((c) => c.proven && c.folded), "every source proven + folded when fully covered");
-  assert.deepEqual(loaded.sourceCoverage.filter((c) => c.required).map((c) => c.sourceKey), [KEYS.campaign, KEYS.asin], "campaign + ASIN are the required defaults");
+  assert.deepEqual(loaded.sourceCoverage.filter((c) => c.required).map((c) => c.sourceKey), [KEYS.campaign], "campaign is the sole required default (ASIN retired)");
 });
 
 test("19. loadPersistedPpcAds: validated EMPTY window is status ok (distinct from a read failure => unavailable)", async () => {
@@ -531,7 +529,7 @@ test("28. E2E: cycle -> runReportJobs -> saved snapshot; zero network in derive;
   assert.equal(res.succeeded, 1, "PPC derived + saved");
   assert.equal(saved[0].accountId, ID);
   assert.equal(saved[0].totalSales, 800, "TACoS denominator summed from the canonical OLI total-sales slices");
-  assert.equal(saved[0].adsRowCount, 7);
+  assert.equal(saved[0].adsRowCount, 5, "5 active-source rows (ASIN retired -> not loaded)");
   const before = store.saveCalls;
   await runReportJobs({ store, cycleId: cycle.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: cycle.plannedReports, loadDerivedContext: makePpcAdsContextLoader(readers) });
   assert.equal(store.saveCalls, before, "no duplicate snapshot on re-run");
@@ -610,7 +608,6 @@ test("33. required-source coverage partial/gapped/stale/schema-missing/read-fail
     "stale (does not reach asOf)": { [KEYS.campaign]: covState({ windows: [{ from: FROM, to: asOfM(-3) }] }), "*": covFull() },
     "schema-missing table": { [KEYS.campaign]: { windows: [], read: "schema-missing" }, "*": covFull() },
     "read-failed": { [KEYS.campaign]: { windows: [{ from: FROM, to: ASOF }], read: "read-failed" }, "*": covFull() },
-    "required ASIN missing while campaign covered": { [KEYS.asin]: { windows: [], read: "ok" }, "*": covFull() },
   };
   for (const [label, map] of Object.entries(cases)) {
     const readers = makeAdsReaders({ A1: ADS_ROWS() }, { A1: SYNCS }, { A1: map });
@@ -624,7 +621,7 @@ test("33. required-source coverage partial/gapped/stale/schema-missing/read-fail
 test("34. optional targeting/search policy: covered folds; an unproven optional is unavailable + its rows are NEVER folded", async () => {
   // Required defaults + targeting fully covered; search-terms STALE (does not reach asOf) => unproven optional.
   const map = { A1: {
-    [KEYS.campaign]: covFull(), [KEYS.asin]: covFull(), [KEYS.targeting]: covFull(),
+    [KEYS.campaign]: covFull(), [KEYS.targeting]: covFull(),
     [KEYS.search]: covState({ windows: [{ from: FROM, to: addDaysStr(ASOF, -3) }] }),
   } };
   const readers = makeAdsReaders({ A1: ADS_ROWS() }, { A1: SYNCS }, map);
@@ -632,8 +629,9 @@ test("34. optional targeting/search policy: covered folds; an unproven optional 
   assert.equal(loaded.status, "ok", "required defaults covered => Ads validated");
   const byKey = Object.fromEntries(loaded.sourceCoverage.map((c) => [c.sourceKey, c]));
   // Availability state table:
-  assert.deepEqual([byKey[KEYS.campaign].proven, byKey[KEYS.asin].proven, byKey[KEYS.targeting].proven], [true, true, true]);
-  assert.deepEqual([byKey[KEYS.campaign].folded, byKey[KEYS.asin].folded, byKey[KEYS.targeting].folded], [true, true, true]);
+  assert.deepEqual([byKey[KEYS.campaign].proven, byKey[KEYS.targeting].proven], [true, true]);
+  assert.deepEqual([byKey[KEYS.campaign].folded, byKey[KEYS.targeting].folded], [true, true]);
+  assert.equal(byKey[KEYS.asin], undefined, "ASIN is not a PPC coverage source");
   assert.equal(byKey[KEYS.search].proven, false, "stale search-terms is not proven");
   assert.equal(byKey[KEYS.search].folded, false, "unproven optional rows are NOT folded");
   assert.ok(!loaded.adsRows.some((r) => r.source_key === KEYS.search), "no stale search-term row survives the fold");
@@ -646,7 +644,7 @@ test("34. optional targeting/search policy: covered folds; an unproven optional 
   // Blocker 2: the SAVED payload's sourceAvailability explicitly marks the stale search source unavailable
   // even though SYNCS[3] would otherwise be shown; the covered sources stay validated.
   const sa = Object.fromEntries(r.payload.sourceAvailability.map((s) => [s.key, s]));
-  assert.deepEqual([sa[KEYS.campaign].coverageStatus, sa[KEYS.asin].coverageStatus, sa[KEYS.targeting].coverageStatus], ["validated", "validated", "validated"]);
+  assert.deepEqual([sa[KEYS.campaign].coverageStatus, sa[KEYS.targeting].coverageStatus], ["validated", "validated"]);
   assert.equal(sa[KEYS.search].coverageStatus, "unavailable", "stale optional search is explicitly unavailable in the payload");
   assert.equal(sa[KEYS.search].coverageProven, false);
   assert.equal(sa[KEYS.search].coverageFolded, false);
@@ -723,21 +721,21 @@ test("37. evaluateSourceCoverage is fail-closed: explicit read + structurally-va
   assert.equal(evaluateSourceCoverage([], F, T).reason, "coverage-state-malformed");
 });
 
-test("38. validatePpcSourceCoverage enforces the four-key contract (count/dup/unknown/flags/required/proven/folded)", () => {
-  const base = () => provenCoverage();
+test("38. validatePpcSourceCoverage enforces the three-key contract (count/dup/unknown/flags/required/proven/folded; ASIN retired)", () => {
+  const base = () => provenCoverage(); // [campaign(required), targeting(optional), search(optional)]
   assert.equal(validatePpcSourceCoverage(base()).ok, true, "canonical fully-proven+folded coverage is valid");
   const optUnproven = base().map((c) => c.sourceKey === KEYS.search ? { ...c, proven: false, folded: false, reason: "coverage-incomplete" } : c);
   assert.equal(validatePpcSourceCoverage(optUnproven).ok, true, "an optional with folded===proven (both false) is valid");
   assert.equal(validatePpcSourceCoverage(null).reason, "source-coverage-not-array");
-  assert.equal(validatePpcSourceCoverage(base().slice(0, 3)).reason, "source-coverage-wrong-count", "a missing key");
-  assert.equal(validatePpcSourceCoverage([base()[0], { ...base()[0] }, base()[2], base()[3]]).reason, "source-coverage-duplicate-key");
-  assert.equal(validatePpcSourceCoverage(base().map((c, i) => (i === 3 ? { ...c, sourceKey: "totally-unknown" } : c))).reason, "source-coverage-unknown-key");
+  assert.equal(validatePpcSourceCoverage(base().slice(0, 2)).reason, "source-coverage-wrong-count", "a missing key");
+  assert.equal(validatePpcSourceCoverage([base()[0], { ...base()[0] }, base()[2]]).reason, "source-coverage-duplicate-key");
+  assert.equal(validatePpcSourceCoverage(base().map((c, i) => (i === 2 ? { ...c, sourceKey: "totally-unknown" } : c))).reason, "source-coverage-unknown-key");
   assert.equal(validatePpcSourceCoverage(base().map((c) => (c.sourceKey === KEYS.campaign ? { ...c, required: false } : c))).reason, "source-coverage-required-flag-mismatch");
-  assert.equal(validatePpcSourceCoverage(base().map((c) => (c.sourceKey === KEYS.asin ? { ...c, proven: false } : c))).reason, "source-coverage-required-not-proven-folded", "required ASIN not proven");
-  assert.equal(validatePpcSourceCoverage(base().map((c) => (c.sourceKey === KEYS.asin ? { ...c, folded: false } : c))).reason, "source-coverage-required-not-proven-folded", "required ASIN not folded");
+  assert.equal(validatePpcSourceCoverage(base().map((c) => (c.sourceKey === KEYS.campaign ? { ...c, proven: false } : c))).reason, "source-coverage-required-not-proven-folded", "required campaign not proven");
+  assert.equal(validatePpcSourceCoverage(base().map((c) => (c.sourceKey === KEYS.campaign ? { ...c, folded: false } : c))).reason, "source-coverage-required-not-proven-folded", "required campaign not folded");
   assert.equal(validatePpcSourceCoverage(base().map((c) => (c.sourceKey === KEYS.targeting ? { ...c, proven: false, folded: true } : c))).reason, "source-coverage-optional-folded-not-equal-proven", "optional folded!=proven");
   assert.equal(validatePpcSourceCoverage(base().map((c) => (c.sourceKey === KEYS.search ? { ...c, proven: "yes" } : c))).reason, "source-coverage-flags-not-boolean");
-  assert.equal(validatePpcSourceCoverage([null, base()[1], base()[2], base()[3]]).reason, "source-coverage-entry-malformed");
+  assert.equal(validatePpcSourceCoverage([null, base()[1], base()[2]]).reason, "source-coverage-entry-malformed");
 });
 
 test("39. derive RE-ENFORCES the coverage contract on the injected context => unavailable, no snapshot, LKG", async () => {
@@ -774,7 +772,7 @@ test("40. E2E worker snapshot: stale optional (succeeded sync state) saved sourc
   // asOf). It must NOT look current: coverage overrides the succeeded sync state.
   const syncs = [sync(KEYS.campaign), sync(KEYS.asin), sync(KEYS.targeting), sync(KEYS.search, { status: "succeeded", latest: "2025-08-02" })];
   const map = { A1: {
-    [KEYS.campaign]: covFull(), [KEYS.asin]: covFull(), [KEYS.targeting]: covFull(),
+    [KEYS.campaign]: covFull(), [KEYS.targeting]: covFull(),
     [KEYS.search]: covState({ windows: [{ from: FROM, to: addDaysStr(ASOF, -3) }] }),
   } };
   const readers = makeAdsReaders({ A1: ADS_ROWS() }, { A1: syncs }, map);
@@ -801,10 +799,9 @@ test("40. E2E worker snapshot: stale optional (succeeded sync state) saved sourc
 
 group("ppc coverage reason safety: closed allowlist enforced at the derive boundary AND the saved payload");
 
-// Minimal four-source descriptors for DIRECT ppcPerformancePayload calls (campaign, asin, targeting, search).
+// Minimal three-source descriptors for DIRECT ppcPerformancePayload calls (campaign, targeting, search; ASIN retired).
 const PPC_DESCRIPTORS = [
   { syncKey: KEYS.campaign, label: "Campaign", coverage: "c", defaultDataset: true },
-  { syncKey: KEYS.asin, label: "ASIN", coverage: "a", defaultDataset: true },
   { syncKey: KEYS.targeting, label: "Targeting", coverage: "t", defaultDataset: false },
   { syncKey: KEYS.search, label: "Search", coverage: "s", defaultDataset: false },
 ];
@@ -812,10 +809,9 @@ const directPpcPayload = (sourceCoverage, over = {}) => ppcPerformancePayload({
   accountId: ID, asOf: ASOF, from: FROM, windowDays: 30, adsSourceDescriptors: PPC_DESCRIPTORS,
   totalSalesSourceLabel: "TS", totalSalesLagDays: 4, adsRows: [], syncStates: [], catalogRows: [], ...over, sourceCoverage,
 });
-// A structurally-valid four-key contract; `searchOver` mutates the unproven-optional search entry under test.
+// A structurally-valid three-key contract; `searchOver` mutates the unproven-optional search entry under test.
 const covContract = (searchOver = {}) => [
   { sourceKey: KEYS.campaign, required: true, proven: true, folded: true, reason: null },
-  { sourceKey: KEYS.asin, required: true, proven: true, folded: true, reason: null },
   { sourceKey: KEYS.targeting, required: false, proven: true, folded: true, reason: null },
   { sourceKey: KEYS.search, required: false, proven: false, folded: false, reason: "coverage-incomplete", ...searchOver },
 ];

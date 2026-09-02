@@ -98,11 +98,14 @@ test("ASIN->Campaign CUTOVER: campaign-performance-v1 (ads-campaign-date) is the
   assert.ok(d.includes("brand-view"), "Brand View reads the campaign grain (brand-level, via campaign->brand mapping) post-cutover");
 });
 
-test("ASIN->Campaign CUTOVER: asin-performance-v1 (ads-asin-date) is RETIRED from Daily/Brand -- PPC-only (history retained)", () => {
+test("ASIN Ads FULLY RETIRED: asin-performance-v1 (ads-asin-date) has ZERO active report consumers (Daily/Brand/PPC all off; history retained)", () => {
+  const entry = reg.SOURCE_REGISTRY.find((r) => r.sourceKey === "ads-asin-date");
+  assert.deepEqual([...entry.usedByReports], [], "ads-asin-date has no report consumers (fully retired)");
   const d = reg.dashboardsUsingSource("ads-asin-date");
-  assert.ok(!d.includes("daily-reporting"), "Daily Reporting no longer reads the ASIN grain (retired)");
-  assert.ok(!d.includes("brand-view"), "Brand View no longer reads the ASIN grain (retired)");
-  assert.ok(d.includes("ppc-performance"), "ASIN grain remains a PPC-only input (durable history retained, exports blocked)");
+  assert.ok(!d.includes("daily-reporting") && !d.includes("brand-view") && !d.includes("ppc-performance"), "no report reads the retired ASIN grain");
+  // Still REGISTERED (rollback + retained history + export guard reference it); the consistency gate allows a
+  // registered family with no consumers.
+  assert.ok(entry && entry.storage === "durable-ads", "the ASIN family stays registered (durable-ads) for rollback");
 });
 
 test("FBA Inventory Health feeds Brand View, FBA Plan, Buy Box Loss, Listing Health, Sales Movers", () => {

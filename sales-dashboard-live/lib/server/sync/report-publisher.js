@@ -106,7 +106,7 @@ export const SCHEDULER_LIVE_SNAPSHOT_CONTRACTS = Object.freeze({
     liveParams: (p) => (isDate(p.to) ? { to: p.to } : null),
   }),
   "ppc-performance": Object.freeze({
-    liveReportKey: "ppc-performance", liveReportVersion: "ppc-performance-v1",
+    liveReportKey: "ppc-performance", liveReportVersion: "ppc-performance-v2-campaign",
     liveParams: (p) => (isDate(p.to) ? { to: p.to } : null),
   }),
   "listing-optimizer": Object.freeze({

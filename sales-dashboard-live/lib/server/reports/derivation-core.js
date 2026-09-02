@@ -1976,17 +1976,20 @@ export function ppcPerformancePayload({
   const rows = Array.isArray(adsRows) ? adsRows : [];
   const descriptors = Array.isArray(adsSourceDescriptors) ? adsSourceDescriptors : [];
   const coverageByKey = new Map((Array.isArray(sourceCoverage) ? sourceCoverage : []).map((c) => [c && c.sourceKey, c]));
-  const [campaignDesc, asinDesc, targetingDesc, searchTermsDesc] = descriptors;
+  // Descriptors, in canonical order, are [campaign, targeting, search] (ASIN Ads is RETIRED -- no longer a PPC
+  // descriptor). Positional so any caller's own syncKeys work; every caller now passes exactly these three in order.
+  const [campaignDesc, targetingDesc, searchTermsDesc] = descriptors;
   const syncByKey = new Map((Array.isArray(syncStates) ? syncStates : []).map((s) => [s.source_key, s]));
   const bySource = new Map(descriptors.map((d) => [d.syncKey, []]));
   for (const row of rows) { const b = bySource.get(row.source_key); if (b) b.push(row); }
-  const campaignRows = bySource.get(campaignDesc.syncKey) || [];
-  const asinRows = bySource.get(asinDesc.syncKey) || [];
-  const targetingRows = bySource.get(targetingDesc.syncKey) || [];
-  const searchTermRows = bySource.get(searchTermsDesc.syncKey) || [];
+  const campaignRows = campaignDesc ? (bySource.get(campaignDesc.syncKey) || []) : [];
+  const targetingRows = targetingDesc ? (bySource.get(targetingDesc.syncKey) || []) : [];
+  const searchTermRows = searchTermsDesc ? (bySource.get(searchTermsDesc.syncKey) || []) : [];
 
   const campaigns = ppcCampaigns(campaignRows);
-  const asins = ppcAsins(asinRows);
+  // ASIN Ads is RETIRED from PPC: the per-ASIN level is no longer aggregated (always empty; the payload contract
+  // shape is unchanged so downstream validators/frontend stay stable).
+  const asins = [];
   const targets = ppcTargets(targetingRows);
   const searchTerms = ppcSearchTerms(searchTermRows);
   const daily = ppcDailySeries(campaignRows);
@@ -2016,18 +2019,13 @@ export function ppcPerformancePayload({
     }
   }
 
+  // Product Catalog is folded for catalogBrands only; the retired ASIN level no longer needs per-row enrichment.
   const catalog = salesMoversCatalogFold(catalogRows);
-  for (const row of asins) {
-    const meta = row.asin ? catalog.byAsin.get(row.asin) || {} : {};
-    row.productName = row.productName || meta.name || null;
-    row.brand = salesMoversBrandLabel(meta.brand);
-  }
 
   const latestMetricDate = rows.reduce((latest, row) => (!latest || row.metric_date > latest ? row.metric_date : latest), null);
 
-  const descRows = [campaignRows.length, asinRows.length, targetingRows.length, searchTermRows.length];
-  const sourceAvailability = descriptors.map((d, i) => {
-    const entry = { key: d.syncKey, label: d.label, coverage: d.coverage, rows: descRows[i], sync: syncByKey.get(d.syncKey) || null, defaultDataset: !!d.defaultDataset };
+  const sourceAvailability = descriptors.map((d) => {
+    const entry = { key: d.syncKey, label: d.label, coverage: d.coverage, rows: (bySource.get(d.syncKey) || []).length, sync: syncByKey.get(d.syncKey) || null, defaultDataset: !!d.defaultDataset };
     if (d.enableHint) entry.enableHint = d.enableHint;
     // Scheduler-only: surface the DURABLE-coverage outcome so an unproven optional source reads as explicitly
     // unavailable (with 0 folded rows) even when its ads_sync_state last succeeded. Admin-safe typed fields

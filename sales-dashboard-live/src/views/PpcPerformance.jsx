@@ -35,9 +35,9 @@ import {
 
 const PAGE_SIZE = 50;
 
+// ASIN Ads is retired: the per-ASIN level is removed (PPC reads Campaign + keyword/target + search-term sources only).
 const LEVELS = [
   { key: "campaigns", label: "Campaigns", identity: "Campaign" },
-  { key: "asins", label: "ASINs", identity: "Product / ASIN" },
   { key: "targets", label: "Keywords & targets", identity: "Target" },
   { key: "searchTerms", label: "Search terms", identity: "Customer search term" },
 ];
@@ -135,16 +135,15 @@ export default function PpcPerformance({ data, loading, error, accountName, sele
   const state = <SnapshotState data={data} loading={loading} error={error} label="PPC Performance report" icon={<Megaphone size={22} />} />;
   // Money may only be totalled inside a single currency.
   const money = moneyScope(data, currency);
-  const scopeLabel = `${accountName || "the selected account"}${level === "asins" && selectedBrand !== "ALL" ? ` · ${selectedBrand}` : ""}`;
+  const scopeLabel = `${accountName || "the selected account"}`;
   const activeLevel = LEVELS.find((item) => item.key === level);
   const levelCoverage = data?.sourceAvailability?.find((entry) => entry.key?.startsWith(
-    level === "searchTerms" ? "search-terms" : level === "targets" ? "keyword-targeting" : level === "asins" ? "asin" : "campaign"
+    level === "searchTerms" ? "search-terms" : level === "targets" ? "keyword-targeting" : "campaign"
   ));
 
   const exportTable = () => downloadCsv(sorted.map((row) => ({
     Level: activeLevel.label,
     [activeLevel.identity]: identityOf(row),
-    ASIN: row.asin || "",
     Brand: row.brand || "",
     Campaign: row.campaignName || "",
     "Ad Group": row.adGroupName || "",
@@ -228,10 +227,6 @@ export default function PpcPerformance({ data, loading, error, accountName, sele
           <Notice>
             This account's saved Ads rows report {data.currencies.join(", ")}. Spend and sales are shown per row in that row's own currency and are never converted or combined; treat the account totals as meaningful only for a single-currency account.
           </Notice>
-        )}
-
-        {level === "asins" && selectedBrand !== "ALL" && (
-          <Notice>Brand filtering applies at the ASIN level only. Campaign, target and search-term rows are not brand-attributable in the Ads sources, so they are never filtered by brand — hiding them would silently remove real spend from the totals.</Notice>
         )}
 
         <StatRow stats={[
@@ -391,7 +386,7 @@ export default function PpcPerformance({ data, loading, error, accountName, sele
         </div>
 
         <div className="footer-note">
-          Every advertising figure here is read from the <strong>persisted Supabase Amazon Ads history</strong>, not from a live export: opening this report, switching level, filtering, sorting and even pressing Refresh do not run an Amazon Ads export, so dashboard traffic cannot consume Ads quota. The scheduled worker owns those exports and keeps late attribution correct by re-fetching each source's documented rolling window (21 days daily, 49 days monthly) and upserting on its natural daily key, so a figure Amazon revises is replaced rather than added twice. Sources: <code>Ad Performance by Campaign &amp; Date</code>, <code>Ad Performance by ASIN &amp; Date</code> (same-SKU attributed), <code>Keyword Targeting Performance</code> (SP + SB + SD) and <code>Search Term Performance</code> (SP + SB only).
+          Every advertising figure here is read from the <strong>persisted Supabase Amazon Ads history</strong>, not from a live export: opening this report, switching level, filtering, sorting and even pressing Refresh do not run an Amazon Ads export, so dashboard traffic cannot consume Ads quota. The scheduled worker owns those exports and keeps late attribution correct by re-fetching each source's documented rolling window (21 days daily, 49 days monthly) and upserting on its natural daily key, so a figure Amazon revises is replaced rather than added twice. Sources: <code>Ad Performance by Campaign &amp; Date</code>, <code>Keyword Targeting Performance</code> (SP + SB + SD) and <code>Search Term Performance</code> (SP + SB only). Ad Performance by ASIN &amp; Date is no longer used.
           {" "}ACoS, ROAS, CPC, CTR and CVR are recomputed from summed spend, sales, clicks, impressions and orders — no ratio is ever summed or averaged. TACoS is ad spend ÷ total account sales from <code>{data.totalSalesSourceLabel}</code>, the one non-Ads figure this report needs, which is fetched once per refresh and can lag about {data.totalSalesLagDays} days. <strong>Dead spend</strong> is the whole spend of a row with clicks but no attributed orders, and only above {data.minClicksForWaste} clicks so a small sample is not called waste. A <strong>break-even breach</strong> counts only the spend <em>above</em> your break-even ACoS as wasted, because the sales up to that point are still worth buying. Scaling candidates are shown separately as opportunities. This report is strictly read-only: it never changes a bid, a budget, or a negative keyword. The break-even input, level tabs, filters, search, sorting, paging and both exports are all local.
         </div>
       </>}

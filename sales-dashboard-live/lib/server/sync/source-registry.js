@@ -290,11 +290,12 @@ export const SOURCE_REGISTRY = Object.freeze([
     // batches). Corrected to stable-batch/5 to match reality. Durable-ads families batch via that architecture,
     // not a source-job SELLER_SCOPED_REQUEST_KEYS contract (validator 6 exempts durable-ads accordingly).
     batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
-    // ASIN->Campaign CUTOVER: ASIN Ads is RETIRED from Daily Reporting + Brand View (new exports blocked; durable
-    // history + reader code retained). It remains ONLY a PPC input (PPC reads both grains and never sums them). Kept
-    // in lockstep with REPORT_SOURCE_REQUIREMENTS.
-    usedByReports: ["ppc-performance"],
-    usedByDashboards: ["ppc-performance", "priority-feed"],
+    // ASIN Ads is now FULLY RETIRED from every report (Daily, Brand View, AND PPC): new exports are blocked and it
+    // has ZERO active report consumers. The durable history + reader/aggregation code are retained (rollback:
+    // ADS_ACTIVE_SOURCE="asin" restores it to Daily/Brand). A registered family with no consumers is allowed by the
+    // consistency gate (fetched/derived => registered is one-directional). Kept in lockstep with REPORT_SOURCE_REQUIREMENTS.
+    usedByReports: [],
+    usedByDashboards: [],
     initialBackfill: { kind: "window-days", days: 60 },
     incrementalRefresh: { kind: "rolling-window-days", days: 21, upsert: "replace-matching-rows" },
     tokenClass: "standard",

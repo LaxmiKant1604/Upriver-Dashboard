@@ -137,8 +137,8 @@ const PPC_TOTAL_SALES_DEGRADED_REASON = "TACoS is unavailable because the accoun
 // reason for the "empty"/"invalid" states matches the live builder AND the pure fold byte-for-byte.
 const PPC_TOTAL_SALES_CURRENCY_MISMATCH_REASON = "TACoS is unavailable because the account total-sales are in a different currency than the Ads spend; a combined total-sales denominator would be meaningless.";
 const PPC_ADS_SOURCE_DESCRIPTORS = Object.freeze([
+  // ASIN Ads (asin-performance-v1) is RETIRED from PPC -- not a dataset here any longer.
   { syncKey: "campaign-performance-v1", label: "Ad Performance by Campaign & Date", coverage: "All campaign types present in the account", defaultDataset: true },
-  { syncKey: "asin-performance-v1", label: "Ad Performance by ASIN & Date", coverage: "Same-SKU attributed metrics", defaultDataset: true },
   { syncKey: "keyword-targeting-performance-v1", label: "Keyword Targeting Performance", coverage: "SP + SB + SD", defaultDataset: false, enableHint: "In DataDoe, open Settings > Data tables and enable Keyword Targeting Performance, then refresh this report again." },
   { syncKey: "search-terms-performance-v1", label: "Search Term Performance (Ads)", coverage: "SP + SB only (no Sponsored Display)", defaultDataset: false, enableHint: "In DataDoe, open Settings > Data tables and enable Search Term Performance (Ads), then refresh this report again." },
 ]);
@@ -1117,9 +1117,9 @@ const REGISTRY = {
   // merged (every rollup key includes currency). Payload accountId is the PUBLIC id; rawSellerId scopes the
   // DataDoe catalog/total-sales fragments.
   "ppc-performance": {
-    snapshotVersion: "ppc-performance/v2d-3",
+    snapshotVersion: "ppc-performance/v2e-campaign",
     optionalRequestKeys: ["ppc-performance:oli-sales"],
-    derivedSourceKeys: ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"],
+    derivedSourceKeys: ["ads-campaign-date", "ads-targeting-date", "ads-search-terms-date"],
     derivedContextKeys: ["ppcAds"],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";

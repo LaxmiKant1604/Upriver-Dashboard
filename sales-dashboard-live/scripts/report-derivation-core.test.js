@@ -186,7 +186,7 @@ test("derived-only reports own zero source contracts (create no source job)", as
 
 test("PPC declares Ads as DERIVED source keys and owns no Ads export", async () => {
   const ppc = REPORT_DERIVATIONS["ppc-performance"];
-  assert.deepEqual(ppc.derivedSourceKeys, ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"]);
+  assert.deepEqual(ppc.derivedSourceKeys, ["ads-campaign-date", "ads-targeting-date", "ads-search-terms-date"]);
   const adsRequired = ppc.requiredRequestKeys.filter((k) => k.includes("ads"));
   assert.deepEqual(adsRequired, [], "PPC required keys must not include an owned Ads export");
 });

@@ -161,7 +161,7 @@ export const SYNC_REGISTRY = [
     windowFor: ({ asOf }) => ({ to: asOf }), adapter: "buy-box-loss", retentionDays: 14, enabled: false }),
   report({ reportKey: "returns-leakage", reportVersion: "returns-leakage-v2", label: "Returns & Refund Leakage", domain: "insight",
     windowFor: ({ asOf }) => ({ to: asOf }), adapter: "returns-leakage", retentionDays: 14, enabled: false }),
-  report({ reportKey: "ppc-performance", reportVersion: "ppc-performance-v1", label: "PPC Performance", domain: "insight",
+  report({ reportKey: "ppc-performance", reportVersion: "ppc-performance-v2-campaign", label: "PPC Performance", domain: "insight",
     windowFor: ({ asOf }) => ({ to: asOf }), adapter: "ppc-performance", retentionDays: 14, enabled: false }),
   report({ reportKey: "listing-optimizer", reportVersion: "listing-optimizer-v1", label: "Listing & Search Optimizer", domain: "insight",
     windowFor: ({ asOf }) => ({ to: asOf }), adapter: "listing-optimizer", retentionDays: 14, enabled: false }),

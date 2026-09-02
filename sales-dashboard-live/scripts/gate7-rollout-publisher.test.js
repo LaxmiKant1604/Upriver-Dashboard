@@ -1133,7 +1133,7 @@ test("(F1) exactly 14 contracts (13 dispatch + the source-promoted brand-invento
     "listing-health": "listing-health-v1",
     "buy-box-loss": "buy-box-loss-v1",
     "returns-leakage": "returns-leakage-v2",
-    "ppc-performance": "ppc-performance-v1",
+    "ppc-performance": "ppc-performance-v2-campaign",
     "listing-optimizer": "listing-optimizer-v1",
     // Round-6 fix 3: the source-promoted compact Brand View inventory -- publishable through the same
     // four gates, NEVER dispatchable (not in CONTROLLED_REPORT_KEYS; proven below).

@@ -1214,7 +1214,8 @@ test("(14) PPC creates NO Ads DataDoe source jobs; ads are declared derived from
   const jobs = reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: ppcWin, dependencySignals: PPC_CUR_OK });
   assert.deepEqual([...new Set(jobs.map((j) => j.requestKey))].sort(), ["ppc-performance:catalog", "ppc-performance:oli-sales"]);
   for (const c of REPORT_SOURCE_CONTRACTS["ppc-performance"]) assert.ok(!/^ads-/.test(c.sourceKey), "PPC owns no Ads source");
-  assert.deepEqual(REPORT_DERIVED_SOURCE_KEYS["ppc-performance"], ["ads-campaign-date", "ads-asin-date", "ads-targeting-date", "ads-search-terms-date"]);
+  assert.deepEqual(REPORT_DERIVED_SOURCE_KEYS["ppc-performance"], ["ads-campaign-date", "ads-targeting-date", "ads-search-terms-date"]);
+  assert.ok(!REPORT_DERIVED_SOURCE_KEYS["ppc-performance"].includes("ads-asin-date"), "ASIN Ads retired from PPC (not loaded/required/displayed)");
   assert.ok(/getAdsDailySourceRows/.test(builderText("ppc.js")), "PPC builder must read persisted ads rows, not fetch an export");
 });
 
