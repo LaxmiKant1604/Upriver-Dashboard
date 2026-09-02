@@ -56,7 +56,9 @@ on:
 
 concurrency:
   # One in-flight run PER REGION (regions are independent); a re-dispatch of the same region queues behind its own run.
-  group: scheduler-v2-${{ github.event.schedule || inputs.region }}
+  # Resolve scheduled crons to the SAME region key used by workflow_dispatch. This prevents a delayed native cron
+  # and its Cloudflare watchdog dispatch from running concurrently under different concurrency groups.
+  group: scheduler-v2-${{ github.event_name == 'schedule' && (github.event.schedule == '0 3 * * *' && 'india' || github.event.schedule == '30 8 * * *' && 'europe-au' || github.event.schedule == '30 16 * * *' && 'us-ca' || 'unknown') || inputs.region }}
   cancel-in-progress: false
 
 permissions:

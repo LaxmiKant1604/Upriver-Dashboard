@@ -57,6 +57,16 @@ test("A4. NO legacy us/non-us (or old FBA) cron remains in scheduler-v2", () => 
   for (const legacy of LEGACY_CRONS) assert.ok(!c.includes(legacy), "legacy cron must be gone: " + legacy);
 });
 
+test("A5. native primaries and Cloudflare dispatches share the same per-region concurrency key", () => {
+  const groupLine = schedulerYml.split("\n").find((line) => line.trim().startsWith("group: scheduler-v2-")) || "";
+  assert.match(groupLine, /github\.event_name == 'schedule'/);
+  assert.match(groupLine, /github\.event\.schedule == '0 3 \* \* \*' && 'india'/);
+  assert.match(groupLine, /github\.event\.schedule == '30 8 \* \* \*' && 'europe-au'/);
+  assert.match(groupLine, /github\.event\.schedule == '30 16 \* \* \*' && 'us-ca'/);
+  assert.match(groupLine, /\|\| inputs\.region/);
+  assert.ok(!groupLine.includes("github.event.schedule || inputs.region"), "cron text must not become the concurrency key");
+});
+
 group("B. ONE automatic Campaign owner");
 
 test("B1. scheduler-v2 refreshes Campaign exactly once per run (the ONE automatic owner)", () => {

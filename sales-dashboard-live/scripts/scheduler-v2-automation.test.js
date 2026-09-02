@@ -186,7 +186,12 @@ test("D1. scheduler-v2.yml: the THREE regional crons (0 3 india / 30 8 europe-au
   // The old 2-bucket crons are entirely gone.
   for (const legacy of ["0 2 * * *", "30 10 * * *"]) assert.ok(!crons.includes(legacy), "legacy cron removed: " + legacy);
   assert.match(yml, /Unknown cron[^\n]*refusing/, "an unknown cron fails closed");
-  assert.match(yml, /group:\s*scheduler-v2-\$\{\{ github\.event\.schedule \|\| inputs\.region \}\}/, "per-region concurrency group");
+  const groupLine = yml.split("\n").find((line) => line.trim().startsWith("group: scheduler-v2-")) || "";
+  assert.match(groupLine, /github\.event_name == 'schedule'/, "scheduled runs resolve their concurrency region");
+  assert.match(groupLine, /'0 3 \* \* \*' && 'india'/, "india primary uses the india concurrency key");
+  assert.match(groupLine, /'30 8 \* \* \*' && 'europe-au'/, "europe primary uses the europe-au concurrency key");
+  assert.match(groupLine, /'30 16 \* \* \*' && 'us-ca'/, "US primary uses the us-ca concurrency key");
+  assert.match(groupLine, /\|\| inputs\.region/, "watchdog dispatch uses the same region key");
   assert.match(yml, /cancel-in-progress:\s*false/, "runs serialize, never overlap");
   assert.match(yml, /node-version:\s*"24"/, "Node 24");
   const tm = /timeout-minutes:\s*(\d+)/.exec(yml);
