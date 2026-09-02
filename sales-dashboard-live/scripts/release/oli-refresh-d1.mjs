@@ -33,7 +33,7 @@ const { fetchAccounts } = await import("../../lib/server/datadoe.js");
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, openSupersedingSyncCycle, reserveOliFreshnessCreate, recordOliFreshnessExport, getOliCompleteness } = await import("../../lib/server/supabase.js");
 const { OLI_SOURCE_KEY, windowsProve } = await import("../../lib/server/sync/source-durable-model.js");
-const { classifyScheduledOliCycle, assessScheduledOliCycle, assessDurableOliCoverageComplete, oliBucketPlan } = await import("../../lib/server/sync/source-scheduled-oli.js");
+const { classifyScheduledOliCycle, assessScheduledOliCycle, assessDurableOliCoverageComplete, oliBucketPlan, OLI_TOKENS_PER_CREATE } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 const { freshnessOperationKey, attemptKindForMode } = await import("../../lib/server/sync/source-oli-freshness.js");
@@ -62,7 +62,6 @@ const ids = discovered.map((a) => a.accountId);
 const oliStart = sourceRegistryEntry(OLI).initialBackfill.start;
 const orgFp = primaryConn.organizationFingerprint || organizationFingerprint(primaryConn.apiKey);
 const plan = oliBucketPlan(discovered);
-const ceilingCreates = plan.maxCreates; const ceilingTokens = plan.maxTokens;
 
 // Read durable OLI coverage -> which accounts are behind D-1? (used for the classifier + the escalation set)
 async function coverageState() {
@@ -73,7 +72,16 @@ async function coverageState() {
 }
 
 let cov0 = await coverageState();
-log(cov0.missing.length + "/" + ids.length + " account(s) behind D-1 (unreadable=" + cov0.anyUnreadable + ")");
+// Create/token ceiling = the steady <=5-seller batch count PLUS one create per account behind D-1. Rationale:
+// planOliSliceExports scopes each export to batch members sharing a contiguous MISSING window, so a batch holding
+// an account behind D-1 (heterogeneous coverage -- normal settlement lag, or a fresh region cycle's first run)
+// SPLITS into an extra slice for that account. This headroom is bounded (<= discovered accounts), keeps steady
+// state (0 behind) byte-identical to the old expectedBatches ceiling, and never enables runaway. Legacy us/non-us
+// steady-state runs are unchanged; a region's first run (or any lagged day) can now complete instead of tripping
+// a false TOKEN_CEILING_EXCEEDED.
+const ceilingCreates = plan.maxCreates + cov0.missing.length;
+const ceilingTokens = ceilingCreates * OLI_TOKENS_PER_CREATE;
+log(cov0.missing.length + "/" + ids.length + " account(s) behind D-1 (unreadable=" + cov0.anyUnreadable + "); create ceiling=" + ceilingCreates + " (" + plan.maxCreates + " batches + " + cov0.missing.length + " behind)");
 if (cov0.durableComplete) { log("ALREADY_PUBLISHED_D1: durable coverage complete through D-1 -- ZERO creates, ZERO tokens (idempotent primary/fallback no-op)."); console.log("RESULT " + JSON.stringify({ ok: true, bucket, requestedAsOf, classification: "ALREADY_PUBLISHED_D1", creates: 0, tokens: 0, d1Complete: true, alreadyComplete: true })); process.exit(0); }
 if (cov0.anyUnreadable) { console.error("STOP OLI coverage unreadable -- fail closed (never classify freshness without evidence)."); process.exit(1); }
 
@@ -174,7 +182,7 @@ if (cov1.missing.length && !cov1.anyUnreadable) {
 // Final proof: assess the attempt's OLI + the D-1 coverage.
 const jobsF = (await getSyncSourceJobs(workingCycleId)).filter((j) => (j.source_key ?? j.sourceKey) === OLI);
 const ownersF = await getSyncSourceJobOwnersForCycle(workingCycleId);
-const a = assessScheduledOliCycle({ bucket, discoveredAccounts: discovered, sourceJobs: jobsF, owners: ownersF, open: await oliOpen(workingCycleId) });
+const a = assessScheduledOliCycle({ bucket, discoveredAccounts: discovered, sourceJobs: jobsF, owners: ownersF, open: await oliOpen(workingCycleId), extraCreatesHeadroom: cov0.missing.length });
 const d1Complete = cov1.missing.length === 0;
 // PRECISE, PROVEN not-ready reason (never a vague "settlement delay"). A genuinely fresh D-1 export was fetched
 // (forceFreshOli), but coverage did not advance for some accounts. The item_status classifier separates two cases:

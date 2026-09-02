@@ -60,7 +60,7 @@ export function oliBucketPlan(accounts, existingMembership = new Map()) {
  *   - total creates <= the plan ceiling AND tokens (creates * 2) <= the token ceiling.
  * ok === true ONLY when problems is empty. The caller exits nonzero on any problem.
  */
-export function assessScheduledOliCycle({ bucket, discoveredAccounts, sourceJobs, owners, open } = {}) {
+export function assessScheduledOliCycle({ bucket, discoveredAccounts, sourceJobs, owners, open, extraCreatesHeadroom = 0 } = {}) {
   const problems = [];
   const push = (p) => problems.push(p);
   if (!isRoutingScope(bucket)) return { ok: false, problems: ["bad-bucket"], creates: 0, tokens: 0, batches: 0, ceilingCreates: 0, ceilingTokens: 0 };
@@ -104,9 +104,16 @@ export function assessScheduledOliCycle({ bucket, discoveredAccounts, sourceJobs
   }
   for (const a of discovered) if (!ownerUnion.has(a)) push("owner-coverage-missing");
 
+  // Ceiling = the steady <=5-seller batch count PLUS a bounded headroom of one create per account behind D-1 at
+  // the run's start: planOliSliceExports splits a batch that holds a behind account into an extra forced-fresh
+  // window slice, so a lagged day / a fresh cycle's first run legitimately exceeds expectedBatches. Default 0 keeps
+  // steady state (and every existing caller/test) byte-identical.
+  const headroom = Math.max(0, Number(extraCreatesHeadroom) || 0);
+  const ceilingCreates = plan.maxCreates + headroom;
+  const ceilingTokens = ceilingCreates * OLI_TOKENS_PER_CREATE;
   const tokens = creates * OLI_TOKENS_PER_CREATE;
-  if (creates > plan.maxCreates) push("creates-over-ceiling:" + creates + ">" + plan.maxCreates);
-  if (tokens > plan.maxTokens) push("tokens-over-ceiling:" + tokens + ">" + plan.maxTokens);
+  if (creates > ceilingCreates) push("creates-over-ceiling:" + creates + ">" + ceilingCreates);
+  if (tokens > ceilingTokens) push("tokens-over-ceiling:" + tokens + ">" + ceilingTokens);
 
   return {
     ok: problems.length === 0,
@@ -114,8 +121,8 @@ export function assessScheduledOliCycle({ bucket, discoveredAccounts, sourceJobs
     creates,
     tokens,
     batches: seenHashes.size,
-    ceilingCreates: plan.maxCreates,
-    ceilingTokens: plan.maxTokens,
+    ceilingCreates,
+    ceilingTokens,
   };
 }
 
