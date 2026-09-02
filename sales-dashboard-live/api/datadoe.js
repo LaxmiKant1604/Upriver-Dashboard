@@ -70,6 +70,9 @@ import {
   projectBrandSalesPayload, projectSkuMovementPayload, projectBrandDirectoryPayload, projectReturnsLeakagePayload, accountBrandPairAuthorized,
 } from "../lib/server/report-authorization.js";
 import { brandKey as canonicalBrandKey } from "../lib/server/reports/brand-membership.js";
+// The single ASIN->Campaign cutover authority: block a retired ASIN Ads export create from ANY raw-sourceId path
+// (e.g. the admin discovery `sample` probe) before the DataDoe request, so the browser can never mint an ASIN export.
+import { isAdsExportRetiredForSourceId } from "../lib/server/active-ads-source.js";
 // Shared DataDoe transport. Extracted so every report — the seven original ones
 // and the six insight reports — shares one 2-req/sec rate limiter, one export
 // poller, and one row-cap policy.
@@ -4104,6 +4107,15 @@ async function handleDataDoe(req, res) {
       else if (sourceId === DASHBOARD_SOURCE_ID) columns = DASHBOARD_COLUMNS;
       else if (sourceId === ADS_SOURCE_ID) columns = ADS_COLUMNS;
       else columns = ["date", "seller_or_vendor_id"];
+
+      // ASIN Ads EXPORT-RETIREMENT guard: this admin discovery probe takes a browser-supplied sourceId and would
+      // create a DataDoe export for it. After the ASIN->Campaign cutover the retired ASIN Ads source can never mint
+      // a new export from ANY path -- block it here BEFORE the create (single authority; the browser never selects an
+      // ads grain to export). Durable ASIN history stays readable; rolling ADS_ACTIVE_SOURCE back to "asin" clears it.
+      if (isAdsExportRetiredForSourceId(sourceId)) {
+        res.status(409).json({ error: "ASIN_ADS_EXPORT_RETIRED", sourceId, note: "Creating ASIN Ads exports is disabled (Campaign Ads is the only active Ads source); the durable history is retained read-only." });
+        return;
+      }
 
       // Sources without a date column need a different orderBy and no date
       // range; pass ?orderBy=<col> and omit from/to for those.

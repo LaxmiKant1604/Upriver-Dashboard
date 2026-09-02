@@ -23,6 +23,7 @@ const {
 } = await import("../lib/server/sync/registry.js");
 const { shapeSyncStatus } = await import("../lib/server/sync/status.js");
 const { runReportAdapter } = await import("../lib/server/sync/adapters/report-adapter.js");
+const { isAdsExportRetiredFor } = await import("../lib/server/active-ads-source.js");
 const { expandSyncWork, targetDisposition, MAX_TARGET_ATTEMPTS } = await import("../lib/server/sync/planner.js");
 const { publicAccountId, resolveDataDoeAccountIds } = await import("../lib/server/datadoe-connections.js");
 const { ADS_SOURCES } = await import("../lib/server/ads-sync.js");
@@ -100,11 +101,15 @@ test("registry covers every existing DataDoe report key + the 4 ads sources", ()
   ];
   for (const k of expected) assert.ok(keys.has(k), `registry missing ${k}`);
 });
-test("only ads + brand-sales are enabled until long report adapters are checkpointable", () => {
+test("only NON-RETIRED ads + brand-sales are enabled; the retired ASIN ads grain is DISABLED (ASIN->Campaign cutover)", () => {
   const enabled = SYNC_REGISTRY.filter((e) => e.enabled).map((e) => e.reportKey).sort();
-  const expected = ["brand-sales", ...ADS_SOURCE_KEYS.map((k) => `ads:${k}`)].sort();
+  // The retired ASIN ads grain (asin-performance-v1 while Campaign is active) is disabled at the Scheduler-v1
+  // wiring level, so run-sync never even attempts it -- a clean retirement, not just a guard-caught failure.
+  const expected = ["brand-sales", ...ADS_SOURCE_KEYS.filter((k) => !isAdsExportRetiredFor(k)).map((k) => `ads:${k}`)].sort();
   assert.deepEqual(enabled, expected);
   const byKey = new Map(SYNC_REGISTRY.map((e) => [e.reportKey, e]));
+  assert.equal(byKey.get("ads:asin-performance-v1").enabled, false, "retired ASIN ads grain must be disabled");
+  assert.equal(byKey.get("ads:campaign-performance-v1").enabled, true, "active Campaign ads grain stays enabled");
   assert.equal(byKey.get("brand-sales").reportVersion, "brand-sales-shared-v1");
   assert.equal(byKey.get("sales-movers").reportVersion, "sales-movers-v1");
   assert.equal(byKey.get("sales-movers").enabled, false);

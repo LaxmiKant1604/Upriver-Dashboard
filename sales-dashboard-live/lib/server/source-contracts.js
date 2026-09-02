@@ -124,9 +124,10 @@ export const SOURCE_CONTRACTS = [
     label: "Ad Performance by Campaign & Date",
     grain: "campaign-day",
     fields: ["date", "ad_campaign_id", "ad_campaign_type", "ad_campaign_budget_currency", "ad_sales", "ad_spend", "ad_clicks", "ad_impressions", "ad_orders", "ad_units_sold"],
-    // Campaign grain is now PPC-only: Daily Reporting reads the ASIN grain (ads-asin-date) as the single
-    // reusable Ads source, and Brand View never read this family. Campaign Ads stays paused (never exported).
-    consumers: ["ppc-performance"],
+    // Post ASIN->Campaign cutover the Campaign grain is the SINGLE active Ads source for Daily Reporting
+    // (account-level), Brand View (via account-scoped campaign->brand mappings) AND PPC. It is the only grain the
+    // scheduler refreshes. (Authoritative consumer set: source-registry.js ads-campaign-date usedByReports.)
+    consumers: ["daily-reporting", "ppc-performance", "brand-view"],
     cacheHours: 6,
   }),
   contract({
@@ -135,10 +136,10 @@ export const SOURCE_CONTRACTS = [
     label: "Ad Performance by ASIN & Date",
     grain: "asin-campaign-ad-day",
     fields: ["date", "child_asin", "sku", "ad_campaign_id", "ad_group_id", "ad_id", "ad_campaign_type", "ad_campaign_budget_currency", "ad_sales_same_sku", "ad_spend", "ad_clicks", "ad_impressions", "ad_orders_same_sku", "ad_units_sold_same_sku"],
-    // The SINGLE reusable Ads source: Daily Reporting (account-level) + Brand View (brand-level) + PPC all
-    // read this ASIN grain. Attributed sales is ad_sales_same_sku (same-SKU only -- the only attributed-sales
-    // field this contract supplies; no campaign halo). ONE saved dataset feeds every consumer.
-    consumers: ["daily-reporting", "ppc-performance", "brand-view"],
+    // RETIRED post ASIN->Campaign cutover: ZERO active consumers. The durable definition + history are retained for
+    // rollback ONLY (ADS_ACTIVE_SOURCE="asin" restores the ASIN readers). New exports are blocked centrally by
+    // active-ads-source.js. Kept in lockstep with source-registry.js ads-asin-date usedByReports: [].
+    consumers: [],
     cacheHours: 6,
   }),
   contract({
