@@ -33,7 +33,7 @@
 import { asinOf, asinAdsMetricsFromRow } from "./asin-ads-aggregation.js";
 import { campaignIdentityOfRow, campaignAdsMetricsFromRow, campaignBrandMap } from "./campaign-ads-aggregation.js";
 import { brandKey } from "./brand-membership.js";
-import { ACTIVE_ADS_SOURCE_KEY } from "../active-ads-source.js";
+import { ACTIVE_ADS_SOURCE_KEY, ASIN_ADS_SOURCE_KEY } from "../active-ads-source.js";
 
 // ---------------------------------------------------------------- identifiers
 
@@ -931,9 +931,9 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
 
   const noAsinMap = usable.filter((slice) => !slice.asinBrandCount);
   if (noAsinMap.length === usable.length) {
-    notes.push("Ad spend and TACoS are unavailable because no saved report maps ASINs to a brand yet. Refresh FBA Shipment Plan, SKU P&L, Listing Health or Sales Movers once for these accounts to build that mapping.");
+    notes.push("Ad spend and TACoS are unavailable because no saved report maps this account's catalog to a brand yet. Refresh FBA Shipment Plan, SKU P&L, Listing Health or Sales Movers once for these accounts to build that mapping.");
   } else if (noAsinMap.length) {
-    notes.push(`These accounts have no saved ASIN-to-brand mapping, so their marketplaces show ad spend as unavailable rather than as zero: ${noAsinMap.map(label).join(", ")}.`);
+    notes.push(`These accounts have no saved brand mapping, so their marketplaces show ad spend as unavailable rather than as zero: ${noAsinMap.map(label).join(", ")}.`);
   }
   const adsFailed = usable.filter((slice) => slice.adsError);
   if (adsFailed.length) {
@@ -944,7 +944,7 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
   // has ads at all, the mapping note above already explains why.
   const salesOnlyCountries = [...currencyByCountry.keys()].filter((country) => !adsCountrySet.has(country));
   if (adsCountries.length && salesOnlyCountries.length) {
-    notes.push(`No saved same-ASIN advertising covers every account selling in ${salesOnlyCountries.join(", ")}, so ad spend and TACoS there are shown as unavailable rather than as a partial sum.`);
+    notes.push(`No saved advertising covers every account selling in ${salesOnlyCountries.join(", ")}, so ad spend and TACoS there are shown as unavailable rather than as a partial sum.`);
   }
   if (inventoryScope === "unavailable") {
     notes.push("FBA inventory and inventory cover are unavailable because no contributing account has a saved FBA Shipment Plan or Listing Health snapshot yet.");
@@ -1015,7 +1015,10 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
     },
     sources: {
       sales: "Saved Dashboard snapshots (Order Line Items joined to Product Catalog)",
-      ads: "Saved Ad Performance by ASIN & Date rows joined to each account's ASIN-to-brand map",
+      // Source-aware: post ASIN->Campaign cutover, Brand View attributes ads via each account's campaign->brand map.
+      ads: ACTIVE_ADS_SOURCE_KEY === ASIN_ADS_SOURCE_KEY
+        ? "Saved Ad Performance by ASIN & Date rows joined to each account's ASIN-to-brand map"
+        : "Saved Ad Performance by Campaign & Date rows attributed via each account's campaign-to-brand map",
       inventory: "Saved FBA Shipment Plan snapshots (FBA Inventory Health)",
     },
     notes,

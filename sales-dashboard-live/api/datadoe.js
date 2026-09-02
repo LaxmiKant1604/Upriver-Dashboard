@@ -71,8 +71,9 @@ import {
 } from "../lib/server/report-authorization.js";
 import { brandKey as canonicalBrandKey } from "../lib/server/reports/brand-membership.js";
 // The single ASIN->Campaign cutover authority: block a retired ASIN Ads export create from ANY raw-sourceId path
-// (e.g. the admin discovery `sample` probe) before the DataDoe request, so the browser can never mint an ASIN export.
-import { isAdsExportRetiredForSourceId } from "../lib/server/active-ads-source.js";
+// (e.g. the admin discovery `sample` probe) before the DataDoe request, so the browser can never mint an ASIN export;
+// and gate the legacy ASIN-attributed portfolio read to the rollback path so no ASIN ad metrics reach the browser.
+import { isAdsExportRetiredForSourceId, ACTIVE_ADS_SOURCE_KEY, ASIN_ADS_SOURCE_KEY } from "../lib/server/active-ads-source.js";
 // Shared DataDoe transport. Extracted so every report — the seven original ones
 // and the six insight reports — shares one 2-req/sec rate limiter, one export
 // poller, and one row-cap policy.
@@ -700,8 +701,11 @@ export function usableCatalogBrands(rows) {
 }
 
 const BRAND_PORTFOLIO_REPORT_KEY = "brand-portfolio";
-const BRAND_PORTFOLIO_VERSION = "brand-portfolio-shared-v3";
-const BRAND_ADS_SOURCE_KEY = "asin-performance-v1";
+// v4: ASIN->Campaign cutover. This LEGACY portfolio action (superseded by brand-view-portfolio; its frontend
+// component was removed) attributed ads by child_asin -> product_brand. Post-cutover that ASIN-attributed read is
+// gated to the rollback path only, so no ASIN ad metrics reach the browser. The version bump prevents an old
+// ASIN-derived brand-portfolio snapshot from serving as current.
+const BRAND_PORTFOLIO_VERSION = "brand-portfolio-shared-v4";
 
 // Brand View is a portfolio report, but it must be as quick and cheap as any
 // account report once users have refreshed their source snapshots.  It reads
@@ -762,29 +766,32 @@ async function buildBrandPortfolioSnapshot({ brand, accountIds, asOf }) {
       });
     }
 
-    // ASIN-level Ads history is maintained by the scheduled worker.  Joining
-    // it to this account's saved ASIN->brand map avoids the old bug where all
-    // account spend was displayed for one selected brand.
-    try {
-      const adRows = await getAdsDailySourceRows({
-        accountId,
-        sourceKeys: [BRAND_ADS_SOURCE_KEY],
-        from: addDaysStr(asOf, -60),
-        to: asOf,
-        maxRows: 60000,
-      });
-      for (const row of adRows) {
-        if (asinBrand.get(String(row.child_asin || "").trim()) !== brand) continue;
-        ads.push({
+    // ASIN->Campaign cutover: this legacy portfolio attributes ads by the child_asin -> brand catalog map, which is
+    // meaningful ONLY for the ASIN grain. Post-cutover (Campaign active) it does NOT read or attribute ads here --
+    // never ASIN, and never fabricated from campaign (the active campaign portfolio is served by brand-view-portfolio
+    // via account-scoped campaign->brand mappings). Rolling ADS_ACTIVE_SOURCE back to "asin" restores this read.
+    if (ACTIVE_ADS_SOURCE_KEY === ASIN_ADS_SOURCE_KEY) {
+      try {
+        const adRows = await getAdsDailySourceRows({
           accountId,
-          date: row.metric_date,
-          country: row.marketplace_country_code || null,
-          currency: row.currency || null,
-          adSpend: num(row.metrics?.ad_spend),
+          sourceKeys: [ASIN_ADS_SOURCE_KEY],
+          from: addDaysStr(asOf, -60),
+          to: asOf,
+          maxRows: 60000,
         });
+        for (const row of adRows) {
+          if (asinBrand.get(String(row.child_asin || "").trim()) !== brand) continue;
+          ads.push({
+            accountId,
+            date: row.metric_date,
+            country: row.marketplace_country_code || null,
+            currency: row.currency || null,
+            adSpend: num(row.metrics?.ad_spend),
+          });
+        }
+      } catch (error) {
+        unavailable.push({ accountId, reason: `Saved Ads history unavailable: ${error instanceof Error ? error.message : String(error)}` });
       }
-    } catch (error) {
-      unavailable.push({ accountId, reason: `Saved Ads history unavailable: ${error instanceof Error ? error.message : String(error)}` });
     }
   }
 
@@ -797,7 +804,9 @@ async function buildBrandPortfolioSnapshot({ brand, accountIds, asOf }) {
     unavailable,
     sources: {
       sales: "Saved Brand Sales snapshots (Order Line Items + Product Catalog)",
-      ads: "Saved Ad Performance by ASIN & Date history",
+      ads: ACTIVE_ADS_SOURCE_KEY === ASIN_ADS_SOURCE_KEY
+        ? "Saved Ad Performance by ASIN & Date history"
+        : "Campaign advertising is served by Brand View (brand-view-portfolio) via account-scoped campaign-to-brand mappings",
       inventory: "Saved FBA Shipment Plan snapshots (FBA Inventory Health)",
     },
   };
