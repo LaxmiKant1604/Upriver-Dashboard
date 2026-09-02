@@ -906,6 +906,74 @@ export async function recordSkuMovementIdentifierBulk({ organizationFingerprint,
   return Array.isArray(body) ? body[0] : body;
 }
 
+// ---- CAMPAIGN -> BRAND mapping (user-managed; dormant foundation) --------------------------------------------
+// The campaign directory's source of truth: the account's EXISTING durable campaign-performance rows
+// (ads_daily_source_rows, source_key 'campaign-performance-v1'). Account-scoped. Fail-soft: schema-missing / read
+// error => [] (an empty directory; a campaign is NEVER fabricated). Reads only; never a DataDoe call.
+export async function getCampaignPerformanceRows({ accountId, signal = null } = {}) {
+  const id = String(accountId || "").trim();
+  if (!id) throw new Error("getCampaignPerformanceRows requires accountId (fail closed).");
+  const q = new URLSearchParams({
+    source_key: "eq.campaign-performance-v1", account_id: `eq.${id}`,
+    select: "marketplace_country_code,campaign_id,campaign_type,currency,metric_date,dimensions",
+  });
+  try { const rows = await request(`/rest/v1/ads_daily_source_rows?${q}`, { signal }); return Array.isArray(rows) ? rows : []; }
+  catch (e) { if (isSchemaMissingError(e)) return []; throw e; }
+}
+
+// Current campaign->brand mappings for ONE account. Account-scoped. Fail-soft => [].
+export async function getCampaignBrandMappings({ organizationFingerprint, connectionId = "primary", accountId, signal = null } = {}) {
+  if (!organizationFingerprint || !accountId) throw new Error("getCampaignBrandMappings requires organizationFingerprint + accountId (fail closed).");
+  const q = new URLSearchParams({
+    organization_fingerprint: `eq.${organizationFingerprint}`, connection_id: `eq.${connectionId}`, account_id: `eq.${accountId}`,
+    select: "marketplace,ads_profile_id,ad_campaign_id,canonical_brand_key,brand_display_name,mapping_source,updated_at",
+  });
+  try { const rows = await request(`/rest/v1/campaign_brand_mapping?${q}`, { signal }); return Array.isArray(rows) ? rows : []; }
+  catch (e) { if (isSchemaMissingError(e)) return []; throw e; }
+}
+
+// Whether a user EXPLICITLY holds the campaign-mapping capability for one account. Fail-soft => false (fail closed).
+export async function getCampaignMappingCapability({ organizationFingerprint, connectionId = "primary", accountId, userId, signal = null } = {}) {
+  if (!organizationFingerprint || !accountId || !userId) return false;
+  const q = new URLSearchParams({
+    organization_fingerprint: `eq.${organizationFingerprint}`, connection_id: `eq.${connectionId}`,
+    account_id: `eq.${accountId}`, user_id: `eq.${userId}`, select: "can_manage_campaign_brand_mapping", limit: "1",
+  });
+  try {
+    const rows = await request(`/rest/v1/account_campaign_map_grant?${q}`, { signal });
+    return Boolean(Array.isArray(rows) && rows[0] && rows[0].can_manage_campaign_brand_mapping === true);
+  } catch (e) { if (isSchemaMissingError(e)) return false; throw e; }
+}
+
+// Single-row campaign mapping assign/change/clear via the SECURITY DEFINER RPC (atomic + audited). Blank brandKey = clear.
+export async function recordCampaignBrandMapping({ organizationFingerprint, connectionId = "primary", accountId, marketplace, adsProfileId = "", campaignId, brandKey = "", brandDisplay = "", source = "MANUAL", note = "", actor = null, actorEmail = "" }) {
+  const body = await request("/rest/v1/rpc/record_campaign_brand_mapping", {
+    method: "POST",
+    body: {
+      p_organization_fingerprint: organizationFingerprint, p_connection_id: connectionId, p_account_id: accountId,
+      p_marketplace: marketplace, p_ads_profile_id: adsProfileId == null ? "" : String(adsProfileId), p_ad_campaign_id: campaignId,
+      p_brand_key: brandKey == null ? "" : String(brandKey), p_brand_display: brandDisplay == null ? "" : String(brandDisplay),
+      p_source: source, p_note: note == null ? "" : String(note), p_actor: actor, p_actor_email: actorEmail,
+    },
+  });
+  return Array.isArray(body) ? body[0] : body;
+}
+
+// Atomic BULK campaign mapping apply for ONE account, all-or-nothing. rows:[{marketplace, adsProfileId, campaignId,
+// brandKey, brandDisplay, note}] -- a blank brandKey CLEARS that campaign.
+export async function recordCampaignBrandMappingBulk({ organizationFingerprint, connectionId = "primary", accountId, rows, actor = null, actorEmail = "" }) {
+  const p_rows = (Array.isArray(rows) ? rows : []).map((r) => ({
+    marketplace: String(r.marketplace ?? ""), ads_profile_id: String(r.adsProfileId ?? r.ads_profile_id ?? ""),
+    ad_campaign_id: String(r.campaignId ?? r.ad_campaign_id ?? ""), brand_key: String(r.brandKey ?? r.brand_key ?? ""),
+    brand_display: String(r.brandDisplay ?? r.brand_display ?? ""), note: String(r.note ?? ""),
+  }));
+  const body = await request("/rest/v1/rpc/record_campaign_brand_mapping_bulk", {
+    method: "POST",
+    body: { p_organization_fingerprint: organizationFingerprint, p_connection_id: connectionId, p_account_id: accountId, p_rows, p_actor: actor, p_actor_email: actorEmail },
+  });
+  return Array.isArray(body) ? body[0] : body;
+}
+
 const ADS_ROW_CONFLICT_KEY = "source_key,account_id,marketplace_country_code,metric_date,dimension_key";
 
 export async function getAdsSyncStates(accountIds) {
