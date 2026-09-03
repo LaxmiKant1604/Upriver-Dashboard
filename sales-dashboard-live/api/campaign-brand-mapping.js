@@ -103,8 +103,6 @@ async function resolveScope(deps, access, accountId, requestedBrand) {
 // sees another brand's or Unmapped spend. An empty history -> empty view. Currencies are never combined.
 async function handleView(req, res, deps, access, accountId) {
   deps.assertAccountAccess(access, [accountId]); // account authorization first (admins bypass)
-  const from = S(req.query.from).trim() || null;
-  const to = S(req.query.to).trim() || null;
   const scope = await resolveScope(deps, access, accountId, req.query.brand);
   // The org fingerprint is required only to JOIN saved mappings; a missing connection yields Unmapped-only, never a 500.
   let org = "";
@@ -116,23 +114,38 @@ async function handleView(req, res, deps, access, accountId) {
       org ? deps.getCampaignBrandMappings({ organizationFingerprint: org, connectionId: "primary", accountId }).catch(() => []) : [],
     ]);
   } catch (_e) { throw new DashboardAccessError("Campaign Ads evidence is temporarily unavailable; please retry.", 503); }
+  const rows = durableRows || [];
 
-  const view = buildCampaignAdsView({ durableRows: durableRows || [], mappingRows: mappingRows || [], from, to });
+  // The account's PROVEN coverage from the source date strings (verbatim, no UTC shift): earliest + latest observed
+  // Campaign date. Every client date window (7D/14D/30D/custom) anchors on `latestProvenDate`, never the browser's clock.
+  let minDate = null; let latestProvenDate = null;
+  for (const r of rows) {
+    const d = String((r && r.metric_date) || (r && r.dimensions && r.dimensions.date) || "").slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
+    if (!minDate || d < minDate) minDate = d;
+    if (!latestProvenDate || d > latestProvenDate) latestProvenDate = d;
+  }
+  // Build the view over FULL durable history (from=null,to=null): each campaign carries its COMPLETE per-day breakdown
+  // (`daily`) so the browser re-windows 7D/14D/30D/custom (within coverage) with ZERO refetch + ZERO DataDoe tokens, and
+  // the Brand Mapping tab still sees every recent campaign identity (never truncated by the selected window).
+  const view = buildCampaignAdsView({ durableRows: rows, mappingRows: mappingRows || [], from: null, to: null });
   const projected = projectCampaignsForScope(view.campaigns, scope);
   // Full summary for an unrestricted view; scoped to the projected (permitted) campaigns for a restricted viewer so
-  // account/Unmapped totals never leak another brand's spend.
+  // account/Unmapped totals never leak another brand's spend. (This is the all-loaded-history summary; the browser
+  // re-summarizes per selected window from the per-campaign `daily` breakdown using the SAME formulas.)
   let summaryView = view;
   if (scope.mode !== "ALL") {
     const keep = new Set(projected.map((c) => `${c.campaignId}|${c.marketplace}|${c.adsProfileId}`));
     summaryView = { _internal: (view._internal || []).filter((r) => keep.has(`${r.campaignId}|${r.marketplace}|${r.adsProfileId}`)) };
   }
   res.status(200).json({
-    accountId, from, to,
+    accountId,
     restricted: scope.mode !== "ALL",
     brandScope: scope.mode,
+    coverage: { minDate, latestProvenDate },
     campaigns: projected,
     summary: summarizeCampaignAds(summaryView),
-    hasData: (durableRows || []).length > 0,
+    hasData: rows.length > 0,
   });
 }
 

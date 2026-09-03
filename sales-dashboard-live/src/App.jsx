@@ -3826,7 +3826,7 @@ function DashboardApp({ session, access, onSignOut }) {
       <div className="app-shell">
         <Sidebar
           view={view}
-          onNavigate={(next) => { setView(next); setDashboardMode("account"); setMobileOpen(false); }}
+          onNavigate={(next) => { setView(next === "ppc" && CAMPAIGN_ADS_TAB ? "campaign-ads" : next); setDashboardMode("account"); setMobileOpen(false); }}
           isAdmin={isAdmin}
           email={access.email}
           collapsed={collapsed}
@@ -3841,14 +3841,14 @@ function DashboardApp({ session, access, onSignOut }) {
 
         <div className={"main-area"
           + (view === "dashboard" && dashboardMode === "account" ? " dash-workspace" : "")
-          + ((view === "brandview" || view === "daily" || view === "returns" || view === "fbaplan" || view === "skumovement" || view === "campaign-ads" || (view === "dashboard" && dashboardMode === "brand")) ? " op-workspace" : "")}>
+          + ((view === "brandview" || view === "daily" || view === "returns" || view === "fbaplan" || view === "skumovement" || view === "campaign-ads" || (view === "ppc" && CAMPAIGN_ADS_TAB) || (view === "dashboard" && dashboardMode === "brand")) ? " op-workspace" : "")}>
           {/* Isolated fluid-motion background, only behind the account Dashboard.
               It self-disables under reduced motion / low-power / no-WebGL and
               falls back to the static CSS wash, so nothing here can block or
               alter the data render. */}
           {view === "dashboard" && dashboardMode === "account" && <WaterBackground />}
           <TopBar
-            viewTitle={VIEW_TITLES[view] || "Dashboard"}
+            viewTitle={VIEW_TITLES[view] || (view === "ppc" && CAMPAIGN_ADS_TAB ? VIEW_TITLES["campaign-ads"] : "Dashboard")}
             onOpenMenu={() => setMobileOpen(true)}
             mobileOpen={mobileOpen}
             showScope={showGlobalScope}
@@ -4947,7 +4947,8 @@ function DashboardApp({ session, access, onSignOut }) {
         />
       )}
 
-      {view === "campaign-ads" && CAMPAIGN_ADS_TAB && (
+      {/* The consolidated Campaign Ads workspace also serves the retired PPC view (old "ppc" URL redirects here). */}
+      {(view === "campaign-ads" || view === "ppc") && CAMPAIGN_ADS_TAB && (
         <CampaignAds
           accountId={selectedAccountId}
           accountName={refreshScopeAccount?.name}
@@ -4991,7 +4992,8 @@ function DashboardApp({ session, access, onSignOut }) {
         />
       )}
 
-      {view === "ppc" && (
+      {/* Legacy standalone PPC report -- only when the consolidated Campaign Ads workspace is OFF (rollback path). */}
+      {view === "ppc" && !CAMPAIGN_ADS_TAB && (
         <PpcPerformance
           data={ppc.data}
           loading={ppc.loading}

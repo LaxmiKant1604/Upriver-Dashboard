@@ -47,6 +47,7 @@
     "test:campaign-mapping-import": "node scripts/campaign-mapping-import.test.js",
     "test:campaign-map-capability-admin": "node scripts/campaign-map-capability-admin.test.js",
     "test:campaign-ads": "node scripts/campaign-ads.test.js",
+    "test:campaign-ads-view": "node scripts/campaign-ads-view.test.js",
     "test:campaign-ads-golive": "node scripts/campaign-ads-golive.test.js",
     "test:campaign-ads-recovery": "node scripts/campaign-ads-recovery.test.js",
     "test:campaign-ads-aggregation": "node scripts/campaign-ads-aggregation.test.js",

@@ -190,10 +190,15 @@ const APP = readFileSync(join(ROOT, "src/App.jsx"), "utf8");
 const APIVIEW = readFileSync(join(ROOT, "api/campaign-brand-mapping.js"), "utf8"); // VIEW consolidated here (?action=view)
 const SRC = readFileSync(join(ROOT, "src/lib/daily-metrics.js"), "utf8");
 
-test("FE1. the tab is LIVE (go-live): flag ON; nav + render still gate on the flag", () => {
+test("FE1. LIVE + consolidated: flag ON; ONE Campaign Ads destination; legacy PPC gated to flag-OFF", () => {
   assert.ok(/CAMPAIGN_ADS_TAB = true/.test(FLAGS), "flag ON at go-live");
-  assert.ok(/CAMPAIGN_ADS_TAB \? \[\{ view: "campaign-ads"/.test(SHELL), "nav item flag-gated");
-  assert.ok(/view === "campaign-ads" && CAMPAIGN_ADS_TAB &&/.test(APP), "render flag-gated");
+  // Consolidation: "Ad Performance by Campaign" is the flag-ON nav destination; the retired standalone PPC item is now
+  // only the flag-OFF (rollback) branch of the same ternary.
+  assert.ok(/CAMPAIGN_ADS_TAB\s*\n?\s*\?\s*\[\{\s*view:\s*"campaign-ads"/.test(SHELL), "campaign-ads is the flag-ON nav destination");
+  assert.ok(/:\s*\[\{\s*view:\s*"ppc"/.test(SHELL), "legacy PPC nav item only in the flag-OFF branch");
+  // Render: campaign-ads is flag-gated (and also serves a redirected old ppc view); legacy PPC renders only flag-OFF.
+  assert.ok(/\(view === "campaign-ads" \|\| view === "ppc"\) && CAMPAIGN_ADS_TAB/.test(APP), "campaign-ads render flag-gated");
+  assert.ok(/view === "ppc" && !CAMPAIGN_ADS_TAB/.test(APP), "legacy PPC render only when the flag is OFF");
   passed += 1;
 });
 

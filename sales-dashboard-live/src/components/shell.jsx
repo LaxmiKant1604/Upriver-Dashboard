@@ -82,9 +82,12 @@ export const NAV_GROUPS = [
     items: [
       { view: "salesmovers", label: "Sales Movers", title: "Sales Movers — weekly ASIN gains and declines", icon: TrendingUp },
       { view: "skumovement", label: "SKU Movement", title: "SKU Movement — per-ASIN/SKU units, trend and month projection", icon: Activity },
-      { view: "ppc", label: "PPC Performance", title: "PPC Performance & Wasted Spend", icon: Megaphone },
-      // Dormant until the Campaign Ads go-live (CAMPAIGN_ADS_TAB). Hidden entirely while OFF.
-      ...(CAMPAIGN_ADS_TAB ? [{ view: "campaign-ads", label: "Ad Performance by Campaign", title: "Ad Performance by Campaign — campaign metrics + brand mapping", icon: Megaphone }] : []),
+      // ONE consolidated advertising destination. With CAMPAIGN_ADS_TAB on, "Ad Performance by Campaign" is the single
+      // workspace (Performance / Wasted Spend / Brand Mapping tabs) and the legacy standalone "PPC Performance" item is
+      // retired (its old view redirects here). With the flag OFF (rollback), the legacy PPC item returns.
+      ...(CAMPAIGN_ADS_TAB
+        ? [{ view: "campaign-ads", label: "Ad Performance by Campaign", title: "Ad Performance by Campaign — Performance, Wasted Spend & Brand Mapping", icon: Megaphone }]
+        : [{ view: "ppc", label: "PPC Performance", title: "PPC Performance & Wasted Spend", icon: Megaphone }]),
       { view: "keywordrank", label: "Keyword Rank", title: "Keyword rank and share of query", icon: Tag },
       { view: "optimizer", label: "Listing Optimizer", title: "Listing & Search Optimizer — search-funnel and content gaps", icon: FileSearch },
     ],

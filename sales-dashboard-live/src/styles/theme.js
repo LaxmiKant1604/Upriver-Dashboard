@@ -2098,6 +2098,27 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .op-report .ca-map-select{ border:1px solid var(--op-border); border-radius:7px; background:#fff; color:var(--op-ink); font:600 12px inherit; padding:4px 6px; max-width:170px; }
 .op-report .ca-map-select:hover{ border-color:#B9C0C5; }
 .op-report .campaign-ads-table td{ font-variant-numeric:tabular-nums; }
+/* One-workspace tab bar (Performance / Wasted Spend / Brand Mapping). */
+.op-report .ca-tabs{ display:flex; gap:4px; margin:2px 0 14px; border-bottom:1px solid var(--op-border-2); flex-wrap:wrap; }
+.op-report .ca-tab{ display:inline-flex; align-items:center; gap:7px; border:none; background:transparent; color:var(--op-ink-3); font:750 13px inherit; padding:9px 14px; border-radius:8px 8px 0 0; cursor:pointer; border-bottom:2px solid transparent; margin-bottom:-1px; }
+.op-report .ca-tab:hover{ color:var(--op-ink); background:var(--op-hair); }
+.op-report .ca-tab.active{ color:var(--op-navy); border-bottom-color:var(--op-orange); background:#fff; }
+.op-report .ca-tab.active svg{ color:var(--op-orange); }
+.op-report .ca-tab:focus-visible{ outline:2px solid var(--op-orange); outline-offset:1px; }
+.op-report .ca-controls{ flex-wrap:wrap; gap:10px; }
+.op-report .ca-daterange{ display:inline-flex; align-items:center; gap:6px; }
+.op-report .ca-daterange input{ border:1px solid var(--op-border); border-radius:8px; background:#fff; color:var(--op-ink); font:600 12px inherit; padding:5px 8px; }
+.op-report .ca-daterange input:focus-visible{ outline:none; border-color:var(--op-orange); box-shadow:0 0 0 3px rgba(255,153,0,.16); }
+.op-report .ca-daterange-sep{ color:var(--op-ink-4); font-weight:800; }
+.op-report .ca-coverage{ display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; font-size:11.5px; color:var(--op-ink-3); margin:0 0 12px; }
+.op-report .ca-coverage strong{ color:var(--op-ink); font-weight:800; }
+.op-report .ca-coverage-warn{ color:var(--op-warn-ink); background:var(--op-warn-soft); border:1px solid var(--op-warn-border); border-radius:6px; padding:2px 8px; font-weight:700; }
+.op-report .ca-waste-kpis{ grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); }
+.op-report .ca-waste-card .metric-value{ font-size:22px; }
+.op-report .ca-neg{ color:var(--op-red); }
+.op-report .ca-warn-ink{ color:var(--op-warn-ink); }
+.op-report .ca-reasons{ display:flex; flex-wrap:wrap; gap:4px; }
+.op-report .ca-reason{ display:inline-block; font:700 10.5px inherit; color:var(--op-ink-2); background:var(--op-hair); border:1px solid var(--op-border-2); border-radius:5px; padding:1px 7px; white-space:nowrap; }
 `;
 
 /* Chart colours, exported so recharts series stay in step with the CSS tokens

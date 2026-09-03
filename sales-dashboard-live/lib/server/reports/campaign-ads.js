@@ -67,15 +67,27 @@ export function buildCampaignAdsView({ durableRows = [], mappingRows = [], from 
     }
     const met = r && r.metrics && typeof r.metrics === "object" ? r.metrics : {};
     for (const k of CAMPAIGN_METRICS) e.m[k] += num(met[k]);
+    // COMPACT per-(campaign,date) daily fold so the browser can re-window 7D/14D/30D/custom with ZERO refetch + ZERO
+    // DataDoe. Order matches CAMPAIGN_METRICS: [date, spend, sales, orders, units, impressions, clicks]. Source date
+    // strings are used verbatim (no UTC shift). Currency isolation holds (a campaign identity is one currency).
+    if (date) {
+      if (!e.dailyMap) e.dailyMap = new Map();
+      const dm = e.dailyMap.get(date) || zero();
+      for (const k of CAMPAIGN_METRICS) dm[k] += num(met[k]);
+      e.dailyMap.set(date, dm);
+    }
   }
   const campaigns = [...byId.values()].map((e) => {
     const map = mappings.get(e.key) || null;
+    const daily = [...(e.dailyMap || new Map()).entries()]
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .map(([date, m]) => [date, m.ad_spend, m.ad_sales, m.ad_orders, m.ad_units_sold, m.ad_impressions, m.ad_clicks]);
     return {
       campaignId: e.campaignId, campaignName: e.campaignName, campaignType: e.campaignType, campaignStatus: e.campaignStatus,
       marketplace: e.marketplace, adsProfileId: e.adsProfileId, currency: e.currency,
       budgetAmount: e.budgetAmount, budgetCurrency: e.budgetCurrency,
       brandKey: map ? map.brandKey : "", brandDisplay: map ? map.brandDisplay : "", mapped: !!map,
-      ...campaignKpis(e.m), _m: e.m,
+      daily, ...campaignKpis(e.m), _m: e.m,
     };
   });
   campaigns.sort((a, b) => (b.spend || 0) - (a.spend || 0) || a.campaignId.localeCompare(b.campaignId));
