@@ -33,6 +33,7 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 let status; // source-status
 let runtimeMod; // source-bucket-sync-runtime
 let registry; // source-registry
+let adsSrc; // active-ads-source (the ONE cutover authority)
 
 const runRow = (sourceKey, bucket, over = {}) => ({
   source_key: sourceKey, bucket, last_status: "succeeded",
@@ -52,7 +53,12 @@ test("A1. one card per registered family with the exact reviewed field set; unkn
     controls: [{ source_key: "order-line-items", paused: false, schedule_enabled: false }],
     runStatuses: [runRow("order-line-items", "us")],
   });
-  assert.equal(cards.length, registry.SOURCE_REGISTRY.length, "one card per registered source family");
+  // Post ASIN->Campaign cutover the retired ads grain's card is filtered SERVER-SIDE, so the DSC shows one card
+  // per registered NON-retired family. The registry entry is retained (rollback) but never rendered.
+  const visibleFamilies = registry.SOURCE_REGISTRY.filter((e) => !adsSrc.isAdsRegistryKeyRetired(e.sourceKey)).length;
+  assert.equal(cards.length, visibleFamilies, "one card per registered NON-retired source family");
+  assert.equal(cards.find((c) => c.sourceKey === "ads-asin-date"), undefined, "the retired ASIN ads card is hidden from the active Data Sync Center");
+  assert.ok(cards.find((c) => c.sourceKey === "ads-campaign-date"), "the active Campaign ads card remains visible");
   const oli = cards.find((c) => c.sourceKey === "order-line-items");
   assert.equal(oli.label, "Order Line Items", "the human label comes from the canonical contract");
   assert.deepEqual([...oli.usedBy], [...registry.dashboardsUsingSource("order-line-items")], "the Used-by dashboard list");
@@ -130,7 +136,9 @@ test("B3. an unhealthy Ads/inventory source DEGRADES its dashboard half without 
   assert.deepEqual([...daily.degradedBy], [{ sourceKey: "ads-campaign-date", reason: "last-run-failed" }], "Daily degrades on the CAMPAIGN grain only");
   const bv = summary.find((r) => r.dashboard === "brand-view");
   assert.equal(bv.ready, true);
-  assert.deepEqual([...bv.degradedBy], [{ sourceKey: "ads-asin-date", reason: "last-run-failed" }], "Brand View degrades on the ASIN grain only");
+  // Post ASIN->Campaign cutover Brand View degrades on the ACTIVE Campaign grain (+ FBA health), never ASIN.
+  assert.deepEqual([...bv.degradedBy], [{ sourceKey: "ads-campaign-date", reason: "last-run-failed" }], "Brand View degrades on the active Campaign grain, not ASIN");
+  assert.ok(!bv.degradedBy.some((d) => d.sourceKey === "ads-asin-date"), "no active Brand View readiness references ads-asin-date");
 });
 
 group("C. production composition (offline, injected fakes)");
@@ -162,8 +170,9 @@ function makeMiniStore() {
 
 const CONNS = [{ id: "primary", apiKey: ["prim", "key"].join("-"), accountPrefix: "" }];
 
-function makeComposition({ paused = [], calls } = {}) {
+function makeComposition({ paused = [], calls, adsCoverage = null } = {}) {
   const record = calls || { discovery: 0, creates: [] };
+  record.adsCoverageReads = record.adsCoverageReads || [];
   const runtime = runtimeMod.buildBucketSourceSyncRuntime({
     getConnections: () => { record.getConnections = (record.getConnections || 0) + 1; return CONNS; },
     fetchAccounts: async () => { record.discovery += 1; return [{ id: "A01", name: "Acct", country: "US", currency: "USD", status: "active" }]; },
@@ -179,7 +188,10 @@ function makeComposition({ paused = [], calls } = {}) {
     readSourceControls: async () => ({ rows: paused.map((k) => ({ source_key: k, paused: true, schedule_enabled: false })), read: "ok", error: null }),
     readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: "2026-08-19" }], read: "ok", error: null }),
     readSnapshot: async () => ({ snapshot: null, read: "ok", error: null }),
-    readAdsCoverage: async () => ({ windows: [], read: "ok", error: null }),
+    readAdsCoverage: async (accountId, sourceKey) => {
+      record.adsCoverageReads.push({ accountId, sourceKey });
+      return adsCoverage ? adsCoverage(sourceKey, accountId) : { windows: [], read: "ok", error: null };
+    },
     readBatchMembership: async () => [],
     assignBatchMembership: async () => { record.assigns = (record.assigns || 0) + 1; return record.assigns - 1 >= 0 ? 0 : 0; },
     replaceHistory: async ({ rows }) => ({ write: "ok", replaced: 0, inserted: rows.length }),
@@ -227,6 +239,62 @@ test("C3. a missing primary connection fails closed BEFORE any discovery (contro
   assert.equal(discoveries, 0);
 });
 
+group("C-ADS. Atomic Ads cutover -- gatherDurableReadiness reads the ACTIVE grain ONLY");
+
+test("C-ADS1. Campaign mode: readAdsCoverage is called for campaign-performance-v1 and NEVER asin-performance-v1 (zero ASIN reads)", async () => {
+  const record = { discovery: 0, creates: [] };
+  const { runtime } = makeComposition({ calls: record });
+  await runtime.gatherDurableReadiness({ bucket: "us", accounts: [{ accountId: "A01" }], asOf: "2026-08-19" });
+  assert.equal(adsSrc.ACTIVE_ADS_SOURCE_KEY, "campaign-performance-v1", "Campaign is the active Ads source");
+  const grains = [...new Set(record.adsCoverageReads.map((r) => r.sourceKey))];
+  assert.deepEqual(grains, ["campaign-performance-v1"], "only the ACTIVE grain's coverage is read");
+  assert.equal(record.adsCoverageReads.filter((r) => r.sourceKey === "asin-performance-v1").length, 0, "ASIN coverage read count is exactly zero");
+  assert.ok(record.adsCoverageReads.length > 0, "the active grain WAS read (no silent skip)");
+});
+
+test("C-ADS2. an active Campaign coverage failure degrades Daily + Brand View as ads-campaign-date (never ads-asin-date) and never blocks sales", async () => {
+  const record = { discovery: 0, creates: [] };
+  const { runtime } = makeComposition({ calls: record, adsCoverage: () => ({ windows: null, read: "read-failed", error: "COVERAGE_READ_FAILED" }) });
+  const r = await runtime.gatherDurableReadiness({ bucket: "us", accounts: [{ accountId: "A01" }], asOf: "2026-08-19" });
+  const adsOf = (rr) => rr.blockedBy.filter((b) => String(b.sourceKey).startsWith("ads-"));
+  assert.ok(adsOf(r.daily).some((b) => b.sourceKey === "ads-campaign-date"), "Daily degrades on ads-campaign-date");
+  assert.ok(!r.daily.blockedBy.some((b) => b.sourceKey === "ads-asin-date"), "no ads-asin-date in Daily readiness");
+  assert.ok(adsOf(r.brandView).some((b) => b.sourceKey === "ads-campaign-date"), "Brand View degrades on ads-campaign-date");
+  assert.ok(!r.brandView.blockedBy.some((b) => b.sourceKey === "ads-asin-date"), "no ads-asin-date in Brand View readiness");
+  assert.ok(adsOf(r.daily).every((b) => b.blocksSales === false) && adsOf(r.brandView).every((b) => b.blocksSales === false), "an Ads coverage failure is a typed degradation, never a sales blocker");
+  // Only the active grain was read even on failure -- the retired grain is never touched.
+  assert.equal(record.adsCoverageReads.filter((r2) => r2.sourceKey === "asin-performance-v1").length, 0, "ASIN grain never read on the failure path either");
+});
+
+test("C-ADS3. a forged manual ASIN card action is refused BEFORE any preflight/coverage/create/token I/O (zero creates, zero reads)", async () => {
+  const record = { discovery: 0, creates: [] };
+  const { runtime } = makeComposition({ calls: record });
+  const res = await runtime.runSourceCardAction({ bucket: "us", sourceKey: "ads-asin-date" });
+  assert.equal(res.refused, true, "the retired ASIN card action is refused");
+  assert.equal(res.code, "SOURCE_ACTION_ADS_ARCHITECTURE", "typed refusal");
+  assert.equal(record.creates.length, 0, "zero creates");
+  assert.equal(record.adsCoverageReads.length, 0, "refused BEFORE any coverage / DataDoe / token I/O");
+});
+
+test("C-ADS4. active readiness identities use the ACTIVE Campaign grain (Brand View also FBA); NO ads-asin-date; derived from the single authority; rollback stays possible", () => {
+  const daily = status.PRIORITY_DASHBOARD_SOURCES["daily-reporting"];
+  const bv = status.PRIORITY_DASHBOARD_SOURCES["brand-view"];
+  assert.deepEqual([...daily.degrading], ["ads-campaign-date"], "Daily degrades on the active Campaign grain");
+  assert.deepEqual([...bv.degrading], ["ads-campaign-date", "fba-inventory-health"], "Brand View degrades on Campaign Ads + FBA health");
+  for (const d of [daily, bv]) {
+    assert.ok(!d.degrading.includes("ads-asin-date") && !d.blocking.includes("ads-asin-date"), "no active readiness references ads-asin-date");
+  }
+  // The identities derive from the ONE cutover authority (not a second hardcoded switch).
+  assert.equal(daily.degrading[0], adsSrc.ACTIVE_ADS_REGISTRY_KEY, "daily grain == ACTIVE_ADS_REGISTRY_KEY");
+  assert.equal(bv.degrading[0], adsSrc.ACTIVE_ADS_REGISTRY_KEY, "brand-view ads grain == ACTIVE_ADS_REGISTRY_KEY");
+  assert.ok(adsSrc.isAdsRegistryKeyRetired("ads-asin-date"), "the ASIN registry grain is retired while Campaign is active");
+  assert.ok(!adsSrc.isAdsRegistryKeyRetired("ads-campaign-date"), "the Campaign registry grain is never retired");
+  // Rollback remains structurally possible through the single authority: every retirement predicate is DERIVED
+  // from ADS_ACTIVE_SOURCE (no second hardcoded switch), so flipping it back to "asin" clears the retirement.
+  assert.equal(adsSrc.ADS_ACTIVE_SOURCE, "campaign", "Campaign is the single active source");
+  assert.deepEqual([...adsSrc.RETIRED_ADS_REGISTRY_KEYS], ["ads-asin-date"], "exactly the ASIN grain is retired; rollback re-includes it");
+});
+
 group("D. endpoint structural pins");
 
 test("D1. api/admin/sources.js requires admin, audits mutations, and rate-limits the manual run", () => {
@@ -245,6 +313,7 @@ async function main() {
   status = await import("../lib/server/sync/source-status.js");
   runtimeMod = await import("../lib/server/sync/source-bucket-sync-runtime.js");
   registry = await import("../lib/server/sync/source-registry.js");
+  adsSrc = await import("../lib/server/active-ads-source.js");
 
   let failures = 0;
   for (const t of tests) {

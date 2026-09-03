@@ -24,6 +24,17 @@ export const ACTIVE_ADS_SOURCE_KEY = ADS_ACTIVE_SOURCE === "asin" ? ASIN_ADS_SOU
 // blockers + registry consumers so they name the active family.
 export const ACTIVE_ADS_REGISTRY_KEY = ADS_ACTIVE_SOURCE === "asin" ? "ads-asin-date" : "ads-campaign-date";
 
+// The source-registry family key of the RETIRED (inactive) ads grain -- so a display/readiness surface can hide
+// or exclude the retired ads family from ONE authority. When Campaign is active the ASIN registry family is
+// retired; on rollback nothing is retired. The registry ENTRY itself is retained (this only affects display).
+export const RETIRED_ADS_REGISTRY_KEYS = Object.freeze(
+  ADS_ACTIVE_SOURCE === "campaign" ? ["ads-asin-date"] : []
+);
+// True if the source-registry family `registryKey` is the retired (inactive) ads grain (hidden from active UI).
+export function isAdsRegistryKeyRetired(registryKey) {
+  return RETIRED_ADS_REGISTRY_KEYS.includes(String(registryKey || ""));
+}
+
 // When Campaign is active, the ASIN grain's EXPORT path is RETIRED (its durable history + all reader code are retained
 // untouched -- only new exports are blocked). Rolling back to "asin" clears the retirement so ASIN can refresh again.
 export const RETIRED_ADS_EXPORT_SOURCE_KEYS = Object.freeze(

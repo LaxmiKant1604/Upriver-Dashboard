@@ -13,20 +13,22 @@
 
 import { SOURCE_REGISTRY, sourceRegistryEntry } from "./source-registry.js";
 import { sourceContractForKey } from "../source-contracts.js";
+import { ACTIVE_ADS_REGISTRY_KEY, isAdsRegistryKeyRetired } from "../active-ads-source.js";
 
 export const CARD_BUCKETS = Object.freeze(["us", "non-us"]);
 
 // The sources whose health gates each priority dashboard's summary. Sales-blocking sources are the durable
 // OLI/catalog evidence; the Ads/inventory sources degrade their half without blocking sales (mirrors
-// durable-dashboards readiness semantics; Daily = CAMPAIGN Ads grain, Brand View = ASIN grain + FBA).
+// durable-dashboards readiness semantics). The Ads grain is the ACTIVE grain from the ONE cutover authority
+// (ACTIVE_ADS_REGISTRY_KEY = ads-campaign-date post-cutover; ads-asin-date on rollback) -- never the retired grain.
 export const PRIORITY_DASHBOARD_SOURCES = Object.freeze({
   "daily-reporting": Object.freeze({
     blocking: Object.freeze(["order-line-items", "product-catalog"]),
-    degrading: Object.freeze(["ads-campaign-date"]),
+    degrading: Object.freeze([ACTIVE_ADS_REGISTRY_KEY]),
   }),
   "brand-view": Object.freeze({
     blocking: Object.freeze(["order-line-items", "product-catalog"]),
-    degrading: Object.freeze(["ads-asin-date", "fba-inventory-health"]),
+    degrading: Object.freeze([ACTIVE_ADS_REGISTRY_KEY, "fba-inventory-health"]),
   }),
 });
 
@@ -41,7 +43,13 @@ const controlOf = (rows, sourceKey) => (rows || []).find((r) => (r.source_key ??
  */
 export function shapeSourceCards({ bucket, controls = [], runStatuses = [] } = {}) {
   if (!CARD_BUCKETS.includes(bucket)) throw new Error(`shapeSourceCards requires bucket 'us'|'non-us' (got "${bucket}").`);
-  return SOURCE_REGISTRY.map((entry) => {
+  return SOURCE_REGISTRY
+    // Hide the RETIRED ads grain's card from the active Data Sync Center (server-side, per the ONE cutover
+    // authority): while Campaign is active the ads-asin-date card is not rendered and exposes no pause/sync action.
+    // Its registry entry, contract, durable history + rollback code are untouched; a forged manual ASIN action is
+    // still refused before any DB/DataDoe/token I/O (durable-ads architecture guard + the ads-sync export guard).
+    .filter((entry) => !isAdsRegistryKeyRetired(entry.sourceKey))
+    .map((entry) => {
     const contract = sourceContractForKey(entry.sourceKey);
     const control = controlOf(controls, entry.sourceKey);
     const s = toRow(runStatuses, entry.sourceKey, bucket) || {};

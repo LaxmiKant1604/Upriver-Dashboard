@@ -45,7 +45,7 @@ import {
   deriveDurableDashboardSnapshots, DAILY_ADS_GRAIN, BRAND_VIEW_ADS_GRAIN,
   dailyReportingReadiness, brandViewReadiness,
 } from "./durable-dashboards.js";
-import { ACTIVE_ADS_SOURCE_KEY } from "../active-ads-source.js";
+import { ACTIVE_ADS_SOURCE_KEY, ACTIVE_ADS_REGISTRY_KEY } from "../active-ads-source.js";
 import { shadowSnapshotKey, REPORT_DERIVATIONS } from "./report-derivation.js";
 import { buildBrandInventorySnapshot, BRAND_INVENTORY_SNAPSHOT_KEY, BRAND_INVENTORY_REPORT_VERSION } from "../reports/brand-view.js";
 import {
@@ -426,6 +426,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     catalogRows: pf.evidence.catalogRows,
     fbaSnapshotsByAccount: { ...(pf.evidence.fbaSnapshotsByAccount || {}) },
     fbaRowsByAccount: { ...(pf.evidence.fbaRowsByAccount || {}) },
+    activeAdsCoverageStateByAccountId: pf.evidence.activeAdsCoverageStateByAccountId,
     campaignCoverageStateByAccountId: pf.evidence.campaignCoverageStateByAccountId,
     asinCoverageStateByAccountId: pf.evidence.asinCoverageStateByAccountId,
     campaignAds: pf.evidence.campaignAds,
@@ -519,36 +520,36 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         fbaRowsByAccount[a.accountId] = fba.rows;
       }
     }
-    const campaignWindows = {};
-    const asinWindows = {};
-    const campaignCoverageStateByAccountId = {};
-    const asinCoverageStateByAccountId = {};
+    // Read coverage for the ONE ACTIVE Ads grain only (Campaign post-cutover; ASIN on rollback). The single
+    // authority active-ads-source.js (ACTIVE_ADS_SOURCE_KEY / ACTIVE_ADS_REGISTRY_KEY) decides which grain is
+    // active; the inactive grain is NEVER read (zero reads) and the two grains are never mixed or summed. A
+    // failed/incomplete ACTIVE coverage read is a typed Ads degradation keyed to ACTIVE_ADS_REGISTRY_KEY with
+    // blocksSales:false, so it degrades Daily/Brand Ads but never blocks a valid OLI sales publish.
+    const activeAdsWindows = {};
+    const activeAdsCoverageStateByAccountId = {};
     for (const a of accounts) {
-      // Campaign-grain coverage is still read for PPC diagnostics/read-blockers (PPC reads both grains).
-      const camp = await call("ads-coverage-read", (signal) => readAdsCoverage(a.accountId, "campaign-performance-v1", { signal }));
-      campaignCoverageStateByAccountId[a.accountId] = camp;
-      campaignWindows[a.accountId] = camp.read === "ok" ? camp.windows : null;
-      if (camp.read !== "ok") readBlockers.push({ sourceKey: "ads-campaign-date", accountId: a.accountId, reason: "ads-coverage-" + camp.read, blocksSales: false });
-      // ASIN-grain coverage is retained for rollback + PPC diagnostics. After the ASIN->Campaign cutover the campaign
-      // grain (above) is the AUTHORITATIVE Daily + Brand View Ads coverage; the ASIN read below gates Daily/Brand ONLY
-      // when ASIN is the ACTIVE grain (rollback) -- otherwise a retired-ASIN coverage gap never blocks a publish.
-      const asin = await call("ads-coverage-read", (signal) => readAdsCoverage(a.accountId, "asin-performance-v1", { signal }));
-      asinCoverageStateByAccountId[a.accountId] = asin;
-      asinWindows[a.accountId] = asin.read === "ok" ? asin.windows : null;
-      if (asin.read !== "ok" && ACTIVE_ADS_SOURCE_KEY === "asin-performance-v1") readBlockers.push({ sourceKey: "ads-asin-date", accountId: a.accountId, reason: "ads-coverage-" + asin.read, blocksSales: false });
+      const cov = await call("ads-coverage-read", (signal) => readAdsCoverage(a.accountId, ACTIVE_ADS_SOURCE_KEY, { signal }));
+      activeAdsCoverageStateByAccountId[a.accountId] = cov;
+      activeAdsWindows[a.accountId] = cov.read === "ok" ? cov.windows : null;
+      if (cov.read !== "ok") readBlockers.push({ sourceKey: ACTIVE_ADS_REGISTRY_KEY, accountId: a.accountId, reason: "ads-coverage-" + cov.read, blocksSales: false });
     }
-    // The Daily/Brand readiness ads input uses the ACTIVE grain's coverage windows (campaign post-cutover, asin on rollback).
-    const activeAdsWindows = ACTIVE_ADS_SOURCE_KEY === "asin-performance-v1" ? asinWindows : campaignWindows;
+    const activeAdsIsCampaign = ACTIVE_ADS_SOURCE_KEY === "campaign-performance-v1";
+    const activeWindowsByAccountId = Object.fromEntries(Object.entries(activeAdsWindows).map(([k, v]) => [k, v || []]));
     return {
       readBlockers, oliCoverageByAccountId,
       catalogSnapshot: catalog.snapshot,
       catalogRows: catalog.rows,
       fbaSnapshotsByAccount,
       fbaRowsByAccount,
-      campaignCoverageStateByAccountId,
-      asinCoverageStateByAccountId,
-      campaignAds: { grain: "campaign-performance-v1", read: "ok", windowsByAccountId: Object.fromEntries(Object.entries(campaignWindows).map(([k, v]) => [k, v || []])) },
-      asinAds: { grain: BRAND_VIEW_ADS_GRAIN, read: "ok", windowsByAccountId: Object.fromEntries(Object.entries(activeAdsWindows).map(([k, v]) => [k, v || []])) },
+      // The ACTIVE grain's coverage state -- the ONLY grain read. Fed to the derive as its ads coverage state.
+      activeAdsCoverageStateByAccountId,
+      // Legacy per-grain fields kept for evidence-shape compatibility; ONLY the active grain is populated (the
+      // inactive grain was never read, so its map is empty -- never a stale/mixed read of the other grain).
+      campaignCoverageStateByAccountId: activeAdsIsCampaign ? activeAdsCoverageStateByAccountId : {},
+      asinCoverageStateByAccountId: activeAdsIsCampaign ? {} : activeAdsCoverageStateByAccountId,
+      campaignAds: { grain: "campaign-performance-v1", read: "ok", windowsByAccountId: activeAdsIsCampaign ? activeWindowsByAccountId : {} },
+      // The Daily/Brand View Ads input: the ACTIVE grain's windows (field name is legacy; grain = BRAND_VIEW_ADS_GRAIN).
+      asinAds: { grain: BRAND_VIEW_ADS_GRAIN, read: "ok", windowsByAccountId: activeWindowsByAccountId },
     };
   };
 
@@ -955,7 +956,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         fbaSnapshotsByAccount: evidence.fbaSnapshotsByAccount,
         campaignAds: evidence.campaignAds, asinAds: evidence.asinAds,
         adMetricsByAccountId,
-        adsCoverageStateByAccountId: evidence.asinCoverageStateByAccountId,
+        adsCoverageStateByAccountId: evidence.activeAdsCoverageStateByAccountId,
         dailyWindow, brandViewWindow,
       });
     } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(e); throw e; }
@@ -1500,21 +1501,23 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     if (!isRoutingScope(bucket)) {
       throw new Error(`runSourceCardAction requires a routing scope (region india|europe-au|us-ca or legacy us|non-us; got "${bucket}").`);
     }
-    // Round-5 blockers 3+4: ONE route-owned deadline (created by the route BEFORE preflight when this is
-    // endpoint-driven) and ONE memoized preflight. A caller that already preflighted passes the bundle
-    // through; a direct caller still gets the uniform controls-first guarantee here.
-    const dl = resolveDeadline(deadline);
-    const pf = preflight && preflight.bucket === bucket ? preflight : await preflightEvidence({ bucket, sourceKey, deadline: dl });
     if (entry.storage === "durable-ads") {
-      // The REAL architecture for the four Ads families is the existing durable Ads sync (its own bounded
-      // cron scopes + coverage model). Executing it from a source card is a separate reviewed wiring, so
-      // this action refuses TYPED rather than pretending.
+      // The REAL architecture for the durable Ads families is the existing durable Ads sync (its own bounded cron
+      // scopes + coverage model). Executing it from a source card is a separate reviewed wiring, so this action
+      // refuses TYPED -- BEFORE any preflight/DataDoe/coverage/token I/O. In particular a forged manual action on
+      // the retired ASIN Ads grain (asin-performance-v1 / ads-asin-date) can never create an export from here; the
+      // ads-sync.js runAdsSyncWithDeps export guard is the additional backstop on the durable path.
       return {
         refused: true, code: "SOURCE_ACTION_ADS_ARCHITECTURE",
         message: "This family is fetched by the existing durable Ads architecture (bounded cron scopes); use that path.",
         sourceKey, bucket,
       };
     }
+    // Round-5 blockers 3+4: ONE route-owned deadline (created by the route BEFORE preflight when this is
+    // endpoint-driven) and ONE memoized preflight. A caller that already preflighted passes the bundle
+    // through; a direct caller still gets the uniform controls-first guarantee here.
+    const dl = resolveDeadline(deadline);
+    const pf = preflight && preflight.bucket === bucket ? preflight : await preflightEvidence({ bucket, sourceKey, deadline: dl });
     if (entry.storage === "durable-history" || entry.storage === "durable-snapshot") {
       return run({ bucket, onlySourceKey: sourceKey, reuseOnly, deadline: dl, preflight: pf, forceFreshOli: freshOli });
     }
@@ -1608,8 +1611,8 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     };
     return {
       asOf: effectivePublishAsOf, refreshAsOf, effectivePublishAsOf, asOfClamped: effectivePublishAsOf !== refreshAsOf,
-      daily: merge(daily, ["order-line-items", "product-catalog", "ads-asin-date"]),
-      brandView: merge(brandView, ["order-line-items", "product-catalog", "ads-asin-date", "fba-inventory-health"]),
+      daily: merge(daily, ["order-line-items", "product-catalog", ACTIVE_ADS_REGISTRY_KEY]),
+      brandView: merge(brandView, ["order-line-items", "product-catalog", ACTIVE_ADS_REGISTRY_KEY, "fba-inventory-health"]),
     };
   };
 
