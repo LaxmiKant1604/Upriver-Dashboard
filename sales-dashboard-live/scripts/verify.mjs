@@ -73,6 +73,7 @@ const SUITES = [
   "test:effective-asof",
   "test:source-bucket-sync",
   "test:source-status",
+  "test:admin-sources-boundary",
   "test:source-schedule",
   "test:zero-export-rehearsal",
   "test:source-production-hardening",

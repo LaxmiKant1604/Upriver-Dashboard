@@ -60,6 +60,7 @@
     "test:effective-asof": "node scripts/effective-asof.test.js",
     "test:source-bucket-sync": "node scripts/source-bucket-sync.test.js",
     "test:source-status": "node scripts/source-status.test.js",
+    "test:admin-sources-boundary": "node scripts/admin-sources-boundary.test.js",
     "test:source-schedule": "node scripts/source-schedule.test.js",
     "test:zero-export-rehearsal": "node scripts/zero-export-rehearsal.test.js",
     "test:source-production-hardening": "node scripts/source-production-hardening.test.js",

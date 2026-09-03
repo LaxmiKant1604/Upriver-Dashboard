@@ -16,8 +16,19 @@ import { sourceRegistryEntry } from "../../lib/server/sync/source-registry.js";
 import { buildBucketSourceSyncRuntime } from "../../lib/server/sync/source-bucket-sync-runtime.js";
 import { validateSourceSyncRequest, runReleaseSlice, ORCHESTRATED_SOURCE_KEYS } from "../../lib/server/sync/source-sync-operation.js";
 import { isFbaOperationSource, resolveFbaPlanScope, planFbaBucketCost, fbaBucketAccounts, advanceFbaPlanBucket, fbaServerCeiling, fbaCycleBucket } from "../../lib/server/sync/fba-plan-operation.js";
+// The ONE ASIN->Campaign cutover authority: reject a forged action on the retired ads grain at the API BOUNDARY,
+// after auth + source-key parse, BEFORE any runtime / preflight / coverage / discovery / control-or-audit write.
+import { isAdsRegistryKeyRetired } from "../../lib/server/active-ads-source.js";
 
 export const config = { maxDuration: 60 };
+
+// Production collaborators, injectable for narrowly-scoped API-boundary tests (the established handler(req,res,deps)
+// pattern). The default export wires exactly these; authorization + production imports are never weakened.
+const DEFAULT_DEPS = Object.freeze({
+  getDashboardAccess, assertAdmin, insertAuditLog, getSourceControls, getSourceRunStatuses, setSourceControl,
+  getAccountDirectoryRows, getAccountOliQualityCounts, primaryOrganizationFingerprint, buildBucketSourceSyncRuntime,
+  isAdsRegistryKeyRetired,
+});
 
 const RATE = new Map();
 // A completed manual sync is a POLLED CONTINUATION flow (the UI re-POSTs the same operation until terminal), so
@@ -39,7 +50,8 @@ function bodyFor(req) {
   return req.body;
 }
 
-async function statusPayload() {
+async function statusPayload(deps = DEFAULT_DEPS) {
+  const { getSourceControls, getSourceRunStatuses, getAccountDirectoryRows, getAccountOliQualityCounts, primaryOrganizationFingerprint, buildBucketSourceSyncRuntime } = deps;
   const [controls, statuses] = await Promise.all([getSourceControls(), getSourceRunStatuses()]);
   // Finding 8: dashboard readiness comes from AUTHORITATIVE per-account durable evidence (coverage /
   // snapshot freshness / per-account Ads windows), gathered per bucket from the account directory --
@@ -91,13 +103,13 @@ async function statusPayload() {
   };
 }
 
-export default async function handler(req, res) {
+export async function handler(req, res, deps = DEFAULT_DEPS) {
   try {
-    const access = await getDashboardAccess(req);
-    assertAdmin(access);
+    const access = await deps.getDashboardAccess(req);
+    deps.assertAdmin(access);
 
     if (req.method === "GET") {
-      res.status(200).json(await statusPayload());
+      res.status(200).json(await statusPayload(deps));
       return;
     }
 
@@ -109,6 +121,14 @@ export default async function handler(req, res) {
         res.status(400).json({ error: "Unknown source." });
         return;
       }
+      // ATOMIC ADS CUTOVER -- retired-source refusal at the API BOUNDARY, immediately after the source key is
+      // parsed + validated and BEFORE setSourceControl / insertAuditLog / statusPayload (or any other write). A
+      // forged PATCH on the retired ASIN grain can never mutate its hidden control. Runtime-level guards remain
+      // (SOURCE_ACTION_ADS_ARCHITECTURE + the ads-sync export guard) as defense in depth.
+      if (deps.isAdsRegistryKeyRetired(sourceKey)) {
+        res.status(409).json({ error: "SOURCE_RETIRED", sourceKey, message: "This source is retained only for rollback and cannot be operated while Campaign Ads is active." });
+        return;
+      }
       // Finding 8: `paused` must be an ACTUAL boolean. A missing/malformed value must never coerce into a
       // silent resume (false) -- it is a 400 with ZERO writes (no control write, no audit row).
       if (typeof body.paused !== "boolean") {
@@ -116,13 +136,13 @@ export default async function handler(req, res) {
         return;
       }
       const paused = body.paused;
-      await setSourceControl({ sourceKey, paused, updatedBy: access.userId });
-      await insertAuditLog({
+      await deps.setSourceControl({ sourceKey, paused, updatedBy: access.userId });
+      await deps.insertAuditLog({
         actorUserId: access.userId,
         action: paused ? "source.paused" : "source.resumed",
         target: { sourceKey },
       });
-      res.status(200).json(await statusPayload());
+      res.status(200).json(await statusPayload(deps));
       return;
     }
 
@@ -143,6 +163,15 @@ export default async function handler(req, res) {
           return;
         }
       }
+      // ATOMIC ADS CUTOVER -- retired-source refusal at the API BOUNDARY, immediately after the source key is
+      // parsed + validated and BEFORE runtime construction / preflightEvidence / coverage reads / discovery /
+      // audit writes / any DataDoe / token-or-create activity. A forged POST on the retired ASIN grain can never
+      // reach the sync path. Runtime-level guards remain (SOURCE_ACTION_ADS_ARCHITECTURE + the ads-sync export
+      // guard) as defense in depth.
+      if (onlySourceKey && deps.isAdsRegistryKeyRetired(onlySourceKey)) {
+        res.status(409).json({ error: "SOURCE_RETIRED", sourceKey: onlySourceKey, message: "This source is retained only for rollback and cannot be operated while Campaign Ads is active." });
+        return;
+      }
 
       // ---------------- FBA Shipment Plan sync (fba-inventory-health / US Listings-AWD) ----------------
       // The FBA source cards run the SHARED, decoupled fba-plan operation core -- the SAME deadline-aware,
@@ -154,14 +183,14 @@ export default async function handler(req, res) {
       // scheduled fallback -- a zero-create idempotent no-op (never a duplicate export or double-spent token), and
       // an FBA failure NEVER touches Daily Reporting / Brand View (separate cycle namespace + control envelope).
       if (onlySourceKey && isFbaOperationSource(onlySourceKey)) {
-        const fbaDeadline = buildBucketSourceSyncRuntime().makeDeadline();
+        const fbaDeadline = deps.buildBucketSourceSyncRuntime().makeDeadline();
         // Audit BEFORE any execution write, bounded by the same route budget (a duplicate audit row on a retry is
         // harmless; an unaudited execution is not).
-        await fbaDeadline.bound("audit-write", (signal) => insertAuditLog({
+        await fbaDeadline.bound("audit-write", (signal) => deps.insertAuditLog({
           actorUserId: access.userId, action: "source.sync.missing", target: { bucket, sourceKey: onlySourceKey, family: "fba-plan" },
         }, { signal }), { write: true });
         const boundedStatusFn = async (dl) => {
-          try { return await dl.bound("status-reads", () => statusPayload()); }
+          try { return await dl.bound("status-reads", () => statusPayload(deps)); }
           catch (error) { if (error && error.code === "ROUTE_DEADLINE_EXCEEDED") return { unavailable: "ROUTE_DEADLINE_EXCEEDED" }; throw error; }
         };
         const operator = access.userId ? "admin:" + String(access.userId) : "admin:data-sync-center";
@@ -172,7 +201,7 @@ export default async function handler(req, res) {
         try {
           // Respect an explicit source pause (parity with the OLI path): an admin who paused this FBA source must
           // not have it synced. Fail closed on an unreadable control table (never a silent create).
-          const controlsRead = await fbaDeadline.bound("controls-read", () => getSourceControls());
+          const controlsRead = await fbaDeadline.bound("controls-read", () => deps.getSourceControls());
           if (controlsRead && controlsRead.read !== "ok") throw Object.assign(new Error("source controls unavailable (migration/read)"), { status: 503 });
           const pausedSet = new Set((controlsRead.rows || []).filter((r) => r.paused === true).map((r) => r.source_key));
           if (pausedSet.has(onlySourceKey)) {
@@ -225,7 +254,7 @@ export default async function handler(req, res) {
       // and executed, and execution consumes the ONE memoized bundle (no repeated discovery/reads).
       // Round-5 blocker 4: the ONE route-owned deadline is created BEFORE preflight, so preflight time
       // counts against the same route budget that bounds execution.
-      const runtime = buildBucketSourceSyncRuntime();
+      const runtime = deps.buildBucketSourceSyncRuntime();
       const deadline = runtime.makeDeadline();
       const preflight = await runtime.preflightEvidence({ bucket, sourceKey: onlySourceKey, deadline });
       // Round-6 fix 4: the AUDIT WRITE is bounded by the SAME route budget and carries the route's
@@ -233,7 +262,7 @@ export default async function handler(req, res) {
       // IN-FLIGHT expiry means the audit row MAY have committed (commitUnknown) -- in both cases the
       // action is refused typed BEFORE any execution write (a duplicate audit row on retry is harmless;
       // an unaudited execution is not).
-      await deadline.bound("audit-write", (signal) => insertAuditLog({
+      await deadline.bound("audit-write", (signal) => deps.insertAuditLog({
         actorUserId: access.userId,
         action: "source.sync.missing",
         target: { bucket, sourceKey: onlySourceKey },
@@ -242,7 +271,7 @@ export default async function handler(req, res) {
       // single-family tranche composition / the durable-Ads runner) or refuses TYPED; finding 3: the runtime
       // enforces a real serverless deadline with reserve headroom and returns a typed-resumable rollup.
       //
-      // ORCHESTRATED sources (OLI / ads-asin-date / product-catalog) get the FULL trusted flow: sync the ONE
+      // ORCHESTRATED sources (OLI / ads-campaign-date / product-catalog) get the FULL trusted flow: sync the ONE
       // selected source, then derive + publish every affected dashboard from the SAME persisted evidence via the
       // shared release engine (open controls -> publish via freshness CAS -> ALWAYS safe-close per slice -> exact
       // live read-back). One request runs ONE bounded slice; `operation.continuationRequired` tells the UI to
@@ -252,7 +281,7 @@ export default async function handler(req, res) {
       // the refresh to a TYPED unavailable marker -- the action result itself is still reported honestly.
       const boundedStatusFn = async (dl) => {
         try {
-          return await dl.bound("status-reads", () => statusPayload());
+          return await dl.bound("status-reads", () => statusPayload(deps));
         } catch (error) {
           if (error && error.code === "ROUTE_DEADLINE_EXCEEDED") return { unavailable: "ROUTE_DEADLINE_EXCEEDED" };
           throw error;
@@ -352,3 +381,7 @@ export default async function handler(req, res) {
     res.status(error?.status || 500).json({ error: error?.message || "Source-control request failed." });
   }
 }
+
+// Vercel serverless entry: the production handler wired to the real collaborators (DEFAULT_DEPS). This adds NO new
+// api/*.js function -- it is the same single endpoint, now with the established handler(req, res, deps) test seam.
+export default function (req, res) { return handler(req, res); }
