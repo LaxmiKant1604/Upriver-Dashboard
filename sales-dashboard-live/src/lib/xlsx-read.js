@@ -100,7 +100,10 @@ function parseSheet(xml, shared) {
   let rm;
   while ((rm = rowRe.exec(xml))) {
     const cells = [];
-    const cRe = /<c\b([^>]*)(?:\/>|>([\s\S]*?)<\/c>)/g;
+    // Non-greedy attrs so a self-closing empty cell (<c r="H1"/>) does NOT let its attrs consume the trailing "/" and
+    // then swallow the NEXT cell's content up to the first </c>. Greedy [^>]* mis-parsed an empty cell followed by a
+    // non-empty one (dropping the non-empty value); [^>]*? stops at the first "/>" or ">", parsing each cell exactly.
+    const cRe = /<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g;
     let cm;
     while ((cm = cRe.exec(rm[1]))) {
       const attrs = cm[1] || "";

@@ -6,7 +6,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { RefreshCw, Search, Download, Upload, Megaphone } from "lucide-react";
 import { fmtMoney, fmtRate, compactNumber } from "../lib/format.js";
-import { downloadCsv } from "../lib/csv.js";
+import { downloadCsvMatrix } from "../lib/csv.js";
+import { buildCampaignMappingMatrix, validateCampaignMappingRows, validateCampaignMappingText } from "../lib/campaign-mapping-import.js";
 import { DataQualityAlert, EmptyState, SegmentedControl, SkeletonMetricGrid } from "../components/ui.jsx";
 
 const S = (v) => (v == null ? "" : String(v));
@@ -18,7 +19,6 @@ function authFetch(path, token, options = {}) {
   return fetch(path, { ...options, headers: { Authorization: `Bearer ${token}`, ...(options.body ? { "Content-Type": "application/json" } : {}), ...(options.headers || {}) } });
 }
 
-const BULK_COLUMNS = ["account", "marketplace", "ads_profile_id", "campaign_id", "campaign_name", "campaign_type", "campaign_status", "current_brand", "new_brand", "action", "note", "last_synced_at"];
 
 export default function CampaignAds({ accountId, accountName, selectedBrand = "ALL", accessToken, isAdmin = false }) {
   const [data, setData] = useState(null);
@@ -94,42 +94,67 @@ export default function CampaignAds({ accountId, accountName, selectedBrand = "A
     await load();
   }, [canEdit, accountId, accessToken, load]);
 
-  const downloadTemplate = useCallback(() => {
-    const rows = [BULK_COLUMNS];
-    for (const c of data?.campaigns || []) {
-      rows.push([accountId, c.marketplace, c.adsProfileId, c.campaignId, c.campaignName, c.campaignType, c.campaignStatus, c.brandDisplay || "", "", "", "", c.lastObservedDate || ""]);
-    }
-    downloadCsv(rows, `campaign-brand-mapping-${S(accountName || accountId).replace(/[^a-z0-9]+/gi, "-")}.csv`);
-  }, [data, accountId, accountName]);
+  const baseName = useCallback(() => `campaign-brand-mapping-${S(accountName || accountId).replace(/[^a-z0-9]+/gi, "-")}`, [accountName, accountId]);
+
+  // XLSX is the RECOMMENDED template: account/marketplace/ads_profile_id/campaign_id are written as inline (text)
+  // cells so Excel keeps long identifiers byte-for-byte instead of converting them to scientific notation. Every cell
+  // in the matrix is already a string (buildCampaignMappingMatrix), and the writer emits a string as an inline-string
+  // (text) cell -- so no numFmt/styles are needed and the shared xlsx.js writer is reused unchanged.
+  const downloadTemplate = useCallback(async () => {
+    const matrix = buildCampaignMappingMatrix({ accountId, campaigns: data?.campaigns || [] });
+    const { buildXlsx } = await import("../lib/xlsx.js");
+    const bytes = buildXlsx([{ name: "Campaign Mapping", rows: matrix, freezeHeaderRows: 1 }]);
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+    const link = document.createElement("a");
+    link.href = url; link.download = `${baseName()}.xlsx`; link.click();
+    URL.revokeObjectURL(url);
+  }, [data, accountId, baseName]);
+
+  // CSV remains available, but the FIRST row is now the real header exactly once (downloadCsvMatrix, never object-key
+  // inference), with the BOM + formula-injection protection preserved. It is NOT recommended: Excel can silently
+  // convert long campaign_id/ads_profile_id values to scientific notation and lose digits -- the importer rejects such
+  // files with a clear message. No unsafe ="..." executable formula is ever used.
+  const downloadTemplateCsv = useCallback(() => {
+    const matrix = buildCampaignMappingMatrix({ accountId, campaigns: data?.campaigns || [] });
+    downloadCsvMatrix(matrix, `${baseName()}.csv`);
+    setNotice({ tone: "warning", msg: "CSV downloaded. Excel can convert long campaign IDs to scientific notation and lose digits — the XLSX template is recommended and keeps IDs exact." });
+  }, [data, accountId, baseName]);
 
   const onImportFile = useCallback(async (file) => {
     if (!file || !canEdit) return;
     setNotice(null);
     try {
-      let matrix;
-      if (/\.xlsx$/i.test(file.name)) { const { readXlsxFirstSheet } = await import("../lib/xlsx-read.js"); matrix = await readXlsxFirstSheet(await file.arrayBuffer()); }
-      else { matrix = (await file.text()).split(/\r?\n/).filter((l) => l.trim()).map((l) => l.split(",").map((x) => x.replace(/^"|"$/g, "").trim())); }
-      if (!matrix || matrix.length < 2) { setNotice({ tone: "warning", msg: "The file has no data rows." }); return; }
-      const head = matrix[0].map((h) => S(h).trim().toLowerCase());
-      const idx = (name) => head.indexOf(name);
-      const iCamp = idx("campaign_id"), iMkt = idx("marketplace"), iProf = idx("ads_profile_id"), iNew = idx("new_brand"), iNote = idx("note"), iAction = idx("action");
-      if (iCamp < 0 || iMkt < 0) { setNotice({ tone: "error", msg: "The file must include at least campaign_id and marketplace columns." }); return; }
-      const rows = [];
-      for (const r of matrix.slice(1)) {
-        const action = (iAction >= 0 ? S(r[iAction]) : "").trim().toUpperCase();
-        const newBrand = iNew >= 0 ? S(r[iNew]).trim() : "";
-        // Only rows with an explicit new_brand or a CLEAR action are applied; blank/no-action rows are ignored.
-        if (!newBrand && action !== "CLEAR") continue;
-        rows.push({ campaignId: S(r[iCamp]).trim(), marketplace: S(r[iMkt]).trim(), adsProfileId: iProf >= 0 ? S(r[iProf]).trim() : "", brand: action === "CLEAR" ? "" : newBrand, note: iNote >= 0 ? S(r[iNote]).trim() : "" });
+      // Parse to string[][] then run the ONE shared validator (CSV, TSV and XLSX all feed it). The RFC4180 parser
+      // handles the BOM, quoted commas, escaped quotes, CRLF/LF and blank trailing cells; the XLSX reader yields the
+      // same shape. A legacy 0,1,2... index row above the real header is skipped by the validator's header detection.
+      let result;
+      if (/\.xlsx$/i.test(file.name)) {
+        const { readXlsxFirstSheet } = await import("../lib/xlsx-read.js");
+        result = validateCampaignMappingRows(await readXlsxFirstSheet(await file.arrayBuffer()));
+      } else {
+        result = validateCampaignMappingText(await file.text());
       }
-      if (!rows.length) { setNotice({ tone: "warning", msg: "No rows to apply (fill new_brand or set action=CLEAR)." }); return; }
-      const resp = await authFetch("/api/campaign-brand-mapping", accessToken, { method: "POST", body: JSON.stringify({ kind: "bulk", accountId, rows }) });
+      const p = result.preview || {};
+      const previewLine = `Preview: ${p.total || 0} data row(s) — ${p.assign || 0} to assign, ${p.clear || 0} to clear, ${p.ignored || 0} unchanged, ${p.invalid || 0} invalid.`;
+      // All-or-nothing at the client too: any invalid row (or a missing header, or Excel-damaged IDs) -> zero API
+      // calls, zero writes, with the exact reason.
+      if (!result.ok) {
+        if (result.missingHeader) { setNotice({ tone: "error", msg: result.message }); return; }
+        if (result.nothingToApply) { setNotice({ tone: "warning", msg: previewLine + " " + result.message }); return; }
+        const reasons = (result.errors || []).slice(0, 5).map((e) => `line ${e.line}: ${e.reason}`).join("; ");
+        setNotice({ tone: "error", msg: `${result.message} ${previewLine}${reasons ? " [" + reasons + "]" : ""}` });
+        return;
+      }
+      const resp = await authFetch("/api/campaign-brand-mapping", accessToken, {
+        method: "POST",
+        body: JSON.stringify({ kind: "bulk", accountId, rows: result.applyRows.map((r) => ({ campaignId: r.campaignId, marketplace: r.marketplace, adsProfileId: r.adsProfileId, brand: r.brand, note: r.note })) }),
+      });
       const b = await resp.json().catch(() => ({}));
       if (!resp.ok) { setNotice({ tone: "error", msg: b.error || "Bulk mapping failed; nothing was written." }); return; }
-      setNotice({ tone: "success", msg: `Applied ${b.applied || rows.length} mapping(s).` });
+      setNotice({ tone: "success", msg: `Applied ${b.applied || result.applyRows.length} mapping(s). ${previewLine}` });
       await load();
     } catch (e) { setNotice({ tone: "error", msg: e.message || "Could not read the file." }); }
-    finally { if (fileRef.current) fileRef.current.value = ""; }
+    finally { if (fileRef.current) fileRef.current.value = ""; } // reset so the same corrected file can be re-selected
   }, [canEdit, accountId, accessToken, load]);
 
   const money = (v) => (v == null ? "—" : fmtMoney(v, currency || "USD"));
@@ -170,7 +195,8 @@ export default function CampaignAds({ accountId, accountName, selectedBrand = "A
         </div>
         <span className="chip-row" style={{ gap: 8 }}>
           <button type="button" className="plan-tool-btn" onClick={load} disabled={loading} title="Reload saved data (no export)"><RefreshCw size={14} className={loading ? "spin" : ""} aria-hidden="true" /> Reload</button>
-          <button type="button" className="plan-tool-btn" onClick={downloadTemplate} disabled={!data?.campaigns?.length}><Download size={15} aria-hidden="true" /> Download mapping</button>
+          <button type="button" className="plan-tool-btn" onClick={downloadTemplate} disabled={!data?.campaigns?.length} title="Recommended: keeps long campaign IDs exact"><Download size={15} aria-hidden="true" /> Download mapping (XLSX)</button>
+          <button type="button" className="plan-tool-btn" onClick={downloadTemplateCsv} disabled={!data?.campaigns?.length} title="CSV — Excel can damage long IDs; use the XLSX template instead">CSV</button>
           {canEdit && <>
             <button type="button" className="plan-tool-btn" onClick={() => fileRef.current && fileRef.current.click()}><Upload size={15} aria-hidden="true" /> Bulk map</button>
             <input ref={fileRef} type="file" accept=".csv,.tsv,.xlsx,text/csv" style={{ display: "none" }} onChange={(e) => onImportFile(e.target.files && e.target.files[0])} />

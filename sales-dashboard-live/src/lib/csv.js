@@ -21,6 +21,30 @@ export function csvText(exportRows) {
     .join("\r\n");
 }
 
+/**
+ * Serialize a MATRIX (array of arrays -- rows of cells, the FIRST row being the header exactly once) to an
+ * Excel-compatible CSV. Same BOM + formula-injection protection as csvText, but the caller controls the exact header
+ * row, so no object-key inference can ever emit a 0,1,2... numeric-index header. Use this for a fixed-schema template.
+ */
+export function csvMatrixText(matrix) {
+  const rows = Array.isArray(matrix) ? matrix : [];
+  if (!rows.length) return "";
+  return "﻿" + rows.map((row) => (Array.isArray(row) ? row : [row]).map(csvCell).join(",")).join("\r\n");
+}
+
+/** Download a MATRIX (array of arrays) as an Excel-compatible CSV. Returns false when empty. */
+export function downloadCsvMatrix(matrix, filename) {
+  const rows = Array.isArray(matrix) ? matrix : [];
+  if (!rows.length) return false;
+  const url = URL.createObjectURL(new Blob([csvMatrixText(matrix)], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+  return true;
+}
+
 export function slug(value, fallback = "account") {
   const text = String(value || "")
     .replace(/[^a-z0-9]+/gi, "-")
