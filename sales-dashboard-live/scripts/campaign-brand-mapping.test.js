@@ -298,6 +298,28 @@ test("R-BRANDS. the available-brands endpoint returns trusted brands ONLY to an 
   passed += 1;
 });
 
+test("R-BRANDS-SCOPE. a SELECTED_BRANDS mapper sees ONLY granted brands; admin/ALL_BRANDS see the full trusted set", async () => {
+  // Account A trusts {acme, bravo}. A capability-holding member restricted to {acme} must NOT receive 'bravo'.
+  const restrictedAccess = { userId: "u1", email: "u@x", role: "member", accountIds: ["A"], accountGrants: { A: { mode: "SELECTED_BRANDS", brandKeys: ["acme"] } } };
+  const restricted = makeDeps({ caps: { u1: new Set(["A"]) }, access: restrictedAccess });
+  let res = fakeRes();
+  await handler({ method: "GET", query: { action: "brands", accountId: "A" } }, res, restricted.deps);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body.brands.map((b) => b.key), ["acme"], "forbidden brand 'bravo' is ABSENT from the mapping dropdown");
+  // An explicit ALL_BRANDS grant (capability-holding member) still sees every trusted brand.
+  const allAccess = { userId: "u1", email: "u@x", role: "member", accountIds: ["A"], accountGrants: { A: { mode: "ALL_BRANDS", brandKeys: null } } };
+  const allb = makeDeps({ caps: { u1: new Set(["A"]) }, access: allAccess });
+  res = fakeRes();
+  await handler({ method: "GET", query: { action: "brands", accountId: "A" } }, res, allb.deps);
+  assert.equal(res.statusCode, 200); assert.deepEqual(res.body.brands.map((b) => b.key), ["acme", "bravo"], "ALL_BRANDS unchanged");
+  // Admin bypasses the capability gate AND is unrestricted.
+  const admin = makeDeps({ caps: {}, access: { userId: "adm", role: "admin", accountIds: ["A"], accountGrants: {} } });
+  res = fakeRes();
+  await handler({ method: "GET", query: { action: "brands", accountId: "A" } }, res, admin.deps);
+  assert.equal(res.statusCode, 200); assert.deepEqual(res.body.brands.map((b) => b.key), ["acme", "bravo"], "admin unrestricted");
+  passed += 1;
+});
+
 /* ================= (3) MIGRATION static invariants + (20/23/24) structure ================= */
 
 const MIG = readFileSync(join(ROOT, "supabase/migrations/20260915_campaign_brand_mapping.sql"), "utf8");

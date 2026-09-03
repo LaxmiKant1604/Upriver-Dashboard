@@ -64,6 +64,7 @@ const SUITES = [
   "test:sku-movement-import",
   "test:sku-movement-rederive",
   "test:brand-authorization",
+  "test:brand-scope-filter",
   "test:access-brand-scope",
   "test:report-registry-coverage",
   "test:returns-durable",

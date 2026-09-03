@@ -168,7 +168,20 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
       const action = S(req.query.action).trim() || "campaigns";
       if (action === "brands") {
         const trusted = await deps.getTrustedAccountBrands({ accountId }).catch(() => { throw new DashboardAccessError("Trusted brands are temporarily unavailable; please retry.", 503); });
-        res.status(200).json({ brands: (trusted || []).map((b) => ({ key: b.key, display: b.display || b.key })) });
+        const list = Array.isArray(trusted) ? trusted : [];
+        // BRAND-SCOPE: the mapping brand dropdown must obey the caller's grant exactly like the `view` action's
+        // resolveScope -- a SELECTED_BRANDS user (even one holding the mapping capability) may only see brands they
+        // are granted, intersected with the account's trusted membership. Admin / ALL_BRANDS -> full trusted set.
+        // This closes a forbidden-brand-name disclosure via the mapping endpoint (never trust a browser-supplied brand).
+        let visible = list;
+        if (access.role !== "admin") {
+          const grant = access.accountGrants ? access.accountGrants[accountId] : null;
+          if (grant && grant.mode === "SELECTED_BRANDS") {
+            const permitted = new Set((grant.brandKeys || []).map((k) => brandKey(k)).filter(Boolean));
+            visible = list.filter((b) => permitted.has(brandKey(b.key)));
+          }
+        }
+        res.status(200).json({ brands: visible.map((b) => ({ key: b.key, display: b.display || b.key })) });
         return;
       }
       if (action === "mappings") {

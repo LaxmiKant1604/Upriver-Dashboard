@@ -34,6 +34,7 @@ import {
 import { validateWarehouseImport, validateWarehouseRows, buildImportTemplateCsv, IMPORT_COLUMNS } from "./lib/warehouse-import.js";
 import { matchesPlanBrand, UNMAPPED_BRAND } from "./lib/plan-brand.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
+import { canonicalBrandKey, permittedBrandKeySetForAccount, filterBrandNamesToPermitted } from "./lib/brand-scope-filter.js";
 import SalesMovers from "./views/SalesMovers.jsx";
 import SkuMovement from "./views/SkuMovement.jsx";
 import DailyReporting from "./views/DailyReporting.jsx";
@@ -1576,12 +1577,11 @@ function usePrefersReducedMotion() {
 // The account dashboard and Brand View both read this same cache shape.  It
 // intentionally considers only brand-sales rows, never broad catalog metadata,
 // so a brand cannot appear under an account where it has not been observed.
-// The CANONICAL brand-key for MATCHING -- MUST mirror lib/server/reports/brand-membership.js#brandKey so the
-// frontend selects the same brand the server keyed its directory/membership map by: trim, collapse repeated
-// interior whitespace to one space, lowercase. Punctuation preserved (punctuation-distinct brands stay separate).
+// The CANONICAL brand-key for MATCHING -- delegates to the shared pure helper (src/lib/brand-scope-filter.js), which
+// MUST mirror lib/server/reports/brand-membership.js#brandKey so the frontend selects the same brand the server keyed
+// its directory/membership map by: trim, collapse interior whitespace, lowercase. Punctuation preserved.
 function brandKey(value) {
-  const t = String(value == null ? "" : value).trim().replace(/\s+/g, " ").toLowerCase();
-  return t || null;
+  return canonicalBrandKey(value);
 }
 
 function cachedBrandsForAccount(accountId) {
@@ -3485,9 +3485,16 @@ function DashboardApp({ session, access, onSignOut }) {
     // account. Only rows whose account was selected contribute a brand.
     const currentRowBrands = rows.map(productBrand).filter((brand) => brand !== "Unassigned");
     const currentSnapshotBrands = catalogBrandsAccountId === selectedAccountId ? catalogBrands : [];
-    const names = new Set([...cachedAccountBrands, ...currentSnapshotBrands, ...currentRowBrands]);
-    return [...names].sort((a, b) => a.localeCompare(b));
-  }, [cachedAccountBrands, catalogBrands, catalogBrandsAccountId, rows, selectedAccountId]);
+    let names = [...new Set([...cachedAccountBrands, ...currentSnapshotBrands, ...currentRowBrands])];
+    // BRAND-SCOPE (defense-in-depth; the server is the security boundary). The three sources above include CLIENT
+    // caches (localStorage brand-sales rows) and still-in-memory payloads that, for a stale/pre-restriction cache or
+    // an in-session grant narrowing not yet re-fetched, can contain a brand this user is NOT granted. Never OFFER
+    // such a name: filter the selector to the account's permitted keys (null = admin/ALL_BRANDS -> unchanged). The
+    // server still projects every payload + 403s a forbidden request, so data is safe regardless; this closes the
+    // selector-label leak.
+    names = filterBrandNamesToPermitted(names, permittedBrandKeySetForAccount(access, selectedAccountId));
+    return names.sort((a, b) => a.localeCompare(b));
+  }, [cachedAccountBrands, catalogBrands, catalogBrandsAccountId, rows, selectedAccountId, access]);
   // BRAND-SCOPE (frontend UX; the server is the security boundary): is the selected account brand-limited for this
   // user? The served brand list is ALREADY projected to permitted brands server-side, so this only drives the label
   // + single-brand auto-select.
@@ -3501,11 +3508,32 @@ function DashboardApp({ session, access, onSignOut }) {
     if (brandRestricted && brandList.length === 1 && selectedBrand === "ALL") setSelectedBrand(brandList[0]);
   }, [brandRestricted, brandList, selectedBrand]);
   const portfolioBrandList = useMemo(() => {
+    // The server-projected brand-directory (brandDirectoryBrands) is already limited to the user's permitted brands
+    // across their accounts. The per-account localStorage caches, however, are NOT re-projected, so filter each
+    // account's contribution to THAT account's permitted keys (null = unrestricted -> unchanged).
     const names = new Set(brandDirectoryBrands);
-    accounts.forEach((account) => cachedBrandsForAccount(account.id).forEach((brand) => names.add(brand)));
+    accounts.forEach((account) => {
+      const permitted = permittedBrandKeySetForAccount(access, account.id);
+      filterBrandNamesToPermitted(cachedBrandsForAccount(account.id), permitted).forEach((brand) => names.add(brand));
+    });
     if (selectedPortfolioBrand) names.add(selectedPortfolioBrand);
-    return [...names].sort((a, b) => a.localeCompare(b));
-  }, [accounts, selectedPortfolioBrand, brandDirectoryBrands, brandDirectoryVersion, rows]);
+    // Defense-in-depth: when EVERY in-scope account is brand-restricted (no admin, no ALL_BRANDS account), the
+    // portfolio selector can only legitimately offer the UNION of permitted brands -- constrain it so a stale
+    // directory cache or a previously-selected forbidden brand can never surface. If ANY account is unrestricted the
+    // portfolio may legitimately span all brands those accounts sell, so no union constraint is applied.
+    let out = [...names];
+    if (!isAdmin && accounts.length) {
+      const unionKeys = new Set();
+      let anyUnrestricted = false;
+      for (const account of accounts) {
+        const permitted = permittedBrandKeySetForAccount(access, account.id);
+        if (!permitted) { anyUnrestricted = true; break; }
+        permitted.forEach((k) => unionKeys.add(k));
+      }
+      if (!anyUnrestricted) out = out.filter((b) => unionKeys.has(canonicalBrandKey(b)));
+    }
+    return out.sort((a, b) => a.localeCompare(b));
+  }, [accounts, selectedPortfolioBrand, brandDirectoryBrands, brandDirectoryVersion, rows, access, isAdmin]);
   function filterRows(from, to) {
     return brandRows.filter((r) => r.date >= from && r.date <= to);
   }
@@ -5091,10 +5119,25 @@ export default function App() {
     if (!session?.access_token) { setAccess(null); return; }
     let active = true;
     setAccess(null); setAccessError("");
-    authFetch("/api/access?action=me", session.access_token)
+    const loadAccess = (initial) => authFetch("/api/access?action=me", session.access_token)
       .then((body) => { if (active) setAccess(body.access); })
-      .catch((error) => { if (active) setAccessError(error.message || "Unable to load dashboard access."); });
-    return () => { active = false; };
+      .catch((error) => { if (active && initial) setAccessError(error.message || "Unable to load dashboard access."); });
+    loadAccess(true);
+    // BRAND-SCOPE cache-invalidation: an admin can narrow a user's account/brand grants while that user's tab stays
+    // open. Re-fetch the authoritative access on focus / tab-visible so a mid-session grant change is picked up
+    // WITHOUT a manual reload: setAccess with the new grants changes the access fingerprint, which fires the
+    // DashboardApp purge effect (clears localStorage + IndexedDB report caches) and re-resolves every brand selector
+    // from the newly authorized grants. Server requests are always projected regardless; this closes the display
+    // window where an already-open session could still show removed brand names. A refetch failure keeps the current
+    // access (never blanks a working session on a transient network blip).
+    const revalidate = () => { if (active && (typeof document === "undefined" || document.visibilityState === "visible")) loadAccess(false); };
+    window.addEventListener("focus", revalidate);
+    if (typeof document !== "undefined") document.addEventListener("visibilitychange", revalidate);
+    return () => {
+      active = false;
+      window.removeEventListener("focus", revalidate);
+      if (typeof document !== "undefined") document.removeEventListener("visibilitychange", revalidate);
+    };
   }, [session?.access_token]);
 
   const signOut = useCallback(async () => {
