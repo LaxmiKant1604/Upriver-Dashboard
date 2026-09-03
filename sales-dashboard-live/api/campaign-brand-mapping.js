@@ -116,20 +116,25 @@ async function handleView(req, res, deps, access, accountId) {
   } catch (_e) { throw new DashboardAccessError("Campaign Ads evidence is temporarily unavailable; please retry.", 503); }
   const rows = durableRows || [];
 
-  // The account's PROVEN coverage from the source date strings (verbatim, no UTC shift): earliest + latest observed
-  // Campaign date. Every client date window (7D/14D/30D/custom) anchors on `latestProvenDate`, never the browser's clock.
-  let minDate = null; let latestProvenDate = null;
-  for (const r of rows) {
-    const d = String((r && r.metric_date) || (r && r.dimensions && r.dimensions.date) || "").slice(0, 10);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
-    if (!minDate || d < minDate) minDate = d;
-    if (!latestProvenDate || d > latestProvenDate) latestProvenDate = d;
-  }
   // Build the view over FULL durable history (from=null,to=null): each campaign carries its COMPLETE per-day breakdown
   // (`daily`) so the browser re-windows 7D/14D/30D/custom (within coverage) with ZERO refetch + ZERO DataDoe tokens, and
   // the Brand Mapping tab still sees every recent campaign identity (never truncated by the selected window).
   const view = buildCampaignAdsView({ durableRows: rows, mappingRows: mappingRows || [], from: null, to: null });
   const projected = projectCampaignsForScope(view.campaigns, scope);
+
+  // PROVEN coverage from the source date strings (verbatim, no UTC shift) of the AUTHORIZED campaigns only: a
+  // brand-restricted viewer's windows anchor on the latest date among THEIR permitted campaigns, never an account-wide
+  // date they cannot otherwise see. Every client date window (7D/14D/30D/custom) anchors on `latestProvenDate`, never
+  // the browser's clock.
+  let minDate = null; let latestProvenDate = null;
+  for (const c of projected) {
+    for (const d of Array.isArray(c.daily) ? c.daily : []) {
+      const date = String(d && d[0] || "").slice(0, 10);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+      if (!minDate || date < minDate) minDate = date;
+      if (!latestProvenDate || date > latestProvenDate) latestProvenDate = date;
+    }
+  }
   // Full summary for an unrestricted view; scoped to the projected (permitted) campaigns for a restricted viewer so
   // account/Unmapped totals never leak another brand's spend. (This is the all-loaded-history summary; the browser
   // re-summarizes per selected window from the per-campaign `daily` breakdown using the SAME formulas.)
@@ -145,7 +150,7 @@ async function handleView(req, res, deps, access, accountId) {
     coverage: { minDate, latestProvenDate },
     campaigns: projected,
     summary: summarizeCampaignAds(summaryView),
-    hasData: rows.length > 0,
+    hasData: projected.length > 0, // what THIS viewer is authorized to see (empty history / no permitted campaigns -> false)
   });
 }
 

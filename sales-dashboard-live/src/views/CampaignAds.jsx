@@ -308,14 +308,16 @@ export default function CampaignAds({ accountId, accountName, selectedBrand = "A
           {/* ---- PERFORMANCE TAB ---- */}
           {tab === "performance" && (
             <>
-              <div className="metric-grid ca-kpis">
-                {KPIS.map((k) => (
-                  <div className="metric-card" key={k.label}>
-                    <div className="metric-top"><div className="metric-label">{k.label}</div></div>
-                    <div className="metric-value">{k.value}</div>
-                  </div>
-                ))}
-              </div>
+              {hasWindowRows && kpi && (
+                <div className="metric-grid ca-kpis">
+                  {KPIS.map((k) => (
+                    <div className="metric-card" key={k.label}>
+                      <div className="metric-top"><div className="metric-label">{k.label}</div></div>
+                      <div className="metric-value">{k.value}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
               {!hasWindowRows ? (
                 <div className="panel" style={{ marginTop: 14 }}><EmptyState icon={<BarChart3 size={19} aria-hidden="true" />} title="No campaign activity in this window">No campaigns had activity in {rangeLabel}{currency ? ` (${currency})` : ""}. Nothing is fabricated — widen the date range.</EmptyState></div>
               ) : (
@@ -364,12 +366,14 @@ export default function CampaignAds({ accountId, accountName, selectedBrand = "A
           {/* ---- WASTED SPEND TAB ---- (same windowed rows, deterministic classification; no new backend report) */}
           {tab === "wasted" && (
             <>
+              {hasWindowRows && (
               <div className="metric-grid ca-kpis ca-waste-kpis">
                 <div className="metric-card ca-waste-card"><div className="metric-top"><div className="metric-label">Definite wasted spend</div></div><div className="metric-value ca-neg">{money(wasteCur.wastedSpend)}</div><div className="pt-meta">Spend with 0 ad sales · {waste.counts.zeroSales} campaign(s)</div></div>
                 <div className="metric-card ca-waste-card"><div className="metric-top"><div className="metric-label">Needs review</div></div><div className="metric-value ca-warn-ink">{money(wasteCur.reviewSpend)}</div><div className="pt-meta">{waste.counts.review} campaign(s) flagged</div></div>
                 <div className="metric-card"><div className="metric-top"><div className="metric-label">Clicks, no orders</div></div><div className="metric-value">{nInt(waste.counts.clicksNoOrders)}</div><div className="pt-meta">≥ {waste.thresholds.minClicksForReview} clicks, 0 orders</div></div>
                 <div className="metric-card"><div className="metric-top"><div className="metric-label">High ACoS / Low ROAS</div></div><div className="metric-value">{nInt(waste.counts.highAcos)} / {nInt(waste.counts.lowRoas)}</div><div className="pt-meta">ACoS &gt; 50% · ROAS &lt; 2.00</div></div>
               </div>
+              )}
               {!hasWindowRows ? (
                 <div className="panel" style={{ marginTop: 14 }}><EmptyState icon={<AlertTriangle size={19} aria-hidden="true" />} title="No campaign activity in this window">Nothing to evaluate for {rangeLabel}{currency ? ` (${currency})` : ""}.</EmptyState></div>
               ) : wasteRows.length === 0 ? (
