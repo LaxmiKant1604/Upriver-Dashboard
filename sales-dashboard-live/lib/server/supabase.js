@@ -698,12 +698,65 @@ export async function getFbaPlanningConfig({ organizationFingerprint, connection
   const base = { organization_fingerprint: `eq.${organizationFingerprint}`, connection_id: `eq.${connectionId}`, account_id: `eq.${accountId}` };
   const q = (extra) => new URLSearchParams({ ...base, ...extra }).toString();
   const safe = async (p) => { try { const r = await request(p, { signal }); return Array.isArray(r) ? r : []; } catch (e) { if (isSchemaMissingError(e)) return []; throw e; } };
-  const [settings, overrides, warehouse] = await Promise.all([
+  const [settings, overrides, warehouse, wddWeights, leadTimes] = await Promise.all([
     safe(`/rest/v1/fba_planning_settings?${q({ select: "horizon_kind,horizon_months,horizon_days,forecast_method,forecast_weights,safety_days,updated_at" })}`),
     safe(`/rest/v1/fba_sku_horizon_overrides?${q({ select: "sku,horizon_kind,horizon_months,horizon_days,updated_at" })}`),
     safe(`/rest/v1/fba_seller_warehouse?${q({ select: "marketplace,sku,child_asin,qty,note,updated_at,updated_by_email" })}`),
+    // ADDITIVE (Migration 22): the per-brand WDD blend weights + the per-ASIN lead-time / countdown inputs. A missing
+    // table (schema not yet applied) yields [] via `safe`, so an older deploy degrades to the existing planner cleanly.
+    safe(`/rest/v1/fba_wdd_weights?${q({ select: "brand_key,weight_7d,weight_30d,weight_60d,updated_at" })}`),
+    safe(`/rest/v1/fba_asin_lead_time?${q({ select: "child_asin,production_days,shipping_days,awd_transfer_days,safety_stock_days,inbound_started_date,inbound_eta,note,updated_at,updated_by_email" })}`),
   ]);
-  return { settings: settings[0] || null, overrides, warehouse };
+  return { settings: settings[0] || null, overrides, warehouse, wddWeights, leadTimes };
+}
+
+// ADDITIVE (Migration 22). One brand's WDD blend (or the account-default when brandKey is '') via the SECURITY DEFINER
+// RPC, which upserts (or deletes when action='clear') AND appends the audit row atomically. The 0..100 range + exact-100
+// total are enforced by the table CHECKs (a bad total raises -> nothing written).
+export async function recordFbaWddWeights({ organizationFingerprint, connectionId = "primary", accountId, brandKey = "", w7, w30, w60, action = "set", updatedBy = null }) {
+  const body = await request("/rest/v1/rpc/record_fba_wdd_weights", {
+    method: "POST",
+    body: {
+      p_organization_fingerprint: organizationFingerprint, p_connection_id: connectionId, p_account_id: accountId,
+      p_brand_key: brandKey || "", p_w7: w7 == null ? null : Number(w7), p_w30: w30 == null ? null : Number(w30),
+      p_w60: w60 == null ? null : Number(w60), p_action: action, p_updated_by: updatedBy,
+    },
+  });
+  return Array.isArray(body) ? body[0] : body;
+}
+
+// ADDITIVE (Migration 22). One ASIN's lead-time write via the SECURITY DEFINER RPC. action 'set' preserves any running
+// countdown; 'start' recomputes + stores the Inbound ETA (start + production + shipping + awd); 'clear' deletes the row.
+export async function recordFbaAsinLeadTime({ organizationFingerprint, connectionId = "primary", accountId, childAsin, production = null, shipping = null, awd = null, safety = null, note = "", action = "set", startedDate = null, updatedBy = null, updatedByEmail = "" }) {
+  const n = (v) => (v == null || v === "" ? null : Number(v));
+  const body = await request("/rest/v1/rpc/record_fba_asin_lead_time", {
+    method: "POST",
+    body: {
+      p_organization_fingerprint: organizationFingerprint, p_connection_id: connectionId, p_account_id: accountId, p_child_asin: childAsin,
+      p_production: n(production), p_shipping: n(shipping), p_awd: n(awd), p_safety: n(safety),
+      p_note: note || "", p_action: action, p_started_date: startedDate || null, p_updated_by: updatedBy, p_updated_by_email: updatedByEmail || "",
+    },
+  });
+  return Array.isArray(body) ? body[0] : body;
+}
+
+// ADDITIVE (Migration 22). Atomic BULK lead-time import for one account (all-or-nothing) via the SECURITY DEFINER RPC.
+// rows: [{ childAsin, production?, shipping?, awd?, safety?, inboundEta? }] -- a null/absent field is written as NULL
+// (blank-as-clear). Any invalid/duplicate row aborts the whole transaction.
+export async function recordFbaAsinLeadTimeBulk({ organizationFingerprint, connectionId = "primary", accountId, rows, updatedBy = null, updatedByEmail = "" }) {
+  const n = (v) => (v == null || v === "" ? null : Number(v));
+  const p_rows = (Array.isArray(rows) ? rows : []).map((r) => ({
+    child_asin: r.childAsin, production_days: n(r.production), shipping_days: n(r.shipping),
+    awd_transfer_days: n(r.awd), safety_stock_days: n(r.safety), inbound_eta: r.inboundEta || null,
+  }));
+  const body = await request("/rest/v1/rpc/record_fba_asin_lead_time_bulk", {
+    method: "POST",
+    body: {
+      p_organization_fingerprint: organizationFingerprint, p_connection_id: connectionId, p_account_id: accountId,
+      p_rows, p_updated_by: updatedBy, p_updated_by_email: updatedByEmail || "",
+    },
+  });
+  return Array.isArray(body) ? body[0] : body;
 }
 
 export async function setFbaPlanningSettings({ organizationFingerprint, connectionId = "primary", accountId, horizonKind, horizonMonths, horizonDays, forecastMethod, forecastWeights, safetyDays, updatedBy }) {

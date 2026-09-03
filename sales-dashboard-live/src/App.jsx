@@ -33,6 +33,9 @@ import {
 } from "./lib/fba-planning.js";
 import { validateWarehouseImport, validateWarehouseRows, buildImportTemplateCsv, IMPORT_COLUMNS } from "./lib/warehouse-import.js";
 import { matchesPlanBrand, UNMAPPED_BRAND } from "./lib/plan-brand.js";
+// ADDITIVE FBA WDD / lead-time / reorder model (sits BESIDE the existing planner; never replaces it).
+import { computeAsinWdd, resolveWddWeights, validateWddWeights, WDD_DEFAULT_WEIGHTS } from "./lib/fba-wdd.js";
+import { buildFbaLeadTimeMatrix, validateFbaLeadTimeRows, validateFbaLeadTimeText } from "./lib/fba-lead-time-import.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import { canonicalBrandKey, permittedBrandKeySetForAccount, filterBrandNamesToPermitted } from "./lib/brand-scope-filter.js";
 import SalesMovers from "./views/SalesMovers.jsx";
@@ -319,6 +322,8 @@ function comparePlanRows(a, b, key, dir) {
 // default" restores exactly this set; "Select all" reveals everything.
 const PLAN_DEFAULT_HIDDEN_COLS = ["reservedFcTransfer", "reservedFcProcessing", "inboundWorking", "inboundShipped", "inboundReceived"];
 const expNum = (v) => (v == null || !Number.isFinite(Number(v)) ? "" : Math.round(Number(v)));
+// ADDITIVE: 2-decimal display for WDD / daily averages (an em dash when unavailable, never a fabricated 0).
+const wnum2 = (v) => (v == null || !Number.isFinite(Number(v)) ? "—" : Number(v).toFixed(2));
 const PLAN_EXPORT_VALUES = {
   m1: (r) => expNum(r.monthsDisplay?.[0]), m2: (r) => expNum(r.monthsDisplay?.[1]), m3: (r) => expNum(r.monthsDisplay?.[2]),
   mtdUnits: (r) => expNum(r.mtdUnits), threeMoAvg: (r) => expNum(r.planning?.threeMonthAverage), mtdProjected: (r) => expNum(r.planning?.mtdProjectedUnits),
@@ -331,6 +336,14 @@ const PLAN_EXPORT_VALUES = {
   horizonDemand: (r) => expNum(r.planning?.horizonDemand), safety: (r) => expNum(r.planning?.safetyStockUnits), targetInv: (r) => expNum(r.planning?.targetInventory),
   sellerWh: (r) => expNum(r.planning?.sellerWarehouseQty), shipWh: (r) => expNum(r.planning?.shipFromSellerWarehouse), produce: (r) => expNum(r.planning?.productionRequirement),
   stockout: (r) => r.planning?.estimatedStockoutDate || "", priority: (r) => r.planning?.planningPriority || "", remark: (r) => r.remark || "",
+  // ADDITIVE WDD / lead-time / reorder columns (blank when unavailable/not configured, never a fabricated 0).
+  avg7: (r) => (r.wdd?.avg7 == null ? "" : Number(r.wdd.avg7).toFixed(2)), avg30: (r) => (r.wdd?.avg30 == null ? "" : Number(r.wdd.avg30).toFixed(2)), avg60: (r) => (r.wdd?.avg60 == null ? "" : Number(r.wdd.avg60).toFixed(2)),
+  wdd: (r) => (r.wdd?.wdd == null ? "" : Number(r.wdd.wdd).toFixed(2)),
+  ltProd: (r) => (r.wdd?.leadTime?.production == null ? "" : r.wdd.leadTime.production), ltShip: (r) => (r.wdd?.leadTime?.shipping == null ? "" : r.wdd.leadTime.shipping),
+  ltAwd: (r) => (r.wdd?.leadTime?.awd == null ? "" : r.wdd.leadTime.awd), ltSafety: (r) => (r.wdd?.leadTime?.safety == null ? "" : r.wdd.leadTime.safety),
+  ltTotal: (r) => (r.wdd?.totalLeadTime == null ? "" : r.wdd.totalLeadTime), inboundEta: (r) => r.wdd?.inboundEta || "", daysToInbound: (r) => (r.wdd?.daysToInbound == null ? "" : r.wdd.daysToInbound),
+  idealCover: (r) => expNum(r.wdd?.idealCover), existingCover: (r) => expNum(r.wdd?.existingCover),
+  reorderStatus: (r) => r.wdd?.reorderStatus || "", suggestedReorder: (r) => (r.wdd?.suggestedReorder == null ? "" : r.wdd.suggestedReorder),
 };
 
 // Export EXACTLY the currently-visible/authorized columns, in order, from the one canonical model.
@@ -533,6 +546,91 @@ function PlanColumnChooser({ groups, hidden, isUS, onToggle, onSelectAll, onRese
             </div>
           );
         })}
+      </div>
+    </div>
+  );
+}
+
+// ADDITIVE: inline editor for ONE per-ASIN lead-time day field (Production / Shipping / AWD Transfer / Safety Stock).
+// A blank commit clears that field to "Not configured" (null); saving persists 'set' (NEVER restarts a countdown) and
+// the plan recomputes locally with zero DataDoe. Whole nonnegative days (0..3650). Sends the merged four-field set so a
+// single-field edit never drops the others.
+function LeadTimeDayCell({ row, field, onSave, busy }) {
+  const [editing, setEditing] = useState(false);
+  const asin = row.asin;
+  const lt = (row.wdd && row.wdd.leadTime) || {};
+  const val = lt[field];
+  if (!asin || row.warehouseOnly) return <td className="mono"><span className="dr-dash">—</span></td>;
+  const commit = (raw) => {
+    const t = String(raw).trim();
+    let next = null;
+    if (t !== "") { const n = Math.trunc(Number(t)); if (!Number.isInteger(n) || n < 0 || n > 3650) { setEditing(false); return; } next = n; }
+    const merged = { production: lt.production ?? null, shipping: lt.shipping ?? null, awd: lt.awd ?? null, safety: lt.safety ?? null };
+    merged[field] = next;
+    onSave({ childAsin: asin, ...merged, action: "set" });
+    setEditing(false);
+  };
+  return (
+    <td className="mono plan-wh-cell">
+      {editing ? (
+        <input autoFocus type="number" min="0" max="3650" step="1" defaultValue={val == null ? "" : val} disabled={busy}
+          onBlur={(e) => commit(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") commit(e.target.value); if (e.key === "Escape") setEditing(false); }} />
+      ) : (
+        <button type="button" className="plan-wh-btn" title="Edit lead-time days (blank clears to Not configured)" onClick={() => setEditing(true)}>
+          {val == null ? <span className="plan-wh-empty">Not configured</span> : nInt(val)}
+        </button>
+      )}
+    </td>
+  );
+}
+
+// ADDITIVE: Inbound ETA + an EXPLICIT Start/Reset countdown. Start stamps the marketplace-local current date as the
+// start and stores ETA = start + Production + Shipping + AWD Transfer (Safety Stock EXCLUDED -- a buffer). Editing day
+// values never restarts a countdown; only this control does. Disabled until Production/Shipping/AWD are configured.
+function InboundEtaCell({ row, marketToday, onStart, busy }) {
+  const asin = row.asin;
+  const lt = (row.wdd && row.wdd.leadTime) || {};
+  const eta = row.wdd ? row.wdd.inboundEta : null;
+  const canStart = lt.production != null && lt.shipping != null && lt.awd != null;
+  if (!asin || row.warehouseOnly) return <td className="mono"><span className="dr-dash">—</span></td>;
+  return (
+    <td className="mono plan-eta-cell">
+      <span className="plan-eta-val">{eta ? fmtDateHuman(eta) : <span className="plan-wh-empty">Not started</span>}</span>
+      <button type="button" className="plan-mini-btn" disabled={busy || !canStart}
+        title={canStart ? `${eta ? "Reset" : "Start"} the countdown from ${marketToday} (marketplace-local) + Production + Shipping + AWD Transfer` : "Configure Production, Shipping and AWD transit first"}
+        onClick={() => onStart(asin)}>{eta ? "Reset" : "Start"}</button>
+    </td>
+  );
+}
+
+// ADDITIVE: the WDD blend-weight settings for the SELECTED brand (or the account default when All Brands / Unmapped is
+// selected). Each weight 0..100; the total must equal EXACTLY 100 before Save (over 100 and under 100 each show a clear
+// message and write nothing). Saved per organization + account + canonical brand key; one brand's weights are never
+// inferred from another's. Recommended default 50/30/20.
+function WddSettingsBar({ brandLabel, brandKey: bk, saved, onSave, busy }) {
+  const initial = saved || WDD_DEFAULT_WEIGHTS;
+  const [w, setW] = useState([String(initial.w7), String(initial.w30), String(initial.w60)]);
+  useEffect(() => { const s = saved || WDD_DEFAULT_WEIGHTS; setW([String(s.w7), String(s.w30), String(s.w60)]); }, [saved, bk]);
+  const check = validateWddWeights({ w7: Number(w[0]), w30: Number(w[1]), w60: Number(w[2]) });
+  const total = check.total == null ? [w[0], w[1], w[2]].reduce((s, x) => s + (Number(x) || 0), 0) : check.total;
+  const scope = bk ? brandLabel : "Account default (unmapped ASINs)";
+  return (
+    <div className="plan-settings plan-wdd-settings" role="group" aria-label="Weighted daily demand weights">
+      <div className="plan-set-group">
+        <span className="plan-field-label">WDD weights % · {scope}</span>
+        <div className="plan-weights">
+          {[0, 1, 2].map((i) => (
+            <label key={i} className="plan-wdd-w">
+              <span className="plan-wdd-tag">{["7D", "30D", "60D"][i]}</span>
+              <input type="number" min="0" max="100" step="1" value={w[i]} disabled={busy} aria-label={`${["7D", "30D", "60D"][i]} weight %`}
+                onChange={(e) => setW(w.map((x, j) => (j === i ? e.target.value : x)))} />
+            </label>
+          ))}
+          <span className={"plan-weight-sum" + (check.valid ? " ok" : " bad")}>{total}%</span>
+          <button type="button" className="plan-mini-btn" disabled={busy || !check.valid}
+            onClick={() => onSave({ brandKey: bk, w7: check.weights.w7, w30: check.weights.w30, w60: check.weights.w60 })}>Save</button>
+        </div>
+        {!check.valid && <span className="plan-wdd-msg">{check.reason}</span>}
       </div>
     </div>
   );
@@ -2423,6 +2521,45 @@ function DashboardApp({ session, access, onSignOut }) {
     return res;
   }, [selectedAccountId, session?.access_token, loadPlanConfig]);
 
+  // ADDITIVE: persist one brand's WDD blend weights (brandKey "" == the account default for unmapped ASINs), then
+  // reload + recompute locally (ZERO DataDoe). clear=true removes the record. The server re-validates 0..100 + total-100.
+  const saveWddWeights = useCallback(async ({ brandKey: bk = "", w7, w30, w60, clear } = {}) => {
+    if (!selectedAccountId || !session?.access_token) return;
+    const body = clear
+      ? { kind: "wdd-weights", accountId: selectedAccountId, brandKey: bk, clear: true }
+      : { kind: "wdd-weights", accountId: selectedAccountId, brandKey: bk, w7, w30, w60 };
+    setPlanConfigBusy(true);
+    try { await authFetch("/api/fba-plan-config", session.access_token, { method: "POST", body: JSON.stringify(body) }); await loadPlanConfig(); }
+    catch (e) { setPlanError(String(e && e.message ? e.message : e)); throw e; }
+    finally { setPlanConfigBusy(false); }
+  }, [selectedAccountId, session?.access_token, loadPlanConfig]);
+
+  // ADDITIVE: persist one ASIN's lead-time inputs. action "set" preserves any running countdown; "start" (with a
+  // marketplace-local start date) recomputes + stores the Inbound ETA; "clear" removes the row. Reload + recompute.
+  const saveLeadTime = useCallback(async ({ childAsin, production, shipping, awd, safety, note, action = "set", startedDate } = {}) => {
+    if (!selectedAccountId || !session?.access_token || !childAsin) return;
+    const body = { kind: "lead-time", accountId: selectedAccountId, childAsin, action };
+    if (action === "clear") { /* identity only */ }
+    else {
+      body.production = production; body.shipping = shipping; body.awd = awd; body.safety = safety; body.note = note || "";
+      if (action === "start") body.startedDate = startedDate;
+    }
+    setPlanConfigBusy(true);
+    try { await authFetch("/api/fba-plan-config", session.access_token, { method: "POST", body: JSON.stringify(body) }); await loadPlanConfig(); }
+    catch (e) { setPlanError(String(e && e.message ? e.message : e)); throw e; }
+    finally { setPlanConfigBusy(false); }
+  }, [selectedAccountId, session?.access_token, loadPlanConfig]);
+
+  // ADDITIVE: atomic bulk lead-time import (validated client rows; blank-as-clear). Returns the applied count or throws.
+  const bulkImportLeadTimes = useCallback(async (rows) => {
+    if (!selectedAccountId || !session?.access_token) throw new Error("No account selected.");
+    const res = await authFetch("/api/fba-plan-config", session.access_token, {
+      method: "POST", body: JSON.stringify({ kind: "lead-time-bulk", accountId: selectedAccountId, rows }),
+    });
+    await loadPlanConfig();
+    return res;
+  }, [selectedAccountId, session?.access_token, loadPlanConfig]);
+
   // Per-USER column-visibility prefs: localStorage for an instant first paint, then the durable server copy (which
   // wins). Saving writes both. A guest (no session) keeps localStorage only.
   const columnPrefsKey = useMemo(() => `fbaplan.cols.${session?.user?.id || "anon"}`, [session?.user?.id]);
@@ -2817,6 +2954,15 @@ function DashboardApp({ session, access, onSignOut }) {
   const skuMovement = useSharedReport({ params: skuMovementParams, active: view === "skumovement" });
   useEffect(() => { skuReloadRef.current = skuMovement.reload; }, [skuMovement.reload]);
 
+  // ADDITIVE: the FBA plan's WDD demand REUSES the shared SKU Movement v2 payload (per-ASIN dailyUnits over its proven
+  // 60-day axis) -- a durable, brand-authorized, ZERO-DataDoe read. Same params as the SKU Movement view, so the shared
+  // snapshot cache is reused (no extra fetch cost). Active only on the FBA plan view.
+  const fbaDemandParams = useMemo(
+    () => (selectedAccountId ? { action: "sku-movement", reportVersion: "sku-movement/v2", ids: selectedAccountId, brand: selectedBrand, to: TODAY } : null),
+    [selectedAccountId, selectedBrand, TODAY]
+  );
+  const fbaDemand = useSharedReport({ params: fbaDemandParams, active: view === "fbaplan" });
+
   const INSIGHT_VIEWS = useMemo(() => ({
     salesmovers: { report: salesMovers, label: "Sales Movers" },
     listinghealth: { report: listingHealth, label: "Listing Health" },
@@ -3009,6 +3155,86 @@ function DashboardApp({ session, access, onSignOut }) {
     return t;
   }, [planRows]);
 
+  // ================= ADDITIVE WDD / lead-time / reorder derivation (client-side, ZERO DataDoe) =================
+  // Per-ASIN demand evidence from the shared SKU Movement v2 payload (dailyUnits over its proven axis + coverage).
+  const fbaDemandByAsin = useMemo(() => {
+    const d = fbaDemand?.data;
+    const map = new Map();
+    if (d && Array.isArray(d.rows)) for (const r of d.rows) { const a = String(r.asin || "").toUpperCase(); if (a) map.set(a, r); }
+    return { map, effectiveAsOf: d?.effectiveAsOf || null, coverageFrom: d?.coverageFrom || null };
+  }, [fbaDemand?.data]);
+  // Saved per-brand WDD weights ('' key = the explicit account default used by unmapped ASINs) + per-ASIN lead-times.
+  const wddWeightsByKey = useMemo(() => {
+    const m = new Map();
+    for (const w of planConfig?.wddWeights || []) m.set(String(w.brand_key || ""), { w7: Number(w.weight_7d), w30: Number(w.weight_30d), w60: Number(w.weight_60d) });
+    return m;
+  }, [planConfig?.wddWeights]);
+  const leadTimeByAsin = useMemo(() => {
+    const m = new Map();
+    for (const lt of planConfig?.leadTimes || []) m.set(String(lt.child_asin || "").toUpperCase(), {
+      production: lt.production_days ?? null, shipping: lt.shipping_days ?? null, awd: lt.awd_transfer_days ?? null, safety: lt.safety_stock_days ?? null,
+      inboundStarted: lt.inbound_started_date || null, inboundEta: lt.inbound_eta || null, updatedByEmail: lt.updated_by_email || "",
+    });
+    return m;
+  }, [planConfig?.leadTimes]);
+  // Marketplace-LOCAL current date for the account (drives Days to Inbound + a countdown start), never the browser clock.
+  const planMarketToday = useMemo(() => marketplaceToday(planData?.marketCountry || "US"), [planData?.marketCountry]);
+
+  // Decorate the SORTED plan rows with the additive WDD / lead-time / reorder outputs. Existing row fields are left
+  // exactly as-is (byte-identical); date/weight/lead-time changes recompute HERE with ZERO refetch (pure). One brand's
+  // weights are never applied to another brand (resolveWddWeights).
+  const planRowsWithWdd = useMemo(() => {
+    return planRows.map((r) => {
+      const asin = String(r.asin || "").toUpperCase();
+      const demand = asin ? fbaDemandByAsin.map.get(asin) : null;
+      const bkey = r.brand ? canonicalBrandKey(r.brand) : "";
+      const resolved = resolveWddWeights(wddWeightsByKey, bkey);
+      const lt = asin ? (leadTimeByAsin.get(asin) || null) : null;
+      const wdd = computeAsinWdd({
+        dailyUnits: demand?.dailyUnits, effectiveAsOf: fbaDemandByAsin.effectiveAsOf, coverageFrom: fbaDemandByAsin.coverageFrom,
+        weights: resolved.weights, leadTime: lt, marketplaceToday: planMarketToday,
+        fbaAvailable: r.planning?.immediatelyAvailable, awdAvailable: r.planning?.awdAvailable, inboundPipeline: r.planning?.inboundPipeline,
+      });
+      return { ...r, wdd: { ...wdd, weightSource: resolved.source, weights: resolved.weights, leadTime: lt } };
+    });
+  }, [planRows, fbaDemandByAsin, wddWeightsByKey, leadTimeByAsin, planMarketToday]);
+
+  // The WDD-weight editor targets the SELECTED brand's canonical key, or '' (the account default) for All Brands /
+  // Unmapped -- never inferring one brand's weights from another.
+  const wddEditKey = useMemo(() => ((selectedBrand && selectedBrand !== "ALL" && selectedBrand !== UNMAPPED_BRAND) ? (canonicalBrandKey(selectedBrand) || "") : ""), [selectedBrand]);
+  const [leadTimeImportBusy, setLeadTimeImportBusy] = useState(false);
+  const [leadTimeNotice, setLeadTimeNotice] = useState(null);
+  const leadTimeFileRef = useRef(null);
+  // ADDITIVE: download a lossless XLSX template of the visible ASINs + their current lead-time values (ASIN kept as
+  // text). Editing + re-uploading applies changes; a blank cell clears that field (blank-as-clear).
+  const downloadLeadTimeTemplate = useCallback(async () => {
+    const rows = []; const seen = new Set();
+    for (const r of planRowsWithWdd) {
+      const a = String(r.asin || "").toUpperCase();
+      if (!a || r.warehouseOnly || seen.has(a)) continue; seen.add(a);
+      const lt = (r.wdd && r.wdd.leadTime) || {};
+      rows.push({ asin: a, productName: r.productName, brand: r.brand, production: lt.production, shipping: lt.shipping, awd: lt.awd, safety: lt.safety, inboundEta: r.wdd?.inboundEta, note: "" });
+    }
+    const matrix = buildFbaLeadTimeMatrix({ accountId: selectedAccountId, rows });
+    const { buildXlsx } = await import("./lib/xlsx.js");
+    const bytes = buildXlsx([{ name: "ASIN Lead Times", rows: matrix, freezeHeaderRows: 1 }]);
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+    const link = document.createElement("a"); link.href = url; link.download = `fba-lead-times-${String(selectedAccountId || "account").replace(/[^a-z0-9]+/gi, "-")}.xlsx`; link.click(); URL.revokeObjectURL(url);
+  }, [planRowsWithWdd, selectedAccountId]);
+  // ADDITIVE: validate (shared validator) then atomically apply an ASIN lead-time import. Any invalid row -> zero writes.
+  const onImportLeadTimeFile = useCallback(async (file) => {
+    if (!file) return; setLeadTimeNotice(null); setLeadTimeImportBusy(true);
+    try {
+      let result;
+      if (/\.xlsx$/i.test(file.name)) { const { readXlsxFirstSheet } = await import("./lib/xlsx-read.js"); result = validateFbaLeadTimeRows(await readXlsxFirstSheet(await file.arrayBuffer())); }
+      else result = validateFbaLeadTimeText(await file.text());
+      if (!result.ok) { setLeadTimeNotice({ tone: result.nothingToApply ? "warning" : "error", msg: result.message || "Import invalid; nothing was written." }); return; }
+      const res = await bulkImportLeadTimes(result.applyRows.map((r) => ({ childAsin: r.childAsin, production: r.production, shipping: r.shipping, awd: r.awd, safety: r.safety, inboundEta: r.inboundEta })));
+      setLeadTimeNotice({ tone: "success", msg: `Applied ${res?.applied || result.applyRows.length} ASIN lead-time row(s).` });
+    } catch (e) { setLeadTimeNotice({ tone: "error", msg: (e && e.message) || "Could not import lead times; nothing was written." }); }
+    finally { setLeadTimeImportBusy(false); if (leadTimeFileRef.current) leadTimeFileRef.current.value = ""; }
+  }, [bulkImportLeadTimes]);
+
   // The full ordered column model (identity + sales + forecast + inventory + planning + status). Each column owns its
   // header metadata + cell + footer renderer, so the grouped column chooser and the table stay perfectly in sync. AWD
   // columns are tagged so they vanish for non-US accounts (never a fake 0). `nInt` renders null as an em dash.
@@ -3054,8 +3280,28 @@ function DashboardApp({ session, access, onSignOut }) {
       { id: "stockout", group: "Planning", label: "Est. Stockout", chooserLabel: "Estimated stockout", thTitle: "Effective-through date + floor(Immediately Available / daily run rate)", cell: (r) => <td key="stockout" className="mono" title={r.planning?.estimatedStockoutDate ? "" : (r.planning?.stockoutReason || "")}>{r.planning?.estimatedStockoutDate ? fmtDateHuman(r.planning.estimatedStockoutDate) : <span className="dr-dash">—</span>}</td>, foot: () => <td key="stockout" className="mono">—</td> },
       { id: "priority", group: "Planning", label: "Priority", chooserLabel: "Priority", align: "left", cell: (r) => <td key="priority">{r.planning?.planningPriority && r.planning.planningPriority !== "Unknown" ? <span className={"pt-badge plan-prio-" + String(r.planning.planningPriority).toLowerCase()} title={r.planning.recommendedAction || ""}>{r.planning.planningPriority}</span> : "—"}</td>, foot: () => <td key="priority">—</td> },
       { id: "remark", group: "Status", label: "Remark", chooserLabel: "Stock remark", align: "left", sortKey: "remark", cell: (r) => <td key="remark">{r.remark ? <span className={"pt-badge " + (r.remark === "Restock" ? "pt-badge-restock" : "pt-badge-ok")}>{r.remark}</span> : "—"}</td>, foot: (t) => <td key="remark">{t.restockCount > 0 ? `${t.restockCount} restock` : "OK"}</td> },
+
+      // ================= ADDITIVE columns: WDD demand + lead time + reorder (sit BESIDE the existing columns) =========
+      // Demand reuses the shared SKU Movement v2 ordered-unit evidence; a missing/uncovered value is an em dash (never a
+      // fabricated 0). WDD shows 2 decimals; unit outputs are whole units. Every new column is off in NO one's saved
+      // hidden set, so it appears for existing users without resetting their preferences.
+      { id: "avg7", group: "Demand (WDD)", label: "7D Avg", chooserLabel: "7-day daily avg", thTitle: "Covered ordered units in the trailing 7 days / covered days (= /7 at full coverage). Non-cancelled OLI units, ASIN-aggregated, from SKU Movement v2.", cell: (r) => <td key="avg7" className="mono">{wnum2(r.wdd?.avg7)}</td>, foot: () => <td key="avg7" className="mono">—</td> },
+      { id: "avg30", group: "Demand (WDD)", label: "30D Avg", chooserLabel: "30-day daily avg", thTitle: "Covered ordered units in the trailing 30 days / covered days.", cell: (r) => <td key="avg30" className="mono">{wnum2(r.wdd?.avg30)}</td>, foot: () => <td key="avg30" className="mono">—</td> },
+      { id: "avg60", group: "Demand (WDD)", label: "60D Avg", chooserLabel: "60-day daily avg", thTitle: "Covered ordered units in the trailing 60 days / covered days.", cell: (r) => <td key="avg60" className="mono">{wnum2(r.wdd?.avg60)}</td>, foot: () => <td key="avg60" className="mono">—</td> },
+      { id: "wdd", group: "Demand (WDD)", label: "WDD", chooserLabel: "Weighted daily demand", thTitle: "(7D×w7 + 30D×w30 + 60D×w60)/100 using this ASIN's brand WDD weights (unmapped uses the account default). Full precision; shown to 2 decimals.", cell: (r) => <td key="wdd" className="mono pt-strong">{wnum2(r.wdd?.wdd)}</td>, foot: () => <td key="wdd" className="mono">—</td> },
+      { id: "ltProd", group: "Lead Time", label: "Production (d)", chooserLabel: "Production lead time (days)", thTitle: "Manual: your production lead time in days. Blank = Not configured.", cell: (r) => <LeadTimeDayCell key="ltProd" row={r} field="production" onSave={saveLeadTime} busy={planConfigBusy} />, foot: () => <td key="ltProd" className="mono">—</td> },
+      { id: "ltShip", group: "Lead Time", label: "Shipping (d)", chooserLabel: "Shipping lead time (days)", thTitle: "Manual: your shipping lead time in days.", cell: (r) => <LeadTimeDayCell key="ltShip" row={r} field="shipping" onSave={saveLeadTime} busy={planConfigBusy} />, foot: () => <td key="ltShip" className="mono">—</td> },
+      { id: "ltAwd", group: "Lead Time", label: "AWD Transfer (d)", chooserLabel: "AWD transfer time (days)", thTitle: "Manual: your AWD transfer time in days.", cell: (r) => <LeadTimeDayCell key="ltAwd" row={r} field="awd" onSave={saveLeadTime} busy={planConfigBusy} />, foot: () => <td key="ltAwd" className="mono">—</td> },
+      { id: "ltSafety", group: "Lead Time", label: "Safety Stock (d)", chooserLabel: "Safety stock (days)", thTitle: "Manual: your safety-stock buffer in days. Excluded from the Inbound ETA (it is a buffer), included in Total Lead Time.", cell: (r) => <LeadTimeDayCell key="ltSafety" row={r} field="safety" onSave={saveLeadTime} busy={planConfigBusy} />, foot: () => <td key="ltSafety" className="mono">—</td> },
+      { id: "ltTotal", group: "Lead Time", label: "Total Lead (d)", chooserLabel: "Total lead time (days)", thTitle: "Production + Shipping + AWD Transfer + Safety Stock. 'Not configured' when any input is missing.", cell: (r) => <td key="ltTotal" className="mono pt-strong">{r.wdd?.totalLeadTime == null ? <span className="plan-wh-empty">Not configured</span> : nInt(r.wdd.totalLeadTime)}</td>, foot: () => <td key="ltTotal" className="mono">—</td> },
+      { id: "inboundEta", group: "Lead Time", label: "Inbound ETA", chooserLabel: "Inbound ETA + Start/Reset", align: "left", thTitle: "Set on an explicit Start/Reset: marketplace-local start date + Production + Shipping + AWD Transfer (Safety excluded).", cell: (r) => <InboundEtaCell key="inboundEta" row={r} marketToday={planMarketToday} busy={planConfigBusy} onStart={(asin) => { const lt = (r.wdd && r.wdd.leadTime) || {}; saveLeadTime({ childAsin: asin, production: lt.production, shipping: lt.shipping, awd: lt.awd, safety: lt.safety, action: "start", startedDate: planMarketToday }); }} />, foot: () => <td key="inboundEta" className="mono">—</td> },
+      { id: "daysToInbound", group: "Lead Time", label: "Days to Inbound", chooserLabel: "Days to inbound", thTitle: "max(0, Inbound ETA − marketplace-local current date). Derived live; 'Not configured' with no ETA.", cell: (r) => <td key="daysToInbound" className="mono">{r.wdd?.daysToInbound == null ? <span className="plan-wh-empty">Not configured</span> : nInt(r.wdd.daysToInbound)}</td>, foot: () => <td key="daysToInbound" className="mono">—</td> },
+      { id: "idealCover", group: "Reorder", label: "Ideal Cover", chooserLabel: "Ideal cover (units)", thTitle: "WDD × Total Lead Time (whole units).", cell: (r) => <td key="idealCover" className="mono">{r.wdd?.idealCover == null ? <span className="dr-dash">—</span> : nInt(r.wdd.idealCover)}</td>, foot: () => <td key="idealCover" className="mono">—</td> },
+      { id: "existingCover", group: "Reorder", label: "Existing Cover", chooserLabel: "Existing cover at inbound (units)", thTitle: "max(0, FBA Available + AWD Available + Inbound Pipeline − WDD × Days to Inbound). Total FBA Inventory is deliberately excluded (it already contains inbound).", cell: (r) => <td key="existingCover" className="mono">{r.wdd?.existingCover == null ? <span className="dr-dash">—</span> : nInt(r.wdd.existingCover)}</td>, foot: () => <td key="existingCover" className="mono">—</td> },
+      { id: "reorderStatus", group: "Reorder", label: "Reorder Status", chooserLabel: "Reorder status", align: "left", thTitle: "Reorder when Existing Cover < Ideal Cover (full precision), else Sufficient. Unavailable when demand, inventory or settings are missing (never a false Sufficient).", cell: (r) => { const s = r.wdd?.reorderStatus; return <td key="reorderStatus">{s === "Reorder" ? <span className="pt-badge pt-badge-restock">Reorder</span> : s === "Sufficient" ? <span className="pt-badge pt-badge-ok">Sufficient</span> : <span className="pt-badge sku-badge-neutral" title="Demand, inventory or lead-time settings not configured">Unavailable</span>}</td>; }, foot: (t, rows) => { const n = (rows || []).filter((r) => r.wdd?.reorderStatus === "Reorder").length; return <td key="reorderStatus">{n > 0 ? `${n} reorder` : "—"}</td>; } },
+      { id: "suggestedReorder", group: "Reorder", label: "Suggested Reorder", chooserLabel: "Suggested reorder (units)", thTitle: "ceil(max(0, Ideal Cover − Existing Cover)) — whole units.", cell: (r) => <td key="suggestedReorder" className="mono pt-strong">{r.wdd?.suggestedReorder == null ? <span className="dr-dash">—</span> : nInt(r.wdd.suggestedReorder)}</td>, foot: (t, rows) => { const sum = (rows || []).reduce((s, r) => s + (r.wdd?.suggestedReorder || 0), 0); return <td key="suggestedReorder" className="mono pt-strong">{sum > 0 ? nInt(sum) : "—"}</td>; } },
     ];
-  }, [planData, targetDays, saveWarehouseQty, planConfigBusy]);
+  }, [planData, targetDays, saveWarehouseQty, saveLeadTime, planConfigBusy, planMarketToday]);
 
   // Visible columns = model minus the user's hidden set, minus AWD columns for non-US accounts.
   const planVisibleColumns = useMemo(
@@ -4400,6 +4646,10 @@ function DashboardApp({ session, access, onSignOut }) {
 
         <PlanningSettingsBar settings={planAccountSettings} onSave={savePlanSettings} busy={planConfigBusy} />
 
+        {/* ADDITIVE: WDD blend weights for the selected brand (or the account default). Sits beside the existing
+            Planning Horizon / Forecast Method controls; never alters them. */}
+        <WddSettingsBar brandLabel={wddEditKey ? selectedBrand : "All brands / unmapped"} brandKey={wddEditKey} saved={wddWeightsByKey.get(wddEditKey)} onSave={saveWddWeights} busy={planConfigBusy} />
+
         <div className="plan-controls">
           <label className="plan-field plan-search">
             <span className="plan-field-label">Search</span>
@@ -4411,6 +4661,14 @@ function DashboardApp({ session, access, onSignOut }) {
           <button className="plan-tool-btn" type="button" disabled={!selectedAccountId} onClick={() => setWarehouseImportOpen(true)} title="Bulk-import your seller warehouse units (CSV / XLSX)">
             <Upload size={15} /> Import warehouse
           </button>
+          {/* ADDITIVE: per-ASIN lead-time XLSX download + upload (ASIN kept as text; atomic import; blank-as-clear). */}
+          <button className="plan-tool-btn" type="button" disabled={!planData} onClick={downloadLeadTimeTemplate} title="Download the ASIN lead-time template (XLSX, keeps ASINs exact)">
+            <Download size={15} /> Lead-time template
+          </button>
+          <button className="plan-tool-btn" type="button" disabled={!selectedAccountId || leadTimeImportBusy} onClick={() => leadTimeFileRef.current && leadTimeFileRef.current.click()} title="Import ASIN lead times (CSV / XLSX). Blank cells clear that field.">
+            <Upload size={15} /> Import lead times
+          </button>
+          <input ref={leadTimeFileRef} type="file" accept=".csv,.tsv,.xlsx,text/csv" style={{ display: "none" }} onChange={(e) => onImportLeadTimeFile(e.target.files && e.target.files[0])} />
           <div className="plan-cols-wrap">
             <button className="plan-tool-btn" type="button" disabled={!planData} onClick={() => setPlanColsOpen((v) => !v)} aria-expanded={planColsOpen} title="Show or hide columns">
               <SlidersHorizontal size={15} /> Columns{planHiddenCols.size > 0 ? ` (${planHiddenCols.size} hidden)` : ""}
@@ -4429,7 +4687,7 @@ function DashboardApp({ session, access, onSignOut }) {
             className="plan-export-btn"
             type="button"
             disabled={!planData || planRows.length === 0}
-            onClick={() => downloadPlanSpreadsheet(planVisibleColumns, planRows, planData)}
+            onClick={() => downloadPlanSpreadsheet(planVisibleColumns, planRowsWithWdd, planData)}
           >
             <Download size={15} />
             Download Excel
@@ -4437,6 +4695,7 @@ function DashboardApp({ session, access, onSignOut }) {
         </div>
 
         {planData && planError && <DataQualityAlert tone="error" title="The last refresh failed" detail={planError} />}
+        {leadTimeNotice && <DataQualityAlert tone={leadTimeNotice.tone} title={leadTimeNotice.msg} />}
 
         {planData && (
           <>
@@ -4489,7 +4748,7 @@ function DashboardApp({ session, access, onSignOut }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {planRows.map((r) => (
+                  {planRowsWithWdd.map((r) => (
                     <tr key={r.rowKey || r.asin} className={(r.remark === "Restock" ? "plan-restock" : "") + (r.warehouseOnly ? " plan-wh-only" : "")}>
                       {planVisibleColumns.map((c) => c.cell(r))}
                     </tr>
@@ -4497,7 +4756,7 @@ function DashboardApp({ session, access, onSignOut }) {
                 </tbody>
                 <tfoot>
                   <tr className="plan-totals-row">
-                    {planVisibleColumns.map((c) => c.foot(planTotals, planRows))}
+                    {planVisibleColumns.map((c) => c.foot(planTotals, planRowsWithWdd))}
                   </tr>
                 </tfoot>
               </table>

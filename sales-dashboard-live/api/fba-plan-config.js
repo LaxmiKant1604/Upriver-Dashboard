@@ -12,10 +12,13 @@ import {
   getFbaPlanningConfig, setFbaPlanningSettings, setFbaSkuHorizonOverride, deleteFbaSkuHorizonOverride,
   recordFbaSellerWarehouse, recordFbaSellerWarehouseBulk, insertAuditLog,
   getLatestReportSnapshotHydrated, getSellerWarehouseRows, getWarehouseOwnershipConflicts,
+  recordFbaWddWeights, recordFbaAsinLeadTime, recordFbaAsinLeadTimeBulk, getTrustedAccountBrands,
 } from "../lib/server/supabase.js";
 import { getDataDoeConnections } from "../lib/server/datadoe-connections.js";
 import { organizationFingerprint } from "../lib/server/source-identity.js";
 import { buildWarehouseAuthority, validateWarehouseRow, validateWarehouseRows, newManualSkuCandidates } from "../lib/server/reports/warehouse-validation.js";
+import { resolveUserReportScope, BrandAccessError } from "../lib/server/report-authorization.js";
+import { brandKey } from "../lib/server/reports/brand-membership.js";
 
 function bodyOf(req) {
   if (!req.body) return {};
@@ -50,8 +53,57 @@ const DEFAULT_DEPS = {
   getFbaPlanningConfig, setFbaPlanningSettings, setFbaSkuHorizonOverride, deleteFbaSkuHorizonOverride,
   recordFbaSellerWarehouse, recordFbaSellerWarehouseBulk, insertAuditLog,
   getLatestReportSnapshotHydrated, getSellerWarehouseRows, getWarehouseOwnershipConflicts,
+  recordFbaWddWeights, recordFbaAsinLeadTime, recordFbaAsinLeadTimeBulk, getTrustedAccountBrands,
+  resolveUserReportScope,
   orgFingerprint,
 };
+
+// ADDITIVE WDD / lead-time authorization: the FBA Shipment Plan (report `fba-plan`) is NOT available to brand-restricted
+// (SELECTED_BRANDS) users -- resolveUserReportScope throws a 403 for them on this capability. The new WDD-weights +
+// lead-time operations apply the EXACT SAME gate (never broadening access): an admin / ALL_BRANDS user is unrestricted;
+// a brand-restricted user is denied, so they can never read or edit another brand's WDD settings or ASIN planning
+// values. Returns true when allowed, false when the user is brand-restricted (used to hide the new GET fields).
+async function fbaPlanCapabilityAllowed(deps, access, accountId) {
+  if (typeof deps.resolveUserReportScope !== "function") return true; // gate not wired (never in prod; only a partial test mock)
+  try {
+    await deps.resolveUserReportScope({ access, requestedAccountId: accountId, requestedBrand: "", action: "fba-plan", getTrustedBrands: deps.getTrustedAccountBrands });
+    return true;
+  } catch (e) {
+    if (e instanceof BrandAccessError) return false;
+    throw e;
+  }
+}
+
+// The account's TRUSTED canonical brand keys (membership) for validating a WDD brand_key write. '' (account-default) is
+// always allowed. Fails closed: an unavailable read throws a 503 rather than accepting an unverified brand.
+async function accountTrustedBrandKeys(deps, accountId) {
+  let names;
+  try { names = await deps.getTrustedAccountBrands({ accountId }); }
+  catch (_e) { throw new DashboardAccessError("Brand membership is temporarily unavailable; please retry.", 503); }
+  const set = new Set();
+  for (const n of Array.isArray(names) ? names : []) { const k = brandKey(n && (n.brand ?? n.name ?? n)); if (k) set.add(k); }
+  return set;
+}
+
+// The account's catalog child-ASIN authority (for lead-time ASIN-ownership validation), from the published fba-plan
+// snapshot. Fails closed: a missing/errored snapshot throws so a write can never target an unverified ASIN.
+async function accountAsinAuthority(deps, accountId) {
+  let snap;
+  try { snap = await deps.getLatestReportSnapshotHydrated({ reportKey: "fba-plan", accountId }); }
+  catch (_e) { throw new DashboardAccessError("Account ASIN evidence is temporarily unavailable; please retry.", 503); }
+  const authority = buildWarehouseAuthority(snap?.payload || null, { existingWarehouseRows: [] });
+  return authority.catalogAsins instanceof Set ? authority.catalogAsins : new Set();
+}
+
+// Server-side WDD-weight validation (mirrors src/lib/fba-wdd.js#validateWddWeights): each 0..100, total EXACTLY 100.
+function normWddWeights(b) {
+  const w7 = Number(b.w7), w30 = Number(b.w30), w60 = Number(b.w60);
+  if ([w7, w30, w60].some((x) => !Number.isFinite(x) || x < 0 || x > 100)) return { error: "each weight must be a number between 0 and 100." };
+  const total = Math.round((w7 + w30 + w60) * 100) / 100;
+  if (total > 100) return { error: `weights total ${total}; they must total exactly 100.` };
+  if (total < 100) return { error: "Weights must total 100%." };
+  return { w7, w30, w60 };
+}
 
 // Build the trusted warehouse-write authority for an account: the published snapshot evidence + the account's OWN
 // existing warehouse identity + (for genuinely new manual SKUs among `rows`) cross-account ownership evidence.
@@ -91,6 +143,10 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
 
     if (req.method === "GET") {
       const config = await deps.getFbaPlanningConfig({ organizationFingerprint: organization_fingerprint, connectionId, accountId });
+      // The ADDITIVE WDD-weights + lead-time config is gated on the fba-plan capability (identical to the report). A
+      // brand-restricted user keeps the EXISTING planner config byte-identical but never receives the new rows.
+      const allowNew = await fbaPlanCapabilityAllowed(deps, access, accountId);
+      if (!allowNew) { config.wddWeights = []; config.leadTimes = []; }
       res.status(200).json(config);
       return;
     }
@@ -193,7 +249,99 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
         return;
       }
 
-      res.status(400).json({ error: "unknown POST kind (expected settings | sku-horizon | warehouse | warehouse-bulk)." });
+      // ================= ADDITIVE (Migration 22): WDD weights + per-ASIN lead-time / reorder inputs =================
+      // All three apply the SAME capability gate as the fba-plan report: a brand-restricted user is denied 403 (never
+      // broadening access), so they can never read or edit another brand's WDD settings or ASIN planning values.
+      if (kind === "wdd-weights" || kind === "lead-time" || kind === "lead-time-bulk") {
+        if (!(await fbaPlanCapabilityAllowed(deps, access, accountId))) {
+          res.status(403).json({ error: "The FBA Shipment Plan is not available for your brand-limited access." });
+          return;
+        }
+
+        if (kind === "wdd-weights") {
+          const bkRaw = S(body.brandKey).trim();
+          const bk = bkRaw ? brandKey(bkRaw) : ""; // '' == the account-default record (unmapped ASINs)
+          if (body.clear === true) {
+            await deps.recordFbaWddWeights({ organizationFingerprint: organization_fingerprint, connectionId, accountId, brandKey: bk, action: "clear", updatedBy: access.userId });
+            await deps.insertAuditLog({ actorUserId: access.userId, action: "fba-plan.wdd-weights.cleared", target: { accountId, brandKey: bk } });
+            res.status(200).json({ cleared: true, brandKey: bk });
+            return;
+          }
+          const w = normWddWeights(body);
+          if (w.error) { res.status(400).json({ error: w.error }); return; }
+          if (bk) {
+            // A NAMED brand must be a TRUSTED brand of this account (canonical-brand ownership); '' is always allowed.
+            const trusted = await accountTrustedBrandKeys(deps, accountId);
+            if (!trusted.has(bk)) { res.status(400).json({ error: "unknown brand for this account." }); return; }
+          }
+          const saved = await deps.recordFbaWddWeights({ organizationFingerprint: organization_fingerprint, connectionId, accountId, brandKey: bk, w7: w.w7, w30: w.w30, w60: w.w60, action: "set", updatedBy: access.userId });
+          await deps.insertAuditLog({ actorUserId: access.userId, action: "fba-plan.wdd-weights.set", target: { accountId, brandKey: bk, weights: [w.w7, w.w30, w.w60] } });
+          res.status(200).json({ weights: saved });
+          return;
+        }
+
+        const dayVal = (v) => { if (v == null || v === "") return null; const n = Number(v); if (!Number.isInteger(n) || n < 0 || n > 3650) return NaN; return n; };
+
+        if (kind === "lead-time") {
+          const childAsin = S(body.childAsin).trim().toUpperCase();
+          if (!childAsin) { res.status(400).json({ error: "childAsin is required." }); return; }
+          const action = S(body.action).trim() || "set";
+          if (!["set", "start", "clear"].includes(action)) { res.status(400).json({ error: "action must be set, start or clear." }); return; }
+          if (action === "clear") {
+            await deps.recordFbaAsinLeadTime({ organizationFingerprint: organization_fingerprint, connectionId, accountId, childAsin, action: "clear", updatedBy: access.userId, updatedByEmail: S(access.email) });
+            await deps.insertAuditLog({ actorUserId: access.userId, action: "fba-plan.lead-time.cleared", target: { accountId, childAsin } });
+            res.status(200).json({ cleared: true, childAsin });
+            return;
+          }
+          // ASIN ownership: the child ASIN must be in this account's catalog (server-trusted, browser never a boundary).
+          const asins = await accountAsinAuthority(deps, accountId);
+          if (asins.size === 0) { res.status(400).json({ error: "no published FBA plan for this account yet; refresh the plan before saving lead times." }); return; }
+          if (!asins.has(childAsin)) { res.status(400).json({ error: `ASIN ${childAsin} is not in this account's catalog.` }); return; }
+          const production = dayVal(body.production), shipping = dayVal(body.shipping), awd = dayVal(body.awd), safety = dayVal(body.safety);
+          if ([production, shipping, awd, safety].some((x) => Number.isNaN(x))) { res.status(400).json({ error: "each lead-time day must be a whole number 0-3650 or blank." }); return; }
+          let startedDate = null;
+          if (action === "start") {
+            startedDate = S(body.startedDate).trim();
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(startedDate)) { res.status(400).json({ error: "startedDate (YYYY-MM-DD, marketplace-local) is required to start a countdown." }); return; }
+            if (production == null || shipping == null || awd == null) { res.status(400).json({ error: "production, shipping and AWD transit are required before starting a countdown." }); return; }
+          }
+          const saved = await deps.recordFbaAsinLeadTime({ organizationFingerprint: organization_fingerprint, connectionId, accountId, childAsin, production, shipping, awd, safety, note: S(body.note).slice(0, 500), action, startedDate, updatedBy: access.userId, updatedByEmail: S(access.email) });
+          await deps.insertAuditLog({ actorUserId: access.userId, action: `fba-plan.lead-time.${action}`, target: { accountId, childAsin } });
+          res.status(200).json({ leadTime: saved });
+          return;
+        }
+
+        if (kind === "lead-time-bulk") {
+          // Atomic multi-ASIN import. The browser preview is NOT trusted: every ASIN is re-validated for account
+          // ownership here; ANY invalid/duplicate row => zero writes AND zero audit (validated BEFORE the atomic RPC).
+          const rawRows = Array.isArray(body.rows) ? body.rows : null;
+          if (!rawRows || rawRows.length === 0) { res.status(400).json({ error: "rows must be a non-empty array." }); return; }
+          if (rawRows.length > 5000) { res.status(400).json({ error: "too many rows (max 5000 per import)." }); return; }
+          const asins = await accountAsinAuthority(deps, accountId);
+          if (asins.size === 0) { res.status(400).json({ error: "no published FBA plan for this account yet; refresh the plan before importing lead times." }); return; }
+          const seen = new Set();
+          const norm = [];
+          for (const raw of rawRows) {
+            const childAsin = S(raw.childAsin).trim().toUpperCase();
+            if (!childAsin) { res.status(400).json({ error: "a row has a blank childAsin; nothing was written." }); return; }
+            if (!asins.has(childAsin)) { res.status(400).json({ error: `ASIN ${childAsin} is not in this account's catalog; nothing was written.` }); return; }
+            if (seen.has(childAsin)) { res.status(400).json({ error: `duplicate ASIN ${childAsin} in this import; nothing was written.` }); return; }
+            seen.add(childAsin);
+            const production = dayVal(raw.production), shipping = dayVal(raw.shipping), awd = dayVal(raw.awd), safety = dayVal(raw.safety);
+            if ([production, shipping, awd, safety].some((x) => Number.isNaN(x))) { res.status(400).json({ error: `a day value for ${childAsin} is invalid; nothing was written.` }); return; }
+            let inboundEta = S(raw.inboundEta).trim();
+            if (inboundEta && !/^\d{4}-\d{2}-\d{2}$/.test(inboundEta)) { res.status(400).json({ error: `inbound_eta for ${childAsin} must be YYYY-MM-DD or blank; nothing was written.` }); return; }
+            if (!inboundEta) inboundEta = null;
+            norm.push({ childAsin, production, shipping, awd, safety, inboundEta });
+          }
+          const result = await deps.recordFbaAsinLeadTimeBulk({ organizationFingerprint: organization_fingerprint, connectionId, accountId, rows: norm, updatedBy: access.userId, updatedByEmail: S(access.email) });
+          await deps.insertAuditLog({ actorUserId: access.userId, action: "fba-plan.lead-time.bulk", target: { accountId, applied: norm.length } });
+          res.status(200).json({ bulk: result, applied: norm.length });
+          return;
+        }
+      }
+
+      res.status(400).json({ error: "unknown POST kind (expected settings | sku-horizon | warehouse | warehouse-bulk | wdd-weights | lead-time | lead-time-bulk)." });
       return;
     }
 

@@ -109,6 +109,8 @@ const SUITES = [
   "test:brand-view-freshness",
   "test:brand-view-render",
   "test:fba-planning",
+  "test:fba-wdd",
+  "test:fba-wdd-config",
   "test:warehouse-import",
   "test:warehouse-validation",
   "test:warehouse-ownership",

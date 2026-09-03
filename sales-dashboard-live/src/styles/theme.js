@@ -424,6 +424,14 @@ body{ overflow-x:hidden; }
 .plan-wh-btn:hover{ border-color:var(--accent); color:var(--accent-strong); background:var(--accent-soft); }
 .plan-wh-empty{ color:var(--text-muted); font-weight:600; }
 .plan-wh-cell input{ width:64px; height:28px; border:1px solid var(--accent); border-radius:var(--radius-sm); background:var(--bg-elevated); text-align:right; font:700 12px inherit; padding:0 6px; }
+/* ADDITIVE: WDD weight settings + Inbound-ETA countdown cell (sit beside the existing plan controls). */
+.plan-wdd-settings{ margin-top:10px; }
+.plan-wdd-w{ display:inline-flex; align-items:center; gap:5px; }
+.plan-wdd-tag{ font:800 10px inherit; color:var(--text-muted); letter-spacing:.02em; }
+.plan-wdd-msg{ font-size:11px; font-weight:700; color:var(--negative); margin-top:4px; }
+.plan-eta-cell{ padding:4px 8px; white-space:nowrap; }
+.plan-eta-cell .plan-eta-val{ margin-right:8px; font-variant-numeric:tabular-nums; }
+.plan-eta-cell .plan-mini-btn{ height:24px; padding:0 8px; }
 .pt-badge.plan-prio-critical{ background:var(--negative-soft); color:var(--negative); }
 .pt-badge.plan-prio-high{ background:var(--warning-soft); color:var(--warning); }
 .pt-badge.plan-prio-medium{ background:var(--accent-soft); color:var(--accent-strong); }
