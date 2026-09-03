@@ -24,6 +24,11 @@ import { marketplaceProfile } from "../marketplaces.js";
 // path is blocked here at the one chokepoint every entry point (scheduler, watchdog, DSC, manual CLI, cron) flows
 // through. Rolling ADS_ACTIVE_SOURCE back to "asin" clears the retirement.
 import { isAdsExportRetiredFor } from "./active-ads-source.js";
+import { sanitizeExcerpt } from "./sync/source-failure-classifier.js";
+
+// Bounded HTTP retry cap (429 on any method; 5xx on a free idempotent GET only -- a 5xx create POST is ambiguous and
+// is reconciled by the runner, never blind-retried). Kept small so a run never exceeds the workflow's safe runtime.
+const MAX_HTTP_RETRIES = 4;
 
 // Two marketplace codes identify the SAME marketplace when they are equal, or when both are CONFIGURED
 // marketplaces resolving to the same country -- Amazon returns the ISO "GB" for the UK while the account
@@ -219,9 +224,16 @@ async function datadoeFetch(url, options, attempt = 0) {
     }
     throw networkError;
   }
-  if (response.status === 429 && attempt < 4) {
-    const retryAfter = Number(response.headers.get("retry-after")) || 1;
-    await sleep(retryAfter * 1000 + 250);
+  const method = (options && options.method ? String(options.method) : "GET").toUpperCase();
+  // Bounded backoff-with-jitter retry, respecting Retry-After. 429 is safe to retry on ANY method (the request was
+  // REJECTED -- nothing was created). A 5xx is retried ONLY for a free idempotent GET (status poll / raw download): a
+  // 5xx on a create POST is AMBIGUOUS (the export may have landed + charged), so it is surfaced and RECONCILED by the
+  // runner (adopt-or-recreate on the next coverage-pre-filtered pass), never blind-retried into a duplicate charge.
+  const retryableStatus = response.status === 429 || (response.status >= 500 && method === "GET");
+  if (retryableStatus && attempt < MAX_HTTP_RETRIES) {
+    const retryAfter = Number(response.headers.get("retry-after"));
+    const backoff = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : Math.min(8000, 500 * 2 ** attempt);
+    await sleep(backoff + Math.floor(Math.random() * 250));
     return datadoeFetch(url, options, attempt + 1);
   }
   return response;
@@ -262,13 +274,29 @@ export function buildAdsExportRequestBody(source, ids, from, to, skip = 0) {
 }
 
 async function createExport(apiKey, source, ids, from, to, skip = 0) {
-  const response = await datadoeFetch(`${BASE}/exports`, {
-    method: "POST",
-    headers: authHeaders(apiKey),
-    body: JSON.stringify(buildAdsExportRequestBody(source, ids, from, to, skip)),
-  });
+  let response;
+  try {
+    response = await datadoeFetch(`${BASE}/exports`, {
+      method: "POST",
+      headers: authHeaders(apiKey),
+      body: JSON.stringify(buildAdsExportRequestBody(source, ids, from, to, skip)),
+    });
+  } catch (networkError) {
+    // A thrown create POST is AMBIGUOUS: it may have landed + charged server-side. Carry a typed marker so the runner
+    // reconciles via the coverage pre-filter instead of blind-recreating a duplicate. Never carries a secret.
+    const e = new Error(`DataDoe ${source.key} create network failure`);
+    e.sourceStage = "create"; e.network = true; e.safeBody = sanitizeExcerpt(networkError && networkError.message);
+    throw e;
+  }
   if (!response.ok) {
-    throw new Error(`DataDoe ${source.key} export creation failed (${response.status}): ${(await response.text()).slice(0, 500)}`);
+    const bodyText = await response.text().catch(() => "");
+    // Typed create-time HTTP failure. The runner classifies it (SOURCE_REQUEST_REJECTED / SOURCE_RATE_LIMITED /
+    // SOURCE_UPSTREAM_TRANSIENT / SOURCE_ACCOUNT_REJECTED for a single seller) and decides retry / split / isolate.
+    const e = new Error(`DataDoe ${source.key} export creation failed (${response.status})`);
+    e.httpStatus = response.status; e.sourceStage = "create";
+    const ra = Number(response.headers.get("retry-after")); if (Number.isFinite(ra)) e.retryAfterSeconds = ra;
+    e.safeBody = sanitizeExcerpt(bodyText);
+    throw e;
   }
   return response.json();
 }

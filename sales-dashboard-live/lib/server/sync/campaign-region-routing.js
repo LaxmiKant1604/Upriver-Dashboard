@@ -73,6 +73,18 @@ export function batchAccounts(accounts, size = MAX_SELLERS_PER_BATCH) {
   return batches;
 }
 
+// DETERMINISTIC binary split of ONE failed batch's seller allowlist, preserving the original stable ordering. A batch
+// that DataDoe rejected create-time (a non-transient 4xx on the multi-seller request) is split into two ordered halves
+// so the failing seller is isolated with the FEWEST child creates; the caller recurses until a single seller remains
+// (then isolates it as SOURCE_ACCOUNT_REJECTED). A single seller cannot be split -> returns [] (signal: isolate it).
+// Every returned sub-batch is <= the input size, so a <=5-seller batch never yields an oversized child.
+export function splitBatchAllowlist(allowlist) {
+  const list = (Array.isArray(allowlist) ? allowlist : []).map((x) => String(x == null ? "" : x)).filter(Boolean);
+  if (list.length <= 1) return [];
+  const mid = Math.ceil(list.length / 2);
+  return [list.slice(0, mid), list.slice(mid)];
+}
+
 // A ZERO-CREATE dry-run plan for ONE run kind. Returns per-region batches + the exact export count and the maximum
 // token spend, so the human can authorize the spend against a proven balance BEFORE any create. Never creates.
 //   accounts    : the dynamically-discovered [{accountId, marketplace}] list

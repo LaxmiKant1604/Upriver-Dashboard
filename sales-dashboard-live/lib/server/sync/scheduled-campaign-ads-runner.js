@@ -20,9 +20,10 @@ import { getDailyAdsCoverage } from "../supabase.js";
 import { evaluateSourceCoverage } from "./ppc-ads-loader.js";
 import { getDataDoeTokenBalance } from "../datadoe-usage.js";
 import {
-  REGIONS, routeAccounts, batchAccounts, planCampaignRun,
+  REGIONS, routeAccounts, batchAccounts, planCampaignRun, splitBatchAllowlist,
   CAMPAIGN_WINDOWS, MAX_SELLERS_PER_BATCH,
 } from "./campaign-region-routing.js";
+import { classifyThrownSourceError, SOURCE_FAILURE } from "./source-failure-classifier.js";
 
 export const CAMPAIGN_ADS_GRAIN = "campaign-performance-v1";     // the durable Ads worker key for Campaign Ads
 export const CAMPAIGN_ADS_SOURCE_KEY = "ads-campaign-date";      // the source-registry key
@@ -131,47 +132,137 @@ export async function planCampaignAdsRegionRun({ region, asOf, runKind = "initia
  *   { phase: "sync", continuationRequired: true, ... }                     -- worker deferred (slice budget) -> resume;
  *   { phase: "sync", ok: false, problems, creates, tokens }               -- a typed failure (LKG preserved).
  */
-export async function runCampaignAdsRegionSlice({ region, asOf, runKind = "initial", windowOverride = null, maxCreates = null, plan = null, deps = {}, log = () => {} } = {}) {
+export async function runCampaignAdsRegionSlice({ region, asOf, runKind = "initial", windowOverride = null, maxCreates = null, maxFallbackCreates = null, plan = null, deps = {}, log = () => {} } = {}) {
   const p = plan || await planCampaignAdsRegionRun({ region, asOf, runKind, windowOverride, deps });
   if (!p.compatible.length) {
-    return { phase: "complete", region: p.region, creates: 0, tokens: 0, batches: 0, covered: 0, incompatible: p.incompatible.length, note: "no Amazon-Ads-compatible accounts in region" };
+    return { phase: "complete", region: p.region, creates: 0, tokens: 0, batches: 0, covered: 0, incompatible: p.incompatible.length, rejected: [], transient: [], ambiguous: [], diagnostics: [], note: "no Amazon-Ads-compatible accounts in region" };
   }
   if (!p.pending.length) {
-    return { phase: "complete", region: p.region, creates: 0, tokens: 0, batches: 0, covered: p.covered.length, incompatible: p.incompatible.length, note: "already fully covered" };
+    return { phase: "complete", region: p.region, creates: 0, tokens: 0, batches: 0, covered: p.covered.length, incompatible: p.incompatible.length, rejected: [], transient: [], ambiguous: [], diagnostics: [], note: "already fully covered" };
   }
   const batches = batchAccounts(p.pending, MAX_SELLERS_PER_BATCH);
-  const hardCeiling = maxCreates != null ? Math.min(batches.length, Math.max(0, Math.trunc(Number(maxCreates)))) : batches.length;
-  let creates = 0;
+  // Normal ceiling = one create per planned batch. FALLBACK ceiling = extra creates a create-time-4xx SPLIT may need,
+  // bounded by the pending seller count (worst case: every rejected batch bisects down to single sellers). Both are
+  // configurable; the combined hard ceiling is enforced BEFORE every POST (fail closed -> never spends past budget).
+  const normalCeiling = maxCreates != null ? Math.max(0, Math.trunc(Number(maxCreates))) : batches.length;
+  const fallbackCeiling = maxFallbackCreates != null ? Math.max(0, Math.trunc(Number(maxFallbackCreates))) : p.pending.length;
+  // TWO independent budgets: a normal (depth-0) planned-batch create draws from normalCeiling; a SPLIT child create
+  // (depth>0, born from a create-time-4xx) draws from the SEPARATE fallbackCeiling. Both refuse BEFORE the POST (fail
+  // closed) so a split can never exhaust the normal budget and no budget can ever be exceeded.
+  let normalCreates = 0; let fallbackCreates = 0;
+  const isFallbackRef = { value: false };
   const baseCreate = (deps.createExport || PRODUCTION_ADS_SYNC_DEPS.createExport);
   const guardedCreate = async (...args) => {
-    if (creates >= hardCeiling) { const e = new Error("CAMPAIGN_ADS_CREATE_CEILING_EXCEEDED: refusing create " + (creates + 1) + " > ceiling " + hardCeiling); e.code = "CAMPAIGN_ADS_CEILING"; throw e; }
-    creates += 1;
+    if (isFallbackRef.value) {
+      if (fallbackCreates >= fallbackCeiling) { const e = new Error("CAMPAIGN_ADS_CREATE_CEILING_EXCEEDED: fallback ceiling " + fallbackCeiling + " reached"); e.code = "CAMPAIGN_ADS_CEILING"; throw e; }
+      fallbackCreates += 1;
+    } else {
+      if (normalCreates >= normalCeiling) { const e = new Error("CAMPAIGN_ADS_CREATE_CEILING_EXCEEDED: normal ceiling " + normalCeiling + " reached"); e.code = "CAMPAIGN_ADS_CEILING"; throw e; }
+      normalCreates += 1;
+    }
     return baseCreate(...args);
   };
   const workerDeps = { ...PRODUCTION_ADS_SYNC_DEPS, ...(deps.workerDeps || {}), createExport: guardedCreate };
   const runWorker = deps.runAdsSyncWithDeps || runAdsSyncWithDeps;
+  const countryOf = new Map(p.pending.map((a) => [S(a.accountId), S(a.marketplace).toUpperCase()]));
+  const runOne = (ids, depth = 0) => {
+    isFallbackRef.value = depth > 0; // split-child creates (depth>0) draw from the fallback budget; sequential, no interleave
+    const countries = [...new Set(ids.map((id) => countryOf.get(S(id))).filter(Boolean))];
+    return runWorker(workerDeps, countries, [CAMPAIGN_ADS_GRAIN], { accountIds: ids, requiredCoverage: { from: p.window.from, to: p.window.to } });
+  };
 
-  const batchResults = [];
-  let deferred = false;
-  for (const batch of batches) {
-    const batchIds = batch.allowlist;
-    const batchCountries = [...new Set(batch.accounts.map((a) => S(a.marketplace).toUpperCase()))].filter(Boolean);
+  const rec = await runCampaignAdsBatchesWithRecovery({ batches, runOne, classifyError: classifyThrownSourceError, log });
+  const creates = normalCreates + fallbackCreates;
+  const tokens = creates * CAMPAIGN_ADS_TOKENS_PER_CREATE;
+  if (rec.lockHeld) return { phase: "sync", ok: false, region: p.region, problems: ["ads lock held (concurrent run)"], creates, tokens };
+  if (rec.deferred) return { phase: "sync", region: p.region, continuationRequired: true, creates, tokens };
+  if (rec.ceilingExhausted && rec.covered.size === 0) {
+    // No account could be refreshed within budget -> a real budget-insufficiency failure (refuse, retain all LKG).
+    return { phase: "sync", ok: false, region: p.region, problems: ["create ceiling exhausted before any account covered (hardCeiling=" + hardCeiling + ")"], creates, tokens };
+  }
+  const covered = [...rec.covered];
+  const rejected = [...new Set(rec.rejected.map(S))];
+  const transient = [...new Set([...rec.transient, ...(rec.budgetDeferred || [])].map(S))].filter((id) => !rec.covered.has(id));
+  const ambiguous = [...new Set(rec.ambiguous.map(S))].filter((id) => !rec.covered.has(id));
+
+  // Assess ONLY the accounts a batch actually SUCCEEDED for (isolated accounts are honestly reported, not coverage
+  // failures of the run). A structural problem in a SUCCESSFUL batch (wrong account, oversize, non-campaign source)
+  // still fails the run. Every pending account must be accounted for: covered OR isolated (rejected/transient/ambiguous).
+  const assessment = assessCampaignAdsRegionCycle({ region: p.region, discoveredAccounts: covered, batchResults: rec.batchResults.filter((b) => !b.summary || b.summary.deferred !== true), creates, allowZeroBatches: covered.length === 0 });
+  if (!assessment.ok && covered.length) return { phase: "sync", ok: false, region: p.region, problems: assessment.problems.slice(0, 6), creates, tokens };
+  const accountedFor = new Set([...rec.covered, ...rejected, ...transient, ...ambiguous].map(S));
+  const unaccounted = p.pending.map((a) => S(a.accountId)).filter((id) => !accountedFor.has(id));
+  if (unaccounted.length) return { phase: "sync", ok: false, region: p.region, problems: ["accounts unaccounted for: " + unaccounted.length], creates, tokens };
+  const isolatedCount = rejected.length + transient.length + ambiguous.length;
+  if (isolatedCount) {
+    log("region " + p.region + " PARTIAL: covered=" + covered.length + " rejected=" + rejected.length + " transient=" + transient.length + " ambiguous=" + ambiguous.length + " (isolated accounts retain last-known-good)");
+  }
+  return {
+    // COMPLETE only when every pending account is COVERED (fresh). Any isolation -> PARTIAL: incomplete coverage is
+    // never labelled complete; the isolated accounts retain last-known-good and are reported, not fabricated as zero.
+    phase: isolatedCount ? "partial" : "complete", region: p.region, creates, tokens,
+    batches: rec.batchResults.length, covered: p.covered.length + covered.length,
+    incompatible: p.incompatible.length,
+    rejected, transient, ambiguous, diagnostics: rec.diagnostics.slice(0, 20),
+  };
+}
+
+/**
+ * The BOUNDED, IDEMPOTENT Campaign Ads batch recovery engine (pure control-flow; all I/O injected via `runOne`).
+ * Processes a queue of <=5-seller batches; on a per-batch failure it CLASSIFIES and recovers WITHOUT aborting the
+ * other batches:
+ *   - SOURCE_REQUEST_REJECTED (create-time 4xx, >1 seller): deterministically BINARY-SPLIT only the failed batch and
+ *     re-enqueue the two ordered halves (bounded by maxSplitDepth); successful siblings are never re-run.
+ *   - SOURCE_ACCOUNT_REJECTED (create-time 4xx, single seller) OR a split-exhausted rejection: ISOLATE the seller(s)
+ *     -> retain last-known-good, never fabricate zeros, never delete history.
+ *   - SOURCE_CREATE_AMBIGUOUS: do NOT recreate here; the seller(s) are reconciled by the next coverage-pre-filtered
+ *     pass (the fetch layer already refuses to blind-retry an ambiguous create POST).
+ *   - 429/5xx/poll/download/schema/coverage (already retried at the fetch layer where safe): mark this batch's
+ *     accounts transient -> retain LKG; the next scheduled pass retries.
+ *   - the create-ceiling guard (CAMPAIGN_ADS_CEILING): STOP creating; remaining + this batch's accounts are
+ *     budget-deferred (retain LKG); the caller decides if zero coverage is a real budget-insufficiency failure.
+ * Returns { covered:Set, rejected, transient, ambiguous, budgetDeferred, diagnostics, batchResults, lockHeld?,
+ * deferred?, ceilingExhausted? }.
+ */
+export async function runCampaignAdsBatchesWithRecovery({ batches, runOne, classifyError = classifyThrownSourceError, maxSplitDepth = 4, log = () => {} } = {}) {
+  const queue = (Array.isArray(batches) ? batches : []).map((b) => ({ ids: [...((b && b.allowlist) || b || [])].map(S).filter(nb), depth: 0 }));
+  const covered = new Set(); const rejected = []; const transient = []; const ambiguous = []; const budgetDeferred = [];
+  const diagnostics = []; const batchResults = [];
+  let ceilingExhausted = false;
+  while (queue.length) {
+    const { ids, depth } = queue.shift();
+    if (!ids.length) continue;
+    if (ceilingExhausted) { for (const id of ids) budgetDeferred.push(id); continue; }
     let summary;
     try {
-      summary = await runWorker(workerDeps, batchCountries, [CAMPAIGN_ADS_GRAIN], { accountIds: batchIds, requiredCoverage: { from: p.window.from, to: p.window.to } });
-    } catch (e) {
-      return { phase: "sync", ok: false, region: p.region, problems: ["batch failed: " + (e && e.code === "CAMPAIGN_ADS_CEILING" ? e.message : S(e && e.message).slice(0, 120))], creates, tokens: creates * CAMPAIGN_ADS_TOKENS_PER_CREATE };
+      summary = await runOne(ids, depth);
+    } catch (error) {
+      if (error && error.code === "CAMPAIGN_ADS_CEILING") {
+        ceilingExhausted = true; for (const id of ids) budgetDeferred.push(id);
+        log("create ceiling reached; " + ids.length + " account(s) budget-deferred (retain last-known-good)");
+        continue;
+      }
+      const cls = classifyError(error, { stage: "create", singleSeller: ids.length === 1 });
+      diagnostics.push({ classification: cls.classification, stage: cls.stage, status: cls.status, batchSize: ids.length, sellers: ids, excerpt: cls.excerpt, terminal: cls.terminal, retryable: cls.retryable, ambiguous: cls.ambiguous });
+      if (cls.classification === SOURCE_FAILURE.REQUEST_REJECTED && ids.length > 1 && depth < maxSplitDepth) {
+        const halves = splitBatchAllowlist(ids);
+        for (const h of halves) queue.push({ ids: h, depth: depth + 1 });
+        log("split rejected batch (" + ids.length + " sellers) -> " + halves.map((h) => h.length).join("+"));
+        continue;
+      }
+      if (cls.classification === SOURCE_FAILURE.REQUEST_REJECTED || cls.classification === SOURCE_FAILURE.ACCOUNT_REJECTED) { for (const id of ids) rejected.push(id); continue; }
+      if (cls.classification === SOURCE_FAILURE.CREATE_AMBIGUOUS) { for (const id of ids) ambiguous.push(id); continue; }
+      for (const id of ids) transient.push(id); // 429/5xx exhausted, poll/download/schema/coverage -> LKG
+      continue;
     }
-    if (summary && summary.status === "skipped") { return { phase: "sync", ok: false, region: p.region, problems: ["ads lock held (concurrent run)"], creates, tokens: creates * CAMPAIGN_ADS_TOKENS_PER_CREATE }; }
-    if (summary && summary.deferred === true) { deferred = true; batchResults.push({ accountIds: batchIds, summary }); break; }
-    batchResults.push({ accountIds: batchIds, summary });
-    log("campaign batch [" + batchCountries.join(",") + "] " + batchIds.length + " accts: " + S(summary && summary.status));
+    if (summary && summary.status === "skipped") return { covered, rejected, transient, ambiguous, budgetDeferred, diagnostics, batchResults, lockHeld: true };
+    if (summary && summary.deferred === true) { batchResults.push({ accountIds: ids, summary }); return { covered, rejected, transient, ambiguous, budgetDeferred, diagnostics, batchResults, deferred: true }; }
+    batchResults.push({ accountIds: ids, summary });
+    const camp = (summary && summary.sources && summary.sources[CAMPAIGN_ADS_GRAIN]) || {};
+    const failedSet = new Set([...(camp.failedAccounts || []), ...(camp.coverageFailedAccounts || [])].map(S));
+    for (const id of ids) { if (failedSet.has(S(id))) transient.push(id); else covered.add(S(id)); }
   }
-  if (deferred) return { phase: "sync", region: p.region, continuationRequired: true, creates, tokens: creates * CAMPAIGN_ADS_TOKENS_PER_CREATE };
-
-  const assessment = assessCampaignAdsRegionCycle({ region: p.region, discoveredAccounts: p.pending, batchResults, creates });
-  if (!assessment.ok) return { phase: "sync", ok: false, region: p.region, problems: assessment.problems.slice(0, 6), creates, tokens: assessment.tokens };
-  return { phase: "complete", region: p.region, creates: assessment.creates, tokens: assessment.tokens, batches: assessment.batches, covered: p.covered.length + p.pending.length, incompatible: p.incompatible.length };
+  return { covered, rejected, transient, ambiguous, budgetDeferred, diagnostics, batchResults, ceilingExhausted };
 }
 
 /**
@@ -180,17 +271,19 @@ export async function runCampaignAdsRegionSlice({ region, asOf, runKind = "initi
  * "completed" + coverageComplete + successfulCoveragePairs==expected + not deferred + ONLY the campaign grain +
  * zero failed / coverage-failed accounts; and creates/tokens stay within the batch-count ceiling.
  */
-export function assessCampaignAdsRegionCycle({ region, discoveredAccounts, batchResults, creates } = {}) {
+export function assessCampaignAdsRegionCycle({ region, discoveredAccounts, batchResults, creates, allowZeroBatches = false } = {}) {
   const problems = [];
   const push = (x) => problems.push(x);
   if (!VALID_REGIONS.includes(region)) return { ok: false, problems: ["bad-region"], creates: 0, tokens: 0, batches: 0 };
+  // `discoveredAccounts` here is the set of accounts a batch SUCCESSFULLY covered (isolated accounts are reported by
+  // the caller, not judged as coverage failures of the run). When every account was isolated, covered is empty and
+  // allowZeroBatches lets the assessment pass (nothing was created for those; they retain LKG).
   const discovered = [...new Set((discoveredAccounts || []).map((a) => S(a && (a.accountId ?? a)).trim()).filter(Boolean))].sort();
-  if (!discovered.length) return { ok: false, problems: ["no-discovered-accounts"], creates: 0, tokens: 0, batches: 0 };
+  if (!discovered.length) return { ok: allowZeroBatches, problems: allowZeroBatches ? [] : ["no-covered-accounts"], creates: Number(creates) || 0, tokens: (Number(creates) || 0) * CAMPAIGN_ADS_TOKENS_PER_CREATE, batches: 0 };
   const discoveredSet = new Set(discovered);
-  const ceilingCreates = batchAccounts(discovered.map((accountId) => ({ accountId })), MAX_SELLERS_PER_BATCH).length;
 
   const results = Array.isArray(batchResults) ? batchResults : [];
-  if (!results.length) push("no-batches");
+  if (!results.length && !allowZeroBatches) push("no-batches");
   const coveredUnion = new Set();
   for (const r of results) {
     const summary = r && r.summary;
@@ -213,8 +306,9 @@ export function assessCampaignAdsRegionCycle({ region, discoveredAccounts, batch
 
   const createsN = Number(creates) || 0;
   const tokens = createsN * CAMPAIGN_ADS_TOKENS_PER_CREATE;
-  if (createsN > ceilingCreates) push("creates-over-ceiling:" + createsN + ">" + ceilingCreates);
-  return { ok: problems.length === 0, problems, creates: createsN, tokens, batches: results.length, ceilingCreates, ceilingTokens: ceilingCreates * CAMPAIGN_ADS_TOKENS_PER_CREATE };
+  // The create budget is enforced BEFORE every POST by the runner's guardedCreate (a split legitimately adds child
+  // creates within the combined normal+fallback ceiling), so the assessment no longer re-derives a batch-count ceiling.
+  return { ok: problems.length === 0, problems, creates: createsN, tokens, batches: results.length };
 }
 
 /**
@@ -223,21 +317,26 @@ export function assessCampaignAdsRegionCycle({ region, discoveredAccounts, batch
  * scheduled + manual paths share one implementation. Returns a DSC-compatible typed result
  * ({ phase:"complete", creates, tokens, covered } | { phase:"sync", continuationRequired } | { phase:"sync", ok:false, problems }).
  */
-export async function runCampaignAdsBucketSlice({ bucket, asOf, runKind = "daily", maxCreates = null, deps = {}, log = () => {} } = {}) {
+export async function runCampaignAdsBucketSlice({ bucket, asOf, runKind = "daily", maxCreates = null, maxFallbackCreates = null, deps = {}, log = () => {} } = {}) {
   const regions = regionsForBucket(bucket);
   if (!regions.length) return { phase: "sync", ok: false, problems: ["bad-bucket:" + S(bucket)], creates: 0, tokens: 0 };
   let creates = 0; let tokens = 0; let covered = 0; let incompatible = 0;
+  const rejected = []; const transient = []; const ambiguous = [];
   for (const region of regions) {
     const plan = await planCampaignAdsRegionRun({ region, asOf, runKind, deps });
-    const r = await runCampaignAdsRegionSlice({ region, asOf, runKind, plan, maxCreates, deps, log });
+    const r = await runCampaignAdsRegionSlice({ region, asOf, runKind, plan, maxCreates, maxFallbackCreates, deps, log });
     creates += r.creates || 0; tokens += r.tokens || 0;
-    if (r.phase !== "complete") {
+    if (r.phase !== "complete" && r.phase !== "partial") {
       if (r.continuationRequired === true) return { phase: "sync", continuationRequired: true, creates, tokens };
       return { phase: "sync", ok: false, problems: r.problems || [], creates, tokens };
     }
     covered += r.covered || 0; incompatible += r.incompatible || 0;
+    rejected.push(...(r.rejected || [])); transient.push(...(r.transient || [])); ambiguous.push(...(r.ambiguous || []));
   }
-  return { phase: "complete", creates, tokens, covered, incompatible };
+  // A partial region (some sellers isolated with LKG) is a successful bounded pass -- the isolation is surfaced, never
+  // suppressed. The bucket reports PARTIAL when any region isolated an account; only a systemic failure is ok:false.
+  const anyIsolated = rejected.length || transient.length || ambiguous.length;
+  return { phase: anyIsolated ? "partial" : "complete", creates, tokens, covered, incompatible, rejected, transient, ambiguous };
 }
 
 /**

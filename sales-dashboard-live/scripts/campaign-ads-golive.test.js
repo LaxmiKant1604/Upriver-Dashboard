@@ -138,23 +138,27 @@ test("BT2. IDEMPOTENT: an already-fully-covered region creates ZERO exports (rep
   passed += 1;
 });
 
-test("BT3. the guarded create ceiling REFUSES a create beyond the cap (fail closed, LKG preserved)", async () => {
+test("BT3. the guarded NORMAL ceiling BUDGET-DEFERS the un-created batch (fail closed) while covered siblings still succeed", async () => {
   const runWorker = async (workerDeps) => { await workerDeps.createExport(); return okSummary(1); };
-  const two = [{ accountId: "a1", marketplace: "US" }, { accountId: "a2", marketplace: "US" }, { accountId: "a3", marketplace: "US" }, { accountId: "a4", marketplace: "US" }, { accountId: "a5", marketplace: "US" }, { accountId: "a6", marketplace: "US" }];
-  const plan = { region: REGIONS.US_CA, window: { from: "2026-01-05", to: "2026-03-01" }, compatible: two, pending: two, covered: [], incompatible: [] };
-  const res = await runCampaignAdsRegionSlice({ region: REGIONS.US_CA, asOf: "2026-03-01", plan, maxCreates: 1, deps: mkDeps({ runAdsSyncWithDeps: runWorker }) });
-  assert.equal(res.phase, "sync"); assert.equal(res.ok, false);
-  assert.ok(res.problems.some((p) => /CEILING|batch failed/.test(p)), "ceiling refusal is a typed failure");
+  const six = [{ accountId: "a1", marketplace: "US" }, { accountId: "a2", marketplace: "US" }, { accountId: "a3", marketplace: "US" }, { accountId: "a4", marketplace: "US" }, { accountId: "a5", marketplace: "US" }, { accountId: "a6", marketplace: "US" }];
+  const plan = { region: REGIONS.US_CA, window: { from: "2026-01-05", to: "2026-03-01" }, compatible: six, pending: six, covered: [], incompatible: [] };
+  const res = await runCampaignAdsRegionSlice({ region: REGIONS.US_CA, asOf: "2026-03-01", plan, maxCreates: 1, maxFallbackCreates: 0, deps: mkDeps({ runAdsSyncWithDeps: runWorker }) });
+  assert.equal(res.phase, "partial", "the first batch covers; the second is budget-deferred -> incomplete coverage is PARTIAL, never labelled complete");
+  assert.equal(res.creates, 1, "capped at the normal ceiling; NO create beyond budget (fail closed before the POST)");
+  assert.ok(res.transient.includes("a6"), "the un-created batch's account is budget-deferred (retains last-known-good, never fabricated as zero)");
+  assert.ok(res.rejected.length === 0);
   passed += 1;
 });
 
-test("BT4. a worker failure is a typed LKG-preserving problem, never a fabricated success", async () => {
-  const runWorker = async (workerDeps) => { await workerDeps.createExport(); throw new Error("datadoe 500 boom"); };
+test("BT4. a transient worker failure (5xx) ISOLATES the account (LKG-preserving), never a fabricated success or a full abort", async () => {
+  const runWorker = async (workerDeps) => { await workerDeps.createExport(); const e = new Error("upstream"); e.httpStatus = 500; e.sourceStage = "create"; throw e; };
   const one = [{ accountId: "a1", marketplace: "US" }];
   const plan = { region: REGIONS.US_CA, window: { from: "2026-01-05", to: "2026-03-01" }, compatible: one, pending: one, covered: [], incompatible: [] };
   const res = await runCampaignAdsRegionSlice({ region: REGIONS.US_CA, asOf: "2026-03-01", plan, deps: mkDeps({ runAdsSyncWithDeps: runWorker }) });
-  assert.equal(res.phase, "sync"); assert.equal(res.ok, false);
-  assert.ok(res.problems.length >= 1);
+  assert.equal(res.phase, "partial");
+  assert.ok(res.transient.includes("a1"), "5xx -> SOURCE_UPSTREAM_TRANSIENT -> isolated as transient (retry next pass), LKG retained");
+  assert.equal(res.covered, 0, "no fabricated coverage");
+  assert.equal((res.diagnostics[0] || {}).classification, "SOURCE_UPSTREAM_TRANSIENT");
   passed += 1;
 });
 
