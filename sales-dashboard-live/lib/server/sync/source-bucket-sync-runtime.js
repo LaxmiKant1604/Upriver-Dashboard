@@ -1424,7 +1424,10 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     // recorded as the typed "read-failed" degrade instead -- the post-sync derive marks Ads failed while sales
     // still save, so an unrelated ads read blip can never block the selected source's sync. limit-exceeded is a
     // VALID authoritative answer and stays a typed degrade everywhere.
-    const adsReadMayDegrade = sourceKey != null && sourceKey !== "ads-asin-date" && sourceKey !== "ads-campaign-date";
+    // A NON-ads scoped action (OLI/Catalog card) lets an ads read blip degrade instead of refuse; a full run or an
+    // ads-scoped action refuses. Grain-agnostic (any durable-ads family, never a hardcoded grain literal), so it is
+    // correct for both the active Campaign grain and the retired ASIN grain on rollback.
+    const adsReadMayDegrade = sourceKey != null && sourceRegistryEntry(sourceKey).storage !== "durable-ads";
     const dailyWindow = { from: monthBackStr(asOfStr, 5), to: asOfStr };
     const adMetricsByAccountId = {};
     for (const a of accounts) {
