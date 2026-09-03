@@ -13786,3 +13786,46 @@ unchanged. creates=0/tokens=0.
 RESIDUAL: confirm the deployed Vercel SHA (push @ 91553e5 auto-deploys; no token/URL here) + a live browser
 screenshot pass at 1440/1280/768/390 (the new UI reuses the responsive access-grid/bounded-scroll/flex-wrap/aria
 primitives; compiled clean). See [[brand-view-membership-selfheal]], [[sku-movement-live]].
+
+================================================================================
+2026-09-03 -- Campaign Ads workspace: PPC consolidated into ONE "Ad Performance by Campaign" (Performance / Wasted Spend / Brand Mapping) -- commit 8a85d2a LIVE
+================================================================================
+Merged the standalone "PPC Performance & Wasted Spend" page into the existing "Ad Performance by Campaign" as ONE
+secure, responsive workspace with three tabs, powered ONLY by the durable ads-campaign-date source. No new DataDoe
+report/export/scheduler; no new api/*.js (count stays 12 = 8 top-level + admin/2 + cron/2).
+
+DATA CONTRACT: api/campaign-brand-mapping.js handleView loads FULL durable history + returns coverage {minDate,
+latestProvenDate}; every client date window anchors on the PROVEN latest date, never the browser clock. Account+brand
+authz unchanged (resolveScope + projectCampaignsForScope) -- a brand-restricted viewer only receives permitted
+campaigns; Unmapped/other-brand rows never leave the server. lib/server/reports/campaign-ads.js buildCampaignAdsView
+emits a compact per-campaign `daily` = [date,spend,sales,orders,units,impressions,clicks], so the browser re-windows
+7D(default)/14D/30D/custom with ZERO refetch + ZERO tokens; currency+marketplace isolation + mapped/Unmapped
+conservation preserved. action=view is consumed only by CampaignAds.jsx.
+
+SHARED PURE MODULE src/lib/campaign-ads-view.js (imports nothing): resolveWindow (inclusive, latest-proven-anchored,
+clamped to coverage), windowCampaigns (drops no-activity campaigns -- never a fabricated zero), summarizeWindow
+(per-currency account/unmapped/brands + conservationOk), classifyWaste, campaignKpisFromMetrics. Em dash (null) on a
+zero denominator, never Infinity/NaN. Reuses ppc.js MIN_CLICKS_FOR_WASTE=10; only spend-with-zero-sales is DEFINITE
+waste; clicks-no-orders / ACoS>0.5 / ROAS<2 are "Needs review". Keyword/search-term/ASIN(targeting) analysis
+intentionally omitted (campaign-day grain) + documented in the footer.
+
+UI: CampaignAds.jsx rewritten -- 3 tabs + shared date/currency/search controls stable across tab switches; date/filter
+changes recompute IN PLACE (stable identity keys, no remount/flash); coverage line + custom-clamp warning; empty
+windows show explicit "no activity". Brand Mapping keeps inline + all-or-nothing XLSX/CSV bulk + mapping-revision
+zero-export refresh; date-independent. New .ca-* CSS in theme.js (scoped .op-report).
+
+CONSOLIDATION: shell.jsx shows ONE ads destination -- legacy PPC item only in the CAMPAIGN_ADS_TAB-OFF (rollback)
+branch. App.jsx redirects the old "ppc" view -> "campaign-ads"; legacy PpcPerformance renders only flag-OFF. PPC report
+builder (lib/server/reports/ppc.js) UNTOUCHED and still feeds the Priority Feed.
+
+TESTS: new scripts/campaign-ads-view.test.js (12) proves client<->server per-range TOTAL parity, latest-proven
+anchoring+clamp, drop-empty, zero-denominator em dash, currency isolation+conservation, waste classification+MIN_CLICKS
+gate, consolidation seams, client purity; FE1 updated. Full npm run verify = 119 steps / 95 suites incl build:check,
+GREEN. git diff --check clean.
+
+PROD READ-BACK: pushed 1d4c5fb..8a85d2a; HEAD==origin/main==8a85d2a; Vercel new bundle index-DSWlbC2N.js; root 200;
+view/brands/bulk-POST all 401 no-auth (auth-gated); api/*.js==12; zero DataDoe tokens.
+
+LIMITATION: Playwright not installed locally + dashboard needs Supabase auth -> no 4-width authenticated browser pass
+this session; responsiveness rests on existing .plan-scroll overflow-x tables + flex-wrap controls + auto-fit KPI grids
++ structural non-blink invariants.
