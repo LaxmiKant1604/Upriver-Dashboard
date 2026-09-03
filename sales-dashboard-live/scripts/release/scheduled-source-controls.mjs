@@ -46,8 +46,12 @@ if (MODE !== "apply") {
   process.exit(0);
 }
 
+// NOTE: source_controls.updated_by is a uuid FK to auth.users(id) -- the BROWSER-admin attribution column. This is a
+// trusted service-role operator (no browser user), and PRIORITY_OPERATOR is an email by convention across the release
+// scripts, so we must NOT write it here (an email into a uuid column is a 22P02 crash). updated_by is left unchanged;
+// the operator identity is captured in this run's log line above.
 for (const p of plan) {
-  await setSourceControl({ sourceKey: p.sourceKey, scheduleEnabled: p.scheduleEnabled, ...(p.paused !== undefined ? { paused: p.paused } : {}), updatedBy: OPERATOR });
+  await setSourceControl({ sourceKey: p.sourceKey, scheduleEnabled: p.scheduleEnabled, ...(p.paused !== undefined ? { paused: p.paused } : {}) });
 }
 
 // Re-read + verify EXACTLY the two enabled families + that nothing else is schedule-enabled.
