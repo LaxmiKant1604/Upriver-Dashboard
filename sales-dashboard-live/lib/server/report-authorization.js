@@ -198,6 +198,43 @@ export function accountBrandPairAuthorized({ isAdmin = false, grant, requestedBr
   return trusted.has(key);
 }
 
+// CENTRALIZED per-account AUTHORIZED brand map for a NON-ADMIN user. For every authorized account it resolves the
+// permitted canonical brand keys the user may see:
+//   ALL_BRANDS       -> the account's TRUSTED current brands (NEVER "globally unrestricted": a non-admin ALL_BRANDS
+//                       account is limited to THAT account's brands, not the whole organization).
+//   SELECTED_BRANDS  -> the account's trusted brands INTERSECTED with the saved grant keys.
+// An admin returns { admin: true } (unrestricted org-wide; the caller applies no per-account limit). This is the ONE
+// place the "non-admin ALL_BRANDS = the account's trusted brands" rule is computed, so every selector, directory and
+// report consumes the same result. Fail-soft PER ACCOUNT: if an account's trusted membership can't be read, it is
+// marked resolved:false with empty keys, and the CALLER must treat it as "unknown" (leave that account's client
+// selector unrestricted rather than wrongly hiding every brand -- the server still scopes each payload per account).
+export async function resolveAuthorizedBrandMap({ access, getTrustedBrands }) {
+  if (access && access.role === "admin") return { admin: true, accounts: {} };
+  const grants = (access && access.accountGrants) || {};
+  const accountIds = access && Array.isArray(access.accountIds) && access.accountIds.length
+    ? access.accountIds : Object.keys(grants);
+  const accounts = {};
+  for (const rawId of accountIds) {
+    const accountId = String(rawId);
+    const grant = grants[accountId] || { mode: "ALL_BRANDS", brandKeys: null };
+    const mode = grant.mode === "SELECTED_BRANDS" ? "SELECTED_BRANDS" : "ALL_BRANDS";
+    let trusted;
+    try { trusted = await getTrustedBrands({ accountId }); }
+    catch { accounts[accountId] = { mode, resolved: false, permittedKeys: [], permittedDisplays: [] }; continue; }
+    const trustedByKey = new Map();
+    for (const b of Array.isArray(trusted) ? trusted : []) { if (b && b.key) trustedByKey.set(b.key, b.display || b.key); }
+    let keys;
+    if (mode === "SELECTED_BRANDS") {
+      const granted = new Set((grant.brandKeys || []).map((k) => brandKey(k)).filter(Boolean));
+      keys = [...granted].filter((k) => trustedByKey.has(k)).sort();
+    } else {
+      keys = [...trustedByKey.keys()].sort(); // ALL_BRANDS -> exactly this account's trusted brands
+    }
+    accounts[accountId] = { mode, resolved: true, permittedKeys: keys, permittedDisplays: keys.map((k) => trustedByKey.get(k)) };
+  }
+  return { admin: false, accounts };
+}
+
 // A payload row's brand key, from any of the common brand fields.
 export function rowBrandKey(row) {
   if (!row) return null;

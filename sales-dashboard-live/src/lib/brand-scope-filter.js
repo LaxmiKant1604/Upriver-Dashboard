@@ -28,11 +28,23 @@ export function permittedBrandKeySetFromGrant(grant) {
   return set;
 }
 
-// The permitted key Set for one account from a whole access object (admin -> null unrestricted). Never trusts a
-// browser-supplied brand; reads only the authenticated access.accountGrants delivered by /api/access?action=me.
+// The permitted key Set for one account from a whole access object. Admin -> null (unrestricted org-wide). For a
+// NON-admin the server materializes, per authorized account, the exact permitted brand keys (ALL_BRANDS -> that
+// account's TRUSTED brands; SELECTED_BRANDS -> trusted INTERSECT granted) and delivers them on
+// access.accountGrants[accountId].permittedBrandKeys via /api/access?action=me. A non-admin ALL_BRANDS account is
+// therefore the account's brands, NEVER "globally unrestricted" -- only a verified admin gets null. Never trusts a
+// browser-supplied brand; reads only the authenticated access delivered by the server.
 export function permittedBrandKeySetForAccount(access, accountId) {
-  if (!access || access.role === "admin") return null;
+  if (!access || access.role === "admin") return null; // admin: unrestricted org-wide
   const grant = access.accountGrants ? access.accountGrants[accountId] : null;
+  if (!grant) return null; // no grant row for this account (account gating handled elsewhere)
+  if (Array.isArray(grant.permittedBrandKeys)) {
+    const set = new Set();
+    for (const k of grant.permittedBrandKeys) { const ck = canonicalBrandKey(k); if (ck) set.add(ck); }
+    return set;
+  }
+  // Fallback (server map not yet loaded / read failed): SELECTED_BRANDS -> granted keys; ALL_BRANDS -> null so the
+  // client does not over-hide (the server still projects every payload + directory to authorized accounts).
   return permittedBrandKeySetFromGrant(grant);
 }
 

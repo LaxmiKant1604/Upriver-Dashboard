@@ -72,6 +72,45 @@ test("punctuation-distinct brands are isolated in the filter (no fuzzy merge)", 
   passed += 1;
 });
 
+test("AC#2: non-admin ALL_BRANDS account is materialized to the account's trusted brands (NEVER globally unrestricted)", () => {
+  // Server delivers permittedBrandKeys per account on /api/access?action=me, incl. for ALL_BRANDS accounts.
+  const access = { role: "viewer", accountGrants: {
+    A: { mode: "ALL_BRANDS", brandKeys: null, permittedBrandKeys: ["acme", "bravo"] },       // A's trusted brands
+    B: { mode: "ALL_BRANDS", brandKeys: null, permittedBrandKeys: ["charlie"] },              // B's trusted brands
+  } };
+  assert.deepEqual([...permittedBrandKeySetForAccount(access, "A")].sort(), ["acme", "bravo"], "ALL_BRANDS -> the account's trusted brands");
+  assert.deepEqual([...permittedBrandKeySetForAccount(access, "B")].sort(), ["charlie"]);
+  // A brand belonging ONLY to an unauthorized account (e.g. 'zulu') is absent from every authorized account's set.
+  assert.ok(!permittedBrandKeySetForAccount(access, "A").has("zulu") && !permittedBrandKeySetForAccount(access, "B").has("zulu"));
+  passed += 1;
+});
+
+test("AC#5/#6: permission for a brand in account A does not authorize it in account B (per-account pairs)", () => {
+  const access = { role: "viewer", accountGrants: {
+    A: { mode: "SELECTED_BRANDS", brandKeys: ["shared"], permittedBrandKeys: ["shared"] },
+    B: { mode: "SELECTED_BRANDS", brandKeys: ["other"], permittedBrandKeys: ["other"] },
+  } };
+  assert.ok(permittedBrandKeySetForAccount(access, "A").has("shared") && !permittedBrandKeySetForAccount(access, "A").has("other"));
+  assert.ok(permittedBrandKeySetForAccount(access, "B").has("other") && !permittedBrandKeySetForAccount(access, "B").has("shared"));
+  passed += 1;
+});
+
+test("AC#7: organization-wide cached brands are removed for a non-admin (only authorized-account brands survive)", () => {
+  // Simulate a portfolio selector contaminated with org-wide brands from a stale cache.
+  const access = { role: "viewer", accountGrants: { A: { mode: "ALL_BRANDS", brandKeys: null, permittedBrandKeys: ["acme", "bravo"] } } };
+  const contaminated = ["acme", "bravo", "Brilliant Kids", "Cleanfect", "Shrida"]; // last 3 belong only to other accounts
+  assert.deepEqual(filterBrandNamesToPermitted(contaminated, permittedBrandKeySetForAccount(access, "A")).sort(), ["acme", "bravo"]);
+  passed += 1;
+});
+
+test("admin stays unrestricted (null) even with per-account grants present; ALL_BRANDS fallback when server map absent", () => {
+  assert.equal(permittedBrandKeySetForAccount({ role: "admin", accountGrants: { A: { mode: "SELECTED_BRANDS", brandKeys: ["x"], permittedBrandKeys: ["x"] } } }, "A"), null);
+  // Fallback (no permittedBrandKeys yet): SELECTED -> granted keys; ALL_BRANDS -> null (server scopes).
+  assert.deepEqual([...permittedBrandKeySetForAccount({ role: "viewer", accountGrants: { A: { mode: "SELECTED_BRANDS", brandKeys: ["x"] } } }, "A")], ["x"]);
+  assert.equal(permittedBrandKeySetForAccount({ role: "viewer", accountGrants: { A: { mode: "ALL_BRANDS", brandKeys: null } } }, "A"), null);
+  passed += 1;
+});
+
 async function main() {
   out("brand-scope-filter (client selector defense-in-depth)");
   let failures = 0;

@@ -90,4 +90,25 @@ await test("a non-admin cannot even list users / read scopes (assertAdmin gate)"
   assert.equal(cap.code, 403);
 });
 
+await test("me: a non-admin ALL_BRANDS account is materialized to its account trusted brands (permittedBrandKeys attached)", async () => {
+  const d = deps({ role: "viewer" });
+  d.getDashboardAccess = async () => ({ userId: "u2", email: "u@x", role: "viewer", accountIds: ["A", "Z"], accountGrants: { A: { mode: "ALL_BRANDS", brandKeys: null }, Z: { mode: "ALL_BRANDS", brandKeys: null } } });
+  const { res, cap } = fakeRes();
+  await handler(get({ action: "me" }), res, d);
+  assert.equal(cap.code, 200);
+  assert.deepEqual([...(cap.body.access.accountGrants.A.permittedBrandKeys || [])].sort(), ["acme corp", "bebi born"], "A (ALL_BRANDS) -> A's trusted brands");
+  // Account Z has NO trusted membership in this fixture -> resolved with empty set; it still gets a (empty) list, and
+  // crucially never inherits A's brands (per-account isolation).
+  assert.ok(!(cap.body.access.accountGrants.Z.permittedBrandKeys || []).includes("bebi born"), "Z never receives A's brand");
+});
+
+await test("me: an ADMIN receives NO per-account permitted map (unrestricted org-wide, byte-identical)", async () => {
+  const d = deps({ role: "admin" });
+  d.getDashboardAccess = async () => ({ userId: "admin1", role: "admin", accountIds: ["A"], accountGrants: { A: { mode: "ALL_BRANDS", brandKeys: null } } });
+  const { res, cap } = fakeRes();
+  await handler(get({ action: "me" }), res, d);
+  assert.equal(cap.code, 200);
+  assert.ok(!("permittedBrandKeys" in (cap.body.access.accountGrants.A || {})), "admin grant is not narrowed with a permitted map");
+});
+
 out("\n" + passed + " assertions passed");

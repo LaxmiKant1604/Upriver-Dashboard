@@ -7,7 +7,7 @@ import { writeSync } from "node:fs";
 import {
   CAPABILITY, REPORT_CAPABILITIES, resolveUserReportScope, accessFingerprint, BrandAccessError,
   isBrandAccessible, requiresScopeAdapter, projectBrandSalesPayload, projectSkuMovementPayload,
-  projectBrandDirectoryPayload, filterRowsToBrands, accountBrandPairAuthorized,
+  projectBrandDirectoryPayload, filterRowsToBrands, accountBrandPairAuthorized, resolveAuthorizedBrandMap,
 } from "../lib/server/report-authorization.js";
 
 let passed = 0;
@@ -171,6 +171,34 @@ await test("39. an ALL_BRANDS account contributes any brand; a non-granted accou
 await test("30b. filterRowsToBrands never lets an Unmapped/blank-brand row into a named scope", () => {
   const rows = [{ brand: "Bebi Born" }, { brand: "" }, { brand: "Unmapped" }, {}];
   assert.deepEqual(filterRowsToBrands(rows, new Set(["bebi born"])), [{ brand: "Bebi Born" }]);
+});
+
+await test("40. resolveAuthorizedBrandMap: non-admin ALL_BRANDS account -> the account's TRUSTED brands (never org-wide)", async () => {
+  // user has A (ALL_BRANDS) + B (ALL_BRANDS). A sells bebi born/bebi-born/acme corp; B sells zeta.
+  const map = await resolveAuthorizedBrandMap({ access: access(), getTrustedBrands });
+  assert.equal(map.admin, false);
+  assert.deepEqual(map.accounts.A.permittedKeys, ["acme corp", "bebi born", "bebi-born"], "A -> A's trusted brands only");
+  assert.deepEqual(map.accounts.B.permittedKeys, ["zeta"], "B -> B's trusted brands only");
+  // A brand that exists ONLY in an unauthorized account (not A or B) never appears in either account's permitted set.
+  assert.ok(!map.accounts.A.permittedKeys.includes("zeta"), "A does not get B's brand (per-account pairs)");
+  assert.ok(!map.accounts.B.permittedKeys.includes("bebi born"), "B does not get A's brand");
+});
+
+await test("41. resolveAuthorizedBrandMap: SELECTED_BRANDS -> trusted INTERSECT granted; admin -> {admin:true}", async () => {
+  const selAonly = { userId: "u1", role: "viewer", accountIds: ["A"], accountGrants: { A: { mode: "SELECTED_BRANDS", brandKeys: ["bebi born", "gone brand"] } } };
+  const map = await resolveAuthorizedBrandMap({ access: selAonly, getTrustedBrands });
+  assert.deepEqual(map.accounts.A.permittedKeys, ["bebi born"], "granted 'gone brand' is not trusted -> excluded");
+  const adminMap = await resolveAuthorizedBrandMap({ access: { role: "admin", accountIds: ["A"], accountGrants: {} }, getTrustedBrands });
+  assert.equal(adminMap.admin, true, "admin -> unrestricted org-wide (no per-account map applied)");
+});
+
+await test("42. resolveAuthorizedBrandMap: a trusted-membership READ FAILURE is fail-soft (resolved:false, empty keys)", async () => {
+  const failReader = async ({ accountId }) => { if (accountId === "A") throw new Error("db"); return TRUSTED[accountId] || []; };
+  const map = await resolveAuthorizedBrandMap({ access: access(), getTrustedBrands: failReader });
+  assert.equal(map.accounts.A.resolved, false, "A read failed -> resolved:false (caller leaves it unrestricted, never hides all)");
+  assert.deepEqual(map.accounts.A.permittedKeys, []);
+  assert.equal(map.accounts.B.resolved, true, "B still resolves");
+  assert.deepEqual(map.accounts.B.permittedKeys, ["zeta"]);
 });
 
 out("\n" + passed + " assertions passed");

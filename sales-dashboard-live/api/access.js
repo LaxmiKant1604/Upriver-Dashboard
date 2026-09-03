@@ -17,6 +17,7 @@ import {
 import { getDataDoeConnections } from "../lib/server/datadoe-connections.js";
 import { organizationFingerprint } from "../lib/server/source-identity.js";
 import { brandKey as canonicalBrandKey } from "../lib/server/reports/brand-membership.js";
+import { resolveAuthorizedBrandMap } from "../lib/server/report-authorization.js";
 
 function primaryOrgFingerprint() {
   try {
@@ -62,6 +63,24 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
     const access = await deps.getDashboardAccess(req);
 
     if (req.method === "GET" && action === "me") {
+      // CENTRALIZED brand authorization for the browser: attach, per authorized account, the permitted brand keys the
+      // user may see (ALL_BRANDS -> the account's trusted brands; SELECTED_BRANDS -> trusted INTERSECT granted). A
+      // non-admin ALL_BRANDS account is therefore materialized as THAT account's brands, never "globally unrestricted"
+      // -- so every client selector can filter to the authorized per-account brand set (defense in depth; the server
+      // still projects every payload + 403s a forbidden request). Admin -> no per-account map (unrestricted org-wide).
+      // Computed ONLY here (once per access load / focus revalidate), never in the hot-path getDashboardAccess.
+      // Fail-soft PER account: an unreadable membership leaves that account WITHOUT a permitted list (the client keeps
+      // it unrestricted rather than hiding every brand; the server scoping remains authoritative).
+      if (access && access.role !== "admin" && access.accountGrants) {
+        try {
+          const map = await resolveAuthorizedBrandMap({ access, getTrustedBrands: deps.getTrustedAccountBrands });
+          for (const [acct, info] of Object.entries(map.accounts || {})) {
+            if (info && info.resolved && access.accountGrants[acct]) {
+              access.accountGrants[acct] = { ...access.accountGrants[acct], permittedBrandKeys: info.permittedKeys };
+            }
+          }
+        } catch { /* fail-soft: no map attached; client falls back, server enforcement is authoritative */ }
+      }
       res.status(200).json({ access });
       return;
     }

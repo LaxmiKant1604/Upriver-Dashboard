@@ -3486,13 +3486,17 @@ function DashboardApp({ session, access, onSignOut }) {
     const currentRowBrands = rows.map(productBrand).filter((brand) => brand !== "Unassigned");
     const currentSnapshotBrands = catalogBrandsAccountId === selectedAccountId ? catalogBrands : [];
     let names = [...new Set([...cachedAccountBrands, ...currentSnapshotBrands, ...currentRowBrands])];
-    // BRAND-SCOPE (defense-in-depth; the server is the security boundary). The three sources above include CLIENT
-    // caches (localStorage brand-sales rows) and still-in-memory payloads that, for a stale/pre-restriction cache or
-    // an in-session grant narrowing not yet re-fetched, can contain a brand this user is NOT granted. Never OFFER
-    // such a name: filter the selector to the account's permitted keys (null = admin/ALL_BRANDS -> unchanged). The
-    // server still projects every payload + 403s a forbidden request, so data is safe regardless; this closes the
-    // selector-label leak.
-    names = filterBrandNamesToPermitted(names, permittedBrandKeySetForAccount(access, selectedAccountId));
+    // BRAND-SCOPE (defense-in-depth; the server is the security boundary). All three sources above are ALREADY scoped
+    // to the SELECTED account (cachedBrandsForAccount filters by ids=account; rows/catalog are this account's own
+    // payload), so a brand from an unauthorized account cannot appear here. For a SELECTED_BRANDS account we still
+    // filter to the granted brands (the account has more brands than granted). For a non-admin ALL_BRANDS account we
+    // do NOT filter: every brand belonging to this authorized account is permitted, and filtering by a possibly-stale
+    // server permitted set could transiently hide a brand-new brand. The server still projects every payload + 403s a
+    // forbidden request.
+    const selGrant = access.accountGrants && access.accountGrants[selectedAccountId];
+    const singleAccountPermitted = selGrant && selGrant.mode === "SELECTED_BRANDS"
+      ? permittedBrandKeySetForAccount(access, selectedAccountId) : null;
+    names = filterBrandNamesToPermitted(names, singleAccountPermitted);
     return names.sort((a, b) => a.localeCompare(b));
   }, [cachedAccountBrands, catalogBrands, catalogBrandsAccountId, rows, selectedAccountId, access]);
   // BRAND-SCOPE (frontend UX; the server is the security boundary): is the selected account brand-limited for this
