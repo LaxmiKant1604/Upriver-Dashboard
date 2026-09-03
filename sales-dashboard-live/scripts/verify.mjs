@@ -109,6 +109,7 @@ const SUITES = [
   "test:brand-view-freshness",
   "test:brand-view-render",
   "test:fba-planning",
+  "test:awd-europe",
   "test:fba-wdd",
   "test:fba-wdd-config",
   "test:warehouse-import",

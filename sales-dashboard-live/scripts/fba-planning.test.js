@@ -136,7 +136,7 @@ test("13. aggregate fields (total_reserved_quantity / inbound_quantity) are neve
 });
 
 /* ===== 14/15/16. AWD US-only ===== */
-test("14/15. AWD counts ONLY for a US account with validated evidence; Non-US contributes nothing + shows no columns", () => {
+test("14/15. AWD counts for ANY validated marketplace (US + EU5); an UNVALIDATED account contributes nothing (null, never 0)", () => {
   const us = computePlanRow({ isUS: true, awdValidated: true, awdAvailable: 30, awdInbound: 15, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
   assert.equal(us.awdAvailable, 30);
   assert.equal(us.awdInbound, 15);
@@ -145,11 +145,19 @@ test("14/15. AWD counts ONLY for a US account with validated evidence; Non-US co
   assert.equal(us.totalFbaInventory, 100, "Total FBA Inventory is FBA-only, never includes AWD");
   assert.equal(us.amazonNetworkPosition, 100 + 30, "network position adds distributable AWD only");
   assert.equal(us.totalAmazonAwdStock, 100 + 30, "awd_inbound (15) is NOT added to usable stock");
-  const nonUs = computePlanRow({ isUS: false, awdValidated: true, awdAvailable: 30, awdInbound: 15, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
-  assert.equal(nonUs.awdAvailable, null, "Non-US AWD is Unavailable (null), never 0");
-  assert.equal(nonUs.awdInbound, null);
-  assert.equal(nonUs.totalAmazonAwdStock, 100, "Non-US AWD never contributes to stock");
-  assert.equal(nonUs.amazonNetworkPosition, 100);
+  // A VALIDATED European account (isUS false, awdValidated true) counts AWD IDENTICALLY -- the caller encodes the
+  // marketplace eligibility (US + EU5) in awdValidated, so European AWD flows through the SAME (unchanged) formulas.
+  const eu = computePlanRow({ isUS: false, awdValidated: true, awdAvailable: 30, awdInbound: 15, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
+  assert.equal(eu.awdAvailable, 30, "European (validated) AWD is counted, exactly like US");
+  assert.equal(eu.totalFbaInventory, 100, "European Total FBA Inventory still excludes AWD (no double count)");
+  assert.equal(eu.amazonNetworkPosition, 130);
+  assert.equal(eu.totalAmazonAwdStock, 130);
+  // An UNVALIDATED account (a non-AWD marketplace, or a missing/failed source) contributes nothing: null, never 0.
+  const unval = computePlanRow({ isUS: false, awdValidated: false, awdAvailable: null, awdInbound: null, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
+  assert.equal(unval.awdAvailable, null, "unvalidated AWD is Unavailable (null), never 0");
+  assert.equal(unval.awdInbound, null);
+  assert.equal(unval.totalAmazonAwdStock, 100, "unvalidated AWD never contributes to stock");
+  assert.equal(unval.amazonNetworkPosition, 100);
 });
 
 test("canonical model: one non-overlapping equation; each raw state counted exactly once; AWD-inbound + customer-reserve excluded", () => {

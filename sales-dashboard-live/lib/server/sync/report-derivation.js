@@ -40,6 +40,7 @@ import {
   ppcPerformancePayload,
 } from "../reports/derivation-core.js";
 import { skuMovementPayload } from "../reports/sku-movement-core.js";
+import { awdCapableMarketplace, awdRequiredForMarketplace } from "../reports/awd-capability.js";
 import {
   declaredReportKeys,
   declaredRequestKeys,
@@ -519,24 +520,36 @@ const REGISTRY = {
       const expectedInventoryFrom = addDaysStr(asOf, -FBA_INVENTORY_LOOKBACK_DAYS);
       const invRows = singleAccountFragmentRows(sources["fba-plan:inventory-health"], "fba-plan:inventory-health", rawSellerId, expectedInventoryFrom, asOf);
 
-      // 3) AWD -- US only. Missing/failed for a US account BLOCKS (never a silent zero); a validated
-      //    (possibly empty) AWD source is honored. Non-US never reads AWD.
+      // 3) AWD -- the AWD-capable marketplaces (US + EU5). US is a HARD REQUIREMENT: a missing/failed/malformed AWD
+      //    source BLOCKS (never a silent zero) so last-known-good is preserved -- byte-identical to before. Europe is
+      //    BEST-EFFORT: a missing/failed/malformed AWD source leaves AWD honestly unavailable ([] rows) and NEVER
+      //    blocks the plan (a failed Europe AWD fetch must not blank the FBA plan; the account's other columns +
+      //    last-known-good stand). A non-AWD marketplace never reads AWD.
+      const awdEligible = awdCapableMarketplace(context.marketCountry);
+      const awdRequired = awdRequiredForMarketplace(context.marketCountry); // US only
       let awdRows = [];
-      if (isUS) {
+      if (awdEligible) {
         const awd = sources["fba-plan:awd"];
-        if (!awd || awd.available !== true || !Array.isArray(awd.rows)) {
-          throw new Error("fba-plan US account requires a validated AWD source; it is missing or failed, so the snapshot is blocked (previous data preserved).");
+        const present = awd && awd.available === true && Array.isArray(awd.rows);
+        if (!present) {
+          if (awdRequired) throw new Error("fba-plan US account requires a validated AWD source; it is missing or failed, so the snapshot is blocked (previous data preserved).");
+          // Europe best-effort: AWD unavailable -> continue with awdRows = [] (never block).
+        } else {
+          // AWD is a NO-DATE source: require EXACTLY one single-account fragment whose window is the canonical
+          // {from:null, to:null}. A dated/malformed AWD fragment BLOCKS a US account (LKG preserved); for Europe it is
+          // best-effort (AWD unavailable, never block).
+          const frags = awd.fragments || [];
+          const f = frags.length === 1 ? frags[0] : null;
+          const ids = f && f.sellerOrVendorIds;
+          const ok = !!f && f.from === null && f.to === null
+            && Array.isArray(ids) && ids.length === 1 && (rawSellerId == null || String(ids[0]).trim() === rawSellerId);
+          if (!ok) {
+            if (awdRequired) throw new Error("fba-plan AWD must be exactly one single-account no-date fragment (from === null, to === null); snapshot blocked.");
+            // Europe best-effort: malformed AWD fragment -> AWD unavailable, continue.
+          } else {
+            awdRows = awd.rows;
+          }
         }
-        // AWD is a NO-DATE source: require EXACTLY one single-account fragment whose window is the
-        // canonical {from:null, to:null}. A dated AWD fragment (a wrong/narrowed listings window) is
-        // rejected -> derive-invalid -> last-known-good preserved.
-        const frags = awd.fragments || [];
-        const f = frags.length === 1 ? frags[0] : null;
-        const ids = f && f.sellerOrVendorIds;
-        const ok = !!f && f.from === null && f.to === null
-          && Array.isArray(ids) && ids.length === 1 && (rawSellerId == null || String(ids[0]).trim() === rawSellerId);
-        if (!ok) throw new Error("fba-plan AWD must be exactly one single-account no-date fragment (from === null, to === null); snapshot blocked.");
-        awdRows = awd.rows;
       }
 
       return fbaPlanPayload({
@@ -544,6 +557,7 @@ const REGISTRY = {
         accountName: context.accountName ?? null,
         marketCountry: context.marketCountry ?? null,
         isUS,
+        awdEligible,
         completed, current,
         completedUnitRows, mtdUnitRows,
         dailyDateRows, catalogRows, invRows, awdRows,

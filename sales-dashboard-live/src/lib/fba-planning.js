@@ -195,9 +195,12 @@ export function computePlanRow({
   // 2) AWD (US-only, validated). Non-US or unvalidated -> null (Unavailable), never 0.
   //    awdAvailable is DISTRIBUTABLE stock -> counts as usable supply. awdInbound is inbound TO the AWD warehouse and
   //    is NOT yet distributable -> DISPLAY ONLY, never added to usable/network/planning supply.
-  const awdAvail = isUS && awdValidated ? (awdAvailable == null ? null : num0(awdAvailable)) : null;
-  const awdInb = isUS && awdValidated ? (awdInbound == null ? null : num0(awdInbound)) : null;
-  const distributableAwdStock = isUS && awdValidated ? num0(awdAvail) : 0; // awdInbound EXCLUDED (not yet distributable)
+  // AWD is counted whenever the caller proves it validated for THIS account's marketplace (US + EU5). The caller's
+  // awdValidated already encodes marketplace eligibility (payload.awdEligible && payload.awdAvailable), so US stays
+  // byte-identical (awdValidated was only ever true for US) and European AWD now flows through the SAME formulas.
+  const awdAvail = awdValidated ? (awdAvailable == null ? null : num0(awdAvailable)) : null;
+  const awdInb = awdValidated ? (awdInbound == null ? null : num0(awdInbound)) : null;
+  const distributableAwdStock = awdValidated ? num0(awdAvail) : 0; // awdInbound EXCLUDED (not yet distributable)
 
   // 3) network totals. amazonNetworkPosition = FBA inventory + distributable AWD (the usable planning supply).
   const totalAmazonAwdStock = immediatelyAvailable == null ? null : num0(totalFbaInventory) + distributableAwdStock;

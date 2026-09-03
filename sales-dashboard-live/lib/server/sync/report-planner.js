@@ -21,6 +21,7 @@ import { bucketForCountry } from "./registry.js";
 import { buildDependencyPlan } from "./planner.js";
 import { assignAccountBatches, batchSellerIds, MAX_ACCOUNTS_PER_BATCH } from "./source-batching.js";
 import { organizationFingerprint, accountScopeHash } from "../source-identity.js";
+import { awdCapableMarketplace } from "../reports/awd-capability.js";
 
 // Daily Reporting spans the last SIX calendar months exactly as the live UI does:
 // [monthBack(asOf, 5).from .. asOf] (first day of the month five months back .. today). The prior
@@ -344,9 +345,10 @@ export function planFbaPlan({ accountId, name, country, currency, connections, a
   const windowsByRequestKey = {
     "fba-plan:inventory-health": [{ from: addDaysStr(asOfStr, -FBA_INVENTORY_LOOKBACK_DAYS), to: asOfStr }],
   };
-  // AWD is a US-only no-date source; supply its window ONLY for US (the contract's country gate would
-  // otherwise reject an inapplicable request key).
-  if (isUS) windowsByRequestKey["fba-plan:awd"] = [{ from: null, to: null }];
+  // AWD is a no-date source for the AWD-CAPABLE marketplaces (US + EU5); supply its window only for those (the
+  // contract's country gate would otherwise reject an inapplicable request key). US is byte-identical (awdCapable("US")
+  // === true, exactly the former isUS gate). See lib/server/reports/awd-capability.js.
+  if (awdCapableMarketplace(scope.country)) windowsByRequestKey["fba-plan:awd"] = [{ from: null, to: null }];
   const sources = reportSourceRequestHashes({
     reportKey: "fba-plan", apiKey: scope.apiKey, ids: [scope.rawSellerId],
     windowsByRequestKey, marketplaceCountry: scope.country,
@@ -433,7 +435,9 @@ export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, 
       const windowsByRequestKey = {
         "fba-plan:inventory-health": [{ from: addDaysStr(asOf, -FBA_INVENTORY_LOOKBACK_DAYS), to: asOf }],
       };
-      if (isUS) windowsByRequestKey["fba-plan:awd"] = [{ from: null, to: null }];
+      // AWD for the AWD-capable marketplaces (US + EU5); US byte-identical. Each partition is a single marketplace
+      // (line above), so the batched AWD export stays marketplace-safe.
+      if (awdCapableMarketplace(market)) windowsByRequestKey["fba-plan:awd"] = [{ from: null, to: null }];
       const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey, ids, windowsByRequestKey, marketplaceCountry: market });
       // Stamp the batch's single canonical marketplace constraint so resolveFromGenericPlan/plannedSourceJob carry
       // it into the source worker's per-row marketplace validation (validateBatchSourcePayload).

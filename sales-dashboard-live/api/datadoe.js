@@ -70,6 +70,7 @@ import {
   projectBrandSalesPayload, projectSkuMovementPayload, projectBrandDirectoryPayload, projectReturnsLeakagePayload, accountBrandPairAuthorized,
 } from "../lib/server/report-authorization.js";
 import { brandKey as canonicalBrandKey } from "../lib/server/reports/brand-membership.js";
+import { awdCapableMarketplace, canonicalAwdMarketplace } from "../lib/server/reports/awd-capability.js";
 // The single ASIN->Campaign cutover authority: block a retired ASIN Ads export create from ANY raw-sourceId path
 // (e.g. the admin discovery `sample` probe) before the DataDoe request, so the browser can never mint an ASIN export;
 // and gate the legacy ASIN-attributed portfolio read to the rollback path so no ASIN ad metrics reach the browser.
@@ -3694,6 +3695,10 @@ async function handleDataDoe(req, res) {
       const accounts = await fetchAccountsRaw(apiKey);
       const account = accounts.find((a) => a.id === sellerOrVendorIds[0]) || null;
       const isUS = String(account?.country || "").toUpperCase() === "US";
+      // AWD is fetched/folded for the AWD-capable marketplaces (US + EU5); US byte-identical. awdMarket is the account's
+      // OWN canonical marketplace so AWD never attaches to another marketplace. See lib/server/reports/awd-capability.js.
+      const awdEligible = awdCapableMarketplace(account?.country);
+      const awdMarket = canonicalAwdMarketplace(account?.country) || (isUS ? "US" : "");
 
       // 1) ONE canonical Order Line Items sales fragment over [completed[0].from .. asOf] (Blocker 1).
       // Per-ASIN ordered units per month AND the current-month latest sales date are DERIVED from this
@@ -3818,12 +3823,13 @@ async function handleDataDoe(req, res) {
       }
       const inventoryAvailable = invRows.length > 0;
 
-      // 5) AWD available + inbound (US only), folded from SKU to ASIN. Defensive US-only marketplace guard.
+      // 5) AWD available + inbound (AWD-capable marketplaces: US + EU5), folded from SKU to ASIN. Defensive
+      //    own-marketplace guard so one marketplace's AWD never attaches to another (US byte-identical: awdMarket "US").
       const awdByAsin = {};
       const awdInboundByAsin = {};
       let awdAvailable = false;
       let awdRows = [];
-      if (isUS) {
+      if (awdEligible) {
         awdRows = await fetchExportRows(
           apiKey, LISTINGS_SOURCE_ID, LISTINGS_AWD_COLUMNS, sellerOrVendorIds,
           null, null, CATALOG_ROW_LIMIT,
@@ -3831,8 +3837,8 @@ async function handleDataDoe(req, res) {
         );
         awdAvailable = awdRows.length > 0;
         for (const r of awdRows) {
-          const mkt = String(r.marketplace_country_code || "").trim().toUpperCase();
-          if (mkt && mkt !== "US") continue; // US-only: never let a non-US AWD row leak in
+          const mkt = canonicalAwdMarketplace(r.marketplace_country_code);
+          if (mkt && awdMarket && mkt !== awdMarket) continue; // never let another marketplace's AWD row leak in
           const asin = String(r.child_asin || "").trim();
           if (!asin) continue;
           awdByAsin[asin] = (awdByAsin[asin] || 0) + num(r.awd_available_distributable_quantity);
@@ -3866,7 +3872,7 @@ async function handleDataDoe(req, res) {
         } else if (!e.productName && invName) { e.productName = invName; }
       };
       for (const r of invRows) { if (inventoryDate && r.date !== inventoryDate) continue; putSku(r.sku, r.child_asin, r.marketplace_country_code || account?.country, "inventory", String(r.product_name || "").trim() || null); }
-      for (const r of awdRows) { const mkt = String(r.marketplace_country_code || "").trim().toUpperCase(); if (mkt && mkt !== "US") continue; putSku(r.sku, r.child_asin, "US", "awd", null); }
+      for (const r of awdRows) { const mkt = canonicalAwdMarketplace(r.marketplace_country_code); if (mkt && awdMarket && mkt !== awdMarket) continue; putSku(r.sku, r.child_asin, awdMarket || mkt, "awd", null); }
       for (const r of oliSalesRows) putSku(r?.sku, r?.child_asin, account?.country, "sales", null);
       if (skuAsinConflicts.size > 0) {
         const [conflictSku, c] = [...skuAsinConflicts.entries()][0];
@@ -3900,8 +3906,8 @@ async function handleDataDoe(req, res) {
         const invTotal = inv
           ? inv.available + inv.customerOrderReserved + inv.fcTransfer + inv.fcProcessing + inv.inboundShipped + inv.inboundReceived + inv.inboundWorking
           : 0;
-        const awdUnits = isUS ? num(awdByAsin[asin]) : 0;
-        const awdInboundUnits = isUS ? num(awdInboundByAsin[asin]) : 0;
+        const awdUnits = awdEligible ? num(awdByAsin[asin]) : 0;
+        const awdInboundUnits = awdEligible ? num(awdInboundByAsin[asin]) : 0;
         if (salesTotal <= 0 && invTotal <= 0 && awdUnits <= 0 && awdInboundUnits <= 0) continue;
         rows.push({
           asin,
@@ -3920,8 +3926,8 @@ async function handleDataDoe(req, res) {
           inboundShipped: inventoryAvailable ? num(inv?.inboundShipped) : null,
           inboundReceived: inventoryAvailable ? num(inv?.inboundReceived) : null,
           inboundWorking: inventoryAvailable ? num(inv?.inboundWorking) : null,
-          awdAvailable: isUS ? awdUnits : null,
-          awdInbound: isUS ? awdInboundUnits : null,
+          awdAvailable: awdEligible ? awdUnits : null,
+          awdInbound: awdEligible ? awdInboundUnits : null,
         });
       }
 
@@ -3930,6 +3936,7 @@ async function handleDataDoe(req, res) {
         accountName: account?.name || null,
         marketCountry: account?.country || null,
         isUS,
+        awdEligible,
         months: completed,
         currentMonth: current,
         salesLatestDate,

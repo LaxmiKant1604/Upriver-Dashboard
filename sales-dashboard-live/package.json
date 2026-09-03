@@ -34,6 +34,7 @@
     "test:oli-sales-estimate": "node scripts/oli-sales-estimate.test.js && node scripts/oli-sales-estimate-integration.test.js && node scripts/oli-sku-asin-resolution.test.js",
     "test:brand-view-render": "node scripts/brand-view-render.test.js",
     "test:fba-planning": "node scripts/fba-planning.test.js",
+    "test:awd-europe": "node scripts/awd-europe.test.js",
     "test:fba-wdd": "node scripts/fba-wdd.test.js",
     "test:fba-wdd-config": "node scripts/fba-wdd-config.test.js",
     "test:warehouse-import": "node scripts/warehouse-import.test.js",

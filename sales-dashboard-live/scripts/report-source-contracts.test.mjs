@@ -470,7 +470,9 @@ test("fba-plan inventory-health / awd match their constants (both now seller-sco
   assert.ok(awd.columns.includes("seller_or_vendor_id"), "batchable AWD contract carries the seller split key");
   assert.deepEqual(awd.columns.filter((c) => c !== "seller_or_vendor_id"), constArray("LISTINGS_AWD_COLUMNS"));
   assert.equal(awd.limit, constNumber("CATALOG_ROW_LIMIT"));
-  assert.deepEqual(awd.marketplaceCountries, ["US"]);
+  // AWD is offered in the US + the EU5 (GB/UK, DE, FR, IT, ES). US stays in the list (byte-identical); AU + smaller EU
+  // marketplaces are excluded. Both UK and GB are accepted (directory uses UK, Amazon rows use GB).
+  assert.deepEqual([...awd.marketplaceCountries].sort(), ["DE", "ES", "FR", "GB", "IT", "UK", "US"]);
   assert.equal(awd.orderByColumn, "child_asin");
 });
 
@@ -492,11 +494,25 @@ test("fba-plan resolves ONLY its owned FBA Health + US AWD sources (OLI/catalog 
   assert.equal(got.length, 2);
 });
 
-/* --- country-driven US-only AWD --- */
-test("fba-plan resolves without AWD for a non-US account", () => {
+/* --- country-driven AWD: US + EU5 capable; AU + others excluded --- */
+test("fba-plan resolves without AWD for a non-AWD marketplace (IN)", () => {
   const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaBase, marketplaceCountry: "IN" });
-  assert.equal(got.length, 1); // only the owned FBA Health snapshot (OLI/catalog derived; no AWD for non-US)
+  assert.equal(got.length, 1); // only the owned FBA Health snapshot (OLI/catalog derived; no AWD for a non-AWD marketplace)
   assert.ok(got.every((r) => r.requestKey !== "fba-plan:awd"));
+});
+test("fba-plan resolves AWD for the AWD-capable European marketplaces (UK/GB, DE, FR, IT, ES)", () => {
+  for (const cc of ["UK", "GB", "DE", "FR", "IT", "ES"]) {
+    const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: cc });
+    const awd = got.filter((r) => r.requestKey === "fba-plan:awd");
+    assert.equal(awd.length, 1, `${cc} resolves the AWD request`);
+    assert.equal(awd[0].from, null); assert.equal(awd[0].to, null);
+  }
+});
+test("fba-plan EXCLUDES AWD for Australia + Canada + smaller EU marketplaces (never fetched)", () => {
+  for (const cc of ["AU", "CA", "NL", "BE", "PL", "IE", "SE", "AT"]) {
+    const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaBase, marketplaceCountry: cc });
+    assert.ok(got.every((r) => r.requestKey !== "fba-plan:awd"), `${cc} is excluded from AWD`);
+  }
 });
 test("fba-plan resolves AWD as a no-date request for a US account", () => {
   const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });

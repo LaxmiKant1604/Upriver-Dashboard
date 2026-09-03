@@ -187,6 +187,7 @@ const EXPECTED = {
   inventoryDate: "2025-08-06",
   inventoryAvailable: true,
   awdAvailable: true,
+  awdEligible: true, // ADDITIVE (Europe AWD): US is AWD-eligible exactly as before (awdEligible === isUS for US).
   rows: [
     { asin: "ASIN1", productName: "Widget", brand: "Acme", sku: "SKU-1", unitsByMonth: { "2025-05": 10, "2025-06": 20, "2025-07": 7 }, mtdUnits: 3, fbaAvailable: 100, customerOrderReserved: 4, reservedFcTransfer: 8, reservedFcProcessing: 1, inboundShipped: 5, inboundReceived: 2, inboundWorking: 0, awdAvailable: 42, awdInbound: 15 },
     { asin: "ASIN2", productName: "Gadget", brand: "Beta", sku: null, unitsByMonth: { "2025-05": 5, "2025-06": 0, "2025-07": 0 }, mtdUnits: 0, fbaAvailable: 0, customerOrderReserved: 0, reservedFcTransfer: 0, reservedFcProcessing: 0, inboundShipped: 0, inboundReceived: 0, inboundWorking: 0, awdAvailable: 0, awdInbound: 0 },
@@ -706,8 +707,16 @@ test("planFbaPlanBucketBatched: UK accounts batch under the GB marketplace (neve
   // Both UK accounts share ONE batched FBA export (same GB marketplace partition).
   const invHashes = new Set(reqs.map((r) => r.sources.find((s) => s.requestKey === "fba-plan:inventory-health").requestHash));
   assert.equal(invHashes.size, 1, "UK accounts batch together under GB");
-  // UK is non-US, so no AWD.
-  assert.ok(reqs.every((r) => !r.sources.some((s) => s.requestKey === "fba-plan:awd")), "no AWD for UK (non-US)");
+  // UK is an AWD-capable EU5 marketplace (Europe AWD support): it NOW resolves the AWD source (batched under GB).
+  assert.ok(reqs.every((r) => r.sources.some((s) => s.requestKey === "fba-plan:awd")), "UK (EU5) resolves AWD");
+  const awdHashes = new Set(reqs.map((r) => r.sources.find((s) => s.requestKey === "fba-plan:awd").requestHash));
+  assert.equal(awdHashes.size, 1, "UK accounts share ONE batched AWD export under GB");
+});
+test("planFbaPlanBucketBatched: an Australia account is NEVER planned for AWD (excluded from the Europe expansion)", () => {
+  const au = [{ accountId: "AU1", name: "a1", country: "AU", currency: "AUD" }];
+  const reqs = planFbaPlanBucketBatched({ accounts: au, connections: PL_CONN, asOfFor: bAsOfFor });
+  assert.ok(reqs.length >= 1);
+  assert.ok(reqs.every((r) => !r.sources.some((s) => s.requestKey === "fba-plan:awd")), "Australia is excluded from AWD");
 });
 
 test("fba-plan BATCHED derive ISOLATES each account's rows from a shared <=5-seller FBA/AWD export (no cross-account leak)", async () => {

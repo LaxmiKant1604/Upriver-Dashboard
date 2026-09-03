@@ -29,6 +29,7 @@
 
 import { sourceRequestIdentity } from "../source-identity.js";
 import { sourceContractForKey } from "../source-contracts.js";
+import { AWD_CONTRACT_COUNTRIES } from "../reports/awd-capability.js";
 import { chunkAccountIds } from "../id-batching.js";
 // addDaysStr for the derived Sales Movers windows; the strict calendar-month helpers
 // (splitDateRangeByMonth / isFullCalendarMonthWindow) are the SAME helpers the production
@@ -404,8 +405,11 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       aggregations: null,
       orderByColumn: "child_asin",
       orderByDirection: "ASC",
-      windowKind: "none (no-date; US accounts only)",
-      marketplaceCountries: ["US"],
+      windowKind: "none (no-date; AWD-capable marketplaces: US + EU5)",
+      // AWD is offered by Amazon in the US + the EU5 (GB/UK, DE, FR, IT, ES). The gate accepts either UK or GB (the
+      // account directory uses UK, Amazon rows use GB). AU + smaller EU marketplaces are excluded (no AWD). US is
+      // byte-identical (it stays in the list); see lib/server/reports/awd-capability.js.
+      marketplaceCountries: [...AWD_CONTRACT_COUNTRIES],
     },
   ],
   // Keyword Rank (single account). SQP weekly (primary) + SQP monthly (data-dependent

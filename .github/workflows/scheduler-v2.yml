@@ -257,7 +257,10 @@ jobs:
           region="${{ needs.run.outputs.region }}"
           case "$region" in
             "india")     maxtok=30 ;;
-            "europe-au") maxtok=60 ;;
+            # europe-au raised 60 -> 90: Europe AWD (Listings) is now fetched for the EU5 accounts (GB/UK, DE, FR, IT,
+            # ES) -- ~5 extra premium creates -> the batched plan is ~70 tokens; 90 fits it with headroom. Times,
+            # ownership, watchdog + concurrency are UNCHANGED (this is only the FBA token-budget ceiling).
+            "europe-au") maxtok=90 ;;
             "us-ca")     maxtok=40 ;;
             *) echo "Unknown region '$region' for FBA -- refusing (fail closed)." >&2; exit 1 ;;
           esac

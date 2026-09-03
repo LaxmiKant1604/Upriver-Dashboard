@@ -12,7 +12,8 @@
 // SCOPE: `--region` (a region india|europe-au|us-ca, or `all`) is the ACTIVE routing used by the regional
 // coordinator -- it takes precedence when present and runs exactly that region (or all three). `--bucket`
 // (us|non-us|both) is the legacy scope retained for manual runs + rollback. Either way FBA routes by
-// scope-membership; AWD stays US-only per-account (country === "US"), orthogonal to the region.
+// scope-membership; AWD is fetched per-account for the AWD-capable marketplaces (US + the EU5: GB/UK, DE, FR, IT, ES;
+// AU + others excluded -- see lib/server/reports/awd-capability.js), orthogonal to the region.
 // dry-run: ZERO creates, ZERO control changes -- resolves the coverage-maximizing as-of, builds the exact batched
 //   plan, proves how much is already adoptable from cache, and prints the create/token cost vs the ceiling.
 // go-live: refuses to start if the plan exceeds --max-tokens; otherwise, PER SELECTED SCOPE, runs the shared

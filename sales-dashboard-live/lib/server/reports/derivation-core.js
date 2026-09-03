@@ -20,6 +20,7 @@ import { canonicalCurrency, adsCurrencyEvidence } from "../currency.js";
 // daily folds goes through it so a case/whitespace variant selects the same brand while punctuation-distinct
 // brands stay separate.
 import { brandKey } from "./brand-membership.js";
+import { awdCapableMarketplace, canonicalAwdMarketplace } from "./awd-capability.js";
 
 // Numeric coercion identical to lib/server/datadoe.js `num` (Number(v) || 0), kept local so
 // this leaf pulls in no transport module.
@@ -640,10 +641,16 @@ export function foldOliSalesToFbaInputs(rows, completed, current) {
  */
 export function fbaPlanPayload({
   asOf, accountName, marketCountry, isUS,
+  // awdEligible: whether AWD is fetched/derived for this marketplace (US + EU5). Defaults to isUS so any legacy caller
+  // that only passes isUS keeps the exact former US-only behavior. awdMarket is the account's OWN canonical marketplace
+  // (US -> "US", UK -> "GB"); AWD rows attach ONLY to it (never one marketplace's AWD to another).
+  awdEligible = undefined,
   completed, current,
   completedUnitRows = [], mtdUnitRows = [], dailyDateRows = [],
   catalogRows = [], invRows = [], awdRows = [],
 }) {
+  const awdOn = awdEligible === undefined ? (isUS === true) : (awdEligible === true);
+  const awdMarket = canonicalAwdMarketplace(marketCountry) || (isUS ? "US" : "");
   // 1) Per-ASIN units for each completed month.
   const asinSet = new Set();
   const unitsByAsinByMonth = {};
@@ -723,17 +730,19 @@ export function fbaPlanPayload({
   }
   const inventoryAvailable = (invRows || []).length > 0;
 
-  // 5) AWD available + inbound (US only), folded SKU->ASIN. AWD rows are pinned to US at the source (marketplaceCountries
-  //    ["US"]); a defensive marketplace check drops any non-US row so US AWD can never attach to another marketplace.
+  // 5) AWD available + inbound (AWD-capable marketplaces: US + EU5), folded SKU->ASIN. A defensive marketplace check
+  //    drops any row whose marketplace is not THIS account's own canonical marketplace, so one marketplace's AWD can
+  //    never attach to another (US byte-identical: awdMarket === "US"). AWD stays honestly unavailable when there are
+  //    no rows -- never a fabricated zero.
   const awdByAsin = {};
   const awdInboundByAsin = {};
   let awdAvailable = false;
-  if (isUS) {
+  if (awdOn) {
     const rows = awdRows || [];
     awdAvailable = rows.length > 0;
     for (const r of rows) {
-      const mkt = String(r.marketplace_country_code || "").trim().toUpperCase();
-      if (mkt && mkt !== "US") continue; // US-only: never let a non-US AWD row leak in
+      const mkt = canonicalAwdMarketplace(r.marketplace_country_code);
+      if (mkt && awdMarket && mkt !== awdMarket) continue; // never let another marketplace's AWD row leak in
       const asin = String(r.child_asin || "").trim();
       if (!asin) continue;
       awdByAsin[asin] = (awdByAsin[asin] || 0) + num(r.awd_available_distributable_quantity);
@@ -772,7 +781,7 @@ export function fbaPlanPayload({
   };
   // Priority (first writer sets provenance): inventory > AWD > sales.
   for (const r of invRows || []) { if (inventoryDate && r.date !== inventoryDate) continue; putSku(r.sku, r.child_asin, r.marketplace_country_code || marketCountry, "inventory", String(r.product_name || "").trim() || null); }
-  if (isUS) for (const r of awdRows || []) { const mkt = String(r.marketplace_country_code || "").trim().toUpperCase(); if (mkt && mkt !== "US") continue; putSku(r.sku, r.child_asin, "US", "awd", null); }
+  if (awdOn) for (const r of awdRows || []) { const mkt = canonicalAwdMarketplace(r.marketplace_country_code); if (mkt && awdMarket && mkt !== awdMarket) continue; putSku(r.sku, r.child_asin, awdMarket || mkt, "awd", null); }
   for (const arr of completedUnitRows || []) for (const r of arr || []) putSku(r?.sku, r?.child_asin, marketCountry, "sales", null);
   for (const r of mtdUnitRows || []) putSku(r?.sku, r?.child_asin, marketCountry, "sales", null);
   if (skuAsinConflicts.size > 0) {
@@ -804,8 +813,8 @@ export function fbaPlanPayload({
     const invTotal = inv
       ? inv.available + inv.customerOrderReserved + inv.fcTransfer + inv.fcProcessing + inv.inboundShipped + inv.inboundReceived + inv.inboundWorking
       : 0;
-    const awdUnits = isUS ? num(awdByAsin[asin]) : 0;
-    const awdInboundUnits = isUS ? num(awdInboundByAsin[asin]) : 0;
+    const awdUnits = awdOn ? num(awdByAsin[asin]) : 0;
+    const awdInboundUnits = awdOn ? num(awdInboundByAsin[asin]) : 0;
     if (salesTotal <= 0 && invTotal <= 0 && awdUnits <= 0 && awdInboundUnits <= 0) continue;
     rows.push({
       asin,
@@ -824,8 +833,8 @@ export function fbaPlanPayload({
       inboundShipped: inventoryAvailable ? num(inv?.inboundShipped) : null,
       inboundReceived: inventoryAvailable ? num(inv?.inboundReceived) : null,
       inboundWorking: inventoryAvailable ? num(inv?.inboundWorking) : null,
-      awdAvailable: isUS ? awdUnits : null,
-      awdInbound: isUS ? awdInboundUnits : null,
+      awdAvailable: awdOn ? awdUnits : null,
+      awdInbound: awdOn ? awdInboundUnits : null,
     });
   }
 
@@ -841,6 +850,9 @@ export function fbaPlanPayload({
     inventoryDate,
     inventoryAvailable,
     awdAvailable,
+    // Whether AWD is applicable for this account's marketplace (US + EU5). Drives the client's AWD column visibility +
+    // the AWD-source-validated gate, so European AWD renders exactly like US. US byte-identical (awdEligible === isUS).
+    awdEligible: awdOn,
     rows,
     accountSkus: accountSkuDirectory.map((e) => e.sku), // backward compat for readers of the old string-only allowlist
     accountSkuDirectory,

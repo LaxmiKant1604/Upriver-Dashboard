@@ -3030,12 +3030,20 @@ function DashboardApp({ session, access, onSignOut }) {
 
   // Derived FBA Shipment Plan: raw rows -> computed metrics -> filter -> sort.
   // Everything here is local, so search/sort/target/config changes never refetch (ZERO DataDoe).
+  // AWD is applicable for the AWD-capable marketplaces (US + EU5). The snapshot carries `awdEligible`; an OLDER snapshot
+  // (pre-Europe-AWD) omits it, so fall back to isUS so US keeps working immediately on old snapshots (byte-identical).
+  const planAwdEligible = useMemo(
+    () => (planData ? (planData.awdEligible === undefined ? planData.isUS === true : planData.awdEligible === true) : false),
+    [planData]
+  );
+
   const planComputed = useMemo(() => {
     if (!planData || !Array.isArray(planData.rows)) return [];
     const monthKeys = (planData.months || []).map((m) => m.key);
     const effectiveAsOf = planData.salesLatestDate || planData.asOf || null;
     const daysInCurrentMonth = planData.currentMonth?.daysInMonth || null;
-    const awdSourceValidated = planData.isUS === true && planData.awdAvailable === true;
+    // AWD validated = eligible marketplace (US + EU5) AND the AWD source is present. US byte-identical.
+    const awdSourceValidated = planAwdEligible && planData.awdAvailable === true;
     const built = planData.rows.map((r) => {
       const legacy = computePlanRow(r, planData, targetDays); // preserved existing columns (unchanged)
       const wh = r.sku ? planWarehouseBySku.get(String(r.sku)) : null;
@@ -3114,7 +3122,7 @@ function DashboardApp({ session, access, onSignOut }) {
       });
     }
     return [...built, ...synthetic];
-  }, [planData, targetDays, planAccountSettings, planSkuOverrides, planWarehouseBySku, planSkuDirectory, planCatalogByAsin]);
+  }, [planData, planAwdEligible, targetDays, planAccountSettings, planSkuOverrides, planWarehouseBySku, planSkuDirectory, planCatalogByAsin]);
 
   // Brand filtering: All -> everything; "Unmapped" -> only rows with NO catalog-proven brand; a named brand -> only
   // rows whose canonical brandKey matches (whitespace-normalized, case-folded, punctuation-significant -- the shared
@@ -3305,8 +3313,8 @@ function DashboardApp({ session, access, onSignOut }) {
 
   // Visible columns = model minus the user's hidden set, minus AWD columns for non-US accounts.
   const planVisibleColumns = useMemo(
-    () => planColumns.filter((c) => (c.locked || !planHiddenCols.has(c.id)) && (planData?.isUS || !c.awd)),
-    [planColumns, planHiddenCols, planData?.isUS]
+    () => planColumns.filter((c) => (c.locked || !planHiddenCols.has(c.id)) && (planAwdEligible || !c.awd)),
+    [planColumns, planHiddenCols, planAwdEligible]
   );
   // Presentation-only: consecutive same-group runs of the visible columns, for a
   // clear grouped header row (Identity / Sales / Forecast / Inventory / ...).
@@ -4640,7 +4648,7 @@ function DashboardApp({ session, access, onSignOut }) {
         <div className="controls-bar">
           <div>
             <div className="page-title">FBA Shipment Plan</div>
-            <div className="page-sub">Per-ASIN restock recommendation for {refreshScopeAccount?.name || "the selected account"}{selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`} from sales velocity and live FBA{planData?.isUS ? " + AWD" : ""} inventory</div>
+            <div className="page-sub">Per-ASIN restock recommendation for {refreshScopeAccount?.name || "the selected account"}{selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`} from sales velocity and live FBA{planAwdEligible ? " + AWD" : ""} inventory</div>
           </div>
         </div>
 
@@ -4675,7 +4683,7 @@ function DashboardApp({ session, access, onSignOut }) {
             </button>
             {planColsOpen && planData && (
               <PlanColumnChooser
-                groups={planColumnGroups} hidden={planHiddenCols} isUS={planData.isUS === true} busy={planColsBusy}
+                groups={planColumnGroups} hidden={planHiddenCols} isUS={planAwdEligible} busy={planColsBusy}
                 onToggle={(id) => { const next = new Set(planHiddenCols); if (next.has(id)) next.delete(id); else next.add(id); savePlanColumns(next); }}
                 onSelectAll={() => savePlanColumns(new Set())}
                 onReset={() => savePlanColumns(new Set(PLAN_DEFAULT_HIDDEN_COLS))}

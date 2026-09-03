@@ -29,9 +29,10 @@ const OK_FINALIZE = new Set(["finalized", "already-terminal"]);
 const OK_PUBLISH = new Set(["published", "already-current", "newer-live"]);
 
 // The FBA source cards the Data Sync Center + scheduler drive through THIS operation. Both map to the ONE
-// fba-plan pipeline: the pipeline fetches FBA Inventory Health for the bucket and, for US only, Listings/AWD.
-// Syncing either card runs the same bucket pipeline (the pipeline decides US-only AWD internally); listings on a
-// non-US bucket is therefore a no-op source for that bucket.
+// fba-plan pipeline: the pipeline fetches FBA Inventory Health for the bucket and, for the AWD-CAPABLE marketplaces
+// (US + the EU5 -- GB/UK, DE, FR, IT, ES; see lib/server/reports/awd-capability.js), Listings/AWD. Syncing either card
+// runs the same bucket pipeline (the pipeline decides AWD eligibility per-account by marketplace capability); Listings
+// on a non-AWD marketplace is therefore a no-op source for that account.
 export const FBA_OPERATION_SOURCE_KEYS = Object.freeze(["fba-inventory-health", "listings"]);
 export function isFbaOperationSource(sourceKey) { return FBA_OPERATION_SOURCE_KEYS.includes(S(sourceKey).trim()); }
 

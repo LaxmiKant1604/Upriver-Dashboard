@@ -13829,3 +13829,78 @@ view/brands/bulk-POST all 401 no-auth (auth-gated); api/*.js==12; zero DataDoe t
 LIMITATION: Playwright not installed locally + dashboard needs Supabase auth -> no 4-width authenticated browser pass
 this session; responsiveness rests on existing .plan-scroll overflow-x tables + flex-wrap controls + auto-fit KPI grids
 + structural non-blink invariants.
+
+================================================================================
+2026-09-03 -- FBA Shipment Plan: additive WDD + lead-time + inventory-cover + reorder model (migration 20260907) -- commit 8cd4f51 LIVE
+================================================================================
+Added a Weighted Daily Demand (WDD), lead-time, inventory-cover and reorder model to the FBA Shipment Plan as a purely
+ADDITIVE feature. No existing column/label/formula/control changed (existing fba-planning.js + all old columns
+byte-identical; Planning Horizon + Forecast Method untouched). DataDoe creates=0/tokens=0; NO new api/*.js (stays 12).
+
+DEMAND reuses the shared SKU Movement v2 payload (action=sku-movement v2: per-ASIN dailyUnits over its proven 60-day
+axis + coverage) -- non-cancelled OLI units, ASIN aggregation, amzn* handling, catalog-first ASIN resolution,
+currency/brand isolation -- merged into plan rows by row.asin. PURE src/lib/fba-wdd.js: 7/30/60-day averages (covered
+units / covered days; uncovered day excluded from num AND denom, never a fabricated 0), WDD = 7D*w7+30D*w30+60D*w60,
+resolveWddWeights (own brand key; unmapped -> account-default ''; else 50/30/20; never cross-brand), Total Lead Time,
+Inbound ETA (start+Prod+Ship+AWD; SAFETY EXCLUDED), Days to Inbound (marketplace-local), coverModel (Existing =
+max(0, FBA Available + AWD Available + Inbound Pipeline - WDD*DaysToInbound); Ideal = WDD*TotalLeadTime; Reorder when
+Existing<Ideal; Suggested = ceil(max(0,Ideal-Existing)); Total FBA Inventory excluded -> no double count; Unavailable
+never a false Sufficient; whole units, WDD 2dp).
+
+PERSISTENCE (migration 20260907, additive/idempotent; extends api/fba-plan-config.js -- no new function): fba_wdd_weights
+(org+account+canonical brand key, ''=account default; each 0..100; CHECK total=100), fba_asin_lead_time (org+account+ASIN;
+nullable day inputs = Not configured; ETA set only by explicit start/import, never decremented) + audit tables + three
+SECURITY DEFINER RPCs (record_fba_wdd_weights, record_fba_asin_lead_time set/start/clear, record_fba_asin_lead_time_bulk
+atomic). RLS account-scoped, writes service-role-only, audited -- same model as the existing FBA config tables. Lead-time
+RPC params are INTEGER (not smallint) so PostgREST + direct calls resolve.
+
+SECURITY: the new WDD/lead-time ops apply the EXACT fba-plan capability gate (fba-plan = DENY_FOR_BRAND_RESTRICTED_USERS)
+-- a brand-restricted user is denied 403 + the new GET fields stripped; never broadens access. Server validates
+canonical-brand + per-ASIN (account catalog) ownership before every write.
+
+UI (App.jsx, theme.js): 15 additive columns (Demand/Lead Time/Reorder groups) decorated onto a new planRowsWithWdd memo
+(planComputed/planRows/planTotals untouched); inline lead-time editing; explicit Start/Reset countdown; WDD-weights bar
+beside the horizon/forecast controls; XLSX download + atomic upload for ASIN lead times & ETA (src/lib/fba-lead-time-import.js);
+new column ids default visible (saved chooser prefs untouched); values flow into the existing Excel export.
+
+TESTS + PROOF: scripts/fba-wdd.test.js (21) + scripts/fba-wdd-config.test.js (13); full npm run verify = 121 steps / 97
+suites incl build:check GREEN (every existing FBA test still passes -> old columns byte-identical). Migration + RPCs +
+constraints + RLS + grants + ETA(safety-excluded) + no-restart-on-set + blank-as-clear + atomic bulk proven in a
+ROLLED-BACK prod tx (24 checks, zero net change), applied live (MIGRATE_ONLY), rolled-back live write-check (5 checks) =
+zero residue.
+
+RELEASE: pushed 61dbd19..8cd4f51; HEAD==origin/main==8cd4f51; Vercel new bundle index-CXyCzIof.js; root 200;
+/api/fba-plan-config GET+POST 401 no-auth (auth-gated); api/*.js==12; creates/tokens=0/0. No existing column/label/
+formula/report/schedule changed.
+
+================================================================================
+2026-09-04 -- Europe AWD support: FBA AWD generalized US-only -> US + EU5 (marketplace-capability rule) -- pending deploy
+================================================================================
+Generalized the FBA "AWD Inv" support from US-only to US + the EU5 (GB/UK, DE, FR, IT, ES) via a shared, explicit
+marketplace-capability rule (lib/server/reports/awd-capability.js: awdCapableMarketplace / canonicalAwdMarketplace /
+awdRequiredForMarketplace). US byte-identical; Australia EXCLUDED; Europe best-effort (never blocks the plan). No new
+api/*.js; scheduler times/ownership/watchdog/concurrency UNCHANGED (only the europe-au FBA token ceiling 60->90 to fit
+the ~5 extra premium AWD creates).
+
+AWD source = DataDoe "Listings" (ba689c05d7), marketplace-generic; the US-only gate was purely country==="US" +
+contract marketplaceCountries:["US"]. Generalized: report-source-contracts (marketplaceCountries -> AWD_CONTRACT_
+COUNTRIES US+EU5, incl UK+GB), report-planner (AWD-window gate isUS -> awdCapableMarketplace), report-derivation (US
+REQUIRED/block, Europe best-effort), derivation-core fbaPlanPayload (fold when awdEligible; defensive drop to the
+account's OWN marketplace; payload gains awdEligible; awdAvailable boolean unchanged so an absent source renders
+unavailable not 0), api/datadoe.js legacy inline derive (same), src/lib/fba-planning.js computePlanRow (AWD gate
+isUS&&awdValidated -> awdValidated; European AWD flows through the SAME unchanged amazonNetworkPosition + Existing Cover
+formula; Total FBA Inventory still excluded), src/App.jsx (planAwdEligible drives column visibility + validation; old-
+snapshot fallback to isUS keeps US working immediately).
+
+AUDIT (zero-token): 34 accounts; AWD-eligible European = EU5 marketplace + Listings compatible; US 8 (unchanged), AU 1
+excluded, India/CA excluded. CANARY (paid, ~0 net tokens -- FREE usagePool): across ALL EU5 (989 Listings rows over
+every AWD-eligible European account) ZERO rows carry AWD stock -- the source is compatible for Europe but NO connected
+European account currently holds AWD inventory. Shipped the safe compatibility FOUNDATION (mission's second acceptance
+path); European AWD renders automatically once a European seller adopts Amazon AWD (proven end-to-end: the shipped
+derive folds real GB rows with awdEligible=true).
+
+TESTS: new scripts/awd-europe.test.js (12); updated report-fba-plan (additive awdEligible field + UK-now-AWD +
+AU-excluded), fba-planning (AWD counts for any validated marketplace), report-source-contracts (US+EU5, never AU).
+Full npm run verify GREEN 122 steps/98 suites incl build:check; every existing FBA/scheduler/derivation test passes
+(US byte-identical, scheduler unchanged). git diff --check clean. Dry-run: us-ca 2 AWD (unchanged), india 0 AWD,
+europe-au 5 AWD (new) within the raised 90 ceiling.
