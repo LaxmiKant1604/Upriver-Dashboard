@@ -122,6 +122,17 @@ test("18/19. controls safe-close ALWAYS; the scheduler refreshes the active Camp
   assert.doesNotMatch(yml, /scheduled-asin-ads-refresh/i, "no retired ASIN Ads export step in the scheduler");
 });
 
+test("source failures are isolated for execution but fail closed for publication and final status", () => {
+  assert.match(yml, /id:\s*oli\n\s*continue-on-error:\s*true/);
+  assert.match(yml, /id:\s*campaign\n\s*continue-on-error:\s*true\n\s*if:\s*always\(\)[^\n]*steps\.tokengate\.outputs\.proceed == 'true'/);
+  assert.match(yml, /SOURCE_REFRESH_FAILED/, "the run remains visibly failed after all independent attempts");
+  const applyAt = yml.indexOf("priority-control-package.mjs --apply");
+  const applyGuard = yml.slice(Math.max(0, applyAt - 420), applyAt);
+  assert.match(applyGuard, /steps\.oli\.outcome == 'success'/);
+  assert.match(applyGuard, /steps\.campaign\.outcome == 'success'/);
+  assert.match(applyGuard, /steps\.readiness\.outputs\.proceed == 'true'/);
+});
+
 test("US duplicate guard selects only exact D-1 identities for every account x three reports", () => {
   const requestedAsOf = "2026-08-30";
   const accountIds = ["us-account-1", "us-account-2"];

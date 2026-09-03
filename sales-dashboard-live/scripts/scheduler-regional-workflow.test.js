@@ -83,13 +83,26 @@ test("B2. campaign-ads-golive carries NO cron (manual-only), so Campaign is neve
 
 group("C. FBA = isolated, needs-gated job with regional routing; no FBA cron");
 
-test("C1. scheduler-v2 has an isolated fba job: needs run, always()+oli_ready gate, regional invocation", () => {
+test("C1. scheduler-v2 has an isolated fba job: needs run, always()+shared-guard gate, regional invocation", () => {
   assert.match(schedulerYml, /\n\s{2}fba:\n/, "a separate fba job exists");
   assert.match(schedulerYml, /needs:\s*run/);
-  assert.match(schedulerYml, /if:\s*always\(\) && needs\.run\.outputs\.oli_ready == 'true'/);
+  assert.match(schedulerYml, /if:\s*always\(\) && needs\.run\.outputs\.region != '' && \(needs\.run\.outputs\.already_published == 'true' \|\| needs\.run\.outputs\.token_proceed == 'true'\)/);
   assert.match(schedulerYml, /fba-plan-golive\.mjs --mode=go-live --region=\$\{\{ needs\.run\.outputs\.region \}\}/);
-  // the coordinator exposes oli_ready as a job output (guard already-published OR readiness proceed)
+  // The coordinator still exposes OLI readiness for observability, plus the shared guard outputs used by FBA.
   assert.match(schedulerYml, /oli_ready:\s*\$\{\{ steps\.guard\.outputs\.already_published == 'true' \|\| steps\.readiness\.outputs\.proceed == 'true' \}\}/);
+  assert.match(schedulerYml, /already_published:\s*\$\{\{ steps\.guard\.outputs\.already_published \}\}/);
+  assert.match(schedulerYml, /token_proceed:\s*\$\{\{ steps\.tokengate\.outputs\.proceed \}\}/);
+});
+
+test("C1b. OLI, Campaign Ads and FBA have independent failure boundaries while publication stays all-source gated", () => {
+  assert.match(schedulerYml, /id:\s*oli\n\s*continue-on-error:\s*true/);
+  assert.match(schedulerYml, /id:\s*campaign\n\s*continue-on-error:\s*true\n\s*if:\s*always\(\)/);
+  assert.match(schedulerYml, /SOURCE_REFRESH_FAILED/, "independent sequencing must not hide a real source failure");
+  const applyAt = schedulerYml.indexOf("priority-control-package.mjs --apply");
+  const applyGuard = schedulerYml.slice(Math.max(0, applyAt - 420), applyAt);
+  assert.match(applyGuard, /steps\.oli\.outcome == 'success'/);
+  assert.match(applyGuard, /steps\.campaign\.outcome == 'success'/);
+  assert.match(applyGuard, /steps\.readiness\.outputs\.proceed == 'true'/);
 });
 
 test("C2. fba-plan-golive carries NO cron (old 0 4 / 0 5 / 30 12 / 30 13 removed); manual modes preserved", () => {

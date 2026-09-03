@@ -241,7 +241,7 @@ async function main() {
   });
 
   /* ============ 14-16: failure safety + no campaign/fba + manual dispatch parity (workflow shape) ============ */
-  group("workflow: always-safe-close, no Campaign Ads/FBA, manual dispatch parity");
+  group("workflow: always-safe-close, isolated Campaign Ads/FBA, manual dispatch parity");
 
   test("14. EVERY real pipeline failure safe-closes controls; the verified duplicate no-op stays zero-write", () => {
     assert.match(

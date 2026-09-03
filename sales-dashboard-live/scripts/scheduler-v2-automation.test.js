@@ -215,6 +215,9 @@ test("D2. workflow shape: INDEPENDENT per-region ordered pipeline -- per-region 
   assert.ok(idx("confirm-token-budget.mjs") < idx("oli-refresh-d1.mjs"), "token gate before OLI");
   assert.ok(idx("oli-refresh-d1.mjs") < idx("scheduled-campaign-ads-refresh.mjs"), "OLI before Campaign Ads");
   assert.ok(idx("scheduled-campaign-ads-refresh.mjs") < idx("verify-bucket-readiness.mjs"), "Campaign before the readiness proof");
+  assert.match(yml, /id:\s*oli\n\s*continue-on-error:\s*true/, "OLI records failure without suppressing independent sources");
+  assert.match(yml, /id:\s*campaign\n\s*continue-on-error:\s*true\n\s*if:\s*always\(\)[^\n]*steps\.tokengate\.outcome == 'success'/, "Campaign always gets its independent attempt after a permitted token gate");
+  assert.match(yml, /id:\s*readiness\n\s*if:\s*always\(\)[^\n]*steps\.oli\.outcome == 'success'/, "OLI readiness is evaluated independently of Campaign outcome");
   assert.ok(idx("verify-bucket-readiness.mjs") < idx("priority-control-package.mjs --apply"), "readiness/effectivePublishAsOf BEFORE opening controls");
   assert.ok(idx("priority-control-package.mjs --apply") < idx("priority-dashboards-release.mjs"), "open controls before release");
   assert.ok(idx("priority-dashboards-release.mjs") < idx("rebuild-brand-membership.mjs"), "release before membership rebuild");
@@ -231,13 +234,20 @@ test("D2. workflow shape: INDEPENDENT per-region ordered pipeline -- per-region 
     assert.match(before, /steps\.tokengate\.outputs\.proceed == 'true'/, step + " is gated on the token-gate proceed");
   }
   assert.match(yml, /SKIPPED_INSUFFICIENT_TOKENS/, "the run visibly reports the insufficient-tokens skip");
+  assert.match(yml, /SOURCE_REFRESH_FAILED[^\n]*OLI outcome=\$\{\{ steps\.oli\.outcome \}\} Campaign outcome=\$\{\{ steps\.campaign\.outcome \}\}/, "a final aggregate step keeps genuine source failures red");
+  for (const step of ["priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
+    const at = idx(step); const before = yml.slice(Math.max(0, at - 420), at);
+    assert.match(before, /steps\.oli\.outcome == 'success'/, step + " requires successful OLI");
+    assert.match(before, /steps\.campaign\.outcome == 'success'/, step + " requires successful Campaign Ads");
+    assert.match(before, /steps\.readiness\.outputs\.proceed == 'true'/, step + " requires strict D-1 readiness");
+  }
   // safe-close ALWAYS after any pipeline execution (all regions), gated only by the duplicate guard's run_required.
   assert.match(yml, /if:\s*always\(\) && steps\.guard\.outputs\.run_required == 'true'\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS after a pipeline execution");
   // date-scoped operation key uses the requestedAsOf (shared Catalog reservation across ALL regions on a date).
   assert.match(yml, /--operation-key=priority-dashboards\/scheduled\/\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "date-scoped (requestedAsOf) operation key");
   // FBA now runs as an ISOLATED, needs-gated job (independent failure boundary) -- NOT a step of the publish job.
   assert.match(yml, /\n\s{2}fba:\n[\s\S]*needs:\s*run/, "an isolated fba job depends on the run job");
-  assert.match(yml, /if:\s*always\(\) && needs\.run\.outputs\.oli_ready == 'true'/, "the fba job runs iff OLI evidence is ready, independent of the publish outcome");
+  assert.match(yml, /if:\s*always\(\) && needs\.run\.outputs\.region != '' && \(needs\.run\.outputs\.already_published == 'true' \|\| needs\.run\.outputs\.token_proceed == 'true'\)/, "the FBA job gets an independent attempt after the shared guards, even when a source failed");
   assert.match(yml, /fba-plan-golive\.mjs --mode=go-live --region=\$\{\{ needs\.run\.outputs\.region \}\}/, "the fba job uses the SAME regional routing");
   // The publish (run) job itself never invokes an FBA script (the isolation boundary); ASIN + Vercel-cron stay absent.
   const runJob = yml.slice(idx("jobs:"), idx("\n  fba:"));

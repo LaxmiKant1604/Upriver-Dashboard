@@ -19,8 +19,8 @@ run-name: scheduler-v2 ${{ github.event_name == 'workflow_dispatch' && format('{
 # (once, this region) -> HONEST effectivePublishAsOf (bounded 2-day tail; interior gap / lag>2 fail closed) -> open
 # controls for ONLY this region -> Catalog reuse + derive + preflight + publish this region's accounts x3 + live
 # read-back -> rebuild Brand View membership -> ALWAYS safe-close controls. FBA Shipment Plan runs as a SEPARATE,
-# isolated job (its own runner + its own safe-close) AFTER this region's OLI evidence is ready, so an FBA failure can
-# never undo/block a validated Daily/Dashboard/Brand publication and a publish failure can never block FBA.
+# isolated job with its own per-account OLI-coverage resolver and safe-close. OLI, Campaign Ads and FBA each receive a
+# bounded attempt after the shared guards; source failures cannot suppress one another or weaken publication gates.
 #
 # Insufficient tokens is a TYPED SAFE SKIP (SKIPPED_INSUFFICIENT_TOKENS). An UNREADABLE balance hard-fails. A
 # same-date terminal cycle collision fails at the preflight before any token read. A region that cannot publish
@@ -74,6 +74,9 @@ jobs:
     outputs:
       region: ${{ steps.cfg.outputs.region }}
       asof: ${{ steps.cfg.outputs.asof }}
+      run_required: ${{ steps.guard.outputs.run_required }}
+      already_published: ${{ steps.guard.outputs.already_published }}
+      token_proceed: ${{ steps.tokengate.outputs.proceed }}
       oli_ready: ${{ steps.guard.outputs.already_published == 'true' || steps.readiness.outputs.proceed == 'true' }}
       effective_asof: ${{ steps.readiness.outputs.effective_asof }}
     env:
@@ -175,16 +178,23 @@ jobs:
         run: node scripts/release/confirm-token-budget.mjs --min=${{ steps.cfg.outputs.tokenmin }} --bucket=${{ steps.cfg.outputs.region }}
 
       # (step 3) Refresh OLI to D-1 for THIS region (supersede a stale terminal cycle + auto-escalate a fresh fetch of
-      # the still-missing <=5-seller batches, within the region's derived create/token ceiling).
+      # the still-missing <=5-seller batches, within the region's derived create/token ceiling). Record its raw outcome
+      # instead of aborting the job so the independent Campaign Ads and FBA pipelines still get their own attempt.
       - name: Refresh OLI to D-1 (supersede stale terminal cycle + auto-escalate fresh fetch)
+        id: oli
+        continue-on-error: true
         if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/oli-refresh-d1.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }} --refresh-mode=${{ steps.cfg.outputs.mode }} --run-id=${{ github.run_id }}
 
       # (step 4) Refresh CAMPAIGN Ads for THIS region ONCE (coverage mode, 21-day rolling window). Campaign is the ONLY
       # active Ads source and scheduler-v2 is its ONE automatic owner. Idempotent (already-covered => zero creates).
-      # ASIN Ads exports are retired (a hard guard in ads-sync.js refuses them from every entry point).
+      # ASIN Ads exports are retired (a hard guard in ads-sync.js refuses them from every entry point). `always()` is
+      # intentional: Campaign has its own compatibility preflight, <=5-seller recovery split and LKG isolation, so an
+      # unrelated OLI failure must never suppress this source's bounded attempt.
       - name: Refresh Campaign Ads (this region only; coverage mode, 21-day rolling window)
-        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true'
+        id: campaign
+        continue-on-error: true
+        if: always() && steps.guard.outputs.run_required == 'true' && steps.tokengate.outcome == 'success' && steps.tokengate.outputs.proceed == 'true'
         run: node scripts/release/scheduled-campaign-ads-refresh.mjs --bucket=${{ steps.cfg.outputs.region }} --as-of=${{ steps.cfg.outputs.asof }}
 
       # (step 5) STRICT D-1 readiness proof (read-only). Publication requires EVERY account gapless through the EXACT
@@ -192,25 +202,25 @@ jobs:
       # coverage is a typed DATADOE_D1_NOT_READY: fail closed BEFORE any control is opened, publish steps skipped, LKG retained.
       - name: Prove previous-day (D-1) readiness for this region (read-only; strict)
         id: readiness
-        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true'
+        if: always() && steps.guard.outputs.run_required == 'true' && steps.tokengate.outcome == 'success' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success'
         run: node scripts/release/verify-bucket-readiness.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }}
 
       # (step 7) Open publication controls for ONLY this region's accounts x 3 keys (all_primary stays false).
       - name: Open publication controls (this region only)
-        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true'
+        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
         run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.region }}
 
       # (steps 6/8/9/10) Catalog reuse/refresh (ONE create/day shared across ALL regions via the date-only operation
       # key) + derive + preflight EVERY account in this region + publish this region x3 + live read-back. Reached ONLY
       # after the strict D-1 proof; --strict-d1 fails closed (never publishes) if the derive would clamp below D-1.
       - name: Refresh Catalog + derive/preflight/publish this region at D-1 + live read-back
-        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true'
+        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
         run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.region }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }} --strict-d1
 
       # (step 11) Rebuild + verify Brand View membership from ALL current brand-sales snapshots (this region's fresh +
       # every other region's latest-known-good) -- Supabase-only, zero tokens.
       - name: Rebuild + verify Brand View membership (this region's fresh + others' LKG; Supabase-only)
-        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true'
+        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
         run: node scripts/release/rebuild-brand-membership.mjs
 
       # (step 12) Safe-close publication controls after every real pipeline attempt, idempotent + discovery-independent.
@@ -222,14 +232,22 @@ jobs:
         if: always() && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed != 'true' && steps.tokengate.outcome == 'success'
         run: echo "SKIPPED_INSUFFICIENT_TOKENS -- no creates, no controls, LKG unchanged (region=${{ steps.cfg.outputs.region }} requestedAsOf=${{ steps.cfg.outputs.asof }})."
 
-  # FBA Shipment Plan + (US-only) AWD -- ISOLATED job, its OWN runner + its OWN always-safe-close. It runs ONLY after
-  # this region's OLI evidence is ready (needs.run.outputs.oli_ready) and is gated by always() so a Daily/Dashboard/
-  # Brand publish failure in the coordinator can never block it; conversely, an FBA failure here is contained to this
-  # job and can never undo the coordinator's already-validated publication. FBA uses the SAME regional routing and its
-  # dedicated <region>-fba cycle namespace; AWD stays US-only per-account (country === "US"), orthogonal to the region.
+      # Keep the workflow honest after every independent source has had its chance and controls are safe-closed.
+      # continue-on-error above is sequencing only; it must never turn a genuine source failure into a green run.
+      - name: Report independent source failure after all attempts
+        if: always() && steps.guard.outputs.run_required == 'true' && steps.tokengate.outcome == 'success' && steps.tokengate.outputs.proceed == 'true' && (steps.oli.outcome != 'success' || steps.campaign.outcome != 'success')
+        run: |
+          echo "SOURCE_REFRESH_FAILED -- OLI outcome=${{ steps.oli.outcome }} Campaign outcome=${{ steps.campaign.outcome }}. Independent attempts completed; publication stayed closed and LKG was preserved." >&2
+          exit 1
+
+  # FBA Shipment Plan + marketplace-capable AWD -- ISOLATED job, its OWN runner + its OWN always-safe-close. Once the
+  # regional duplicate/token guards allow work, it runs regardless of the coordinator's final result. Its own scope
+  # resolver excludes stale-OLI accounts and preserves their LKG, so one OLI/Campaign failure cannot suppress valid FBA
+  # sellers. A failure here is contained and can never undo coordinator publication. AWD remains account/marketplace
+  # capability-gated (US + compatible EU5; Australia excluded).
   fba:
     needs: run
-    if: always() && needs.run.outputs.oli_ready == 'true'
+    if: always() && needs.run.outputs.region != '' && (needs.run.outputs.already_published == 'true' || needs.run.outputs.token_proceed == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 120
     defaults:
