@@ -917,7 +917,10 @@ export async function getCampaignPerformanceRows({ accountId, signal = null } = 
   if (!id) throw new Error("getCampaignPerformanceRows requires accountId (fail closed).");
   const q = new URLSearchParams({
     source_key: "eq.campaign-performance-v1", account_id: `eq.${id}`,
-    select: "marketplace_country_code,campaign_id,campaign_type,currency,metric_date,dimensions",
+    // `metrics` MUST be selected: the Campaign Ads view + directory sum the per-campaign spend/sales/clicks/orders/
+    // units/impressions from this JSONB. Omitting it made buildCampaignAdsView read undefined metrics and show ZEROS
+    // even though the durable history carried the real values. `updated_at` lets consumers dedupe by natural grain.
+    select: "marketplace_country_code,campaign_id,campaign_type,currency,metric_date,dimension_key,account_id,dimensions,metrics,updated_at",
   });
   try { const rows = await request(`/rest/v1/ads_daily_source_rows?${q}`, { signal }); return Array.isArray(rows) ? rows : []; }
   catch (e) { if (isSchemaMissingError(e)) return []; throw e; }

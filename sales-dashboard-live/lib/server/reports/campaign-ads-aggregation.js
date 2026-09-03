@@ -158,11 +158,53 @@ export function aggregateCampaignAdsDailyRows(rows, { rawSellerId = null } = {})
  * `brandOf(map)` selects which brand identifier the caller compares against (default: the canonical brand key). Returns
  * a Map campaignIdentityKey -> brand identifier. Only ASSIGNED (non-blank brand) mappings are included.
  */
+/**
+ * A DETERMINISTIC revision fingerprint of an account's campaign->brand mappings: a stable hash over the sorted
+ * (campaign identity -> canonical brand key) pairs. It changes on any assign/clear/reassign and is identical for
+ * identical mapping sets (order-independent), so a NAMED-brand snapshot can record the revision it was derived under
+ * and a serve can detect a stale attribution when the current revision differs -- WITHOUT touching account-level
+ * All-Brands totals (which never depend on the mapping). Empty mappings -> a stable "empty" revision.
+ */
+export function campaignMappingRevision(mappingRows) {
+  const idx = indexMappings(mappingRows);
+  const parts = [];
+  for (const [key, m] of idx.entries()) parts.push(key + "=>" + S(m && m.brandKey).trim());
+  parts.sort();
+  const s = parts.join("\n");
+  // Two independent PURE 32-bit rolling hashes (FNV-1a + djb2), concatenated to a stable 16-hex-char revision. No
+  // node:crypto so this stays browser-safe (this module is bundled client-side). Order-independent (parts sorted).
+  let h1 = 0x811c9dc5, h2 = 5381;
+  for (let i = 0; i < s.length; i += 1) {
+    const c = s.charCodeAt(i);
+    h1 ^= c; h1 = Math.imul(h1, 0x01000193) >>> 0;
+    h2 = ((Math.imul(h2, 33) >>> 0) + c) >>> 0;
+  }
+  return (h1 >>> 0).toString(16).padStart(8, "0") + (h2 >>> 0).toString(16).padStart(8, "0");
+}
+
 export function campaignBrandMap(mappingRows, brandOf = (m) => m.brandKey) {
   const idx = indexMappings(mappingRows); // Map identityKey -> { brandKey, brandDisplay, ... }
   const out = new Map();
   for (const [key, m] of idx.entries()) { const b = S(brandOf(m)).trim(); if (b) out.set(key, b); }
   return out;
+}
+
+/**
+ * Filter RAW campaign rows to ONLY those whose campaign identity maps to `brand` (canonical key). The campaign
+ * analog of derivation-core.filterAdRowsToBrand (which attributes ASIN rows via the catalog child_asin -> brand map):
+ * campaign rows carry NO child_asin, so they must attribute through the manual campaign->brand mapping instead. Used
+ * by the named-brand Daily derive so a mapped campaign's spend/sales/clicks reach its brand (unmapped/other-brand
+ * campaigns are excluded). `identityBrandMap` = campaignBrandMap(mappingRows) (identityKey -> canonical brand key).
+ */
+export function filterCampaignAdRowsToBrand(rows, identityBrandMap, brand) {
+  const map = identityBrandMap instanceof Map ? identityBrandMap : new Map(Object.entries(identityBrandMap || {}));
+  const wanted = S(brand).trim();
+  if (!wanted) return [];
+  return (Array.isArray(rows) ? rows : []).filter((row) => {
+    const id = campaignIdentityOfRow(row);
+    const mapped = id ? map.get(id) : undefined;
+    return mapped != null && S(mapped).trim() === wanted;
+  });
 }
 
 /**

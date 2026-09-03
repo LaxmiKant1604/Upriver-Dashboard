@@ -211,6 +211,12 @@ export async function serveSharedReport({
   // falls back to serving the found snapshot as last-known-good (never a blank page). Default null = unchanged for
   // every other report (they never pass it, so the stale-scope/exact behaviour is byte-identical).
   staleWhenParamsToBefore = null,
+  // ATTRIBUTION-REVISION FRESHNESS (Daily Reporting NAMED brand): the account's CURRENT campaign->brand mapping
+  // revision. When set and a found NAMED-brand snapshot recorded a DIFFERENT (or no) `campaignMappingRev`, the
+  // snapshot's ad attribution is stale (a campaign was assigned/cleared/reassigned since it was derived): re-derive
+  // via `deriveDurable` (ZERO DataDoe) so the named brand's ads reflect the current mapping immediately -- WITHOUT
+  // touching account-level All-Brands totals (which never carry a rev and never pass this). Default null = unchanged.
+  staleWhenMappingRev = null,
 }) {
   const paramsHash = paramsHashFor(reportVersion, params);
   // A found snapshot is stale-by-coverage-advance when the account's proven horizon has moved past the snapshot's
@@ -219,6 +225,14 @@ export async function serveSharedReport({
     if (!staleWhenParamsToBefore || !snap || !snap.params) return false;
     const snapTo = snap.params.to != null ? String(snap.params.to) : "";
     return !!snapTo && snapTo < String(staleWhenParamsToBefore);
+  };
+  // A found NAMED-brand snapshot is stale-by-mapping when the account's campaign->brand mapping revision differs from
+  // (or is absent on) the snapshot. A payload is inline for Daily so the recorded rev is available; if unavailable the
+  // check is skipped (fail-soft, never a rebuild loop). Only the named-brand Daily serve supplies staleWhenMappingRev.
+  const mappingRevStale = (snap) => {
+    if (!staleWhenMappingRev || !snap || !snap.payload || typeof snap.payload !== "object") return false;
+    if (!Array.isArray(snap.payload.rows)) return false; // not an inline daily payload -> cannot compare, skip
+    return String(snap.payload.campaignMappingRev || "") !== String(staleWhenMappingRev);
   };
   // Null-safe source-staleness probe: a served snapshot whose source provenance predates the newest contributing
   // provenance is stale (a rebuild is due). Returns false whenever no provenance was supplied (never fabricates).
@@ -254,7 +268,7 @@ export async function serveSharedReport({
       // Stale-by-coverage-advance (Daily named-brand): the account's proven horizon moved past this snapshot's
       // as-of -> re-derive via the durable self-heal (ZERO DataDoe) instead of serving an out-of-date as-of. On a
       // not-ready derive the self-heal returns un-served and we fall through to serve THIS snapshot as LKG.
-      if (paramsToBehindProven(snapshot) && deriveDurable && !deferRebuildOnRead) {
+      if ((paramsToBehindProven(snapshot) || mappingRevStale(snapshot)) && deriveDurable && !deferRebuildOnRead) {
         const healed = await selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds, augmentResponse }, store);
         if (healed.served) return;
       }
@@ -289,7 +303,7 @@ export async function serveSharedReport({
       // Stale-by-coverage-advance (Daily named-brand): if the account's proven horizon moved past this snapshot's
       // as-of, re-derive via the durable self-heal (ZERO DataDoe) so the named-brand horizon tracks the account's,
       // not the brand's last sale. On a not-ready derive, fall through to serving this snapshot as LKG (stale-scope).
-      if (paramsToBehindProven(latest) && deriveDurable && !deferRebuildOnRead) {
+      if ((paramsToBehindProven(latest) || mappingRevStale(latest)) && deriveDurable && !deferRebuildOnRead) {
         const healed = await selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds, augmentResponse }, store);
         if (healed.served) return;
       }

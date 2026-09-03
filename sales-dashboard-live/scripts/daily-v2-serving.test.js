@@ -195,6 +195,31 @@ await testAsync("FRESH named-brand snapshot (as-of == proven horizon) is REUSED 
   assert.equal(cap.body.rows[0].total_sales, 33, "the existing fresh snapshot is served");
 });
 
+await testAsync("MAPPING-REV: a named-brand snapshot whose campaign mapping revision differs SELF-HEALS on read (even when the as-of is current)", async () => {
+  const { readers, seed } = makeReaders();
+  // as-of already at the proven horizon (the DATE self-heal will NOT fire), but the recorded mapping revision is old.
+  seed({ to: PROVEN_NEW, brand: "Caruso Italy", payload: { rows: [{ date: PROVEN_NEW, total_sales: 10, ad_sales: 0 }], brandFiltered: true, campaignMappingRev: "rev-old" } });
+  const { store, snaps } = makeSelfHealStore();
+  let derives = 0;
+  const dd = async () => { derives += 1; return { payload: { rows: [{ date: PROVEN_NEW, total_sales: 10, ad_sales: 500 }], brandFiltered: true, campaignMappingRev: "rev-new" }, sourceRefreshedAt: PROVEN_NEW + "T01:00:00.000Z", effectiveParams: { from: FROM, to: PROVEN_NEW, brand: "Caruso Italy" }, latestCompletedDate: PROVEN_NEW }; };
+  const { res, cap } = fakeRes();
+  await serveSharedReport(req({ res, params: { from: FROM, to: PROVEN_NEW, brand: "Caruso Italy" }, staleScopeKeys: ["brand"], readers, store, deriveDurable: dd, staleWhenParamsToBefore: PROVEN_NEW, staleWhenMappingRev: "rev-new" }));
+  assert.equal(derives, 1, "rev-old != rev-new -> re-derived once (mapping changed since the snapshot was attributed)");
+  assert.equal(cap.body.rows[0].ad_sales, 500, "the FRESH mapping-attributed ads are served (not the stale 0)");
+  assert.equal([...snaps.values()][0].payload.campaignMappingRev, "rev-new", "the current revision is recorded on the re-derived snapshot");
+});
+
+await testAsync("MAPPING-REV: a named-brand snapshot at the CURRENT revision is REUSED (no re-derive, no write)", async () => {
+  const { readers, seed } = makeReaders();
+  seed({ to: PROVEN_NEW, brand: "Caruso Italy", payload: { rows: [{ date: PROVEN_NEW, total_sales: 10, ad_sales: 500 }], brandFiltered: true, campaignMappingRev: "rev-new" } });
+  const { store } = makeSelfHealStore();
+  let derives = 0; const dd = async () => { derives += 1; return brandDerive(PROVEN_NEW, 99)(); };
+  const { res, cap } = fakeRes();
+  await serveSharedReport(req({ res, params: { from: FROM, to: PROVEN_NEW, brand: "Caruso Italy" }, staleScopeKeys: ["brand"], readers, store, deriveDurable: dd, staleWhenParamsToBefore: PROVEN_NEW, staleWhenMappingRev: "rev-new" }));
+  assert.equal(derives, 0, "same revision + current as-of -> served as-is");
+  assert.equal(cap.body.rows[0].ad_sales, 500, "the current snapshot is served");
+});
+
 await testAsync("stale self-heal with a NOT-READY derive falls back to serving the snapshot as LKG (never blank)", async () => {
   const { readers, seed } = makeReaders();
   seed({ to: PROVEN, brand: "Caruso Italy", payload: { rows: [{ date: PROVEN, total_sales: 10 }], brandFiltered: true } });

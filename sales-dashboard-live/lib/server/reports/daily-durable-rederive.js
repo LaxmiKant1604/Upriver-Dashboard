@@ -20,6 +20,21 @@ import { dailyReportingReadiness, slicedOliSourceFromHistory, BRAND_VIEW_ADS_GRA
 import { buildDailyAdsCoverage, DAILY_ADS_SOURCE_KEY } from "../sync/daily-ads-loader.js";
 import { filterAdRowsToBrand } from "./derivation-core.js";
 import { ORGANIZATION_SCOPE_KEY, mergeCoverageWindows } from "../sync/source-durable-model.js";
+import { ACTIVE_ADS_SOURCE_KEY, ASIN_ADS_SOURCE_KEY } from "../active-ads-source.js";
+import { campaignBrandMap, filterCampaignAdRowsToBrand, campaignMappingRevision } from "./campaign-ads-aggregation.js";
+import { brandKey } from "./brand-membership.js";
+
+// SOURCE-AWARE brand attribution for the named-brand Daily ad rows. Before the ASIN->Campaign cutover a brand's ads
+// were the raw ASIN rows whose child_asin mapped to the brand via the Product Catalog (filterAdRowsToBrand). AFTER
+// the cutover the ACTIVE grain is campaign-performance-v1: campaign rows carry NO child_asin, so they must attribute
+// through the account's manual campaign->brand mapping (the SAME map Brand View uses). This is the one place Daily
+// resolves a named brand's ad rows, so Daily and Brand View can never diverge. Unmapped/other-brand campaigns are
+// excluded from the named brand (they still count in the account-level All-Brands total).
+function filterActiveAdRowsToNamedBrand(adRows, { catalogRows, campaignMappingRows, brand }) {
+  if (ACTIVE_ADS_SOURCE_KEY === ASIN_ADS_SOURCE_KEY) return filterAdRowsToBrand(adRows, catalogRows, brand);
+  const identityBrandMap = campaignBrandMap(campaignMappingRows || [], (m) => m.brandKey);
+  return filterCampaignAdRowsToBrand(adRows, identityBrandMap, brandKey(brand));
+}
 
 // The CURRENT Daily Reporting identities (kept in lockstep with report-publisher / registry / api / App.jsx).
 export const DAILY_V2_LIVE_VERSION = "daily-reporting-shared-v2";
@@ -72,6 +87,7 @@ export function rederiveDailyV2Payload({ accountId, rawSellerId, currency, from,
   const {
     historyRows = [], oliWindows = [], catalogSnapshot = null, catalogRows = null,
     asinAdRows = [], asinMetricsRead = "ok", asinCoverageState = null, asinCoverageRead = "ok", asinWindows = [],
+    campaignMappingRows = [],
   } = evidence;
   if (!isDate(from) || !isDate(to) || from > to) return { notReady: "window-invalid" };
   if (!Array.isArray(catalogRows)) return { notReady: "catalog-rows-unavailable" };
@@ -91,14 +107,16 @@ export function rederiveDailyV2Payload({ accountId, rawSellerId, currency, from,
   const context = { from, to, brand: wantBrand, accountId, rawSellerId, currency: currency ?? null };
   // BOTH payload modes carry ads. buildDailyAdsCoverage + resolveDailyAdsAvailability decide
   // validated/partial/stale/unavailable/failed; a failed/absent read shows sales with Ads typed unavailable.
-  // A NAMED brand gets BRAND-SCOPED ad rows: each raw ASIN ad row attributes ONLY through the proven catalog
-  // child_asin -> product_brand mapping (canonical brandKey; unmapped/other-brand ASINs excluded). Account-level
-  // coverage windows apply unchanged: a covered window with no ad rows for this brand is an HONEST zero, while
-  // missing coverage stays typed unavailable (never zero).
+  // A NAMED brand gets BRAND-SCOPED ad rows via the ACTIVE ads source's attribution: post-cutover the campaign grain
+  // attributes each campaign row through the account's manual campaign->brand mapping (the SAME map Brand View uses);
+  // pre-cutover the ASIN grain attributes via the catalog child_asin -> product_brand map. Unmapped/other-brand
+  // campaigns are excluded from the named brand but still count in the account-level All-Brands total (conservation).
+  // Account-level coverage windows apply unchanged: a covered window with no ad rows for this brand is an HONEST zero,
+  // while missing coverage stays typed unavailable (never zero).
   const usableAdRows = asinMetricsRead === "ok" ? asinAdRows : [];
   context.adsCoverage = buildDailyAdsCoverage({
     accountId, rawSellerId, currency: currency ?? null, from, to,
-    metricRows: wantBrand === "ALL" ? usableAdRows : filterAdRowsToBrand(usableAdRows, catalogRows, wantBrand),
+    metricRows: wantBrand === "ALL" ? usableAdRows : filterActiveAdRowsToNamedBrand(usableAdRows, { catalogRows, campaignMappingRows, brand: wantBrand }),
     metricsRead: asinMetricsRead,
     coverageState: asinCoverageState || { windows: [], status: "missing", latestMetricDate: null, read: "read-failed" },
   });
@@ -112,6 +130,11 @@ export function rederiveDailyV2Payload({ accountId, rawSellerId, currency, from,
     return { notReady: "derive-failed", error: e && e.message ? e.message : String(e) };
   }
   if (!daily.validatePayload(payload)) return { notReady: "invalid-payload" };
+  // Record the campaign-mapping revision this NAMED-brand payload attributed under, so a serve can detect a stale
+  // attribution (a later assign/clear) and re-derive. ALL never carries it (account totals never depend on mappings).
+  if (wantBrand !== "ALL" && ACTIVE_ADS_SOURCE_KEY !== ASIN_ADS_SOURCE_KEY) {
+    payload.campaignMappingRev = campaignMappingRevision(campaignMappingRows);
+  }
   return { payload, version: daily.snapshotVersion, latestDataDate: daily.latestDataDate(payload) };
 }
 
@@ -120,7 +143,7 @@ export function rederiveDailyV2Payload({ accountId, rawSellerId, currency, from,
  * the injected readers (defaults are the production supabase wrappers, wired by the caller). ZERO DataDoe.
  */
 export async function gatherDailyDurableEvidence({ accountId, from, to, brand = "ALL", organizationFingerprint, connectionId = "primary" }, readers) {
-  const { readOliHistory, readOliCoverage, readAsinAds, readAdsCoverage, readCatalogSnapshot, loadCatalogPayload } = readers;
+  const { readOliHistory, readOliCoverage, readAsinAds, readAdsCoverage, readCatalogSnapshot, loadCatalogPayload, readCampaignMappings } = readers;
   const wantBrand = S(brand).trim() || "ALL";
 
   const historyRows = await readOliHistory({ organizationFingerprint, connectionId, accountIds: [accountId], from, to });
@@ -141,11 +164,19 @@ export async function gatherDailyDurableEvidence({ accountId, from, to, brand = 
   // child_asin -> product_brand mapping (rederiveDailyV2Payload brand-filters them), so the reads run for every
   // brand. `wantBrand` stays part of the gather signature/identity (the caller's scope) even though the reads
   // themselves are account-level.
-  void wantBrand;
   let asinAdRows = []; let asinMetricsRead = "ok"; let asinCov;
   try { asinAdRows = await readAsinAds(accountId, from, to); }
   catch (e) { asinMetricsRead = e && e.code === "ADS_ROW_LIMIT_EXCEEDED" ? "limit-exceeded" : "read-failed"; asinAdRows = []; }
   asinCov = await readAdsCoverage(accountId, BRAND_VIEW_ADS_GRAIN);
+
+  // The account's campaign->brand mappings (post-cutover named-brand ad attribution). Read ONLY for a named brand
+  // (ALL never filters by brand) and fail-soft to [] (a mapping-read failure withholds a brand's ads, never blocks
+  // sales and never mis-attributes). ZERO DataDoe.
+  let campaignMappingRows = [];
+  if (wantBrand !== "ALL" && typeof readCampaignMappings === "function") {
+    try { campaignMappingRows = await readCampaignMappings({ organizationFingerprint, connectionId, accountId }); }
+    catch { campaignMappingRows = []; }
+  }
 
   return {
     historyRows: Array.isArray(historyRows) ? historyRows : [],
@@ -155,6 +186,7 @@ export async function gatherDailyDurableEvidence({ accountId, from, to, brand = 
     asinCoverageState: asinCov,
     asinCoverageRead: asinCov && asinCov.read ? asinCov.read : "read-failed",
     asinWindows: asinCov && asinCov.read === "ok" ? (asinCov.windows || []) : [],
+    campaignMappingRows: Array.isArray(campaignMappingRows) ? campaignMappingRows : [],
   };
 }
 

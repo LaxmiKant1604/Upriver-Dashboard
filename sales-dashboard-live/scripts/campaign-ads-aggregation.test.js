@@ -7,6 +7,7 @@ import { writeSync } from "node:fs";
 import {
   CAMPAIGN_ADS_METRIC_FIELDS, aggregateCampaignAdsDailyRows, aggregateAccountCampaignAds,
   aggregateBrandCampaignAds, campaignBrandMap, resolveCampaignRowCurrency, campaignIdentityOfRow,
+  filterCampaignAdRowsToBrand, campaignMappingRevision,
 } from "../lib/server/reports/campaign-ads-aggregation.js";
 
 let passed = 0;
@@ -113,6 +114,65 @@ test("CU1. currency resolves explicit -> budget currency -> marketplace-derived;
   assert.equal(resolveCampaignRowCurrency(row({ mkt: "US", cid: "C1", cur: "", budgetCur: "CAD", date: "d", m: {} })), "CAD");
   assert.equal(resolveCampaignRowCurrency(row({ mkt: "GB", cid: "C1", cur: "", date: "d", m: {} })), "GBP", "derived from marketplace");
   assert.equal(resolveCampaignRowCurrency(row({ mkt: "ZZ", cid: "C1", cur: "", date: "d", m: {} })), "", "unknown marketplace + no currency -> blank (caller fails closed)");
+  passed += 1;
+});
+
+// mapping row helper (matches indexMappings input: marketplace/ads_profile_id/ad_campaign_id/canonical_brand_key)
+const mrow = (mkt, prof, cid, brand) => ({ marketplace: mkt, ads_profile_id: prof, ad_campaign_id: cid, canonical_brand_key: brand, brand_display_name: brand });
+
+test("ATTR1. named-brand DAILY attribution: only the brand's mapped campaigns fold in; mapped+unmapped == account (conservation, per metric)", () => {
+  const rows = [
+    row({ mkt: "IN", prof: "P1", cid: "C1", cur: "INR", date: "2026-09-01", m: { ad_sales: 100, ad_spend: 40, ad_clicks: 5 } }),
+    row({ mkt: "IN", prof: "P1", cid: "C2", cur: "INR", date: "2026-09-01", m: { ad_sales: 60, ad_spend: 20, ad_clicks: 3 } }),
+    row({ mkt: "IN", prof: "P1", cid: "C3", cur: "INR", date: "2026-09-01", m: { ad_sales: 30, ad_spend: 10, ad_clicks: 1 } }), // unmapped
+  ];
+  const map = campaignBrandMap([mrow("IN", "P1", "C1", "acme"), mrow("IN", "P1", "C2", "acme")]);
+  const brandRows = filterCampaignAdRowsToBrand(rows, map, "acme");
+  const brandDaily = aggregateCampaignAdsDailyRows(brandRows, { rawSellerId: "raw" });
+  const acct = aggregateAccountCampaignAds(rows).byCurrency.INR;
+  const bAgg = aggregateBrandCampaignAds(rows, map, "acme");
+  assert.equal(brandDaily.reduce((s, r) => s + r.ad_sales, 0), 160, "acme = C1+C2 (100+60), C3 excluded");
+  for (const k of ["spend", "attributedSales", "clicks"]) {
+    const b = (bAgg.byCurrency.INR || {})[k] || 0;
+    const u = (bAgg.unmapped.byCurrency.INR || {})[k] || 0;
+    assert.equal(b + u, acct[k] || 0, `conservation for ${k}: mapped + unmapped == account`);
+  }
+  passed += 1;
+});
+
+test("ATTR2. identity isolation: same campaign id under a DIFFERENT profile/marketplace does NOT inherit the mapping", () => {
+  const rows = [
+    row({ mkt: "IN", prof: "P1", cid: "C1", cur: "INR", date: "2026-09-01", m: { ad_sales: 100 } }),
+    row({ mkt: "IN", prof: "P2", cid: "C1", cur: "INR", date: "2026-09-01", m: { ad_sales: 77 } }),
+    row({ mkt: "US", prof: "P1", cid: "C1", cur: "USD", date: "2026-09-01", m: { ad_sales: 55 } }),
+  ];
+  const map = campaignBrandMap([mrow("IN", "P1", "C1", "acme")]);
+  const b = aggregateBrandCampaignAds(rows, map, "acme");
+  assert.equal((b.byCurrency.INR || {}).attributedSales, 100, "only the exact (IN,P1,C1) identity attributes to acme");
+  assert.ok(!(b.byCurrency.USD), "the US same-id campaign is NOT acme (per-account/marketplace identity)");
+  passed += 1;
+});
+
+test("ATTR3. reassign A->B moves metrics exactly once; clear returns them to Unmapped", () => {
+  const rows = [row({ mkt: "IN", prof: "P1", cid: "C1", cur: "INR", date: "2026-09-01", m: { ad_sales: 100 } })];
+  const toA = campaignBrandMap([mrow("IN", "P1", "C1", "brand-a")]);
+  const toB = campaignBrandMap([mrow("IN", "P1", "C1", "brand-b")]);
+  assert.equal((aggregateBrandCampaignAds(rows, toA, "brand-a").byCurrency.INR || {}).attributedSales, 100);
+  assert.equal(aggregateBrandCampaignAds(rows, toB, "brand-a").byCurrency.INR, undefined, "A loses it after reassign");
+  assert.equal((aggregateBrandCampaignAds(rows, toB, "brand-b").byCurrency.INR || {}).attributedSales, 100, "B gains it exactly once");
+  const cleared = aggregateBrandCampaignAds(rows, new Map(), "brand-a");
+  assert.equal(cleared.byCurrency.INR, undefined, "cleared -> not under the brand");
+  assert.equal((cleared.unmapped.byCurrency.INR || {}).attributedSales, 100, "cleared -> back to Unmapped (still in account total)");
+  passed += 1;
+});
+
+test("REV1. mapping revision is deterministic + order-independent, and changes on assign/clear/reassign; empty is stable", () => {
+  const a = campaignMappingRevision([mrow("IN", "P1", "C1", "acme"), mrow("IN", "P1", "C2", "bravo")]);
+  assert.equal(a, campaignMappingRevision([mrow("IN", "P1", "C2", "bravo"), mrow("IN", "P1", "C1", "acme")]), "order-independent");
+  assert.notEqual(a, campaignMappingRevision([mrow("IN", "P1", "C1", "acme")]), "clearing C2 changes the revision");
+  assert.notEqual(a, campaignMappingRevision([mrow("IN", "P1", "C1", "bravo"), mrow("IN", "P1", "C2", "bravo")]), "reassigning C1 changes the revision");
+  assert.equal(campaignMappingRevision([]), campaignMappingRevision([]), "empty is a stable revision");
+  assert.notEqual(campaignMappingRevision([]), a);
   passed += 1;
 });
 

@@ -178,6 +178,7 @@ import { canonicalizeAdRows } from "../lib/server/sync/daily-ads-loader.js";
 import { refreshCorrectedBrandSalesForAccount } from "../lib/server/reports/brand-sales-live.js";
 import { summarizeExplicitZeroOli, brandByAsinFromCatalog } from "../lib/server/reports/oli-quality.js";
 import { rederiveDailyV2, latestProvenDailyTo, DAILY_OLI_SOURCE_KEY } from "../lib/server/reports/daily-durable-rederive.js";
+import { campaignMappingRevision } from "../lib/server/reports/campaign-ads-aggregation.js";
 import { rederiveSkuMovement, skuMovementProvenDates, skuMovementRefreshedAt } from "../lib/server/reports/sku-movement-durable-rederive.js";
 import { gatherReturnsEvidence } from "../lib/server/reports/returns-publish.js";
 import { RETURNS_ADVANCED_VERSION } from "../lib/server/reports/returns-advanced.js";
@@ -3081,6 +3082,10 @@ async function handleDataDoe(req, res) {
             readAdsCoverage: getDailyAdsCoverage,
             readCatalogSnapshot: getSourceSnapshot,
             loadCatalogPayload: getSourceSnapshotPayload,
+            // Post ASIN->Campaign cutover a NAMED brand's Daily ads attribute through the account's campaign->brand
+            // mapping (the same map Brand View uses), not the catalog child_asin map. Read the account's mappings so
+            // the self-heal derive gives a named brand its mapped campaigns' ad_sales/spend/clicks. ALL never reads it.
+            readCampaignMappings: getCampaignBrandMappings,
           };
           // FRESHNESS BY COVERAGE ADVANCE: the account's CURRENT latest proven OLI date (the SAME clamp
           // rederiveDailyV2 uses). When a stored NAMED-brand snapshot's own as-of (params.to) is behind this,
@@ -3092,6 +3097,16 @@ async function handleDataDoe(req, res) {
             const dailyOliWindows = dailyCov && dailyCov.read === "ok" ? (dailyCov.windows || []) : [];
             sharedOptions.staleWhenParamsToBefore = latestProvenDailyTo({ oliWindows: dailyOliWindows, from: legacyShared.params.from, ceiling: legacyShared.params.to });
           } catch { sharedOptions.staleWhenParamsToBefore = null; }
+          // ATTRIBUTION-REVISION FRESHNESS (named-brand Daily only): the account's CURRENT campaign->brand mapping
+          // revision. A stored named-brand snapshot whose recorded campaignMappingRev differs self-heals immediately
+          // (a new assign/clear/reassign re-attributes its campaign ads) via the SAME zero-export rederive. ALL Brands
+          // never carries a rev -> account totals are untouched by any mapping change. Fail-soft to null on read error.
+          if ((legacyShared.params.brand || "ALL") !== "ALL") {
+            try {
+              const dailyMappings = await getCampaignBrandMappings({ organizationFingerprint: dailyOrgFingerprint, connectionId: "primary", accountId: dailyAccountId }).catch(() => []);
+              sharedOptions.staleWhenMappingRev = campaignMappingRevision(dailyMappings || []);
+            } catch { sharedOptions.staleWhenMappingRev = null; }
+          }
           // Two-layer PROVISIONAL/FINAL completeness: attach the current itemization state (read live from
           // source_oli_completeness) so Daily Reporting labels D-1 provisional/final without a snapshot rewrite.
           sharedOptions.augmentResponse = makeCompletenessAugment({ organizationFingerprint: dailyOrgFingerprint, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows, readEstimates: getSourceOliSalesEstimateRows });
