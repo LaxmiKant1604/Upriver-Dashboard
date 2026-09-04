@@ -38,6 +38,14 @@ import { computeAsinWdd, resolveWddWeights, validateWddWeights, WDD_DEFAULT_WEIG
 import { buildFbaLeadTimeMatrix, validateFbaLeadTimeRows, validateFbaLeadTimeText } from "./lib/fba-lead-time-import.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import { canonicalBrandKey, permittedBrandKeySetForAccount, filterBrandNamesToPermitted } from "./lib/brand-scope-filter.js";
+// Stable stale-while-revalidate lifecycle decisions (why: a tab refocus / token
+// refresh must NEVER replace the mounted shell with a full-page bootstrap screen
+// while valid same-scope content is rendered; a scope change still purges + re-
+// resolves). These are the single source of truth wired throughout App.
+import {
+  accessFingerprintClient, accessScopeChanged, authEventClearsAccess,
+  isColdAccountState, projectAuthorizedAccounts, createInFlightCoalescer,
+} from "./lib/session-lifecycle.js";
 import SalesMovers from "./views/SalesMovers.jsx";
 import SkuMovement from "./views/SkuMovement.jsx";
 import DailyReporting from "./views/DailyReporting.jsx";
@@ -1428,14 +1436,11 @@ function removeUnauthorizedCachedData(allowedAccountIds, isAdmin) {
   }
 }
 
-// Phase 11: a CLIENT access fingerprint mirroring the server's -- changes whenever account access, a brand-scope
-// mode, the selected brands, or the role changes. Used to invalidate ALL of this user's cached report data on any
-// permission mutation so a broader pre-change payload (or a pre-restriction brand list) can never survive.
-function accessFingerprintClient(access) {
-  const grants = access && access.accountGrants ? access.accountGrants : {};
-  const parts = Object.keys(grants).sort().map((a) => { const g = grants[a] || {}; const keys = Array.isArray(g.brandKeys) ? [...g.brandKeys].sort() : []; return `${a}:${g.mode || "ALL_BRANDS"}:${keys.join("|")}`; });
-  return JSON.stringify({ u: (access && access.userId) || "", r: (access && access.role) || "", g: parts });
-}
+// Phase 11: the CLIENT access fingerprint (accessFingerprintClient, imported from
+// ./lib/session-lifecycle.js) mirrors the server's and changes whenever account
+// access, a brand-scope mode, the selected brands, or the role changes. It is
+// used both to invalidate ALL of this user's cached report data on any permission
+// mutation (below) and to keep a same-scope session/access refresh silent (App).
 // Remove EVERY cached report entry for the current owner from localStorage (a full purge, regardless of account).
 function purgeAllOwnerReportCacheLocal() {
   const ownerPrefix = API_CACHE_PREFIX + encodeURIComponent(apiCacheOwner) + ":";
@@ -1532,9 +1537,19 @@ async function cachedLargeApiGet(params, { force = false } = {}) {
    The browser cache is still written, but only as an instant first paint and an
    offline fallback: the shared snapshot is always the authority, which is why
    `loadSharedReport` issues its request even when a cached copy exists. */
+// Concurrent identical reads (a page mount + a focus revalidation + the interval
+// tick all firing loadCachedRows, or two views reading the same account
+// directory) share ONE in-flight request instead of duplicating network calls.
+// Keyed by the owner-scoped cache key, so it never coalesces across users, and
+// read-only by contract (refreshSharedReport is deliberately NOT coalesced), so
+// it can never merge two DataDoe writes.
+const sharedReadCoalescer = createInFlightCoalescer();
+
 async function loadSharedReport(params) {
-  const body = await apiGet(params);
-  return { body, cachedAt: await writeLargeApiCache(params, body), fromCache: false };
+  return sharedReadCoalescer.run(apiCacheKey(params), async () => {
+    const body = await apiGet(params);
+    return { body, cachedAt: await writeLargeApiCache(params, body), fromCache: false };
+  });
 }
 
 async function refreshSharedReport(params) {
@@ -1909,6 +1924,19 @@ function DashboardApp({ session, access, onSignOut }) {
       .finally(() => { if (active) setAccountsLoading(false); });
     return () => { active = false; };
   }, [applyAccounts]);
+
+  // Security: when the authorized account set narrows mid-session (an admin
+  // revoked a grant, changing the access fingerprint), drop any now-unauthorized
+  // account from the in-memory directory IMMEDIATELY -- without waiting for the
+  // background directory refetch -- so the selector can never show, or keep
+  // selected, an account the user may no longer access. Admins are unrestricted.
+  // projectAuthorizedAccounts returns the same reference when nothing changed, so
+  // this is a no-op re-render for the common (unchanged-scope) case.
+  useEffect(() => {
+    if (isAdmin) return;
+    setAccounts((prev) => projectAuthorizedAccounts(prev, allowedAccountIds, isAdmin));
+    setSelectedAccountId((sel) => (sel && !allowedAccountIds.has(String(sel)) ? null : sel));
+  }, [allowedAccountIds, isAdmin]);
 
   const accountById = useMemo(() => {
     const m = {};
@@ -3981,10 +4009,16 @@ function DashboardApp({ session, access, onSignOut }) {
     return <div className="dash-root"><style>{STYLE}</style><div className="loading-screen"><ShieldCheck size={24} style={{ marginBottom: 10 }} /><strong>No Amazon accounts assigned</strong><div style={{ marginTop: 8 }}>Your administrator must assign an account before you can view dashboard data.</div><button className="cache-refresh-btn" onClick={onSignOut}><LogOut size={14} />Sign out</button></div></div>;
   }
 
-  if (accountsLoading) {
+  // The full-page account bootstrap (loading OR error) may appear ONLY in the
+  // cold state -- no authorized accounts have been rendered yet. Once at least one
+  // account exists, a background directory refresh (accountsLoading) shows solely
+  // as the quiet top-bar spinner (accountsRefreshing), and a refresh error shows
+  // as the compact non-blocking banner below: the shell, selection, content and
+  // scroll are never replaced. isColdAccountState centralises that predicate.
+  if (accountsLoading && isColdAccountState(accounts.length)) {
     return <div className="dash-root"><style>{STYLE}</style><div className="loading-screen">Loading your Amazon accounts…</div></div>;
   }
-  if (accountsError) {
+  if (accountsError && isColdAccountState(accounts.length)) {
     return (
       <div className="dash-root">
         <style>{STYLE}</style>
@@ -4123,6 +4157,20 @@ function DashboardApp({ session, access, onSignOut }) {
             flags={FLAGS}
             refresh={refreshDescriptor}
           />
+
+      {/* An account-directory REFRESH that fails while accounts are already on
+          screen never blanks the app (see the cold-only guard above). It surfaces
+          here as a compact, recoverable banner; the last-known-good directory and
+          all report content stay visible. */}
+      {accountsError && accounts.length > 0 && (
+        <div className="container" style={{ paddingTop: 10 }}>
+          <DataQualityAlert
+            tone="error"
+            title="Couldn't refresh the account list"
+            detail={`${accountsError} — showing the last loaded accounts. Reports never call DataDoe on open.`}
+          />
+        </div>
+      )}
 
       {view === "access" && isAdmin && <AccessPanel accessToken={session.access_token} accounts={accounts} onLoadAccounts={fetchAccounts} />}
 
@@ -5354,6 +5402,15 @@ export default function App() {
   const [passwordSetup, setPasswordSetup] = useState(false);
   const [access, setAccess] = useState(null);
   const [accessError, setAccessError] = useState("");
+  // The current session is mirrored into a ref so a background access
+  // revalidation always uses the FRESH access token even though its effect no
+  // longer re-runs on a token refresh (see the user-id-keyed effect below).
+  const sessionRef = useRef(session);
+  useEffect(() => { sessionRef.current = session; }, [session]);
+  // Fingerprint of the access scope currently applied to state. A revalidation
+  // that returns the SAME fingerprint is a silent no-op (no setAccess), which is
+  // what keeps a token refresh / tab refocus from re-rendering the whole tree.
+  const accessFpRef = useRef(null);
 
   useEffect(() => {
     if (!supabase) { setAuthReady(true); return undefined; }
@@ -5379,30 +5436,53 @@ export default function App() {
     });
     const { data: subscription } = supabase.auth.onAuthStateChange((event, nextSession) => {
       if (!active) return;
+      // Keep the session + API token current for every event so background reads
+      // use the fresh JWT, but do NOT disturb `access`: a TOKEN_REFRESHED /
+      // SIGNED_IN (focus recovery) / USER_UPDATED keeps the mounted dashboard.
       setSession(nextSession || null);
       configureApiSession(nextSession || null);
       if (event === "PASSWORD_RECOVERY") setPasswordSetup(true);
       if (event === "USER_UPDATED") setPasswordSetup(false);
-      if (event === "SIGNED_OUT") { setAccess(null); setAccessError(""); setPasswordSetup(false); }
+      // Only a genuine sign-out clears authorized access. A different user signing
+      // in changes the user-id reload key, which cold-boots on its own below.
+      if (authEventClearsAccess(event)) { setAccess(null); setAccessError(""); setPasswordSetup(false); accessFpRef.current = null; }
     });
     return () => { active = false; subscription.subscription.unsubscribe(); };
   }, []);
 
+  // Access is loaded per STABLE user identity, never per access token. A Supabase
+  // token refresh mints a new JWT for the SAME user; keying this effect on the
+  // token (as it once did) re-ran it, nulled `access`, and unmounted the entire
+  // DashboardApp -- the full-page "Loading your Amazon accounts..." interruption.
+  // Keying on the user id means a token refresh does NOT re-run it at all: the
+  // dashboard, accounts, WaterBackground and scroll all stay put. Only first load
+  // or a genuine identity change cold-boots (the one place a full-page access
+  // screen is allowed).
   useEffect(() => {
-    if (!session?.access_token) { setAccess(null); return; }
+    if (!session?.access_token) { setAccess(null); accessFpRef.current = null; return undefined; }
     let active = true;
-    setAccess(null); setAccessError("");
-    const loadAccess = (initial) => authFetch("/api/access?action=me", session.access_token)
-      .then((body) => { if (active) setAccess(body.access); })
+    setAccess(null); setAccessError(""); accessFpRef.current = null;
+    const loadAccess = (initial) => authFetch("/api/access?action=me", sessionRef.current?.access_token || session.access_token)
+      .then((body) => {
+        if (!active) return;
+        // Apply revalidated access ONLY when its scope fingerprint changed. An
+        // identical fingerprint is a silent no-op: no setAccess -> no re-render ->
+        // no account/report re-fetch cascade, so a background refresh stays
+        // invisible while valid same-scope content is on screen. A CHANGED
+        // fingerprint DOES setAccess, which fires the DashboardApp purge (clears
+        // now-unauthorized cache) and re-resolves every scope -- security first,
+        // never a stale cross-scope screen.
+        const fp = accessFingerprintClient(body.access);
+        if (accessScopeChanged(accessFpRef.current, fp)) { accessFpRef.current = fp; setAccess(body.access); }
+      })
       .catch((error) => { if (active && initial) setAccessError(error.message || "Unable to load dashboard access."); });
     loadAccess(true);
     // BRAND-SCOPE cache-invalidation: an admin can narrow a user's account/brand grants while that user's tab stays
     // open. Re-fetch the authoritative access on focus / tab-visible so a mid-session grant change is picked up
-    // WITHOUT a manual reload: setAccess with the new grants changes the access fingerprint, which fires the
-    // DashboardApp purge effect (clears localStorage + IndexedDB report caches) and re-resolves every brand selector
-    // from the newly authorized grants. Server requests are always projected regardless; this closes the display
-    // window where an already-open session could still show removed brand names. A refetch failure keeps the current
-    // access (never blanks a working session on a transient network blip).
+    // WITHOUT a manual reload. When the scope actually changed, setAccess fires the DashboardApp purge effect (clears
+    // localStorage + IndexedDB report caches) and re-resolves every brand selector from the newly authorized grants;
+    // when it is unchanged, nothing re-renders. Server requests are always projected regardless. A refetch failure
+    // keeps the current access (never blanks a working session on a transient network blip).
     const revalidate = () => { if (active && (typeof document === "undefined" || document.visibilityState === "visible")) loadAccess(false); };
     window.addEventListener("focus", revalidate);
     if (typeof document !== "undefined") document.addEventListener("visibilitychange", revalidate);
@@ -5411,11 +5491,12 @@ export default function App() {
       window.removeEventListener("focus", revalidate);
       if (typeof document !== "undefined") document.removeEventListener("visibilitychange", revalidate);
     };
-  }, [session?.access_token]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.user?.id]);
 
   const signOut = useCallback(async () => {
     if (supabase) await supabase.auth.signOut();
-    setSession(null); setAccess(null); configureApiSession(null);
+    setSession(null); setAccess(null); configureApiSession(null); accessFpRef.current = null;
   }, []);
 
   if (!supabase) return <div className="auth-root"><style>{STYLE}</style><div className="auth-panel"><div className="auth-logo">UR</div><div className="auth-title">Login setup incomplete</div><div className="auth-sub">The public Supabase browser configuration is missing from Vercel.</div></div></div>;

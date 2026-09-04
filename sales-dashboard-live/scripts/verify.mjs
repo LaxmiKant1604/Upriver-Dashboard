@@ -32,6 +32,7 @@ const SUITES = [
   "test:currency",
   "test:water-capability",
   "test:dashboard-transition",
+  "test:session-stability",
   "test:insights",
   "test:brand-view",
   "test:sync",
