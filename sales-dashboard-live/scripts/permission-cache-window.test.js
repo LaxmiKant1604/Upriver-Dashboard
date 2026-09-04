@@ -80,9 +80,9 @@ await (async () => {
 /* ================= wiring: the real App.jsx uses these mechanisms ================= */
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const app = readFileSync(path.join(root, "src/App.jsx"), "utf8");
-ok("App keys DashboardApp by the access fingerprint (F3)", /<DashboardApp key=\{accessFingerprintClient\(access\)\}/.test(app));
-ok("readLargeApiCache awaits the purge barrier (F7)", /await largeCachePurgeBarrier;/.test(app));
-ok("the permission-change purge ARMS the barrier with the large-cache purge (F7)", /setLargeCachePurgeBarrier\(clearAllOwnerLargeCache\(\)\)/.test(app));
+ok("App keys DashboardApp by the access fingerprint (F3)", /<DashboardApp key=\{scopeFingerprint\}/.test(app) && /const scopeFingerprint = accessFingerprintClient\(access\);/.test(app));
+ok("readLargeApiCache consults the purge barrier (F7, now the hardened reportLargeCacheBarrier)", /reportLargeCacheBarrier\.ready\(\)/.test(app));
+ok("the permission-change purge ARMS the barrier with the large-cache purge (F7)", /reportLargeCacheBarrier\.arm\(clearAllOwnerLargeCache\(\)\)/.test(app));
 ok("cache keys remain owner-namespaced (no cross-user reuse)", /API_CACHE_PREFIX \+ encodeURIComponent\(apiCacheOwner\)/.test(app));
 
 writeSync(1, `\npermission-cache-window: ${passed} assertions passed\n`);

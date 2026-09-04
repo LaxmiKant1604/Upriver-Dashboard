@@ -50,6 +50,13 @@ import {
   accessFingerprintClient, accessScopeChanged, authEventClearsAccess,
   isColdAccountState, projectAuthorizedAccounts, createInFlightCoalescer,
 } from "./lib/session-lifecycle.js";
+// Authorization-scope isolation for the browser report cache + read coalescer: every cache/coalescer key carries the
+// auth fingerprint, an obsolete-scope in-flight response is rejected before it writes/returns, and a failed IndexedDB
+// purge makes reads bypass (network) instead of returning previous-scope data.
+import {
+  configureReportCacheScope, cacheFingerprintId, currentAuthGeneration, isObsoleteGeneration,
+  AuthScopeChangedError, createPurgeBarrier,
+} from "./lib/report-cache-scope.js";
 import SalesMovers from "./views/SalesMovers.jsx";
 import SkuMovement from "./views/SkuMovement.jsx";
 import DailyReporting from "./views/DailyReporting.jsx";
@@ -1403,6 +1410,10 @@ const LARGE_CACHE_STORE = "responses";
 function apiCacheKey(params) {
   const qs = new URLSearchParams();
   Object.keys(params).sort().forEach((key) => qs.set(key, params[key]));
+  // Every cache + coalescer key carries the authorization fingerprint, so a different scope can neither read an entry
+  // nor join an in-flight read belonging to another scope, and legacy (pre-fingerprint) entries -- which have no __fp
+  // -- are never matched, hence never reused. Kept as a normal query param so the key-parsing helpers below still work.
+  qs.set("__fp", cacheFingerprintId());
   return API_CACHE_PREFIX + encodeURIComponent(apiCacheOwner) + ":" + qs.toString();
 }
 
@@ -1466,11 +1477,13 @@ function writeApiCache(params, body) {
 }
 
 async function cachedApiGet(params, { force = false } = {}) {
+  const generation = currentAuthGeneration();
   if (!force) {
     const cached = readApiCache(params);
     if (cached) return { ...cached, fromCache: true };
   }
   const body = await apiGet(params);
+  if (isObsoleteGeneration(generation)) throw new AuthScopeChangedError();
   return { body, cachedAt: writeApiCache(params, body), fromCache: false };
 }
 
@@ -1487,18 +1500,19 @@ function openLargeCache() {
     request.onerror = () => reject(request.error);
   });
 }
-// F7: a barrier so a large-cache READ never races an in-flight owner purge. The IndexedDB purge on a permission
-// (access-fingerprint) change is async; without this, a report read fired in the same tick could return a
-// not-yet-deleted previous-scope payload. On a fingerprint change the purge effect assigns the purge promise via
-// setLargeCachePurgeBarrier; readLargeApiCache awaits it first. Resolved by default (no wait when nothing is
-// pending); a failed/blocked purge still unblocks reads (fail-safe) -- the fingerprint-keyed refetch is the backstop.
-let largeCachePurgeBarrier = Promise.resolve();
-function setLargeCachePurgeBarrier(promise) {
-  largeCachePurgeBarrier = Promise.resolve(promise).catch(() => {});
-}
+// A barrier so a large-cache READ never races -- or trusts -- an in-flight owner purge. The IndexedDB purge on a
+// permission (access-fingerprint) change is async; a read fired in the same tick could otherwise return a
+// not-yet-deleted previous-scope payload. On a fingerprint change the purge effect arms this with the purge promise;
+// readLargeApiCache awaits its status first. Default is trusted (no purge pending). A FAILED/aborted purge reports
+// ok:false, and the reader BYPASSES the cache and does an authorized network read (fail closed) rather than returning
+// possibly-previous-scope data; it never rejects, so a read can never deadlock.
+const reportLargeCacheBarrier = createPurgeBarrier();
 async function readLargeApiCache(params) {
   const key = apiCacheKey(params);
-  try { await largeCachePurgeBarrier; } catch (_e) { /* fail-safe: never block a read on a purge error */ }
+  const { ok: purgeOk } = await reportLargeCacheBarrier.ready();
+  // Fail closed: if the last owner purge did not verifiably complete, the on-disk cache for this scope is untrustworthy
+  // -- bypass it (null) so the caller performs an authorized network read instead of reusing an uncertain entry.
+  if (!purgeOk) return null;
   try {
     const db = await openLargeCache();
     const cached = await new Promise((resolve, reject) => {
@@ -1529,11 +1543,13 @@ async function writeLargeApiCache(params, body) {
   }
 }
 async function cachedLargeApiGet(params, { force = false } = {}) {
+  const generation = currentAuthGeneration();
   if (!force) {
     const cached = await readLargeApiCache(params);
     if (cached) return { ...cached, fromCache: true };
   }
   const body = await apiGet(params);
+  if (isObsoleteGeneration(generation)) throw new AuthScopeChangedError();
   return { body, cachedAt: await writeLargeApiCache(params, body), fromCache: false };
 }
 
@@ -1560,8 +1576,13 @@ async function cachedLargeApiGet(params, { force = false } = {}) {
 const sharedReadCoalescer = createInFlightCoalescer();
 
 async function loadSharedReport(params) {
+  // Capture the authorization generation at REQUEST creation. The coalescer key (apiCacheKey) carries the fingerprint,
+  // so a different scope cannot join this in-flight read; and if the scope changes before this resolves, we reject the
+  // obsolete result BEFORE it can be returned to a consumer or written to the cache under the new scope's key.
+  const generation = currentAuthGeneration();
   return sharedReadCoalescer.run(apiCacheKey(params), async () => {
     const body = await apiGet(params);
+    if (isObsoleteGeneration(generation)) throw new AuthScopeChangedError();
     return { body, cachedAt: await writeLargeApiCache(params, body), fromCache: false };
   });
 }
@@ -1569,7 +1590,9 @@ async function loadSharedReport(params) {
 async function refreshSharedReport(params) {
   // `refresh` is deliberately NOT part of the cache key, so a refreshed report
   // and a read of the same scope share one cache entry.
+  const generation = currentAuthGeneration();
   const body = await apiGet({ ...params, refresh: "1" });
+  if (isObsoleteGeneration(generation)) throw new AuthScopeChangedError();
   return { body, cachedAt: await writeLargeApiCache(params, body), fromCache: false };
 }
 
@@ -1720,6 +1743,9 @@ function cachedBrandsForAccount(accountId) {
       const key = window.localStorage.key(i);
       if (!key || !key.startsWith(ownerPrefix)) continue;
       const params = new URLSearchParams(key.slice(ownerPrefix.length));
+      // Only the CURRENT authorization scope's brand cache is eligible: a legacy (no __fp) or previous-scope entry is
+      // never read, so a narrowed user can't see a prior scope's brand names.
+      if (params.get("__fp") !== cacheFingerprintId()) continue;
       if (params.get("action") !== "brand-sales" || params.get("ids") !== accountId) continue;
       const cached = JSON.parse(window.localStorage.getItem(key) || "{}");
       (cached.body?.rows || []).forEach((row) => {
@@ -1751,9 +1777,9 @@ function DashboardApp({ session, access, onSignOut }) {
       const fp = accessFingerprintClient(access);
       if (window.localStorage.getItem(fpKey) !== fp) {
         purgeAllOwnerReportCacheLocal();
-        // F7: arm the read barrier with THIS purge so any large-cache read (from the freshly-keyed remount below)
-        // waits for the previous-scope IndexedDB entries to be deleted before it can return anything.
-        setLargeCachePurgeBarrier(clearAllOwnerLargeCache());
+        // Arm the read barrier with THIS purge so any large-cache read (from the freshly-keyed remount below) waits
+        // for the previous-scope IndexedDB entries to be deleted, and BYPASSES the cache if the purge fails/aborts.
+        reportLargeCacheBarrier.arm(clearAllOwnerLargeCache());
         window.localStorage.setItem(fpKey, fp);
       }
     } catch (e) { /* storage may be unavailable; server authorization is final */ }
@@ -5597,7 +5623,13 @@ export default function App() {
   // land on the unmounted instance) in the SAME commit, so no previous-scope frame can paint under the new labels.
   // A routine TOKEN_REFRESHED keeps the SAME fingerprint (access identity is preserved unless the scope changed), so
   // it does NOT remount -- silent background refresh is preserved. Hook order is untouched (#310 correction intact).
-  return <DashboardApp key={accessFingerprintClient(access)} session={session} access={access} onSignOut={signOut} />;
+  const scopeFingerprint = accessFingerprintClient(access);
+  // Establish the cache/coalescer authorization scope SYNCHRONOUSLY here -- before the (re)mounted DashboardApp subtree
+  // renders and its loaders read -- so every cache key + coalescer key + generation is already the new scope's. A
+  // later effect would run after the first read. Idempotent for an unchanged fingerprint (no generation churn), so a
+  // silent token refresh stays silent.
+  configureReportCacheScope(scopeFingerprint);
+  return <DashboardApp key={scopeFingerprint} session={session} access={access} onSignOut={signOut} />;
 }
 
 async function removeUnauthorizedLargeCachedData(allowedAccountIds, isAdmin) {
@@ -5629,15 +5661,24 @@ async function removeUnauthorizedLargeCachedData(allowedAccountIds, isAdmin) {
 
 // Phase 11: clear EVERY large cached report entry for the current owner (a full purge on an access-fingerprint change).
 async function clearAllOwnerLargeCache() {
+  // Resolves only when the delete TRANSACTION verifiably commits (tx.oncomplete); it REJECTS on abort/error (or if
+  // storage is unavailable) so the caller/barrier records the failure and reads fail closed (bypass -> network) rather
+  // than trusting entries a failed purge may have left behind. Keying on the cursor request alone would report success
+  // even if the transaction later aborted.
   const ownerPrefix = API_CACHE_PREFIX + encodeURIComponent(apiCacheOwner) + ":";
+  const db = await openLargeCache();
   try {
-    const db = await openLargeCache();
     await new Promise((resolve, reject) => {
-      const store = db.transaction(LARGE_CACHE_STORE, "readwrite").objectStore(LARGE_CACHE_STORE);
+      const tx = db.transaction(LARGE_CACHE_STORE, "readwrite");
+      const store = tx.objectStore(LARGE_CACHE_STORE);
       const cursor = store.openCursor();
-      cursor.onsuccess = () => { const cur = cursor.result; if (!cur) { resolve(); return; } if (String(cur.key || "").startsWith(ownerPrefix)) cur.delete(); cur.continue(); };
-      cursor.onerror = () => reject(cursor.error);
+      cursor.onsuccess = () => { const cur = cursor.result; if (!cur) return; if (String(cur.key || "").startsWith(ownerPrefix)) cur.delete(); cur.continue(); };
+      cursor.onerror = () => { try { tx.abort(); } catch (_e) { /* noop */ } };
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error || new Error("large-cache purge transaction aborted"));
+      tx.onerror = () => reject(tx.error || new Error("large-cache purge transaction failed"));
     });
-    db.close();
-  } catch (e) { /* IndexedDB may be unavailable; server authorization is final */ }
+  } finally {
+    try { db.close(); } catch (_e) { /* noop */ }
+  }
 }

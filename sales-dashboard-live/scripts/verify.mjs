@@ -40,6 +40,7 @@ const SUITES = [
   "test:fba-plan-config-brand-gate",
   "test:sku-movement-identifier-brand-scope",
   "test:permission-cache-window",
+  "test:permission-cache-scope",
   "test:region-view",
   "test:regional-brand-view",
   "test:insights",
