@@ -14165,3 +14165,53 @@ AU-excluded), fba-planning (AWD counts for any validated marketplace), report-so
 Full npm run verify GREEN 122 steps/98 suites incl build:check; every existing FBA/scheduler/derivation test passes
 (US byte-identical, scheduler unchanged). git diff --check clean. Dry-run: us-ca 2 AWD (unchanged), india 0 AWD,
 europe-au 5 AWD (new) within the raised 90 ceiling.
+
+================================================================================
+2026-09-04 -- Permission-cache: immutable per-request identity across async boundaries (commit b21096e, LIVE)
+================================================================================
+Closed the two remaining async permission-cache defects in 80fab37. Browser cache/in-flight only; no report math/UI/
+schedulers/grants/backend-authz/FBA-AWD/source-contract touched; no new serverless function (api/*.js stays 12); zero
+DataDoe / zero tokens. Commit b21096e; deployed SHA b21096e (Vercel Production deployment "success" 12:02:04Z; public
+alias upriverdashboard.vercel.app 200, Last-Modified 12:02:53Z, bundle index-C2bDxq7k.js -- prior deploy b1339ef was
+10:55Z so the alias is definitively the new build). Per-deployment URL is behind Vercel deployment protection (302);
+verified via public alias + GitHub deployment record.
+
+DEFECTS (both independently reproduced): (1) a late IndexedDB failure AFTER a scope change made writeLargeApiCache's
+catch call writeApiCache(params), which RECOMPUTED apiCacheKey from the CURRENT global scope -> the old ALL_BRANDS body
+persisted under the new SELECTED_BRANDS key (and the obsolete loader resolved "successfully"). (2) cachedLargeApiGet's
+cache-hit branch returned a pending IndexedDB get's result with NO generation check -> a revoked payload served after a
+mid-read scope change.
+
+FIX -- new src/lib/report-cache-io.js (the injectable async IndexedDB/localStorage core, so the REAL async writer is
+unit-testable): scopedLargeRead / scopedLargeWrite / runCachedLargeGet / runSharedLoad. Every op carries an IMMUTABLE
+captured identity (exact KEY + authorization GENERATION); the generation is re-validated after each async boundary and
+BEFORE returning a cached/network result, before a write, before a localStorage fallback, and before delivering after a
+write. AuthScopeChangedError is rethrown, never swallowed as a storage error and never a fallback. Writes/purge key off
+IndexedDB transaction completion/abort. Captured key => a fallback can never land under a different (current) scope's
+key; an obsolete body is never written under, or returned as, the current scope.
+
+App.jsx: readLargeApiCache/cachedLargeApiGet/loadSharedReport/refreshSharedReport thread the captured context (key +
+currentAuthGeneration()) into the core via largeCacheIO(); the recompute-prone writeLargeApiCache wrapper REMOVED;
+cachedApiGet validates on its (sync) cache hit too. useSharedReport now swallows AuthScopeChangedError SILENTLY in both
+the load and refresh catches (the F3 fingerprint remount already supersedes) -- never an error flash, never a
+previous-scope browser fallback. App invalidates the cache scope on EVERY no-access state (sign-out/session-loss/
+password-setup/access-error/loading) via `if (!scopeActive) configureReportCacheScope("")` BEFORE the early returns, so
+a read still in flight from a previous signed-in mount is rejected instead of resolving/writing after access is gone.
+The success-path configureReportCacheScope(scopeFingerprint) + <DashboardApp key={scopeFingerprint}> unchanged.
+
+Caller audit: loadSharedReport/refreshSharedReport keep task-7 throw semantics (no new caller contract); readLargeApiCache
+still never throws (barrier bypass -> null); the ~20 direct callers are all protected by the atomic F3 remount +
+reqId/active guards (a scope-change rejection lands on an unmounted instance -> no flash/stuck-loader/wrong-data).
+cachedApiGet/cachedLargeApiGet are legacy (no runtime callers) but fixed+tested.
+
+TESTS: new scripts/report-cache-io.test.js (26 assertions) drives the REAL core with a controllable fake IndexedDB
+(pending open/get, tx complete/abort) + fake storage + real report-cache-scope generation -- asserts BOTH returned
+results AND actual cache keys/payloads for both defects, plus write-during-change (data only under the captured old key,
+result rejected), abort+fallback (cross-scope throws, same-scope falls back), sign-out mid-flight, rapid A->B->A,
+same-scope refresh/dedup, failed-purge bypass, legacy-key exclusion. Registered in package.json + verify.mjs. Wiring
+assertions in permission-cache-scope/permission-cache-window/session-stability updated for the delegation. Full
+npm run verify GREEN: 134 steps / 110 suites incl build:check.
+
+REMAINING (human): interactive authenticated browser verification (narrow a real session's brands and confirm no leak)
+-- NOT done here (no browser/creds; must not make real permission-grant changes or spend tokens). All 12 prod grants
+are still ALL_BRANDS so the cross-scope leak stays LATENT in prod.
