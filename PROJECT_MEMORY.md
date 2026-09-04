@@ -1,5 +1,44 @@
 # Project Memory
 
+## Stable stale-while-revalidate: no full-page "Loading your Amazon accounts..." on tab-refocus / token refresh (2026-09-04)
+
+Defect: returning to the tab, or a routine Supabase token refresh, sometimes replaced the WHOLE authenticated app
+with the full-page bootstrap screen (remounting the shell + WaterBackground, resetting scroll, replaying entrance
+animations). Two over-eager invalidations at the App root, both fixed:
+
+- **ROOT CAUSE 1 -- access effect keyed on the access TOKEN (`src/App.jsx` App root)**: the `access`-loading effect
+  keyed on `session?.access_token`, so a `TOKEN_REFRESHED` (new JWT, SAME user -- Supabase also emits this / a
+  `SIGNED_IN` on tab-visibility recovery) re-ran it, called `setAccess(null)`, and UNMOUNTED the entire DashboardApp
+  (accounts, WaterBackground, scroll). FIX: key it on the STABLE `session?.user?.id`; a token refresh no longer
+  re-runs it. The API JWT is kept current independently (`configureApiSession` on every auth event + a `sessionRef`
+  the background revalidation reads), so silent reads still use the fresh token.
+- **ROOT CAUSE 2 -- focus/visibility revalidation always rebuilt `access`**: `loadAccess(false)` on focus always did
+  `setAccess(body.access)` (a NEW object), whose fresh `accountIds` array reference cascaded `allowedAccountIds` ->
+  `applyAccounts` -> the account-directory effect -> `setAccountsLoading(true)` -> the full-page takeover. FIX: apply
+  revalidated access ONLY when its scope FINGERPRINT changed (`accessScopeChanged`); an identical scope is a silent
+  no-op (no `setAccess`, no re-render, no refetch). A CHANGED fingerprint still `setAccess` -> the existing Phase-11
+  purge (clears now-unauthorized cache) + re-resolve -- security first, never a stale cross-scope screen.
+- **Cold-only bootstrap**: the full-page account loading/error now shows ONLY when `isColdAccountState(accounts.length)`
+  (no authorized accounts rendered yet). Once accounts exist, a background directory refresh is the quiet top-bar
+  spinner (`accountsRefreshing`) and a refresh error is a compact non-blocking banner; shell/selection/content/scroll
+  are retained. WaterBackground therefore stops being remounted (DashboardApp no longer unmounts).
+- **Dedup + security tightening**: `loadSharedReport` reads are coalesced by owner-scoped cache key
+  (`createInFlightCoalescer`) so mount + focus + interval no longer fire duplicate account/report requests (refresh /
+  DataDoe is NEVER coalesced). `projectAuthorizedAccounts` drops now-unauthorized accounts from the selector the
+  instant a grant narrows, without waiting for the refetch. Existing per-report `reqId` race guards untouched.
+- **New pure lib** `src/lib/session-lifecycle.js` (single source of truth: `accessFingerprintClient` moved here,
+  `accessScopeChanged`, `accessReloadKey`, `authEventClearsAccess`, `isColdAccountState`, `projectAuthorizedAccounts`,
+  `createInFlightCoalescer`). **Tests**: `scripts/session-stability.test.js` (40 assertions -- token-refresh/focus
+  never blank/remount, silent same-scope revalidation, cold-only bootstrap, read coalescing, cross-scope cache
+  impossible, grant-narrowing purge; static wiring proofs FAIL on the old code), wired into `verify`. **verify
+  123/123 across 99 suites incl. build:check**; three.module stays a separate 684 kB lazy chunk; `git diff --check`
+  clean; new files 7-bit ASCII.
+- **No change** to report formulas/business values, APIs, DB schema, DataDoe contracts, schedulers, or authorization
+  rules. **Zero DataDoe creates / zero tokens.** **Commit dd3b155** (5 files); pushed to origin/main; Vercel
+  Production deployment state=success. Production deployment URL is behind Vercel Deployment Protection (SSO 302 for
+  both `/` and `/api/*`), so an unauthenticated 200 could not be fetched from here; live multi-viewport browser
+  verification was not possible in this environment (no browser automation + SSO gate).
+
 ## Daily Reporting -- named brand uses the ACCOUNT's proven horizon, not the brand's last sale (2026-08-31)
 
 Defect: Haven&Hue US (account 916be46e) All Brands showed data through 2026-08-30 but the Caruso Italy named brand
