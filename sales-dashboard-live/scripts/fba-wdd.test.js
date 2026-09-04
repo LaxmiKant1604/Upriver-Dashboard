@@ -5,6 +5,7 @@
 // Total Lead Time, Inbound ETA (Safety excluded), Days to Inbound (marketplace-local), the non-double-counting cover
 // model (Total FBA Inventory excluded), rounding, and the "Unavailable, never a false Sufficient" rule.
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   trailingDailyAverage, dailyAverages, validateWddWeights, weightedDailyDemand, resolveWddWeights,
   totalLeadTime, computeInboundEta, daysToInbound, coverModel, marketplaceLocalDate, computeAsinWdd, WDD_DEFAULT_WEIGHTS,
@@ -23,6 +24,14 @@ function denseDaily(endDate, days, perDay) {
 }
 
 console.log("fba-wdd");
+
+test("App imports the bare useRef hook used by the FBA lead-time upload control", () => {
+  const app = readFileSync(new URL("../src/App.jsx", import.meta.url), "utf8");
+  const reactImport = app.match(/^import React, \{([^}]+)\} from "react";/m);
+  assert.ok(reactImport, "App must retain its named React hook import");
+  assert.match(reactImport[1], /\buseRef\b/, "bare useRef calls must have a named React import");
+  assert.match(app, /const leadTimeFileRef = useRef\(null\)/, "guard the FBA lead-time upload ref that caused the production blank page");
+});
 
 test("trailingDailyAverage: full coverage divides by N (covered units / 7)", () => {
   const daily = denseDaily("2026-06-30", 60, 3); // 3 units every day

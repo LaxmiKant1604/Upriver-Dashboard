@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useCallback } from "react";
+import React, { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, ComposedChart, Line, PieChart, Pie, Cell, Legend } from "recharts";
 import { TrendingUp, Info, RefreshCw, AlertTriangle, X, Search, Boxes, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check, Wallet, BellRing, Pencil, RotateCcw, UsersRound, UserPlus, LogOut, ShieldCheck, CalendarRange, BarChart3, Inbox, DatabaseZap, Upload, SlidersHorizontal } from "lucide-react";
 import { supabase } from "./lib/supabase.js";
