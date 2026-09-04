@@ -9,6 +9,7 @@
   "use strict";
   var RELOAD_KEY = "upriver:boot-reloaded-at";
   var WINDOW_MS = 20000;
+  var watchdogId = null;
   function now() { return Date.now(); }
 
   function guardedReloadOnce() {
@@ -28,9 +29,12 @@
 
   function fallback() { return document.getElementById("boot-fallback"); }
 
-  // Called by the top-level Error Boundary after React commits a frame -> remove the boot surface.
+  // Called by the top-level Error Boundary after React commits a frame -> remove the boot surface AND retire the
+  // watchdog. The error/unhandledrejection listeners are also self-disabling (every branch early-returns once the
+  // mounted flag is set), so nothing here can act on a healthy running app.
   window.__upriverBootMounted = function () {
     window.__UPRIVER_BOOT_MOUNTED = true;
+    if (watchdogId !== null) { try { clearTimeout(watchdogId); } catch (e) {} watchdogId = null; }
     try { sessionStorage.removeItem(RELOAD_KEY); } catch (e) {}
     var f = fallback();
     if (f && f.parentNode) f.parentNode.removeChild(f);
@@ -80,5 +84,6 @@
   });
 
   // Backstop: if React never signals a mount, the bundle silently failed -> show recovery (user-driven Retry).
-  setTimeout(function () { if (!window.__UPRIVER_BOOT_MOUNTED) showRecovery(false); }, 12000);
+  // The id is retained so __upriverBootMounted can clear it once React is up (no dangling timer on a healthy app).
+  watchdogId = setTimeout(function () { watchdogId = null; if (!window.__UPRIVER_BOOT_MOUNTED) showRecovery(false); }, 12000);
 })();

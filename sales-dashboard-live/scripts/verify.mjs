@@ -34,6 +34,8 @@ const SUITES = [
   "test:dashboard-transition",
   "test:session-stability",
   "test:boot-recovery",
+  "test:boot-guard-behavior",
+  "test:boundary-behavior",
   "test:region-view",
   "test:regional-brand-view",
   "test:insights",
