@@ -277,6 +277,41 @@ body{ overflow-x:hidden; }
 .account-sync-btn:hover:not(:disabled){ border-color:var(--accent); color:var(--accent); background:var(--accent-soft); }
 .account-sync-btn:disabled{ opacity:.5; cursor:not-allowed; }
 
+/* ---- Region selector (native <select>, three fixed scheduler regions) ---- */
+.tb-select.region select{ min-width:150px; max-width:230px; }
+
+/* ---- Searchable combobox (Account / Brand): the same .tb-select shell, but the
+   value is a button that opens a search + listbox popover. Stable trigger widths
+   match the native selects so switching Account<->Brand view never shifts the header. */
+.tb-combo-trigger{
+  appearance:none; border:0; background:transparent; padding:0 16px 0 0; margin:0;
+  font:750 12.5px inherit; color:var(--text-primary); cursor:pointer; outline:none;
+  width:100%; text-align:left; display:block; line-height:1.35;
+}
+.tb-combo-trigger:disabled{ color:var(--text-muted); cursor:not-allowed; }
+.tb-combo-text{ display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.tb-combo-text.placeholder{ color:var(--text-muted); font-weight:650; }
+.tb-combo.account .tb-combo-trigger{ min-width:190px; max-width:290px; }
+.tb-combo.brand .tb-combo-trigger{ min-width:150px; max-width:230px; }
+.tb-combo-pop{
+  position:absolute; top:calc(100% + 6px); left:0; z-index:60;
+  min-width:240px; max-width:360px; width:max-content;
+  background:var(--bg-surface); border:1px solid var(--border-default); border-radius:var(--radius-md);
+  box-shadow:var(--shadow-lg); padding:6px; display:flex; flex-direction:column; gap:6px;
+}
+.tb-combo-search{ display:flex; align-items:center; gap:6px; padding:5px 8px; border:1px solid var(--border-default);
+  border-radius:var(--radius-sm); background:var(--bg-elevated); }
+.tb-combo-search > svg{ color:var(--text-muted); flex-shrink:0; }
+.tb-combo-search input{ border:0; background:transparent; outline:none; width:100%; font:600 12.5px inherit; color:var(--text-primary); }
+.tb-combo-list{ list-style:none; margin:0; padding:0; max-height:290px; overflow-y:auto; overscroll-behavior:contain; }
+.tb-combo-opt{ display:flex; align-items:center; justify-content:space-between; gap:10px; padding:7px 9px;
+  border-radius:6px; cursor:pointer; font-size:12.5px; color:var(--text-primary); }
+.tb-combo-opt-label{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.tb-combo-opt.active{ background:var(--accent-soft); }
+.tb-combo-opt.selected{ font-weight:800; }
+.tb-combo-meta{ color:var(--text-muted); font-size:11px; flex-shrink:0; }
+.tb-combo-empty{ padding:12px 9px; color:var(--text-muted); font-size:12px; text-align:center; }
+
 /* ---- Refresh status cluster ---- */
 .refresh-cluster{
   display:flex; align-items:center; gap:9px; border:1px solid var(--border-default);
@@ -1330,6 +1365,9 @@ body{ overflow-x:hidden; }
   .skupl-kpis{ grid-template-columns:repeat(4,minmax(0,1fr)); }
   .tb-select.account select{ min-width:150px; max-width:210px; }
   .tb-select.brand select{ min-width:110px; max-width:160px; }
+  .tb-select.region select{ min-width:120px; max-width:180px; }
+  .tb-combo.account .tb-combo-trigger{ min-width:150px; max-width:210px; }
+  .tb-combo.brand .tb-combo-trigger{ min-width:120px; max-width:180px; }
   .dashboard-mode button{ min-width:74px; }
   .refresh-status-value{ max-width:150px; }
 }
@@ -1368,7 +1406,9 @@ body{ overflow-x:hidden; }
   .tb-right{ width:100%; margin-left:0; justify-content:flex-start; }
   .tb-select{ flex:1 1 190px; min-width:0; }
   .dashboard-mode{ flex:1 1 100%; }
-  .tb-select.account select,.tb-select.brand select{ min-width:0; max-width:none; width:100%; }
+  .tb-select.account select,.tb-select.brand select,.tb-select.region select{ min-width:0; max-width:none; width:100%; }
+  .tb-combo.account .tb-combo-trigger,.tb-combo.brand .tb-combo-trigger{ min-width:0; max-width:none; width:100%; }
+  .tb-combo-pop{ left:0; right:0; width:auto; max-width:none; }
   .refresh-cluster{ flex:1 1 160px; }
   .refresh-status-value{ max-width:none; }
 

@@ -144,6 +144,9 @@ function campaignMappingsReader() {
   return async ({ accountId }) => (fp ? getCampaignBrandMappings({ organizationFingerprint: fp, connectionId: "primary", accountId }).catch(() => []) : []);
 }
 import { makeRouteDeadline } from "../lib/server/sync/source-bucket-sync-runtime.js";
+// Regional Brand View: server-side region validation + trusted-metadata membership filter (pure helpers over the
+// SINGLE canonical marketplace->region mapping the scheduler owns; no second mapping is introduced).
+import { normalizeRegionParam, filterAccountIdsToRegion, RegionScopeError } from "../lib/server/reports/region-scope.js";
 import { isCancelledStatus } from "../lib/server/sync/oli-order-rules.js";
 import { getEnrichedOliHistoryRows } from "../lib/server/sync/oli-enriched-history.js";
 import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
@@ -2893,6 +2896,15 @@ async function handleDataDoe(req, res) {
     if (action === "brand-view-portfolio") {
       const brand = String(req.query.brand || "").trim();
       const asOf = String(req.query.asOf || "");
+      // Optional REGION scope. When present it must be one of the three real scheduler regions; an invalid value is
+      // rejected (the region names are public scheduler scopes, so this discloses nothing). When absent the behaviour
+      // is byte-identical to before (no region filter), so an older client / cached request still works.
+      let region;
+      try { region = normalizeRegionParam(req.query.region); }
+      catch (regionError) {
+        if (regionError instanceof RegionScopeError) { res.status(400).json({ error: regionError.message }); return; }
+        throw regionError;
+      }
       const requestedIds = [...new Set(publicAccountIds.map(String))].sort();
       if (!brand || !requestedIds.length || !isDateStr(asOf)) {
         res.status(400).json({ error: "Brand View requires a brand, one or more allowed account ids, and an asOf date (YYYY-MM-DD)." });
@@ -2906,7 +2918,7 @@ async function handleDataDoe(req, res) {
       // inventory are all excluded because it drops out of the account set entirely). Admin -> unchanged.
       const bvAuthorized = await authorizedAccountsForBrand(access, requestedIds, brand);
       if (!bvAuthorized.length) { res.status(403).json({ error: "You do not have access to the requested brand for these accounts." }); return; }
-      const accountIds = [...bvAuthorized].sort();
+      const authorizedIds = [...bvAuthorized].sort();
 
       const directory = await getLatestReportSnapshot({
         reportKey: "account-directory",
@@ -2914,9 +2926,20 @@ async function handleDataDoe(req, res) {
       }).catch(() => null);
       const accountsById = Object.fromEntries(
         (directory?.payload?.accounts || [])
-          .filter((entry) => accountIds.includes(String(entry.id)))
+          .filter((entry) => authorizedIds.includes(String(entry.id)))
           .map((entry) => [String(entry.id), { name: entry.name || null, country: entry.country || null }])
       );
+      // REGION ENFORCEMENT (server is the authority): recompute each authorized account's region from its TRUSTED
+      // directory country and keep only those in the requested region. A browser can never smuggle a cross-region
+      // account into a region's rollup, and an account whose marketplace is unknown/absent from the trusted directory
+      // is fail-closed OUT of the region. When no region is requested this is a no-op (byte-identical legacy path).
+      const accountIds = filterAccountIdsToRegion(authorizedIds, accountsById, region);
+      if (!accountIds.length) {
+        // Legitimate empty state (no authorized account for this brand in this region yet) -- an honest 200, never a
+        // 403 that would reveal whether other-region accounts exist for the brand.
+        res.status(200).json({ snapshotMissing: true, message: "No saved data for this brand in the selected region yet." });
+        return;
+      }
 
       // Brand-sales is read STORAGE-FIRST so a large (out-of-line) payload never drops its country, and the same
       // build is the read-path self-heal: when the selected brand's account set changes (the directory just
@@ -2963,7 +2986,12 @@ async function handleDataDoe(req, res) {
         reportKey: BRAND_VIEW_PORTFOLIO_REPORT_KEY,
         reportVersion: BRAND_VIEW_PORTFOLIO_VERSION,
         accountId: brandViewPortfolioScopeId(accountIds, brand),
-        params: { accountIds: accountIds.join(","), brand, asOf },
+        // `region` participates in the snapshot identity (paramsHashFor hashes every non-empty param), so a region's
+        // portfolio can never be served under another region's key. The account set already differs per region, so
+        // this is belt-and-suspenders that also labels the snapshot honestly.
+        params: { accountIds: accountIds.join(","), brand, asOf, ...(region ? { region } : {}) },
+        // A cross-region snapshot must never be served as the across-midnight last-known-good fallback either.
+        staleScopeKeys: region ? ["region"] : undefined,
         userId: access.userId,
         label: "Brand View",
         // Reading a dozen saved Dashboard payloads sequentially takes longer

@@ -11,7 +11,7 @@
    item is the same key the app has always used, so no route behaviour changes
    when items are regrouped or reordered.                                    */
 
-import React, { useEffect } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { CAMPAIGN_ADS_TAB } from "../lib/feature-flags.js";
 import {
   BellRing,
@@ -21,6 +21,7 @@ import {
   ChevronDown,
   ChevronRight,
   FileSearch,
+  Globe,
   LayoutDashboard,
   ListChecks,
   LogOut,
@@ -30,6 +31,7 @@ import {
   PanelLeftOpen,
   ReceiptText,
   RefreshCw,
+  Search,
   ShieldAlert,
   Store,
   Tag,
@@ -203,59 +205,250 @@ export function Sidebar({
 /* ======================== GLOBAL SCOPE SELECTORS ======================== */
 
 /**
- * AccountSelector / BrandSelector wrap the existing native <select> elements.
- * A native select is intentional: it stays keyboard accessible, works on
- * mobile, and keeps the exact change semantics the app already relies on.
+ * SearchableSelect — an accessible combobox used for the header account/brand
+ * pickers. It keeps the exact `.tb-select` look and change semantics but adds a
+ * type-to-filter search over an already-authorized option list, so it never
+ * exposes a hidden match or a global result count. Keyboard-complete: the closed
+ * trigger opens on Enter/Space/ArrowDown; the search input drives ArrowUp/Down,
+ * Home/End, Enter (select), Escape (close, focus returns to the trigger) and Tab
+ * (close). Selecting preserves the value; closing or clearing the search never
+ * changes it. Options: [{ value, label, searchText?, meta? }].
  */
-export function AccountSelector({ accounts, value, onChange, flags, onRefresh, refreshing = false }) {
+export function SearchableSelect({
+  id, ariaLabel, icon, label, value, options, onChange,
+  placeholder = "Select…", disabled = false, emptyText = "No options available", noMatchText = "No matches",
+  variant = "brand", trailing = null,
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [activeIndex, setActiveIndex] = useState(0);
+  const rootRef = useRef(null);
+  const inputRef = useRef(null);
+  const triggerRef = useRef(null);
+  const listRef = useRef(null);
+  const listboxId = `${id}-listbox`;
+
+  const selected = useMemo(
+    () => options.find((option) => String(option.value) === String(value)) || null,
+    [options, value]
+  );
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return options;
+    return options.filter((option) => String(option.searchText || option.label).toLowerCase().includes(q));
+  }, [options, query]);
+
+  // Keep the active row in range whenever the filtered set changes.
+  useEffect(() => {
+    setActiveIndex((index) => (filtered.length ? Math.min(Math.max(index, 0), filtered.length - 1) : 0));
+  }, [filtered]);
+
+  // Focus the search input on open so typing filters immediately.
+  useEffect(() => { if (open && inputRef.current) inputRef.current.focus(); }, [open]);
+
+  // Close on an outside pointer press (the value is preserved).
+  useEffect(() => {
+    if (!open) return undefined;
+    const onPointer = (event) => { if (rootRef.current && !rootRef.current.contains(event.target)) closeMenu(false); };
+    window.addEventListener("pointerdown", onPointer);
+    return () => window.removeEventListener("pointerdown", onPointer);
+  }, [open]);
+
+  // Keep the active option scrolled into view during keyboard navigation.
+  useEffect(() => {
+    if (!open || !listRef.current) return;
+    const el = listRef.current.querySelector(`[data-index="${activeIndex}"]`);
+    if (el && el.scrollIntoView) el.scrollIntoView({ block: "nearest" });
+  }, [activeIndex, open]);
+
+  function openMenu() {
+    if (disabled) return;
+    setQuery("");
+    const idx = options.findIndex((option) => String(option.value) === String(value));
+    setActiveIndex(idx >= 0 ? idx : 0);
+    setOpen(true);
+  }
+  function closeMenu(returnFocus = true) {
+    setOpen(false);
+    setQuery("");
+    if (returnFocus && triggerRef.current) triggerRef.current.focus();
+  }
+  function choose(option) {
+    if (!option) return;
+    onChange(option.value);
+    closeMenu(true);
+  }
+  function onInputKeyDown(event) {
+    if (event.key === "ArrowDown") { event.preventDefault(); setActiveIndex((i) => Math.min(i + 1, filtered.length - 1)); }
+    else if (event.key === "ArrowUp") { event.preventDefault(); setActiveIndex((i) => Math.max(i - 1, 0)); }
+    else if (event.key === "Home") { event.preventDefault(); setActiveIndex(0); }
+    else if (event.key === "End") { event.preventDefault(); setActiveIndex(Math.max(0, filtered.length - 1)); }
+    else if (event.key === "Enter") { event.preventDefault(); choose(filtered[activeIndex]); }
+    else if (event.key === "Escape") { event.preventDefault(); closeMenu(true); }
+    else if (event.key === "Tab") { closeMenu(false); }
+  }
+  function onTriggerKeyDown(event) {
+    if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") { event.preventDefault(); openMenu(); }
+  }
+
+  const activeDescendant = open && filtered[activeIndex] ? `${id}-opt-${activeIndex}` : undefined;
   return (
-    <div className="tb-select account">
-      <Store size={15} aria-hidden="true" />
+    <div
+      className={`tb-select tb-combo ${variant}` + (disabled ? " disabled" : "") + (open ? " open" : "")}
+      ref={rootRef}
+    >
+      {icon}
       <div className="tb-select-body">
-        <div className="tb-select-label">Account</div>
+        {label && <div className="tb-select-label">{label}</div>}
         <div className="tb-select-value">
-          <select
-            aria-label="Account selection"
-            value={value || ""}
-            onChange={(event) => onChange(event.target.value)}
-            disabled={!accounts.length}
+          <button
+            type="button"
+            className="tb-combo-trigger"
+            ref={triggerRef}
+            aria-label={ariaLabel}
+            aria-haspopup="listbox"
+            aria-expanded={open}
+            aria-controls={open ? listboxId : undefined}
+            disabled={disabled}
+            onClick={() => (open ? closeMenu(true) : openMenu())}
+            onKeyDown={onTriggerKeyDown}
+            title={selected ? selected.label : placeholder}
           >
-            {!accounts.length && <option value="">No accounts available</option>}
-            {accounts.map((account) => (
-              <option value={account.id} key={account.id}>
-                {(flags[account.country] || "")} {account.name} ({account.currency || "—"})
-              </option>
-            ))}
-          </select>
+            <span className={"tb-combo-text" + (selected ? "" : " placeholder")}>{selected ? selected.label : placeholder}</span>
+          </button>
           <ChevronDown size={14} aria-hidden="true" />
         </div>
       </div>
-      {onRefresh && (
-        <button
-          className="account-sync-btn"
-          type="button"
-          onClick={onRefresh}
-          disabled={refreshing}
-          title="Refresh account list from DataDoe"
-          aria-label="Refresh account list from DataDoe"
-        >
-          <RefreshCw size={14} className={refreshing ? "spin" : ""} aria-hidden="true" />
-        </button>
+      {trailing}
+      {open && (
+        <div className="tb-combo-pop">
+          <div className="tb-combo-search">
+            <Search size={13} aria-hidden="true" />
+            <input
+              ref={inputRef}
+              type="text"
+              role="combobox"
+              aria-autocomplete="list"
+              aria-controls={listboxId}
+              aria-expanded="true"
+              aria-activedescendant={activeDescendant}
+              aria-label={`Search ${ariaLabel || label || "options"}`}
+              placeholder="Type to search…"
+              value={query}
+              onChange={(event) => { setQuery(event.target.value); setActiveIndex(0); }}
+              onKeyDown={onInputKeyDown}
+            />
+          </div>
+          <ul className="tb-combo-list" role="listbox" id={listboxId} ref={listRef} aria-label={ariaLabel || label}>
+            {options.length === 0 ? (
+              <li className="tb-combo-empty">{emptyText}</li>
+            ) : filtered.length === 0 ? (
+              <li className="tb-combo-empty">{noMatchText}</li>
+            ) : filtered.map((option, idx) => (
+              <li
+                key={option.value}
+                id={`${id}-opt-${idx}`}
+                data-index={idx}
+                role="option"
+                aria-selected={String(option.value) === String(value)}
+                className={"tb-combo-opt" + (idx === activeIndex ? " active" : "") + (String(option.value) === String(value) ? " selected" : "")}
+                onMouseEnter={() => setActiveIndex(idx)}
+                onMouseDown={(event) => { event.preventDefault(); choose(option); }}
+              >
+                <span className="tb-combo-opt-label">{option.label}</span>
+                {option.meta ? <span className="tb-combo-meta">{option.meta}</span> : null}
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   );
 }
 
-export function BrandSelector({ brands, value, onChange, includeAll = true, label = "Brand", allLabel = "All brands" }) {
+/**
+ * AccountSelector / BrandSelector / RegionSelector are the header scope pickers.
+ * Account and Brand are searchable comboboxes (SearchableSelect); Region is a
+ * short native <select> (three fixed regions, no search needed). All keep the
+ * exact change semantics the app relies on.
+ */
+export function AccountSelector({ accounts, value, onChange, flags, onRefresh, refreshing = false }) {
+  const options = useMemo(() => accounts.map((account) => ({
+    value: account.id,
+    // The visible label keeps the flag + name + currency; search also matches marketplace + currency.
+    label: `${(flags[account.country] || "")} ${account.name} (${account.currency || "—"})`.trim(),
+    searchText: `${account.name || ""} ${account.country || ""} ${account.currency || ""}`,
+  })), [accounts, flags]);
+  const refreshButton = onRefresh ? (
+    <button
+      className="account-sync-btn"
+      type="button"
+      onClick={onRefresh}
+      disabled={refreshing}
+      title="Refresh account list from DataDoe"
+      aria-label="Refresh account list from DataDoe"
+    >
+      <RefreshCw size={14} className={refreshing ? "spin" : ""} aria-hidden="true" />
+    </button>
+  ) : null;
   return (
-    <div className="tb-select brand">
-      <Tag size={15} aria-hidden="true" />
+    <SearchableSelect
+      id="tb-account"
+      ariaLabel="Account selection"
+      icon={<Store size={15} aria-hidden="true" />}
+      label="Account"
+      variant="account"
+      value={value || ""}
+      options={options}
+      onChange={onChange}
+      placeholder={accounts.length ? "Select account" : "No accounts available"}
+      disabled={!accounts.length}
+      emptyText="No accounts available"
+      trailing={refreshButton}
+    />
+  );
+}
+
+export function BrandSelector({ brands, value, onChange, includeAll = true, label = "Brand", allLabel = "All brands" }) {
+  const options = useMemo(() => {
+    const list = includeAll ? [{ value: "ALL", label: allLabel, searchText: allLabel }] : [];
+    (brands || []).forEach((brand) => list.push({ value: brand, label: brand, searchText: brand }));
+    return list;
+  }, [brands, includeAll, allLabel]);
+  return (
+    <SearchableSelect
+      id={`tb-brand-${label.replace(/\s+/g, "-").toLowerCase()}`}
+      ariaLabel="Brand selection"
+      icon={<Tag size={15} aria-hidden="true" />}
+      label={label}
+      variant="brand"
+      value={value || (includeAll ? "ALL" : "")}
+      options={options}
+      onChange={onChange}
+      placeholder={includeAll ? allLabel : "Select a brand"}
+      emptyText={includeAll ? allLabel : "No brands in this region yet"}
+      noMatchText="No matching brands"
+    />
+  );
+}
+
+export function RegionSelector({ regions, value, onChange }) {
+  return (
+    <div className="tb-select region">
+      <Globe size={15} aria-hidden="true" />
       <div className="tb-select-body">
-        <div className="tb-select-label">{label}</div>
+        <div className="tb-select-label">Region</div>
         <div className="tb-select-value">
-          <select aria-label="Brand selection" value={value} onChange={(event) => onChange(event.target.value)}>
-            {includeAll ? <option value="ALL">{allLabel}</option> : <option value="">Select a brand</option>}
-            {brands.map((brand) => <option value={brand} key={brand}>{brand}</option>)}
+          <select
+            aria-label="Region selection"
+            value={value || ""}
+            onChange={(event) => onChange(event.target.value)}
+            disabled={!regions.length}
+          >
+            {!regions.length && <option value="">No regions available</option>}
+            {regions.map((region) => (
+              <option value={region.value} key={region.value}>{region.label}</option>
+            ))}
           </select>
           <ChevronDown size={14} aria-hidden="true" />
         </div>
@@ -280,6 +473,7 @@ export function TopBar({
   accounts, selectedAccountId, onAccountChange, onRefreshAccounts, accountsRefreshing,
   brands, selectedBrand, onBrandChange, flags, brandAllLabel = "All brands",
   dashboardMode = "account", onDashboardModeChange, portfolioBrands = [], selectedPortfolioBrand = "", onPortfolioBrandChange,
+  regions = [], selectedRegion = "", onRegionChange,
   refresh,
 }) {
   return (
@@ -300,9 +494,15 @@ export function TopBar({
 
       {showScope && (
         <div className="tb-right">
+          {/* The Account/Brand view switch is available on every scoped report page. Both modes carry TWO scope
+              controls (Account+Brand, or Region+Brand) so the header keeps the same shape and never shifts when the
+              mode changes. */}
           {onDashboardModeChange && <DashboardModeSelector value={dashboardMode} onChange={onDashboardModeChange} />}
           {dashboardMode === "brand" ? (
-            <BrandSelector brands={portfolioBrands} value={selectedPortfolioBrand} onChange={onPortfolioBrandChange} includeAll={false} label="Portfolio brand" />
+            <>
+              <RegionSelector regions={regions} value={selectedRegion} onChange={onRegionChange} />
+              <BrandSelector brands={portfolioBrands} value={selectedPortfolioBrand} onChange={onPortfolioBrandChange} includeAll={false} label="Portfolio brand" />
+            </>
           ) : <>
             <AccountSelector
               accounts={accounts}

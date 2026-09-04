@@ -36,7 +36,7 @@ import {
 const PORTFOLIO_VERSION = "brand-view-portfolio-v1";
 
 export default function BrandPortfolio({
-  brand, accountIds, accountsKnown, loadReport, refreshReport,
+  brand, region = "", accountIds, accountsKnown, loadReport, refreshReport,
   directoryLoading, directoryError, onLoadBrandDirectory,
   isAdmin = false, sourceAccounts = [],
 }) {
@@ -87,9 +87,10 @@ export default function BrandPortfolio({
   });
 
   const reportParams = useMemo(() => {
-    if (!brand || !idsKey) return null;
-    return { action: "brand-view-portfolio", reportVersion: PORTFOLIO_VERSION, ids: idsKey, brand, asOf };
-  }, [asOf, brand, idsKey]);
+    // A region is required: Brand View is region-scoped, and the server enforces + segregates the snapshot by region.
+    if (!brand || !idsKey || !region) return null;
+    return { action: "brand-view-portfolio", reportVersion: PORTFOLIO_VERSION, ids: idsKey, brand, asOf, region };
+  }, [asOf, brand, idsKey, region]);
 
   const applyReport = useCallback((body, cachedAt) => {
     // `updating` means a rebuild is due; the page shows the LKG (if any) and converges. It is NOT an error and
@@ -146,7 +147,7 @@ export default function BrandPortfolio({
     setSourceProgress(null);
     setSourceOutcome(null);
     resetRange();
-  }, [brand, idsKey, resetRange]);
+  }, [brand, idsKey, region, resetRange]);
 
   useEffect(() => {
     if (!reportParams) return undefined;

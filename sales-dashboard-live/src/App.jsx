@@ -38,6 +38,10 @@ import { computeAsinWdd, resolveWddWeights, validateWddWeights, WDD_DEFAULT_WEIG
 import { buildFbaLeadTimeMatrix, validateFbaLeadTimeRows, validateFbaLeadTimeText } from "./lib/fba-lead-time-import.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import { canonicalBrandKey, permittedBrandKeySetForAccount, filterBrandNamesToPermitted } from "./lib/brand-scope-filter.js";
+// Regional Brand View: Region -> Brand selection, using the SINGLE canonical marketplace->region mapping the
+// scheduler owns (never a second mapping). Region membership is derived from each authorized account's trusted
+// marketplace metadata; the server re-enforces it on the portfolio data request.
+import { accountsInRegion, regionsForAccounts, resolveSelectedRegion } from "./lib/region-view.js";
 // Stable stale-while-revalidate lifecycle decisions (why: a tab refocus / token
 // refresh must NEVER replace the mounted shell with a full-page bootstrap screen
 // while valid same-scope content is rendered; a scope change still purges + re-
@@ -1773,6 +1777,11 @@ function DashboardApp({ session, access, onSignOut }) {
   // deliberately separate portfolio scope: it never changes account-report
   // state or causes background DataDoe requests.
   const [dashboardMode, setDashboardMode] = useState("account");
+  // Brand View selects a REGION first (india / europe-au / us-ca), then a brand within it. "" until an authorized
+  // region is resolved. The account-context report the user was on before entering Brand View, so returning to
+  // Account View restores it (the global header switch is available on every report page).
+  const [selectedRegion, setSelectedRegion] = useState("");
+  const [accountReturnView, setAccountReturnView] = useState("dashboard");
   const [selectedPortfolioBrand, setSelectedPortfolioBrand] = useState("");
   // The portfolio report's own data, loading, refresh, currency and export
   // state now live inside BrandPortfolio. DashboardApp keeps only the brand
@@ -1970,6 +1979,22 @@ function DashboardApp({ session, access, onSignOut }) {
     return { action: "oli-quality", ids: selectedAccountId, from: addDays(monthStart(TODAY), -420), to: TODAY, brand: selectedBrand || "ALL" };
   }, [selectedAccountId, TODAY, selectedBrand]);
 
+  // ===== Regional Brand View scope =====
+  // Regions the signed-in user actually has authorized accounts in (canonical order); the selector offers only these,
+  // so a region choice can never reference an account the user cannot access. Membership is derived from each
+  // account's trusted marketplace metadata via the single canonical mapping (never a browser-supplied region).
+  const availableRegions = useMemo(() => regionsForAccounts(accounts), [accounts]);
+  // The authorized accounts within the selected region.
+  const regionAccounts = useMemo(() => accountsInRegion(accounts, selectedRegion), [accounts, selectedRegion]);
+  const regionAccountIdSet = useMemo(() => new Set(regionAccounts.map((a) => String(a.id))), [regionAccounts]);
+  // Resolve the region when Brand View is active (or when the authorized account set changes): keep a still-valid
+  // prior region, else fall back to the first available one; "" when the user has no regioned accounts. Never leaves a
+  // region the user cannot access selected.
+  useEffect(() => {
+    if (dashboardMode !== "brand") return;
+    setSelectedRegion((prev) => resolveSelectedRegion(prev, accounts));
+  }, [dashboardMode, accounts]);
+
   const portfolioAccountSignature = useMemo(() => {
     const discoveredIds = accounts.map((account) => String(account.id)).filter(Boolean);
     // Account permissions are already enforced server-side. This fallback lets
@@ -1991,8 +2016,10 @@ function DashboardApp({ session, access, onSignOut }) {
     // never refresh every account merely because an older directory was read.
     if (!Array.isArray(mappedIds)) return [];
     const allowedIds = new Set(mappedIds.map(String));
-    return accounts.filter((account) => allowedIds.has(String(account.id)));
-  }, [accounts, brandDirectoryAccounts, selectedBrandKey]);
+    // Intersect with the selected REGION so the portfolio only ever aggregates accounts within it. The server
+    // re-enforces this from trusted metadata, so this is the UX-side of the same scope, never the only guard.
+    return accounts.filter((account) => allowedIds.has(String(account.id)) && regionAccountIdSet.has(String(account.id)));
+  }, [accounts, brandDirectoryAccounts, selectedBrandKey, regionAccountIdSet]);
   const brandDirectoryCacheParams = useMemo(() => {
     if (portfolioAccountSignature) {
       return { action: "brand-directory", reportVersion: "brand-directory-shared-v2", ids: portfolioAccountSignature };
@@ -2006,7 +2033,9 @@ function DashboardApp({ session, access, onSignOut }) {
   const discoverSavedBrandAccounts = useCallback(async () => {
     const matchedIds = new Set();
     const rows = [];
-    await Promise.all(accounts.map(async (account) => {
+    // Discovery is scoped to the SELECTED REGION's accounts only, so a v1-directory brand is placed against exactly
+    // the region accounts that actually sell it (never a cross-region account).
+    await Promise.all(regionAccounts.map(async (account) => {
       const accountToday = marketplaceToday(account.country);
       const params = {
         action: "brand-sales", reportVersion: "brand-sales-shared-v1", ids: account.id,
@@ -2024,16 +2053,9 @@ function DashboardApp({ session, access, onSignOut }) {
         // error for this brand. It simply cannot prove this brand is present.
       }
     }));
-    const matchedAccounts = accounts.filter((account) => matchedIds.has(String(account.id)));
-    if (matchedAccounts.length) {
-      // Seed the map under the CANONICAL key (matching the server directory), so the lookup finds it.
-      setBrandDirectoryAccounts((current) => ({
-        ...current,
-        [brandKey(selectedPortfolioBrand)]: matchedAccounts.map((account) => String(account.id)),
-      }));
-    }
+    const matchedAccounts = regionAccounts.filter((account) => matchedIds.has(String(account.id)));
     return { accounts: matchedAccounts, rows };
-  }, [accounts, selectedPortfolioBrand]);
+  }, [regionAccounts, selectedPortfolioBrand]);
 
   /* ===== Which accounts sell the selected portfolio brand =====
      The Brand Directory v2 map answers this directly. An older v1 directory has
@@ -2044,9 +2066,10 @@ function DashboardApp({ session, access, onSignOut }) {
   const [discoveredBrandAccountIds, setDiscoveredBrandAccountIds] = useState(null);
   const [discoveringBrandAccounts, setDiscoveringBrandAccounts] = useState(false);
 
+  // Re-discover when the brand OR the region changes: a v1-directory brand's account set is region-specific.
   useEffect(() => {
     setDiscoveredBrandAccountIds(null);
-  }, [selectedPortfolioBrand]);
+  }, [selectedPortfolioBrand, selectedRegion]);
 
   useEffect(() => {
     if (dashboardMode !== "brand" || !selectedPortfolioBrand) return undefined;
@@ -2071,6 +2094,25 @@ function DashboardApp({ session, access, onSignOut }) {
     portfolioAccountIds.map((accountId) => accountById[accountId]).filter(Boolean)
   ), [accountById, portfolioAccountIds]);
   const portfolioScopeResolved = portfolioMappingKnown || discoveredBrandAccountIds !== null;
+
+  // Is the currently-selected brand actually sold by an account in the selected region? True when the server
+  // directory maps it to a region account, or a region account's saved brand-sales cache records it.
+  const selectedBrandInRegion = useMemo(() => {
+    if (!selectedPortfolioBrand || !selectedRegion) return false;
+    const key = brandKey(selectedPortfolioBrand);
+    const mapped = brandDirectoryAccounts[key];
+    if (Array.isArray(mapped) && mapped.some((id) => regionAccountIdSet.has(String(id)))) return true;
+    return regionAccounts.some((account) => cachedBrandsForAccount(account.id).some((b) => brandKey(b) === key));
+  }, [selectedPortfolioBrand, selectedRegion, brandDirectoryAccounts, regionAccountIdSet, regionAccounts]);
+  // When the region CHANGES, keep the selected brand only if it is valid in the new region; otherwise clear it and
+  // require a fresh selection -- never silently substitute another brand. Keyed on an actual region change (not every
+  // recompute) so selecting a valid brand within a region never clears it.
+  const prevRegionRef = useRef(selectedRegion);
+  useEffect(() => {
+    if (prevRegionRef.current === selectedRegion) return;
+    prevRegionRef.current = selectedRegion;
+    if (selectedPortfolioBrand && !selectedBrandInRegion) setSelectedPortfolioBrand("");
+  }, [selectedRegion, selectedPortfolioBrand, selectedBrandInRegion]);
 
   // The brand directory is READ-ONLY and self-healing: the server rebuilds it from the latest validated
   // brand-sales when the evidence changes, so re-reading it (on mount, focus, and the 60s interval) automatically
@@ -3794,24 +3836,32 @@ function DashboardApp({ session, access, onSignOut }) {
     if (brandRestricted && brandList.length === 1 && selectedBrand === "ALL") setSelectedBrand(brandList[0]);
   }, [brandRestricted, brandList, selectedBrand]);
   const portfolioBrandList = useMemo(() => {
-    // The server-projected brand-directory (brandDirectoryBrands) is already limited to the user's permitted brands
-    // across their accounts. The per-account localStorage caches, however, are NOT re-projected, so filter each
-    // account's contribution to THAT account's permitted keys (null = unrestricted -> unchanged).
-    const names = new Set(brandDirectoryBrands);
-    accounts.forEach((account) => {
+    // Region-SCOPED: only brands belonging to authorized accounts WITHIN the selected region are offered. Until a
+    // region is resolved the list is empty (the selector shows a "choose a region" state). A brand is in-region when
+    // the server directory maps it to a region account, or a region account's own permitted brand-sales cache records
+    // it. The directory is already server-projected to permitted brands; the per-account caches are re-projected here.
+    if (!selectedRegion) return [];
+    const displayByKey = new Map(brandDirectoryBrands.map((b) => [canonicalBrandKey(b), b]));
+    const names = new Set();
+    Object.entries(brandDirectoryAccounts).forEach(([key, accts]) => {
+      if (Array.isArray(accts) && accts.some((id) => regionAccountIdSet.has(String(id)))) {
+        names.add(displayByKey.get(key) || key);
+      }
+    });
+    regionAccounts.forEach((account) => {
       const permitted = permittedBrandKeySetForAccount(access, account.id);
       filterBrandNamesToPermitted(cachedBrandsForAccount(account.id), permitted).forEach((brand) => names.add(brand));
     });
-    if (selectedPortfolioBrand) names.add(selectedPortfolioBrand);
-    // Defense-in-depth: when EVERY in-scope account is brand-restricted (no admin, no ALL_BRANDS account), the
-    // portfolio selector can only legitimately offer the UNION of permitted brands -- constrain it so a stale
-    // directory cache or a previously-selected forbidden brand can never surface. If ANY account is unrestricted the
-    // portfolio may legitimately span all brands those accounts sell, so no union constraint is applied.
+    // Keep a still-valid current selection visible (it is cleared elsewhere when it leaves the region).
+    if (selectedPortfolioBrand && selectedBrandInRegion) names.add(selectedPortfolioBrand);
+    // Defense-in-depth: when EVERY region account is brand-restricted (no admin, no ALL_BRANDS account), the selector
+    // may only offer the UNION of permitted brands -- constrain it so a stale directory cache or a previously-selected
+    // forbidden brand can never surface. If ANY region account is unrestricted, no union constraint is applied.
     let out = [...names];
-    if (!isAdmin && accounts.length) {
+    if (!isAdmin && regionAccounts.length) {
       const unionKeys = new Set();
       let anyUnrestricted = false;
-      for (const account of accounts) {
+      for (const account of regionAccounts) {
         const permitted = permittedBrandKeySetForAccount(access, account.id);
         if (!permitted) { anyUnrestricted = true; break; }
         permitted.forEach((k) => unionKeys.add(k));
@@ -3819,7 +3869,7 @@ function DashboardApp({ session, access, onSignOut }) {
       if (!anyUnrestricted) out = out.filter((b) => unionKeys.has(canonicalBrandKey(b)));
     }
     return out.sort((a, b) => a.localeCompare(b));
-  }, [accounts, selectedPortfolioBrand, brandDirectoryBrands, brandDirectoryVersion, rows, access, isAdmin]);
+  }, [selectedRegion, regionAccounts, regionAccountIdSet, selectedPortfolioBrand, selectedBrandInRegion, brandDirectoryBrands, brandDirectoryAccounts, brandDirectoryVersion, access, isAdmin]);
   function filterRows(from, to) {
     return brandRows.filter((r) => r.date >= from && r.date <= to);
   }
@@ -4107,6 +4157,19 @@ function DashboardApp({ session, access, onSignOut }) {
   // pickers that could disagree. Every other view keeps its existing header.
   const showGlobalScope = view !== "access" && view !== "sync-center" && view !== "brandview";
 
+  // GLOBAL Account/Brand view switch (available on every scoped report page). Switching to Brand View remembers the
+  // account-context report to return to and opens the portfolio workspace (view "dashboard", mode "brand") with the
+  // remembered valid region/brand; switching back to Account View restores that report and its filters. Idempotent:
+  // re-selecting the active mode does nothing, so it never clobbers the remembered view.
+  const handleDashboardModeChange = useCallback((next) => {
+    if (next === "brand") {
+      if (dashboardMode !== "brand") { setAccountReturnView(view); setView("dashboard"); setDashboardMode("brand"); }
+    } else if (dashboardMode !== "account") {
+      setDashboardMode("account");
+      setView(accountReturnView || "dashboard");
+    }
+  }, [dashboardMode, view, accountReturnView]);
+
   return (
     <div className="dash-root">
       <style>{STYLE}</style>
@@ -4149,11 +4212,14 @@ function DashboardApp({ session, access, onSignOut }) {
             selectedBrand={selectedBrand}
             onBrandChange={setSelectedBrand}
             brandAllLabel={brandRestricted ? "All permitted brands" : "All brands"}
-            dashboardMode={view === "dashboard" ? dashboardMode : "account"}
-            onDashboardModeChange={view === "dashboard" ? setDashboardMode : undefined}
+            dashboardMode={dashboardMode}
+            onDashboardModeChange={showGlobalScope ? handleDashboardModeChange : undefined}
             portfolioBrands={portfolioBrandList}
             selectedPortfolioBrand={selectedPortfolioBrand}
             onPortfolioBrandChange={setSelectedPortfolioBrand}
+            regions={availableRegions}
+            selectedRegion={selectedRegion}
+            onRegionChange={setSelectedRegion}
             flags={FLAGS}
             refresh={refreshDescriptor}
           />
@@ -4189,6 +4255,7 @@ function DashboardApp({ session, access, onSignOut }) {
       {view === "dashboard" && (dashboardMode === "brand" ? (
         <BrandPortfolio
           brand={selectedPortfolioBrand}
+          region={selectedRegion}
           accountIds={portfolioAccountIds}
           accountsKnown={portfolioScopeResolved}
           loadReport={loadSharedReport}
