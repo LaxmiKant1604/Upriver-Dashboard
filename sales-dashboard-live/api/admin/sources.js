@@ -15,7 +15,7 @@ import { shapeSourceCards, dashboardReadinessSummary, CARD_BUCKETS } from "../..
 import { sourceRegistryEntry } from "../../lib/server/sync/source-registry.js";
 import { buildBucketSourceSyncRuntime } from "../../lib/server/sync/source-bucket-sync-runtime.js";
 import { validateSourceSyncRequest, runReleaseSlice, ORCHESTRATED_SOURCE_KEYS } from "../../lib/server/sync/source-sync-operation.js";
-import { isFbaOperationSource, resolveFbaPlanScope, planFbaBucketCost, fbaBucketAccounts, advanceFbaPlanBucket, fbaServerCeiling, fbaCycleBucket } from "../../lib/server/sync/fba-plan-operation.js";
+import { isFbaOperationSource, resolveFbaPlanScope, planFbaBucketCost, fbaBucketAccounts, advanceFbaPlanBucket, fbaServerCeiling, fbaCycleBucket, fbaInventoryAsOf } from "../../lib/server/sync/fba-plan-operation.js";
 // The ONE ASIN->Campaign cutover authority: reject a forged action on the retired ads grain at the API BOUNDARY,
 // after auth + source-key parse, BEFORE any runtime / preflight / coverage / discovery / control-or-audit write.
 import { isAdsRegistryKeyRetired } from "../../lib/server/active-ads-source.js";
@@ -213,20 +213,21 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
 
           // The go-live as-of is resolved GLOBALLY (across all accounts), identical to the CLI/scheduler, so the
           // dedicated operation identity is the SAME regardless of which path or bucket triggers it.
-          const scope = await resolveFbaPlanScope({ accounts, connections: release.connections, asOfArg: null, maxBlocked: 2, ceiling: fbaServerCeiling(), readers: release.scopeReaders });
-          if (!scope.asOf) { res.status(200).json({ operation: { phase: "sync", ok: false, problems: ["no account has durable OLI coverage; cannot resolve an as-of"] }, status: await boundedStatusFn(fbaDeadline) }); return; }
           const bucketAccounts = fbaBucketAccounts(accounts, bucket);
+          const inventoryAsOf = fbaInventoryAsOf();
+          const scope = await resolveFbaPlanScope({ accounts: bucketAccounts, connections: release.connections, asOfArg: null, maxBlocked: 2, ceiling: fbaServerCeiling(), readers: release.scopeReaders });
+          if (!scope.asOf) { res.status(200).json({ operation: { phase: "sync", ok: false, problems: ["no account has durable OLI coverage; cannot resolve an as-of"] }, status: await boundedStatusFn(fbaDeadline) }); return; }
           if (!bucketAccounts.length) { res.status(200).json({ operation: { phase: "complete", ok: true, published: 0, note: "no-bucket-accounts" }, status: await boundedStatusFn(fbaDeadline) }); return; }
           // Skip the FETCH-only cost plan when the dedicated cycle is already terminal: a publish-only pass has
           // nothing to fetch (no token gate needed), and the plan/adopt reads would only slow the bounded slice.
-          const existingCycle = await release.runtime.store.getCycleByBucketDate(fbaCycleBucket(bucket), scope.asOf).catch(() => null);
+          const existingCycle = await release.runtime.store.getCycleByBucketDate(fbaCycleBucket(bucket), inventoryAsOf).catch(() => null);
           const terminal = existingCycle && ["succeeded", "partial", "failed"].includes(String(existingCycle.status));
-          const cost = terminal ? null : (await planFbaBucketCost({ bucketAccounts, connections: release.connections, asOf: scope.asOf, getSourceExportCache: release.getSourceExportCache })).cost;
+          const cost = terminal ? null : (await planFbaBucketCost({ bucketAccounts, connections: release.connections, asOf: scope.asOf, inventoryAsOf, getSourceExportCache: release.getSourceExportCache })).cost;
           const includedIds = scope.included.filter((id) => bucketAccounts.some((a) => a.accountId === id));
           const maxTokens = bucket === "us" ? 30 : 70; // per-bucket share of the 80-token daily ceiling (scheduler parity)
 
           const result = await advanceFbaPlanBucket({
-            bucket, asOf: scope.asOf, includedIds, bucketAccounts, cost, maxTokens,
+            bucket, asOf: scope.asOf, inventoryAsOf, includedIds, bucketAccounts, cost, maxTokens,
             runtime: release.runtime, publisher: release.publisher, controls: release.controls,
             readbackLive: release.readbackLive, ownershipBackfill: release.ownershipBackfill,
             trigger: "vercel", deadlineMs: fbaDeadline.deadlineMs, reserveMs: fbaDeadline.reserveMs, outOfTime: fbaDeadline.outOfTime,

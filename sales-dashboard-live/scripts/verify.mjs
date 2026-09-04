@@ -129,6 +129,7 @@ const SUITES = [
   "test:warehouse-ownership",
   "test:fba-plan-config-handler",
   "test:fba-plan-operation",
+  "test:fba-regional-inventory",
   "test:plan-brand",
   "test:asin-ads-backfill-window",
   "test:manual-source-continuation",

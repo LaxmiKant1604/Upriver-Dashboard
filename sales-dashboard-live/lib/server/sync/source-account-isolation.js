@@ -65,7 +65,7 @@ const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArr
  *   - a ZERO-ROW payload is VALID-EMPTY evidence.
  * The WHOLE batch is rejected on the first offending row -- a partial/cross-account payload is never saved.
  */
-export function validateBatchSourcePayload({ rows, sellerOrVendorIds, sourceScope, marketplaceScoped = false, marketplaceCountry = null } = {}) {
+export function validateBatchSourcePayload({ rows, sellerOrVendorIds, sourceScope, marketplaceScoped = false, marketplaceCountry = null, marketplacePairs = null } = {}) {
   if (!Array.isArray(rows)) return { valid: false, code: "MALFORMED_PAYLOAD", reason: "batch payload was not an array" };
   if (sourceScope !== "seller" && sourceScope !== "organization") {
     return { valid: false, code: "SOURCE_SCOPE_UNKNOWN", reason: "batch job has an unknown/missing sourceScope" };
@@ -82,7 +82,15 @@ export function validateBatchSourcePayload({ rows, sellerOrVendorIds, sourceScop
   }
   const needMkt = marketplaceScoped === true;
   const expectMkt = marketplaceCountry == null ? "" : String(marketplaceCountry).trim().toUpperCase();
-  if (needMkt && expectMkt === "") {
+  if (marketplacePairs != null && (!Array.isArray(marketplacePairs) || marketplacePairs.some((p) => !p || typeof p !== "object"))) {
+    return { valid: false, code: "BATCH_MARKETPLACE_CONSTRAINT_MISSING", reason: "seller-marketplace allowlist is malformed" };
+  }
+  const pairSet = Array.isArray(marketplacePairs) ? new Set(marketplacePairs.map((p) => JSON.stringify([String(p.sellerId), String(p.marketplace).trim().toUpperCase()]))) : null;
+  if (pairSet && (!marketplacePairs.length || marketplacePairs.some((p) => !allowed.has(String(p.sellerId)) || !/^[A-Z]{2}$/.test(String(p.marketplace)))
+    || [...allowed].some((id) => !marketplacePairs.some((p) => String(p.sellerId) === id)))) {
+    return { valid: false, code: "BATCH_MARKETPLACE_CONSTRAINT_MISSING", reason: "seller-marketplace allowlist is incomplete or invalid" };
+  }
+  if (needMkt && expectMkt === "" && !pairSet) {
     return { valid: false, code: "BATCH_MARKETPLACE_CONSTRAINT_MISSING", reason: "a marketplace-scoped seller batch has no canonical marketplace constraint" };
   }
   for (const row of rows) {
@@ -93,7 +101,7 @@ export function validateBatchSourcePayload({ rows, sellerOrVendorIds, sourceScop
     if (needMkt) {
       const mkt = rowValue(row, MARKETPLACE_COLUMN).trim().toUpperCase();
       if (mkt === "") return { valid: false, code: "BATCH_ROW_NO_MARKETPLACE", reason: "a non-empty batch row is missing its marketplace_country_code" };
-      if (mkt !== expectMkt) return { valid: false, code: "BATCH_CROSS_MARKETPLACE", reason: "a batch row's marketplace_country_code is not the canonical batch marketplace" };
+      if (pairSet ? !pairSet.has(JSON.stringify([sid, mkt])) : mkt !== expectMkt) return { valid: false, code: "BATCH_CROSS_MARKETPLACE", reason: "a batch row does not match an authorized seller-marketplace pair" };
     }
   }
   return { valid: true, code: null, reason: null };
@@ -134,7 +142,9 @@ export function isolateFragmentRowsForOwner(fragment, owner) {
     return { rows: null, sellerOrVendorIds, rejected: true };
   }
 
-  const mine = Array.isArray(rows) ? rows.filter((r) => rowValue(r, SELLER_ID_COLUMN) === ownerRaw) : rows;
+  const marketplace = owner.marketplace == null ? null : String(owner.marketplace).trim().toUpperCase();
+  const mine = Array.isArray(rows) ? rows.filter((r) => rowValue(r, SELLER_ID_COLUMN) === ownerRaw
+    && (!marketplace || rowValue(r, MARKETPLACE_COLUMN).trim().toUpperCase() === marketplace)) : rows;
   return { rows: mine, sellerOrVendorIds: [ownerRaw], rejected: false };
 }
 

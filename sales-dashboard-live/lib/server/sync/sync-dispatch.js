@@ -113,6 +113,7 @@ const resolveFromGenericPlan = (plan) => () => ({
       req.reportKey, s, req.bucket, DRIVER_CONNECTION_ID[req.connectionId] || req.connectionId, req.accountId,
       req.owner ? req.owner.rawSellerId : null,
       s.marketplaceConstraint != null ? s.marketplaceConstraint : null,
+      req.owner ? req.owner.marketplace : null,
     ),
   )),
 });
@@ -155,7 +156,7 @@ export function composeDerivedContextLoaders(loaders) {
  * creates NO duplicate export (each driver + runReportJobs is idempotent/checkpointable).
  */
 export async function runSchedulerV2Shadow({
-  bucket, cycleDate, asOf = null, asOfFor = null,
+  bucket, cycleDate, asOf = null, asOfFor = null, inventoryAsOf = null,
   settings = [], manualReportKeys = null, controlCatalog = schedulerV2ReportControlCatalog,
   connections, discoverAccounts,
   store, dataDoe, saveSnapshot,
@@ -335,7 +336,7 @@ export async function runSchedulerV2Shadow({
     const remaining = budgetLeft();
     let res;
     if (unit.kind === "generic") {
-      const plan = buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: unit.keys, connections, asOfFor: genericAsOfFor });
+      const plan = buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: unit.keys, connections, asOfFor: genericAsOfFor, inventoryAsOf });
       // Blocker 4d wiring: freeze + thread the GENERIC unit's create/AI-token ceilings when the trusted
       // composition supplied a budget planner and the tranche is statically plannable. The budget is
       // persisted BEFORE any execution (the cycle open is the same idempotent (bucket, cycle_date) upsert

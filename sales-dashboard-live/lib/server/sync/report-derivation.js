@@ -517,8 +517,11 @@ const REGISTRY = {
       // Inventory window is EXACTLY [asOf - 10d .. asOf]. Recompute the expected start here and pin
       // BOTH endpoints (a shortened or extended lookback fragment is rejected -> derive-invalid ->
       // last-known-good preserved), never implicitly trusting the planner/caller.
-      const expectedInventoryFrom = addDaysStr(asOf, -FBA_INVENTORY_LOOKBACK_DAYS);
-      const invRows = singleAccountFragmentRows(sources["fba-plan:inventory-health"], "fba-plan:inventory-health", rawSellerId, expectedInventoryFrom, asOf);
+      const inventoryAsOf = context.inventoryAsOf == null ? asOf : String(context.inventoryAsOf);
+      if (!isValidCalendarDate(inventoryAsOf)) throw new Error("fba-plan inventoryAsOf must be a real calendar date.");
+      const expectedInventoryFrom = addDaysStr(inventoryAsOf, -FBA_INVENTORY_LOOKBACK_DAYS);
+      const invRows = singleAccountFragmentRows(sources["fba-plan:inventory-health"], "fba-plan:inventory-health", rawSellerId, expectedInventoryFrom, inventoryAsOf);
+      assertRowsInWindow(invRows, expectedInventoryFrom, inventoryAsOf, "fba-plan inventory");
 
       // 3) AWD -- the AWD-capable marketplaces (US + EU5). US is a HARD REQUIREMENT: a missing/failed/malformed AWD
       //    source BLOCKS (never a silent zero) so last-known-good is preserved -- byte-identical to before. Europe is
@@ -552,7 +555,7 @@ const REGISTRY = {
         }
       }
 
-      return fbaPlanPayload({
+      const payload = fbaPlanPayload({
         asOf,
         accountName: context.accountName ?? null,
         marketCountry: context.marketCountry ?? null,
@@ -562,6 +565,13 @@ const REGISTRY = {
         completedUnitRows, mtdUnitRows,
         dailyDateRows, catalogRows, invRows, awdRows,
       });
+      if (context.inventoryAsOf != null) {
+        payload.inventoryRequestedThrough = inventoryAsOf;
+        payload.inventoryStale = !payload.inventoryDate || payload.inventoryDate < inventoryAsOf;
+        payload.inventoryFetchedAt = sources["fba-plan:inventory-health"]?.fragments?.[0]?.fetchedAt || null;
+        payload.awdFetchedAt = awdEligible ? (sources["fba-plan:awd"]?.fragments?.[0]?.fetchedAt || null) : null;
+      }
+      return payload;
     },
     validatePayload: (p) => !!p && Array.isArray(p.rows) && Array.isArray(p.months)
       && Array.isArray(p.inventoryByBrandCountry) && typeof p.isUS === "boolean"

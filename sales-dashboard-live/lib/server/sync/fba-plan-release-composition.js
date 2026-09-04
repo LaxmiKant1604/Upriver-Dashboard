@@ -8,7 +8,7 @@
 //
 // Construction performs NO I/O; every collaborator is injectable so the composition is offline-testable.
 
-import { buildSchedulerV2Runtime } from "./runtime-composition.js";
+import { buildSchedulerV2Runtime, makeProductionDiscoverAccounts } from "./runtime-composition.js";
 import { buildSchedulerV2Publisher } from "./publisher-composition.js";
 import { runControlPackageCli, buildFbaPlanControlPackage } from "./source-priority-control-package.js";
 import { CONTROLLED_REPORT_KEYS } from "./report-controls.js";
@@ -17,7 +17,7 @@ import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "./report-publisher.js";
 import { REPORT_DERIVATIONS } from "./report-derivation.js";
 import { paramsHashFor } from "../report-store.js";
 import {
-  getReportSnapshot, getReportSnapshotStoragePayload, getAccountDirectorySnapshotAccounts,
+  getReportSnapshot, getReportSnapshotStoragePayload,
   getSourceCoverageWindows, getSourceExportCache,
 } from "../supabase.js";
 import { getDataDoeConnections, resolveDataDoeAccountIds } from "../datadoe-connections.js";
@@ -45,16 +45,15 @@ export function buildFbaPlanRelease(overrides = {}) {
     computeHash = paramsHashFor,
     readReportSnapshot = getReportSnapshot,
     loadStoragePayload = getReportSnapshotStoragePayload,
-    // The COMPLETE authoritative directory (report_snapshots 'account-directory'), NOT the incrementally-populated
-    // account_directory table (which can lag -- proven 22/30). Both FBA paths resolve scope from the SAME source.
-    readDirectoryAccounts = getAccountDirectorySnapshotAccounts,
+    // Production uses the same fresh accounts GET as the runtime. A saved directory can omit newly connected sellers.
+    readDirectoryAccounts = null,
     discoverAccounts = discoverPrimaryAccountIds,
     connectStore = connectPriorityControlStore,
     getConnections = getDataDoeConnections,
     resolveAccountIds = resolveDataDoeAccountIds,
     readCoverage = getSourceCoverageWindows,
     readExportCache = getSourceExportCache,
-    ownershipModulePath = "../../scripts/backfill-fba-ownership.mjs",
+    ownershipModulePath = "../../../scripts/backfill-fba-ownership.mjs",
   } = overrides;
 
   const runtime = makeRuntime({});
@@ -75,15 +74,15 @@ export function buildFbaPlanRelease(overrides = {}) {
     return mod.backfillFbaOwnership({ dry: false });
   };
 
-  // Load the authoritative primary accounts with directory metadata (country/currency) from the COMPLETE
-  // account-directory snapshot -- the SAME scope every path plans + publishes. Zero DataDoe.
+  // Load current account metadata, not a stale snapshot. Discovery is a read-only accounts GET, never an export.
   // dd-secondary/public-prefixed ids + accounts without a marketplace country are excluded (they can never be
   // batched or bucketed safely). Intersected with the fresh authoritative primary discovery.
   const loadAccounts = async () => {
-    const rows = (await readDirectoryAccounts()) || [];
+    const readAccounts = readDirectoryAccounts || makeProductionDiscoverAccounts({ connections: getConnections });
+    const rows = (await readAccounts()) || [];
     const metaById = new Map();
     for (const r of rows) {
-      const id = String((r && (r.accountId || r.account_id)) || "").trim();
+      const id = String((r && (r.accountId || r.account_id || r.id)) || "").trim();
       const country = String((r && (r.country || r.marketplace_country_code)) || "").trim();
       if (!id || id.includes(":") || !country) continue;
       metaById.set(id, { accountId: id, country, currency: (r && r.currency) || null, name: (r && r.name) || null });

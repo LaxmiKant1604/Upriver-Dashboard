@@ -42,6 +42,8 @@ export function fbaCycleBucket(bucket) { return S(bucket).trim() + "-fba"; }
 
 // The server D-1 ceiling (never publish past yesterday). Server-resolved -- never taken from a request body.
 export function fbaServerCeiling(now = Date.now()) { return new Date(now - 86400000).toISOString().slice(0, 10); }
+// Inventory is a current snapshot, never capped by the sales coverage cutoff.
+export function fbaInventoryAsOf(now = Date.now()) { return new Date(now).toISOString().slice(0, 10); }
 
 /**
  * Resolve the coverage-maximizing go-live as-of + the included/blocked account split. Pure orchestration over
@@ -111,15 +113,20 @@ export function fbaBucketAccounts(accounts, bucket) {
  * Build the exact batched plan + prove the token cost for ONE bucket (ZERO creates). `getSourceExportCache`
  * proves what is already adoptable from the durable cache (adoptable => 0 tokens). Returns { plan, cost }.
  */
-export async function planFbaBucketCost({ bucketAccounts, connections, asOf, getSourceExportCache }) {
+export async function planFbaBucketCost({ bucketAccounts, connections, asOf, inventoryAsOf = null, getSourceExportCache }) {
   const asOfFor = () => asOf;
   const plan = bucketAccounts.length
-    ? buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: ["fba-plan"], connections, asOfFor })
+    ? buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: ["fba-plan"], connections, asOfFor, inventoryAsOf })
     : { sourceJobs: [], reportRequests: [] };
   const adoptable = new Set();
+  const plannedSources = new Map(plan.reportRequests.flatMap((r) => r.sources.map((s) => [s.requestHash, s])));
   for (const j of plan.sourceJobs) {
     const h = j.requestHash ?? j.request_hash;
-    try { if (await getSourceExportCache(h)) adoptable.add(h); } catch { /* treat as not-adoptable */ }
+    try {
+      const entry = await getSourceExportCache(h);
+      const since = plannedSources.get(h)?.freshnessNotBefore;
+      if (entry && (!since || Date.parse(entry.fetched_at ?? entry.fetchedAt ?? "") >= Date.parse(since))) adoptable.add(h);
+    } catch { /* treat as not-adoptable */ }
   }
   const cost = fbaGoLiveTokenCost(plan.sourceJobs, (h) => adoptable.has(h));
   return { plan, cost };
@@ -156,16 +163,17 @@ export async function planFbaBucketCost({ bucketAccounts, connections, asOf, get
  *     published, readback, blocked }
  */
 export async function advanceFbaPlanBucket({
-  bucket, asOf, includedIds = [], bucketAccounts = [], cost = null, maxTokens = 80,
+  bucket, asOf, inventoryAsOf = null, includedIds = [], bucketAccounts = [], cost = null, maxTokens = 80,
   runtime, publisher, controls, readbackLive, ownershipBackfill = null,
   trigger = "github", deadlineMs = Infinity, reserveMs = 3000, outOfTime = () => false,
   maxSlices = 40, log = () => {},
 } = {}) {
   const cycleBucket = fbaCycleBucket(bucket);
+  const cycleDate = inventoryAsOf || asOf;
   const included = [...new Set((includedIds || []).map(S).filter((x) => x))];
   const batches = cost && cost.sourceJobs != null ? cost.sourceJobs : null;
   const base = {
-    operationId: cycleBucket + "@" + S(asOf),
+    operationId: cycleBucket + "@" + S(cycleDate),
     accounts: bucketAccounts.length,
     batches: (cost && cost.plan && Array.isArray(cost.plan.sourceJobs)) ? cost.plan.sourceJobs.length : (batches || 0),
     creates: cost ? Number(cost.creates || 0) : 0,
@@ -191,7 +199,7 @@ export async function advanceFbaPlanBucket({
     return { ...base, phase: "sync", ok: false, problems: ["plan costs " + cost.tokens + " tokens > the " + maxTokens + "-token ceiling; refusing (zero creates)"] };
   }
 
-  const cycleOf = async () => runtime.store.getCycleByBucketDate(cycleBucket, asOf).catch(() => null);
+  const cycleOf = async () => runtime.store.getCycleByBucketDate(cycleBucket, cycleDate).catch(() => null);
   let cycle = await cycleOf();
   let cycleId = cycle && cycle.id ? cycle.id : null;
 
@@ -208,7 +216,7 @@ export async function advanceFbaPlanBucket({
       for (let slice = 1; slice <= maxSlices; slice += 1) {
         // cycleBucket namespaces the fba-plan cycle; the account scope is still the REAL routing region/bucket.
         const res = await runtime.run({
-          bucket, cycleBucket, cycleDate: asOf, asOf, asOfFor: () => asOf,
+          bucket, cycleBucket, cycleDate, asOf, asOfFor: () => asOf, ...(inventoryAsOf ? { inventoryAsOf } : {}),
           manualReportKeys: ["fba-plan"], trigger, deadlineMs, reserveMs,
         });
         cycleId = res.cycleId || cycleId;

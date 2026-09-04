@@ -4860,7 +4860,8 @@ function DashboardApp({ session, access, onSignOut }) {
               <span>Sales through <strong>{planData.salesLatestDate ? fmtDateHuman(planData.salesLatestDate) : "—"}</strong></span>
               <span className="plan-fresh-sep">·</span>
               <span>FBA inventory snapshot <strong>{planData.inventoryDate ? fmtDateHuman(planData.inventoryDate) : "unavailable"}</strong></span>
-              {planData.isUS && <><span className="plan-fresh-sep">·</span><span>AWD {planData.awdAvailable ? "included" : "no live units"}</span></>}
+              {planData.inventoryStale && <span className="warning-text">Latest available; requested through {fmtDateHuman(planData.inventoryRequestedThrough)}</span>}
+              {(["US", "UK", "GB", "DE", "FR", "IT", "ES"].includes(String(planData.marketCountry || "").toUpperCase())) && <><span className="plan-fresh-sep">·</span><span>Listings/AWD {planData.awdFetchedAt ? `refreshed ${new Date(planData.awdFetchedAt).toLocaleString()}` : (planData.awdAvailable ? "included" : "unavailable")}</span></>}
               <span className="plan-fresh-sep">·</span>
               <span>{planCachedAt ? `cached ${planCachedAt.toLocaleString()}` : ""}</span>
             </div>

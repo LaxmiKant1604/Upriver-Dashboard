@@ -22,6 +22,7 @@ import { buildDependencyPlan } from "./planner.js";
 import { assignAccountBatches, batchSellerIds, MAX_ACCOUNTS_PER_BATCH } from "./source-batching.js";
 import { organizationFingerprint, accountScopeHash } from "../source-identity.js";
 import { awdCapableMarketplace } from "../reports/awd-capability.js";
+import { regionForMarketplace } from "./campaign-region-routing.js";
 
 // Daily Reporting spans the last SIX calendar months exactly as the live UI does:
 // [monthBack(asOf, 5).from .. asOf] (first day of the month five months back .. today). The prior
@@ -377,83 +378,61 @@ export function marketplaceCodeFor(country) {
 }
 
 /**
- * MARKETPLACE-SAFE BATCHED FBA Shipment Plan planner for a WHOLE bucket's accounts. This is what a batched
- * go-live/refresh uses (planFbaPlan stays the per-account planner). fba-plan's only owned exports are the FBA
- * Inventory Health snapshot + the US-only AWD listing (OLI + Product Catalog are durable derived deps). Both owned
- * contracts are seller-scoped + marketplace-scoped (their columns carry seller_or_vendor_id + marketplace_country_code),
- * so a <=5-seller export splits back per account (isolateFragmentRowsForOwner in the report worker) AND is validated
- * to a single marketplace (validateBatchSourcePayload). This planner therefore:
- *   1) resolves each account's authoritative scope (raw seller id, connection, org fingerprint) -- never from a row;
- *   2) PARTITIONS accounts by (connection & marketplace country & as-of) so a batch NEVER mixes marketplaces/orgs;
- *   3) assigns stable <=5-account batches WITHIN each partition;
- *   4) resolves ONE batched FBA (+ US-only AWD) request over the batch's sorted seller ids (shared request_hash),
- *      so the <=5 members fetch ONCE (buildDependencyPlan/plannedSourceJob dedupe the shared hash to one export);
- *   5) emits a PER-ACCOUNT fba-plan report request carrying the batched sources + that account's COMPLETE owner
- *      metadata (accountId, rawSellerId, connectionId, organizationFingerprint, accountScopeHash) so the report
- *      worker isolates exactly that account's rows from the shared batch (fail-closed on missing owner metadata).
- * `accounts`: [{ accountId, name, country, currency }]. `asOfFor(country)` -> the marketplace as-of (batch members
- * share one as-of, so one FBA window). `existingFbaMembership`: durable accountId->batchIndex (stable batches).
- * Returns the per-account report requests (feed them to buildDependencyPlan / runReportJobs like any request).
+ * Regional FBA planning: pack each owned source independently into <=5-seller batches, across marketplaces,
+ * within one region and connection/organization. Carry exact seller-marketplace pairs for source validation
+ * and per-account ownership for derivation. inventoryAsOf is independent of the sales asOfFor cutoff.
  */
-export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, existingFbaMembership = new Map() }) {
+export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, inventoryAsOf = null, existingFbaMembership = new Map() }) {
   const scoped = (accounts || []).map((a) => {
     const scope = resolveAccountScope({ accountId: a.accountId, country: a.country, currency: a.currency, connections });
     const asOf = String(typeof asOfFor === "function" ? asOfFor(a.country) : a.asOf);
     if (!isValidCalendarDate(asOf)) throw new Error(`planFbaPlanBucketBatched requires a real calendar as-of for account "${a.accountId}" (got "${asOf}").`);
-    return { account: a, scope, asOf };
+    const inventoryTo = inventoryAsOf == null ? asOf : String(inventoryAsOf);
+    if (!isValidCalendarDate(inventoryTo)) throw new Error("FBA inventoryAsOf must be a real calendar date.");
+    const region = regionForMarketplace(scope.country);
+    if (region === "unassigned") throw new Error("FBA account has no supported regional assignment.");
+    return { account: a, scope, asOf, inventoryTo, region };
   });
 
-  // 2) PARTITION by (connection & marketplace & as-of): a batch must share one org (isolation), one marketplace
-  //    (the FBA/AWD contracts are marketplace-scoped), and one as-of (one identical FBA window => one shared hash).
-  //    The batch marketplace uses the AMAZON marketplace code that FBA Inventory Health rows actually carry -- the
-  //    account directory calls the United Kingdom marketplace "UK", but Amazon (and thus the FBA rows'
-  //    marketplace_country_code) uses "GB"; without this normalization a batch of "UK" accounts is validated
-  //    against "UK" while its rows say "GB" -> BATCH_CROSS_MARKETPLACE.
+  // Marketplace is NOT a partition: its exact seller binding travels with every batch instead.
   const partitions = new Map();
   for (const s of scoped) {
-    const key = `${s.scope.connectionId}|${marketplaceCodeFor(s.scope.country)}|${s.asOf}`;
+    const key = `${s.scope.connectionId}|${organizationFingerprint(s.scope.apiKey)}|${s.region}|${s.inventoryTo}`;
     if (!partitions.has(key)) partitions.set(key, []);
     partitions.get(key).push(s);
   }
 
   const requests = [];
   for (const members of partitions.values()) {
-    const market = marketplaceCodeFor(members[0].scope.country);
-    const asOf = members[0].asOf;
-    const isUS = market === "US";
     const apiKey = members[0].scope.apiKey;
-    const scopedById = new Map(members.map((m) => [m.scope.accountId, m]));
-
-    // 3) STABLE <=5-account batches within this single-marketplace partition.
-    const batchAccounts = members.map((m) => ({ accountId: m.scope.accountId, rawSellerId: m.scope.rawSellerId }));
-    const { batches } = assignAccountBatches(batchAccounts, existingFbaMembership, MAX_ACCOUNTS_PER_BATCH);
-
-    for (const batch of batches) {
-      const ids = batchSellerIds(batch); // the batch's SORTED raw seller ids (the canonical request identity)
-      // 4) ONE batched FBA (+ US-only AWD) request over these <=5 ids. The window is EXACTLY the per-account
-      //    fba-plan window ([asOf-10d..asOf] FBA; no-date AWD), so it matches the derive's expectations.
-      const windowsByRequestKey = {
-        "fba-plan:inventory-health": [{ from: addDaysStr(asOf, -FBA_INVENTORY_LOOKBACK_DAYS), to: asOf }],
-      };
-      // AWD for the AWD-capable marketplaces (US + EU5); US byte-identical. Each partition is a single marketplace
-      // (line above), so the batched AWD export stays marketplace-safe.
-      if (awdCapableMarketplace(market)) windowsByRequestKey["fba-plan:awd"] = [{ from: null, to: null }];
-      const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey, ids, windowsByRequestKey, marketplaceCountry: market });
-      // Stamp the batch's single canonical marketplace constraint so resolveFromGenericPlan/plannedSourceJob carry
-      // it into the source worker's per-row marketplace validation (validateBatchSourcePayload).
-      const batchedSources = resolved.map((s) => ({ ...s, marketplaceConstraint: market }));
-
-      // 5) a per-account report request per batch member: shared batched sources + this account's owner metadata.
-      for (const rec of batch.accounts) {
-        const m = scopedById.get(rec.accountId);
-        if (!m) continue;
+    const sourcesByAccount = new Map(members.map((m) => [m.scope.accountId, []]));
+    // Pack each source independently: ineligible AWD accounts must neither be exported nor fragment the AWD batches.
+    for (const requestKey of ["fba-plan:inventory-health", "fba-plan:awd"]) {
+      const eligible = members.filter((m) => requestKey !== "fba-plan:awd" || awdCapableMarketplace(m.scope.country));
+      const byId = new Map(eligible.map((m) => [m.scope.accountId, m]));
+      const membership = new Map([...existingFbaMembership].filter(([id]) => byId.has(id)));
+      const { batches } = assignAccountBatches(eligible.map((m) => ({ accountId: m.scope.accountId, rawSellerId: m.scope.rawSellerId })), membership, MAX_ACCOUNTS_PER_BATCH);
+      for (const batch of batches) {
+        const owners = batch.accounts.map((a) => byId.get(a.accountId));
+        const pairs = owners.map((m) => ({ sellerId: m.scope.rawSellerId, marketplace: marketplaceCodeFor(m.scope.country) }));
+        const markets = [...new Set(pairs.map((p) => p.marketplace))];
+        const inventoryTo = owners[0].inventoryTo;
+        const windowsByRequestKey = { "fba-plan:inventory-health": [{ from: addDaysStr(inventoryTo, -FBA_INVENTORY_LOOKBACK_DAYS), to: inventoryTo }] };
+        if (awdCapableMarketplace(markets[0])) windowsByRequestKey["fba-plan:awd"] = [{ from: null, to: null }];
+        const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey, ids: batchSellerIds(batch), windowsByRequestKey, marketplaceCountry: markets[0] }).filter((s) => s.requestKey === requestKey);
+        const sources = resolved.map((s) => ({ ...s, marketplaceConstraint: markets.length === 1 ? markets[0] : null,
+          marketplacePairs: pairs, ...(inventoryAsOf == null ? {} : { freshnessNotBefore: inventoryTo + "T00:00:00.000Z" }) }));
+        for (const m of owners) sourcesByAccount.get(m.scope.accountId).push(...sources);
+      }
+    }
+    for (const m of members) {
         requests.push({
           reportKey: "fba-plan",
           reportVersion: REPORT_DERIVATIONS["fba-plan"].snapshotVersion,
           accountId: m.scope.accountId,
           connectionId: m.scope.connectionId,
           bucket: m.scope.bucket,
-          sources: decorateSources(batchedSources, { reportKey: "fba-plan", connectionId: m.scope.connectionId, bucket: m.scope.bucket }),
+          sources: decorateSources(sourcesByAccount.get(m.scope.accountId), { reportKey: "fba-plan", connectionId: m.scope.connectionId, bucket: m.scope.bucket }),
           // COMPLETE owner metadata the report worker requires to isolate this account's rows from the shared
           // batch (missing/blank => OWNER_BINDING_MISSING, fail closed). The org fingerprint is derived from the
           // connection's api key (never printed); the individual scope is accountScopeHash([this raw seller id]).
@@ -463,10 +442,10 @@ export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, 
             connectionId: m.scope.connectionId,
             organizationFingerprint: organizationFingerprint(m.scope.apiKey),
             accountScopeHash: accountScopeHash([m.scope.rawSellerId]),
+            marketplace: marketplaceCodeFor(m.scope.country),
           },
-          context: { to: m.asOf, rawSellerId: m.scope.rawSellerId, accountName: m.account.name || null, marketCountry: m.account.country || null, isUS },
+          context: { to: m.asOf, ...(inventoryAsOf == null ? {} : { inventoryAsOf: m.inventoryTo }), rawSellerId: m.scope.rawSellerId, accountName: m.account.name || null, marketCountry: m.account.country || null, isUS: m.scope.country === "US" },
         });
-      }
     }
   }
   return requests;
@@ -794,7 +773,7 @@ const PLANNERS = {
  * key (Keyword Rank) is REJECTED fail-closed, never silently planned OR silently dropped. Any other
  * unknown key is ignored. Pure given its inputs; no I/O.
  */
-export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANNED_REPORT_KEYS, connections, asOfFor }) {
+export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANNED_REPORT_KEYS, connections, asOfFor, inventoryAsOf = null }) {
   const requested = reportKeys || [];
   // Fail closed: a staged-cycle report (Keyword Rank) has ONE canonical entry point
   // (runKeywordRankShadowCycle) and must never be planned by -- or silently dropped from -- the generic
@@ -823,7 +802,7 @@ export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANN
     }
   }
   if (keys.includes("fba-plan")) {
-    reportRequests.push(...planFbaPlanBucketBatched({ accounts: active, connections, asOfFor }));
+    reportRequests.push(...planFbaPlanBucketBatched({ accounts: active, connections, asOfFor, inventoryAsOf }));
   }
   const { sourceJobs, reportJobs } = buildDependencyPlan(reportRequests);
   return { reportRequests, sourceJobs, reportJobs, unavailableAccounts: unavailable };

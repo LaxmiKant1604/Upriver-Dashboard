@@ -212,6 +212,9 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
       const cachedRowCount = entry ? (entry.row_count ?? entry.rowCount) : undefined;
       const cachedBytes = entry ? (entry.payload_bytes ?? entry.payloadBytes) : undefined;
       const confirmed = !!cachedRows
+        && (!job.freshnessNotBefore || Date.parse(entry.fetched_at ?? entry.fetchedAt ?? "") >= Date.parse(job.freshnessNotBefore))
+        && (!job.marketplacePairs || validateBatchSourcePayload({ rows: cachedRows, sellerOrVendorIds: job.fetchParams?.sellerOrVendorIds,
+          sourceScope: job.sourceScope, marketplaceScoped: job.marketplaceScoped, marketplacePairs: job.marketplacePairs }).valid)
         && !!cachedSourceId && cachedSourceId === job.sourceId
         && !!cachedOrgFp && cachedOrgFp === job.organizationFingerprint
         && !!cachedScope && cachedScope === job.accountScopeHash
@@ -355,13 +358,14 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   // column heuristic; an unknown/missing scope on a batch fails closed. ----
   const fp = job.fetchParams || {};
   const batchIds = Array.isArray(fp.sellerOrVendorIds) ? fp.sellerOrVendorIds : [];
-  if (batchIds.length > 1) {
+  if (batchIds.length > 1 || job.marketplacePairs) {
     const bv = validateBatchSourcePayload({
       rows,
       sellerOrVendorIds: batchIds,
       sourceScope: job.sourceScope,
       marketplaceScoped: job.marketplaceScoped === true,
       marketplaceCountry: job.marketplaceConstraint ?? null,
+      marketplacePairs: job.marketplacePairs ?? null,
     });
     if (!bv.valid) {
       return fail("validate", bv.code || "BATCH_INVALID", bv.reason || "Batch payload failed per-account integrity validation; result not saved.", true, rows.length);

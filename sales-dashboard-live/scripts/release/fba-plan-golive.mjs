@@ -49,10 +49,11 @@ const log = (m) => console.log("fba-golive[" + mode + (scopeLabel ? "/" + scopeL
 
 const { buildFbaPlanRelease } = await import("../../lib/server/sync/fba-plan-release-composition.js");
 const {
-  resolveFbaPlanScope, planFbaBucketCost, fbaBucketAccounts, advanceFbaPlanBucket, fbaServerCeiling,
+  resolveFbaPlanScope, planFbaBucketCost, fbaBucketAccounts, advanceFbaPlanBucket, fbaServerCeiling, fbaInventoryAsOf,
 } = await import("../../lib/server/sync/fba-plan-operation.js");
 
 const CEILING = fbaServerCeiling();
+const inventoryAsOf = fbaInventoryAsOf();
 const OPERATOR = process.env.PRIORITY_OPERATOR || "laxmikant@superboring.in";
 const release = buildFbaPlanRelease({ operator: OPERATOR });
 
@@ -62,19 +63,21 @@ if (!accounts.length) { console.error("STOP no primary accounts with directory m
 log("discovered " + accounts.length + " primary accounts with metadata");
 
 // ---------------- Stage 1: resolve the coverage-maximizing go-live as-of (SHARED core) ----------------
-const scope = await resolveFbaPlanScope({ accounts, connections: release.connections, asOfArg, maxBlocked, ceiling: CEILING, readers: release.scopeReaders });
-const asOf = scope.asOf;
-if (!asOf) { console.error("STOP no account has durable OLI coverage; cannot resolve a go-live as-of."); process.exit(1); }
-log("go-live as-of = " + asOf + " (ceiling D-1 = " + CEILING + "); included=" + scope.included.length + " blocked(stale OLI)=" + scope.blocked.length);
-if (scope.blocked.length) log("  blocked (publish later once OLI catches up): " + scope.blocked.map((b) => b.accountId.slice(0, 6) + "(" + (b.provenTo || "none") + ")").join(", "));
+log("inventory requested through " + inventoryAsOf + "; sales coverage resolved independently per region");
 
 // ---------------- Stage 2: build the exact batched plan + prove the token cost (ZERO creates, SHARED core) ----
 const bucketPlan = new Map();
 let totalCreates = 0; let totalTokens = 0; let totalBatches = 0;
 for (const bucket of selectedScopes) {
   const bucketAccounts = fbaBucketAccounts(accounts, bucket);
-  const { plan, cost } = await planFbaBucketCost({ bucketAccounts, connections: release.connections, asOf, getSourceExportCache: release.getSourceExportCache });
-  bucketPlan.set(bucket, { bucketAccounts, plan, cost });
+  if (!bucketAccounts.length) continue;
+  const scope = await resolveFbaPlanScope({ accounts: bucketAccounts, connections: release.connections, asOfArg, maxBlocked, ceiling: CEILING, readers: release.scopeReaders });
+  if (!scope.asOf) { console.error("STOP " + bucket + " has no durable sales coverage; inventory export not started."); process.exit(1); }
+  const { plan, cost } = await planFbaBucketCost({ bucketAccounts, connections: release.connections, asOf: scope.asOf, inventoryAsOf, getSourceExportCache: release.getSourceExportCache });
+  bucketPlan.set(bucket, { bucketAccounts, plan, cost, scope });
+  log(bucket + " sales through " + scope.asOf + "; inventory through " + inventoryAsOf + "; included=" + scope.included.length + " blocked=" + scope.blocked.length);
+  const unique = new Map(plan.reportRequests.flatMap((r) => r.sources.map((s) => [s.requestHash, s])));
+  for (const s of unique.values()) log("BATCH " + s.requestKey + " " + JSON.stringify({ sellers: s.sellerOrVendorIds, pairs: s.marketplacePairs, from: s.from, to: s.to, freshAfter: s.freshnessNotBefore }));
   totalCreates += Number(cost.creates || 0); totalTokens += Number(cost.tokens || 0); totalBatches += plan.sourceJobs.length;
   log("PLAN " + bucket + ": " + plan.sourceJobs.length + " batched exports; creates=" + cost.creates + " tokens=" + cost.tokens + " byFamily=" + JSON.stringify(cost.byFamily));
 }
@@ -89,7 +92,9 @@ if (totalTokens > maxTokens) { console.error("STOP the plan costs " + totalToken
 let anyPublished = 0; let anyFailure = false;
 try {
   for (const bucket of selectedScopes) {
-    const { bucketAccounts, cost } = bucketPlan.get(bucket);
+    if (!bucketPlan.has(bucket)) continue;
+    const { bucketAccounts, cost, scope } = bucketPlan.get(bucket);
+    const asOf = scope.asOf;
     if (!bucketAccounts.length) { log(bucket + ": no accounts in this bucket -- skipping."); continue; }
     const includedIds = scope.included.filter((id) => bucketAccounts.some((a) => a.accountId === id));
     let result = null;
@@ -98,7 +103,7 @@ try {
     // idempotent + resumable, bounded by a generous cap.
     for (let pass = 1; pass <= 80; pass += 1) {
       result = await advanceFbaPlanBucket({
-        bucket, asOf, includedIds, bucketAccounts, cost, maxTokens,
+        bucket, asOf, inventoryAsOf, includedIds, bucketAccounts, cost, maxTokens,
         runtime: release.runtime, publisher: release.publisher, controls: release.controls,
         readbackLive: release.readbackLive, ownershipBackfill: release.ownershipBackfill,
         trigger: "github", deadlineMs: Infinity, reserveMs: 0, outOfTime: () => false,
@@ -125,5 +130,5 @@ try {
   process.exit(1);
 }
 if (anyFailure && !anyPublished) { console.error("STOP zero accounts published live -- see problems above."); process.exit(1); }
-log("DONE: fba-plan published for " + anyPublished + " accounts total (as-of " + asOf + "); controls safe-closed.");
+log("DONE: fba-plan published for " + anyPublished + " accounts total (inventory requested through " + inventoryAsOf + "); controls safe-closed.");
 process.exit(anyFailure ? 1 : 0);

@@ -72,7 +72,7 @@ export function normalizeDataDoeConnections(connections) {
 // resolved.accountScopeHash is permitted ONLY for a single-account source (0 or 1 seller id, where the
 // canonical scope already IS the individual scope); a MULTI-id (batched) source with no authoritative
 // rawSellerId FAILS CLOSED rather than collapsing every batch member onto the one shared batch scope.
-export function plannedSourceJob(reportKey, resolved, bucket, connectionId, accountId = "", ownerRawSellerId = null, marketplaceConstraint = null) {
+export function plannedSourceJob(reportKey, resolved, bucket, connectionId, accountId = "", ownerRawSellerId = null, marketplaceConstraint = null, ownerMarketplace = null) {
   if (!VALID_CONNECTION_IDS.has(connectionId)) {
     throw new Error(`plannedSourceJob requires an explicit connectionId of 'primary' or 'dd-secondary' (got "${connectionId}").`);
   }
@@ -131,11 +131,14 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
     sourceScope: resolved.sourceScope,
     marketplaceScoped: resolved.marketplaceScoped === true,
     marketplaceConstraint: marketplaceConstraint == null ? null : String(marketplaceConstraint),
+    ...(resolved.marketplacePairs ? { marketplacePairs: resolved.marketplacePairs } : {}),
+    ...(resolved.freshnessNotBefore ? { freshnessNotBefore: resolved.freshnessNotBefore } : {}),
     // owner.accountScopeHash is the INDIVIDUAL account scope (never the batch scope) -- one exact report/account.
     // owner.rawSellerId is that account's authoritative individual seller id; owner carries the COMPLETE
     // metadata (Finding 1) the derive-time per-account isolation requires: accountId, rawSellerId, connectionId,
     // organizationFingerprint, accountScopeHash (NON-secret; the raw id is already in fetchParams).
-    owner: { ownerId, requestKey: resolved.requestKey, reportKey, accountId: String(accountId || ""), rawSellerId: ownerRaw, connectionId, organizationFingerprint: resolved.organizationFingerprint, accountScopeHash: ownerScope },
+    owner: { ownerId, requestKey: resolved.requestKey, reportKey, accountId: String(accountId || ""), rawSellerId: ownerRaw, connectionId, organizationFingerprint: resolved.organizationFingerprint, accountScopeHash: ownerScope,
+      ...(ownerMarketplace ? { marketplace: String(ownerMarketplace).trim().toUpperCase() } : {}) },
     fetchParams: {
       // Report-contract columns when the reportKey names a declared report; otherwise the RESOLVED request's
       // own columns (the source-first bucket sync plans canonical source requests under a synthetic
