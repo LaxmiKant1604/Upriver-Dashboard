@@ -50,6 +50,8 @@ export const REPORT_CAPABILITIES = Object.freeze({
   "oli-quality-summary": CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS,
   "sales-movers": CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS,
   "listing-health": CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS,
+  // Advanced Listing Health (shadow): identical account-wide, brand-restricted-denied gate as listing-health.
+  "listing-health-v3": CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS,
   "buy-box-loss": CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS,
   "returns-leakage": CAPABILITY.BRAND_DERIVABLE_FROM_ASIN_SKU,  // per-(currency, ASIN) rows carry `brand`
   "ppc-performance": CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS,

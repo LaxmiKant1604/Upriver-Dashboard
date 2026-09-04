@@ -40,6 +40,10 @@ import {
   ppcPerformancePayload,
 } from "../reports/derivation-core.js";
 import { skuMovementPayload } from "../reports/sku-movement-core.js";
+// Advanced Listing Health (shadow) derivation core -- a PURE leaf (its transitive graph is derivation-core +
+// date-windows + source-durable-model + oli-completeness-serve; NO transport/supabase), so importing it keeps the
+// "derivation graph has no transport import" guarantee intact.
+import { buildAdvancedListingHealth, resolveListingHealthWindow } from "../reports/listing-health-advanced.js";
 import { awdCapableMarketplace, awdRequiredForMarketplace } from "../reports/awd-capability.js";
 import {
   declaredReportKeys,
@@ -1058,6 +1062,98 @@ const REGISTRY = {
     // Latest real data date = the validated inventory snapshot date (source evidence), or null. Never asOf /
     // fetched_at / saved_at / Date.now().
     latestDataDate: (p) => (p && p.inventoryAvailable && isValidCalendarDate(p.inventorySnapshotDate) ? p.inventorySnapshotDate : null),
+  },
+  // Advanced Listing Health (SHADOW, snapshotVersion listing-health/v3-oli-window). NOT served: the live route stays
+  // on listing-health/v1. Sales/units come from DURABLE Order Line Items (enriched: priced + operational overlay +
+  // estimates) injected via context.listingHealthV3DurableOli (derivedContextKeys) -- NO Profit-by-SKU. The inclusive
+  // window (7D/14D/30D-default/selected-month/custom) re-aggregates the already-stored OLI, so a window change spends
+  // ZERO exports. Listings / Listings Raw / inventory are batched owned exports whose rows the worker already isolated
+  // to this owner (assembleSources(..., owner)); catalog reuses the shared insight-catalog identity. Missing required
+  // source => unavailable (LKG preserved); disabled Raw => degraded per policy. Pure -- delegates to
+  // buildAdvancedListingHealth which re-asserts the trusted-owner projection boundary + currency isolation.
+  "listing-health-v3": {
+    snapshotVersion: "listing-health/v3-oli-window",
+    optionalRequestKeys: ["listing-health-v3:listings-raw"],
+    derivedSourceKeys: ["order-line-items", "product-catalog"],
+    derivedContextKeys: ["listingHealthV3DurableOli", "listingHealthV3DurableCatalog"],
+    derive: ({ sources, context }) => {
+      const asOf = context.to != null ? String(context.to) : "";
+      if (!isValidCalendarDate(asOf)) {
+        throw new Error("listing-health-v3 derivation requires an authoritative asOf (context.to) that is a real calendar date.");
+      }
+      const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
+      const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
+      // The TWO required owned exports (Raw is optional/degradable; OLI + catalog are derived durable deps below).
+      for (const key of ["listing-health-v3:listings", "listing-health-v3:inventory"]) {
+        const s = sources[key];
+        if (!s || s.available !== true || !Array.isArray(s.rows)) {
+          throw deriveError(`listing-health-v3 ${key} is required but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
+        }
+      }
+      // Listings is a single-account NO-DATE fragment (already isolated to this owner by the worker).
+      const listingRows = noDateFragmentRows(sources["listing-health-v3:listings"], "listing-health-v3:listings", rawSellerId);
+      // Inventory is the LATEST snapshot, INDEPENDENT of the sales window: its window is [inventoryAsOf-10d,
+      // inventoryAsOf] (inventoryAsOf defaults to asOf but may lead it), recomputed + pinned here (never trusted).
+      const inventoryAsOf = context.inventoryAsOf == null ? asOf : String(context.inventoryAsOf);
+      if (!isValidCalendarDate(inventoryAsOf)) throw new Error("listing-health-v3 inventoryAsOf must be a real calendar date.");
+      const inventoryFrom = addDaysStr(inventoryAsOf, -LH_INVENTORY_LOOKBACK_DAYS);
+      const inventoryRows = singleAccountFragmentRows(sources["listing-health-v3:inventory"], "listing-health-v3:inventory", rawSellerId, inventoryFrom, inventoryAsOf);
+      assertRowsInWindow(inventoryRows, inventoryFrom, inventoryAsOf, "listing-health-v3 inventory");
+      // Optional Listings (Raw JSON): validated success => enrich; approved degraded/disabled => issuesAvailable false;
+      // anything else (pending/failed/unreadable) => unavailable (LKG preserved). Mirrors the v1 raw policy exactly.
+      const rawSource = sources["listing-health-v3:listings-raw"];
+      let issuesAvailable = true;
+      let issuesUnavailableReason = null;
+      let rawRows = [];
+      if (rawSource && rawSource.available === true && Array.isArray(rawSource.rows)) {
+        rawRows = noDateFragmentRows(rawSource, "listing-health-v3:listings-raw", rawSellerId);
+      } else if (rawSource && rawSource.disabled === true) {
+        if (sourceDisabledOutcome(rawSource.disabledPolicy || null).blocks) {
+          throw deriveError("listing-health-v3:listings-raw is terminally disabled; snapshot blocked.", "blocked");
+        }
+        issuesAvailable = false;
+        issuesUnavailableReason = LH_ISSUES_ENABLE_HINT;
+      } else {
+        throw deriveError("listing-health-v3:listings-raw is not a validated success and not the approved degraded/disabled state; last-known-good preserved.", "unavailable");
+      }
+      // DURABLE enriched OLI (source_oli_daily_history + operational units + estimates) injected by the loader, with the
+      // account's proven coverage windows + completeness rows. Missing => unavailable (never a fabricated zero).
+      const durableOli = context.listingHealthV3DurableOli;
+      if (!durableOli || durableOli.available !== true || !Array.isArray(durableOli.rows)) {
+        throw deriveError("listing-health-v3 requires durable Order Line Items evidence (source_oli_daily_history); it is missing or short; last-known-good preserved.", "unavailable");
+      }
+      // DERIVED durable Product Catalog: the canonical org catalog snapshot (reused, never a new export). Org-wide rows
+      // give ASIN -> name/brand only; they NEVER prove account ownership (that comes from the account-scoped rows).
+      const durableCatalog = context.listingHealthV3DurableCatalog;
+      if (!durableCatalog || durableCatalog.available !== true || !Array.isArray(durableCatalog.rows)) {
+        throw deriveError("listing-health-v3 requires the durable Product Catalog snapshot; it is missing; last-known-good preserved.", "unavailable");
+      }
+      const catalogRows = durableCatalog.rows;
+      // Resolve the inclusive window from the request controls (only an OMITTED control uses the 30D default).
+      const window = resolveListingHealthWindow({
+        preset: context.windowPreset, from: context.windowFrom, to: context.windowTo, month: context.windowMonth, asOf,
+      });
+      return buildAdvancedListingHealth({
+        owner: { accountId: publicAccountId, rawSellerId },
+        asOf, window,
+        enrichedOliRows: durableOli.rows,
+        oliCoverageWindows: Array.isArray(durableOli.coverageWindows) ? durableOli.coverageWindows : [],
+        completenessRows: Array.isArray(durableOli.completenessRows) ? durableOli.completenessRows : [],
+        listingRows, inventoryRows, catalogRows, rawRows,
+        issuesAvailable, issuesUnavailableReason,
+        provenance: {
+          listingsFetchedAt: context.listingsFetchedAt || null,
+          inventoryFetchedAt: context.inventoryFetchedAt || null,
+          rawFetchedAt: context.rawFetchedAt || null,
+          catalogFetchedAt: context.catalogFetchedAt || null,
+        },
+      });
+    },
+    validatePayload: (p) => !!p && ("accountId" in p) && ("asOf" in p) && Array.isArray(p.rows)
+      && Array.isArray(p.catalogBrands) && Array.isArray(p.currencies) && typeof p.issuesAvailable === "boolean"
+      && !!p.window && typeof p.window === "object" && !!p.coverage && ("salesWindowStatus" in p)
+      && !!p.inventory && ("listingCount" in p) && ("issuesUnavailableReason" in p) && p.salesSource === "order-line-items",
+    latestDataDate: (p) => (p && p.inventory && isValidCalendarDate(p.inventory.snapshotDate) ? p.inventory.snapshotDate : null),
   },
   // Listing & Search Optimizer: reproduce the api/datadoe.js `listing-optimizer` payload from the
   // validated saved fragments. SQP-weekly is the KICKOFF/required-but-DEGRADABLE source: a durable

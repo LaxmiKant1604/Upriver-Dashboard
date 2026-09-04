@@ -853,6 +853,9 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
     "fba-plan:inventory-health", "fba-plan:awd",
     "brand-sales:order-lines", "brand-sales:catalog",
     "content-changes:events", "content-changes:catalog",
+    // Advanced Listing Health (shadow) owned exports -- scheduler-only strict (no live route), backed by the source
+    // worker's cap guard. OLI + catalog are durable derived deps (not owned). inventory reuses fba-plan's identity.
+    "listing-health-v3:listings", "listing-health-v3:listings-raw", "listing-health-v3:inventory",
   ];
   const routeBacked = new Set([...Object.keys(OPERATIONAL_STRICT), ...Object.keys(INSIGHT_STRICT)]);
   // The categories are disjoint: a strict key is EITHER route-backed OR scheduler-only, never both.

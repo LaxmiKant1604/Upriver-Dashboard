@@ -452,6 +452,80 @@ export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, 
 }
 
 /**
+ * Regional Advanced Listing Health (SHADOW) planning: pack the region's accounts into STABLE <=5-seller batches
+ * ACROSS marketplaces, within one connection/organization, for the three OWNED exports (Listings, Listings Raw,
+ * inventory). Carry the EXACT seller-marketplace pairs (so every returned row is validated + isolated per account)
+ * and per-account owner metadata (for derive-time isolation). OLI sales/units + Product Catalog are DERIVED durable
+ * dependencies (never exports), injected into the derive context by the loader. inventoryAsOf is independent of the
+ * sales asOf. This planner is NOT in PLANNERS / SHADOW_PLANNED_REPORT_KEYS: v3 is dormant (nothing dispatches it),
+ * so this is invoked only by the shadow build/verify path and the zero-create dry-run.
+ */
+export function planListingHealthV3BucketBatched({ accounts = [], connections, asOfFor, inventoryAsOf = null, existingMembership = new Map() }) {
+  const scoped = (accounts || []).map((a) => {
+    const scope = resolveAccountScope({ accountId: a.accountId, country: a.country, currency: a.currency, connections });
+    const asOf = String(typeof asOfFor === "function" ? asOfFor(a.country) : a.asOf);
+    if (!isValidCalendarDate(asOf)) throw new Error(`planListingHealthV3BucketBatched requires a real calendar as-of for account "${a.accountId}" (got "${asOf}").`);
+    const inventoryTo = inventoryAsOf == null ? asOf : String(inventoryAsOf);
+    if (!isValidCalendarDate(inventoryTo)) throw new Error("listing-health-v3 inventoryAsOf must be a real calendar date.");
+    const region = regionForMarketplace(scope.country);
+    if (region === "unassigned") throw new Error("listing-health-v3 account has no supported regional assignment.");
+    return { account: a, scope, asOf, inventoryTo, region };
+  });
+
+  // Marketplace is NOT a partition: the exact seller-marketplace binding travels on every batch (across marketplaces).
+  const partitions = new Map();
+  for (const s of scoped) {
+    const key = `${s.scope.connectionId}|${organizationFingerprint(s.scope.apiKey)}|${s.region}|${s.inventoryTo}`;
+    if (!partitions.has(key)) partitions.set(key, []);
+    partitions.get(key).push(s);
+  }
+
+  const requests = [];
+  for (const members of partitions.values()) {
+    const apiKey = members[0].scope.apiKey;
+    const byId = new Map(members.map((m) => [m.scope.accountId, m]));
+    const membership = new Map([...existingMembership].filter(([id]) => byId.has(id)));
+    const { batches } = assignAccountBatches(members.map((m) => ({ accountId: m.scope.accountId, rawSellerId: m.scope.rawSellerId })), membership, MAX_ACCOUNTS_PER_BATCH);
+    const sourcesByAccount = new Map(members.map((m) => [m.scope.accountId, []]));
+    for (const batch of batches) {
+      const owners = batch.accounts.map((a) => byId.get(a.accountId));
+      const pairs = owners.map((m) => ({ sellerId: m.scope.rawSellerId, marketplace: marketplaceCodeFor(m.scope.country) }));
+      const markets = [...new Set(pairs.map((p) => p.marketplace))];
+      const inventoryTo = owners[0].inventoryTo;
+      const windowsByRequestKey = {
+        "listing-health-v3:listings": [{ from: null, to: null }],
+        "listing-health-v3:listings-raw": [{ from: null, to: null }],
+        "listing-health-v3:inventory": [{ from: addDaysStr(inventoryTo, -FBA_INVENTORY_LOOKBACK_DAYS), to: inventoryTo }],
+      };
+      const resolved = reportSourceRequestHashes({ reportKey: "listing-health-v3", apiKey, ids: batchSellerIds(batch), windowsByRequestKey, marketplaceCountry: markets[0] });
+      const sources = resolved.map((s) => ({ ...s, marketplaceConstraint: markets.length === 1 ? markets[0] : null,
+        marketplacePairs: pairs, ...(inventoryAsOf == null ? {} : { freshnessNotBefore: inventoryTo + "T00:00:00.000Z" }) }));
+      for (const m of owners) sourcesByAccount.get(m.scope.accountId).push(...sources);
+    }
+    for (const m of members) {
+      requests.push({
+        reportKey: "listing-health-v3",
+        reportVersion: REPORT_DERIVATIONS["listing-health-v3"].snapshotVersion,
+        accountId: m.scope.accountId,
+        connectionId: m.scope.connectionId,
+        bucket: m.scope.bucket,
+        sources: decorateSources(sourcesByAccount.get(m.scope.accountId), { reportKey: "listing-health-v3", connectionId: m.scope.connectionId, bucket: m.scope.bucket }),
+        owner: {
+          accountId: m.scope.accountId,
+          rawSellerId: m.scope.rawSellerId,
+          connectionId: m.scope.connectionId,
+          organizationFingerprint: organizationFingerprint(m.scope.apiKey),
+          accountScopeHash: accountScopeHash([m.scope.rawSellerId]),
+          marketplace: marketplaceCodeFor(m.scope.country),
+        },
+        context: { to: m.asOf, inventoryAsOf: m.inventoryTo, rawSellerId: m.scope.rawSellerId, accountId: m.scope.accountId, accountName: m.account.name || null, marketCountry: m.account.country || null },
+      });
+    }
+  }
+  return requests;
+}
+
+/**
  * Plan Keyword Rank for ONE account from that account's OWN typed weekly signal (Blocker 1: never a
  * global request-key signal). Emits the SQP-weekly probe (asOf-84d..asOf) + the 365-day catalog, and --
  * ONLY when the typed weekly signal makes the contract's `distinct_periods < 4` fallback apply -- the

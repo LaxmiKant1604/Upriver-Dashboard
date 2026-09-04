@@ -88,7 +88,7 @@ test("Product Catalog feeds Daily Reporting, Brand Sales/Brand View and the cata
   const expected = Object.entries(sourceContracts.REPORT_SOURCE_REQUIREMENTS)
     .filter(([, deps]) => deps.includes("product-catalog")).map(([k]) => k);
   for (const want of expected) assert.ok(d.includes(want), `catalog-dependent dashboard ${want}`);
-  assert.equal(expected.length, 12, "catalog has 12 direct consumers");
+  assert.equal(expected.length, 13, "catalog has 13 direct consumers (incl. advanced Listing Health v3 shadow)");
 });
 
 test("ASIN->Campaign CUTOVER: campaign-performance-v1 (ads-campaign-date) is the ACTIVE Ads grain -- Daily + Brand View + PPC", () => {

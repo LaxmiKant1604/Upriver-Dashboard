@@ -26,7 +26,7 @@ export const SOURCE_CONTRACTS = [
     // Canonical sales/ordered-units source (item_price_value for sales, quantity for
     // ordered units). Daily Reporting, FBA Plan, Buy Box Loss, Returns Leakage and PPC
     // read sales/units here; Sales Movers keeps Sales & Traffic (it needs sessions/page views).
-    consumers: ["dashboard", "reconciliation", "daily-reporting", "fba-plan", "buy-box-loss", "returns-leakage", "ppc-performance"],
+    consumers: ["dashboard", "reconciliation", "daily-reporting", "fba-plan", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-health-v3"],
   }),
   contract({
     key: "sales-traffic-asin-date",
@@ -72,7 +72,7 @@ export const SOURCE_CONTRACTS = [
     label: "Product Catalog by ASIN",
     grain: "asin-current",
     fields: ["child_asin", "parent_asin", "product_name", "product_brand", "sku", "product_root_category_name", "product_root_best_selling_rank", "product_description", "product_bullet_point_1", "product_bullet_point_2", "product_bullet_point_3", "product_bullet_point_4", "product_bullet_point_5", "product_image_url"],
-    consumers: ["dashboard", "reconciliation", "fba-plan", "keyword-rank", "content-changes", "sales-movers", "listing-health", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer", "brand-view"],
+    consumers: ["dashboard", "reconciliation", "fba-plan", "keyword-rank", "content-changes", "sales-movers", "listing-health", "listing-health-v3", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer", "brand-view"],
     cacheHours: 24,
   }),
   contract({
@@ -80,8 +80,8 @@ export const SOURCE_CONTRACTS = [
     ids: ["44fc5ba0ce81a7807601f6d7a9b8b7aaec64be4c7e046ea30dc6864d1a4aa823"],
     label: "FBA Inventory Health",
     grain: "sku-snapshot-day",
-    fields: ["date", "marketplace_country_code", "sku", "fnsku", "child_asin", "product_name", "currency", "available", "reserved_fc_transfer", "reserved_fc_processing", "inbound_working", "inbound_shipped", "inbound_received", "unfulfillable_quantity", "days_of_supply", "units_shipped_t30", "your_price", "sales_price", "featuredoffer_price", "lowest_price_new_plus_shipping", "alert"],
-    consumers: ["fba-plan", "sales-movers", "listing-health", "buy-box-loss", "brand-view"],
+    fields: ["date", "marketplace_country_code", "seller_or_vendor_id", "sku", "fnsku", "child_asin", "product_name", "currency", "available", "reserved_fc_transfer", "reserved_fc_processing", "inbound_working", "inbound_shipped", "inbound_received", "unfulfillable_quantity", "days_of_supply", "units_shipped_t30", "your_price", "sales_price", "featuredoffer_price", "lowest_price_new_plus_shipping", "alert"],
+    consumers: ["fba-plan", "sales-movers", "listing-health", "listing-health-v3", "buy-box-loss", "brand-view"],
     cacheHours: 8,
   }),
   contract({
@@ -89,8 +89,8 @@ export const SOURCE_CONTRACTS = [
     ids: ["ba689c05d7f7cee1a1690990c28995680a0654b7ed258230f4173d61bbcd1ab3"],
     label: "Listings",
     grain: "sku-current",
-    fields: ["sku", "fnsku", "child_asin", "listing_name", "listing_status", "listing_price_value", "listing_price_currency", "listing_current_quantity", "listing_pending_quantity", "fba_quantity_available", "fba_quantity_inbound", "fba_quantity_reserved", "listing_fulfillment_channel", "listing_open_date", "awd_available_distributable_quantity"],
-    consumers: ["fba-plan:awd", "listing-health"],
+    fields: ["seller_or_vendor_id", "marketplace_country_code", "sku", "fnsku", "child_asin", "listing_name", "listing_status", "listing_price_value", "listing_price_currency", "listing_current_quantity", "listing_pending_quantity", "fba_quantity_available", "fba_quantity_inbound", "fba_quantity_reserved", "listing_fulfillment_channel", "listing_open_date", "awd_available_distributable_quantity"],
+    consumers: ["fba-plan:awd", "listing-health", "listing-health-v3"],
     cacheHours: 12,
   }),
   contract({
@@ -98,8 +98,8 @@ export const SOURCE_CONTRACTS = [
     ids: ["6ea445cdc459f9fbb9517c5c009384da60ef31a1e70d4de9187ea3d4c28535c4"],
     label: "Listings (Raw JSON)",
     grain: "sku-current",
-    fields: ["sku", "child_asin", "summaries", "issues", "offers", "fulfillment_availability"],
-    consumers: ["listing-health"],
+    fields: ["seller_or_vendor_id", "marketplace_country_code", "sku", "child_asin", "summaries", "issues", "offers", "fulfillment_availability"],
+    consumers: ["listing-health", "listing-health-v3"],
     cacheHours: 12,
   }),
   contract({
@@ -191,6 +191,10 @@ export const REPORT_SOURCE_REQUIREMENTS = Object.freeze({
   "content-changes": ["content-changes", "product-catalog"],
   "sales-movers": ["sales-traffic-asin-date", "profit-by-sku-date", "fba-inventory-health", "product-catalog"],
   "listing-health": ["listings", "listings-raw", "profit-by-sku-date", "fba-inventory-health", "product-catalog"],
+  // Advanced Listing Health (shadow, listing-health/v3-oli-window): OLI (durable derived) replaces Profit-by-SKU;
+  // Listings + Listings Raw carry seller+marketplace for exact per-account attribution; FBA inventory + catalog reuse
+  // the existing request identities (no new export).
+  "listing-health-v3": ["order-line-items", "listings", "listings-raw", "fba-inventory-health", "product-catalog"],
   "buy-box-loss": ["order-line-items", "profit-by-sku-date", "fba-inventory-health", "product-catalog"],
   "returns-leakage": ["returns", "settlements", "order-line-items", "product-catalog"],
   "ppc-performance": ["ads-campaign-date", "ads-targeting-date", "ads-search-terms-date", "order-line-items", "product-catalog"],

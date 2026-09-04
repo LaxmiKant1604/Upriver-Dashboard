@@ -81,6 +81,7 @@ test("every current report declares source or upstream snapshot requirements", (
   const expected = [
     "brand-sales", "daily-reporting", "reconciliation", "fba-plan", "sku-pl",
     "keyword-rank", "content-changes", "sales-movers", "listing-health",
+    "listing-health-v3", // advanced Listing Health (shadow); OLI+catalog derived, listings/raw/inventory owned
     "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer",
     "brand-view", "priority-feed",
   ];

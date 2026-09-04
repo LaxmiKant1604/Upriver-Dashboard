@@ -63,8 +63,8 @@ export const SOURCE_REGISTRY = Object.freeze([
     scope: "seller",
     grain: "dated",
     batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
-    usedByReports: ["brand-sales", "daily-reporting", "reconciliation", "fba-plan", "buy-box-loss", "returns-leakage", "ppc-performance"],
-    usedByDashboards: ["brand-sales", "brand-view", "daily-reporting", "reconciliation", "fba-plan", "buy-box-loss", "returns-leakage", "ppc-performance", "priority-feed"],
+    usedByReports: ["brand-sales", "daily-reporting", "reconciliation", "fba-plan", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-health-v3"],
+    usedByDashboards: ["brand-sales", "brand-view", "daily-reporting", "reconciliation", "fba-plan", "buy-box-loss", "returns-leakage", "ppc-performance", "priority-feed", "listing-health-v3"],
     // Authorized durable OLI backfill: the complete missing window per <=5-seller batch (no 7-day pre-slicing),
     // SPLIT into contiguous chunks no larger than the proven application safety cap (MAX_OLI_EXPORT_WINDOW_DAYS).
     // A GENUINELY FIXED calendar start (2025-01-01), so the authorized window is [2025-01-01, asOf] for ANY asOf
@@ -87,8 +87,8 @@ export const SOURCE_REGISTRY = Object.freeze([
     scope: "organization",
     grain: "current-snapshot",
     batching: { mode: "organization", maxAccountsPerExport: null, marketplaceSafe: true },
-    usedByReports: ["brand-sales", "daily-reporting", "reconciliation", "fba-plan", "keyword-rank", "content-changes", "sales-movers", "listing-health", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer"],
-    usedByDashboards: ["brand-sales", "brand-view", "daily-reporting", "reconciliation", "fba-plan", "keyword-rank", "content-changes", "sales-movers", "listing-health", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer", "priority-feed"],
+    usedByReports: ["brand-sales", "daily-reporting", "reconciliation", "fba-plan", "keyword-rank", "content-changes", "sales-movers", "listing-health", "listing-health-v3", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer"],
+    usedByDashboards: ["brand-sales", "brand-view", "daily-reporting", "reconciliation", "fba-plan", "keyword-rank", "content-changes", "sales-movers", "listing-health", "listing-health-v3", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer", "priority-feed"],
     initialBackfill: { kind: "current-only" },
     // Once per day per ORGANIZATION -- never once per dashboard or per seller. A failed refresh preserves the
     // latest VALIDATED catalog (durable-snapshot semantics).
@@ -162,13 +162,13 @@ export const SOURCE_REGISTRY = Object.freeze([
     dataDoeSourceId: "ba689c05d7f7cee1a1690990c28995680a0654b7ed258230f4173d61bbcd1ab3",
     scope: "seller",
     grain: "current-snapshot",
-    // fba-plan:awd is a marketplace-safe seller-scoped batchable contract (LISTINGS_AWD_COLUMNS carries
-    // seller_or_vendor_id + marketplace_country_code), so the source declares stable-batch/5. listing-health's
+    // fba-plan:awd AND listing-health-v3:listings are marketplace-safe seller-scoped batchable contracts (they carry
+    // seller_or_vendor_id + marketplace_country_code), so the source declares stable-batch/5. listing-health's (v1)
     // own listings contract is NOT seller-scoped, so it still fetches per account (batching is driven by the
     // contract sourceScope, not this registry flag).
     batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
-    usedByReports: ["fba-plan", "listing-health"],
-    usedByDashboards: ["fba-plan", "listing-health", "priority-feed"],
+    usedByReports: ["fba-plan", "listing-health", "listing-health-v3"],
+    usedByDashboards: ["fba-plan", "listing-health", "listing-health-v3", "priority-feed"],
     initialBackfill: { kind: "current-only" },
     incrementalRefresh: { kind: "daily-snapshot", perOrganization: false },
     tokenClass: "premium",
@@ -180,9 +180,13 @@ export const SOURCE_REGISTRY = Object.freeze([
     dataDoeSourceId: "6ea445cdc459f9fbb9517c5c009384da60ef31a1e70d4de9187ea3d4c28535c4",
     scope: "seller",
     grain: "current-snapshot",
-    batching: { mode: "per-account", maxAccountsPerExport: 1, marketplaceSafe: true },
-    usedByReports: ["listing-health"],
-    usedByDashboards: ["listing-health", "priority-feed"],
+    // listing-health-v3:listings-raw is a marketplace-safe seller-scoped batchable contract (its columns carry
+    // seller_or_vendor_id + marketplace_country_code), so the source declares stable-batch/5 (consistency check #6).
+    // v1 listing-health's raw contract is NOT seller-scoped, so it still fetches per account (batching follows the
+    // contract sourceScope, not this registry flag) -- v1 behaviour is unchanged.
+    batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
+    usedByReports: ["listing-health", "listing-health-v3"],
+    usedByDashboards: ["listing-health", "listing-health-v3", "priority-feed"],
     initialBackfill: { kind: "current-only" },
     incrementalRefresh: { kind: "daily-snapshot", perOrganization: false },
     tokenClass: "standard",
@@ -199,8 +203,8 @@ export const SOURCE_REGISTRY = Object.freeze([
     // inventory contracts (sales-movers/listing-health/buy-box-loss, INSIGHT_INVENTORY_COLUMNS) are NOT
     // seller-scoped, so they still fetch per account -- unaffected (batching follows the contract, not this flag).
     batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
-    usedByReports: ["fba-plan", "sales-movers", "listing-health", "buy-box-loss"],
-    usedByDashboards: ["fba-plan", "sales-movers", "listing-health", "buy-box-loss", "brand-view", "priority-feed"],
+    usedByReports: ["fba-plan", "sales-movers", "listing-health", "listing-health-v3", "buy-box-loss"],
+    usedByDashboards: ["fba-plan", "sales-movers", "listing-health", "listing-health-v3", "buy-box-loss", "brand-view", "priority-feed"],
     // The latest VALIDATED current snapshot is what matters; historical inventory is never repeatedly
     // backfilled. Inventory ASINs join the SAME durable catalog brand map (never a second brand source).
     initialBackfill: { kind: "current-only" },

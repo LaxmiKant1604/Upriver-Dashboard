@@ -231,6 +231,17 @@ const LH_SALES_AGGREGATIONS = [
   { column: "profit", aggregation: "sum", alias: "profit_sum" },
 ];
 
+// listing-health-v3 (advanced, SHADOW: snapshotVersion listing-health/v3-oli-window). Listings + Listings Raw carry
+// seller_or_vendor_id + marketplace_country_code so a marketplace-safe <=5-seller batch splits back per account
+// (isolateFragmentRowsForOwner) + per marketplace (exact seller-marketplace pairs). Sales/units come from DURABLE
+// Order Line Items (a derived dependency, source_oli_daily_history), so there is NO Profit-by-SKU contract here at all.
+// The inventory + catalog contracts REUSE FBA_HEALTH_COLUMNS / INSIGHT_CATALOG_COLUMNS with the SAME limit/order, so
+// with the same window + account chunk they resolve to a request_hash byte-identical to fba-plan:inventory-health /
+// listing-health:catalog -- one shared export, no duplicate, and every existing FBA/insight hash is untouched (the
+// request-key is never folded into the hash).
+const LH_V3_LISTING_COLUMNS = ["seller_or_vendor_id", "marketplace_country_code", "sku", "child_asin", "listing_name", "listing_status", "listing_price_value", "listing_price_currency", "listing_current_quantity", "fba_quantity_available", "listing_fulfillment_channel", "listing_open_date"];
+const LH_V3_LISTING_RAW_COLUMNS = ["seller_or_vendor_id", "marketplace_country_code", "child_asin", "sku", "summaries", "issues", "offers"];
+
 // ppc.js — PPC's TACoS denominator (total account sales) comes from the shared canonical Order Line
 // Items sales fragment (OLI_SALES_*, Blocker 1); all advertising figures are derived from persisted rows.
 
@@ -772,6 +783,54 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       strict: true,
     },
   ],
+  // Advanced Listing Health (SHADOW / listing-health/v3-oli-window). Owned exports: listings + listings-raw (seller +
+  // marketplace, seller-scoped batchable) + inventory (REUSES fba-plan:inventory-health identity) + catalog (REUSES
+  // listing-health:catalog identity). OLI sales/units are a DERIVED durable dependency (REPORT_DERIVED_SOURCE_KEYS),
+  // never an owned export -- so a window change re-aggregates stored OLI and spends zero exports.
+  "listing-health-v3": [
+    {
+      requestKey: "listing-health-v3:listings",
+      sourceKey: "listings",
+      columns: LH_V3_LISTING_COLUMNS,
+      limit: 20000, // ROW_LIMITS.listings
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      windowKind: "none (no-date listings snapshot; seller+marketplace scoped)",
+      strict: true,
+    },
+    {
+      requestKey: "listing-health-v3:listings-raw",
+      sourceKey: "listings-raw",
+      columns: LH_V3_LISTING_RAW_COLUMNS,
+      limit: 20000, // ROW_LIMITS.listings
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "child_asin",
+      orderByDirection: "ASC",
+      windowKind: "none (no-date; optional listing-issues enrichment; seller+marketplace scoped)",
+      strict: true,
+      // Optional enrichment: a disabled Listings Raw table degrades (report saved with issuesAvailable:false), never blocks.
+      availabilityPolicy: { disabledSource: "degraded", safeCode: "SOURCE_DISABLED", reportOutcome: "save-unavailable-snapshot" },
+    },
+    {
+      requestKey: "listing-health-v3:inventory",
+      sourceKey: "fba-inventory-health",
+      columns: FBA_HEALTH_COLUMNS, // REUSE: identical columns/limit/order/window => same request_hash as fba-plan:inventory-health
+      limit: 50000, // PLAN_INVENTORY_ROW_LIMIT (matches fba-plan:inventory-health for hash reuse)
+      groupBy: null,
+      aggregations: null,
+      orderByColumn: "date",
+      orderByDirection: "DESC",
+      windowKind: "range:asOf-10d..asOf (REUSES the fba-plan:inventory-health export identity)",
+      strict: true,
+    },
+    // NOTE: Product Catalog is NOT an owned export here. Like fba-plan, v3 reuses the canonical org Product Catalog
+    // durable snapshot as a DERIVED dependency (REPORT_DERIVED_SOURCE_KEYS), injected via context -- no extra export,
+    // and an org-wide catalog row never proves account ownership (ownership comes from the account-scoped
+    // Listings/OLI/inventory evidence).
+  ],
   "ppc-performance": [
     {
       requestKey: "ppc-performance:oli-sales",
@@ -869,6 +928,10 @@ export const REPORT_DERIVED_SOURCE_KEYS = Object.freeze({
   // owned fba-plan export -- so opening/refreshing/publishing fba-plan spends ZERO tokens on OLI/catalog. Only the
   // FBA Inventory Health snapshot + the US-only AWD listing are owned (fetched) sources.
   "fba-plan": ["order-line-items", "product-catalog"],
+  // Advanced Listing Health (shadow): OLI sales/units read from durable source_oli_daily_history AND the org Product
+  // Catalog snapshot are DERIVED (no owned export), so a window change spends zero tokens. Its OWNED exports are only
+  // Listings + Listings Raw + inventory (the last reuses the fba-plan:inventory-health identity).
+  "listing-health-v3": ["order-line-items", "product-catalog"],
 });
 
 // Reports that create ZERO owned DataDoe exports: every figure comes from other
@@ -929,6 +992,12 @@ export const SELLER_SCOPED_REQUEST_KEYS = Object.freeze([
   "buy-box-loss:oli-sales",
   "returns-leakage:oli-sales",
   "ppc-performance:oli-sales",
+  // Advanced Listing Health (shadow): its Listings, Listings Raw and inventory contracts all carry
+  // seller_or_vendor_id + marketplace_country_code, so they are marketplace-safe <=5-seller batchable and split
+  // back per account (isolateFragmentRowsForOwner) + per exact seller-marketplace pair. (Its catalog is org-wide.)
+  "listing-health-v3:listings",
+  "listing-health-v3:listings-raw",
+  "listing-health-v3:inventory",
 ]);
 const SELLER_SCOPED_SET = new Set(SELLER_SCOPED_REQUEST_KEYS);
 
@@ -1024,6 +1093,7 @@ export const REPORT_SOURCE_COVERAGE = Object.freeze({
   "buy-box-loss": "complete", // daily buy-box (4x7-day slices) + ordered OLI (4x7-day slices), inventory, catalog
   "returns-leakage": "complete", // returns raw, settlements, traffic, catalog
   "listing-health": "complete", // listings, listings-raw (degraded), sales, inventory, catalog
+  "listing-health-v3": "shadow", // advanced/dormant: listings + listings-raw (degraded) + reused inventory/catalog; OLI derived durable
   "ppc-performance": "complete", // total-sales export + catalog; ads DERIVED from persisted rows
   "listing-optimizer": "complete", // SQP weekly (degraded) + richer content catalog
 });
