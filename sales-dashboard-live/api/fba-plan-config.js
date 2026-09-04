@@ -138,6 +138,15 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
     const accountId = S(req.method === "GET" ? req.query.accountId : bodyOf(req).accountId).trim();
     if (!accountId) { res.status(400).json({ error: "accountId is required." }); return; }
     deps.assertAccountAccess(access, [accountId]); // admins bypass; a member must hold this account
+    // F2: the FBA Shipment Plan report is DENY_FOR_BRAND_RESTRICTED_USERS, so its configuration endpoint must be
+    // denied to the SAME users -- CONSISTENTLY across GET and every POST kind (previously only the base GET stripped
+    // wddWeights/leadTimes and only the wdd/lead-time writes gated, leaving settings/sku-horizon/warehouse readable
+    // and writable by a brand-restricted account member). Admin / ALL_BRANDS pass unchanged; a SELECTED_BRANDS user
+    // gets 403 with no configuration returned and no mutation. This closes the read+write brand-scope gap.
+    if (!(await fbaPlanCapabilityAllowed(deps, access, accountId))) {
+      res.status(403).json({ error: "This report is not available for your brand-limited access." });
+      return;
+    }
     const organization_fingerprint = deps.orgFingerprint();
     const connectionId = "primary";
 

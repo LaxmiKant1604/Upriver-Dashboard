@@ -55,14 +55,16 @@ test("AUTHZ: a brand-restricted user is DENIED 403 on every new kind, with zero 
   passed += 1;
 });
 
-test("AUTHZ: GET strips the new WDD/lead-time fields for a brand-restricted user (existing config still returned)", async () => {
+test("AUTHZ (F2): GET is DENIED 403 for a brand-restricted user (whole FBA config, not just the new fields)", async () => {
+  // F2 fix: the fba-plan report is DENY_FOR_BRAND_RESTRICTED_USERS, so its ENTIRE config endpoint (GET + every POST
+  // kind) is now denied to a brand-restricted user -- previously the base GET returned settings/sku-horizon/warehouse
+  // and only stripped the new wdd/lead-time fields, which let a restricted account member read cross-brand planning
+  // config. A brand-restricted GET must now return 403 with NO configuration body.
   const { deps } = makeDeps({ restricted: true });
   const res = fakeRes();
   await handler(get("A"), res, deps);
-  assert.equal(res.statusCode, 200);
-  assert.deepEqual(res.body.wddWeights, []);
-  assert.deepEqual(res.body.leadTimes, []);
-  assert.ok("settings" in res.body && "warehouse" in res.body, "existing config fields preserved");
+  assert.equal(res.statusCode, 403);
+  assert.ok(!res.body || res.body.settings === undefined, "no configuration returned to a brand-restricted user");
   passed += 1;
 });
 test("AUTHZ: GET returns the new fields for an unrestricted user", async () => {

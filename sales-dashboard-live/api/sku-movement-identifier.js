@@ -8,9 +8,15 @@ import {
   DashboardAccessError, getDashboardAccess, assertAccountAccess,
   getSkuMovementIdentifiers, recordSkuMovementIdentifier, recordSkuMovementIdentifierBulk,
   getLatestReportSnapshotForScope, getAccountDirectorySnapshotAccounts, insertAuditLog,
+  getTrustedAccountBrands,
 } from "../lib/server/supabase.js";
 import { getDataDoeConnections } from "../lib/server/datadoe-connections.js";
 import { organizationFingerprint } from "../lib/server/source-identity.js";
+// F4: the sku-movement report is BRAND_DERIVABLE_FROM_ASIN_SKU (rows carry `brand` and are projected to the caller's
+// permitted brands on read). The identifier endpoint must apply the SAME brand scope to its reads and writes, using
+// the ONE central resolver -- never a browser-supplied brand.
+import { resolveUserReportScope, BrandAccessError } from "../lib/server/report-authorization.js";
+import { brandKey } from "../lib/server/reports/brand-membership.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const SKU_MOVEMENT_VERSION = "sku-movement/v2";
@@ -38,6 +44,7 @@ const DEFAULT_DEPS = {
   getDashboardAccess, assertAccountAccess,
   getSkuMovementIdentifiers, recordSkuMovementIdentifier, recordSkuMovementIdentifierBulk,
   getLatestReportSnapshotForScope, getAccountDirectorySnapshotAccounts, insertAuditLog, orgFingerprint,
+  resolveUserReportScope, getTrustedAccountBrands,
 };
 
 // The account's canonical marketplace (server-derived from the account-directory snapshot; NEVER from the browser).
@@ -50,15 +57,38 @@ async function accountMarketplace(deps, accountId) {
   return mkt;
 }
 
-// The set of ASINs proven for THIS account (from its latest ALL-brand SKU Movement snapshot). An ASIN not in this
-// set is unknown/cross-account and a write is rejected. FAIL CLOSED: a load error -> 503 before any write; a
-// genuinely-absent snapshot -> 400 (nothing to identify yet). This is the server-side ASIN-belongs-to-account gate.
-async function accountAsinAuthority(deps, { accountId }) {
+// The caller's brand scope for THIS account, via the ONE central resolver (never a browser-supplied brand). Admin /
+// ALL_BRANDS -> { restricted:false }; SELECTED_BRANDS -> { restricted:true, permitted:<canonical brand keys> }. Fails
+// closed: a BrandAccessError (e.g. no permitted brands) -> 403; any other resolver error -> 503. The gate-not-wired
+// path (a partial test mock without resolveUserReportScope) is treated as unrestricted, byte-identical to before.
+async function resolveCallerScope(deps, { access, accountId }) {
+  if (typeof deps.resolveUserReportScope !== "function") return { restricted: false, permitted: new Set() };
+  try {
+    const scope = await deps.resolveUserReportScope({ access, requestedAccountId: accountId, requestedBrand: "", action: "sku-movement", getTrustedBrands: deps.getTrustedAccountBrands });
+    return { restricted: !!scope.restricted, permitted: scope.permittedBrandKeys instanceof Set ? scope.permittedBrandKeys : new Set(scope.permittedBrandKeys || []) };
+  } catch (e) {
+    if (e instanceof BrandAccessError) throw new DashboardAccessError(e.message, e.status || 403);
+    throw new DashboardAccessError("Brand scope is temporarily unavailable; please retry.", 503);
+  }
+}
+
+// The set of ASINs the CALLER may act on for this account: the account's SKU Movement evidence, restricted to the
+// caller's permitted brands when they are brand-limited (unrestricted callers get every account ASIN, identical to
+// the prior all-brand authority). An ASIN not in this set is unknown / cross-account / cross-brand and a write is
+// rejected. FAIL CLOSED: a load error -> 503; a genuinely-absent snapshot -> 400 (nothing to identify yet).
+async function permittedAsinAuthority(deps, { accountId, scope }) {
   let snap;
   try { snap = await deps.getLatestReportSnapshotForScope({ reportKey: "sku-movement", accountId, reportVersion: SKU_MOVEMENT_VERSION, scope: { brand: "ALL" } }); } catch (_e) { throw new DashboardAccessError("SKU Movement evidence is temporarily unavailable; please retry.", 503); }
   const rows = snap && snap.payload && Array.isArray(snap.payload.rows) ? snap.payload.rows : null;
   if (!rows) throw new DashboardAccessError("No SKU Movement evidence for this account yet; identifiers can be set once the report is available.", 400);
-  return new Set(rows.map((r) => S(r.asin).trim().toUpperCase()).filter(Boolean));
+  const asins = new Set();
+  for (const r of rows) {
+    const asin = S(r.asin).trim().toUpperCase();
+    if (!asin) continue;
+    if (scope.restricted && !scope.permitted.has(brandKey(r.brand))) continue; // only the caller's permitted-brand ASINs
+    asins.add(asin);
+  }
+  return asins;
 }
 
 export async function handler(req, res, deps = DEFAULT_DEPS) {
@@ -71,8 +101,17 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
     const connectionId = "primary";
 
     if (req.method === "GET") {
+      const scope = await resolveCallerScope(deps, { access, accountId });
       const identifiers = await deps.getSkuMovementIdentifiers({ organizationFingerprint: organization_fingerprint, connectionId, accountId });
-      res.status(200).json({ identifiers });
+      if (!scope.restricted) { res.status(200).json({ identifiers }); return; } // admin / ALL_BRANDS -> full map (unchanged)
+      // F4: a brand-restricted caller sees only their permitted-brand identifiers. Fail closed: if the evidence
+      // snapshot is absent (nothing to scope against), return an empty map rather than the whole account's map.
+      let permitted;
+      try { permitted = await permittedAsinAuthority(deps, { accountId, scope }); }
+      catch (e) { if (e instanceof DashboardAccessError && e.status === 400) permitted = new Set(); else throw e; }
+      const filtered = {};
+      for (const [asin, id] of Object.entries(identifiers || {})) { if (permitted.has(S(asin).trim().toUpperCase())) filtered[asin] = id; }
+      res.status(200).json({ identifiers: filtered });
       return;
     }
 
@@ -80,17 +119,20 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
       const body = bodyOf(req);
       const kind = S(body.kind).trim() || "set";
       const marketplace = await accountMarketplace(deps, accountId);
+      // F4: resolve the caller's brand scope once; reads + writes below are limited to the caller's permitted-brand ASINs.
+      const scope = await resolveCallerScope(deps, { access, accountId });
 
       if (kind === "set") {
         const asin = S(body.childAsin).trim().toUpperCase();
         if (!asin) { res.status(400).json({ error: "childAsin is required." }); return; }
         const clean = cleanIdentifier(body.identifier);
         if (!clean.ok) { res.status(400).json({ error: clean.reason }); return; }
-        // A CLEAR (blank identifier) needs no ASIN authority (it only removes the account's own row); a SET must
-        // prove the ASIN belongs to this account's evidence.
-        if (clean.value !== "") {
-          const authority = await accountAsinAuthority(deps, { accountId });
-          if (!authority.has(asin)) { res.status(400).json({ error: `ASIN ${asin} is not in this account's SKU Movement evidence.` }); return; }
+        // A SET must prove the ASIN is within the caller's permitted-brand evidence. A CLEAR (blank) is unconditional
+        // for an unrestricted caller (preserves clearing a stale identifier whose ASIN left the evidence), but a
+        // brand-restricted caller must still own the ASIN's brand -- otherwise a clear would mutate another brand's row.
+        if (clean.value !== "" || scope.restricted) {
+          const authority = await permittedAsinAuthority(deps, { accountId, scope });
+          if (!authority.has(asin)) { res.status(400).json({ error: `ASIN ${asin} is not in this account's permitted SKU Movement evidence.` }); return; }
         }
         const result = await deps.recordSkuMovementIdentifier({
           organizationFingerprint: organization_fingerprint, connectionId, accountId, marketplace, childAsin: asin,
@@ -105,7 +147,7 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
         const rawRows = Array.isArray(body.rows) ? body.rows : null;
         if (!rawRows || rawRows.length === 0) { res.status(400).json({ error: "rows must be a non-empty array." }); return; }
         if (rawRows.length > 5000) { res.status(400).json({ error: "too many rows (max 5000 per import)." }); return; }
-        const authority = await accountAsinAuthority(deps, { accountId });
+        const authority = await permittedAsinAuthority(deps, { accountId, scope });
         // Server-side re-validation of EVERY row (the browser preview is never trusted): unknown ASIN, over-long /
         // control-char identifier, and duplicate-ASIN-conflicting-identifier -> ZERO writes (validated before the RPC).
         const norm = [];

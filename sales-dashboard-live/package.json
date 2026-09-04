@@ -113,7 +113,10 @@
     "test:gate7-rollout-publisher": "node scripts/gate7-rollout-publisher.test.js",
     "test:gate7b-in-cutover": "node scripts/gate7b-in-cutover.test.js",
     "verify": "node scripts/verify.mjs",
-    "db:migrate": "node scripts/apply-supabase-migrations.mjs"
+    "db:migrate": "node scripts/apply-supabase-migrations.mjs",
+    "test:fba-plan-config-brand-gate": "node scripts/fba-plan-config-brand-gate.test.js",
+    "test:sku-movement-identifier-brand-scope": "node scripts/sku-movement-identifier-brand-scope.test.js",
+    "test:permission-cache-window": "node scripts/permission-cache-window.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",

@@ -1487,8 +1487,18 @@ function openLargeCache() {
     request.onerror = () => reject(request.error);
   });
 }
+// F7: a barrier so a large-cache READ never races an in-flight owner purge. The IndexedDB purge on a permission
+// (access-fingerprint) change is async; without this, a report read fired in the same tick could return a
+// not-yet-deleted previous-scope payload. On a fingerprint change the purge effect assigns the purge promise via
+// setLargeCachePurgeBarrier; readLargeApiCache awaits it first. Resolved by default (no wait when nothing is
+// pending); a failed/blocked purge still unblocks reads (fail-safe) -- the fingerprint-keyed refetch is the backstop.
+let largeCachePurgeBarrier = Promise.resolve();
+function setLargeCachePurgeBarrier(promise) {
+  largeCachePurgeBarrier = Promise.resolve(promise).catch(() => {});
+}
 async function readLargeApiCache(params) {
   const key = apiCacheKey(params);
+  try { await largeCachePurgeBarrier; } catch (_e) { /* fail-safe: never block a read on a purge error */ }
   try {
     const db = await openLargeCache();
     const cached = await new Promise((resolve, reject) => {
@@ -1741,7 +1751,9 @@ function DashboardApp({ session, access, onSignOut }) {
       const fp = accessFingerprintClient(access);
       if (window.localStorage.getItem(fpKey) !== fp) {
         purgeAllOwnerReportCacheLocal();
-        void clearAllOwnerLargeCache();
+        // F7: arm the read barrier with THIS purge so any large-cache read (from the freshly-keyed remount below)
+        // waits for the previous-scope IndexedDB entries to be deleted before it can return anything.
+        setLargeCachePurgeBarrier(clearAllOwnerLargeCache());
         window.localStorage.setItem(fpKey, fp);
       }
     } catch (e) { /* storage may be unavailable; server authorization is final */ }
@@ -5579,7 +5591,13 @@ export default function App() {
   if (passwordSetup) return <LoginScreen passwordSetup />;
   if (accessError) return <div className="auth-root"><style>{STYLE}</style><div className="auth-panel"><div className="auth-logo">UR</div><div className="auth-title">Access unavailable</div><div className="auth-error"><AlertTriangle size={15} />{accessError}</div><button className="auth-submit" onClick={signOut}>Sign out</button></div></div>;
   if (!access) return <div className="auth-root"><style>{STYLE}</style><div className="loading-screen">Loading your dashboard access…</div></div>;
-  return <DashboardApp session={session} access={access} onSignOut={signOut} />;
+  // F3: key DashboardApp by the access-scope FINGERPRINT. A permission change (account/brand-scope/role) changes the
+  // fingerprint, so React atomically replaces the whole subtree with a fresh one -- discarding ALL previous-scope
+  // in-memory state (rows, catalogs, every report slice) and abandoning in-flight reads (their active/reqId guards
+  // land on the unmounted instance) in the SAME commit, so no previous-scope frame can paint under the new labels.
+  // A routine TOKEN_REFRESHED keeps the SAME fingerprint (access identity is preserved unless the scope changed), so
+  // it does NOT remount -- silent background refresh is preserved. Hook order is untouched (#310 correction intact).
+  return <DashboardApp key={accessFingerprintClient(access)} session={session} access={access} onSignOut={signOut} />;
 }
 
 async function removeUnauthorizedLargeCachedData(allowedAccountIds, isAdmin) {
