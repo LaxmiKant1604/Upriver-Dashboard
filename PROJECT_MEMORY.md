@@ -1,5 +1,37 @@
 # Project Memory
 
+## Permission-cache scope isolation: fingerprint-keyed cache/coalescer + fail-closed purge (2026-09-04)
+
+Closed the two remaining permission-cache findings. Browser cache/in-flight only; no report math/UI/schedulers/grants
+touched; no new serverless function; zero DataDoe / zero tokens. **Commit 80fab37; deployed SHA 80fab37 (Vercel
+Production success, bundle index-BE2IyL-i.js live).**
+
+- **Root causes**: (1) `apiCacheKey` + the module-global `sharedReadCoalescer` keyed by user+params, NOT the auth
+  fingerprint; the coalescer survives the DashboardApp remount, so after a narrowing a new subtree could JOIN an older
+  in-flight coalesced read, get revoked-brand data, and repopulate the cleared cache. (2) the large-cache purge barrier
+  swallowed purge failures and read anyway -> a failed IndexedDB purge could return previous-scope data.
+- **Fix** (new [src/lib/report-cache-scope.js](sales-dashboard-live/src/lib/report-cache-scope.js), wired in
+  [src/App.jsx](sales-dashboard-live/src/App.jsx)):
+  - `apiCacheKey` embeds the fingerprint as `__fp` -> every localStorage + IndexedDB key AND every coalescer key is
+    scope-qualified; a different scope can't read or join another scope's read; legacy (no `__fp`) entries never match.
+  - `configureReportCacheScope(accessFingerprintClient(access))` runs SYNCHRONOUSLY at the App root BEFORE the
+    (re)mounted subtree reads, advancing an auth GENERATION on fingerprint change; idempotent for an unchanged
+    fingerprint (silent token refresh stays silent, same-scope cache + dedup preserved).
+  - `loadSharedReport`/`refreshSharedReport`/`cachedApiGet`/`cachedLargeApiGet` capture the generation at creation and
+    reject an obsolete result (`AuthScopeChangedError`) BEFORE returning or writing.
+  - `readLargeApiCache` consults `reportLargeCacheBarrier.ready()` -> a failed/aborted purge => BYPASS the cache
+    (network read), never returns uncertain data, never deadlocks. `clearAllOwnerLargeCache` resolves on tx
+    `oncomplete`, REJECTS on `onabort`/`onerror`. `cachedBrandsForAccount` reads only current-`__fp` brand caches.
+- **Tests**: [scripts/permission-cache-scope.test.js](sales-dashboard-live/scripts/permission-cache-scope.test.js)
+  (25) REPRODUCES the leak with the REAL `createInFlightCoalescer` (unscoped key + no gen check -> new scope joins old
+  in-flight), then proves the fix (scoped key blocks the join, obsolete rejected without write, failed purge bypasses,
+  same-scope dedupe preserved, legacy keys ignored) + static App.jsx wiring. Updated permission-cache-window's F3/F7
+  assertions to the hardened barrier names. **verify 133/133 across 109 suites incl. build:check.**
+- **PENDING**: the authenticated multi-viewport browser pass (permission narrowing WITH a pending request, in a real
+  signed-in session) needs a browser tool / minted user token (neither available); proven instead via the real-
+  coalescer reproduction + fix-logic tests + full suite + build + live bundle. Note: local deletion cannot erase data
+  a previously-authorized user already received (server remains the boundary).
+
 ## Brand-isolation security fixes F1/F2/F3/F4/F7 (2026-09-04)
 
 Closed the brand-isolation gaps from the audit. LIVE-VERIFIED latent at implementation time (read-only DB check:
