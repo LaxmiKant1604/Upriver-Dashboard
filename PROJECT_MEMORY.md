@@ -1,5 +1,43 @@
 # Project Memory
 
+## Brand-isolation security fixes F1/F2/F3/F4/F7 (2026-09-04)
+
+Closed the brand-isolation gaps from the audit. LIVE-VERIFIED latent at implementation time (read-only DB check:
+`account_permissions.brand_scope_mode` = ALL_BRANDS x16, zero SELECTED_BRANDS, `account_brand_grant` = 0 rows), so
+there was no current victim -- but each gap goes live the moment a SELECTED_BRANDS grant is issued. **Code commit
+db8a204, migration commit 1b166df; deployed SHA 1b166df (Vercel Production success); F1 migration applied to prod +
+verified.** No formulas/permissions/schedulers/watchdogs/DataDoe touched; no new serverless function (still 12); zero
+DataDoe exports / zero tokens; zero customer-data mutations (F1 is a grant REVOKE, no data change).
+
+- **F1 (migration [20260918_revoke_direct_report_snapshot_reads.sql](sales-dashboard-live/supabase/migrations/20260918_revoke_direct_report_snapshot_reads.sql))**:
+  `report_snapshots` granted SELECT to `authenticated` with an ACCOUNT-only RLS policy (no brand predicate), so a
+  SELECTED_BRANDS user's JWT + the browser anon client could read all-brand inline payloads via direct PostgREST.
+  Since brand can't be filtered inside an account-wide JSON payload, the fail-closed fix is `REVOKE ALL ON
+  report_snapshots FROM anon, authenticated`. RLS left enabled (defense-in-depth); `service_role` (the API path)
+  intact. Applied via `MIGRATE_ONLY=... node scripts/apply-supabase-migrations.mjs`; verified live: anon/authenticated
+  have NO grants, service_role SELECT intact, RLS on, ledger recorded.
+- **F2 ([api/fba-plan-config.js](sales-dashboard-live/api/fba-plan-config.js))**: one top-level `fbaPlanCapabilityAllowed`
+  gate after `assertAccountAccess` -> GET + every POST kind (settings/sku-horizon/warehouse/warehouse-bulk/wdd/lead-time)
+  return 403 for a brand-restricted user (previously only new fields were stripped and only wdd/lead-time writes gated).
+- **F4 ([api/sku-movement-identifier.js](sales-dashboard-live/api/sku-movement-identifier.js))**: reads/writes scope to
+  the caller's permitted brands via central `resolveUserReportScope` (GET returns only permitted-brand identifiers;
+  set/clear/bulk validate every ASIN against permitted-brand evidence; bulk atomic; missing evidence fails closed).
+- **F3 ([src/App.jsx](sales-dashboard-live/src/App.jsx))**: `<DashboardApp key={accessFingerprintClient(access)}>` --
+  a permission change atomically remounts (drops all previous-scope in-memory state + in-flight reads in one commit,
+  no unauthorized frame); a token refresh keeps the same fingerprint -> no remount -> silent refresh preserved; hooks
+  unconditional ([[react-310-hook-order-fix]] intact).
+- **F7 (src/App.jsx)**: `largeCachePurgeBarrier` -- `readLargeApiCache` awaits the in-flight IndexedDB owner purge so a
+  read after a permission change can't return a not-yet-deleted previous-scope payload; failed purge still unblocks reads.
+- **Tests**: fba-plan-config-brand-gate (11), sku-movement-identifier-brand-scope (9), permission-cache-window (12,
+  real React via react-test-renderer + F7 barrier contract); updated the obsolete fba-wdd-config GET assertion (was
+  200-with-stripped-fields -> now 403); existing fba-plan-config-handler + sku-movement-identifier-api pass unchanged.
+  **verify 132/132 across 108 suites incl. build:check.**
+- **NOT closed here (out of scope, flagged for a decision)**: `cogs_overrides` + `ad_daily_metrics` share the same
+  account-only-RLS + authenticated-SELECT pattern as report_snapshots (same class as F1) but were not the named F1
+  finding; `dashboard_events` (realtime signal, no payload) intentionally left. **PENDING verification**: the
+  authenticated-user-JWT direct-PostgREST probe and the multi-viewport browser pass need a signed-in session (no
+  browser tool / no minted user token here); F1 is proven at the DB-grant layer instead.
+
 ## PROVEN blank-page root cause fixed: React #310 hook-after-early-return in DashboardApp (2026-09-04)
 
 The blank page/recovery screen had a CONFIRMED cause (production Console): **React error #310 "Rendered more hooks
