@@ -1,0 +1,25 @@
+-- F1 -- Prevent the direct-PostgREST report snapshot access bypass.
+--
+-- CONFIRMED (live, read-only): public.report_snapshots grants SELECT to the `authenticated` role and its RLS read
+-- policy ("Users can read their allowed snapshots") scopes to the ACCOUNT only (no brand predicate). Because the
+-- browser holds a real Supabase client (anon/publishable key) plus the signed-in user's JWT, a SELECTED_BRANDS user
+-- could call GET /rest/v1/report_snapshots?account_id=eq.<granted-account> directly and read the FULL, all-brands
+-- inline `payload` for any account they hold ANY grant on -- bypassing the brand projection the server API applies.
+-- (Latent today: brand_scope_mode is ALL_BRANDS for every current grant and the shipped client only calls
+-- supabase.auth.*; this closes the gap before any SELECTED_BRANDS grant is issued.)
+--
+-- WHY REVOKE (not a brand-aware RLS predicate): the payload is an account-wide JSON blob; a row-level policy cannot
+-- filter brands INSIDE a single JSON payload. The only fail-closed design is to remove direct client access entirely.
+-- Every legitimate read already goes through the Vercel API using the service-role key (which is unaffected by grants
+-- to anon/authenticated and bypasses RLS). Verified: no browser/realtime code path reads this table directly (src/
+-- uses only supabase.auth.*; report_snapshots is not in the realtime publication; no VIEW references it).
+--
+-- SCOPE: exactly one table, the confirmed finding. RLS stays ENABLED and the account-scoped SELECT policy is LEFT in
+-- place as defense-in-depth (it only matters if SELECT is ever re-granted). service_role keeps its explicit grants, so
+-- the server API + schedulers are byte-identical. No data, policy, RLS toggle, or snapshot content is changed.
+--
+-- ROLLBACK (if a direct browser read is ever genuinely required -- do NOT do this without first adding a brand-aware
+-- design, since the account-only policy would again expose all-brand payloads):
+--   grant select on table public.report_snapshots to authenticated;
+
+revoke all privileges on table public.report_snapshots from anon, authenticated;
