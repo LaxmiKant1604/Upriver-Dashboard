@@ -18,8 +18,61 @@
       rel="stylesheet"
       href="https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700;800&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap"
     />
+    <!--
+      Static boot surface. This paints during HTML parsing, BEFORE any JavaScript
+      runs, so the user never sees a blank white document while the bundle loads
+      or if it fails. It is removed only after React commits its first frame
+      (window.__upriverBootMounted, called by the top-level Error Boundary). If
+      the bundle never loads / never mounts, the inline script below swaps this
+      loading state for a calm, recoverable screen. No confidential detail, no
+      report data, no token is ever shown here.
+    -->
+    <style>
+      #boot-fallback{
+        position:fixed; inset:0; z-index:2147483000; display:flex; align-items:center; justify-content:center;
+        padding:24px; background:#0d1830; color:#e8edf7; text-align:center;
+        font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+      }
+      #boot-fallback .boot-card{ width:100%; max-width:420px; }
+      #boot-fallback .boot-mark{
+        width:44px; height:44px; margin:0 auto 18px; border-radius:11px; display:flex; align-items:center;
+        justify-content:center; font-weight:800; font-size:16px; letter-spacing:.06em; color:#0d1830;
+        background:linear-gradient(135deg,#7fb2ff,#38e0c4);
+      }
+      #boot-fallback .boot-title{ font-size:16px; font-weight:800; margin:0 0 6px; }
+      #boot-fallback .boot-sub{ font-size:13px; line-height:1.6; color:#9aa6c2; margin:0 0 18px; }
+      #boot-fallback .boot-spinner{
+        width:26px; height:26px; margin:14px auto 0; border-radius:50%;
+        border:3px solid rgba(127,178,255,.25); border-top-color:#7fb2ff; animation:boot-spin .8s linear infinite;
+      }
+      #boot-fallback .boot-actions{ display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }
+      #boot-fallback .boot-btn{
+        appearance:none; border:1px solid #2a3552; border-radius:9px; padding:10px 18px; cursor:pointer;
+        font-size:13px; font-weight:700; color:#e8edf7; background:transparent;
+      }
+      #boot-fallback .boot-btn.primary{ border-color:#7fb2ff; color:#0d1830; background:#7fb2ff; }
+      #boot-fallback .boot-ref{ margin-top:18px; font-size:11px; color:#6b7699; letter-spacing:.04em; }
+      @keyframes boot-spin{ to{ transform:rotate(360deg); } }
+      @media (prefers-reduced-motion: reduce){ #boot-fallback .boot-spinner{ animation:none; } }
+    </style>
+    <!--
+      Pre-React boot guard. An EXTERNAL same-origin classic (blocking, non-deferred)
+      script so it satisfies the strict CSP (script-src 'self') AND executes during
+      head parsing -- BEFORE the module bundle Vite injects below it -- so its
+      capture-phase error + mount handlers are registered before the bundle is even
+      fetched. It never auto-reloads more than once (sessionStorage-guarded), so it
+      can never loop. See public/boot-guard.js.
+    -->
+    <script src="/boot-guard.js"></script>
   </head>
   <body>
+    <div id="boot-fallback">
+      <div class="boot-card">
+        <div class="boot-mark">UR</div>
+        <div class="boot-title">Loading your workspace…</div>
+        <div class="boot-spinner"></div>
+      </div>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>

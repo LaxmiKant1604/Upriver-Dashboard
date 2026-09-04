@@ -12,6 +12,7 @@
     "test:water-capability": "node scripts/water-capability.test.mjs",
     "test:dashboard-transition": "node scripts/dashboard-transition.test.mjs",
     "test:session-stability": "node scripts/session-stability.test.js",
+    "test:boot-recovery": "node scripts/boot-recovery.test.js",
     "test:region-view": "node scripts/region-view.test.js",
     "test:regional-brand-view": "node scripts/regional-brand-view.test.js",
     "test:insights": "node scripts/test-insights.mjs",
