@@ -1,5 +1,51 @@
 # Project Memory
 
+## Never an unexplained blank page: static boot surface + top-level ErrorBoundary + bounded chunk recovery (2026-09-04)
+
+P0: the authenticated app could render a COMPLETELY BLANK white viewport (no sidebar/header/loading/error). Distinct
+from the earlier "Loading your Amazon accounts" takeover. Two architectural gaps made an *unexplained* blank page
+possible: (1) `index.html` had an empty `<div id="root">` with NO static boot surface, so a bundle that failed to
+load/evaluate -- a stale hashed chunk after a deploy in an old tab, a transient network failure on the main JS, or a
+synchronous module-eval throw -- painted nothing; (2) there was NO top-level React Error Boundary, so any
+render/effect throw unmounted the whole tree to blank. **Commit 3c68ce7** (LIVE, Vercel Production success).
+
+- **Static boot surface** (`index.html`): a `#boot-fallback` overlay paints "Loading your workspace..." during HTML
+  parse, before any JS; removed only after React commits (via `window.__upriverBootMounted`).
+- **External boot guard** ([public/boot-guard.js](sales-dashboard-live/public/boot-guard.js)): an EXTERNAL same-origin
+  classic script (satisfies the strict CSP `script-src 'self'` -- an inline script would have been BLOCKED and is the
+  trap to avoid), placed in `<head>` BEFORE Vite's module tag so its handlers register before the bundle is fetched.
+  It has a capture-phase `error` listener (catches a module that fails to load), an `unhandledrejection` handler, and
+  a no-mount watchdog; on failure it swaps the surface for a recovery screen (Retry / Sign out / non-sensitive
+  reference id, no raw error/token). A stale-deploy failure does ONE cache-busted reload, sessionStorage-guarded so it
+  can NEVER loop.
+- **RootErrorBoundary** ([src/components/RootErrorBoundary.jsx](sales-dashboard-live/src/components/RootErrorBoundary.jsx))
+  wraps `<App/>` in [src/main.jsx](sales-dashboard-live/src/main.jsx): any render/effect throw shows the same calm
+  recovery screen (self-contained INLINE styles so it renders even if the app stylesheet never mounted), and its
+  `componentDidMount` removes the boot surface whether it mounted the real shell OR the fallback. Sign out is
+  dependency-free (clears `sb-*`/`upriver:*` keys; never imports the possibly-broken Supabase client). `main.jsx` also
+  recovers a stale lazy chunk via Vite `vite:preloadError` with the same one-shot guard.
+- **Pure decisions** in [src/lib/boot-recovery.js](sales-dashboard-live/src/lib/boot-recovery.js)
+  (`shouldReloadForStaleChunk` one-shot guard, `isStaleChunkError`, `generateReferenceId`).
+- **Cache safety** (`vercel.json`): `index.html` + `/boot-guard.js` `max-age=0, must-revalidate` (an old tab recovers
+  after a deploy with no manual cache clear); hashed `/assets/*` `immutable` (a fresh index.html always references
+  same-deployment assets). CSP unchanged (still `script-src 'self'`, no `unsafe-inline` added). No service worker
+  exists or was added. **No new `api/*.js`** -> 12-function cap preserved ([[vercel-function-cap]]).
+- WaterBackground/WebGL failure was already caught (CSS fallback) and cannot crash the tree (asserted). Auth/account
+  loading/error/unauthenticated states + TOKEN_REFRESHED/focus non-teardown are the prior [[session-swr-loading-fix]]
+  (still covered by session-stability). No formula/data/permission/routing/scheduler/DataDoe change. **Zero DataDoe /
+  zero tokens.**
+- **Tests**: [scripts/boot-recovery.test.js](sales-dashboard-live/scripts/boot-recovery.test.js) (42) -- one-shot
+  stale-chunk reload (never a loop), stale-chunk detection, non-sensitive reference id, and static proofs the boot
+  surface + external guard-before-module + boundary + preload recovery + cache headers are wired and leak no error
+  detail; wired into verify. **verify 126/126 across 102 suites incl. build:check**; the built `dist/index.html`
+  emits the guard before the module; three.module stays a separate lazy chunk.
+- **LIMITATION (unchanged this session)**: production is behind Vercel Deployment Protection (SSO 302 on `/`,
+  `/index.html`, `/assets/*`, `/boot-guard.js`, `/api/*`), and no browser automation is available here, so the
+  authenticated production reproduction (Phase 1) and the real-browser multi-viewport pass (Phase 5) could NOT be run.
+  The blank-page TRIGGER therefore remains unproven in production; the recovery architecture is defensive and
+  guarantees no *unexplained* blank page regardless of trigger. Verified: build emits the surfaces, full suite,
+  deployed SHA 3c68ce7, and 302 gating on all paths.
+
 ## Regional Brand View + searchable selectors + global Account/Brand switch (2026-09-04)
 
 Brand View (the cross-account portfolio, header "Brand view" toggle -> `dashboardMode==="brand"` -> `BrandPortfolio`)
