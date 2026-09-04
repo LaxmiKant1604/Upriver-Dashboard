@@ -55,8 +55,12 @@ import {
 // purge makes reads bypass (network) instead of returning previous-scope data.
 import {
   configureReportCacheScope, cacheFingerprintId, currentAuthGeneration, isObsoleteGeneration,
-  AuthScopeChangedError, createPurgeBarrier,
+  AuthScopeChangedError, isAuthScopeChangedError, createPurgeBarrier,
 } from "./lib/report-cache-scope.js";
+// The async IndexedDB/localStorage read+write core, threaded an IMMUTABLE per-request identity (captured key +
+// generation) so a late storage failure or a mid-flight scope change can never write an obsolete-scope body under the
+// current scope's key, nor return a revoked payload. The genuine async writer lives here so it is unit-testable.
+import { scopedLargeRead, runCachedLargeGet, runSharedLoad } from "./lib/report-cache-io.js";
 import SalesMovers from "./views/SalesMovers.jsx";
 import SkuMovement from "./views/SkuMovement.jsx";
 import DailyReporting from "./views/DailyReporting.jsx";
@@ -1480,7 +1484,8 @@ async function cachedApiGet(params, { force = false } = {}) {
   const generation = currentAuthGeneration();
   if (!force) {
     const cached = readApiCache(params);
-    if (cached) return { ...cached, fromCache: true };
+    // Validate the captured generation before returning any cached result -- an obsolete-scope hit is never served.
+    if (cached) { if (isObsoleteGeneration(generation)) throw new AuthScopeChangedError(); return { ...cached, fromCache: true }; }
   }
   const body = await apiGet(params);
   if (isObsoleteGeneration(generation)) throw new AuthScopeChangedError();
@@ -1507,50 +1512,31 @@ function openLargeCache() {
 // ok:false, and the reader BYPASSES the cache and does an authorized network read (fail closed) rather than returning
 // possibly-previous-scope data; it never rejects, so a read can never deadlock.
 const reportLargeCacheBarrier = createPurgeBarrier();
-async function readLargeApiCache(params) {
-  const key = apiCacheKey(params);
-  const { ok: purgeOk } = await reportLargeCacheBarrier.ready();
-  // Fail closed: if the last owner purge did not verifiably complete, the on-disk cache for this scope is untrustworthy
-  // -- bypass it (null) so the caller performs an authorized network read instead of reusing an uncertain entry.
-  if (!purgeOk) return null;
-  try {
-    const db = await openLargeCache();
-    const cached = await new Promise((resolve, reject) => {
-      const request = db.transaction(LARGE_CACHE_STORE, "readonly").objectStore(LARGE_CACHE_STORE).get(key);
-      request.onsuccess = () => resolve(request.result || null);
-      request.onerror = () => reject(request.error);
-    });
-    db.close();
-    return cached || readApiCache(params);
-  } catch (e) {
-    return readApiCache(params);
-  }
+// The injected I/O dependencies the report-cache-io core operates on. Bundled here (not recomputed inside the core) so
+// the real IndexedDB open, object store, localStorage fallback, and purge barrier are swappable with fakes in tests.
+function largeCacheIO() {
+  return {
+    openLargeCache,
+    largeStore: LARGE_CACHE_STORE,
+    storage: (typeof window !== "undefined" ? window.localStorage : null),
+    purgeBarrier: reportLargeCacheBarrier,
+  };
 }
-async function writeLargeApiCache(params, body) {
-  const cachedAt = Date.now();
-  const key = apiCacheKey(params);
-  try {
-    const db = await openLargeCache();
-    await new Promise((resolve, reject) => {
-      const request = db.transaction(LARGE_CACHE_STORE, "readwrite").objectStore(LARGE_CACHE_STORE).put({ body, cachedAt }, key);
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
-    db.close();
-    return cachedAt;
-  } catch (e) {
-    return writeApiCache(params, body);
-  }
+// Read one large-cache entry under the CAPTURED key (honors the purge barrier; localStorage fallback under the SAME key).
+async function readLargeApiCache(params) {
+  return scopedLargeRead(apiCacheKey(params), largeCacheIO());
 }
 async function cachedLargeApiGet(params, { force = false } = {}) {
-  const generation = currentAuthGeneration();
-  if (!force) {
-    const cached = await readLargeApiCache(params);
-    if (cached) return { ...cached, fromCache: true };
-  }
-  const body = await apiGet(params);
-  if (isObsoleteGeneration(generation)) throw new AuthScopeChangedError();
-  return { body, cachedAt: await writeLargeApiCache(params, body), fromCache: false };
+  // Capture the immutable request identity (exact key + authorization generation) at creation; the core re-validates the
+  // generation after the async read and after the write, so a mid-flight scope change can neither return a revoked cache
+  // hit nor persist an obsolete body -- and, because the key is captured, never under a different scope's key.
+  return runCachedLargeGet({
+    key: apiCacheKey(params),
+    generation: currentAuthGeneration(),
+    force,
+    apiGet: () => apiGet(params),
+    io: largeCacheIO(),
+  });
 }
 
 /* ===== Shared report layer (the six insight reports) =====
@@ -1576,24 +1562,21 @@ async function cachedLargeApiGet(params, { force = false } = {}) {
 const sharedReadCoalescer = createInFlightCoalescer();
 
 async function loadSharedReport(params) {
-  // Capture the authorization generation at REQUEST creation. The coalescer key (apiCacheKey) carries the fingerprint,
-  // so a different scope cannot join this in-flight read; and if the scope changes before this resolves, we reject the
-  // obsolete result BEFORE it can be returned to a consumer or written to the cache under the new scope's key.
+  // Capture the immutable request identity (exact key + authorization generation) at REQUEST creation. The coalescer key
+  // carries the fingerprint, so a different scope cannot join this in-flight read; runSharedLoad then re-validates the
+  // captured generation before writing OR returning, so a scope change mid-flight rejects the obsolete result instead of
+  // returning it or persisting it under the new scope's key.
+  const key = apiCacheKey(params);
   const generation = currentAuthGeneration();
-  return sharedReadCoalescer.run(apiCacheKey(params), async () => {
-    const body = await apiGet(params);
-    if (isObsoleteGeneration(generation)) throw new AuthScopeChangedError();
-    return { body, cachedAt: await writeLargeApiCache(params, body), fromCache: false };
-  });
+  return sharedReadCoalescer.run(key, () => runSharedLoad({ key, generation, apiGet: () => apiGet(params), io: largeCacheIO() }));
 }
 
 async function refreshSharedReport(params) {
   // `refresh` is deliberately NOT part of the cache key, so a refreshed report
   // and a read of the same scope share one cache entry.
+  const key = apiCacheKey(params);
   const generation = currentAuthGeneration();
-  const body = await apiGet({ ...params, refresh: "1" });
-  if (isObsoleteGeneration(generation)) throw new AuthScopeChangedError();
-  return { body, cachedAt: await writeLargeApiCache(params, body), fromCache: false };
+  return runSharedLoad({ key, generation, apiGet: () => apiGet({ ...params, refresh: "1" }), io: largeCacheIO() });
 }
 
 function readSharedReportCache(params) {
@@ -1667,6 +1650,10 @@ function useSharedReport({ params, active }) {
       setCachedAt(new Date(result.cachedAt));
     } catch (loadError) {
       if (myId !== reqId.current) return;
+      // The authorization scope changed while this read was in flight: the fingerprint remount is already replacing this
+      // subtree, so drop the response SILENTLY -- never show an error and never fall back to the (now previous-scope)
+      // browser copy. This is a scope transition, not a storage failure.
+      if (isAuthScopeChangedError(loadError)) return;
       setError(cached
         ? `Showing the last copy saved in this browser. The shared snapshot could not be read: ${loadError.message}`
         : loadError.message);
@@ -1688,7 +1675,8 @@ function useSharedReport({ params, active }) {
       setData(result.body);
       setCachedAt(new Date(result.cachedAt));
     } catch (refreshError) {
-      setError(refreshError.message);
+      // Scope changed mid-refresh -> the remount supersedes this; drop it silently rather than surfacing an error.
+      if (!isAuthScopeChangedError(refreshError)) setError(refreshError.message);
     } finally {
       refreshing.current = false;
       setLoading(false);
@@ -5610,6 +5598,15 @@ export default function App() {
     if (supabase) await supabase.auth.signOut();
     setSession(null); setAccess(null); configureApiSession(null); accessFpRef.current = null;
   }, []);
+
+  // The no-access states below (sign-out, session loss, password setup, access error, or still loading) return BEFORE the
+  // dashboard renders and before the success-path configureReportCacheScope runs. Invalidate the cache/coalescer scope
+  // here for all of them: an empty scope advances the authorization generation away from any signed-in scope, so a
+  // report read still in flight from a previous signed-in mount is REJECTED (AuthScopeChangedError) instead of resolving
+  // and writing to the cache after access is gone. Idempotent, so a steady signed-in or signed-out state causes no
+  // generation churn -- a silent token refresh stays silent.
+  const scopeActive = Boolean(supabase && authReady && session && !passwordSetup && !accessError && access);
+  if (!scopeActive) configureReportCacheScope("");
 
   if (!supabase) return <div className="auth-root"><style>{STYLE}</style><div className="auth-panel"><div className="auth-logo">UR</div><div className="auth-title">Login setup incomplete</div><div className="auth-sub">The public Supabase browser configuration is missing from Vercel.</div></div></div>;
   if (!authReady) return <div className="auth-root"><style>{STYLE}</style><div className="loading-screen">Loading secure session…</div></div>;

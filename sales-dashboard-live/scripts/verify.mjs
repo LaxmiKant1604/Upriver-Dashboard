@@ -41,6 +41,7 @@ const SUITES = [
   "test:sku-movement-identifier-brand-scope",
   "test:permission-cache-window",
   "test:permission-cache-scope",
+  "test:report-cache-io",
   "test:region-view",
   "test:regional-brand-view",
   "test:insights",

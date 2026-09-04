@@ -194,7 +194,9 @@ const guardWindow = app.slice(Math.max(0, accountLoadingIdx - 220), accountLoadi
 ok("account-loading full page is gated by the cold state (isColdAccountState)", /isColdAccountState\(accounts\.length\)/.test(guardWindow));
 ok("account-loading full page is no longer a bare `if (accountsLoading)`", !/if \(accountsLoading\) \{\s*$/.test(guardWindow.split("\n").slice(-3).join("\n")));
 
-// Account-directory reads are coalesced through the shared read layer.
-ok("loadSharedReport coalesces concurrent reads", /createInFlightCoalescer\(\)/.test(app) && /\.run\(apiCacheKey\(params\)/.test(app));
+// Account-directory reads are coalesced through the shared read layer, keyed by the captured (fingerprint-scoped) key.
+ok("loadSharedReport coalesces concurrent reads keyed by the captured cache key",
+  /createInFlightCoalescer\(\)/.test(app)
+  && /async function loadSharedReport[\s\S]{0,800}const key = apiCacheKey\(params\)[\s\S]{0,300}sharedReadCoalescer\.run\(key,/.test(app));
 
 writeSync(1, `\nsession-stability: ${passed} assertions passed\n`);

@@ -187,12 +187,14 @@ ok("App establishes the cache scope before the subtree reads (configureReportCac
   /const scopeFingerprint = accessFingerprintClient\(access\);/.test(app)
   && /configureReportCacheScope\(scopeFingerprint\);/.test(app)
   && app.indexOf("configureReportCacheScope(scopeFingerprint);") < app.indexOf("<DashboardApp key={scopeFingerprint}"));
-ok("loadSharedReport captures the generation and rejects obsolete before write/return",
-  /async function loadSharedReport[\s\S]{0,700}currentAuthGeneration\(\)[\s\S]{0,700}isObsoleteGeneration\(/.test(app));
-ok("refreshSharedReport also rejects an obsolete-scope response before write",
-  /async function refreshSharedReport[\s\S]{0,700}currentAuthGeneration\(\)[\s\S]{0,700}isObsoleteGeneration\(/.test(app));
-ok("readLargeApiCache bypasses the cache when the purge barrier reports failure",
-  /report(Large)?CacheBarrier\.ready\(\)/.test(app) && /if \(!.*\bok\b/.test(app));
+ok("loadSharedReport captures the generation + key and runs the obsolete-guarded shared load inside the coalescer",
+  /async function loadSharedReport[\s\S]{0,500}const generation = currentAuthGeneration\(\)[\s\S]{0,300}sharedReadCoalescer\.run\([\s\S]{0,160}runSharedLoad\(/.test(app));
+ok("refreshSharedReport captures the generation + key and delegates to the obsolete-guarded shared load",
+  /async function refreshSharedReport[\s\S]{0,500}const generation = currentAuthGeneration\(\)[\s\S]{0,300}runSharedLoad\(/.test(app));
+// The purge-barrier gate (bypass on a failed/aborted purge) now lives in the report-cache-io core; App threads the
+// hardened barrier into it and readLargeApiCache delegates there.
+ok("App threads the purge barrier into the cache I/O core, and readLargeApiCache delegates to it",
+  /purgeBarrier: reportLargeCacheBarrier/.test(app) && /function readLargeApiCache[\s\S]{0,200}scopedLargeRead\(/.test(app));
 ok("the permission-change purge ARMS the barrier", /CacheBarrier\.arm\(clearAllOwnerLargeCache\(\)\)/.test(app));
 ok("clearAllOwnerLargeCache keys off TRANSACTION completion/abort (not only request success)",
   /\.oncomplete\s*=/.test(app) && /\.onabort\s*=/.test(app));

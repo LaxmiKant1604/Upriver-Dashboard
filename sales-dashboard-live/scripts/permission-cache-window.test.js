@@ -81,7 +81,8 @@ await (async () => {
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const app = readFileSync(path.join(root, "src/App.jsx"), "utf8");
 ok("App keys DashboardApp by the access fingerprint (F3)", /<DashboardApp key=\{scopeFingerprint\}/.test(app) && /const scopeFingerprint = accessFingerprintClient\(access\);/.test(app));
-ok("readLargeApiCache consults the purge barrier (F7, now the hardened reportLargeCacheBarrier)", /reportLargeCacheBarrier\.ready\(\)/.test(app));
+ok("readLargeApiCache consults the purge barrier (F7): App threads the hardened reportLargeCacheBarrier into the cache I/O core it delegates to",
+  /purgeBarrier: reportLargeCacheBarrier/.test(app) && /function readLargeApiCache[\s\S]{0,200}scopedLargeRead\(/.test(app));
 ok("the permission-change purge ARMS the barrier with the large-cache purge (F7)", /reportLargeCacheBarrier\.arm\(clearAllOwnerLargeCache\(\)\)/.test(app));
 ok("cache keys remain owner-namespaced (no cross-user reuse)", /API_CACHE_PREFIX \+ encodeURIComponent\(apiCacheOwner\)/.test(app));
 
