@@ -15,6 +15,7 @@
     "test:boot-recovery": "node scripts/boot-recovery.test.js",
     "test:boot-guard-behavior": "node scripts/boot-guard-behavior.test.js",
     "test:boundary-behavior": "node scripts/boundary-behavior.test.js",
+    "test:hook-order": "node scripts/hook-order.test.js",
     "test:region-view": "node scripts/region-view.test.js",
     "test:regional-brand-view": "node scripts/regional-brand-view.test.js",
     "test:insights": "node scripts/test-insights.mjs",
@@ -125,6 +126,7 @@
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",
     "pg": "^8.22.0",
+    "react-test-renderer": "^18.3.1",
     "vite": "^5.4.8"
   }
 }

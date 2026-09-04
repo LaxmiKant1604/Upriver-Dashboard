@@ -4055,6 +4055,23 @@ function DashboardApp({ session, access, onSignOut }) {
   // which are two different states and get two different screens.
   const hasDashboardData = scopedRows.length > 0;
 
+  // GLOBAL Account/Brand view switch (available on every scoped report page). Switching to Brand View remembers the
+  // account-context report to return to and opens the portfolio workspace (view "dashboard", mode "brand") with the
+  // remembered valid region/brand; switching back to Account View restores that report and its filters. Idempotent:
+  // re-selecting the active mode does nothing, so it never clobbers the remembered view.
+  // IMPORTANT: this useCallback MUST stay ABOVE the early-return guards below. A hook placed after a conditional
+  // return is skipped on the loading render and run on the loaded render, changing the hook count between renders
+  // (React #310 "Rendered more hooks than during the previous render") -- which blanked the app into the recovery
+  // screen. Keeping every hook before the first `return` guarantees a stable hook order on every render.
+  const handleDashboardModeChange = useCallback((next) => {
+    if (next === "brand") {
+      if (dashboardMode !== "brand") { setAccountReturnView(view); setView("dashboard"); setDashboardMode("brand"); }
+    } else if (dashboardMode !== "account") {
+      setDashboardMode("account");
+      setView(accountReturnView || "dashboard");
+    }
+  }, [dashboardMode, view, accountReturnView]);
+
   if (!isAdmin && access.accountIds.length === 0) {
     return <div className="dash-root"><style>{STYLE}</style><div className="loading-screen"><ShieldCheck size={24} style={{ marginBottom: 10 }} /><strong>No Amazon accounts assigned</strong><div style={{ marginTop: 8 }}>Your administrator must assign an account before you can view dashboard data.</div><button className="cache-refresh-btn" onClick={onSignOut}><LogOut size={14} />Sign out</button></div></div>;
   }
@@ -4156,19 +4173,9 @@ function DashboardApp({ session, access, onSignOut }) {
   // global scope cluster is hidden there rather than showing two account
   // pickers that could disagree. Every other view keeps its existing header.
   const showGlobalScope = view !== "access" && view !== "sync-center" && view !== "brandview";
-
-  // GLOBAL Account/Brand view switch (available on every scoped report page). Switching to Brand View remembers the
-  // account-context report to return to and opens the portfolio workspace (view "dashboard", mode "brand") with the
-  // remembered valid region/brand; switching back to Account View restores that report and its filters. Idempotent:
-  // re-selecting the active mode does nothing, so it never clobbers the remembered view.
-  const handleDashboardModeChange = useCallback((next) => {
-    if (next === "brand") {
-      if (dashboardMode !== "brand") { setAccountReturnView(view); setView("dashboard"); setDashboardMode("brand"); }
-    } else if (dashboardMode !== "account") {
-      setDashboardMode("account");
-      setView(accountReturnView || "dashboard");
-    }
-  }, [dashboardMode, view, accountReturnView]);
+  // NOTE: handleDashboardModeChange (a useCallback) is declared ABOVE the early-return guards, not here -- a hook
+  // after a conditional return changes the hook count between the loading and loaded renders (React #310). See its
+  // definition near hasDashboardData.
 
   return (
     <div className="dash-root">

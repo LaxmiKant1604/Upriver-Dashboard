@@ -36,6 +36,7 @@ const SUITES = [
   "test:boot-recovery",
   "test:boot-guard-behavior",
   "test:boundary-behavior",
+  "test:hook-order",
   "test:region-view",
   "test:regional-brand-view",
   "test:insights",
