@@ -1,5 +1,37 @@
 # Project Memory
 
+## PROVEN blank-page root cause fixed: React #310 hook-after-early-return in DashboardApp (2026-09-04)
+
+The blank page/recovery screen had a CONFIRMED cause (production Console): **React error #310 "Rendered more hooks
+than during the previous render"**, `useCallback` in `DashboardApp` (minified `Dbe`, bundle `index-Dx6B7p38.js`).
+
+- **Root cause**: `handleDashboardModeChange` (a `useCallback`, added with the regional Brand View switch in ec47a7e)
+  sat AFTER `DashboardApp`'s early-return guards (`if (accountsLoading && isColdAccountState(...))` / accountsError /
+  no-accounts). Cold load: render 1 hits the loading guard -> returns early -> the useCallback is SKIPPED; render 2
+  (accounts arrived) -> no early return -> the useCallback RUNS -> more hooks than the previous render -> React
+  unmounts the tree -> RootErrorBoundary shows recovery. Retry = reload = same cold path, which is exactly why Retry
+  never cleared it. It was effectively deterministic on cold load, not truly "intermittent".
+- **Fix (minimal, [src/App.jsx](sales-dashboard-live/src/App.jsx))**: moved the `handleDashboardModeChange` useCallback
+  ABOVE the early-return guards (declared near `hasDashboardData`), so every hook runs unconditionally in the same
+  order every render. No dependency-array change, no lint rule disabled, no key-remount/reload/timer; stable shell +
+  background refresh + request-race guards untouched. Boundary stays a backstop only. `App()` was already clean (all
+  hooks before its returns).
+- **Reproduced with REAL React before fixing** ([scripts/hook-order.test.js](sales-dashboard-live/scripts/hook-order.test.js), 13):
+  `react-test-renderer` renders the exact defect shape (hook after a conditional early return) across a
+  loading->loaded update and THROWS #310; the corrected shape renders both states with no throw (and loaded->loading,
+  no #300). Plus a source guard over the real App.jsx: handleDashboardModeChange is before the guards + no top-level
+  hook between DashboardApp's first guard and its render return + App() has no hook after its bootstrap guards -- FAILS
+  pre-fix, passes after. Added `react-test-renderer@18.3.1` as a TEST-ONLY devDep (not imported by the app; bundle +
+  12-function ceiling unchanged). Wired into verify. **verify 129/129 across 105 suites incl. build:check.**
+- **Deploy**: **commit 1ef3aaf**, Vercel Production success. The alias
+  https://upriverdashboard.vercel.app/ now serves the corrected bundle **index-pGxCRJau.js** (was the crashing
+  Dx6B7p38); root 200, `/api/*` 401 (auth intact), boot surface present. New visits get the corrected build; an
+  already-open crashed tab needs ONE normal reload (no-cache index.html -> new bundle). Zero DataDoe / zero tokens.
+- **PENDING**: the authenticated multi-viewport visual pass (1440/1280/768/390: cold load renders the workspace,
+  controls work, Console clean) is NOT done -- no browser-automation tool in the agent env. The fix is a textbook
+  Rules-of-Hooks correction proven by real-React re-render + a live corrected bundle; confidence is high but the final
+  authenticated visual confirmation needs the user's browser or a browser tool.
+
 ## Blank-page follow-up: correct PUBLIC alias verified + boot-guard watchdog cleanup + real behavioral tests (2026-09-04)
 
 Correcting an earlier wrong assumption: the production ALIAS **https://upriverdashboard.vercel.app/** (no hyphens)
