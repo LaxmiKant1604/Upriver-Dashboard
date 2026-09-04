@@ -1,5 +1,35 @@
 # Project Memory
 
+## Blank-page follow-up: correct PUBLIC alias verified + boot-guard watchdog cleanup + real behavioral tests (2026-09-04)
+
+Correcting an earlier wrong assumption: the production ALIAS **https://upriverdashboard.vercel.app/** (no hyphens)
+is PUBLIC and healthy -- it was the deployment-specific `upriver-dashboard-*-projects.vercel.app` URLs that are
+SSO-gated, NOT the alias. Verified via real HTTP against the alias: root **200**; `/api/datadoe?action=accounts`
+**401** (application authorization works -- not an SSO 302); the static boot surface + `/boot-guard.js` (loaded BEFORE
+the module) + `/assets/index-*.js` and all lazy chunks (three.module / xlsx-read / brand-view-export) all **200**;
+`Cache-Control` = must-revalidate on index.html + boot-guard.js and immutable on `/assets/*`; CSP intact
+(`script-src 'self'`); and the boot/recovery code (`vite:preloadError`, `__upriverBootMounted`, recovery copy) is
+compiled into the live bundle. So the current deployment is internally consistent (no stale-chunk 404) and the P0
+blank-page DEFENCES are live.
+
+Audited the recovery patch ([[blank-page-boot-recovery]]) against the real production CSP and the task's defect list;
+one real gap fixed: the no-mount watchdog is now CLEARED in `__upriverBootMounted` (retained id + clearTimeout), not
+just disabled by the flag, so a healthy app leaves no dangling timer. Everything else held (benign resource failures
+do not escalate; post-mount errors are inert; one-shot reload guard is fail-safe when storage is blocked; Retry
+reloads; Sign out clears only sb-*/upriver:*). **Commit 34329db** (LIVE, Vercel Production success).
+
+Replaced string-only coverage with BEHAVIOURAL tests that execute the real code:
+`scripts/boot-guard-behavior.test.js` (26) runs the actual `public/boot-guard.js` in a simulated browser (node:vm);
+`scripts/boundary-behavior.test.js` (9) transpiles the real `RootErrorBoundary` (esbuild) and renders it
+(react-dom/server) -- proving render errors -> recovery (no raw-error/token leak), healthy children pass through,
+one-shot reload never loops, storage-denied fail-safe, and post-mount inertness. Both wired into verify. **verify
+128/128 across 104 suites incl. build:check.** Zero DataDoe / zero tokens; no new api/*.js.
+
+STILL UNVERIFIED / not done: the ORIGINAL blank-page failure was never reproduced (no browser-automation tool is
+available in the agent environment, so the authenticated multi-viewport interaction pass at 1440/1280/768/390 was NOT
+run). The fix is defensive and guarantees no *unexplained* blank page regardless of trigger; the specific original
+trigger remains unproven. To close it, an authenticated browser session (the user's, or a browser tool) is required.
+
 ## Never an unexplained blank page: static boot surface + top-level ErrorBoundary + bounded chunk recovery (2026-09-04)
 
 P0: the authenticated app could render a COMPLETELY BLANK white viewport (no sidebar/header/loading/error). Distinct
