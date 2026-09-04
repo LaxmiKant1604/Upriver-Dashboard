@@ -2,8 +2,8 @@
 // pipeline used identically by the CLI operator, the automatic scheduler, and the Data Sync Center route.
 //
 // Proves the state machine with pure doubles (ZERO I/O): the FETCH phase runs the shadow dispatch under the
-// dedicated `${bucket}-fba` cycle namespace and finalizes on drain; the PUBLISH phase opens the guarded gates,
-// publishes only preflight-ready accounts, ALWAYS safe-closes (success/partial/failure), reads back each live
+// dedicated `${bucket}-fba` cycle namespace under a guarded fetch envelope and finalizes on drain; the PUBLISH
+// phase reopens the guarded gates, publishes only ready accounts, ALWAYS safe-closes (success/partial/failure), reads back each live
 // pair, and runs the ownership backfill; the hard token ceiling refuses over-budget plans with zero creates;
 // blocked (stale-OLI) accounts are never published (LKG untouched); and a replay on an already-terminal cycle is
 // a zero-create idempotent no-op. Also proves the release composition wires the guarded fba-plan control package
@@ -33,7 +33,7 @@ let COMP; // fba-plan-release-composition.js
 // ---- doubles -----------------------------------------------------------------------------------------------
 // A runtime double: the shadow dispatch drains after `drainAfter` run() calls; the dedicated cycle is created on
 // the first run and finalized to `finalizeStatus`. Records every run() arg + the cycle-bucket used.
-function makeRuntime({ drainAfter = 1, finalizeStatus = "succeeded", preTerminal = null } = {}) {
+function makeRuntime({ drainAfter = 1, finalizeStatus = "succeeded", preTerminal = null, events = null } = {}) {
   const runArgs = [];
   let cur = preTerminal; // {id, status} | null
   let runCalls = 0;
@@ -43,6 +43,7 @@ function makeRuntime({ drainAfter = 1, finalizeStatus = "succeeded", preTerminal
     get finalizeCalls() { return finalizeCalls; },
     runArgs,
     run: async (args) => {
+      if (events) events.push("runtime.run");
       runCalls += 1;
       runArgs.push(args);
       if (!cur) cur = { id: "cyc-" + args.cycleBucket, status: "running" };
@@ -51,7 +52,18 @@ function makeRuntime({ drainAfter = 1, finalizeStatus = "succeeded", preTerminal
     },
     store: {
       getCycleByBucketDate: async (_b, _d) => cur,
-      finalizeCycle: async ({ cycleId }) => { finalizeCalls += 1; cur = { id: cycleId, status: finalizeStatus }; return { disposition: cur.status === finalizeStatus ? "finalized" : "already-terminal", cycle: { status: finalizeStatus } }; },
+      finalizeCycle: async ({ cycleId }) => { if (events) events.push("runtime.finalize"); finalizeCalls += 1; cur = { id: cycleId, status: finalizeStatus }; return { disposition: cur.status === finalizeStatus ? "finalized" : "already-terminal", cycle: { status: finalizeStatus } }; },
+    },
+  };
+}
+function makeNoCycleRuntime() {
+  let runCalls = 0;
+  return {
+    get runCalls() { return runCalls; },
+    run: async () => { runCalls += 1; return { cycleId: null, drained: true, continuationRequired: false }; },
+    store: {
+      getCycleByBucketDate: async () => null,
+      finalizeCycle: async () => { throw new Error("must not finalize a missing cycle"); },
     },
   };
 }
@@ -73,9 +85,13 @@ function makePublisher({ badPreflight = new Set(), badPublish = new Set() } = {}
     },
   };
 }
-function makeControls() {
+function makeControls(events = null) {
   const calls = [];
-  return { calls, apply: async () => { calls.push("apply"); }, close: async () => { calls.push("close"); } };
+  return {
+    calls,
+    apply: async () => { calls.push("apply"); if (events) events.push("controls.apply"); },
+    close: async () => { calls.push("close"); if (events) events.push("controls.close"); },
+  };
 }
 const okReadback = async () => ({ ok: true });
 
@@ -111,6 +127,9 @@ test("isFbaOperationSource: fba-inventory-health + listings only", () => {
 test("fbaCycleBucket: namespaces the cycle so it never collides with the scheduler-v2 daily cycle", () => {
   assert.equal(OP.fbaCycleBucket("us"), "us-fba");
   assert.equal(OP.fbaCycleBucket("non-us"), "non-us-fba");
+  assert.equal(OP.fbaCycleBucket("india"), "india-fba");
+  assert.equal(OP.fbaCycleBucket("europe-au"), "europe-au-fba");
+  assert.equal(OP.fbaCycleBucket("us-ca"), "us-ca-fba");
 });
 
 test("fbaServerCeiling: yesterday (never past server D-1)", () => {
@@ -178,10 +197,11 @@ test("HARD token ceiling: an over-budget plan refuses with zero fetch/creates", 
 
 test("FETCH not drained (slice budget) -> phase sync continuation; cycle NOT finalized", async () => {
   const runtime = makeRuntime({ drainAfter: 99 }); // never drains in one bounded slice
+  const controls = makeControls();
   let calls = 0;
   const r = await OP.advanceFbaPlanBucket({
     bucket: "non-us", asOf: "2026-08-29", includedIds: ["a1"], bucketAccounts: [{ accountId: "a1", country: "DE" }], cost: OK_COST, maxTokens: 80,
-    runtime, publisher: makePublisher(), controls: makeControls(), readbackLive: okReadback,
+    runtime, publisher: makePublisher(), controls, readbackLive: okReadback,
     outOfTime: () => (++calls > 1), // out of time after the first run
   });
   assert.equal(r.phase, "sync");
@@ -189,12 +209,30 @@ test("FETCH not drained (slice budget) -> phase sync continuation; cycle NOT fin
   assert.equal(runtime.finalizeCalls, 0, "un-drained fetch never finalizes");
   assert.equal(runtime.runArgs[0].cycleBucket, "non-us-fba", "dedicated cycle namespace");
   assert.equal(runtime.runArgs[0].bucket, "non-us", "account scope is the real bucket");
+  assert.deepEqual(controls.calls, ["apply", "close"], "fetch continuation safe-closes its rollout envelope");
+});
+
+test("FALSE-SUCCESS GUARD: drained runtime with no regional cycle fails before finalize/publish", async () => {
+  const runtime = makeNoCycleRuntime();
+  const publisher = makePublisher();
+  const controls = makeControls();
+  const r = await OP.advanceFbaPlanBucket({
+    bucket: "india", asOf: "2026-09-02", includedIds: ["a1"], bucketAccounts: [{ accountId: "a1", country: "IN" }],
+    cost: OK_COST, maxTokens: 80, runtime, publisher, controls, readbackLive: okReadback,
+  });
+  assert.equal(r.phase, "sync");
+  assert.equal(r.ok, false);
+  assert.match(r.problems[0], /without a dedicated india-fba cycle/);
+  assert.equal(runtime.runCalls, 1);
+  assert.equal(publisher.calls.publish.length, 0, "old snapshots are never published after a fetch no-op");
+  assert.deepEqual(controls.calls, ["apply", "close"], "the failed fetch is still safe-closed");
 });
 
 test("HAPPY PATH: fetch drains -> finalize -> publish -> read-back -> ownership -> complete", async () => {
-  const runtime = makeRuntime({ drainAfter: 1 });
+  const events = [];
+  const runtime = makeRuntime({ drainAfter: 1, events });
   const publisher = makePublisher();
-  const controls = makeControls();
+  const controls = makeControls(events);
   let ownershipRan = 0;
   const r = await OP.advanceFbaPlanBucket({
     bucket: "us", asOf: "2026-08-29", includedIds: ["a1", "a2"], bucketAccounts: [{ accountId: "a1", country: "US" }, { accountId: "a2", country: "US" }], cost: OK_COST, maxTokens: 80,
@@ -206,7 +244,8 @@ test("HAPPY PATH: fetch drains -> finalize -> publish -> read-back -> ownership 
   assert.equal(r.published, 2);
   assert.equal(r.readback, 2);
   assert.equal(runtime.finalizeCalls, 1);
-  assert.deepEqual(controls.calls, ["apply", "close"], "gates opened then ALWAYS safe-closed");
+  assert.deepEqual(controls.calls, ["apply", "close", "apply", "close"], "fetch and publish each run inside an ALWAYS-safe-closed envelope");
+  assert.deepEqual(events.slice(0, 4), ["controls.apply", "runtime.run", "runtime.finalize", "controls.close"], "fetch rollout opens before runtime I/O and closes after finalization");
   assert.equal(publisher.calls.publish.length, 2);
   assert.equal(publisher.calls.preflight.length, 0, "single publish pass (no redundant preflight gate) -- convergence fix");
   assert.equal(ownershipRan, 1, "ownership backfill runs on the completion path");

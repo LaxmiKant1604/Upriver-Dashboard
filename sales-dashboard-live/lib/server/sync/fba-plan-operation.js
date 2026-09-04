@@ -4,9 +4,9 @@
 //   - the Data Sync Center route  (api/admin/sources.js): runs ONE bounded slice per POST, resumed by polling.
 //
 // It runs the SAME reviewed Scheduler-v2 machinery every path uses: the shadow dispatcher (batched
-// marketplace-safe FBA Inventory Health + US Listings/AWD fetch, durable OLI + Catalog derive -- NEVER a new
+// marketplace-safe FBA Inventory Health + AWD-capable Listings fetch, durable OLI + Catalog derive -- NEVER a new
 // OLI/Catalog/Ads export), the four-gate CAS publisher, the guarded fba-plan control package, an
-// ALWAYS-safe-close publication envelope, a hard token ceiling, and the durable operation identity (the
+// ALWAYS-safe-close fetch + publication envelopes, a hard token ceiling, and the durable operation identity (the
 // DEDICATED `${bucket}-fba` cycle at as-of = D-1). There is NO parallel implementation: the route and the
 // operator call THIS module.
 //
@@ -197,38 +197,58 @@ export async function advanceFbaPlanBucket({
 
   // ---------------- FETCH phase: shadow dispatch until drained (or the slice budget runs out) ----------------
   if (!(cycle && cycleId && TERMINAL.has(S(cycle.status)))) {
-    let drained = false;
-    for (let slice = 1; slice <= maxSlices; slice += 1) {
-      // cycleBucket namespaces the fba-plan cycle; the account scope is still the REAL bucket (us|non-us).
-      const res = await runtime.run({
-        bucket, cycleBucket, cycleDate: asOf, asOf, asOfFor: () => asOf,
-        manualReportKeys: ["fba-plan"], trigger, deadlineMs, reserveMs,
-      });
-      cycleId = res.cycleId || cycleId;
-      log(bucket + " fetch slice " + slice + ": cycle=" + S(cycleId).slice(0, 8) + " drained=" + res.drained + (res.deadlineReached ? " (deadline)" : ""));
-      if (res.drained === true) { drained = true; break; }
-      if (res.continuationRequired !== true && res.stoppedForBudget !== true && res.deadlineReached !== true) {
-        return { ...base, phase: "sync", ok: false, problems: [bucket + " dispatch stopped un-drained without requesting continuation"] };
+    // The shared runtime enforces the durable account-rollout gate even for manual report dispatches. The global
+    // rollout is deliberately safe-closed between operations, so the FBA control package MUST be active while
+    // fetching as well as while publishing. Otherwise the runtime returns a drained no-op with cycleId=null,
+    // creates no DataDoe export, and a later publish can accidentally observe an older snapshot. Keep this a
+    // separate bounded envelope so every continuation/error safe-closes before returning to its caller.
+    await controls.apply();
+    try {
+      let drained = false;
+      for (let slice = 1; slice <= maxSlices; slice += 1) {
+        // cycleBucket namespaces the fba-plan cycle; the account scope is still the REAL routing region/bucket.
+        const res = await runtime.run({
+          bucket, cycleBucket, cycleDate: asOf, asOf, asOfFor: () => asOf,
+          manualReportKeys: ["fba-plan"], trigger, deadlineMs, reserveMs,
+        });
+        cycleId = res.cycleId || cycleId;
+        log(bucket + " fetch slice " + slice + ": cycle=" + S(cycleId).slice(0, 8) + " drained=" + res.drained + (res.deadlineReached ? " (deadline)" : ""));
+        // A non-empty FBA operation can never drain without opening/resuming its dedicated cycle. This is a hard
+        // false-success guard: do not finalize or publish older snapshots when rollout/readiness prevented fetch.
+        if (!cycleId) {
+          return { ...base, phase: "sync", ok: false, problems: [bucket + " dispatch returned without a dedicated " + cycleBucket + " cycle; zero FBA exports were executed"] };
+        }
+        if (res.drained === true) { drained = true; break; }
+        if (res.continuationRequired !== true && res.stoppedForBudget !== true && res.deadlineReached !== true) {
+          return { ...base, phase: "sync", ok: false, problems: [bucket + " dispatch stopped un-drained without requesting continuation"] };
+        }
+        if (outOfTime()) return { ...base, phase: "sync", continuationRequired: true, cycleId };
+        if (slice === maxSlices) return { ...base, phase: "sync", ok: false, problems: [bucket + " dispatch did not drain within the slice budget"] };
       }
-      if (outOfTime()) return { ...base, phase: "sync", continuationRequired: true, cycleId };
-      if (slice === maxSlices) return { ...base, phase: "sync", ok: false, problems: [bucket + " dispatch did not drain within the slice budget"] };
-    }
-    if (!drained) return { ...base, phase: "sync", continuationRequired: true, cycleId };
+      if (!drained) return { ...base, phase: "sync", continuationRequired: true, cycleId };
 
-    // FINALIZE the DEDICATED fba-plan cycle (a manualReportKeys dispatch never auto-finalizes a shared cycle;
-    // this cycle is dedicated, and the four-gate publisher requires a validated job in a terminal cycle).
-    // Idempotent: an already-terminal cycle returns "already-terminal".
-    if (cycleId) {
+      // FINALIZE the DEDICATED fba-plan cycle (a manualReportKeys dispatch never auto-finalizes a shared cycle;
+      // this cycle is dedicated, and the four-gate publisher requires a validated job in a terminal cycle).
+      // Idempotent: an already-terminal cycle returns "already-terminal".
       const disp = await runtime.store.finalizeCycle({ cycleId });
       const status = disp && disp.cycle && disp.cycle.status;
       log(bucket + " cycle finalized: disposition=" + (disp && disp.disposition) + " status=" + status);
       if (!disp || !OK_FINALIZE.has(S(disp.disposition)) || !TERMINAL.has(S(status))) {
         return { ...base, phase: "sync", ok: false, problems: [bucket + " fba-plan cycle did not reach a terminal status: " + JSON.stringify(disp)] };
       }
+    } finally {
+      await controls.close();
     }
     cycle = await cycleOf();
     // Let the caller re-enter for the publish phase on a fresh budget if the fetch consumed the slice.
     if (outOfTime()) return { ...base, phase: "publish", continuationRequired: true, cycleId };
+  }
+
+  // Re-read and prove the exact regional FBA cycle before opening publication controls. A missing, mismatched, or
+  // non-terminal row is never allowed to fall through to publisher.publish(), which may otherwise find an older
+  // successful report job and make a stale snapshot appear like a fresh scheduled result.
+  if (!cycle || !cycleId || S(cycle.id) !== S(cycleId) || !TERMINAL.has(S(cycle.status))) {
+    return { ...base, phase: "sync", ok: false, problems: [bucket + " dedicated " + cycleBucket + " cycle is missing, mismatched, or non-terminal; refusing stale publication"] };
   }
 
   // ---------------- PUBLISH phase: open gates -> preflight+publish -> ALWAYS safe-close -> read-back ----------
