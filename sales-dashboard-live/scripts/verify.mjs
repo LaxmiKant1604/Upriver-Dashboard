@@ -42,6 +42,8 @@ const SUITES = [
   "test:permission-cache-window",
   "test:permission-cache-scope",
   "test:report-cache-io",
+  "test:listing-health-advanced",
+  "test:listing-health-advanced-regressions",
   "test:region-view",
   "test:regional-brand-view",
   "test:insights",

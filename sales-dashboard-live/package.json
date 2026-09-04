@@ -119,7 +119,9 @@
     "test:sku-movement-identifier-brand-scope": "node scripts/sku-movement-identifier-brand-scope.test.js",
     "test:permission-cache-window": "node scripts/permission-cache-window.test.js",
     "test:permission-cache-scope": "node scripts/permission-cache-scope.test.js",
-    "test:report-cache-io": "node scripts/report-cache-io.test.js"
+    "test:report-cache-io": "node scripts/report-cache-io.test.js",
+    "test:listing-health-advanced": "node scripts/report-listing-health-advanced.test.js",
+    "test:listing-health-advanced-regressions": "node scripts/report-listing-health-advanced-regressions.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",
