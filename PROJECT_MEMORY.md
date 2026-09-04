@@ -1,5 +1,49 @@
 # Project Memory
 
+## Regional Brand View + searchable selectors + global Account/Brand switch (2026-09-04)
+
+Brand View (the cross-account portfolio, header "Brand view" toggle -> `dashboardMode==="brand"` -> `BrandPortfolio`)
+now selects a REGION first, then a brand within it. The SINGLE canonical marketplace->region mapping the scheduler
+owns (`regionForMarketplace` / `REGIONS` / `REGION_SCHEDULE` in `lib/server/sync/campaign-region-routing.js`, pure)
+is reused everywhere -- NO second mapping was created. **Commit ec47a7e** (LIVE, Vercel Production success).
+
+- **Client Region -> Brand** (`src/lib/region-view.js` + `src/App.jsx`): `regionsForAccounts` offers only regions the
+  user has authorized accounts in; `accountsInRegion` / `accountRegion` derive membership from each account's trusted
+  `country`. A newly-connected account inherits its region automatically (recomputed every render; no stored
+  assignment); an unknown marketplace -> `unassigned`, never a region. `portfolioBrandList` is region-scoped (empty
+  until a region resolves); `portfolioAccounts` and the v1-directory discovery are intersected with the region set.
+  `resolveSelectedRegion` keeps a still-valid region else the first available; on a region CHANGE the selected brand
+  is kept only if `selectedBrandInRegion`, else cleared (never silently substituted).
+- **Server enforcement** (`lib/server/reports/region-scope.js` + `api/datadoe.js` `brand-view-portfolio`): the route
+  validates region (`normalizeRegionParam` -> 400 "Invalid region", no disclosure) and RE-FILTERS the authorized
+  account set from TRUSTED directory country (`filterAccountIdsToRegion`), so a browser can never smuggle a
+  cross-region account into a region rollup; unknown/absent marketplace is fail-closed OUT. Region joins the snapshot
+  identity (`params.region` + `staleScopeKeys:["region"]`) so a region's data is never served -- even as stale LKG --
+  under another region. NO region param => byte-identical legacy path. The filter is role-INDEPENDENT (an admin's
+  explicit region is respected); existing SELECTED_BRANDS/ALL_BRANDS/`authorizedAccountsForBrand` authorization is
+  unchanged and orthogonal. No new `api/*.js` -> the 12-function ceiling is preserved (see [[vercel-function-cap]]).
+- **Global Account/Brand switch + stable header** (`src/components/shell.jsx` + `App.jsx`): the view switch shows on
+  EVERY scoped report page (`onDashboardModeChange={showGlobalScope ? handleDashboardModeChange : undefined}`).
+  Switching to Brand View remembers the account-context report (`accountReturnView`) and opens the portfolio with the
+  remembered valid region/brand; Account View restores that report + filters. Both modes carry two scope controls
+  (Account+Brand or Region+Brand) with stable widths, so the header never shifts; no capability gate weakened.
+- **Searchable selectors** (`SearchableSelect` in shell.jsx): Account + Brand (incl. the regional portfolio Brand)
+  are accessible comboboxes (roles combobox/listbox/option, Arrow/Home/End/Enter/Escape/Tab, focus returns to the
+  trigger on close, value preserved on close/clear, bounded scroll, mobile full-width). Account search matches
+  name/marketplace/currency; only the already-authorized option list is searched (no hidden matches / global counts).
+  Region is a short native `<select>` (three fixed scheduler regions).
+- **No** scheduler/watchdog/batching/source-contract/report-formula/permission/history change; no retired ASIN Ads or
+  auto Returns export; **ZERO DataDoe creates / zero tokens** (region selection reads saved snapshots only). Builds on
+  and preserves the [[session-swr-loading-fix]] (no full-page takeover / no WaterBackground remount on scope change).
+- **Tests**: `scripts/region-view.test.js` (33) + `scripts/regional-brand-view.test.js` (43) -- three-region routing,
+  new-account inheritance, unassigned handling, same-brand-across-regions disambiguation, server region validation +
+  cross-region drop + fail-closed unknown + role-independence, region in the snapshot identity, and the full
+  header/App/BrandPortfolio wiring; both wired into `verify`. **verify 125/125 across 101 suites incl. build:check**;
+  three.module stays a separate 684 kB lazy chunk. Production deployment (ec47a7e) is behind Vercel Deployment
+  Protection (SSO 302 on `/` and `/api/*`), so an authenticated multi-viewport browser pass was not possible from the
+  agent environment (no browser automation + SSO gate) -- verification was code + reproduction/behavioral tests +
+  full suite + build + deployed-SHA/gating checks.
+
 ## Stable stale-while-revalidate: no full-page "Loading your Amazon accounts..." on tab-refocus / token refresh (2026-09-04)
 
 Defect: returning to the tab, or a routine Supabase token refresh, sometimes replaced the WHOLE authenticated app
