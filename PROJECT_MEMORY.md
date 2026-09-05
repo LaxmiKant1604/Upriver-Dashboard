@@ -14389,3 +14389,50 @@ inventory batches -- verify with a fresh dry-run showing inventoryAdoptable=true
 Consider (follow-up) investigating why the FBA India 3-seller inventory batch did not cache (transient vs persistent),
 and whether the operator should derive PER-ACCOUNT (5 now, 3 deferred) rather than all-or-nothing on inventory.
 UNCHANGED: LISTING_HEALTH_V3 false; no api/*.js added; no control/cron/watchdog/scheduler change; no v1/formula change.
+
+---
+
+## 2026-09-05 -- India FBA Inventory [5,3] TRUNCATED incident: root-caused, regression-guarded (commit 3bd708e, PUSHED). ZERO exports/tokens.
+
+INVESTIGATION (read-only; balance 3288 unchanged): the "missing" 3-seller India FBA inventory batch is NOT missing --
+it FAILED. Full lifecycle of both canonical fba-plan:inventory-health hashes for cycle india-fba/2026-09-05:
+- batch[5] hash 5fd6e7a598d3...: fetch_status=succeeded, create_export_count=1, export_id 6ba460b4..., 14732 rows,
+  fetched 2026-09-05T03:34:33Z, cached (expires 23:34Z). Its 5 accounts derived+published.
+- batch[3] hash c807c4e204cc...: fetch_status=FAILED, create_export_count=1, export_id 375e14a4..., error_stage=validate,
+  error_code=TRUNCATED, terminal=true, row_count=50000 (== the create `limit` = PLAN_INVENTORY_ROW_LIMIT). NOT saved.
+ROOT CAUSE: the 3-seller batch's combined inventory exceeds the 50000-row export cap. createExport() sends `limit`, so
+the DataDoe export is capped AT SOURCE at 50000; the STRICT validator (source-worker step 6) rejects a cap-sized page as
+TRUNCATED ("partial data would be misleading") -> terminal, never saved. Classification = download/validation failure
+(TRUNCATED, oversized batch) -- NOT never-planned / pending / budget-excluded / deadline-deferred / cache / accounting.
+It is a legitimate DATA-VOLUME failure, handled FAIL-CLOSED + HONESTLY.
+
+HONESTY VERIFIED (already correct): cycle status=partial; the 3 affected accounts (d65844/e5ce6a/fd7653) are
+fetch=blocked / derive=skipped / save=skipped (SOURCE_BLOCKED), their LIVE fba-plan snapshots NOT refreshed (LKG
+preserved) -- the region is NEVER reported as fully fresh. The 5 batch[5] accounts are fetch=ready/derive+save=succeeded.
+No frozen tranche-budget rows (FBA uses the token-ceiling path, not the frozen reservation). v3's canary correctly saw
+5/8 inventory fresh. EVERY Phase-3 correctness property (registration, resumption, budget, deadline, watchdog, honest
+partial region, no-recreate, per-account honesty, no-duplicate-cycle, [5,3] support) is ALREADY satisfied -> NO
+orchestration code defect; no production code changed.
+
+RECOVERY: IMPOSSIBLE via the existing export -- it is capped at source (re-download yields the same truncated 50000)
+AND is terminal at stage=validate (ineligible for the download-only recovery path, which requires stage poll/download +
+terminal:false). ZERO new exports were created (strict spend rule honored). Recovering the 3 accounts REQUIRES a NEW
+export: either the batch split into smaller sub-batches (down to single-seller; each a new create) OR a higher inventory
+row cap (which changes the FBA request_hash -- a larger reviewed change). Expected token cost of the split recovery:
+up to 3 single-seller Listings-... no -- inventory-health exports (STANDARD, ~2 tokens each) => ~2-6 tokens, IF each
+isolated seller is under the 50000 cap; a single seller still over the cap needs a higher limit instead.
+
+DELIVERABLE: regression guard scripts/report-fba-inventory-truncated.test.js (14) reproduces the exact 8-account [5,3]
+TRUNCATED through the REAL source worker + proves the honest behavior (both batches planned strict/50000; 5-seller
+saves+isolated; 3-seller TRUNCATES terminal + not saved; replay zero new creates; report gate 5 ready / 3 blocked).
+No production/FBA-formula/column/AWD/OLI/Ads/Catalog/Returns/v1/permission/selector/cron/concurrency change; no new
+api/*.js; LISTING_HEALTH_V3 stays false; v3 not triggered. verify 144/144, 120 suites.
+
+REMAINING / RECOMMENDED (separately authorized): (1) a ONE-region authorized FBA inventory recovery for India's 3-seller
+batch -- run it as split single-seller inventory exports (each strict/50000). If any single seller still truncates, that
+account needs a reviewed higher inventory row cap (hash change). (2) The permanent self-heal enhancement: reactive
+per-seller batch-split on TRUNCATED for seller-scoped inventory (isolate a truncated batch's sellers into single-seller
+batches on the next cycle; keep other batches' hashes byte-identical; escalate honestly when a single seller alone
+exceeds the cap). This changes shared FBA (+ v3-reuse) batching and MUST be validated with authorized exports -- do it
+in a dedicated, export-budgeted phase, not under a zero-export rule. Only AFTER India FBA inventory is fully fresh (all
+8) should the Listing Health v3 India canary be re-run.
