@@ -14215,3 +14215,46 @@ npm run verify GREEN: 134 steps / 110 suites incl build:check.
 REMAINING (human): interactive authenticated browser verification (narrow a real session's brands and confirm no leak)
 -- NOT done here (no browser/creds; must not make real permission-grant changes or spend tokens). All 12 prod grants
 are still ALL_BRANDS so the cross-scope leak stays LATENT in prod.
+
+---
+
+## 2026-09-05 -- Listing Health v3: additive READ-ONLY preview UI (Phase 3), default-OFF (commit ceaac3c, PUSHED to main)
+
+WHAT: shipped the Advanced Listing Health v3 preview as an ADDITIVE, DEFAULT-OFF (LISTING_HEALTH_V3=false) tab + serving
+path beside the UNCHANGED v1 Listing Health page. Flag OFF => app tree byte-identical to production (no nav item, no
+route, no active hook; v1 stays the default). This is the frontend for the Phase 2 shadow backend
+(listing-health/v3-oli-window); it does NOT activate v3 in the scheduler.
+
+BACKEND (read-only; zero DataDoe exports; zero writes): new api action "listing-health-v3" on the EXISTING datadoe
+boundary -- NO new serverless function (api/*.js stays 12). Authorised by the same listing-health-v3 capability already
+enforced pre-branch (assertAccountAccess 403 + DENY_FOR_BRAND_RESTRICTED_USERS 403 + 401 unauth; account+marketplace
+pinned via accountScope). New lib/server/reports/listing-health-v3-serve.js (serveListingHealthV3Preview) assembles the
+payload from ALREADY-SAVED evidence ONLY: durable enriched OLI (window sales/units via getEnrichedOliHistoryRows) +
+coverage/completeness + durable ORG product-catalog snapshot + cache-only saved listings/inventory/listings-raw
+(getSourceExportCache by the v3 request identity; inventory identity == fba-plan:inventory-health). A cache MISS is an
+honest Unavailable, NEVER an export. Status/issues/inventory use the latest snapshot independent of the sales window;
+cross-account rows fail closed (buildAdvancedListingHealth owner guard); an invalid/reversed/future window -> 400.
+NOTE: listings/listings-raw are v3-owned and NOT yet scheduled, and inventory is written per-BATCH not per-seller, so in
+prod today the per-account cache reads MISS -> those dimensions render Unavailable while OLI sales/units + catalog work;
+the preview fully lights up once v3 per-account ingestion is scheduled (remaining activation work, out of Phase 3 scope).
+
+FRONTEND: pure presenter src/lib/listing-health-v3-view.js (EXACT 16 columns; deterministic Gate / Why Flagged /
+Recommended Action from server evidence, never an invented cause -- a "possible" reason yields an INVESTIGATE step;
+null vs genuine-zero vs Not-applicable; ranked Priority Actions; Excel export mirrors the authorized filtered rows).
+src/views/ListingHealthV3.jsx: 16-col table, 7D/14D/30D/Month/Custom window controls, Covered/Partial/Unavailable badge,
+collapsible Priority Actions (closed by default), search + health-gate + fulfilment filters, in-surface
+loading/empty/partial/unavailable states, xlsx download. ALL hooks unconditional above the single return. App.jsx adds
+listingHealthV3Window state + params memo (only DEFINED window keys, else URLSearchParams sends "undefined") + a
+useSharedReport hook UNCONDITIONALLY (stable order; active only on the flagged view, never the Priority Feed; stale
+responses dropped by the existing reqId guard). shell.jsx nav item + App render branch gated by LISTING_HEALTH_V3.
+
+TESTS (in package.json + verify.mjs): scripts/report-listing-health-v3-serve.test.js (26 -- injected read-only readers,
+zero network, window re-aggregation, latest-inventory independence, covered/partial/unavailable, degraded evidence,
+cross-account isolation, window validation, fail-closed owner) + scripts/listing-health-v3-view.test.js (94 -- 16-column
+contract, deterministic recommendations, gate/why, null/zero/N-A, ranked priority actions, export parity, hook-order +
+flag-OFF v1-preservation source guards). Full `npm run verify` GREEN: 140/140 steps, 116 suites, incl. build:check
+(app compiled with the new view). git diff --check clean; DataDoe creates 0 / tokens 0.
+
+REMAINING (future, authorized activation only): schedule v3 per-account listings/listings-raw ingestion (+ per-account
+inventory read) so the preview's status/issue/on-hand dimensions populate; then flip LISTING_HEALTH_V3 ON for the
+authorized preview go-live. Scheduler-v2 UNCHANGED here.
