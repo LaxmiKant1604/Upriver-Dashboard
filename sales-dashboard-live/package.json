@@ -127,7 +127,8 @@
     "test:listing-health-v3-view": "node scripts/listing-health-v3-view.test.js",
     "test:listing-health-v3-materialize": "node scripts/report-listing-health-v3-materialize.test.js",
     "test:listing-health-v3-operation": "node scripts/report-listing-health-v3-operation.test.js",
-    "test:listing-health-v3-ingestion": "node scripts/report-listing-health-v3-ingestion.test.js"
+    "test:listing-health-v3-ingestion": "node scripts/report-listing-health-v3-ingestion.test.js",
+    "test:fba-inventory-truncated": "node scripts/report-fba-inventory-truncated.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",

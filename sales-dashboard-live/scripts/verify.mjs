@@ -50,6 +50,7 @@ const SUITES = [
   "test:listing-health-v3-materialize",
   "test:listing-health-v3-operation",
   "test:listing-health-v3-ingestion",
+  "test:fba-inventory-truncated",
   "test:region-view",
   "test:regional-brand-view",
   "test:insights",
