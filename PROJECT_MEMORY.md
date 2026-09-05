@@ -14519,3 +14519,42 @@ fba-strict-source-worker.test.js (compaction + hard-stop + generic-validator-unc
 (12 functions, no new api/*.js). The residual "single whale over a single-seller cap" class from the prior entry is now
 RESOLVED for the latest-snapshot consumers (FBA Plan + v3) via compaction; the higher-limit request_hash change is no
 longer needed for those two reports.
+
+================================================================================
+2026-09-06 -- LISTING HEALTH v3 INDIA CANARY: LIVE + CONCLUSIVELY SUCCESSFUL (commits e31ef2c migration + 88b34ab planner, verify 147/147)
+================================================================================
+Ran exactly ONE India Listing Health v3 shadow-ingestion canary; all 8 accounts got shadow snapshots. cycleDate
+2026-09-05 (proven from durable data: the ONLY window with fresh adoptable inventory for 8/8; no 2026-09-06 daily cycle
+had run).
+
+TWO code fixes were required first (both LIVE, tested, verified, committed):
+1. INVENTORY-ONLY OVERFLOW SPLIT (88b34ab). The v3 plan never derived overflowSellers, and planListingHealthV3-
+   BucketBatched split the WHOLE batch (Listings+Listings-Raw too) => 8 creates, over the india ceiling of 4. Fixed:
+   the v3 planner now splits INVENTORY only (mirrors planFbaPlanBucketBatched); buildListingHealthV3Plan accepts
+   overflowSellers; the ingestion composition's buildPlan derives the inventory-only split from the SAME india-fba
+   terminal-TRUNCATED evidence (fails soft, injectable readers), awaited by the operator. Empty overflow => byte-
+   identical. Effect: inventory [5,1,1,1] all REUSED (0 inventory creates, adopts the recovered single-seller caches);
+   Listings [5,3] + Listings-Raw [5,3] = 4 owned creates. Test +5 (report-listing-health-v3-ingestion.test.js).
+2. MIGRATION 20260918 (e31ef2c, LEAST PRIVILEGE, applied to prod via MIGRATE_ONLY). The v3 cycle opens a dedicated
+   namespace bucket listing-health-v3-<region> (never collides with the daily cycle), but sync_cycles' allow-list was
+   never widened -> open_sync_cycle raised 'Invalid bucket listing-health-v3-india' at openCycle (earlier canaries
+   deferred on inventory BEFORE openCycle, masking it). Widens ONLY sync_cycles_bucket_check (dropped by EXACT name,
+   not a dynamic drop) + open_sync_cycle guard to append the 3 v3 buckets to the preserved 10; explicit least-privilege
+   grants (revoke public/anon/authenticated; grant execute only service_role). The 5 other scheduler tables + account_
+   directory deliberately UNTOUCHED (v3 source/report jobs carry the region bucket; the v3 path never writes source_run_
+   status/sync_runs). Rollback documented + refuses while any listing-health-v3-* row remains. Test 23
+   (listing-health-v3-cycle-bucket-migration.test.js). Prod-verified: constraint+RPC have 13 values; grants service_role
+   only; other 5 tables v3-absent.
+
+CANARY RESULT (live): 4 exports created (2 Listings 5872+3793 rows, 2 Listings-Raw 4312+3017 rows; export ids
+543903c4/b595975e/23641eb0/96b85a16), ALL succeeded, none truncated. Inventory: 4 jobs REUSED (0 creates; 5fd6e7a5
+14732 / e7d33cd9 936 / 77054114 1980 / dd1c159f 9191). Balance 3266 -> 3258 = 8 tokens (2/export; premium-classed
+observed flat 2). 8 shadow snapshots saved under report_key scheduler-v2/listing-health-v3 (one per account; distinct
+accountIds; inventory.snapshotDate=2026-09-05 = latest, independent of the 30D sales window; honest null-vs-zero;
+partial coverage on the D-1 day, not fabricated). aliases written 21, skippedStale 3 (the recovery had pre-materialized
+the 3 single-seller inventory aliases). IDEMPOTENT REPLAY (same operationId): 0 new exports, balance 3258->3258 (0
+tokens), 0 new snapshots (still 8), 24 aliases skippedStale. LIVE window proof via serveListingHealthV3Preview (durable
+OLI, 0 tokens): 7D/14D/30D/Month/Custom give distinct sales/units; inventory snapshotDate CONSTANT across all windows.
+LISTING_HEALTH_V3 stays OFF; no cron/route invokes the operator (manual-only, triple-gated). api/*.js stays 12.
+NEXT (separate approvals): flip LISTING_HEALTH_V3 on after UI review; Europe-AU + US-CA canaries (their buckets are
+allowed by 20260918 but NOT run).
