@@ -101,8 +101,10 @@ export function selectSchedulerV2ReportKeys({ settings = [], manualReportKeys = 
 
 // Turn a generic buildShadowReportPlan into the owner-decorated source jobs runStagedSourceCycle expects. The
 // plan is STATIC (no signal-gated staging for the generic single-shot reports), so resolvePlan returns the
-// same owned jobs each round; the driver reaches its fixpoint after one drained round.
-const resolveFromGenericPlan = (plan) => () => ({
+// same owned jobs each round; the driver reaches its fixpoint after one drained round. Exported so a DEDICATED
+// operator (listing-health-v3 ingestion) composes the SAME plan->owned-jobs mapping the live dispatcher uses,
+// with no drift and no duplication of source-worker logic.
+export const resolveFromGenericPlan = (plan) => () => ({
   sourceJobs: plan.reportRequests.flatMap((req) => req.sources.map(
     // A BATCHED seller-scoped report request (fba-plan) carries per-account owner metadata + a per-source
     // marketplace constraint; pass the account's individual rawSellerId + the batch marketplace so plannedSourceJob
