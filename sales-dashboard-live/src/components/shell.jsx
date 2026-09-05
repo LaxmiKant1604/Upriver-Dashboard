@@ -12,7 +12,7 @@
    when items are regrouped or reordered.                                    */
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { CAMPAIGN_ADS_TAB } from "../lib/feature-flags.js";
+import { CAMPAIGN_ADS_TAB, LISTING_HEALTH_V3 } from "../lib/feature-flags.js";
 import {
   BellRing,
   Boxes,
@@ -76,6 +76,11 @@ export const NAV_GROUPS = [
     items: [
       { view: "fbaplan", label: "FBA Shipment Plan", title: "Per-ASIN restock recommendation", icon: Boxes },
       { view: "listinghealth", label: "Listing Health", title: "Listing Health — suppressed, inactive and stranded listings", icon: ShieldAlert },
+      // LISTING_HEALTH_V3 (default OFF): additive READ-ONLY preview with a selectable sales window (durable OLI) beside
+      // the unchanged v1 page. When the flag is OFF the tree is byte-identical to production.
+      ...(LISTING_HEALTH_V3
+        ? [{ view: "listinghealth-v3", label: "Listing Health (v3 preview)", title: "Listing Health v3 — read-only OLI-window preview (creates no exports)", icon: ShieldAlert }]
+        : []),
       { view: "buybox", label: "Buy Box Loss", title: "Buy Box Loss — featured-offer share and its causes", icon: Trophy },
     ],
   },

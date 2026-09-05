@@ -65,11 +65,12 @@ import SalesMovers from "./views/SalesMovers.jsx";
 import SkuMovement from "./views/SkuMovement.jsx";
 import DailyReporting from "./views/DailyReporting.jsx";
 import ListingHealth from "./views/ListingHealth.jsx";
+import ListingHealthV3 from "./views/ListingHealthV3.jsx";
 import BuyBoxLoss from "./views/BuyBoxLoss.jsx";
 import ReturnsLeakage from "./views/ReturnsLeakage.jsx";
 import PpcPerformance from "./views/PpcPerformance.jsx";
 import CampaignAds from "./views/CampaignAds.jsx";
-import { CAMPAIGN_ADS_TAB } from "./lib/feature-flags.js";
+import { CAMPAIGN_ADS_TAB, LISTING_HEALTH_V3 } from "./lib/feature-flags.js";
 import ListingOptimizer from "./views/ListingOptimizer.jsx";
 import PriorityFeed from "./views/PriorityFeed.jsx";
 // Account-scoped Brand View (Account -> Brand -> Brand Reports). Deliberately a
@@ -3006,6 +3007,10 @@ function DashboardApp({ session, access, onSignOut }) {
     () => (selectedAccountId ? { ids: selectedAccountId, to: TODAY } : null),
     [selectedAccountId, TODAY]
   );
+  // Listing Health v3 preview (default-OFF LISTING_HEALTH_V3): the selected durable-OLI sales window. Unconditional
+  // state + hook below (stable hook order regardless of the flag); only sales/units re-aggregate on change -- reading
+  // this page or moving its date NEVER calls DataDoe. Default is the trailing 30 days.
+  const [listingHealthV3Window, setListingHealthV3Window] = useState({ preset: "30D" });
   const salesMoversParams = useMemo(
     () => (insightScope ? { action: "sales-movers", ...insightScope } : null),
     [insightScope]
@@ -3014,6 +3019,17 @@ function DashboardApp({ session, access, onSignOut }) {
     () => (insightScope ? { action: "listing-health", ...insightScope } : null),
     [insightScope]
   );
+  // v3 preview params carry the selected sales window so each window is a distinct read-only cache entry. Only DEFINED
+  // window keys are included (URLSearchParams would otherwise send the literal string "undefined").
+  const listingHealthV3Params = useMemo(() => {
+    if (!selectedAccountId) return null;
+    const w = listingHealthV3Window || {};
+    const p = { action: "listing-health-v3", ids: selectedAccountId, to: TODAY, windowPreset: w.preset || "30D" };
+    if (w.month) p.windowMonth = w.month;
+    if (w.from) p.windowFrom = w.from;
+    if (w.to) p.windowTo = w.to;
+    return p;
+  }, [selectedAccountId, TODAY, listingHealthV3Window]);
   const buyBoxParams = useMemo(
     () => (insightScope ? { action: "buy-box-loss", ...insightScope } : null),
     [insightScope]
@@ -3043,6 +3059,8 @@ function DashboardApp({ session, access, onSignOut }) {
   const onFeed = view === "priority";
   const salesMovers = useSharedReport({ params: salesMoversParams, active: view === "salesmovers" || onFeed });
   const listingHealth = useSharedReport({ params: listingHealthParams, active: view === "listinghealth" || onFeed });
+  // v3 preview: unconditional hook (stable order); only ever active on its own flagged view, never on the Priority Feed.
+  const listingHealthV3 = useSharedReport({ params: listingHealthV3Params, active: LISTING_HEALTH_V3 && view === "listinghealth-v3" });
   const buyBox = useSharedReport({ params: buyBoxParams, active: view === "buybox" || onFeed });
   const returns = useSharedReport({ params: returnsParams, active: view === "returns" || onFeed });
   const ppc = useSharedReport({ params: ppcParams, active: view === "ppc" || onFeed });
@@ -5382,6 +5400,20 @@ function DashboardApp({ session, access, onSignOut }) {
           accountName={refreshScopeAccount?.name}
           selectedBrand={selectedBrand}
           currency={displayCurrency}
+        />
+      )}
+
+      {/* Additive READ-ONLY v3 preview -- rendered ONLY behind the default-OFF flag; v1 above stays the default. */}
+      {view === "listinghealth-v3" && LISTING_HEALTH_V3 && (
+        <ListingHealthV3
+          data={listingHealthV3.data}
+          loading={listingHealthV3.loading}
+          error={listingHealthV3.error}
+          accountName={refreshScopeAccount?.name}
+          selectedBrand={selectedBrand}
+          currency={displayCurrency}
+          window={listingHealthV3Window}
+          onWindowChange={setListingHealthV3Window}
         />
       )}
 

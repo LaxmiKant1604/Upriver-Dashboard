@@ -151,6 +151,9 @@ import { isCancelledStatus } from "../lib/server/sync/oli-order-rules.js";
 import { getEnrichedOliHistoryRows } from "../lib/server/sync/oli-enriched-history.js";
 import { buildSalesMovers, SALES_MOVERS_REPORT_KEY, SALES_MOVERS_VERSION } from "../lib/server/reports/sales-movers.js";
 import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION } from "../lib/server/reports/listing-health.js";
+// Advanced Listing Health v3 READ-ONLY preview serve (Phase 3): durable OLI/catalog + latest saved evidence only,
+// zero DataDoe exports, zero production writes. Additive action on THIS boundary -- no new api/*.js function.
+import { serveListingHealthV3Preview } from "../lib/server/reports/listing-health-v3-serve.js";
 import { buildBuyBoxLoss, BUY_BOX_REPORT_KEY, BUY_BOX_VERSION } from "../lib/server/reports/buy-box.js";
 import { buildReturnsLeakage, RETURNS_REPORT_KEY, RETURNS_VERSION } from "../lib/server/reports/returns.js";
 import { buildPpcPerformance, PPC_REPORT_KEY, PPC_VERSION } from "../lib/server/reports/ppc.js";
@@ -215,6 +218,10 @@ const ACCOUNT_SCOPED_ACTIONS = new Set([
   // in the browser, so there is nothing extra to authorise here.
   "sales-movers", "listing-health", "buy-box-loss",
   "returns-leakage", "ppc-performance", "listing-optimizer",
+  // Advanced Listing Health v3 READ-ONLY preview (default-OFF flag). Single-account, authorised against the same
+  // listing-health-v3 capability; served ENTIRELY from durable OLI/catalog + latest SAVED source evidence (zero
+  // DataDoe exports, zero production writes). Never refreshes/creates -- a date change only re-reads durable OLI.
+  "listing-health-v3",
   // OLI data-quality: a read-only, ZERO-DataDoe explicit-zero indicator (Sales Dashboard) + per-account quality
   // counts (Data Sync Center). Both are single-account, authorised, and read only the durable dimensional table.
   "oli-quality", "oli-quality-summary",
@@ -4032,6 +4039,33 @@ async function handleDataDoe(req, res) {
         label: "Listing Health",
         build: () => buildListingHealth({ apiKey, ids, to }),
       });
+      return;
+    }
+
+    // Advanced Listing Health v3 -- READ-ONLY preview. Authorised by the same listing-health-v3 capability enforced in
+    // the brand-scope block above (401 unauthenticated / 403 brand-restricted or unauthorised account; account pinned
+    // by accountScope). Served from durable OLI + catalog + latest SAVED source evidence: it NEVER creates a DataDoe
+    // export (a date change only re-reads durable OLI) and NEVER writes a snapshot. A refresh flag is ignored.
+    if (action === "listing-health-v3") {
+      const ids = singleAccountId(req, res, "Listing Health (v3 preview)");
+      if (!ids) return;
+      const to = reportAsOf(req, res);
+      if (!to) return;
+      const connectionId = accountScope.connection && accountScope.connection.id === "secondary" ? "dd-secondary" : "primary";
+      try {
+        const payload = await serveListingHealthV3Preview({
+          owner: { accountId: accountScope.accountIds[0], rawSellerId: ids[0] },
+          identity: { apiKey, connectionId },
+          windowControls: { preset: req.query.windowPreset, from: req.query.windowFrom, to: req.query.windowTo, month: req.query.windowMonth },
+          asOf: to,
+        });
+        res.status(200).json(payload);
+      } catch (e) {
+        const msg = String((e && e.message) || "listing-health-v3 preview failed");
+        // An invalid/reversed/future window control is a 400; a durable read failure is a read-only-safe 503.
+        const badWindow = /window|calendar|month|custom|from <= to|asOf/i.test(msg);
+        res.status(badWindow ? 400 : 503).json({ error: badWindow ? msg : "The Listing Health v3 preview could not be built from saved evidence right now." });
+      }
       return;
     }
 
