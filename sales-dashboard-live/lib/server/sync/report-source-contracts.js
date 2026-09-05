@@ -405,6 +405,13 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       orderByColumn: "date",
       orderByDirection: "DESC",
       windowKind: "range:asOf-10d..asOf",
+      // LATEST-SNAPSHOT inventory: FBA Plan consumes ONLY the latest inventory date, so the source worker reduces a
+      // single-seller payload to its latest PROVABLY-COMPLETE date (fitting the row cap + 8MB cache limit) instead of
+      // hard-failing an oversized/cap-sized response -- NEVER summing across dates. Execution policy only (NOT part of
+      // request_hash), so the shared identity with listing-health-v3:inventory is unchanged. Scoped to THIS contract:
+      // the insight reports' inventory (buy-box-loss/sales-movers, INSIGHT_INVENTORY_COLUMNS => a different hash) keep
+      // the generic strict validator.
+      latestSnapshot: true,
     },
     {
       requestKey: "fba-plan:awd",
@@ -825,6 +832,10 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       orderByDirection: "DESC",
       windowKind: "range:asOf-10d..asOf (REUSES the fba-plan:inventory-health export identity)",
       strict: true,
+      // LATEST-SNAPSHOT inventory (same as fba-plan:inventory-health, whose export identity this REUSES): v3 consumes
+      // only the latest inventory date. Kept in lockstep with fba-plan:inventory-health so the shared canonical job
+      // carries the flag regardless of which report resolves it first. Execution policy only (not in request_hash).
+      latestSnapshot: true,
     },
     // NOTE: Product Catalog is NOT an owned export here. Like fba-plan, v3 reuses the canonical org Product Catalog
     // durable snapshot as a DERIVED dependency (REPORT_DERIVED_SOURCE_KEYS), injected via context -- no extra export,
@@ -1862,6 +1873,9 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
           // contract object) so a worker mutating a job cannot mutate the registry,
           // and NOT part of the DataDoe request — request_hash is unaffected.
           strict: c.strict === true,
+          // Latest-snapshot inventory normalization opt-in (execution policy, NOT in request_hash). Only the two
+          // inventory contracts that consume ONLY the latest date declare it; every other source stays false.
+          latestSnapshot: c.latestSnapshot === true,
           availabilityPolicy: normalizeAvailabilityPolicy(c.availabilityPolicy),
           // Generic any-failure degradation policy (distinct from availabilityPolicy);
           // null unless declared. Frozen + detached from the registry.

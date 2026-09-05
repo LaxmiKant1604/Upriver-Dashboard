@@ -37,6 +37,7 @@ import { isDataDoeDeadlineError, isDataDoePollPendingError, isSourceDisabledErro
 import { sourceJobOwnerId } from "../source-identity.js";
 import { validateBatchSourcePayload } from "./source-account-isolation.js";
 import { isRoutingScope } from "./scheduler-scope.js";
+import { compactLatestInventorySnapshot, isLatestSnapshotSource } from "./fba-inventory-latest-snapshot.js";
 
 const DEFAULT_RESERVE_MS = 3_000; // stop before the server cap so status/locks persist
 
@@ -344,7 +345,32 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   if (!Array.isArray(rows)) {
     return fail("validate", "MALFORMED_PAYLOAD", "DataDoe payload was not an array; result not saved.", true);
   }
-  if (job.strict === true && rows.length >= Number(job.limit)) {
+  // LATEST-SNAPSHOT normalization exception: a SINGLE-seller inventory payload from a contract EXPLICITLY marked
+  // `latestSnapshot` (fba-plan:inventory-health + listing-health-v3:inventory -- FBA Plan + Listing Health v3 consume
+  // only the latest inventory date) is reduced to its latest PROVABLY-COMPLETE date so an oversized/cap-sized payload
+  // fits the row cap + 8MB cache limit -- NEVER summing across dates. Gated by BOTH the contract flag AND the inventory
+  // source key (defense in depth) AND a single seller; EVERY other source (the insight reports' own inventory contract
+  // with different columns/limit, OLI, Ads, catalog, ...) and any multi-seller batch keep the generic strict TRUNCATED
+  // validator below unchanged. An unprovable latest date is a terminal validate failure (never inferred complete). The
+  // contract's own row limit is the cap (so a 50000-row inventory export is judged against 50000, never a default).
+  const fpLs = job.fetchParams || {};
+  const lsIds = Array.isArray(fpLs.sellerOrVendorIds) ? fpLs.sellerOrVendorIds : [];
+  const isLatestSnapshotSingle = job.latestSnapshot === true && isLatestSnapshotSource(job.sourceKey) && lsIds.length === 1;
+  let rowsToPersist = rows;
+  let latestSnapshotMeta = null;
+  if (isLatestSnapshotSingle) {
+    const compacted = compactLatestInventorySnapshot({
+      rows, seller: lsIds[0],
+      marketplace: job.marketplaceConstraint ?? (Array.isArray(job.marketplacePairs) && job.marketplacePairs[0] && job.marketplacePairs[0].marketplace) ?? null,
+      rowCap: Number(job.limit) > 0 ? Number(job.limit) : undefined,
+      exportRef: exportId, requestedFrom: fpLs.from, requestedTo: fpLs.to,
+    });
+    if (!compacted.complete) {
+      return fail("validate", "LATEST_SNAPSHOT_INCOMPLETE", "Latest inventory date is not provably complete; not saved (previous data preserved).", true, rows.length);
+    }
+    rowsToPersist = compacted.rows;
+    latestSnapshotMeta = compacted.metadata;
+  } else if (job.strict === true && rows.length >= Number(job.limit)) {
     return fail("validate", "TRUNCATED", "Result reached the row cap; partial data was not saved.", true, rows.length);
   }
 
@@ -359,8 +385,10 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   const fp = job.fetchParams || {};
   const batchIds = Array.isArray(fp.sellerOrVendorIds) ? fp.sellerOrVendorIds : [];
   if (batchIds.length > 1 || job.marketplacePairs) {
+    // Validate the rows that will ACTUALLY be persisted (the compacted latest-date block for a latest-snapshot single
+    // seller; the raw rows otherwise) so a cross-account/marketplace row can never be saved.
     const bv = validateBatchSourcePayload({
-      rows,
+      rows: rowsToPersist,
       sellerOrVendorIds: batchIds,
       sourceScope: job.sourceScope,
       marketplaceScoped: job.marketplaceScoped === true,
@@ -374,10 +402,16 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
 
   // ---- STEP 7: persist (atomic last-known-good). A save error / empty object path is a
   // SEPARATE persist-stage failure and never overwrites the previous good data. ----
-  const payloadBytes = approxPayloadBytes(rows);
+  // A latest-snapshot job persists the COMPACTED latest-date block + records the normalization provenance in the cache
+  // row's request_meta (so an old full-range cache can never be mistaken for a normalized latest-snapshot cache); the
+  // request_hash is UNCHANGED (only the stored payload + metadata differ), so no unrelated identity moves.
+  const persistJob = latestSnapshotMeta
+    ? { ...job, request_meta: { ...(job.request_meta ?? job.requestMeta ?? {}), ...latestSnapshotMeta } }
+    : job;
+  const payloadBytes = approxPayloadBytes(rowsToPersist);
   let saveResult;
   try {
-    saveResult = await store.saveSourceRows({ job, rows, payloadBytes, exportId, version: `${cycleId}-${exportId}` });
+    saveResult = await store.saveSourceRows({ job: persistJob, rows: rowsToPersist, payloadBytes, exportId, version: `${cycleId}-${exportId}` });
   } catch (error) {
     // A concurrent cycle that ALREADY holds this request's cache pointer is a benign,
     // non-terminal persist conflict, not data loss: we record NO success rather than pair
@@ -393,8 +427,8 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   // ADOPTED. In the adopted case we MUST record the WINNER's rows/count/bytes under the
   // WINNER's path — never this attempt's rows under another object's path.
   const objectPath = typeof saveResult === "string" ? saveResult : (saveResult && saveResult.objectPath) || null;
-  const savedRows = saveResult && Array.isArray(saveResult.rows) ? saveResult.rows : rows;
-  const savedRowCount = saveResult && typeof saveResult.rowCount === "number" ? saveResult.rowCount : rows.length;
+  const savedRows = saveResult && Array.isArray(saveResult.rows) ? saveResult.rows : rowsToPersist;
+  const savedRowCount = saveResult && typeof saveResult.rowCount === "number" ? saveResult.rowCount : rowsToPersist.length;
   const savedBytes = saveResult && typeof saveResult.payloadBytes === "number" ? saveResult.payloadBytes : payloadBytes;
   if (!objectPath) {
     return fail("persist", "SAVE_NO_PATH", "Source save returned no object path; treated as a failure.", true, rows.length);

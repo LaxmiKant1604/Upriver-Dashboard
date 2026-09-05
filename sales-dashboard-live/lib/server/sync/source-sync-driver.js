@@ -124,6 +124,9 @@ export function plannedSourceJob(reportKey, resolved, bucket, connectionId, acco
     requestMeta: resolved.requestMeta,
     bucket: resolved.bucket || bucket,
     strict: resolved.strict === true,
+    // Latest-snapshot inventory normalization opt-in (execution policy; not in request_hash). Carried onto the job so
+    // the source worker can compact ONLY a contract explicitly marked latest-snapshot (never a heuristic on sourceKey).
+    latestSnapshot: resolved.latestSnapshot === true,
     limit: resolved.limit,
     // Finding 2/3: the DECLARED source scope + whether the contract fetched marketplace_country_code + the
     // batch's canonical marketplace constraint, carried as immutable planned metadata into the source worker's

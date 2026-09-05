@@ -1,11 +1,16 @@
-// Scheduler v2 -- FBA strict-cap source-worker integration test (SHADOW MODE).
+// Scheduler v2 -- FBA strict-cap + latest-snapshot source-worker integration test (SHADOW MODE).
 //
-// One small, independently-readable ESM artifact (the content scanner reads it directly). Proves the
-// Scheduler-v2 `strict:true` flag on the fba-plan contracts reaches the real source worker guard: a
-// resolved fba-plan source whose result reaches the row cap (rows.length === job.limit) is recorded
-// as TRUNCATED, persists NO source payload, does not block an unrelated source in the same batch, and
-// is NOT attempted again on a repeated worker run. Self-contained: a lean in-memory store + DataDoe
-// double drive the real runSourceJobs; no DataDoe/Supabase/network calls, no process.exit, no timers.
+// One small, independently-readable ESM artifact (the content scanner reads it directly). Proves how the
+// Scheduler-v2 `strict:true` flag on the source contracts reaches the real source worker guard:
+//   * A NON-latest-snapshot strict source (product-catalog) whose result reaches the row cap is recorded as
+//     TRUNCATED, persists NO source payload -- the GENERIC validator is UNCHANGED.
+//   * A SINGLE-seller fba-inventory-health payload is normalized to its LATEST snapshot date: a cap-sized
+//     payload with a complete leading latest date is COMPACTED to that date and persisted (only latest-date
+//     rows); a cap-sized payload whose latest date itself fills the cap is a HARD STOP recorded as
+//     LATEST_SNAPSHOT_INCOMPLETE, persisting nothing. Neither blocks an unrelated source in the same batch,
+//     and a terminal one is not attempted again on a repeated worker run.
+// Self-contained: a lean in-memory store + DataDoe double drive the real runSourceJobs; no DataDoe/Supabase/
+// network calls, no process.exit, no timers.
 //
 // 7-bit ASCII, LF, no top-level await, synchronous writeSync progress, dynamic imports after a dummy
 // Supabase env. No secret-shaped literals.
@@ -99,51 +104,100 @@ function makeDataDoe(rowsFor) {
 
 const runOpts = (over) => ({ bucket: "us", cycleDate: "2026-08-07", ...over });
 
-group("fba-plan strict-cap source worker");
-
-test("a cap-sized FBA source records TRUNCATED, persists nothing, unrelated source succeeds, and is not re-attempted", async () => {
-  const store = makeStore();
-  // Resolve a REAL fba-plan job so the CONTRACT strict flag + real row limit flow onto the planned job. OLI +
-  // Product Catalog are now durable DERIVED deps (not owned exports), so fba-plan's ONLY owned per-cycle sources
-  // are the FBA Inventory Health snapshot (all markets) + the US-only AWD listing. A CA (non-US) account owns
-  // ONLY inventory-health; one capped inventory-health fetch is enough to drive the strict-cap guard.
-  const fbaWin = {
-    "fba-plan:inventory-health": [{ from: "2025-07-27", to: "2025-08-06" }],
-  };
-  const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWin, marketplaceCountry: "CA" });
-  const fbaSrc = resolved.find((r) => r.requestKey === "fba-plan:inventory-health");
-  assert.equal(fbaSrc.strict, true, "the fba-plan:inventory-health contract is strict:true");
-  const capped = plannedSourceJob("fba-plan", fbaSrc, "us", "primary");
-
-  // The capped source returns EXACTLY job.limit rows (rows.length === limit) -- indistinguishable from
-  // truncation, so the strict guard must reject it. Use the contract's real limit (no in-test shrink).
-  const cappedRows = Array.from({ length: capped.limit }, () => ({}));
-  // An UNRELATED healthy source (a different report) in the same batch.
+// A single-seller fba-plan inventory source (CA, non-US -> owns ONLY inventory-health). marketplaceConstraint "CA"
+// so the worker's latest-snapshot compaction validates each block row against the trusted seller + marketplace.
+function invJob(ids = ["A1"], marketplace = "CA") {
+  const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids, windowsByRequestKey: { "fba-plan:inventory-health": [{ from: "2025-07-27", to: "2025-08-06" }] }, marketplaceCountry: marketplace });
+  const src = resolved.find((r) => r.requestKey === "fba-plan:inventory-health");
+  assert.equal(src.strict, true, "the fba-plan:inventory-health contract is strict:true");
+  assert.equal(src.sourceKey, "fba-inventory-health", "the inventory contract's sourceKey is the latest-snapshot key");
+  // plannedSourceJob(reportKey, resolved, bucket, connectionId, accountId, ownerRawSellerId, marketplaceConstraint)
+  return { src, job: plannedSourceJob("fba-plan", src, "us", "primary", "acct-A1", "A1", marketplace) };
+}
+// An UNRELATED healthy source (brand-sales:catalog) in the same batch -- returns one row and must always succeed.
+function healthyOther() {
   const bs = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "brand-sales:order-lines": [{ from: "2025-01-01", to: "2025-06-30" }], "brand-sales:catalog": [{ from: "2025-01-01", to: "2025-06-30" }] } });
-  const other = plannedSourceJob("brand-sales", bs.find((r) => r.requestKey === "brand-sales:catalog"), "us", "primary");
+  return plannedSourceJob("brand-sales", bs.find((r) => r.requestKey === "brand-sales:catalog"), "us", "primary");
+}
+const invRow = (date, seller = "A1", mkt = "CA", extra = {}) => ({ date, seller_or_vendor_id: seller, marketplace_country_code: mkt, ...extra });
 
+group("source worker: generic strict cap + FBA latest-snapshot compaction");
+
+test("GENERIC strict validator UNCHANGED: a cap-sized NON-inventory source (product-catalog) records TRUNCATED, persists nothing", async () => {
+  const store = makeStore();
+  // brand-sales:catalog is strict:true, sourceKey product-catalog (NOT a latest-snapshot source), limit 10000.
+  const bs = reportSourceRequestHashes({ reportKey: "brand-sales", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "brand-sales:order-lines": [{ from: "2025-01-01", to: "2025-06-30" }], "brand-sales:catalog": [{ from: "2025-01-01", to: "2025-06-30" }] } });
+  const catSrc = bs.find((r) => r.requestKey === "brand-sales:catalog");
+  assert.equal(catSrc.strict, true);
+  assert.notEqual(catSrc.sourceKey, "fba-inventory-health");
+  const cat = plannedSourceJob("brand-sales", catSrc, "us", "primary");
+  const cappedRows = Array.from({ length: cat.limit }, () => ({})); // rows.length === limit => truncation, rejected
+  const dd = makeDataDoe(() => cappedRows);
+  const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [cat] }));
+  const j = store._rawJob(res.cycleId, catSrc.requestHash);
+  assert.equal(j.error_code, "TRUNCATED", "a non-latest-snapshot cap-sized source is still generic TRUNCATED");
+  assert.equal(j.error_stage, "validate");
+  assert.equal(j.terminal, true);
+  assert.equal(store._cache.has(catSrc.requestHash), false, "nothing persisted for the truncated catalog");
+  assert.equal(res.failed, 1);
+});
+
+test("FBA latest-snapshot HARD STOP: a single-seller inventory payload whose latest date fills the cap records LATEST_SNAPSHOT_INCOMPLETE, persists nothing, unrelated source succeeds, and is not re-attempted", async () => {
+  const store = makeStore();
+  const { src: fbaSrc, job: capped } = invJob(["A1"], "CA");
+  const other = healthyOther();
+
+  // The cap-sized payload is ENTIRELY the latest date -> the latest-date block itself fills the row cap (no older
+  // date can prove it was not truncated mid-latest-date): a genuine single-seller latest-date overflow = hard stop.
+  const cappedRows = Array.from({ length: capped.limit }, () => invRow("2026-09-05"));
   const dd = makeDataDoe((job) => (job.requestHash === fbaSrc.requestHash ? cappedRows : [{ ok: 1 }]));
   const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [capped, other] }));
 
-  // Capped FBA source: recorded TRUNCATED at the validate stage, terminal, and NOTHING persisted.
   const cappedJob = store._rawJob(res.cycleId, fbaSrc.requestHash);
-  assert.equal(cappedJob.error_code, "TRUNCATED");
+  assert.equal(cappedJob.error_code, "LATEST_SNAPSHOT_INCOMPLETE", "an unprovable single-seller latest date is a terminal hard stop");
   assert.equal(cappedJob.error_stage, "validate");
   assert.equal(cappedJob.terminal, true);
-  assert.equal(cappedJob.row_count, capped.limit, "the cap count is recorded (rows.length === limit)");
-  assert.equal(store._cache.has(fbaSrc.requestHash), false, "no source payload persisted for the capped FBA source");
+  assert.equal(cappedJob.row_count, capped.limit, "the raw cap count is recorded");
+  assert.equal(store._cache.has(fbaSrc.requestHash), false, "no source payload persisted for the hard-stopped inventory");
   // The unrelated source completes and persists (one source failing never blocks another).
   assert.equal(store._cache.has(other.requestHash), true, "the unrelated source persisted its payload");
   assert.equal(store._rawJob(res.cycleId, other.requestHash).fetch_status, "succeeded");
   assert.equal(res.failed, 1);
   assert.equal(res.succeeded, 1);
 
-  // A repeated worker run must NOT attempt the truncated export again (terminal failure is skipped).
+  // A repeated worker run must NOT attempt the terminal export again.
   const downloadsBefore = dd.downloadCount(fbaSrc.requestHash);
   const res2 = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [capped, other] }));
-  assert.equal(dd.downloadCount(fbaSrc.requestHash), downloadsBefore, "the truncated FBA export is not downloaded again");
-  assert.equal(dd.createCount(fbaSrc.requestHash), 1, "exactly one create-export ever issued for the truncated source");
+  assert.equal(dd.downloadCount(fbaSrc.requestHash), downloadsBefore, "the terminal inventory export is not downloaded again");
+  assert.equal(dd.createCount(fbaSrc.requestHash), 1, "exactly one create-export ever issued for the terminal source");
   assert.equal(res2.processed, 0, "no pending/attempted jobs remain to process on the repeat run");
+});
+
+test("FBA latest-snapshot COMPACTION: a cap-sized single-seller inventory payload with a complete leading latest date is compacted to that date and persisted (only latest-date rows)", async () => {
+  const store = makeStore();
+  const { src: fbaSrc, job } = invJob(["A1"], "CA");
+
+  // A cap-sized payload (rows.length === limit) whose latest date is a small COMPLETE leading block, followed by a
+  // strictly-older date (which proves the latest block was not itself truncated). DataDoe returns date-DESC.
+  const LATEST_N = 3;
+  const rows = [
+    ...Array.from({ length: LATEST_N }, (_, i) => invRow("2026-09-05", "A1", "CA", { sku: `S${i}`, units: i === 0 ? 0 : i })),
+    ...Array.from({ length: job.limit - LATEST_N }, () => invRow("2026-09-04")),
+  ];
+  assert.equal(rows.length, job.limit, "the payload is cap-sized (indistinguishable from truncation without the proof)");
+  const dd = makeDataDoe(() => rows);
+  const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [job] }));
+
+  const j = store._rawJob(res.cycleId, fbaSrc.requestHash);
+  assert.equal(j.fetch_status, "succeeded", "the latest date was provably complete -> success");
+  assert.equal(j.row_count, LATEST_N, "only the latest-date rows were persisted (compacted), not the cap-sized raw");
+  const cached = store.loadSourceRows(fbaSrc.requestHash);
+  assert.ok(cached && Array.isArray(cached.rows), "the compacted payload is cached");
+  assert.equal(cached.rows.length, LATEST_N, "the cache holds only the latest-date block");
+  assert.ok(cached.rows.every((r) => r.date === "2026-09-05"), "every cached row is the latest date (no summing across dates)");
+  assert.equal(cached.rows.find((r) => r.sku === "S0").units, 0, "a zero inventory value is preserved verbatim");
+  assert.equal(res.succeeded, 1);
+  assert.equal(res.failed, 0);
 });
 
 async function main() {

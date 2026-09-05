@@ -129,7 +129,8 @@
     "test:listing-health-v3-operation": "node scripts/report-listing-health-v3-operation.test.js",
     "test:listing-health-v3-ingestion": "node scripts/report-listing-health-v3-ingestion.test.js",
     "test:fba-inventory-truncated": "node scripts/report-fba-inventory-truncated.test.js",
-    "test:fba-inventory-overflow": "node scripts/report-fba-inventory-overflow.test.js"
+    "test:fba-inventory-overflow": "node scripts/report-fba-inventory-overflow.test.js",
+    "test:fba-inventory-latest-snapshot": "node scripts/fba-inventory-latest-snapshot.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",
