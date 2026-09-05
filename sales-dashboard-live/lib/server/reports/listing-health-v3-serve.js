@@ -13,14 +13,12 @@
 // written -- this is a live derivation from durable/saved evidence, returned directly.
 
 import { buildAdvancedListingHealth, resolveListingHealthWindow } from "./listing-health-advanced.js";
-import { reportSourceRequestHashes } from "../sync/report-source-contracts.js";
-import { addDaysStr } from "../date-windows.js";
+import { listingHealthV3PerAccountReadHashes } from "../sync/listing-health-v3-materialize.js";
 import { organizationFingerprint as orgFingerprintOf } from "../source-identity.js";
 import { getEnrichedOliHistoryRows } from "../sync/oli-enriched-history.js";
 import { getSourceCoverageWindows, getOliCompleteness, getSourceSnapshot, getSourceSnapshotPayload, getSourceExportCache } from "../supabase.js";
 
 const S = (v) => (v == null ? "" : String(v));
-const INVENTORY_LOOKBACK_DAYS = 10;
 
 // Production READ-ONLY default readers (all Supabase/durable reads; NEVER a DataDoe export). Overridable for tests.
 const defaultCatalogReader = async ({ organizationFingerprint, connectionId }) => {
@@ -77,16 +75,12 @@ export async function serveListingHealthV3Preview({ owner, identity, windowContr
   let catalogRows = [];
   try { const cat = await getCatalog({ organizationFingerprint: org, connectionId }); catalogRows = Array.isArray(cat) ? cat : []; } catch (_e) { catalogRows = []; }
 
-  // 3) LATEST SAVED listings / inventory / listings-raw via the v3 request identities (cache-only; NO create). The
-  //    inventory identity is byte-identical to fba-plan:inventory-health, so a prior fba-plan export is reused.
-  const invAsOf = asOf; // inventory uses its own latest snapshot window (independent of the sales window)
-  const windowsByRequestKey = {
-    "listing-health-v3:listings": [{ from: null, to: null }],
-    "listing-health-v3:listings-raw": [{ from: null, to: null }],
-    "listing-health-v3:inventory": [{ from: addDaysStr(invAsOf, -INVENTORY_LOOKBACK_DAYS), to: invAsOf }],
-  };
-  const resolved = reportSourceRequestHashes({ reportKey: "listing-health-v3", apiKey: identity && identity.apiKey, ids: [rawSellerId], windowsByRequestKey, marketplaceCountry: owner.marketplace || null }) || [];
-  const hashOf = (rk) => { const s = resolved.find((x) => x.requestKey === rk); return s ? s.requestHash : null; };
+  // 3) LATEST SAVED listings / inventory / listings-raw via the PER-ACCOUNT read identities (cache-only; NO create).
+  //    These date-free single-seller identities are byte-identical to what the scheduler ingestion writes when it
+  //    splits each <=5-seller batch export back per account (see listing-health-v3-materialize.js). A cache MISS
+  //    means that per-account fragment has not been materialized yet -> the dimension is honestly Unavailable.
+  const readHashes = listingHealthV3PerAccountReadHashes({ apiKey: identity && identity.apiKey, rawSellerId, marketplaceCountry: owner.marketplace || null });
+  const hashOf = (rk) => readHashes[rk] || null;
   const readSaved = async (rk) => { const h = hashOf(rk); if (!h || typeof getSavedSourceRows !== "function") return null; try { const rows = await getSavedSourceRows(h); return Array.isArray(rows) ? rows : (rows && Array.isArray(rows.rows) ? rows.rows : null); } catch (_e) { return null; } };
   const listingRows = await readSaved("listing-health-v3:listings");
   const inventoryRows = await readSaved("listing-health-v3:inventory");

@@ -9,8 +9,7 @@
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
 import { serveListingHealthV3Preview } from "../lib/server/reports/listing-health-v3-serve.js";
-import { reportSourceRequestHashes } from "../lib/server/sync/report-source-contracts.js";
-import { addDaysStr } from "../lib/server/date-windows.js";
+import { listingHealthV3PerAccountReadHashes } from "../lib/server/sync/listing-health-v3-materialize.js";
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -21,18 +20,12 @@ const API_KEY = "fixture-key";
 const SELLER = "acct-00";
 const OTHER = "acct-99";
 const asOf = "2026-09-02";
-const INVENTORY_LOOKBACK_DAYS = 10; // mirrors the serve
 
-// The v3 request identities, computed with the SAME inputs the serve uses -- so injecting getSavedSourceRows keyed by
-// these hashes proves the serve reads the correct saved-source identity (and the inventory identity is asOf-based).
-function hashesFor({ apiKey = API_KEY, rawSellerId = SELLER, marketplace = "US", to = asOf } = {}) {
-  const windowsByRequestKey = {
-    "listing-health-v3:listings": [{ from: null, to: null }],
-    "listing-health-v3:listings-raw": [{ from: null, to: null }],
-    "listing-health-v3:inventory": [{ from: addDaysStr(to, -INVENTORY_LOOKBACK_DAYS), to }],
-  };
-  const resolved = reportSourceRequestHashes({ reportKey: "listing-health-v3", apiKey, ids: [rawSellerId], windowsByRequestKey, marketplaceCountry: marketplace || null }) || [];
-  const by = {}; for (const r of resolved) by[r.requestKey] = r.requestHash; return by;
+// The v3 PER-ACCOUNT read identities, computed by the SAME shared helper the serve uses -- so injecting
+// getSavedSourceRows keyed by these hashes proves the serve reads the correct per-account identity. The identities
+// are DATE-FREE (stable), so `to`/preset never change them (proving inventory is window-independent).
+function hashesFor({ apiKey = API_KEY, rawSellerId = SELLER, marketplace = "US" } = {}) {
+  return listingHealthV3PerAccountReadHashes({ apiKey, rawSellerId, marketplaceCountry: marketplace || null });
 }
 
 /* ---- fixtures (row shapes byte-match the v3 integration test) ---- */

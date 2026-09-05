@@ -18,6 +18,7 @@ import { makeSupabaseSourceStore, makeDataDoeAdapter } from "./source-sync-drive
 import { makeSupabaseReportStore, makeSourceRowLoader, makeShadowSnapshotSaver } from "./report-snapshot-store.js";
 import { makeDailyAdsContextLoader } from "./daily-ads-loader.js";
 import { makeFbaPlanDurableContextLoader } from "./fba-plan-durable-loader.js";
+import { makeListingHealthV3DurableContextLoader } from "./listing-health-v3-durable-loader.js";
 import { schedulerV2ReportControlCatalog, CONTROLLED_REPORT_KEYS, SCHEDULER_V2_READY_REPORT_KEYS } from "./report-controls.js";
 import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "./report-publisher.js";
 import { runSchedulerV2Shadow } from "./sync-dispatch.js";
@@ -205,7 +206,11 @@ export function buildSchedulerV2Runtime(overrides = {}) {
   // safe union (no report is claimed by two loaders). fba-plan reads its DERIVED durable OLI + Catalog here.
   const dailyAdsLoader = makeDailyAdsContextLoader({ connections, getAdMetrics, getCoverageState });
   const fbaPlanDurableLoader = makeFbaPlanDurableContextLoader({ connections, getOliCoverage: readOliCoverage, getOliHistory: readOliHistory, getCatalogSnapshot: readCatalogSnapshot, loadCatalogPayload });
-  const loadDerivedContext = async (args) => ({ ...(await dailyAdsLoader(args)), ...(await fbaPlanDurableLoader(args)) });
+  // listing-health-v3 (dormant shadow preview): returns {} for every other report, so this is inert for the 13 live
+  // reports and only produces durable OLI + Catalog context if a v3 report is ever derived (never on the default/
+  // scheduled path). Uses the SAME production wrappers by default (enriched OLI / coverage / completeness).
+  const listingHealthV3DurableLoader = makeListingHealthV3DurableContextLoader({ connections, getCatalogSnapshot: readCatalogSnapshot, loadCatalogPayload });
+  const loadDerivedContext = async (args) => ({ ...(await dailyAdsLoader(args)), ...(await fbaPlanDurableLoader(args)), ...(await listingHealthV3DurableLoader(args)) });
   const discoverAccounts = makeProductionDiscoverAccounts({ connections, fetchAccounts });
   // Gate-7 durable ACCOUNT gate loader (the dispatcher enforces it on EVERY dispatch, scheduled AND manual --
   // manualReportKeys selects reports only, never accounts). Trusted + fixed: RUN_OPERATIONAL_ARGS does not

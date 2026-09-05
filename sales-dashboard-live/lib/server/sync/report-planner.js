@@ -98,6 +98,14 @@ export { TIMEOUT_SAFE_SLICE_DAYS };
 
 export const SHADOW_PLANNED_REPORT_KEYS = Object.freeze(["brand-sales", "daily-reporting", "content-changes", "sku-pl", "fba-plan", "reconciliation", "buy-box-loss", "returns-leakage", "listing-health"]);
 
+// Batched SHADOW reports a DEDICATED operator may plan by EXPLICIT request only -- NEVER a default/scheduled key.
+// listing-health-v3 is a dormant read-only preview: keeping it OUT of SHADOW_PLANNED_REPORT_KEYS (the default set)
+// AND out of CONTROLLED_REPORT_KEYS / SCHEDULER_V2_READY_REPORT_KEYS means no scheduled or manual control-plane
+// dispatch can ever select it (structurally safe-closed), while a reviewed Phase-4B ingestion operator can still build
+// its batched plan via buildShadowReportPlan({ reportKeys: ["listing-health-v3"] }) -- exactly how fba-plan-operation
+// plans fba-plan. The default plan (and therefore every existing scheduled report) is byte-identical.
+export const DEDICATED_BATCHED_SHADOW_REPORT_KEYS = Object.freeze(["listing-health-v3"]);
+
 // Keyword Rank is NOT a generic single-shot plan: its weekly->monthly fallback and catalog token
 // are staged per account by runKeywordRankShadowCycle (keyword-rank-cycle.js). It therefore has ONE
 // canonical entry point and MUST NOT flow through the eager generic builder (which would emit weekly +
@@ -857,7 +865,10 @@ export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANN
     const directions = stagedRequested.map((key) => `${key} -> ${STAGED_CYCLE_ENTRY_POINTS[key] || "its account-scoped staged cycle"}`).join("; ");
     throw new Error(`buildShadowReportPlan cannot plan staged-cycle report(s) [${stagedRequested.join(", ")}]; use ${directions}.`);
   }
-  const keys = requested.filter((key) => SHADOW_PLANNED_REPORT_KEYS.includes(key));
+  // A default (scheduled) plan sees ONLY SHADOW_PLANNED_REPORT_KEYS; a DEDICATED operator may additionally request a
+  // batched dormant key (listing-health-v3). The default set is unchanged, so scheduled dispatch is byte-identical.
+  const acceptedKeys = new Set([...SHADOW_PLANNED_REPORT_KEYS, ...DEDICATED_BATCHED_SHADOW_REPORT_KEYS]);
+  const keys = requested.filter((key) => acceptedKeys.has(key));
   // Primary-only safety: partition the directory against the CONFIGURED connections BEFORE planning. A
   // stale `dd-secondary:` account (secondary org retired) is never planned, never routed to the primary
   // key, and its prefix/snapshots are untouched -- it is returned read-only so its unavailability cannot
@@ -866,7 +877,9 @@ export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANN
   const reportRequests = [];
   // fba-plan uses MARKETPLACE-SAFE <=5-seller BATCHED planning across the whole bucket (its owned FBA Health +
   // US AWD exports are seller-scoped/batchable) -- planned ONCE across all accounts, not per-account.
-  const perAccountKeys = keys.filter((k) => k !== "fba-plan");
+  // fba-plan AND listing-health-v3 are <=5-seller BATCHED (planned once across the bucket), so they are excluded from
+  // the per-account loop and handled by their dedicated batched planners below.
+  const perAccountKeys = keys.filter((k) => k !== "fba-plan" && k !== "listing-health-v3");
   for (const account of active) {
     const asOf = typeof asOfFor === "function" ? asOfFor(account.country) : account.asOf;
     for (const reportKey of perAccountKeys) {
@@ -877,6 +890,11 @@ export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANN
   }
   if (keys.includes("fba-plan")) {
     reportRequests.push(...planFbaPlanBucketBatched({ accounts: active, connections, asOfFor, inventoryAsOf }));
+  }
+  // listing-health-v3 (dormant, explicit-request only): the same marketplace-safe <=5-seller batched planner fba-plan
+  // uses. Never reached by a default/scheduled plan (v3 is not a default key), so it is inert unless an operator asks.
+  if (keys.includes("listing-health-v3")) {
+    reportRequests.push(...planListingHealthV3BucketBatched({ accounts: active, connections, asOfFor, inventoryAsOf }));
   }
   const { sourceJobs, reportJobs } = buildDependencyPlan(reportRequests);
   return { reportRequests, sourceJobs, reportJobs, unavailableAccounts: unavailable };
