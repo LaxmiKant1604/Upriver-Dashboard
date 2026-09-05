@@ -14305,3 +14305,49 @@ buildShadowReportPlan({reportKeys:["listing-health-v3"]}) -> assertListingHealth
 (frozen tranche budget) -> materializeListingHealthV3PerAccount -> runReportJobs (shadow snapshot), gated by its OWN
 explicit control (never the live 13-report control plane); then, once per-account aliases are proven populated in prod,
 flip LISTING_HEALTH_V3 = true for the authorized preview go-live.
+
+---
+
+## 2026-09-05 -- Listing Health v3 Phase 4B1: dedicated ingestion operator, safe-closed (commit b1b9428, PUSHED to main)
+
+WHAT: built (did NOT run) the ONE trusted v3 ingestion operator as a SEPARATE dispatch path from the live 13-report
+control plane. v3 stays absent from CONTROLLED_REPORT_KEYS / SCHEDULER_V2_READY_REPORT_KEYS, so the scheduled/manual
+dispatcher can never select it; this operator is the only way v3 ingestion runs, and only behind BOTH an explicit
+operator authorization AND an independent, DEFAULT-DISABLED ingestion gate. NOT wired to any api route / GitHub cron /
+Cloudflare watchdog, and NOT invoked this phase.
+
+NEW lib/server/sync/listing-health-v3-operation.js (injectable, pure orchestration, offline-testable):
+runListingHealthV3Ingestion({region, cycleDate, mode, authorized, gate, connections, discoverAccounts, buildPlan,
+resolveCost, checkBalance, runSources, materialize, runReports, ...}) -> per-region evidence. Sequence (every step
+fail-closed, LKG preserved): 1 auth -> 2 gate (live REFUSES while disabled; dry-run may plan) -> 3 region allowlist
+india|europe-au|us-ca -> 4 discover primary accounts -> 5 resolve region by marketplace country (accountInScope; never
+browser/clock) -> 6 build+FREEZE buildShadowReportPlan(["listing-health-v3"]) with freshnessNotBefore=cycleDate -> 7
+validate ceiling + freshness-aware cost + pricingKnown + reservationSupported + usable balance (minus emergency reserve,
+default 50) BEFORE any POST -> 8 runSources (listings/listings-raw CREATE in the frozen budget; inventory REUSE-ONLY) ->
+9 materialize per-account aliases -> 10 derive ONLY the scheduler-v2/listing-health-v3 SHADOW snapshot, DEFERRED when
+current FBA Plan inventory is unavailable (deferred-inventory phase; never publishes stale inventory as current) -> 11
+evidence. Dry-run does ZERO creates/writes/tokens (discover+plan+cost reads only; no balance check, no source/report
+work). Live refuses while gate disabled. planListingHealthV3IngestionCost = freshness-aware pre-POST cost (mirrors
+planFbaBucketCost): a date-free cache with fetched_at < the source freshnessNotBefore is NOT adoptable (would refresh);
+current-cycle cache adoptable => 0 tokens; inventory never counted as a create; estimatedTokens = creates x 2 OBSERVED
+(rowCountBilling=true => not a guaranteed max). Operation id: listing-health-v3/{region}/{cycleDate}.
+
+FRESHNESS (materialize.js): new optional readAliasMeta -> a per-account alias is OVERWRITTEN only from a STRICTLY newer
+validated batch (compared by the batch fetched_at, stamped into request_meta.batchFetchedAt). A late/older OR
+same-cycle-replay batch is skipped (summary.skippedStale) -> newer alias data is never replaced, replay writes nothing.
+New supabase getSourceExportCacheMeta (metadata-only read, no payload hydration) backs the operator's readAliasMeta.
+
+BUDGET: hard per-region create ceilings (india 4 / europe-au 8 / us-ca 4) count ONLY Listings+Listings-Raw creates
+(inventory/OLI/Catalog = 0); the operator aborts BEFORE the first POST on ceiling excess, unknown pricing, missing
+reservation support, or insufficient usable balance (usable - reserve < estimatedTokens).
+
+TESTS: report-listing-health-v3-operation.test.js (32) + materialize suite +4 (newer-only overwrite). Full npm run
+verify GREEN 142/142 steps, 118 suites, incl. build:check. api/*.js stays 12; LISTING_HEALTH_V3 false; zero DataDoe
+creates, zero tokens; operator imported only by its test (dark).
+
+REMAINING (Phase 4B2 activation, reviewed + gated): (a) a thin CLI/route runner that wires the operator's execution
+collaborators (runSources -> runSourceJobs/runStagedSourceCycle with the frozen tranche budget + two-pass
+create/reuse-only split for inventory; runReports -> runReportJobs; discoverAccounts; checkBalance -> DataDoe usage/
+balance; resolveCost -> planListingHealthV3IngestionCost + getSourceExportCache; materialize -> materialize + supabase
+readers) behind its own enabled gate; (b) a ONE-region ONE-cycle authorized live canary; (c) once aliases prove
+populated in prod, flip LISTING_HEALTH_V3 = true for the preview go-live.
