@@ -14258,3 +14258,50 @@ flag-OFF v1-preservation source guards). Full `npm run verify` GREEN: 140/140 st
 REMAINING (future, authorized activation only): schedule v3 per-account listings/listings-raw ingestion (+ per-account
 inventory read) so the preview's status/issue/on-hand dimensions populate; then flip LISTING_HEALTH_V3 ON for the
 authorized preview go-live. Scheduler-v2 UNCHANGED here.
+
+---
+
+## 2026-09-05 -- Listing Health v3 Phase 4A: per-account source materialization + safe-closed scheduler wiring (commit 0a5cc8b, PUSHED to main)
+
+ROOT CAUSE (the "always Unavailable" preview): regional Listings/Listings-Raw/inventory are exported in <=5-seller
+BATCHES, so batch rows sit in source_export_cache under the BATCH request_hash (ids = up to 5 sellers). The v3 serve
+resolves a PER-ACCOUNT identity (ids=[one seller]) whose request_hash DIFFERS from the batch hash (accountScopeHash is
+a hash of the id SET), so every valid per-account read MISSED. request_hash folds org+accountScopeHash+sourceMeta;
+marketplace is NOT in it (only gates conditional contracts).
+
+FIX (zero new exports): new lib/server/sync/listing-health-v3-materialize.js splits ONE already-saved, already-validated
+batch back per account and UPSERTS each isolated fragment under that account's OWN per-account read hash -- the exact
+hash the serve computes. Shared helper listingHealthV3PerAccountReadHashes/Identities uses DATE-FREE windows for all 3
+keys (listings/listings-raw/inventory) so serve + materializer always agree regardless of day (inventory is "latest
+snapshot", not windowed). Isolation via the pure isolateFragmentRowsForOwner (rawSellerId + marketplace + org +
+connection): unattributable rows REJECTED (never written); empty owner -> valid-empty [] (distinct from missing);
+missing/failed batch -> skipped (prior LKG survives); UPSERT by request_hash so replay never duplicates; never copies
+one seller's rows into another. Inventory REUSES the fba-plan:inventory-health batch (read + alias only; no FBA/AWD
+hash touched). The serve (listing-health-v3-serve.js) now reads the alias via the shared helper (date-free inventory).
+
+BUDGET SAFETY: assertListingHealthV3ExportCeiling counts ONLY new Listings+Listings-Raw creates (inventory reuse + OLI
++ Catalog = 0 incremental) and FAILS CLOSED before any create when planned > the per-region ceiling. Ceilings are a
+STRUCTURAL create count (NOT a token max -- DataDoe rowCountBilling=true, so 2 tokens is never an unconditional max):
+LISTING_HEALTH_V3_REGION_EXPORT_CEILING = india 4 / europe-au 8 / us-ca 4 (= 2 x regional batch count).
+
+SAFE-CLOSED WIRING: buildShadowReportPlan gains a DORMANT, explicit-request-only listing-health-v3 branch
+(DEDICATED_BATCHED_SHADOW_REPORT_KEYS) -- the DEFAULT/scheduled plan set is UNCHANGED (every existing scheduled report
+byte-identical). runtime-composition composes makeListingHealthV3DurableContextLoader into loadDerivedContext (returns
+{} for the 13 live reports -> inert). DELIBERATELY kept OUT of CONTROLLED_REPORT_KEYS + SCHEDULER_V2_READY_REPORT_KEYS:
+those are the LIVE-publish control plane (a key there REQUIRES a SCHEDULER_LIVE_SNAPSHOT_CONTRACT and would make v3
+live-publishable + break the reviewed "exactly 13" invariant in gate7b/sync-runtime-composition/gate7-rollout/
+report-sync-controls). v3 is a shadow preview with NO live snapshot contract. RESULT: a scheduled run (all controls
+enabled) selects ZERO v3, and a manual v3 request is locked out at the readiness gate -> zero dispatch, zero exports.
+No control rows created; no cron/concurrency/watchdog change; LISTING_HEALTH_V3 stays false; api/*.js stays 12.
+
+TESTS: scripts/report-listing-health-v3-materialize.test.js (44) -- reproduces the miss; 5 accounts -> 5 isolated
+per-account reads from ONE export; end-to-end serve HIT with isolation; empty-seller valid-empty; mixed-marketplace
+isolation; malformed-identity + cross-org rejection; idempotent replay; partial/failed-batch LKG; per-region ceiling
+fail-closed; zero-dispatch safe-closed wiring. Full `npm run verify` GREEN 141/141 steps, 117 suites, incl. build:check.
+DataDoe creates 0, tokens 0.
+
+REMAINING (Phase 4B activation, all reviewed + gated): build a dedicated v3 shadow-ingestion operator that calls
+buildShadowReportPlan({reportKeys:["listing-health-v3"]}) -> assertListingHealthV3ExportCeiling -> runSourceJobs
+(frozen tranche budget) -> materializeListingHealthV3PerAccount -> runReportJobs (shadow snapshot), gated by its OWN
+explicit control (never the live 13-report control plane); then, once per-account aliases are proven populated in prod,
+flip LISTING_HEALTH_V3 = true for the authorized preview go-live.
