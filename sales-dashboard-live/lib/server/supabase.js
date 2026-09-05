@@ -1398,6 +1398,20 @@ export async function getSyncCycle(cycleId, { signal = null } = {}) {
 // ACTIVE, non-superseded HEAD of the supersession chain -- the cycle that no other cycle supersedes. Exactly one
 // head is expected; zero rows -> null; a fork (more than one head) or a headless chain FAILS CLOSED. Selects
 // operation_key/supersedes_cycle_id/attempt_kind + trigger so callers can prove identity + a reviewed manual run.
+// Recent sync-cycle ids for one bucket at/after `sinceDate` (adaptive FBA-inventory overflow evidence: scan recent
+// region-fba cycles for terminal TRUNCATED inventory jobs). Read-only; returns [cycleId] newest-first, bounded.
+export async function getRecentSyncCycleIds(bucket, sinceDate, { signal = null, limit = 60 } = {}) {
+  const query = new URLSearchParams({
+    select: "id,cycle_date",
+    bucket: `eq.${bucket}`,
+    cycle_date: `gte.${sinceDate}`,
+    order: "cycle_date.desc",
+    limit: String(limit),
+  });
+  const rows = await request(`/rest/v1/sync_cycles?${query}`, { signal });
+  return Array.isArray(rows) ? rows.map((r) => r.id).filter(Boolean) : [];
+}
+
 export async function getSyncCycleByBucketDate(bucket, cycleDate, { signal = null } = {}) {
   const query = new URLSearchParams({
     select: "id,bucket,cycle_date,status,trigger,operation_key,supersedes_cycle_id,attempt_kind,created_at,started_at,finished_at",

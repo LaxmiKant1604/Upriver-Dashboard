@@ -36,6 +36,10 @@ export const REQUIRED_WRAPPERS = REQUIRED_WRAPPER_EXPORTS;
 export const RUN_OPERATIONAL_ARGS = Object.freeze([
   "bucket", "cycleBucket", "cycleDate", "asOf", "asOfFor", "inventoryAsOf", "manualReportKeys",
   "clock", "deadlineMs", "reserveMs", "maxJobs", "scheduledAt", "trigger",
+  // Adaptive FBA-inventory self-heal: a Set of proven-overflow raw seller ids the trusted composition derives from
+  // recent terminal TRUNCATED evidence, so the plan isolates them into single-seller inventory batches. Empty/absent
+  // => byte-identical default batching. Never widens account scope (only re-shapes inventory batches).
+  "overflowSellers",
 ]);
 
 // The single Daily Ads source_key ad_daily_metrics is keyed under (mirrors daily-ads-loader.DAILY_ADS_SOURCE_KEY).

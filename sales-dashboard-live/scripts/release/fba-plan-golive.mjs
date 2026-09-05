@@ -73,8 +73,14 @@ for (const bucket of selectedScopes) {
   if (!bucketAccounts.length) continue;
   const scope = await resolveFbaPlanScope({ accounts: bucketAccounts, connections: release.connections, asOfArg, maxBlocked, ceiling: CEILING, readers: release.scopeReaders });
   if (!scope.asOf) { console.error("STOP " + bucket + " has no durable sales coverage; inventory export not started."); process.exit(1); }
-  const { plan, cost } = await planFbaBucketCost({ bucketAccounts, connections: release.connections, asOf: scope.asOf, inventoryAsOf, getSourceExportCache: release.getSourceExportCache });
-  bucketPlan.set(bucket, { bucketAccounts, plan, cost, scope });
+  // Adaptive self-heal: proactively route proven-overflow sellers (recent terminal TRUNCATED inventory evidence) into
+  // single-seller inventory jobs so a persistently-oversized batch does not waste one failed export every cycle. Empty
+  // => byte-identical default batching; fail-soft. Single-seller HARD STOPS are surfaced (never auto-raise the limit).
+  const { overflowSellers, singleSellerHardStops } = await release.resolveOverflowSellers({ bucket, bucketAccounts, asOf: scope.asOf, inventoryAsOf });
+  if (overflowSellers.size) log(bucket + " adaptive split: isolating " + overflowSellers.size + " proven-overflow seller(s) into single-seller inventory jobs");
+  if (singleSellerHardStops.length) log(bucket + " WARN " + singleSellerHardStops.length + " single-seller inventory batch(es) still exceed 50000 (cannot split further; not auto-raising the limit)");
+  const { plan, cost } = await planFbaBucketCost({ bucketAccounts, connections: release.connections, asOf: scope.asOf, inventoryAsOf, getSourceExportCache: release.getSourceExportCache, overflowSellers });
+  bucketPlan.set(bucket, { bucketAccounts, plan, cost, scope, overflowSellers });
   log(bucket + " sales through " + scope.asOf + "; inventory through " + inventoryAsOf + "; included=" + scope.included.length + " blocked=" + scope.blocked.length);
   const unique = new Map(plan.reportRequests.flatMap((r) => r.sources.map((s) => [s.requestHash, s])));
   for (const s of unique.values()) log("BATCH " + s.requestKey + " " + JSON.stringify({ sellers: s.sellerOrVendorIds, pairs: s.marketplacePairs, from: s.from, to: s.to, freshAfter: s.freshnessNotBefore }));
@@ -93,7 +99,7 @@ let anyPublished = 0; let anyFailure = false;
 try {
   for (const bucket of selectedScopes) {
     if (!bucketPlan.has(bucket)) continue;
-    const { bucketAccounts, cost, scope } = bucketPlan.get(bucket);
+    const { bucketAccounts, cost, scope, overflowSellers } = bucketPlan.get(bucket);
     const asOf = scope.asOf;
     if (!bucketAccounts.length) { log(bucket + ": no accounts in this bucket -- skipping."); continue; }
     const includedIds = scope.included.filter((id) => bucketAccounts.some((a) => a.accountId === id));
@@ -107,6 +113,7 @@ try {
         runtime: release.runtime, publisher: release.publisher, controls: release.controls,
         readbackLive: release.readbackLive, ownershipBackfill: release.ownershipBackfill,
         trigger: "github", deadlineMs: Infinity, reserveMs: 0, outOfTime: () => false,
+        overflowSellers,
         log: (m) => log(m),
       });
       log(bucket + " pass " + pass + ": phase=" + result.phase + " published=" + result.published + " readback=" + result.readback + (result.continuationRequired ? " (continuation)" : "") + (result.problems ? " problems=" + JSON.stringify(result.problems) : ""));

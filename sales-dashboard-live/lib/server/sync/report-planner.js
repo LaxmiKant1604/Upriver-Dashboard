@@ -390,7 +390,21 @@ export function marketplaceCodeFor(country) {
  * within one region and connection/organization. Carry exact seller-marketplace pairs for source validation
  * and per-account ownership for derivation. inventoryAsOf is independent of the sales asOfFor cutoff.
  */
-export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, inventoryAsOf = null, existingFbaMembership = new Map() }) {
+// Split any batch that contains a proven-overflow seller into single-seller batches, leaving every other batch
+// byte-identical. `overflowSellers` is a Set of RAW seller ids proven to overflow the strict 50000-row cap (from prior
+// terminal TRUNCATED evidence). Empty set => byte-identical (existing hashes unchanged).
+function splitOverflowBatches(batches, byId, overflowSellers) {
+  if (!overflowSellers || overflowSellers.size === 0) return batches;
+  const out = [];
+  for (const batch of batches) {
+    const hasOverflow = batch.accounts.some((a) => overflowSellers.has(String(byId.get(a.accountId).scope.rawSellerId)));
+    if (hasOverflow) for (const a of batch.accounts) out.push({ accounts: [a] }); // isolate the whole overflow batch
+    else out.push(batch);
+  }
+  return out;
+}
+
+export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, inventoryAsOf = null, existingFbaMembership = new Map(), overflowSellers = new Set() }) {
   const scoped = (accounts || []).map((a) => {
     const scope = resolveAccountScope({ accountId: a.accountId, country: a.country, currency: a.currency, connections });
     const asOf = String(typeof asOfFor === "function" ? asOfFor(a.country) : a.asOf);
@@ -420,7 +434,10 @@ export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, 
       const byId = new Map(eligible.map((m) => [m.scope.accountId, m]));
       const membership = new Map([...existingFbaMembership].filter(([id]) => byId.has(id)));
       const { batches } = assignAccountBatches(eligible.map((m) => ({ accountId: m.scope.accountId, rawSellerId: m.scope.rawSellerId })), membership, MAX_ACCOUNTS_PER_BATCH);
-      for (const batch of batches) {
+      // Adaptive self-heal: isolate proven-overflow sellers into single-seller INVENTORY batches (never AWD). Empty
+      // overflow set => byte-identical to the default plan (existing hashes unchanged).
+      const effectiveBatches = requestKey === "fba-plan:inventory-health" ? splitOverflowBatches(batches, byId, overflowSellers) : batches;
+      for (const batch of effectiveBatches) {
         const owners = batch.accounts.map((a) => byId.get(a.accountId));
         const pairs = owners.map((m) => ({ sellerId: m.scope.rawSellerId, marketplace: marketplaceCodeFor(m.scope.country) }));
         const markets = [...new Set(pairs.map((p) => p.marketplace))];
@@ -468,7 +485,7 @@ export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, 
  * sales asOf. This planner is NOT in PLANNERS / SHADOW_PLANNED_REPORT_KEYS: v3 is dormant (nothing dispatches it),
  * so this is invoked only by the shadow build/verify path and the zero-create dry-run.
  */
-export function planListingHealthV3BucketBatched({ accounts = [], connections, asOfFor, inventoryAsOf = null, existingMembership = new Map() }) {
+export function planListingHealthV3BucketBatched({ accounts = [], connections, asOfFor, inventoryAsOf = null, existingMembership = new Map(), overflowSellers = new Set() }) {
   const scoped = (accounts || []).map((a) => {
     const scope = resolveAccountScope({ accountId: a.accountId, country: a.country, currency: a.currency, connections });
     const asOf = String(typeof asOfFor === "function" ? asOfFor(a.country) : a.asOf);
@@ -494,8 +511,12 @@ export function planListingHealthV3BucketBatched({ accounts = [], connections, a
     const byId = new Map(members.map((m) => [m.scope.accountId, m]));
     const membership = new Map([...existingMembership].filter(([id]) => byId.has(id)));
     const { batches } = assignAccountBatches(members.map((m) => ({ accountId: m.scope.accountId, rawSellerId: m.scope.rawSellerId })), membership, MAX_ACCOUNTS_PER_BATCH);
+    // Mirror the FBA adaptive self-heal so v3's inventory read hash matches the FBA single-seller child for proven-
+    // overflow sellers (empty set => byte-identical). v3 batches all three sources together, so an overflow seller's
+    // whole batch is isolated -- only the inventory identity needs to match, and nothing else is fetched here.
+    const effectiveBatches = splitOverflowBatches(batches, byId, overflowSellers);
     const sourcesByAccount = new Map(members.map((m) => [m.scope.accountId, []]));
-    for (const batch of batches) {
+    for (const batch of effectiveBatches) {
       const owners = batch.accounts.map((a) => byId.get(a.accountId));
       const pairs = owners.map((m) => ({ sellerId: m.scope.rawSellerId, marketplace: marketplaceCodeFor(m.scope.country) }));
       const markets = [...new Set(pairs.map((p) => p.marketplace))];
@@ -855,7 +876,7 @@ const PLANNERS = {
  * key (Keyword Rank) is REJECTED fail-closed, never silently planned OR silently dropped. Any other
  * unknown key is ignored. Pure given its inputs; no I/O.
  */
-export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANNED_REPORT_KEYS, connections, asOfFor, inventoryAsOf = null }) {
+export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANNED_REPORT_KEYS, connections, asOfFor, inventoryAsOf = null, overflowSellers = new Set() }) {
   const requested = reportKeys || [];
   // Fail closed: a staged-cycle report (Keyword Rank) has ONE canonical entry point
   // (runKeywordRankShadowCycle) and must never be planned by -- or silently dropped from -- the generic
@@ -889,12 +910,12 @@ export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANN
     }
   }
   if (keys.includes("fba-plan")) {
-    reportRequests.push(...planFbaPlanBucketBatched({ accounts: active, connections, asOfFor, inventoryAsOf }));
+    reportRequests.push(...planFbaPlanBucketBatched({ accounts: active, connections, asOfFor, inventoryAsOf, overflowSellers }));
   }
   // listing-health-v3 (dormant, explicit-request only): the same marketplace-safe <=5-seller batched planner fba-plan
   // uses. Never reached by a default/scheduled plan (v3 is not a default key), so it is inert unless an operator asks.
   if (keys.includes("listing-health-v3")) {
-    reportRequests.push(...planListingHealthV3BucketBatched({ accounts: active, connections, asOfFor, inventoryAsOf }));
+    reportRequests.push(...planListingHealthV3BucketBatched({ accounts: active, connections, asOfFor, inventoryAsOf, overflowSellers }));
   }
   const { sourceJobs, reportJobs } = buildDependencyPlan(reportRequests);
   return { reportRequests, sourceJobs, reportJobs, unavailableAccounts: unavailable };

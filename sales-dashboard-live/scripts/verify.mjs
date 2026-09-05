@@ -51,6 +51,7 @@ const SUITES = [
   "test:listing-health-v3-operation",
   "test:listing-health-v3-ingestion",
   "test:fba-inventory-truncated",
+  "test:fba-inventory-overflow",
   "test:region-view",
   "test:regional-brand-view",
   "test:insights",

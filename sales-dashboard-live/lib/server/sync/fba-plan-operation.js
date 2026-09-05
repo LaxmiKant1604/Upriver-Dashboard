@@ -113,10 +113,10 @@ export function fbaBucketAccounts(accounts, bucket) {
  * Build the exact batched plan + prove the token cost for ONE bucket (ZERO creates). `getSourceExportCache`
  * proves what is already adoptable from the durable cache (adoptable => 0 tokens). Returns { plan, cost }.
  */
-export async function planFbaBucketCost({ bucketAccounts, connections, asOf, inventoryAsOf = null, getSourceExportCache }) {
+export async function planFbaBucketCost({ bucketAccounts, connections, asOf, inventoryAsOf = null, getSourceExportCache, overflowSellers = new Set() }) {
   const asOfFor = () => asOf;
   const plan = bucketAccounts.length
-    ? buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: ["fba-plan"], connections, asOfFor, inventoryAsOf })
+    ? buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: ["fba-plan"], connections, asOfFor, inventoryAsOf, overflowSellers })
     : { sourceJobs: [], reportRequests: [] };
   const adoptable = new Set();
   const plannedSources = new Map(plan.reportRequests.flatMap((r) => r.sources.map((s) => [s.requestHash, s])));
@@ -167,6 +167,9 @@ export async function advanceFbaPlanBucket({
   runtime, publisher, controls, readbackLive, ownershipBackfill = null,
   trigger = "github", deadlineMs = Infinity, reserveMs = 3000, outOfTime = () => false,
   maxSlices = 40, log = () => {},
+  // Adaptive self-heal: proven-overflow raw seller ids to isolate into single-seller inventory batches (empty =>
+  // byte-identical default batching). Passed straight to the plan via runtime.run.
+  overflowSellers = new Set(),
 } = {}) {
   const cycleBucket = fbaCycleBucket(bucket);
   const cycleDate = inventoryAsOf || asOf;
@@ -218,6 +221,7 @@ export async function advanceFbaPlanBucket({
         const res = await runtime.run({
           bucket, cycleBucket, cycleDate, asOf, asOfFor: () => asOf, ...(inventoryAsOf ? { inventoryAsOf } : {}),
           manualReportKeys: ["fba-plan"], trigger, deadlineMs, reserveMs,
+          ...(overflowSellers && overflowSellers.size ? { overflowSellers } : {}),
         });
         cycleId = res.cycleId || cycleId;
         log(bucket + " fetch slice " + slice + ": cycle=" + S(cycleId).slice(0, 8) + " drained=" + res.drained + (res.deadlineReached ? " (deadline)" : ""));

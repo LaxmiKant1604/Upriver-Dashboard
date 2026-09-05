@@ -158,7 +158,7 @@ export function composeDerivedContextLoaders(loaders) {
  * creates NO duplicate export (each driver + runReportJobs is idempotent/checkpointable).
  */
 export async function runSchedulerV2Shadow({
-  bucket, cycleDate, asOf = null, asOfFor = null, inventoryAsOf = null,
+  bucket, cycleDate, asOf = null, asOfFor = null, inventoryAsOf = null, overflowSellers = new Set(),
   settings = [], manualReportKeys = null, controlCatalog = schedulerV2ReportControlCatalog,
   connections, discoverAccounts,
   store, dataDoe, saveSnapshot,
@@ -338,7 +338,7 @@ export async function runSchedulerV2Shadow({
     const remaining = budgetLeft();
     let res;
     if (unit.kind === "generic") {
-      const plan = buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: unit.keys, connections, asOfFor: genericAsOfFor, inventoryAsOf });
+      const plan = buildShadowReportPlan({ accounts: bucketAccounts, reportKeys: unit.keys, connections, asOfFor: genericAsOfFor, inventoryAsOf, overflowSellers });
       // Blocker 4d wiring: freeze + thread the GENERIC unit's create/AI-token ceilings when the trusted
       // composition supplied a budget planner and the tranche is statically plannable. The budget is
       // persisted BEFORE any execution (the cycle open is the same idempotent (bucket, cycle_date) upsert

@@ -540,6 +540,9 @@ test("(C1) RUN_OPERATIONAL_ARGS is pinned: no trusted collaborator is per-run ov
     // (fba-plan uses us-fba / non-us-fba), never the account scope or any collaborator -- so it stays operational.
     "bucket", "cycleBucket", "cycleDate", "asOf", "asOfFor", "inventoryAsOf", "manualReportKeys",
     "clock", "deadlineMs", "reserveMs", "maxJobs", "scheduledAt", "trigger",
+    // overflowSellers re-shapes ONLY the FBA-inventory batch composition (isolates proven-overflow sellers into
+    // single-seller batches); it never overrides a collaborator or widens account scope -- so it stays operational.
+    "overflowSellers",
   ]);
   for (const trusted of ["loadAccountRollout", "getAccountRollout", "discoverAccounts", "controlCatalog", "settings", "connections", "store", "dataDoe", "saveSnapshot"]) {
     assert.ok(!RUN_OPERATIONAL_ARGS.includes(trusted), trusted + " is fixed by the composition");
