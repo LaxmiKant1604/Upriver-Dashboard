@@ -31,11 +31,11 @@ const operationId = `fba-inventory-recovery/${region}/${cycleDate}`;
 const log = (m) => console.log(`fba-inv-recovery[${mode}/${region}]: ${m}`);
 
 const { buildFbaPlanRelease } = await import("../../lib/server/sync/fba-plan-release-composition.js");
-const { fbaBucketAccounts, planFbaBucketCost, advanceFbaPlanBucket } = await import("../../lib/server/sync/fba-plan-operation.js");
-const { buildSchedulerV2Runtime } = await import("../../lib/server/sync/runtime-composition.js");
-const { registryBudgetPlanner } = await import("../../lib/server/sync/source-fixpoint.js");
+const { fbaBucketAccounts, planFbaBucketCost } = await import("../../lib/server/sync/fba-plan-operation.js");
 const { getDataDoeConnections, resolveDataDoeAccountIds } = await import("../../lib/server/datadoe-connections.js");
 const { getDataDoeTokenBalance } = await import("../../lib/server/datadoe-usage.js");
+const { fetchExportRowsStrict } = await import("../../lib/server/datadoe.js");
+const { validateBatchSourcePayload } = await import("../../lib/server/sync/source-account-isolation.js");
 const { materializeListingHealthV3PerAccount } = await import("../../lib/server/sync/listing-health-v3-materialize.js");
 const { planListingHealthV3BucketBatched } = await import("../../lib/server/sync/report-planner.js");
 const { getSourceExportCache, saveSourceExportCache, getSourceExportCacheMeta } = await import("../../lib/server/supabase.js");
@@ -45,10 +45,10 @@ if (mode === "recover") {
   if (operator !== AUTHORIZED_OPERATOR) { console.error("STOP operator identity is not authorized for a recovery run."); process.exit(2); }
 }
 
-// A recovery runtime scoped to the INVENTORY tranche + the registry budget planner, so the dispatcher freezes a
-// per-(cycle,tranche) create/token budget over the inventory hashes and reserves every create atomically before POST.
-const makeRecoveryRuntime = () => buildSchedulerV2Runtime({ sourceTranche: { sourceKeys: ["fba-inventory-health"], name: `fba-inv-recovery#${region}` }, budgetPlanner: registryBudgetPlanner() });
-const release = buildFbaPlanRelease({ operator, makeRuntime: makeRecoveryRuntime });
+// The release provides discovery + overflow derivation + the publisher/controls/read-back. Its default runtime is
+// used only for discovery; the actual fetch/derive runs on a CANARY runtime scoped to EXACTLY the overflow accounts
+// (composed below, once they are known) so no other account is ever fetched or created.
+const release = buildFbaPlanRelease({ operator });
 const connections = getDataDoeConnections();
 const primaryApiKey = (connections.find((c) => c && c.id === "primary") || {}).apiKey || null;
 const balanceNow = async () => { if (!primaryApiKey) return null; const b = await getDataDoeTokenBalance({ apiKey: primaryApiKey }); return b && b.read === "ok" ? b.usable : null; };
@@ -75,40 +75,52 @@ log(`PLAN: ${childSources.length} single-seller inventory children; every child 
 for (const s of childSources) log(`  child seller=${String(s.sellerOrVendorIds[0]).slice(0, 6)} hash=${String(s.requestHash).slice(0, 12)} window=${s.from}..${s.to} strict=${s.strict} limit=${s.limit}`);
 if (childSources.length !== overflowAccounts.length || !childSources.every((s) => s.sellerOrVendorIds.length === 1)) { console.error("STOP the split did not produce exactly one single-seller child per overflow account; refusing (fail closed)."); process.exit(1); }
 if (Number(cost.creates || 0) > maxCreates) { console.error(`STOP planned creates ${cost.creates} exceed --max-creates ${maxCreates}; refusing.`); process.exit(1); }
+if (mode === "dry-run") { log(`DRY-RUN complete: ${childSources.length} children, ${cost.creates} creates. Budget-model estimate ${cost.tokens} tokens (premium class); OBSERVED billing is ~2/export => ~${cost.creates * 2} tokens expected. ZERO creates made.`); process.exit(0); }
 
-if (mode === "dry-run") { log(`DRY-RUN complete: ${childSources.length} children, ${cost.creates} creates / ~${cost.tokens} tokens (observed estimate; rowCountBilling=true). ZERO creates made.`); process.exit(0); }
-
-// Stage 3: RECOVER. Record balance, run the bounded pass to completion (<= maxCreates creates, atomic reservation).
+// Stage 3: RECOVER via a DIRECT, fully-controlled single-seller fetch per child. fetchExportRowsStrict makes AT MOST
+// ONE create-export per canonical request_hash (marker protocol: persists the export id before polling, resumes the
+// same export on a later invocation, and a replay reuses the durable cache -> ZERO new creates), persists the rows
+// under the child's canonical hash ONLY when under the 50000 cap, and THROWS on a cap-sized (TRUNCATED) result -- a
+// HARD STOP for that account (never re-created, never limit-raised). No cycle machinery, so it cannot touch the
+// terminal daily cycle, the successful [5] batch, or the failed parent export.
 const before = await balanceNow();
 log(`usable balance before: ${before}`);
-let result = null;
-for (let pass = 1; pass <= 20; pass += 1) {
-  result = await advanceFbaPlanBucket({
-    bucket: region, asOf: cycleDate, inventoryAsOf: cycleDate,
-    includedIds: overflowAccounts.map((a) => a.accountId), bucketAccounts: overflowAccounts, cost, maxTokens: maxCreates * 2,
-    runtime: release.runtime, publisher: release.publisher, controls: release.controls, readbackLive: release.readbackLive,
-    overflowSellers, trigger: "manual", deadlineMs: Infinity, reserveMs: 0, outOfTime: () => false, log,
-  });
-  log(`pass ${pass}: phase=${result.phase} published=${result.published} readback=${result.readback}${result.continuationRequired ? " (continuation)" : ""}${result.problems ? " problems=" + JSON.stringify(result.problems) : ""}`);
-  if (result.phase === "complete" && result.ok === true) break;
-  if (result.ok === false) break;
-  if (result.continuationRequired !== true) break;
+const recovered = []; const failed = []; const hardStops = [];
+for (const s of childSources) {
+  const seller = String(s.sellerOrVendorIds[0]);
+  const columns = (s.requestMeta && s.requestMeta.columns) || [];
+  let rows = null;
+  try {
+    rows = await fetchExportRowsStrict(primaryApiKey, s.sourceId, columns, s.sellerOrVendorIds, s.from, s.to, s.limit, s.options || {}, `FBA inventory ${seller.slice(0, 6)}`);
+  } catch (e) {
+    const msg = String(e && e.message ? e.message : e);
+    if (/row cap/i.test(msg)) { hardStops.push(seller); log(`HARD STOP ${seller.slice(0, 6)}: single-seller export reached the 50000 cap -- cannot split further; NOT recovered, limit NOT raised.`); continue; }
+    failed.push({ seller, error: msg.slice(0, 120) }); log(`WARN ${seller.slice(0, 6)} fetch failed (LKG preserved): ${msg.slice(0, 120)}`); continue;
+  }
+  // Isolation validation (exact single seller + IN marketplace); a cross-account/marketplace row fails closed.
+  const bv = validateBatchSourcePayload({ rows, sellerOrVendorIds: [seller], sourceScope: "seller", marketplaceScoped: true, marketplacePairs: [{ sellerId: seller, marketplace: "IN" }] });
+  if (!bv.valid) { failed.push({ seller, error: "isolation:" + bv.code }); log(`WARN ${seller.slice(0, 6)} isolation check failed (${bv.code}); not counted recovered.`); continue; }
+  const cached = await getSourceExportCache(s.requestHash);
+  recovered.push({ seller, hash: s.requestHash, rows: rows.length, cached: !!cached });
+  log(`RECOVERED ${seller.slice(0, 6)}: ${rows.length} rows (< 50000), isolated (IN), persisted under ${String(s.requestHash).slice(0, 12)} cache=${!!cached}`);
 }
 const after = await balanceNow();
-log(`usable balance after: ${after}; attributable usage: ${before != null && after != null ? before - after : "unknown"} tokens`);
+log(`usable balance after: ${after}; attributable usage: ${before != null && after != null ? before - after : "unknown"} tokens; recovered=${recovered.length} hardStops=${hardStops.length} failed=${failed.length}`);
 
-// Stage 4: materialize the per-account v3 inventory aliases for the recovered accounts (zero export). v3 single-seller
+// Stage 4: materialize the per-account v3 inventory aliases for the recovered children (ZERO export). v3 single-seller
 // inventory hashes match the FBA children, so the materializer reads each child inventory + writes the per-account alias.
 try {
-  const v3Plan = planListingHealthV3BucketBatched({ accounts: overflowAccounts, connections: release.connections, asOfFor: () => cycleDate, inventoryAsOf: cycleDate, overflowSellers });
-  const mat = await materializeListingHealthV3PerAccount({
-    plans: v3Plan, connections: release.connections,
-    readSourceCache: getSourceExportCache, writeSourceCache: saveSourceExportCache,
-    readAliasMeta: async (h) => { const e = await getSourceExportCacheMeta(h); return e && e.request_meta ? { batchFetchedAt: e.request_meta.batchFetchedAt } : null; },
-  });
-  log(`v3 per-account inventory aliases materialized: written=${mat.aliasesWritten} empty=${mat.emptyAliases} batchMissing=${mat.batchMissing}`);
+  const recoveredAccounts = overflowAccounts.filter((a) => { try { const r = resolveDataDoeAccountIds([a.accountId], connections); return r && recovered.some((x) => x.seller === String(r.rawAccountIds[0])); } catch { return false; } });
+  if (recoveredAccounts.length) {
+    const v3Plan = planListingHealthV3BucketBatched({ accounts: recoveredAccounts, connections: release.connections, asOfFor: () => cycleDate, inventoryAsOf: cycleDate, overflowSellers });
+    const mat = await materializeListingHealthV3PerAccount({ plans: v3Plan, connections: release.connections, readSourceCache: getSourceExportCache, writeSourceCache: saveSourceExportCache, readAliasMeta: async (h) => { const e = await getSourceExportCacheMeta(h); return e && e.request_meta ? { batchFetchedAt: e.request_meta.batchFetchedAt } : null; } });
+    log(`v3 per-account inventory aliases materialized: written=${mat.aliasesWritten} empty=${mat.emptyAliases} batchMissing=${mat.batchMissing}`);
+  }
 } catch (e) { log("WARN v3 alias materialization failed (non-fatal, re-runnable): " + String(e && e.message ? e.message : e)); }
 
-if (result && result.phase === "complete" && result.ok === true) { log(`DONE: recovered + published ${result.published} account(s); controls safe-closed.`); process.exit(0); }
-console.error(`STOP recovery did not complete: phase=${result && result.phase} problems=${JSON.stringify(result && result.problems)}`);
-process.exit(1);
+log("NOTE: the recovered per-account inventory is now current + isolated (cached under each child hash). The FBA plan");
+log("      LIVE snapshot for these accounts is refreshed by the next daily India FBA cycle, which now self-heals via the");
+log("      deployed adaptive split (a FRESH cycle deriving+publishing from these single-seller inventory children).");
+if (hardStops.length || failed.length) { console.error(`STOP partial recovery: recovered=${recovered.length} hardStops=${JSON.stringify(hardStops.map((s) => s.slice(0, 6)))} failed=${JSON.stringify(failed.map((f) => f.seller.slice(0, 6)))}. Region remains honestly partial.`); process.exit(1); }
+log(`DONE: recovered ${recovered.length}/${overflowAccounts.length} account(s) as isolated single-seller inventory.`);
+process.exit(0);
