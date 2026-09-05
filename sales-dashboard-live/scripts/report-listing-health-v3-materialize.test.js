@@ -55,6 +55,8 @@ function makeCache() {
     },
     // The serve's cache-only saved-source reader reads the SAME cache by request_hash.
     getSavedSourceRows: async (h) => { const e = map.get(h); return e && Array.isArray(e.rows) ? e.rows : null; },
+    // Metadata-only reader for the newer-only alias-overwrite guard (request_meta.batchFetchedAt).
+    readAliasMeta: async (h) => { const e = map.get(h); return e && e.request_meta ? { batchFetchedAt: e.request_meta.batchFetchedAt } : null; },
   };
 }
 
@@ -278,6 +280,45 @@ await (async () => {
   // classify: v3 is not a live-dispatch route (stays out of the generic/staged sets), so the live dispatcher would
   // never route it even if it were somehow selected (it cannot be).
   ok("J: classifySchedulerV2ReportKey(v3) is 'unsupported' for the LIVE dispatcher (never selectable there)", classifySchedulerV2ReportKey("listing-health-v3") === "unsupported");
+})();
+
+/* ===================== K. newer-only alias overwrite (late/older + replay never replace newer data) ===================== */
+await (async () => {
+  const cache = makeCache();
+  const p = plans();
+  const NEWER = "2026-09-04T06:00:00.000Z";
+  const OLDER = "2026-09-03T06:00:00.000Z";
+  const seedWithFetchedAt = (fetchedAt, listings) => {
+    const seen = new Set();
+    for (const src of p[0].sources) {
+      if (seen.has(src.requestHash)) continue; seen.add(src.requestHash);
+      const rows = src.requestKey === "listing-health-v3:listings" ? listings : (src.requestKey === "listing-health-v3:listings-raw" ? rawBatch : inventoryBatch);
+      cache.map.set(src.requestHash, { rows: [...rows], fetched_at: fetchedAt, expires_at: "2999-01-01T00:00:00.000Z", source_id: src.sourceId, organization_fingerprint: src.organizationFingerprint, account_scope_hash: src.accountScopeHash });
+    }
+  };
+  const h02 = listingHealthV3PerAccountReadHashes({ apiKey: API_KEY, rawSellerId: "acct-02", marketplaceCountry: "US" })["listing-health-v3:listings"];
+
+  // 1) NEWER cycle writes acct-02 = [S02a, S02b].
+  seedWithFetchedAt(NEWER, listingsBatch);
+  await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache, readAliasMeta: cache.readAliasMeta });
+  ok("K: the newer batch materialized acct-02's alias (2 rows)", (await cache.getSavedSourceRows(h02)).length === 2);
+
+  // 2) A LATE, OLDER batch (different content) must NOT overwrite the newer alias.
+  seedWithFetchedAt(OLDER, [listingRow("acct-02", "US", "OLD-ONLY")]);
+  const late = await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache, readAliasMeta: cache.readAliasMeta });
+  const afterLate = await cache.getSavedSourceRows(h02);
+  ok("K: a late OLDER completion is skipped (skippedStale) and never replaces newer alias data", late.skippedStale >= 1 && afterLate.length === 2 && !afterLate.some((r) => r.sku === "OLD-ONLY"));
+
+  // 3) Same-cycle REPLAY (same NEWER batch) writes nothing new (idempotent, no duplication).
+  seedWithFetchedAt(NEWER, listingsBatch);
+  const replay = await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache, readAliasMeta: cache.readAliasMeta });
+  ok("K: a same-cycle replay (equal freshness) is skipped -- idempotent, no overwrite", replay.skippedStale >= 1 && (await cache.getSavedSourceRows(h02)).length === 2);
+
+  // 4) A genuinely NEWER cycle DOES overwrite.
+  seedWithFetchedAt("2026-09-05T06:00:00.000Z", [listingRow("acct-02", "US", "S02-NEXT")]);
+  await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache, readAliasMeta: cache.readAliasMeta });
+  const afterNext = await cache.getSavedSourceRows(h02);
+  ok("K: a strictly newer batch DOES overwrite the alias", afterNext.length === 1 && afterNext[0].sku === "S02-NEXT");
 })();
 
 writeSync(1, `\nreport-listing-health-v3-materialize: ${passed} assertions passed\n`);

@@ -48,6 +48,7 @@ const SUITES = [
   "test:listing-health-v3-serve",
   "test:listing-health-v3-view",
   "test:listing-health-v3-materialize",
+  "test:listing-health-v3-operation",
   "test:region-view",
   "test:regional-brand-view",
   "test:insights",

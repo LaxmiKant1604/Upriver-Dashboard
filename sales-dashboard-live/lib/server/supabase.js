@@ -601,6 +601,20 @@ export async function getSourceExportCache(requestHash, { signal = null } = {}) 
   return { ...entry, rows: payload.rows };
 }
 
+// Lean metadata-only read of a source_export_cache row (NO storage payload fetch): returns request_meta + timing so a
+// caller can decide freshness/overwrite ordering cheaply. Used by the v3 per-account materializer to enforce
+// newer-only alias overwrites (request_meta.batchFetchedAt) without hydrating the payload. Unexpired rows only.
+export async function getSourceExportCacheMeta(requestHash, { signal = null } = {}) {
+  const query = new URLSearchParams({
+    select: "request_hash,request_meta,fetched_at,expires_at",
+    request_hash: `eq.${requestHash}`,
+    expires_at: `gt.${new Date().toISOString()}`,
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/source_export_cache?${query}`, { signal });
+  return rows[0] || null;
+}
+
 export async function saveSourceExportCache({
   requestHash,
   sourceId,

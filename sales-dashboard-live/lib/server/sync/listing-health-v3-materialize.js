@@ -126,18 +126,23 @@ export function assertListingHealthV3ExportCeiling({ region, plans, ceiling = nu
  *
  *   plans            : v3 report requests, each { owner, sources[], connectionId } (per account).
  *   connections      : [{ id, apiKey }] -- resolves the owner's apiKey for the read identity.
- *   readSourceCache  : async (requestHash) -> { rows, expires_at?, ... } | null  (getSourceExportCache; cache-only).
+ *   readSourceCache  : async (requestHash) -> { rows, fetched_at?, expires_at?, ... } | null  (getSourceExportCache; cache-only).
  *   writeSourceCache : async ({ requestHash, sourceId, organizationFingerprint, accountScopeHash, requestMeta, rows,
  *                      payloadBytes, expiresAt }) -> void  (saveSourceExportCache; UPSERT by request_hash).
+ *   readAliasMeta    : OPTIONAL async (requestHash) -> { batchFetchedAt } | null. When provided, an alias is
+ *                      OVERWRITTEN only from a STRICTLY NEWER validated batch (compared by the source batch's
+ *                      fetched_at). A late/older or same-cycle-replay batch is SKIPPED, so an older or concurrent
+ *                      completion can never replace newer alias data and a replay writes nothing. Omitted -> writes
+ *                      unconditionally (backward compatible).
  *
- * Returns a summary { accounts, aliasesWritten, emptyAliases, rejected, batchMissing, skippedAccounts, aliases[],
- * rejections[] } -- never a secret. One plan's failure never aborts the others.
+ * Returns a summary { accounts, aliasesWritten, emptyAliases, rejected, batchMissing, skippedAccounts, skippedStale,
+ * aliases[], rejections[] } -- never a secret. One plan's failure never aborts the others.
  */
-export async function materializeListingHealthV3PerAccount({ plans = [], connections = [], readSourceCache, writeSourceCache, clock = () => Date.now() }) {
+export async function materializeListingHealthV3PerAccount({ plans = [], connections = [], readSourceCache, writeSourceCache, readAliasMeta = null, clock = () => Date.now() }) {
   if (typeof readSourceCache !== "function" || typeof writeSourceCache !== "function") {
     throw new Error("materializeListingHealthV3PerAccount requires readSourceCache + writeSourceCache callbacks (fail closed).");
   }
-  const summary = { accounts: 0, aliasesWritten: 0, emptyAliases: 0, rejected: 0, batchMissing: 0, skippedAccounts: 0, aliases: [], rejections: [] };
+  const summary = { accounts: 0, aliasesWritten: 0, emptyAliases: 0, rejected: 0, batchMissing: 0, skippedAccounts: 0, skippedStale: 0, aliases: [], rejections: [] };
   const connById = new Map((connections || []).map((c) => [String(c.id), c]));
 
   for (const plan of plans || []) {
@@ -183,8 +188,24 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
         continue;
       }
 
-      // 3) Persist the isolated fragment under the PER-ACCOUNT read identity (UPSERT by request_hash -> idempotent,
-      //    no duplicates). A genuinely empty fragment ([]) is a VALID-EMPTY alias (distinct from a missing alias).
+      // 3) FRESHNESS GUARD: overwrite an existing alias ONLY from a STRICTLY NEWER validated batch (compared by the
+      //    batch's fetched_at). A late/older completion or a same-cycle replay is skipped -> newer alias data is never
+      //    replaced and a replay writes nothing. Skipped when readAliasMeta is not injected or the batch has no
+      //    fetched_at (backward compatible).
+      const incomingFetchedAt = batch.fetched_at || batch.fetchedAt || null;
+      if (incomingFetchedAt && typeof readAliasMeta === "function") {
+        let existingMeta = null;
+        try { existingMeta = await readAliasMeta(ident.requestHash); } catch (_e) { existingMeta = null; }
+        const existingFetchedAt = existingMeta && (existingMeta.batchFetchedAt || existingMeta.batch_fetched_at) || null;
+        if (existingFetchedAt && Date.parse(String(existingFetchedAt)) >= Date.parse(String(incomingFetchedAt))) {
+          summary.skippedStale += 1; // an equal-or-newer alias already exists -> preserve it (LKG / idempotent replay)
+          continue;
+        }
+      }
+
+      // 4) Persist the isolated fragment under the PER-ACCOUNT read identity (UPSERT by request_hash -> idempotent,
+      //    no duplicates). A genuinely empty fragment ([]) is a VALID-EMPTY alias (distinct from a missing alias). The
+      //    source batch's fetched_at is stamped so a later pass can enforce newer-only overwrites (above).
       const rows = iso.rows;
       try {
         await writeSourceCache({
@@ -192,7 +213,7 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
           sourceId: ident.sourceId,
           organizationFingerprint: ident.organizationFingerprint,
           accountScopeHash: ident.accountScopeHash,
-          requestMeta: ident.requestMeta,
+          requestMeta: { ...(ident.requestMeta || {}), batchFetchedAt: incomingFetchedAt || null, materializedFromHash: src.requestHash },
           rows,
           payloadBytes: approxBytes(rows),
           expiresAt: batch.expires_at || batch.expiresAt || null,
