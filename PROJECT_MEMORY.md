@@ -14475,3 +14475,47 @@ REMAINING (separately authorized, reviewed): e5ce6a needs a higher source-cache 
 needs a higher inventory row limit (50000 ->) -- both change the FBA inventory request_hash (mass re-fetch) so they are
 a reviewed, export-budgeted decision, NOT auto-raised. The adaptive split (deployed) fully resolves the COMMON case
 (several medium sellers summing over a cap); a SINGLE whale seller over a single-seller cap is the residual class.
+
+================================================================================
+2026-09-05 -- FBA INVENTORY LATEST-SNAPSHOT COMPACTION: e5ce6a + fd7653 RECOVERED with ZERO exports/tokens (commit 9124115, LIVE)
+================================================================================
+RESOLVED the two residual India FBA inventory whales (e5ce6a >8MB, fd7653 50000-cap) that the direct single-seller
+fetch could not persist -- WITHOUT raising any limit and WITHOUT a new export. KEY INSIGHT: FBA Plan + Listing Health v3
+consume ONLY the latest inventory date, so an oversized/cap-sized SINGLE-seller payload can be reduced to its latest
+PROVABLY-COMPLETE date, which fits under both caps.
+
+NEW lib/server/sync/fba-inventory-latest-snapshot.js -- pure compactLatestInventorySnapshot: a cap-sized response's
+latest date is complete ONLY when ALL hold: monotonic date-DESC; latest date is one contiguous LEADING block; a
+strictly-older date follows the block (proves it was not cut mid-latest-date); no latest row after an older row; block
+< row cap; every block row matches the trusted seller+marketplace; compacted block <= 8MB. A non-cap-sized response is
+already whole (older-date-after not required). Rows are FILTERED, never mutated/summed; zero/null preserved verbatim.
+
+SOURCE-WORKER permanent contract: a SINGLE-seller job whose contract is EXPLICITLY marked `latestSnapshot:true`
+(fba-plan:inventory-health + listing-health-v3:inventory, which SHARE one request_hash; flag is execution policy, NOT
+in the hash) is compacted to its latest date before persistence, recording provenance in the cache row's request_meta
+(normalizedLatestSnapshot, inventorySnapshotDate, raw/compacted counts+bytes, completeness proof, sourceExportRef);
+request_hash UNCHANGED. Gated by BOTH the flag AND the fba-inventory-health source key (defense in depth) AND single
+seller; the contract's own limit is the cap. An unprovable latest date is terminal LATEST_SNAPSHOT_INCOMPLETE (never
+inferred). CRITICAL: the insight reports' own inventory (buy-box-loss/sales-movers, INSIGHT_INVENTORY_COLUMNS => a
+DIFFERENT request_hash, NOT flagged), OLI, Ads, catalog, and any multi-seller batch keep the GENERIC strict TRUNCATED
+validator UNCHANGED. (First cut gated on sourceKey alone and broke sales-movers' E2E -- fixed by the explicit per-
+contract flag.) A test caught a second bug: `capSized` was wrongly inside the completeness AND, which would have
+rejected the normal daily single-date happy path.
+
+RECOVERY (scripts/release/fba-inventory-recovery.mjs, recover mode rewritten): reuses each blocked account's EXISTING
+export via the retained manual-source marker exportId -> downloadExport (READ-ONLY GET, tokensUsed=0) -> compact ->
+saveSourceExportCache the compacted block under the child hash + v3 alias. ZERO creates, ZERO tokens.
+
+LIVE RESULT (2026-09-05): recovered 2, skipped 1 (d65844 already cached), failed 0. Balance before==after==3278 (the
+session drift 3288->3274 is the daily scheduler's 2-tok creates + campaign-ads free GETs settling in usage-logs, NOT
+this task -- proven: recover path makes only free EXPORTS_API_GET). Read-back of all 8 India accounts: ALL FRESH.
+  - e5ce6a: COMPACTED snapshotDate 2026-09-05, 15859 -> 1980 rows (10.96MB -> 1.369MB), latest-only=true, no-summing=true.
+  - fd7653: COMPACTED snapshotDate 2026-09-05, 50000 -> 9191 rows (35.24MB -> 6.477MB), latest-only=true, no-summing=true.
+  - d65844 + the [5] batch: full-range, fresh, latest 2026-09-05 (untouched).
+The FBA plan LIVE snapshot for these accounts refreshes on the next daily India FBA cycle, which now compacts single-
+seller latest-snapshot inventory before persistence (deployed source-worker contract) -- so the daily cycle self-heals
+even the whale sellers. LISTING_HEALTH_V3 stays OFF (v3 not run). Tests: fba-inventory-latest-snapshot.test.js (39) +
+fba-strict-source-worker.test.js (compaction + hard-stop + generic-validator-unchanged). verify 146/146. Vercel Ready
+(12 functions, no new api/*.js). The residual "single whale over a single-seller cap" class from the prior entry is now
+RESOLVED for the latest-snapshot consumers (FBA Plan + v3) via compaction; the higher-limit request_hash change is no
+longer needed for those two reports.
