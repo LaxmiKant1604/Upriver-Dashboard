@@ -71,8 +71,10 @@ const evidence = await runListingHealthV3Ingestion({
   log,
 });
 
-// Structured, secret-free evidence.
-const safe = (o) => JSON.stringify(o, (k, v) => (/apikey|api_key|token|authorization|secret|password/i.test(k) ? "[redacted]" : v));
+// Structured, secret-free evidence. Only ACTUAL secret keys are redacted (an exact key match) -- a benign field
+// like estimatedTokens / usableBalance is NOT a secret and prints normally.
+const SECRET_KEY = /^(apikey|api_key|authorization|auth|secret|password|bearer|datadoe-api-key)$/i;
+const safe = (o) => JSON.stringify(o, (k, v) => (SECRET_KEY.test(k) ? "[redacted]" : v));
 log("EVIDENCE " + safe({
   operationId: evidence.operationId, phase: evidence.phase, ok: evidence.ok, dryRun: !!evidence.dryRun,
   accounts: evidence.accounts, newExports: evidence.newExports, ceiling: evidence.ceiling,
