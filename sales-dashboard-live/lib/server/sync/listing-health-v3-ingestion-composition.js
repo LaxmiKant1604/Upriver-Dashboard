@@ -24,11 +24,14 @@ import { makeSourceTranche } from "./source-tranche.js";
 import { computeFrozenTrancheBudget } from "./source-tranche-budget.js";
 import { registryBudgetPlanner } from "./source-fixpoint.js";
 import { getDataDoeConnections } from "../datadoe-connections.js";
-import { getSourceExportCache, saveSourceExportCache, getSourceExportCacheMeta } from "../supabase.js";
+import { getSourceExportCache, saveSourceExportCache, getSourceExportCacheMeta, getRecentSyncCycleIds, getSyncSourceJobsWithMeta } from "../supabase.js";
 import { getDataDoeTokenBalance } from "../datadoe-usage.js";
 import { discoverPrimaryAccountIds } from "./priority-control-pg-store.js";
 import { buildListingHealthV3Plan, planListingHealthV3IngestionCost } from "./listing-health-v3-operation.js";
 import { materializeListingHealthV3PerAccount, LISTING_HEALTH_V3_REGION_EXPORT_CEILING } from "./listing-health-v3-materialize.js";
+import { planFbaPlanBucketBatched } from "./report-planner.js";
+import { fbaCycleBucket } from "./fba-plan-operation.js";
+import { defaultInventoryBatchesOf, overflowSellersFromTruncated, readRecentTruncatedInventoryHashes, DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS } from "./fba-inventory-overflow.js";
 
 const V3_NEW_SOURCE_KEYS = Object.freeze(["listings", "listings-raw"]);
 const V3_INVENTORY_SOURCE_KEY = "fba-inventory-health";
@@ -57,6 +60,10 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     runReportsFn = runReportJobs,
     materializeFn = materializeListingHealthV3PerAccount,
     regionCeilings = LISTING_HEALTH_V3_REGION_EXPORT_CEILING,
+    // Injectable durable evidence readers for the inventory-only overflow derivation (default: the real Supabase
+    // readers). A build-time test seam ONLY -- kept injectable so the composition stays offline-testable.
+    getRecentCycleIds = getRecentSyncCycleIds,
+    getSourceJobsWithMeta = getSyncSourceJobsWithMeta,
   } = overrides;
 
   const runtime = makeRuntime({}); // store + dataDoe + saveSnapshot + loadDerivedContext (shadow namespace)
@@ -81,6 +88,37 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
   };
 
   const resolveCost = ({ plan }) => planListingHealthV3IngestionCost({ plan, getSourceExportCache: getExportCache });
+
+  // Derive the INVENTORY-ONLY overflow split from the SAME proven terminal-TRUNCATED evidence the FBA plan uses (the
+  // region's `<region>-fba` cycle), so a v3 inventory read hash matches the FBA single-seller child recovered for a
+  // whale seller. This is the ONLY way an overflow account's inventory is adoptable with zero new inventory exports.
+  // Fails soft to an empty set (no split => default batching) -- it never blocks planning. Listings/Listings-Raw are
+  // unaffected (the planner splits inventory only).
+  const resolveInventoryOverflowSellers = async ({ accounts, cycleDate, region, maxAgeDays = DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS, now = () => Date.now() }) => {
+    if (!accounts || !accounts.length) return new Set();
+    let defaultInventoryBatches = [];
+    try {
+      const fbaPlan = planFbaPlanBucketBatched({ accounts, connections, asOfFor: () => cycleDate, inventoryAsOf: cycleDate });
+      defaultInventoryBatches = defaultInventoryBatchesOf(fbaPlan);
+    } catch (_e) { return new Set(); }
+    let recentTruncatedHashes = new Set();
+    try {
+      recentTruncatedHashes = await readRecentTruncatedInventoryHashes({
+        cycleBucket: fbaCycleBucket(region), now, maxAgeDays,
+        readRecentCycleIds: (cb, since) => getRecentCycleIds(cb, since),
+        readSourceJobs: (cid) => getSourceJobsWithMeta(cid),
+      });
+    } catch (_e) { return new Set(); }
+    const { overflowSellers } = overflowSellersFromTruncated({ defaultInventoryBatches, recentTruncatedHashes });
+    return overflowSellers;
+  };
+
+  // Production plan builder: derive the inventory-only overflow split, then build the frozen v3 plan with it. buildPlan
+  // is awaited by the operator, so returning a Promise is fine. `region` is required to scope the FBA overflow evidence.
+  const buildPlan = async ({ accounts, connections: conns, cycleDate, region }) => {
+    const overflowSellers = await resolveInventoryOverflowSellers({ accounts, cycleDate, region });
+    return buildListingHealthV3Plan({ accounts, connections: conns || connections, cycleDate, overflowSellers });
+  };
 
   const checkBalance = async () => {
     if (!primaryApiKey) return { usable: null };
@@ -162,7 +200,7 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
   return Object.freeze({
     operator, connections, runtime,
     discoverAccounts,
-    buildPlan: buildListingHealthV3Plan,
+    buildPlan,
     resolveCost, checkBalance, materialize, runSources, runReports,
     getSourceExportCache: getExportCache,
     reservationSupported: typeof runtime.store.reserveExportCreate === "function",

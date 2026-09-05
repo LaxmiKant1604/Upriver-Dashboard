@@ -511,26 +511,35 @@ export function planListingHealthV3BucketBatched({ accounts = [], connections, a
     const byId = new Map(members.map((m) => [m.scope.accountId, m]));
     const membership = new Map([...existingMembership].filter(([id]) => byId.has(id)));
     const { batches } = assignAccountBatches(members.map((m) => ({ accountId: m.scope.accountId, rawSellerId: m.scope.rawSellerId })), membership, MAX_ACCOUNTS_PER_BATCH);
-    // Mirror the FBA adaptive self-heal so v3's inventory read hash matches the FBA single-seller child for proven-
-    // overflow sellers (empty set => byte-identical). v3 batches all three sources together, so an overflow seller's
-    // whole batch is isolated -- only the inventory identity needs to match, and nothing else is fetched here.
-    const effectiveBatches = splitOverflowBatches(batches, byId, overflowSellers);
+    // Mirror the FBA adaptive self-heal (planFbaPlanBucketBatched) so v3's inventory read hash matches the FBA single-
+    // seller child for proven-overflow sellers -- but ONLY for inventory. Listings + Listings-Raw do NOT truncate, so
+    // they stay BATCHED (splitting them would multiply the owned Listings/Raw create count past the region ceiling).
+    // The overflow evidence is inventory-specific; applying it beyond inventory would be incorrect over-splitting.
+    // Empty overflow set => inventoryBatches === batches => byte-identical to the pre-split single-loop result.
+    const inventoryBatches = splitOverflowBatches(batches, byId, overflowSellers);
     const sourcesByAccount = new Map(members.map((m) => [m.scope.accountId, []]));
-    for (const batch of effectiveBatches) {
-      const owners = batch.accounts.map((a) => byId.get(a.accountId));
-      const pairs = owners.map((m) => ({ sellerId: m.scope.rawSellerId, marketplace: marketplaceCodeFor(m.scope.country) }));
-      const markets = [...new Set(pairs.map((p) => p.marketplace))];
-      const inventoryTo = owners[0].inventoryTo;
-      const windowsByRequestKey = {
-        "listing-health-v3:listings": [{ from: null, to: null }],
-        "listing-health-v3:listings-raw": [{ from: null, to: null }],
-        "listing-health-v3:inventory": [{ from: addDaysStr(inventoryTo, -FBA_INVENTORY_LOOKBACK_DAYS), to: inventoryTo }],
-      };
-      const resolved = reportSourceRequestHashes({ reportKey: "listing-health-v3", apiKey, ids: batchSellerIds(batch), windowsByRequestKey, marketplaceCountry: markets[0] });
-      const sources = resolved.map((s) => ({ ...s, marketplaceConstraint: markets.length === 1 ? markets[0] : null,
-        marketplacePairs: pairs, ...(inventoryAsOf == null ? {} : { freshnessNotBefore: inventoryTo + "T00:00:00.000Z" }) }));
-      for (const m of owners) sourcesByAccount.get(m.scope.accountId).push(...sources);
-    }
+    const buildSourcesInto = (batchSet, keepRequestKeys) => {
+      for (const batch of batchSet) {
+        const owners = batch.accounts.map((a) => byId.get(a.accountId));
+        const pairs = owners.map((m) => ({ sellerId: m.scope.rawSellerId, marketplace: marketplaceCodeFor(m.scope.country) }));
+        const markets = [...new Set(pairs.map((p) => p.marketplace))];
+        const inventoryTo = owners[0].inventoryTo;
+        // reportSourceRequestHashes requires a window for EVERY active contract, so all three are supplied; only the
+        // requested keys are kept for this batch set (listings/raw from the batched set; inventory from the split set).
+        const windowsByRequestKey = {
+          "listing-health-v3:listings": [{ from: null, to: null }],
+          "listing-health-v3:listings-raw": [{ from: null, to: null }],
+          "listing-health-v3:inventory": [{ from: addDaysStr(inventoryTo, -FBA_INVENTORY_LOOKBACK_DAYS), to: inventoryTo }],
+        };
+        const resolved = reportSourceRequestHashes({ reportKey: "listing-health-v3", apiKey, ids: batchSellerIds(batch), windowsByRequestKey, marketplaceCountry: markets[0] }).filter((s) => keepRequestKeys.includes(s.requestKey));
+        const sources = resolved.map((s) => ({ ...s, marketplaceConstraint: markets.length === 1 ? markets[0] : null,
+          marketplacePairs: pairs, ...(inventoryAsOf == null ? {} : { freshnessNotBefore: inventoryTo + "T00:00:00.000Z" }) }));
+        for (const m of owners) sourcesByAccount.get(m.scope.accountId).push(...sources);
+      }
+    };
+    // Contract order preserved (listings, listings-raw, inventory): non-inventory from the unsplit batches, then inventory.
+    buildSourcesInto(batches, ["listing-health-v3:listings", "listing-health-v3:listings-raw"]);
+    buildSourcesInto(inventoryBatches, ["listing-health-v3:inventory"]);
     for (const m of members) {
       requests.push({
         reportKey: "listing-health-v3",

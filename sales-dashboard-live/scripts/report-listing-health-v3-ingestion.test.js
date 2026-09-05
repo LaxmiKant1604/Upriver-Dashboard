@@ -23,7 +23,7 @@ const IN8 = Array.from({ length: 8 }, (_, i) => ({ accountId: `in-${String(i).pa
 
 // A fake runtime whose store records the budget + returns fabricated post-run job rows so runSources can count
 // "actual creates" without any real I/O. runSourceCycle / runReportsFn / materializeFn are spies.
-function makeFakeRelease({ ceiling = 4, jobsAfter = null } = {}) {
+function makeFakeRelease({ ceiling = 4, jobsAfter = null, recentCycleIds = [], truncatedJobs = [] } = {}) {
   const calls = { openCycle: 0, persistBudget: [], sourceCycle: [], reports: 0, materialize: 0, saveSnapshot: 0 };
   const store = {
     openCycle: async ({ bucket }) => { calls.openCycle += 1; calls.lastCycleBucket = bucket; return "cyc-1"; },
@@ -47,6 +47,9 @@ function makeFakeRelease({ ceiling = 4, jobsAfter = null } = {}) {
     runReportsFn: async (a) => { calls.reports += 1; calls.reportPlanned = (a.plannedReports || []).length; calls.hasSaver = typeof a.saveSnapshot === "function"; calls.hasDerived = typeof a.loadDerivedContext === "function"; return { succeeded: (a.plannedReports || []).length, drained: true }; },
     materializeFn: async (a) => { calls.materialize += 1; calls.materializePlans = (a.plans || []).length; return { accounts: 8, aliasesWritten: 16, emptyAliases: 0, rejected: 0, batchMissing: 0, skippedStale: 0 }; },
     regionCeilings: { india: ceiling, "europe-au": 8, "us-ca": 4 },
+    // Injected offline evidence readers for the inventory-only overflow derivation (default: no evidence => no split).
+    getRecentCycleIds: async () => recentCycleIds,
+    getSourceJobsWithMeta: async () => truncatedJobs,
   });
   return { release, calls };
 }
@@ -54,7 +57,7 @@ function makeFakeRelease({ ceiling = 4, jobsAfter = null } = {}) {
 /* ===================== A. two-pass source wiring: create then inventory reuse-only ===================== */
 await (async () => {
   const NEW = ["lhv3:listings", "lhv3:raw"]; // batch hashes with create_export_count>0 filled below
-  const plan = buildListingHealthV3IngestionRelease({ getConnections: () => connections, makeRuntime: () => ({ store: {}, dataDoe: {}, saveSnapshot: async () => {}, loadDerivedContext: async () => {} }) }).buildPlan({ accounts: IN8, connections, cycleDate });
+  const plan = await makeFakeRelease().release.buildPlan({ accounts: IN8, connections, cycleDate, region: "india" });
   const v3 = plan.reportRequests.filter((r) => r.reportKey === "listing-health-v3");
   const newHashes = [...new Set(v3.flatMap((r) => r.sources.filter((s) => s.requestKey !== "listing-health-v3:inventory").map((s) => s.requestHash)))];
   const invHashes = [...new Set(v3.flatMap((r) => r.sources.filter((s) => s.requestKey === "listing-health-v3:inventory").map((s) => s.requestHash)))];
@@ -80,7 +83,7 @@ await (async () => {
 
 /* ===================== B. ceiling fail-closed BEFORE any pass ===================== */
 await (async () => {
-  const plan = makeFakeRelease().release.buildPlan({ accounts: IN8, connections, cycleDate });
+  const plan = await makeFakeRelease().release.buildPlan({ accounts: IN8, connections, cycleDate, region: "india" });
   const { release, calls } = makeFakeRelease({ ceiling: 1 }); // artificially below the 4 planned creates
   await throwsAsync("B: a frozen create count above the region ceiling throws BEFORE any source pass", () => release.runSources({ plan, region: "india", cycleDate }));
   ok("B: no source pass ran when the ceiling gate failed", calls.sourceCycle.length === 0);
@@ -88,7 +91,7 @@ await (async () => {
 
 /* ===================== C. report wiring -> shadow saver + derived-context loader ===================== */
 await (async () => {
-  const plan = makeFakeRelease().release.buildPlan({ accounts: IN8, connections, cycleDate });
+  const plan = await makeFakeRelease().release.buildPlan({ accounts: IN8, connections, cycleDate, region: "india" });
   const { release, calls } = makeFakeRelease({ ceiling: 4 });
   const rep = await release.runReports({ plan, region: "india", cycleDate });
   ok("C: runReports derives ONLY the v3 report requests (8 accounts) through the report worker", calls.reports === 1 && calls.reportPlanned === 8);
@@ -110,6 +113,27 @@ await (async () => {
   ok("D: dry-run discovered exactly 8 India accounts", ev.accounts === 8);
   ok("D: dry-run ran NO source/report/materialize work", calls.sourceCycle.length === 0 && calls.reports === 0 && calls.materialize === 0);
   ok("D: the release reports reservation support + known pricing", release.reservationSupported === true && release.pricingKnown === true);
+})();
+
+/* ===================== E. INVENTORY-ONLY overflow split from terminal-TRUNCATED evidence ===================== */
+await (async () => {
+  // Default (no evidence): inventory batched [5,3].
+  const basePlan = await makeFakeRelease().release.buildPlan({ accounts: IN8, connections, cycleDate, region: "india" });
+  const invOf = (plan) => [...new Map(plan.reportRequests.flatMap((r) => r.sources.filter((s) => s.requestKey === "listing-health-v3:inventory").map((s) => [s.requestHash, s]))).values()];
+  const newHashesOf = (plan) => [...new Set(plan.reportRequests.flatMap((r) => r.sources.filter((s) => s.requestKey !== "listing-health-v3:inventory").map((s) => s.requestHash)))];
+  const baseInv = invOf(basePlan);
+  ok("E: default inventory batching is [5,3]", baseInv.map((s) => s.sellerOrVendorIds.length).sort().join(",") === "3,5");
+  const threeBatch = baseInv.find((s) => s.sellerOrVendorIds.length === 3);
+  const fiveBatchHash = baseInv.find((s) => s.sellerOrVendorIds.length === 5).requestHash;
+
+  // Terminal TRUNCATED evidence for that 3-seller inventory batch => its 3 sellers become proven overflow.
+  const truncatedJobs = [{ request_hash: threeBatch.requestHash, source_key: "fba-inventory-health", fetch_status: "failed", error_code: "TRUNCATED", terminal: true }];
+  const splitPlan = await makeFakeRelease({ recentCycleIds: ["cyc-x"], truncatedJobs }).release.buildPlan({ accounts: IN8, connections, cycleDate, region: "india" });
+  const inv = invOf(splitPlan);
+  ok("E: with overflow evidence, INVENTORY splits to [5,1,1,1] (the whale batch isolated to single sellers)", inv.map((s) => s.sellerOrVendorIds.length).sort().join(",") === "1,1,1,5");
+  ok("E: the 5-seller inventory batch hash is unchanged (byte-identical to default)", inv.some((s) => s.requestHash === fiveBatchHash));
+  ok("E: Listings + Listings-Raw STAY batched [5,3] => still exactly 4 new-export hashes (create budget unchanged)", newHashesOf(splitPlan).length === 4);
+  ok("E: the new-export (listings/raw) hash set is IDENTICAL with and without the inventory overflow split", JSON.stringify(newHashesOf(basePlan).sort()) === JSON.stringify(newHashesOf(splitPlan).sort()));
 })();
 
 writeSync(1, `\nreport-listing-health-v3-ingestion: ${passed} assertions passed\n`);

@@ -48,14 +48,20 @@ export function listingHealthV3OperationId(region, cycleDate) {
   return `listing-health-v3/${S(region)}/${S(cycleDate)}`;
 }
 
-/** Default plan builder: the frozen v3 batched plan for one regional cycle (freshnessNotBefore = the cycle date). */
-export function buildListingHealthV3Plan({ accounts, connections, cycleDate }) {
+/**
+ * Default plan builder: the frozen v3 batched plan for one regional cycle (freshnessNotBefore = the cycle date).
+ * `overflowSellers` (default empty) applies the inventory-only single-seller split so a proven-overflow seller's v3
+ * inventory read hash matches the FBA single-seller child recovered for it (empty set => byte-identical plan). Listings
+ * + Listings-Raw stay batched regardless (the planner splits inventory only).
+ */
+export function buildListingHealthV3Plan({ accounts, connections, cycleDate, overflowSellers = new Set() }) {
   return buildShadowReportPlan({
     accounts,
     reportKeys: ["listing-health-v3"],
     connections,
     asOfFor: () => cycleDate,
     inventoryAsOf: cycleDate, // attaches freshnessNotBefore = cycleDate to every v3 source (see the planner)
+    overflowSellers,
   });
 }
 
@@ -137,9 +143,10 @@ export async function runListingHealthV3Ingestion({
   ev.accounts = regionAccounts.length;
   if (!regionAccounts.length) return { ...ev, phase: "complete", ok: true, note: "no-accounts-in-region", creates: 0, tokens: 0 };
 
-  // 6) build + FREEZE the plan.
+  // 6) build + FREEZE the plan. `region` is forwarded so a composition-provided buildPlan can derive the inventory-only
+  //    overflow split from that region's FBA cycle evidence; buildPlan may be sync or async, so it is awaited.
   let plan;
-  try { plan = buildPlan({ accounts: regionAccounts, connections, cycleDate }); } catch (e) { return fail("plan", "plan build failed: " + safe(e)); }
+  try { plan = await buildPlan({ accounts: regionAccounts, connections, cycleDate, region: S(region) }); } catch (e) { return fail("plan", "plan build failed: " + safe(e)); }
   const v3Requests = (plan.reportRequests || []).filter((r) => r && r.reportKey === "listing-health-v3");
   if (!v3Requests.length) return fail("plan", "frozen plan contains no listing-health-v3 requests (fail closed)");
 
