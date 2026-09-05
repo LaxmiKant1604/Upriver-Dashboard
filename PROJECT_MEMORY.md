@@ -14584,3 +14584,31 @@ only refresh, 46 skippedStale). LIVE window proof via serveListingHealthV3Previe
 account: 7D/14D/30D/Month/Custom give distinct GBP sales/units; inventory snapshotDate CONSTANT across all windows.
 LISTING_HEALTH_V3 stays OFF; no cron/route invokes the operator. api/*.js stays 12. NEXT (separate approval): US-CA
 canary (bucket allowed by 20260918, NOT run); then UI flag flip.
+
+================================================================================
+2026-09-06 -- LISTING HEALTH v3 US-CA CANARY: LIVE + SUCCESSFUL (no code change; reused 1db720e + migration 20260918). All 3 regions now done.
+================================================================================
+Ran exactly ONE US-CA v3 shadow-ingestion canary; all 10 accounts got shadow snapshots + full inventory. NO code or
+migration change (the inventory-only split + migration 20260918 already cover us-ca). HEAD stayed 1db720e; verify
+147/147; git clean.
+
+cycleDate 2026-09-05, proven from durable data (only window with adoptable inventory 10/10; 09-06/09-04 both false;
+UTC still 2026-09-05 21:xx). 10 us-ca accounts (live directory; 9 US + 1 CA). Batching Listings [5,5] + Listings-Raw
+[5,5] = 4 owned creates; inventory [5,5] both cached => 0 new inventory exports. Max 5 sellers/batch.
+
+CANARY RESULT (live): 4 exports created (2 Listings 2315+1375 rows ids 1f9cbebc/32a97866; 2 Listings-Raw 1366+2315 ids
+31ac5702/e267f6f3), ALL succeeded, none truncated. Inventory: 2 jobs REUSED, 0 creates (22319+13789 rows). Balance
+3242 -> 3234 = 8 tokens (2/export). 10 shadow snapshots (total v3 now 34 = 8 india + 16 eu + 10 us-ca; india+eu
+untouched). aliases written 30, empty 0 (ALL 10 accounts fully complete WITH inventory -- no empty, unlike eu's 3).
+CURRENCY ISOLATION CLEAN: the 1 CA account = CAD only; all 9 US accounts = USD only (a leaked US row would carry USD
+into CA -- none did => US<->CA rows cannot cross). channelRaw is AMAZON_NA/DEFAULT (region/fulfillment, NOT marketplace
+country -- an early false-positive leak flag). IDEMPOTENT REPLAY (same operationId): 0 new exports (4 distinct ids,
+create-count still 4), balance 3234->3234 (0 tokens), 0 new snapshots (still 10), all 30 aliases skippedStale (0
+rewrites). LIVE window proof via serveListingHealthV3Preview (durable OLI, 0 tokens) for 1 CA + 1 US account:
+7D/14D/30D/Month/Custom give distinct sales in the correct currency (CAD / USD); inventory snapshotDate CONSTANT across
+all windows.
+
+ALL THREE REGIONS COMPLETE (India 8 + Europe-AU 16 + US-CA 10 = 34 v3 shadow snapshots; total ~32 tokens across the
+three canaries, 3266->3234). LISTING_HEALTH_V3 flag + automatic scheduling STILL OFF; no cron/route invokes the
+operator (manual-only, triple-gated). api/*.js stays 12. NEXT (separate approval): UI-review then flip
+LISTING_HEALTH_V3 on; consider enabling recurring v3 scheduling.
