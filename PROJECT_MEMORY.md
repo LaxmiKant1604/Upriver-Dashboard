@@ -14436,3 +14436,42 @@ batches on the next cycle; keep other batches' hashes byte-identical; escalate h
 exceeds the cap). This changes shared FBA (+ v3-reuse) batching and MUST be validated with authorized exports -- do it
 in a dedicated, export-budgeted phase, not under a zero-export rule. Only AFTER India FBA inventory is fully fresh (all
 8) should the Listing Health v3 India canary be re-run.
+
+---
+
+## 2026-09-05 -- Adaptive FBA Inventory batch-splitting (overflow self-heal) SHIPPED + India recovery (commits 863a3ac impl, 6650d9d recovery CLI, PUSHED). 3 exports / 6 tokens.
+
+IMPLEMENTATION (863a3ac, LIVE, verify 145/145): generic adaptive self-heal for oversized strict seller-scoped FBA
+Inventory batches. planFbaPlanBucketBatched + planListingHealthV3BucketBatched gain `overflowSellers` (Set of raw
+seller ids) -> any inventory batch containing an overflow seller splits into single-seller batches; EVERY other batch
+byte-identical (empty set => byte-identical; existing hashes unchanged). v3 single-seller inventory hashes MATCH the
+FBA children (v3 reuse survives). Threaded runtime.run (RUN_OPERATIONAL_ARGS + gate7 guard) -> runSchedulerV2Shadow ->
+buildShadowReportPlan, and advanceFbaPlanBucket -> runtime.run. New fba-inventory-overflow.js derives overflow sellers
+from RECENT terminal TRUNCATED evidence (scoped region-fba cycle bucket + 14-day recency = expiry/reset; multi-seller
+TRUNCATED => isolate, SINGLE-seller TRUNCATED => HARD STOP, never re-routed). fba-plan-golive.mjs derives + passes
+overflowSellers every run (recurrent self-heal; the next daily India cycle isolates the 3 automatically). Tests:
+report-fba-inventory-overflow.test.js (18). No FBA formula/column/AWD/OLI/Ads/Catalog/cron/concurrency change; api/*.js
+stays 12; LISTING_HEALTH_V3 false.
+
+RECOVERY (6650d9d): advanceFbaPlanBucket could NOT drive the recovery -- the daily india-fba/2026-09-05 cycle is already
+TERMINAL (skips fetch) and open_sync_cycle is base-only, so a superseding attempt mismatches the budget/finalize cycle
+ids (advanceFbaPlanBucket is not built for superseding). Switched to a DIRECT controlled fetch (scripts/release/
+fba-inventory-recovery.mjs): fetchExportRowsStrict per single-seller child -- one create per canonical request_hash
+(marker protocol, idempotent replay via durable cache, resumable), persists under the child hash ONLY when < 50000 rows
+AND < 8MB (SOURCE_CACHE_MAX_OBJECT_BYTES), HARD-STOPS on the 50000 cap (limit never raised). Dry-run = zero creates.
+
+RESULT: 3 exports created, 6 tokens (balance 3288 -> 3282; observed flat ~2/export -- fba-inventory-health is classed
+premium=5 in the budget model, but billed flat 2). Outcome PARTIAL + honest:
+- d65844: RECOVERED (936 rows, isolated IN, cached; v3 alias written).
+- e5ce6a: FETCHED 15859 rows (< 50000) but its payload EXCEEDS the 8MB source-cache object limit -> not persisted ->
+  NOT recovered. A single-seller account too large for the 8MB cache object (a SECOND data-volume cap).
+- fd7653: HARD STOP -- single-seller inventory reached the 50000 row cap -> cannot split further; NOT recovered, limit
+  NOT raised (per the spend rule).
+So 6/8 India accounts current (5 batch + d65844); e5ce6a + fd7653 remain honestly INCOMPLETE (data-volume beyond the
+8MB / 50000 single-seller caps -- split cannot help). The successful [5] batch + the failed parent are untouched; no
+unrelated export; no false regional success; v3 disabled/unexecuted.
+
+REMAINING (separately authorized, reviewed): e5ce6a needs a higher source-cache object byte limit (8MB ->) AND fd7653
+needs a higher inventory row limit (50000 ->) -- both change the FBA inventory request_hash (mass re-fetch) so they are
+a reviewed, export-budgeted decision, NOT auto-raised. The adaptive split (deployed) fully resolves the COMMON case
+(several medium sellers summing over a cap); a SINGLE whale seller over a single-seller cap is the residual class.
