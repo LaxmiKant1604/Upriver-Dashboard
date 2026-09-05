@@ -53,6 +53,7 @@ const SUITES = [
   "test:fba-inventory-truncated",
   "test:fba-inventory-overflow",
   "test:fba-inventory-latest-snapshot",
+  "test:lhv3-cycle-bucket-migration",
   "test:region-view",
   "test:regional-brand-view",
   "test:insights",
