@@ -14558,3 +14558,29 @@ OLI, 0 tokens): 7D/14D/30D/Month/Custom give distinct sales/units; inventory sna
 LISTING_HEALTH_V3 stays OFF; no cron/route invokes the operator (manual-only, triple-gated). api/*.js stays 12.
 NEXT (separate approvals): flip LISTING_HEALTH_V3 on after UI review; Europe-AU + US-CA canaries (their buckets are
 allowed by 20260918 but NOT run).
+
+================================================================================
+2026-09-06 -- LISTING HEALTH v3 EUROPE-AU CANARY: LIVE + SUCCESSFUL (no code change; reused d0a1499 + migration 20260918)
+================================================================================
+Ran exactly ONE Europe-AU v3 shadow-ingestion canary; all 16 accounts got shadow snapshots. NO code or migration
+change this session (the inventory-only split + migration 20260918 from the India canary already cover europe-au). HEAD
+stayed d0a1499 throughout; verify 147/147; git clean.
+
+cycleDate 2026-09-05, proven from durable data: the ONLY window with adoptable inventory for 16/16 (dry-run
+inventoryAdoptable=true; 2026-09-06 and 2026-09-04 both false -- UTC was still 2026-09-05 21:xx, the 09-06 europe-au FBA
+cycle had not run). 16 europe-au accounts (live directory; countries AU,BE,DE,ES,FR,IT,NL,PL,UK). Batching Listings
+[5,5,5,1] + Listings-Raw [5,5,5,1] = 8 owned creates; inventory [5,5,5,1] ALL 4 hashes cached => 0 new inventory
+exports (no overflow evidence for europe-au => default batching). Max 5 sellers/batch.
+
+CANARY RESULT (live): 8 exports created (4 Listings 152+103+583+312 rows ids 1aa360d9/3ca14136/891645b6/b8ff7bd4; 4
+Listings-Raw 149+310+103+583 rows ids 1046f723/38858a9c/770e1064/8039ba92), ALL succeeded, none truncated. Inventory: 4
+jobs REUSED, 0 creates (117/4245/414/5431 rows). Balance 3258 -> 3242 = 16 tokens (2/export). 16 shadow snapshots under
+report_key scheduler-v2/listing-health-v3 (total v3 now 24 = 8 india + 16 eu; india untouched). Per-account, distinct
+accountIds, 9 marketplaces; inventory.snapshotDate=2026-09-05 for 13 accounts; 3 accounts (BE/NL/PL) have HONESTLY
+UNAVAILABLE inventory (invAvail=false, empty alias -- genuine no-FBA-stock, aliases.empty=3, rejected=0 -- never
+fabricated). aliases written 45 + empty 3 = 48 = 16x3. IDEMPOTENT REPLAY (same operationId): 0 new exports (8 distinct
+export ids, create count still 8), balance 3242->3242 (0 tokens), 0 new snapshots (still 16; 2 aliases in-place newer-
+only refresh, 46 skippedStale). LIVE window proof via serveListingHealthV3Preview (durable OLI, 0 tokens) for a UK
+account: 7D/14D/30D/Month/Custom give distinct GBP sales/units; inventory snapshotDate CONSTANT across all windows.
+LISTING_HEALTH_V3 stays OFF; no cron/route invokes the operator. api/*.js stays 12. NEXT (separate approval): US-CA
+canary (bucket allowed by 20260918, NOT run); then UI flag flip.
