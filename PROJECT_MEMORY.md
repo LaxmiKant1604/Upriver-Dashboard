@@ -14351,3 +14351,41 @@ create/reuse-only split for inventory; runReports -> runReportJobs; discoverAcco
 balance; resolveCost -> planListingHealthV3IngestionCost + getSourceExportCache; materialize -> materialize + supabase
 readers) behind its own enabled gate; (b) a ONE-region ONE-cycle authorized live canary; (c) once aliases prove
 populated in prod, flip LISTING_HEALTH_V3 = true for the preview go-live.
+
+---
+
+## 2026-09-05 -- Listing Health v3 Phase 4B2: India production ingestion runner BUILT + DEPLOYED; canary REHEARSED, paid run DEFERRED (inventory not fully fresh). commits 9c22913 + 6a52f18, PUSHED, Vercel Ready
+
+BUILT (Phase A): thin production runner + composition around the v3 operator, reusing the established machinery with
+zero drift + no worker-logic duplication:
+- lib/server/sync/listing-health-v3-ingestion-composition.js (buildListingHealthV3IngestionRelease): binds
+  buildSchedulerV2Runtime (store + DataDoe adapter + shadow saver + derived-context loaders), resolveFromGenericPlan
+  (now EXPORTED from sync-dispatch.js), the frozen tranche budget + atomic reserveExportCreate, runStagedSourceCycle,
+  runReportJobs, materializeListingHealthV3PerAccount, and the read-only DataDoe balance. SOURCE = deliberate TWO-PASS
+  split: pass 1 creates listings+listings-raw under the FROZEN per-region budget (<= ceiling, atomic pre-POST
+  reservation); pass 2 runs inventory REUSE-ONLY (adopt the current FBA Plan cache; NEVER a v3 inventory create).
+- scripts/release/listing-health-v3-ingestion.mjs (CLI): THREE live-run gates -- exact --confirm=<operationId>,
+  authorized operator identity (PRIORITY_OPERATOR == laxmikant@superboring.in), and env LISTING_HEALTH_V3_INGESTION_
+  ENABLED=true (default OFF -> live refuses). Dry-run = zero creates/writes/tokens; secrets never printed.
+- Offline integration test report-listing-health-v3-ingestion.test.js (19): frozen budget over listings+raw only,
+  ceiling fail-closed, the two source passes (create then inventory reuse-only), honest actual-create count, report
+  wiring to the shadow saver + derived loader, dry-run zero source work. verify 143/143, 119 suites.
+
+REHEARSED (Phase B) against PROD (dry-run, ZERO creates/tokens): India has EXACTLY 8 authoritative primary accounts
+(0 unassigned) -> 2 batches -> 4 new-export hashes (2 listings + 2 listings-raw); ceiling 4; plannedCreates 4;
+estimatedTokens 8 (observed estimate). v3 inventory batching MATCHES fba-plan EXACTLY (both [5,3]; all hashes match --
+no divergence). DataDoe usable balance 3288 (ample; unchanged before/after -> zero spend).
+
+PAID RUN (Phase C) NOT EXECUTED -- BLOCKER: inventoryAdoptable=false. The FBA Plan India run today cached ONLY the
+5-seller inventory batch (fetched 2026-09-05T03:34Z); the 3-seller batch inventory is ABSENT from the current cache.
+So inventory is fresh for only 5/8 India accounts. Per the FAILURE RULES ("never continue after missing fresh
+inventory") + inventory-reuse-only ("adopt only the current validated FBA Plan cache; if unavailable defer/block +
+preserve LKG"), I STOPPED before any create -> zero tokens, LKG intact, one authorized cycle preserved for a clean run.
+
+RECOMMENDATION: do NOT proceed to Europe-AU. Re-run the India canary ONLY after the next FBA India cycle caches BOTH
+inventory batches -- verify with a fresh dry-run showing inventoryAdoptable=true, then:
+  LISTING_HEALTH_V3_INGESTION_ENABLED=true node scripts/release/listing-health-v3-ingestion.mjs \
+    --region=india --mode=live --cycle-date=<D> --confirm=listing-health-v3/india/<D>
+Consider (follow-up) investigating why the FBA India 3-seller inventory batch did not cache (transient vs persistent),
+and whether the operator should derive PER-ACCOUNT (5 now, 3 deferred) rather than all-or-nothing on inventory.
+UNCHANGED: LISTING_HEALTH_V3 false; no api/*.js added; no control/cron/watchdog/scheduler change; no v1/formula change.
