@@ -14685,3 +14685,43 @@ natural v3 window is europe-au 08:30 UTC, which will check out main (6f6813f) an
 So there is NO defective v3 run to remediate; no replacement run was created. UI flag LISTING_HEALTH_V3 stays OFF;
 api/*.js=12; zero DataDoe exports/tokens. ROLLOUT still NOT complete until the 3 natural runs (europe-au 08:30, us-ca
 16:30, india next-day 03:00 UTC) are observed. Expected ~16 exports/~32 tokens/day (row-based billing may vary).
+
+================================================================================
+2026-09-06 -- DASHBOARD MATERIALIZATION AUDIT (Phase 1) + CANONICAL MATERIALIZATION REGISTRY (Phase 2, commit 9c44b20). Reelleo root-caused.
+================================================================================
+PHASE 1 (read-only, zero exports) findings that RESHAPED the mission (the "page-open materialization gap" premise was
+largely false for primary accounts):
+- PRIMARY accounts' core reports ARE scheduler-materialized + FRESH (latest 2026-09-06, all 34 accts): brand-sales,
+  daily-reporting, brand-inventory (priority path), fba-plan (fba job), sku-movement. Not page-open-created.
+- Browser GETs NEVER mint/complete a DataDoe export (DataDoe sits behind refresh=1 or admin gates). BUT plain GETs
+  (page-open + 60s auto-revalidate) DO write Supabase snapshots via ZERO-DataDoe self-heal for 5 reports: daily,
+  sku-movement, returns-leakage, brand-directory, brand-view-brands (the real, zero-export-fixable slice of "page open
+  completes data").
+- 11 reports have NO live scheduler owner (enabled:false): sales, reconciliation, sku-pl, keyword-rank, content-changes,
+  sales-movers, listing-health(v1), buy-box-loss, ppc-performance, listing-optimizer (+ sku-pl). Materialized only by a
+  user Refresh (DataDoe) -> "waiting for the scheduled data refresh" until then. Auto-materializing them needs exports.
+- REELLEO/Italy ROOT CAUSE (data/config, NOT architecture): "REELLEO Express IT" = dd-secondary:d1e4ec70 (secondary
+  connection). Ads unavailable = 3611 Campaign Ads rows exist BUT ZERO campaign_brand_mapping for the Reelleo brand
+  (only bebi born/dream haven/justhuman mapped) => all unmapped => brand Ad Spend/TACoS honestly unavailable (fix =
+  admin mapping, not materialization). FBA unavailable = no FBA snapshot for the dd-secondary account. Also 0 OLI in
+  every table + only a stale Aug-4 brand-catalog. WHOLE secondary connection is unmaterialized (all snapshots Aug 8, 0
+  dd-secondary OLI) AND DATADOE_API_KEY_SECONDARY is NOT configured -> its OLI/FBA cannot be refreshed without that key
+  + new exports. So Reelleo is blocked on external inputs (secondary key + exports + campaign mappings) I must not
+  fabricate; deferred to an approval-gated recovery plan.
+
+PHASE 2 (implemented; commit 9c44b20; verify 153/153): NEW canonical registry
+lib/server/reports/report-materialization-registry.js -- every user-facing report (24, = the non-NON_REPORT
+REPORT_CAPABILITIES set) declares reportKey/version, required+optional durable sources, source owner + BACKEND
+materialization owner, grain, freshness+coverage, provenance fields, LKG policy, regional scheduling, capability, serve
+mode, bucket, pageOpenWrite. PURE (imports only the existing registries), imported by NO serving path -> zero behavior/
+formula change; api/*.js stays 12. Release-guard report-materialization-registry.test.js (18) +
+validateReportMaterializationRegistry cross-check vs REPORT_CAPABILITIES (coverage + no NON_REPORT) + REPORT_DERIVATIONS
+(version parity) + REPORT_SOURCE_CONTRACTS (every contract-owned source declared); FAILS a future report missing a
+declaration/field/backend-owner/contract-source or with a capability mismatch => a new report is STRUCTURALLY prevented
+from depending on page-open-only materialization. The registry records the current gaps: pageOpenWrite=true for the 5
+self-heal reports; materializationOwner="manual-refresh" for the unowned ones.
+
+SCOPE per review: Phase 2 ONLY. Phase 3 (move the 5 self-heal derivations into the scheduler + make GETs read-only,
+zero-export) and Phases 5-6 remain deferred. Reelleo/dd-secondary + the 11 unowned reports need a separate,
+approval-gated recovery/export plan (+ the secondary key + campaign mappings). UI flag LISTING_HEALTH_V3 stays OFF.
+Do NOT claim the dashboard-wide gap "permanently fixed" -- only the structural-prevention guard is in place so far.
