@@ -14612,3 +14612,47 @@ ALL THREE REGIONS COMPLETE (India 8 + Europe-AU 16 + US-CA 10 = 34 v3 shadow sna
 three canaries, 3266->3234). LISTING_HEALTH_V3 flag + automatic scheduling STILL OFF; no cron/route invokes the
 operator (manual-only, triple-gated). api/*.js stays 12. NEXT (separate approval): UI-review then flip
 LISTING_HEALTH_V3 on; consider enabling recurring v3 scheduling.
+
+================================================================================
+2026-09-06 -- LISTING HEALTH v3 SHADOW SCHEDULING ENABLED (commit 8afd81a, deployed Ready). NATURAL-CYCLE VERIFICATION PENDING.
+================================================================================
+Wired automatic v3 SHADOW ingestion into the existing scheduler-v2 GitHub Actions workflow AFTER first fixing two
+orchestration-correctness gaps. UI flag LISTING_HEALTH_V3 stays OFF (false); api/*.js stays 12; NO new cron/scheduler
+owner; ZERO DataDoe exports/tokens during implementation (offline tests only). verify 151/151; git diff --check clean;
+Vercel Ready.
+
+PHASE 1 (shared inventory date): scheduler-v2.yml run job computes inventory_asof (UTC today) ONCE + exposes it as an
+output (asof unchanged = D-1 for OLI/Ads). fba-plan-golive.mjs gains optional validated --inventory-as-of (default
+fbaInventoryAsOf() = UTC today; manual callers byte-identical). FBA job passes needs.run.outputs.inventory_asof; v3 job
+passes the SAME value as --cycle-date + inside --confirm => FBA and v3 always adopt ONE inventory identity; no downstream
+UTC-today recompute (no midnight drift).
+
+PHASE 2 (honest completion) -- the real correctness fix: runListingHealthV3Ingestion no longer returns ok:true just
+because runReports returned. New finalizeCycle collaborator (composition -> runtime.store.finalizeCycle ->
+finalize_sync_cycle RPC). SUCCESS requires a DURABLE terminal status "succeeded" (zero source AND report failures).
+open-work(undrained)/partial/failed/not-found/invalid-status, a reuse-only inventory CREATE, a materialization
+rejection, and an inventory deferral all return ok:false (CLI exits nonzero) with LKG preserved. Durable finalized
+status is the replay-safe source of truth (already-terminal succeeded replay = zero-create success). A deferral does NOT
+finalize (cycle left open for a same-cycle retry).
+
+PHASE 3 (future account-identity guard): before any create (dry-run + live) the operator fails closed if two distinct
+accounts resolve to one marketplace-independent per-account read hash (a future pan-EU seller id across marketplaces),
+naming only safe public account-id prefixes (never rawSellerId/apiKey). Does not redesign shared hashes.
+
+PHASE 4 (workflow job): ONE listing-health-v3 job, needs:[run,fba], if: always() && region!='' && needs.fba.result==
+'success'; reuses checkout/Node/deps/secret-check; sets LISTING_HEALTH_V3_INGESTION_ENABLED=true ONLY in this job;
+invokes scripts/release/listing-health-v3-ingestion.mjs --mode=live for the resolved region + shared inventory_asof;
+inherits the workflow-level per-region concurrency group (primary+watchdog => one operation/hashes). Ceilings India=4/
+Europe-AU=8/US-CA=4; inventory/OLI/Catalog zero-create.
+
+TESTS (+4 new; verify 151/151): report-listing-health-v3-finalize (false-green blocked/failed/undrained now ok:false +
+succeeded/partial/failed/replay/inv-create/mat-reject/deferral), report-listing-health-v3-identity-guard (pan-EU
+collision fail-closed + safe diagnostics), lhv3-shared-inventory-date (normal/watchdog/manual/UTC-boundary share one
+identity), scheduler-v2-lhv3-workflow (dependency order/gate/shared date/ceilings/env-gate-scoped/UI-off/no-2nd-cron);
+report-listing-health-v3-operation updated for the finalize contract.
+
+ROLLBACK (independent one-change each): scheduler = remove the v3 job (or unset LISTING_HEALTH_V3_INGESTION_ENABLED) ->
+v3 stops ingesting; UI = LISTING_HEALTH_V3 stays false (already off). NATURAL-CYCLE STATUS: today's india 03:00 UTC run
+already ran PRE-deploy (old workflow, no v3). First v3 shadow run = europe-au today 08:30 UTC, then us-ca 16:30 UTC,
+then india next day 03:00 UTC. ROLLOUT NOT COMPLETE until all three natural runs are observed (expected 16 exports /
+~32 tokens per day total; row-based billing may vary). Do NOT manually trigger -- let the natural windows run.
