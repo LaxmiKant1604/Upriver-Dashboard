@@ -1,5 +1,89 @@
 # Project Memory
 
+## Primary DataDoe automatic onboarding + FBA exact-D-1 inventory (2026-09-07, commit 56b92e9 -- UNAPPLIED migration, UNDEPLOYED, approval-gated)
+
+Mission: fully automatic Primary-DataDoe account onboarding + correct FBA Inventory to EXACTLY the latest D-1
+snapshot everywhere. Implemented + tested end-to-end; **verify green (162 steps / 138 suites incl. build:check)**;
+DataDoe spend this session = 0 exports / 0 tokens (audit was zero-token GETs + read-only SQL only).
+
+**PHASE-1 AUDIT (read-only, proven 2026-09-06)**: the live directory GET returns 45 primary accounts with
+readiness evidence `sellerCentralConnection.initialLoadComplete` (34 ready / 11 loading) + rowCount progress --
+ALL previously dropped by `fetchAccounts`. Classification: 30 fully live; **4 READY but INVISIBLE** (Cruchlorent
+Cuscini Italia IT 183e4070, Cruchlorent Coussins France FR 4bb5b7da, Cruchlorent Espana ES 54bb4dfa, Rugs 4 Less
+US 623be5c9 -- fully scheduler-materialized: OLI 2024-12-31..D-1, daily/brand/fba/v3 snapshots, ~30 snapshots
+each) because the account-directory SNAPSHOT (the selector + operator-scope source) is written ONLY by a manual
+admin refresh and froze at 30; **11 LOADING** (aHeal IT/ES/DE/FR/IE/PL/SE/BE/NL/UK + SIMPLIFY ASTHETIC US).
+**ACTIVE INCIDENT proven**: scheduled discovery was readiness-blind -- the 2026-09-06 12:14Z europe-au
+superseding attempt (cycle 05ce4abb) burned 8 HTTP-400 OLI creates on the 10 aHeal accounts, and the us-ca
+16:52Z run's shared FBA-inventory + Listings batches containing SIMPLIFY got whole-batch 400s (us-ca-fba
+partial). DataDoe HARD-REJECTS exports for not-loaded accounts (the export-layer readiness proof). IE/SE/PL/BE
+etc. all map to europe-au (zero unsupported marketplaces today). Balance read 3154 usable @16:56Z.
+**Also proven**: DataDoe stamps inventory rows with the FETCH date -- live fba-plan snapshots carry
+invDate == run date, so the D-1 row set provably exists by every next-day run.
+
+**FBA D-1 (Phase 6)**: window is EXACTLY [D-1 .. D-1] everywhere -- report-planner (planFbaPlan/batched/v3),
+report-derivation pins (from===to===inventoryAsOf; ANY cross-date row => derive-invalid => LKG),
+resolvedFbaSnapshot (priority path, shared hash), Brand View invWindow {asOf..asOf}, api/datadoe.js live routes
+(planInventoryDay = previous UTC date), insight reports (buy-box/sales-movers/listing-health v1: asOf-1..asOf-1),
+fetchInventorySnapshot. fbaInventoryAsOf() = previous UTC date; scheduler-v2.yml `inventory_asof="$asof"` (ONE
+D-1, threaded to FBA + v3 unchanged -- shared identity + freshnessNotBefore preserved). Old cached 10-day windows
+can never be adopted (from/to are inside request_hash). Latest-snapshot compaction/overflow-split/ceilings
+unchanged; a cap-sized single-day payload stays honestly LATEST_SNAPSHOT_INCOMPLETE (LKG). Note: D-1..D-1 is
+~10x less data => fewer TRUNCATED/8MB failures. Guard suite scripts/fba-d1-source-guard.test.js (30).
+
+**ONBOARDING (Phases 2-5, 7)**:
+- `fetchAccountsDetailed` preserves readiness/progress; `fetchAccounts` output byte-identical.
+- Migration **20260919_account_onboarding.sql (PREPARED, NOT APPLIED)**: `account_onboarding` (7-status
+  lifecycle, readiness + per-source `sources` jsonb, region, typed failure codes, no secrets; RLS admin-read;
+  service-role select/insert/update; no delete) + SECURITY DEFINER `claim_account_bootstrap` (atomic once-only
+  claim `account-bootstrap/<id>/<firstDiscoveredDate>`; same op => already-claimed; different => held).
+- **Export-eligibility gate** (lib/server/sync/account-onboarding.js `fetchExportEligibleAccounts`) wired into
+  EVERY scheduled/paid discovery choke point: makeProductionDiscoverAccounts (=> scheduler dispatch, fba
+  release, v3 ingestion, both materializers, publisher), discoverPrimaryAccountIds (controls/rollout),
+  discoverRoutedAccounts (campaign), oli-refresh-d1, verify-bucket-readiness, verify-us-d1-published,
+  scheduled-cycle-preflight, regional dry-run, oli-escalation, returns-golive. Rule: DataDoe-ready AND status in
+  {bootstrapping, partially_ready, ready}. FAILS SOFT to readiness-only on an unreadable table (deploy-before-
+  migration safe; the 34 keep publishing; **loading accounts are excluded in BOTH modes** -- the incident is
+  fixed at deploy time). ready_for_bootstrap waits for the claim (every bootstrap under ONE operation).
+- **15-min worker**: .github/workflows/account-onboarding.yml (cron */15, concurrency `account-onboarding`) ->
+  scripts/release/account-onboarding-discovery.mjs -> lib/server/sync/account-onboarding-discovery.js.
+  STRUCTURALLY zero-export (only the zero-token GET; no export adapter in its graph; regression-guarded).
+  Classifies/upserts (material-change-only writes -> idempotent replay writes NOTHING), claims newly-ready
+  accounts, ADDITIVELY merges the account-directory snapshot (new accounts appear "Setting up" to admins;
+  entries never removed; permissions untouched -- non-admins still need grants), refreshes account_directory
+  table (region as bucket). Scheduler-v2 stays the ONE paid-export owner; the next regional run bootstraps a
+  claimed account via existing machinery (OLI fixed-start 2025-01-01 + safe splitting; Catalog/Listings/FBA
+  current-only) under existing regional ceilings. Serving scopes exclude settingUp entries
+  (getAccountDirectorySnapshotAccounts filter); manual refresh re-decorates flags instead of wiping them.
+- **Campaign initial window**: never-covered account => INITIAL 56 inclusive days (own batch; splits inherit),
+  then rolling 21d once covered; unreadable coverage never triggers the 56d fetch.
+- **Grandfathering rehearsed against prod (zero writes)**: dry-run classifies all 45 -- 34 -> `ready`
+  (evidence-graded; the 4 invisible ones included), 11 -> `waiting_for_datadoe`, 0 claims needed. (Fixed en
+  route: bulk snapshot-presence read hit the PostgREST row cap -> per-pair limit=1 probes.)
+
+**TESTS** (all 16 mandated Phase-8 behaviors covered): account-onboarding (41), account-onboarding-worker (21),
+campaign-initial-window (13), fba-d1-source-guard (30) + updated report-fba-plan/fba-regional-inventory/
+lhv3-shared-inventory-date/report-listing-health-v3-integration/report-{buy-box,listing-health,sales-movers,
+returns}/scheduler-v2-automation (D3 now: exactly scheduler-v2 + the zero-export onboarding workflow may be
+scheduled, onboarding workflow may only run the discovery operator)/scheduler-v2-lhv3-workflow.
+
+**RELEASE PLAN (approval-gated, in order)**:
+1. APPLY migration 20260919 (db:migrate / apply-one-migration) -- additive, idempotent, no secrets.
+2. PUSH 56b92e9 (Vercel deploy) -- from deploy time the readiness-only gate already stops the aHeal 400-burn on
+   the next regional runs (URGENT: each europe-au run wastes ~8 creates until deployed).
+3. First live worker pass (dispatch account-onboarding.yml or CLI --mode=live): seeds 45 rows, merges the 4
+   ready-but-missing accounts into the selector (the visibility canary -- ZERO exports), 11 show "Setting up".
+4. Natural-cycle observation: regional runs (gated set = same 34), then the */15 natural cron.
+5. FUTURE paid bootstraps (when aHeal/SIMPLIFY flip ready): bounded by existing regional ceilings; estimate for
+   all 10 aHeal at once ~ 6 OLI creates (12 tok) + 2 Campaign initial (4 tok) + ~2 FBA premium (10 tok) +
+   listings/AWD/v3 within existing region ceilings => ~26-60 tokens total; SIMPLIFY US smaller. No new ceiling
+   was raised; explicit approval recorded here is for arming within EXISTING ceilings.
+
+**REMAINING/PENDING**: migration + push + live worker pass + natural-run observation (above); the stuck
+europe-au superseding cycle 05ce4abb (running, 8 failed 400 jobs) left as-is -- the superseding model handles
+stale heads; legacy v1 api/cron sync path left ungated (unreachable); Reelleo/dd-secondary + fx-rates cache
+items unchanged (out of scope).
+
 ## Permission-cache scope isolation: fingerprint-keyed cache/coalescer + fail-closed purge (2026-09-04)
 
 Closed the two remaining permission-cache findings. Browser cache/in-flight only; no report math/UI/schedulers/grants
