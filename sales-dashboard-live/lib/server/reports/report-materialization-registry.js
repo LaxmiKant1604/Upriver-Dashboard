@@ -20,23 +20,25 @@ import { REPORT_SOURCE_CONTRACTS } from "../sync/report-source-contracts.js";
 
 // WHO refreshes the durable SOURCE evidence the report derives from.
 export const SOURCE_OWNERS = Object.freeze(["scheduler-v2", "manual-refresh", "none"]);
-// WHO produces the durable REPORT artifact (snapshot) -- the backend materialization path. "serve:derive-durable" is a
-// zero-DataDoe derive from already-durable sources; "serve:self-heal" additionally WRITES a snapshot on a read miss
-// (the page-open-write reports flagged for the later scheduler-move); "manual-refresh" = only a user Refresh (DataDoe)
-// materializes it today (no automatic owner). Every value is a BACKEND path (none is "page-open-only with no backend").
+// WHO produces the durable REPORT artifact (snapshot) -- the backend materialization path. "scheduler-v2:materialize"
+// is the zero-export report-materialization job (report-materialization.mjs) publishing per region; "serve:derive-durable"
+// is a zero-DataDoe READ-ONLY derive at serve time (serve stored, else derive from durable evidence, NEVER a write);
+// "manual-refresh" = only a user Refresh (DataDoe) materializes it today (no automatic owner). Every value is a BACKEND
+// path (none is "page-open-only with no backend"). As of Phase 3 Increment 2 NO owner writes a snapshot on a plain GET
+// (the former "serve:self-heal" owner + the "self-heal-write-on-read" serve mode were removed).
 export const MATERIALIZATION_OWNERS = Object.freeze([
   "scheduler-v2:priority",   // priority-dashboards-release.mjs derives+publishes per region
   "scheduler-v2:fba",        // the scheduler-v2 fba job (fba-plan-golive.mjs) publishes per region
   "scheduler-v2:v3-shadow",  // the scheduler-v2 listing-health-v3 shadow ingestion (UI flag off)
+  "scheduler-v2:materialize",// the scheduler-v2 report-materialization job (report-materialization.mjs) publishes per region (zero export)
   "serve:derive-durable",    // zero-DataDoe derive-at-serve from durable evidence (no write)
-  "serve:self-heal",         // zero-DataDoe derive-at-serve that persists a snapshot on a read miss (page-open write)
   "manual-refresh",          // materialized only by an explicit user Refresh (DataDoe); no automatic owner yet
 ]);
 export const SERVE_MODES = Object.freeze([
   "read-snapshot",             // read a durable snapshot; else stale-LKG or "waiting"
   "read-snapshot-else-waiting",
+  "read-snapshot-or-derive",   // read the durable snapshot; on a miss/stale, derive READ-ONLY from durable evidence (NEVER a write)
   "derive-at-serve",           // compute from durable sources each GET (no write)
-  "self-heal-write-on-read",   // compute + persist a snapshot on a read miss (zero DataDoe)
 ]);
 export const GRAINS = Object.freeze(["account", "account-brand", "account-region", "region", "organization"]);
 export const LKG_POLICIES = Object.freeze(["serve-last-known-good", "waiting-if-missing", "derive-fresh-each-read"]);
@@ -48,15 +50,12 @@ export const REQUIRED_DECLARATION_FIELDS = Object.freeze([
   "bucket", "pageOpenWrite", "clientOpenTriggeredWrite", "notes",
 ]);
 
-// GRANDFATHERED page-open writes (Phase 3). The EXACT, named set of reports whose plain-GET serve path STILL writes a
-// snapshot on a read miss (zero DataDoe self-heal), pending their move fully into the scheduler-owned materializer.
-// This is a SHRINKING allowlist: as each report's serve is made read-only, it is removed from here AND its
-// pageOpenWrite is flipped to false, and the guard asserts the two stay in lockstep (the set of pageOpenWrite:true
-// reports must EQUAL this allowlist). A NEW report can never appear here without a deliberate, reviewable edit that a
-// reviewer will reject -- so a new report is structurally prevented from shipping a page-open write. DO NOT ADD.
-export const PAGE_OPEN_WRITE_GRANDFATHERED = Object.freeze([
-  "daily", "sku-movement", "returns-leakage", "brand-view-brands", "brand-directory",
-]);
+// GRANDFATHERED page-open writes. EMPTY as of Phase 3 Increment 2 -- every report GET is now read-only (the five
+// former self-heal writers -- daily, sku-movement, returns-leakage, brand-view-brands, brand-directory -- were
+// converted to serve stored / derive read-only / waiting, with NO snapshot write, lock, or publish on any read
+// path). The guard requires the set of pageOpenWrite:true reports to EQUAL this allowlist, so with it empty NO
+// report may declare (or ship) a page-open write. This list MUST stay empty: a new page-open writer fails the guard.
+export const PAGE_OPEN_WRITE_GRANDFATHERED = Object.freeze([]);
 
 // Client-open-triggered writes (a browser page-open/converge effect that calls the WRITE endpoint refresh=1). Phase 3
 // removed the last two (BrandView + BrandPortfolio auto-converge now poll read-only), so this allowlist is EMPTY and
@@ -103,8 +102,8 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at", "salesWindowStatus", "coverage"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["daily"],
-    serveMode: "self-heal-write-on-read", bucket: "A", pageOpenWrite: true, clientOpenTriggeredWrite: false,
-    notes: "Scheduler-published AND self-heals+writes on a read miss (zero DataDoe). pageOpenWrite=true -> a candidate to move fully into the scheduler so GET is read-only.",
+    serveMode: "read-snapshot-or-derive", bucket: "A", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    notes: "ALL-brand is scheduler-published (priority path) at the exact serve identity {from:monthBack(asOf,5),to:asOf,brand:ALL}; a named-brand read DERIVES read-only from durable OLI/Catalog and serves WITHOUT writing (Phase 3). GET performs zero backend mutations; the refresh=1 DataDoe path stays click-only.",
   },
   "brand-inventory": {
     reportKey: "brand-inventory", reportVersion: vTag("brand-inventory"),
@@ -129,22 +128,22 @@ export const REPORT_MATERIALIZATION = Object.freeze({
   "sku-movement": {
     reportKey: "sku-movement", reportVersion: vTag("sku-movement"),
     requiredSources: [OLI, CATALOG], optionalSources: [],
-    sourceOwner: "scheduler-v2", materializationOwner: "serve:self-heal",
-    grain: "account", freshness: { maxAgeHours: 24, coverage: "selectable-window" },
+    sourceOwner: "scheduler-v2", materializationOwner: "scheduler-v2:materialize",
+    grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "selectable-window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["sku-movement"],
-    serveMode: "self-heal-write-on-read", bucket: "B", pageOpenWrite: true, clientOpenTriggeredWrite: false,
-    notes: "Sources scheduled; report self-heals+writes on read from durable OLI/Catalog (zero DataDoe). Move to scheduler to make GET read-only.",
+    serveMode: "read-snapshot-or-derive", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    notes: "Scheduler materializer (report-materialization job) publishes ALL + each named brand at {asOf,brand}; the client re-windows N days from the canonical payload. A read serves the stored snapshot, or on a stale/miss derives read-only from durable OLI/Catalog -- zero DataDoe, zero write (Phase 3).",
   },
   "returns-leakage": {
     reportKey: "returns-leakage", reportVersion: vTag("returns-leakage"),
     requiredSources: [RETURNS, SETTLEMENTS, OLI], optionalSources: [CATALOG],
-    sourceOwner: "manual-refresh", materializationOwner: "serve:self-heal",
+    sourceOwner: "manual-refresh", materializationOwner: "scheduler-v2:materialize",
     grain: "account-brand", freshness: { maxAgeHours: 168, coverage: "durable-history" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
-    regionalScheduling: "manual-only", capability: REPORT_CAPABILITIES["returns-leakage"],
-    serveMode: "self-heal-write-on-read", bucket: "B", pageOpenWrite: true, clientOpenTriggeredWrite: false,
-    notes: "Returns workflow is manual-only (crons removed); report self-heals+writes on a read miss from durable Returns/Settlement/OLI.",
+    regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["returns-leakage"],
+    serveMode: "read-snapshot-or-derive", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    notes: "SOURCE (Returns/Settlement history) stays manual-only (crons removed); the scheduler materializer re-publishes the REPORT daily from whatever durable evidence exists, stamping the SOURCE provenance (not the materialization time) so stale Returns data is never marked fresh. A read serves stored or derives read-only -- zero write (Phase 3).",
   },
   "brand-view": {
     reportKey: "brand-view", reportVersion: null,
@@ -179,22 +178,22 @@ export const REPORT_MATERIALIZATION = Object.freeze({
   "brand-view-brands": {
     reportKey: "brand-view-brands", reportVersion: null,
     requiredSources: [OLI, CATALOG], optionalSources: [],
-    sourceOwner: "scheduler-v2", materializationOwner: "serve:self-heal",
+    sourceOwner: "scheduler-v2", materializationOwner: "scheduler-v2:materialize",
     grain: "account", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
-    regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["brand-view-brands"],
-    serveMode: "self-heal-write-on-read", bucket: "B", pageOpenWrite: true, clientOpenTriggeredWrite: false,
-    notes: "Brand dropdown directory; writes on a read miss (zero DataDoe) from brand-sales membership.",
+    regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["brand-view-brands"],
+    serveMode: "read-snapshot-or-derive", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    notes: "Brand dropdown directory; the scheduler materializer publishes it per account from brand-sales membership. A read serves stored or builds read-only from durable membership -- zero DataDoe, zero write (Phase 3).",
   },
   "brand-directory": {
     reportKey: "brand-directory", reportVersion: null,
     requiredSources: [OLI, CATALOG], optionalSources: [],
-    sourceOwner: "scheduler-v2", materializationOwner: "serve:self-heal",
+    sourceOwner: "scheduler-v2", materializationOwner: "serve:derive-durable",
     grain: "organization", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["brand-directory"],
-    serveMode: "self-heal-write-on-read", bucket: "B", pageOpenWrite: true, clientOpenTriggeredWrite: false,
-    notes: "Account/brand selector; rebuilds+writes on read when the brand-sales fingerprint changes (zero DataDoe). Refresh (Catalog export) is admin-gated.",
+    serveMode: "read-snapshot-or-derive", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    notes: "Account/brand selector, keyed by the viewer's authorized selection. A read serves the stored directory when the brand-sales membership fingerprint matches, else rebuilds READ-ONLY from the scheduler-materialized per-account brand-sales membership (zero DataDoe, zero write) and applies authorization projection on serve. Because a read never writes, concurrent regional runs can never overwrite one region's membership with another's (Phase 3). Refresh (Catalog export) stays admin-gated.",
   },
   "oli-quality": {
     reportKey: "oli-quality", reportVersion: null,
@@ -347,18 +346,18 @@ export const NON_REPORT_ACTIONS = Object.freeze(
  *     (required OR optional) -- the report must not omit a source its own contract fetches. (Derived deps like OLI/
  *     Catalog may additionally be declared even when the contract does not own them.)
  *  8. clientOpenTriggeredWrite is a boolean.
- *  9. write-flag <-> serve-mode/owner consistency: pageOpenWrite:true IFF serveMode==="self-heal-write-on-read" IFF
- *     materializationOwner==="serve:self-heal" (a page-open write can never hide behind a read-looking declaration).
- * 10. a page-open write is allowed ONLY for a report in PAGE_OPEN_WRITE_GRANDFATHERED, and a client-open-triggered
- *     write is allowed for NONE -- so a NEW report cannot ship either kind of browser-triggered write.
+ *  9. Phase 3 read-only invariant: every serve mode is read-only, so NO report may flag a page-open write (the
+ *     write-on-read serve mode + the serve:self-heal owner were removed from the vocabularies).
+ * 10. a page-open write is allowed ONLY for a report in `grandfathered` (default PAGE_OPEN_WRITE_GRANDFATHERED, now
+ *     EMPTY), and a client-open-triggered write for NONE -- so a NEW report cannot ship either browser-triggered write.
  * 11. the write allowlist stays in EXACT lockstep with the declared flags (the pageOpenWrite:true set EQUALS
- *     PAGE_OPEN_WRITE_GRANDFATHERED; no report declares clientOpenTriggeredWrite:true) -- so the grandfather can only
- *     SHRINK as serve paths are made read-only, never grow.
+ *     `grandfathered`; no report declares clientOpenTriggeredWrite:true). With the allowlist empty this means every
+ *     GET is read-only -- the allowlist can only SHRINK, never grow. `grandfathered` is injectable for the guard test.
  */
 export function validateReportMaterializationRegistry({
   capabilities = REPORT_CAPABILITIES, capabilityEnum = CAPABILITY,
   derivations = REPORT_DERIVATIONS, sourceContracts = REPORT_SOURCE_CONTRACTS,
-  registry = REPORT_MATERIALIZATION,
+  registry = REPORT_MATERIALIZATION, grandfathered = PAGE_OPEN_WRITE_GRANDFATHERED,
 } = {}) {
   const problems = [];
   const reportActions = Object.entries(capabilities).filter(([, c]) => c !== capabilityEnum.NON_REPORT).map(([a]) => a);
@@ -406,18 +405,13 @@ export function validateReportMaterializationRegistry({
     }
     // 8. clientOpenTriggeredWrite is a boolean (does a browser page-open/converge effect call the WRITE endpoint?).
     if (typeof e.clientOpenTriggeredWrite !== "boolean") problems.push(`"${a}" clientOpenTriggeredWrite must be a boolean`);
-    // 9. write-flag <-> serve-mode consistency (biconditional): a page-open write is EXACTLY a self-heal serve, so no
-    //    report can hide a write behind a read-looking serve mode, nor claim a self-heal serve while flagging read-only.
-    //    (The owner is NOT biconditional: "daily" is a legit hybrid -- ALL-brand is scheduler-materialized, so its
-    //    owner is scheduler-v2:priority, while its named-brand read still self-heals+writes, so pageOpenWrite=true. But
-    //    a serve:self-heal OWNER always writes on read, so that direction IS enforced.)
-    const selfHealMode = e.serveMode === "self-heal-write-on-read";
-    if (e.pageOpenWrite === true && !selfHealMode) problems.push(`"${a}" pageOpenWrite=true but serveMode is "${e.serveMode}" (a page-open write must serve via self-heal-write-on-read)`);
-    if (e.pageOpenWrite === false && selfHealMode) problems.push(`"${a}" serveMode is self-heal-write-on-read but pageOpenWrite=false (a self-heal serve DOES write on a read miss)`);
-    if (e.materializationOwner === "serve:self-heal" && e.pageOpenWrite !== true) problems.push(`"${a}" materializationOwner is serve:self-heal but pageOpenWrite is not true (a self-heal owner writes on a read miss)`);
+    // 9. Phase 3 read-only invariant: every serve mode is read-only (the write-on-read serve mode + the serve:self-heal
+    //    owner were REMOVED), so no report may flag a page-open write. A pageOpenWrite:true on a read-only serve mode is
+    //    a defect (a write can never hide behind a read-looking declaration).
+    if (e.pageOpenWrite === true) problems.push(`"${a}" pageOpenWrite=true, but every serve mode is read-only in Phase 3 -- a plain GET must never write a snapshot (serve stored / derive read-only / waiting instead)`);
     // 10. a page-open / client-open write is allowed ONLY for a grandfathered report -> a NEW report is structurally
     //     prevented from shipping either kind of browser-triggered write.
-    if (e.pageOpenWrite === true && !PAGE_OPEN_WRITE_GRANDFATHERED.includes(a)) {
+    if (e.pageOpenWrite === true && !grandfathered.includes(a)) {
       problems.push(`"${a}" has pageOpenWrite=true but is NOT in PAGE_OPEN_WRITE_GRANDFATHERED -- a new report may not depend on a page-open snapshot write; make its GET read-only (scheduler-materialized) instead`);
     }
     if (e.clientOpenTriggeredWrite === true && !CLIENT_OPEN_TRIGGERED_WRITE_GRANDFATHERED.includes(a)) {
@@ -429,11 +423,11 @@ export function validateReportMaterializationRegistry({
   //     pageOpenWrite is true must EQUAL PAGE_OPEN_WRITE_GRANDFATHERED (so the allowlist can neither grow silently nor
   //     keep a stale entry once a report is made read-only), and clientOpenTriggeredWrite must be true for NONE.
   const declaredPageOpenWriters = Object.entries(registry).filter(([a, e]) => reportSet.has(a) && e.pageOpenWrite === true).map(([a]) => a).sort();
-  const grandfathered = [...PAGE_OPEN_WRITE_GRANDFATHERED].sort();
-  if (JSON.stringify(declaredPageOpenWriters) !== JSON.stringify(grandfathered)) {
-    problems.push(`PAGE_OPEN_WRITE_GRANDFATHERED [${grandfathered.join(",")}] must EQUAL the set of reports declaring pageOpenWrite:true [${declaredPageOpenWriters.join(",")}] -- update BOTH in lockstep (remove a report from the allowlist only when its GET is made read-only)`);
+  const allowlist = [...grandfathered].sort();
+  if (JSON.stringify(declaredPageOpenWriters) !== JSON.stringify(allowlist)) {
+    problems.push(`PAGE_OPEN_WRITE_GRANDFATHERED [${allowlist.join(",")}] must EQUAL the set of reports declaring pageOpenWrite:true [${declaredPageOpenWriters.join(",")}] -- update BOTH in lockstep (remove a report from the allowlist only when its GET is made read-only)`);
   }
-  for (const a of PAGE_OPEN_WRITE_GRANDFATHERED) if (!reportSet.has(a)) problems.push(`PAGE_OPEN_WRITE_GRANDFATHERED lists "${a}", which is not a registered report action`);
+  for (const a of grandfathered) if (!reportSet.has(a)) problems.push(`PAGE_OPEN_WRITE_GRANDFATHERED lists "${a}", which is not a registered report action`);
   const declaredClientWriters = Object.entries(registry).filter(([a, e]) => reportSet.has(a) && e.clientOpenTriggeredWrite === true).map(([a]) => a).sort();
   if (declaredClientWriters.length !== 0) {
     problems.push(`no report may declare clientOpenTriggeredWrite:true (Phase 3 made every browser converge/poll read-only); offenders: [${declaredClientWriters.join(",")}]`);

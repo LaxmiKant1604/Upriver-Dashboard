@@ -78,14 +78,14 @@ await testAsync("a NAMED-brand request is ISOLATED: it never falls back to the A
   assert.equal(cap.body.rows, undefined, "the ALL-brand rows are NOT leaked to the named-brand request");
 });
 
-await testAsync("a MISSING named-brand snapshot SELF-HEALS: derives from durable evidence, SAVES under the named-brand identity, serves in the same request (zero exports)", async () => {
+await testAsync("PHASE 3: a MISSING named-brand snapshot derives READ-ONLY and serves in the same request, writing NOTHING (zero exports, zero mutations)", async () => {
   const { readers, seed } = makeReaders();
   seed({ to: PROVEN, brand: "ALL", payload: { rows: [{ date: PROVEN, total_sales: 999 }], brandFiltered: false } }); // ALL exists; Acme does not
-  // Injectable self-heal store (the same shape production wires): lock + snapshot persistence.
+  // Injectable store whose every WRITE records the call -> "zero writes" is proven, not assumed.
   const snaps = new Map(); const locks = new Set();
   const key = (o) => [o.reportKey, o.accountId, o.paramsHash].join("|");
   const store = {
-    claimRefreshLock: async (o) => { const k = key(o); if (locks.has(k)) return false; locks.add(k); return true; },
+    claimRefreshLock: async (o) => { locks.add(key(o)); return true; },
     releaseRefreshLock: async (o) => { locks.delete(key(o)); },
     getReportSnapshot: async (o) => snaps.get(key(o)) || null,
     saveReportSnapshot: async (o) => { const row = { id: "s", updated_at: "u", source_refreshed_at: o.sourceRefreshedAt, payload: o.payload, params: o.params }; snaps.set(key(o), row); return row; },
@@ -102,14 +102,15 @@ await testAsync("a MISSING named-brand snapshot SELF-HEALS: derives from durable
   };
   const { res, cap } = fakeRes();
   await serveSharedReport(req({ res, params: { from: FROM, to: TODAY, brand: "Acme" }, staleScopeKeys: ["brand"], readers, store, deriveDurable }));
-  assert.equal(derives, 1, "the self-heal derived exactly once");
+  assert.equal(derives, 1, "the read-only self-heal derived exactly once");
   assert.equal(cap.body.snapshotMissing, undefined, "NOT a waiting state -- served in the same request");
   assert.equal(cap.body.rows[0].total_sales, 42, "the BRAND payload is served (never the ALL-brand 999)");
   assert.equal(cap.body.rows[0].ad_sales, 7, "brand-scoped ads are present");
   assert.equal(cap.body.snapshot.rederived, true, "flagged as re-derived");
-  const stored = [...snaps.values()][0];
-  assert.equal(stored.params.brand, "Acme", "SAVED under the named-brand identity (clamped effective params)");
-  assert.equal(stored.params.to, PROVEN, "honest clamped as-of");
+  assert.equal(cap.body.snapshot.readOnly, true, "flagged read-only (no write)");
+  assert.equal(cap.body.paramsHash, paramsHashFor(V2, { from: FROM, to: PROVEN, brand: "Acme" }), "served under the clamped effective named-brand identity");
+  assert.equal(snaps.size, 0, "ZERO snapshot writes -- the GET is read-only");
+  assert.equal(locks.size, 0, "ZERO locks claimed -- the GET is read-only");
 });
 
 await testAsync("a named-brand request serves ITS OWN snapshot (not the ALL-brand one, even if ALL is newer)", async () => {
@@ -169,19 +170,21 @@ const brandDerive = (to, sales) => async () => ({
   effectiveParams: { from: FROM, to, brand: "Caruso Italy" }, latestCompletedDate: to,
 });
 
-await testAsync("STALE named-brand snapshot (as-of behind the account's proven horizon) SELF-HEALS on read (zero exports)", async () => {
+await testAsync("PHASE 3: a STALE named-brand snapshot derives READ-ONLY on read (fresh payload, zero write)", async () => {
   const { readers, seed } = makeReaders();
   seed({ to: PROVEN, brand: "Caruso Italy", payload: { rows: [{ date: PROVEN, total_sales: 10 }], brandFiltered: true } }); // stale as-of PROVEN(08-22)
-  const { store, snaps } = makeSelfHealStore();
+  const { store, snaps, locks } = makeSelfHealStore();
   let derives = 0; const dd = async () => { derives += 1; return brandDerive(PROVEN_NEW, 55)(); };
   const { res, cap } = fakeRes();
   await serveSharedReport(req({ res, params: { from: FROM, to: TODAY, brand: "Caruso Italy" }, staleScopeKeys: ["brand"], readers, store, deriveDurable: dd, staleWhenParamsToBefore: PROVEN_NEW }));
-  assert.equal(derives, 1, "the account's proven horizon advanced past the snapshot's as-of -> re-derived once");
+  assert.equal(derives, 1, "the account's proven horizon advanced past the snapshot's as-of -> re-derived once (read-only)");
   assert.equal(cap.body.rows[0].total_sales, 55, "the FRESH named-brand payload is served");
   assert.equal(cap.body.snapshot.rederived, true, "flagged re-derived");
-  const saved = [...snaps.values()][0];
-  assert.equal(saved.params.to, PROVEN_NEW, "saved under the account's proven horizon (not the brand's last sale)");
-  assert.equal(saved.params.brand, "Caruso Italy", "brand isolation preserved through the self-heal");
+  assert.equal(cap.body.snapshot.readOnly, true, "flagged read-only");
+  assert.equal(cap.body.snapshot.savedForParams.to, PROVEN_NEW, "served under the account's proven horizon (clamped effective identity, not the brand's last sale)");
+  assert.equal(cap.body.paramsHash, paramsHashFor(V2, { from: FROM, to: PROVEN_NEW, brand: "Caruso Italy" }), "brand isolation preserved through the read-only derive");
+  assert.equal(snaps.size, 0, "ZERO snapshot writes -- the GET is read-only");
+  assert.equal(locks.size, 0, "ZERO locks claimed -- the GET is read-only");
 });
 
 await testAsync("FRESH named-brand snapshot (as-of == proven horizon) is REUSED without a write", async () => {
@@ -195,18 +198,20 @@ await testAsync("FRESH named-brand snapshot (as-of == proven horizon) is REUSED 
   assert.equal(cap.body.rows[0].total_sales, 33, "the existing fresh snapshot is served");
 });
 
-await testAsync("MAPPING-REV: a named-brand snapshot whose campaign mapping revision differs SELF-HEALS on read (even when the as-of is current)", async () => {
+await testAsync("PHASE 3: MAPPING-REV -- a named-brand snapshot whose campaign mapping revision differs derives READ-ONLY on read (even when the as-of is current), zero write", async () => {
   const { readers, seed } = makeReaders();
   // as-of already at the proven horizon (the DATE self-heal will NOT fire), but the recorded mapping revision is old.
   seed({ to: PROVEN_NEW, brand: "Caruso Italy", payload: { rows: [{ date: PROVEN_NEW, total_sales: 10, ad_sales: 0 }], brandFiltered: true, campaignMappingRev: "rev-old" } });
-  const { store, snaps } = makeSelfHealStore();
+  const { store, snaps, locks } = makeSelfHealStore();
   let derives = 0;
   const dd = async () => { derives += 1; return { payload: { rows: [{ date: PROVEN_NEW, total_sales: 10, ad_sales: 500 }], brandFiltered: true, campaignMappingRev: "rev-new" }, sourceRefreshedAt: PROVEN_NEW + "T01:00:00.000Z", effectiveParams: { from: FROM, to: PROVEN_NEW, brand: "Caruso Italy" }, latestCompletedDate: PROVEN_NEW }; };
   const { res, cap } = fakeRes();
   await serveSharedReport(req({ res, params: { from: FROM, to: PROVEN_NEW, brand: "Caruso Italy" }, staleScopeKeys: ["brand"], readers, store, deriveDurable: dd, staleWhenParamsToBefore: PROVEN_NEW, staleWhenMappingRev: "rev-new" }));
   assert.equal(derives, 1, "rev-old != rev-new -> re-derived once (mapping changed since the snapshot was attributed)");
-  assert.equal(cap.body.rows[0].ad_sales, 500, "the FRESH mapping-attributed ads are served (not the stale 0)");
-  assert.equal([...snaps.values()][0].payload.campaignMappingRev, "rev-new", "the current revision is recorded on the re-derived snapshot");
+  assert.equal(cap.body.rows[0].ad_sales, 500, "the FRESH mapping-attributed ads are SERVED (not the stale 0)");
+  assert.equal(cap.body.campaignMappingRev, "rev-new", "the served read-only payload carries the current revision");
+  assert.equal(snaps.size, 0, "ZERO snapshot writes -- the GET is read-only");
+  assert.equal(locks.size, 0, "ZERO locks claimed -- the GET is read-only");
 });
 
 await testAsync("MAPPING-REV: a named-brand snapshot at the CURRENT revision is REUSED (no re-derive, no write)", async () => {
@@ -231,22 +236,22 @@ await testAsync("stale self-heal with a NOT-READY derive falls back to serving t
   assert.equal(cap.body.rows[0].total_sales, 10, "the stale LKG is served when the derive is not ready");
 });
 
-await testAsync("concurrent stale reads self-heal exactly ONCE (serialized by the refresh lock)", async () => {
+await testAsync("PHASE 3: concurrent stale reads each derive READ-ONLY (no lock), both serve fresh, and write NOTHING", async () => {
   const { readers, seed } = makeReaders();
   seed({ to: PROVEN, brand: "Caruso Italy", payload: { rows: [{ date: PROVEN, total_sales: 10 }], brandFiltered: true } });
-  const { store } = makeSelfHealStore();
+  const { store, snaps, locks } = makeSelfHealStore();
   let derives = 0; const dd = async () => { derives += 1; await new Promise((r) => setTimeout(r, 5)); return brandDerive(PROVEN_NEW, 55)(); };
   const r1 = fakeRes(); const r2 = fakeRes();
   await Promise.all([
     serveSharedReport(req({ res: r1.res, params: { from: FROM, to: TODAY, brand: "Caruso Italy" }, staleScopeKeys: ["brand"], readers, store, deriveDurable: dd, staleWhenParamsToBefore: PROVEN_NEW })),
     serveSharedReport(req({ res: r2.res, params: { from: FROM, to: TODAY, brand: "Caruso Italy" }, staleScopeKeys: ["brand"], readers, store, deriveDurable: dd, staleWhenParamsToBefore: PROVEN_NEW })),
   ]);
-  assert.equal(derives, 1, "the lock serializes -> exactly ONE derive/save across concurrent reads");
-  // The lock winner serves the FRESH re-derive (55); the loser serves the last-known-good (10) while the winner
-  // is mid-derive -- neither ever blanks, and the derive/save happens exactly once.
+  // Read-only means NO lock: concurrent reads derive independently (more compute, but zero mutation). Neither writes.
+  assert.equal(derives, 2, "each concurrent read derives read-only (no lock to serialize them)");
   for (const x of [r1, r2]) assert.ok(x.cap.body.rows && x.cap.body.rows.length, "neither concurrent read blanks");
-  const served = [r1.cap.body.rows[0].total_sales, r2.cap.body.rows[0].total_sales].sort((a, b) => a - b);
-  assert.deepEqual(served, [10, 55], "one fresh (55) + one LKG (10) -- exactly one derive, no blank, no double-write");
+  assert.deepEqual([r1.cap.body.rows[0].total_sales, r2.cap.body.rows[0].total_sales], [55, 55], "both serve the FRESH read-only derive");
+  assert.equal(snaps.size, 0, "ZERO snapshot writes across BOTH concurrent reads");
+  assert.equal(locks.size, 0, "ZERO locks claimed -- a read-only path never locks");
 });
 
 await testAsync("stale self-heal is OFF for reports that never pass staleWhenParamsToBefore (byte-identical stale-scope serve)", async () => {

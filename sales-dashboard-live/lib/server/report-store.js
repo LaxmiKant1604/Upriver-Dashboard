@@ -269,7 +269,7 @@ export async function serveSharedReport({
       // as-of -> re-derive via the durable self-heal (ZERO DataDoe) instead of serving an out-of-date as-of. On a
       // not-ready derive the self-heal returns un-served and we fall through to serve THIS snapshot as LKG.
       if ((paramsToBehindProven(snapshot) || mappingRevStale(snapshot)) && deriveDurable && !deferRebuildOnRead) {
-        const healed = await selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds, augmentResponse }, store);
+        const healed = await selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds, augmentResponse, readOnly: true }, store);
         if (healed.served) return;
       }
       // The EXACT snapshot exists. If the contributing sources have advanced past it (e.g. brand-sales rolled
@@ -304,7 +304,7 @@ export async function serveSharedReport({
       // as-of, re-derive via the durable self-heal (ZERO DataDoe) so the named-brand horizon tracks the account's,
       // not the brand's last sale. On a not-ready derive, fall through to serving this snapshot as LKG (stale-scope).
       if ((paramsToBehindProven(latest) || mappingRevStale(latest)) && deriveDurable && !deferRebuildOnRead) {
-        const healed = await selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds, augmentResponse }, store);
+        const healed = await selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds, augmentResponse, readOnly: true }, store);
         if (healed.served) return;
       }
       // A last-known-good for a DIFFERENT params hash (across-day / changed account set) is itself a stale
@@ -344,7 +344,7 @@ export async function serveSharedReport({
     // so a normal page visit auto-populates instead of showing "Nothing saved" while durable evidence is present.
     if (deriveDurable) {
       const healed = await selfHealFromDurable({
-        deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds, augmentResponse,
+        deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds, augmentResponse, readOnly: true,
       }, store);
       if (healed.served) return;
       if (healed.notReady) {
@@ -491,11 +491,42 @@ async function persistDerivedSnapshot({ reportKey, reportVersion, accountId, par
  * concurrent derivation is in flight but not yet saved -> caller shows the honest "not saved yet" state).
  * `store` is injectable so the concurrency + zero-export contract is provable offline.
  */
-export async function selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present = (p) => p, res, label, lockSeconds, augmentResponse = null }, store = DEFAULT_STORE) {
+export async function selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present = (p) => p, res, label, lockSeconds, augmentResponse = null, readOnly = false }, store = DEFAULT_STORE) {
   // Two-layer completeness for the self-heal serve (first visit before a scheduled publish). Advisory; the augment
   // returns {} on any failure, so it never breaks the self-heal.
   const augExtra = augmentResponse ? await augmentResponse({ accountId, params }) : {};
   const withAug = (extra) => ({ ...extra, ...(augExtra && typeof augExtra === "object" ? augExtra : {}) });
+
+  // PHASE 3 READ-ONLY GET (production default for every serve path). Derive the payload from ALREADY-DURABLE evidence
+  // and SERVE it, but NEVER claim a lock, persist a snapshot, or publish an update -- opening a page must perform zero
+  // backend mutations. The scheduler owns materialization; this is the zero-write fallback for an identity that is not
+  // yet materialized (e.g. a named-brand Daily whose window tracks the viewer's marketplace-today). A not-ready derive
+  // degrades to the honest "waiting" state (never a 500, never a fabricated value, never a write).
+  if (readOnly) {
+    let derived = null;
+    try { derived = await deriveDurable(); }
+    catch (_e) { return { served: false, notReady: true, missingSources: [], message: `Waiting for the scheduled data refresh before ${label} can be shown. No fabricated values are displayed and no export is created.` }; }
+    if (!derived || !derived.payload) {
+      const missingSources = describeMissingSources(derived && derived.blockedBy);
+      const named = missingSources.length ? ` (waiting for: ${missingSources.join(", ")})` : "";
+      return { served: false, notReady: true, missingSources, message: `Waiting for the scheduled data refresh before ${label} can be shown${named}. No fabricated values are displayed and no export is created.` };
+    }
+    // A clamped as-of is served under its honest EFFECTIVE identity, exactly like the persisted path -- just not stored.
+    const effectiveParams = derived.effectiveParams || null;
+    const effectiveHash = effectiveParams ? paramsHashFor(reportVersion, effectiveParams) : paramsHash;
+    const clamped = effectiveParams && effectiveHash !== paramsHash;
+    res.status(200).json({
+      ...present(derived.payload),
+      reportKey, reportVersion, paramsHash: effectiveHash,
+      ...(augExtra && typeof augExtra === "object" ? augExtra : {}),
+      snapshot: {
+        savedAt: derived.sourceRefreshedAt || null, updatedAt: null, shared: true, rederived: true, readOnly: true,
+        ...(clamped ? { staleScope: true, savedForParams: { reportVersion, ...effectiveParams }, requestedParams: { reportVersion, ...params } } : {}),
+      },
+    });
+    return { served: true };
+  }
+
   const locked = await store.claimRefreshLock({ reportKey, accountId, paramsHash, lockSeconds });
   if (!locked) {
     // Another request already holds the lock and is re-deriving this exact snapshot. Never derive twice; re-read

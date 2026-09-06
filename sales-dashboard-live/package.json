@@ -134,6 +134,7 @@
     "test:lhv3-cycle-bucket-migration": "node scripts/listing-health-v3-cycle-bucket-migration.test.js",
     "test:report-materialization-registry": "node scripts/report-materialization-registry.test.js",
     "test:report-materialization-operation": "node scripts/report-materialization-operation.test.js",
+    "test:report-readonly-serve": "node scripts/report-readonly-serve.test.js",
     "test:brand-view-readonly": "node scripts/brand-view-readonly.test.js",
     "test:listing-health-v3-finalize": "node scripts/report-listing-health-v3-finalize.test.js",
     "test:listing-health-v3-preflight-defer": "node scripts/report-listing-health-v3-preflight-defer.test.js",

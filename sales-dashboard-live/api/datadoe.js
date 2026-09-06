@@ -985,36 +985,21 @@ async function serveSelfHealingBrandDirectory({ res, accountIds, legacyShared, b
   // Unchanged evidence -> serve the saved directory immediately.
   if (storedHasBrands && storedFp != null && liveFp != null && storedFp === liveFp) { serveStored(); return; }
 
-  // Changed or missing -> rebuild under the shared lock (one rebuild for concurrent readers).
-  const locked = paramsHash ? await claimRefreshLock({ reportKey, accountId, paramsHash, lockSeconds: 300 }).catch(() => false) : false;
-  if (!locked) {
-    if (storedHasBrands) { serveStored({ staleRebuilding: true }); return; }
+  // PHASE 3 READ-ONLY GET: changed or missing -> rebuild the directory READ-ONLY from the latest saved brand-sales
+  // membership and SERVE it, but NEVER lock or persist. Because a read never writes, concurrent regional runs can no
+  // longer race or overwrite one another's membership (there is no write to overwrite), and no page load mutates the
+  // backend. The rebuild reads ONLY already-durable per-account snapshots (zero DataDoe) and is authorization-projected
+  // on serve. On a rebuild failure, serve the stored directory (stale) or the honest "rebuilding" state.
+  let payload;
+  try {
+    const directory = await sharedSnapshotBrandAccounts(accountIds);
+    payload = buildBrandDirectoryReadPayload(directory, brandDirectoryAccounts);
+  } catch (e) {
+    if (storedHasBrands) { serveStored({ staleRebuildFailed: true }); return; }
     res.status(200).json({ reportKey, reportVersion, paramsHash, brands: [], brandAccounts: {}, rebuilding: true, message: "Brand coverage is updating from the latest saved sales." });
     return;
   }
-  try {
-    // Double-check inside the lock -- the race winner may have just rebuilt it.
-    const fresh = await getLatestReportSnapshot({ reportKey, accountId }).catch(() => null);
-    if (Array.isArray(fresh?.payload?.brands) && fresh.payload.brands.length && liveFp != null && fresh.payload.membershipFingerprint === liveFp) {
-      res.status(200).json({ ...project(fresh.payload), reportKey, reportVersion, paramsHash, snapshot: { savedAt: fresh.source_refreshed_at || fresh.updated_at || null, updatedAt: fresh.updated_at || null, shared: true } });
-      return;
-    }
-    let payload;
-    try {
-      const directory = await sharedSnapshotBrandAccounts(accountIds);
-      payload = buildBrandDirectoryReadPayload(directory, brandDirectoryAccounts);
-    } catch (e) {
-      if (storedHasBrands) { serveStored({ staleRebuildFailed: true }); return; }
-      throw e;
-    }
-    if (paramsHash) {
-      const payloadBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
-      await saveReportSnapshot({ reportKey, accountId, paramsHash, params: { reportVersion, ...params }, payload, payloadBytes, sourceRefreshedAt: new Date().toISOString() }).catch(() => {});
-    }
-    res.status(200).json({ ...project(payload), reportKey, reportVersion, paramsHash, snapshot: { savedAt: new Date().toISOString(), updatedAt: null, shared: true, rebuilt: true } });
-  } finally {
-    if (locked && paramsHash) await releaseRefreshLock({ reportKey, accountId, paramsHash }).catch(() => {});
-  }
+  res.status(200).json({ ...project(payload), reportKey, reportVersion, paramsHash, snapshot: { savedAt: null, updatedAt: null, shared: true, rederived: true, readOnly: true } });
 }
 
 // SKU Movement -- a dedicated ZERO-EXPORT self-healing serve (mirrors serveSelfHealingBrandDirectory). The generic
@@ -1049,41 +1034,27 @@ async function serveSelfHealingReturns({ res, accountId, connections, userScope 
   const stored = await getLatestReportSnapshotForScope({ reportKey, accountId, reportVersion, scope: {} }).catch(() => null);
   if (stored && stored.payload && !refresh) { serveStored(stored); return; }
 
-  const lockHash = paramsHashFor(reportVersion, { selfHeal: "returns-leakage" });
-  const locked = await claimRefreshLock({ reportKey, accountId, paramsHash: lockHash, lockSeconds: 300 }).catch(() => false);
-  if (!locked) {
+  // PHASE 3 READ-ONLY GET: never lock/persist/publish on a read. Returns Leakage is a durable ZERO-export report; the
+  // regional scheduler materializer owns its snapshot. On a miss (or an explicit reload) derive the advanced payload
+  // read-only from ALREADY-DURABLE evidence (this report's Returns + Settlement history + the reused OLI + org Catalog)
+  // and SERVE it WITHOUT writing -- opening/reloading the page performs zero backend mutations and never a DataDoe call.
+  const readers = {
+    readReturnsHistory: getReturnsHistoryRows, readSettlementHistory: getSettlementHistoryRows,
+    readOliHistory: getSourceOliHistoryRows, readOliCoverage: getSourceCoverageWindows,
+    readOliOperationalUnits: getSourceOliOperationalUnitRows, readCatalogSnapshot: getSourceSnapshot,
+    loadCatalogPayload: getSourceSnapshotPayload, readOliSkuAsinResolution: getOliSkuAsinResolutionRows,
+    readDirectory: getAccountDirectorySnapshotAccounts,
+  };
+  const ev = await gatherReturnsEvidence({ accountId, organizationFingerprint: orgFp, connectionId: "primary", asOf: to }, readers).catch(() => null);
+  if (!ev || ev.notReady || !ev.payload) {
     if (stored && stored.payload) { serveStored(stored, { updating: true }); return; }
-    res.status(200).json({ snapshotMissing: true, updating: true, reportKey, reportVersion, accountId, message: `${label} is being prepared from saved data — no export is created.` });
+    res.status(200).json({ snapshotMissing: true, reportKey, reportVersion, accountId, waitingForScheduledData: true, message: `No saved ${label} for this account yet — waiting for the scheduled data refresh.` });
     return;
   }
-  try {
-    const readers = {
-      readReturnsHistory: getReturnsHistoryRows, readSettlementHistory: getSettlementHistoryRows,
-      readOliHistory: getSourceOliHistoryRows, readOliCoverage: getSourceCoverageWindows,
-      readOliOperationalUnits: getSourceOliOperationalUnitRows, readCatalogSnapshot: getSourceSnapshot,
-      loadCatalogPayload: getSourceSnapshotPayload, readOliSkuAsinResolution: getOliSkuAsinResolutionRows,
-      readDirectory: getAccountDirectorySnapshotAccounts,
-    };
-    const ev = await gatherReturnsEvidence({ accountId, organizationFingerprint: orgFp, connectionId: "primary", asOf: to }, readers).catch(() => null);
-    if (!ev || ev.notReady || !ev.payload) {
-      if (stored && stored.payload) { serveStored(stored, { updating: true }); return; }
-      res.status(200).json({ snapshotMissing: true, reportKey, reportVersion, accountId, waitingForScheduledData: true, message: `No saved ${label} for this account yet — waiting for the scheduled data refresh.` });
-      return;
-    }
-    const publishedHash = paramsHashFor(reportVersion, { to });
-    const payloadBytes = Buffer.byteLength(JSON.stringify(ev.payload), "utf8");
-    const saved = await saveReportSnapshot({
-      reportKey, accountId, paramsHash: publishedHash, params: { reportVersion, to },
-      payload: ev.payload, payloadBytes, sourceRefreshedAt: ev.sourceRefreshedAt || new Date().toISOString(),
-    }).catch(() => null);
-    if (saved && saved.id) await publishSnapshotUpdate({ reportKey, accountId, paramsHash: publishedHash, snapshotId: saved.id }).catch(() => {});
-    res.status(200).json({
-      ...scopeProject(ev.payload), reportKey, reportVersion, paramsHash: publishedHash,
-      snapshot: { savedAt: ev.sourceRefreshedAt || null, updatedAt: new Date().toISOString(), shared: true },
-    });
-  } finally {
-    await releaseRefreshLock({ reportKey, accountId, paramsHash: lockHash }).catch(() => {});
-  }
+  res.status(200).json({
+    ...scopeProject(ev.payload), reportKey, reportVersion, paramsHash: paramsHashFor(reportVersion, { to }),
+    snapshot: { savedAt: ev.sourceRefreshedAt || null, updatedAt: null, shared: true, rederived: true, readOnly: true },
+  });
 }
 
 const SKU_MOVEMENT_OLI_SOURCE_KEY = "order-line-items";
@@ -1161,16 +1132,11 @@ async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, co
     return;
   }
 
-  // Evidence advanced (or nothing stored yet) -> re-derive from saved OLI + Catalog under a per-(account,brand) lock.
-  // ZERO DataDoe. One re-derive serves concurrent readers; the rest serve the stored snapshot (labelled updating).
-  const lockHash = paramsHashFor(reportVersion, { brand: brandScope.brand, selfHeal: "sku-movement" });
-  const locked = await claimRefreshLock({ reportKey, accountId, paramsHash: lockHash, lockSeconds: 300 }).catch(() => false);
-  if (!locked) {
-    if (stored && stored.payload) { await serveStored(stored, { updating: true }); return; }
-    res.status(200).json({ snapshotMissing: true, updating: true, reportKey, reportVersion, accountId, message: `${label} is being prepared from saved data — no export is created.` });
-    return;
-  }
-  try {
+  // PHASE 3 READ-ONLY GET: evidence advanced (or nothing stored yet) -> re-derive from saved OLI + Catalog and SERVE
+  // it, but NEVER lock, persist, or publish. ZERO DataDoe. The regional scheduler materializer owns the snapshot; a
+  // page load / reload / account-change / brand-change performs zero backend mutations. On a not-ready derive, serve
+  // the stored last-known-good (labelled updating) or the honest waiting state -- never a write, never a fabrication.
+  {
     const derived = await rederiveSkuMovement({ accountId, brand, organizationFingerprint: orgFp, connectionId: "primary", ceiling }, readers);
     if (!derived || derived.notReady || !derived.payload) {
       if (stored && stored.payload) { await serveStored(stored, { updating: true }); return; }
@@ -1183,22 +1149,12 @@ async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, co
     }
     const publishedParams = { asOf: derived.effectiveParams.asOf, brand: brandScope.brand };
     const publishedHash = paramsHashFor(reportVersion, publishedParams);
-    const payloadBytes = Buffer.byteLength(JSON.stringify(derived.payload), "utf8");
-    const saved = await saveReportSnapshot({
-      reportKey, accountId, paramsHash: publishedHash,
-      params: { reportVersion, ...publishedParams },
-      payload: derived.payload, payloadBytes,
-      sourceRefreshedAt: derived.sourceRefreshedAt || new Date().toISOString(),
-    }).catch(() => null);
-    if (saved && saved.id) await publishSnapshotUpdate({ reportKey, accountId, paramsHash: publishedHash, snapshotId: saved.id }).catch(() => {});
     const extraAug = await augment({ accountId, params, payload: derived.payload }).catch(() => ({}));
     res.status(200).json({
       ...withIdentifiers(derived.payload), reportKey, reportVersion, paramsHash: publishedHash,
       ...(extraAug && typeof extraAug === "object" ? extraAug : {}),
-      snapshot: { savedAt: derived.sourceRefreshedAt || new Date().toISOString(), updatedAt: null, shared: true, rebuilt: true },
+      snapshot: { savedAt: derived.sourceRefreshedAt || null, updatedAt: null, shared: true, rederived: true, readOnly: true },
     });
-  } finally {
-    await releaseRefreshLock({ reportKey, accountId, paramsHash: lockHash }).catch(() => {});
   }
 }
 
@@ -1677,21 +1633,12 @@ async function brandViewDirectory(accountId, { rebuild = false } = {}) {
       };
     }
   }
+  // PHASE 3 READ-ONLY GET: build the directory read-only from ALREADY-DURABLE brand-source membership and return it
+  // WITHOUT persisting. The regional scheduler materializer owns the stored brand-view-brands snapshot; a page load or
+  // an explicit reload never writes. The build always reflects current brand-sales membership, so a newly-recorded
+  // brand still appears (from the durable evidence) without a page-open write.
   const payload = await buildBrandViewBrandDirectory({ accountId, getSnapshot: getLatestReportSnapshot });
-  const saved = await saveReportSnapshot({
-    reportKey: BRAND_VIEW_BRANDS_REPORT_KEY,
-    accountId,
-    paramsHash,
-    params: { reportVersion: BRAND_VIEW_BRANDS_VERSION, accountId },
-    payload,
-    payloadBytes: Buffer.byteLength(JSON.stringify(payload), "utf8"),
-    sourceRefreshedAt: new Date().toISOString(),
-  }).catch(() => null);
-  return {
-    payload,
-    savedAt: saved?.source_refreshed_at || new Date().toISOString(),
-    shared: Boolean(saved),
-  };
+  return { payload, savedAt: null, shared: false, rederived: true };
 }
 
 // The first dashboard reports predate the shared snapshot layer. Keep their
