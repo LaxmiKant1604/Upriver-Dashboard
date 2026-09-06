@@ -14725,3 +14725,62 @@ SCOPE per review: Phase 2 ONLY. Phase 3 (move the 5 self-heal derivations into t
 zero-export) and Phases 5-6 remain deferred. Reelleo/dd-secondary + the 11 unowned reports need a separate,
 approval-gated recovery/export plan (+ the secondary key + campaign mappings). UI flag LISTING_HEALTH_V3 stays OFF.
 Do NOT claim the dashboard-wide gap "permanently fixed" -- only the structural-prevention guard is in place so far.
+
+========================================================================================================================
+DASHBOARD MATERIALIZATION -- PHASE 3, INCREMENT 1 (LIVE 2026-09-06; commit a89df4c pushed to main, Vercel Ready;
+verify 155/155 incl. build:check; api/*.js still 12; UI flag LISTING_HEALTH_V3 stays false; ZERO DataDoe exports/tokens)
+========================================================================================================================
+GOAL: move report materialization OFF the browser read path INTO the regional scheduler, and make the browser
+auto-converge read-only. Delivered as a SAFE, ADDITIVE increment (no serve formula/behavior change; the existing
+zero-export self-heal stays only as a rare fallback the scheduler now pre-empts).
+
+SHIPPED
+- lib/server/sync/report-materialization-operation.js: PURE, injectable, zero-export operator. For each region's
+  primary accounts it derives the reports that today self-heal on a GET -- brand-view-brands, sku-movement (ALL + each
+  named brand), returns-leakage -- reusing the SAME standalone derives the serve uses (rederiveSkuMovement,
+  gatherReturnsEvidence, buildBrandViewBrandDirectory) and upserts each snapshot under the EXACT serve identity
+  (paramsHashFor + the real report version). HONEST + LKG-preserving (not-ready => no write, never fabricated);
+  per-(account,report) INDEPENDENT (one failure never blocks the rest); IDEMPOTENT (same-evidence re-run + watchdog
+  replay write nothing -- merge-upsert on report_key+account_id+params_hash); ISOLATED by identity.
+- lib/server/sync/report-materialization-composition.js: trusted wiring (no DataDoe adapter, no export cache, no
+  cycle/budget -- structurally cannot spend a token); region-scopes primary accounts via accountInScope.
+- scripts/release/report-materialization.mjs: region runner (dry-run default; --mode=live upserts; fails on any
+  non-zero token count). NOTE: uses DYNAMIC imports after loadReleaseEnv() because lib/server/supabase.js reads
+  SUPABASE_URL + the service key at MODULE-EVAL time and static ESM imports hoist above loadReleaseEnv() (CI already
+  has env in process.env so static would work there, but the local backfill needs the ordering).
+- .github/workflows/scheduler-v2.yml: additive `materialize` job -- needs ONLY [run] (NOT fba, so an FBA failure never
+  blocks sales/returns reports), if:always on a resolved region, --as-of = the shared inventory_asof. No export CLI /
+  cron / dispatch; never touches the ingestion gate or the UI flag.
+- src/views/BrandView.jsx + BrandPortfolio.jsx: the `updating` auto-converge effects now POLL read-only (loadReport)
+  instead of calling the WRITE endpoint (refreshReport). The scheduler republishes; the bounded poll converges with no
+  page-open write. The explicit Refresh button stays the ONLY rebuild path, and only on a real click.
+- report-materialization-registry.js: guard strengthened -- new clientOpenTriggeredWrite field (false for EVERY report
+  now the two auto-converge effects are read-only) + owner/serve-mode/write-flag consistency + a SHRINKING
+  grandfathered allowlist (pageOpenWrite:true set MUST EQUAL PAGE_OPEN_WRITE_GRANDFATHERED = the 5 known self-heal
+  reports; NO report may declare a client-open write). A NEW report is structurally blocked from any browser-triggered
+  write.
+
+TESTS (registered; verify 155/155): report-materialization-operation.test.js (27: zero-token, exact identity, LKG,
+independence, idempotent replay, per-brand isolation, dry-run, prefixed-skip, locked-skip); brand-view-readonly.test.js
+(11: static invariant on both views + a REAL react-test-renderer mount of BrandPortfolio proving auto-converge never
+calls refreshReport and polls read-only); report-materialization-registry.test.js (26, +8 negative future-report
+cases); scheduler-v2-lhv3-workflow.test.js (29, +7 for the materialize job).
+
+LIVE BACKFILL (2026-09-06, zero-export, all 3 regions): india 69 materialized (replay => 69 unchanged, 0 writes =
+idempotency proven against real prod); europe-au 66 materialized + 2 unchanged + 3 returns HONESTLY unavailable (no
+durable returns history => LKG preserved, not fabricated); us-ca 55 materialized + 1 unchanged + 3 unavailable. ~190
+snapshots, 0 errors, 0 tokens across 35 accounts. So the durable reports are now materialized BEFORE page access.
+
+WHY GETs are read-only in steady state now (even before Increment 2 removes the self-heal writes): once a snapshot
+exists, the serve fast-paths serve it WITHOUT writing -- returns serves stored on any non-refresh read; sku serves
+stored when source_refreshed_at + effectiveAsOf match (the operator writes the SAME skuMovementRefreshedAt the serve
+probes); brand-view-brands returns the saved directory without rebuilding. The self-heal write now fires only on a
+genuine miss/stale, which the scheduler/backfill pre-empts.
+
+DEFERRED to INCREMENT 2 (natural-run-gated): strictly remove the 5 self-heal GET writes (daily selfHealFromDurable +
+the 4 serveSelfHealing* saves) so a miss serves waiting/LKG only; add daily named-brand + brand-directory + the
+brand-view REPORT to the operator (daily needs dynamic-window handling + its brand builders are still module-local in
+api/datadoe.js); then shrink PAGE_OPEN_WRITE_GRANDFATHERED toward empty. Do NOT claim "permanently fixed": the NATURAL
+scheduler materialize job (next regional crons -- india 03:00 / europe-au 08:30 / us-ca 16:30 UTC) has NOT yet been
+OBSERVED producing snapshots before page access; that observation is the remaining gate. Reelleo/dd-secondary + the 11
+unowned reports remain the separate approval-gated recovery (secondary key + exports + campaign mappings).
