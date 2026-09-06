@@ -14835,3 +14835,57 @@ no post-deploy page-open writes seen). (2) The fx-rates GET (saveFxSnapshot) is 
 (exchange rates), staleness-gated, NOT a report snapshot + NOT in the mission's enumerated 5 -- left as-is (making it
 read-only needs its own scheduler owner or rates go stale); flagged, not fixed. (3) Reelleo/dd-secondary + the 11
 unowned reports remain the separate approval-gated recovery.
+
+========================================================================================================================
+DASHBOARD MATERIALIZATION -- PHASE 3 COMPLETION (LIVE 2026-09-06; commit b542a77 on main, Vercel Ready; verify 158/158
+incl. build:check; api/*.js=12; UI flag LISTING_HEALTH_V3 stays false; ZERO DataDoe exports/tokens)
+========================================================================================================================
+DEFECT (reproduced first): brand-view + brand-view-portfolio serve via deferRebuildOnRead with NO backend producer, so a
+missing/stale exact-identity snapshot returned updating=true and the read-only poll NEVER converged until a manual
+Refresh. Proven: operator owned only [brand-view-brands, sku-movement, returns-leakage]; a portfolio serve with no
+snapshot returned updating 4/4 polls, build()=0, writes=0. This was a missing producer, NOT a GET-write issue.
+
+FIX: a scheduler-owned Brand View producer.
+- lib/server/sync/report-materialization-core.js: the shared idempotent/LKG/isolated/zero-write-on-dry-run upsert,
+  EXTRACTED from the Increment-1 operator so both materializers share ONE definition (Increment-1 operator now imports
+  it; its 27 tests unchanged + green).
+- report-materialization-brandview-operation.js + -composition.js + scripts/release/report-materialization-brandview.mjs:
+  the FBA-aware Brand View materializer. Reuses the EXACT serve builders (buildBrandViewSnapshot /
+  buildBrandViewPortfolioSnapshot) + readers, publishing the EXACT serve identities: brand-view per (account,brand) at
+  {accountId,brand,asOf=marketplaceToday(country)} scope brandViewScopeId; brand-view-portfolio per (region,brand) over
+  the CANONICAL set accountsForBrand(brand-sales membership) intersect region, at {sortedAccountIds,brand,
+  asOf=marketplaceToday("IN"),region} scope brandViewPortfolioScopeId. Provenance = newest brand-sales provenance (the
+  SAME value the serve's contributingProvenanceAt compares) so a converged read is not flagged stale + a source advance
+  re-flags updating until the next scheduled publish. FBA unavailable -> fbaAvailable:null (honest); missing Ads maps ->
+  adsAvailable:false. ZERO DataDoe (no adapter). AUTHORIZATION: only the canonical set is materialized; a restricted user's
+  subset is a different scope id (never served the canonical LKG; assertAccountAccess gates it) -> no unauthorized precompute.
+- scheduler-v2.yml: a SECOND materialization job `materialize-inventory` needs:[run, fba, materialize], if: always() so it
+  runs EVEN WHEN FBA FAILS (publishing sales/Ads with FBA honestly unavailable), never gating on needs.fba.result. No new
+  cron / ingestion gate / UI flag. (Daily named-brand + Brand Directory intentionally stay Increment-2 read-only-derive/
+  rebuild -- they already converge on serve; Daily's browser to=TODAY can never exact-match a clamped snapshot so a
+  materialized copy would be staler than the read-only derive, and Brand Directory's per-authorized-selection identity
+  can't be pre-materialized; both keep their TRUTHFUL serve owners, serve:derive-durable not relabelled.)
+- Registry: brand-view + brand-view-portfolio owner -> "scheduler-v2:materialize" (pageOpenWrite/clientOpenTriggeredWrite
+  stay false; allowlist stays []). NEW report-materialization-coverage.test.js: every scheduler-v2:materialize entry is
+  owned by exactly one operator + every operator report is so declared (sets equal + disjoint) -> a future report cannot
+  claim scheduler materialization without a real producer.
+- Fixed 2 misleading comments that said the frontend triggers the rebuild.
+
+TESTS (verify 158/158): report-brandview-materialization.test.js (19: reproduce-then-fix convergence via the REAL
+serveSharedReport read + zero-token/dry-run/replay/LKG/isolation/independence/concurrency), report-materialization-coverage
+(14), scheduler-v2-lhv3-workflow (36, +7 for the new job), report-materialization-operation (27, unchanged post-extraction).
+
+LIVE BACKFILL DONE all 3 regions (zero export): india 75 materialized (45 brand-view + 30 portfolio), europe-au 31
+(22+9, +1 brand-view honestly unavailable/LKG kept), us-ca 42 (26+16) = 148 materialized, 1 unavailable, 0 error, 0
+tokens across 45 accounts. DB verified: 0 duplicate natural keys; brand-view 94 rows, brand-view-portfolio 121 rows; a
+sampled portfolio row is at the EXACT serve identity (account_id "brand-view-portfolio:<id>::SASHAA WORLD", params
+{accountIds,asOf,brand,region,reportVersion}, region us-ca, asOf 2026-09-06, real brand-sales source_refreshed_at). So
+the brand-view + portfolio pages CONVERGE now from the backfill-produced snapshots (the SAME operator the scheduled job
+runs), and the reproduce-then-fix test proves the REAL serveSharedReport read converges after the producer publishes.
+
+PENDING (do NOT claim fully complete until observed): the NATURAL materialize-inventory CRON firing + producing portfolio
+snapshots before page access (the job is wired/tested/deployed + byte-identical to the backfilled operator, and the base
+materialize job was already observed on the Increment-1 europe-au watchdog, but this NEW job's cron trigger is not yet
+observed); and an AUTHENTICATED page check (needs a user session token, not available in-session) proving the portfolio
+current with no Refresh + no GET write. Increment-2 items (authenticated audit, fx-rates provider-cache) still stand;
+Reelleo/dd-secondary + 11 unowned reports remain the separate approval-gated recovery.
