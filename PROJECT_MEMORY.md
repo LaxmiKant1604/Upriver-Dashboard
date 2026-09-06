@@ -14784,3 +14784,54 @@ api/datadoe.js); then shrink PAGE_OPEN_WRITE_GRANDFATHERED toward empty. Do NOT 
 scheduler materialize job (next regional crons -- india 03:00 / europe-au 08:30 / us-ca 16:30 UTC) has NOT yet been
 OBSERVED producing snapshots before page access; that observation is the remaining gate. Reelleo/dd-secondary + the 11
 unowned reports remain the separate approval-gated recovery (secondary key + exports + campaign mappings).
+
+INCREMENT 1 VERIFIED IN PRODUCTION (2026-09-06): scheduler-v2 run 34022987039 (a Cloudflare WATCHDOG workflow_dispatch
+for europe-au, NOT the primary schedule) reached terminal with materialize SUCCESS: 16 accounts, 68 materialized (16
+brand-view-brands + 39 sku-movement + 13 returns-leakage), 3 returns HONESTLY unavailable (LKG kept), tokens 0. DB: 0
+duplicate natural keys; single-region scope. This natural run also validated the runner's DYNAMIC-import fix -- in CI
+the SUPABASE_URL secret is empty and env-bootstrap maps it from VITE_SUPABASE_URL, which only works because
+loadReleaseEnv() runs before supabase.js evaluates (static imports would have failed in CI too).
+
+========================================================================================================================
+DASHBOARD MATERIALIZATION -- PHASE 3, INCREMENT 2 (LIVE 2026-09-06; commit 049548e on main, Vercel Ready; verify
+156/156 incl. build:check; api/*.js=12; UI flag LISTING_HEALTH_V3 stays false; ZERO DataDoe exports/tokens)
+========================================================================================================================
+Removed EVERY remaining plain-GET snapshot write. Opening / loading / focusing / polling / switching account/brand/
+region / hitting a cache miss now performs ZERO backend mutations. The scheduler owns materialization; a read serves the
+durable snapshot or, on a miss/stale identity, DERIVES READ-ONLY from durable evidence -- never a write, lock, publish,
+enqueue, or DataDoe call. NOTE: Increment 2 touched ONLY the serve paths + the registry + tests -- the Increment-1
+operator/composition/runner and the scheduler `materialize` job are BYTE-IDENTICAL (so the next natural materialize run
+behaves exactly as the observed europe-au run; nothing new to observe about the scheduler).
+
+FIVE GET WRITE PATHS -> READ-ONLY:
+- daily: lib/server/report-store.js selfHealFromDurable gained a readOnly mode (derive + serve, NO claimRefreshLock /
+  saveReportSnapshot / publishSnapshotUpdate); serveSharedReport's THREE read-path self-heal calls all pass
+  readOnly:true. ALL-brand Daily is served from the priority-path snapshot (exact identity); a named-brand read derives
+  read-only. The refresh=1 DataDoe path is UNTOUCHED (explicit, click-only).
+- sku-movement (serveSelfHealingSkuMovement), returns-leakage (serveSelfHealingReturns), brand-view-brands
+  (brandViewDirectory), brand-directory (serveSelfHealingBrandDirectory): removed the lock/save/publish; serve stored
+  when current, else derive/build READ-ONLY from durable evidence. brand-directory being read-only ELIMINATES the
+  cross-region-overwrite concern by construction (a read never writes). returns stamps the SOURCE provenance (not the
+  read time) so stale Returns is never marked fresh.
+
+REGISTRY/GUARD (report-materialization-registry.js): PAGE_OPEN_WRITE_GRANDFATHERED is now []; every entry
+pageOpenWrite=false + clientOpenTriggeredWrite=false. The 5 moved to serveMode "read-snapshot-or-derive" +
+materializationOwner "scheduler-v2:materialize" (sku/returns/brand-view-brands) / "scheduler-v2:priority" (daily) /
+"serve:derive-durable" (brand-directory). REMOVED the "self-heal-write-on-read" serve mode + the "serve:self-heal" owner
+from the vocabularies. The guard now FAILS if ANY report declares a page-open or client-open write, or reintroduces the
+removed serve mode -- a future report is structurally blocked from any browser-triggered write. `grandfathered` is an
+injectable validator param (for the lockstep test).
+
+TESTS: report-readonly-serve.test.js (17: instrumented-store proof that selfHealFromDurable readOnly derives+serves with
+ZERO lock/save/publish across miss/clamped/not-ready/throwing + the legacy persist path still writes; static proof the
+4 datadoe serves have NO write call + every serveSharedReport self-heal call is readOnly:true); daily-v2-serving.test.js
+(15, UPDATED: missing/stale/mapping-rev/concurrent named-brand reads now prove ZERO writes + ZERO locks, served
+read-only); report-materialization-registry.test.js (28, Phase-3 end state + negative future-report cases).
+
+REMAINING (honest): (1) an AUTHENTICATED production page-read write-audit -- the read-only property is PROVEN by the
+instrumented tests + deployed, but an end-to-end authenticated GET check needs a user session token (not available
+in-session); post-deploy DB baseline captured (all 5 families' last write <= 09:05 UTC, before the ~10:01 UTC deploy --
+no post-deploy page-open writes seen). (2) The fx-rates GET (saveFxSnapshot) is a SHARED provider-rate cache
+(exchange rates), staleness-gated, NOT a report snapshot + NOT in the mission's enumerated 5 -- left as-is (making it
+read-only needs its own scheduler owner or rates go stale); flagged, not fixed. (3) Reelleo/dd-secondary + the 11
+unowned reports remain the separate approval-gated recovery.
