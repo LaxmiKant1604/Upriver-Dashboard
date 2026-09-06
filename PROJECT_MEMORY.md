@@ -14656,3 +14656,32 @@ v3 stops ingesting; UI = LISTING_HEALTH_V3 stays false (already off). NATURAL-CY
 already ran PRE-deploy (old workflow, no v3). First v3 shadow run = europe-au today 08:30 UTC, then us-ca 16:30 UTC,
 then india next day 03:00 UTC. ROLLOUT NOT COMPLETE until all three natural runs are observed (expected 16 exports /
 ~32 tokens per day total; row-based billing may vary). Do NOT manually trigger -- let the natural windows run.
+
+================================================================================
+2026-09-06 -- LISTING HEALTH v3 P1 FIX: inventory adoptability is now a PRE-CREATE gate (commit 6f6813f). No natural v3 run occurred before the fix.
+================================================================================
+P1 ORDERING DEFECT (in the just-deployed shadow scheduler): runListingHealthV3Ingestion called runSources -- which
+opens the v3 cycle + creates paid Listings/Listings-Raw exports -- BEFORE the cost.inventoryAdoptable deferral. Because
+the FBA job can report success while ONE regional account lacks adoptable inventory (a PARTIAL FBA cycle), a live v3 run
+could open a cycle + spend tokens and only THEN discover inventory was unavailable.
+
+FIX (6f6813f): for LIVE mode, check cost.inventoryAdoptable IMMEDIATELY after cost + ceiling validation and BEFORE the
+balance check, runSources, openCycle/persistBudget, any reservation/POST, materialize, reports, finalize. Non-adoptable
+=> typed deferred-inventory, ok:false, creates=0/tokens=0/snapshots=0, NO v3 cycle opened. The obsolete late gate is
+replaced by an UNREACHABLE invariant assertion (guards against a future re-ordering). Preserved: dry-run (reports
+adoptability + planned cost, zero writes), the terminal-succeeded finalize gate + false-green protections, replay
+(already-terminal succeeded = zero-create success), ceilings, shared inventory_asof, the identity guard, LKG.
+
+Tests (+1 new; verify 152/152): report-listing-health-v3-preflight-defer proves the FBA-success-but-one-account-
+unadoptable scenario defers with runSources/openCycle/persistBudget/reserveExportCreate/create/materialize/runReports/
+finalizeCycle ALL 0, creates=tokens=snapshots=0, no running cycle; then proceeds normally once adoptable; replay
+unchanged; dry-run preserved. -operation(G)/-finalize(F) updated to the pre-create deferral. verify 152/152; git diff
+--check clean.
+
+NATURAL-CYCLE STATUS (checked honestly via gh, read-only, no dispatch): NO natural v3 workflow ran before this
+corrective deploy. Timeline UTC 2026-09-06: enablement 8afd81a committed 05:37; today's india cron/watchdog completed
+03:20 (PRE-enablement -> OLD workflow, no v3 job); P1 fix 6f6813f committed 05:59:46 -> origin/main==6f6813f. The FIRST
+natural v3 window is europe-au 08:30 UTC, which will check out main (6f6813f) and run WITH the P1 fix already in place.
+So there is NO defective v3 run to remediate; no replacement run was created. UI flag LISTING_HEALTH_V3 stays OFF;
+api/*.js=12; zero DataDoe exports/tokens. ROLLOUT still NOT complete until the 3 natural runs (europe-au 08:30, us-ca
+16:30, india next-day 03:00 UTC) are observed. Expected ~16 exports/~32 tokens/day (row-based billing may vary).
