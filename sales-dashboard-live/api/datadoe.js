@@ -2814,7 +2814,9 @@ async function handleDataDoe(req, res) {
 
       const accountMeta = await sharedAccountMetadata(accountId);
       // Freshness: if this account's brand-sales advanced past the assembled single-account Brand View, the read
-      // serves it NOW and flags `updating` so the frontend triggers the (cheap, one-account) zero-export rebuild.
+      // serves the last-known-good NOW and flags `updating`. The read is READ-ONLY (Phase 3): the scheduler's FBA-aware
+      // Brand View materializer republishes the fresh snapshot, and the frontend's bounded READ-ONLY poll converges on
+      // it with no page-open write and no user Refresh.
       const singleProvenanceAt = await getLatestSourceProvenance({ reportKey: BRAND_SALES_REPORT_KEY, accountIds: [accountId] }).catch(() => null);
       await serveSharedReport({
         res,
@@ -2914,8 +2916,10 @@ async function handleDataDoe(req, res) {
         return Array.isArray(payload) ? payload : (payload && Array.isArray(payload.rows) ? payload.rows : null);
       } : null;
       // Freshness: the newest brand-sales provenance across the contributing accounts. When the assembled Brand
-      // View is older than this (sources advanced 21 -> 25 Aug), the read serves the last-known-good NOW and
-      // flags `updating` so the frontend triggers the zero-export rebuild -- never a stale-forever cache.
+      // View is older than this (sources advanced 21 -> 25 Aug), the read serves the last-known-good NOW and flags
+      // `updating`. The read is READ-ONLY (Phase 3): the scheduler's FBA-aware Brand View materializer republishes the
+      // fresh portfolio snapshot and the frontend's bounded READ-ONLY poll converges on it -- never a page-open write,
+      // never a stale-forever cache, never a required user Refresh.
       const portfolioProvenanceAt = await getLatestSourceProvenance({ reportKey: BRAND_SALES_REPORT_KEY, accountIds }).catch(() => null);
       // A refresh (rebuild) is bounded by the serverless budget: a slow multi-account rebuild returns typed
       // "updating" before the deadline (LKG served meanwhile) instead of a 504. Reads never build (deferred).

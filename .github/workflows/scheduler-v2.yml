@@ -390,3 +390,47 @@ jobs:
       # clamps down to each account's latest proven date, so no future or fabricated data can ever be materialized.
       - name: Materialize durable reports for this region (zero export; idempotent upsert)
         run: node scripts/release/report-materialization.mjs --region=${{ needs.run.outputs.region }} --mode=live --as-of=${{ needs.run.outputs.inventory_asof }}
+
+  # FBA-aware Brand View materialization -- the BACKEND PRODUCER for brand-view + brand-view-portfolio (which serve via
+  # deferRebuildOnRead and previously never converged without a manual Refresh). It depends on [run, fba, materialize]
+  # so it runs AFTER the priority `run` (publishes brand-inventory), the `fba` job (publishes fba-plan), and the base
+  # `materialize` (publishes brand-view-brands, its single-view brand list). `if: always()` -- it runs even when FBA
+  # FAILS, publishing sales/Ads with FBA honestly unavailable (fbaAvailable:null, never a fabricated zero); it never
+  # depends on needs.fba.result. ZERO DataDoe (no adapter); the runner fails on any non-zero token. It reuses the exact
+  # serve builders + identities, so a natural run converges the pages with no user interaction.
+  materialize-inventory:
+    needs: [run, fba, materialize]
+    if: always() && needs.run.outputs.region != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      PRIORITY_OPERATOR: laxmikant@superboring.in
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Verify required secrets are present (fail fast, never print values)
+        run: |
+          set -uo pipefail
+          missing=""
+          for v in POSTGRES_URL SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY; do
+            if [ -z "${!v:-}" ]; then missing="$missing $v"; fi
+          done
+          if [ -z "${SUPABASE_URL:-}" ] && [ -z "${VITE_SUPABASE_URL:-}" ]; then missing="$missing SUPABASE_URL|VITE_SUPABASE_URL"; fi
+          if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
+          echo "All required secrets present."
+      - name: Install dependencies
+        run: npm ci
+      # Brand View asOf is derived per the serve (single: marketplaceToday(account.country); portfolio:
+      # marketplaceToday("IN")); no --as-of override. Zero export; converges brand-view + brand-view-portfolio.
+      - name: Materialize Brand View + Portfolio for this region (zero export; idempotent upsert)
+        run: node scripts/release/report-materialization-brandview.mjs --region=${{ needs.run.outputs.region }} --mode=live

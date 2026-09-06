@@ -31,8 +31,13 @@ const matIdx = wf.indexOf("\n  materialize:");
 const v3End = matCommentIdx > v3Idx ? matCommentIdx : (matIdx > v3Idx ? matIdx : wf.length);
 const v3Job = wf.slice(v3Idx, v3End);
 const beforeV3 = wf.slice(0, v3Idx); // run + fba jobs
-// The zero-export report materialization job (added after the v3 job). From its key to end-of-file (it is the last job).
-const matJob = matIdx > 0 ? wf.slice(matIdx) : "";
+// The zero-export per-account report materialization job, bounded at the START of the FBA-aware brand-view block.
+const matInvCommentIdx = wf.indexOf("\n  # FBA-aware Brand View materialization");
+const matInvIdx = wf.indexOf("\n  materialize-inventory:");
+const matEnd = matInvCommentIdx > matIdx ? matInvCommentIdx : (matInvIdx > matIdx ? matInvIdx : wf.length);
+const matJob = matIdx > 0 ? wf.slice(matIdx, matEnd) : "";
+// The FBA-aware Brand View materialization job (the missing backend producer for brand-view + brand-view-portfolio).
+const matInvJob = matInvIdx > 0 ? wf.slice(matInvIdx) : "";
 
 /* ===================== A. dependency order + gate ===================== */
 ok("A: the v3 job needs BOTH run and fba", /needs:\s*\[run,\s*fba\]/.test(v3Job));
@@ -74,5 +79,16 @@ ok("F: materialize invokes the zero-export report-materialization CLI in live mo
 ok("F: materialize passes the SHARED inventory_asof ceiling (never recomputes UTC today)", /report-materialization\.mjs[^\n]*--as-of=\$\{\{\s*needs\.run\.outputs\.inventory_asof\s*\}\}/.test(matJob) && !/date -u/.test(matJob));
 ok("F: materialize creates NO DataDoe export CLI / cron / dispatch (it never spends a token)", !/ingestion\.mjs|fba-plan-golive\.mjs|cron:|schedule:|workflow_dispatch:/.test(matJob));
 ok("F: materialize does NOT enable the ingestion gate or flip the UI flag", !/LISTING_HEALTH_V3_INGESTION_ENABLED/.test(matJob) && !/LISTING_HEALTH_V3\s*:/.test(matJob));
+
+/* ===================== G. the FBA-aware Brand View materialization job (Phase 3 Completion) ===================== */
+ok("G: a materialize-inventory job exists", matInvJob.length > 0 && /^\s{2}materialize-inventory:\s*$/m.test(matInvJob));
+ok("G: it depends on [run, fba, materialize] (runs AFTER inventory + the base materializer)", /needs:\s*\[run,\s*fba,\s*materialize\]/.test(matInvJob));
+ok("G: it runs if:always on a resolved region and NEVER gates on fba success (so an FBA failure still publishes sales/Ads)",
+  /if:\s*always\(\)\s*&&\s*needs\.run\.outputs\.region\s*!=\s*''/.test(matInvJob) && !/needs\.fba\.result/.test(matInvJob));
+ok("G: it invokes the zero-export Brand View materializer CLI in live mode for the region",
+  /report-materialization-brandview\.mjs[^\n]*--mode=live/.test(matInvJob) && /report-materialization-brandview\.mjs[^\n]*--region=\$\{\{\s*needs\.run\.outputs\.region\s*\}\}/.test(matInvJob));
+ok("G: it creates NO DataDoe export CLI / cron / dispatch (never spends a token)", !/ingestion\.mjs|fba-plan-golive\.mjs|cron:|schedule:|workflow_dispatch:/.test(matInvJob));
+ok("G: it does NOT enable the ingestion gate or flip the UI flag", !/LISTING_HEALTH_V3_INGESTION_ENABLED/.test(matInvJob) && !/LISTING_HEALTH_V3\s*:/.test(matInvJob));
+ok("G: it recomputes NO date (Brand View asOf is derived from marketplaceToday, not a workflow date)", !/date -u/.test(matInvJob));
 
 writeSync(1, `\nscheduler-v2-lhv3-workflow: ${passed} assertions passed\n`);

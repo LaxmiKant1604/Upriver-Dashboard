@@ -34,10 +34,12 @@
 // The core is PURE: identity helpers are imported (no I/O), and every derive / read / write / lock / clock is an
 // injected collaborator, so the zero-export + isolation + idempotency contract is provable offline.
 
-import { paramsHashFor } from "../report-store.js";
 import { RETURNS_ADVANCED_VERSION } from "../reports/returns-advanced.js";
 import { SKU_MOVEMENT_VERSION } from "../reports/sku-movement-backfill.js";
 import { BRAND_VIEW_BRANDS_REPORT_KEY, BRAND_VIEW_BRANDS_VERSION } from "../reports/brand-view.js";
+import { materializeSnapshot, runUnit as runUnitCore, summarize } from "./report-materialization-core.js";
+
+export { summarize };
 
 export const SKU_MOVEMENT_REPORT_KEY = "sku-movement";
 export const RETURNS_REPORT_KEY = "returns-leakage";
@@ -102,65 +104,11 @@ export async function runReportMaterialization(
   const events = [];
   const push = (ev) => { events.push(ev); return ev; };
 
-  // Idempotent, LKG-preserving materialization of ONE snapshot identity from an already-derived result. A derive
-  // that is not ready writes nothing (preserving the LKG) and is reported unavailable; an unchanged snapshot (same
-  // identity + same source provenance already stored) is skipped; otherwise the payload is upserted under the exact
-  // identity. NEVER writes on dryRun. Isolated: any collaborator throw is caught by the caller's per-unit try/catch.
-  const materializeOne = async ({ reportKey, reportVersion, accountId, params, scopeLabel, derived }) => {
-    if (!derived || derived.notReady || !derived.payload) {
-      return {
-        report: reportKey, account: accountId, scope: scopeLabel, status: "unavailable",
-        preservedLkg: true, tokens: 0,
-        blockedBy: (derived && derived.blockedBy) || (derived && derived.notReady ? [{ reason: String(derived.notReady) }] : []),
-      };
-    }
-    const paramsHash = paramsHashFor(reportVersion, params);
-    const sourceRefreshedAt = derived.sourceRefreshedAt || null;
-    if (dryRun) {
-      return { report: reportKey, account: accountId, scope: scopeLabel, status: "planned", paramsHash, sourceRefreshedAt, tokens: 0 };
-    }
-    // Cheap idempotency probe: the exact identity is already stored with the same (or newer) source provenance ->
-    // nothing to do. A replay / watchdog / overlapping run lands here and writes nothing.
-    if (typeof readSnapshot === "function") {
-      const existing = await readSnapshot({ reportKey, accountId, paramsHash });
-      if (existing && existing.payload && sourceRefreshedAt
-          && String(existing.source_refreshed_at || "") === String(sourceRefreshedAt)) {
-        return { report: reportKey, account: accountId, scope: scopeLabel, status: "unchanged", paramsHash, sourceRefreshedAt, tokens: 0 };
-      }
-    }
-    const locked = await claimLock({ reportKey, accountId, paramsHash });
-    if (!locked) {
-      return { report: reportKey, account: accountId, scope: scopeLabel, status: "locked-skip", paramsHash, tokens: 0 };
-    }
-    try {
-      // Re-check under the lock: the race winner may have just published this exact identity.
-      if (typeof readSnapshot === "function") {
-        const fresh = await readSnapshot({ reportKey, accountId, paramsHash });
-        if (fresh && fresh.payload && sourceRefreshedAt
-            && String(fresh.source_refreshed_at || "") === String(sourceRefreshedAt)) {
-          return { report: reportKey, account: accountId, scope: scopeLabel, status: "unchanged", paramsHash, sourceRefreshedAt, tokens: 0 };
-        }
-      }
-      const saved = await persistSnapshot({
-        reportKey, reportVersion, accountId, paramsHash,
-        params: { reportVersion, ...params },
-        payload: derived.payload,
-        sourceRefreshedAt: sourceRefreshedAt || undefined,
-      });
-      return {
-        report: reportKey, account: accountId, scope: scopeLabel, status: "materialized",
-        paramsHash, sourceRefreshedAt: (saved && saved.savedAt) || sourceRefreshedAt, tokens: 0,
-      };
-    } finally {
-      await releaseLock({ reportKey, accountId, paramsHash }).catch(() => {});
-    }
-  };
-
-  // Isolate one unit so a single throw becomes an "error" event and never aborts the run.
-  const runUnit = async (fn, ctx) => {
-    try { return push(await fn()); }
-    catch (e) { return push({ ...ctx, status: "error", tokens: 0, error: (e && e.message) || String(e) }); }
-  };
+  // Idempotent, LKG-preserving, isolated materialization -- the SHARED core (report-materialization-core.js), so this
+  // per-account operator and the FBA-aware Brand View operator can never drift. Binds this run's dryRun/now + the
+  // injected store to the core primitive; every unit is isolated so one throw never aborts the rest.
+  const materializeOne = (u) => materializeSnapshot({ ...u, dryRun, now, readSnapshot, persistSnapshot, claimLock, releaseLock });
+  const runUnit = (fn, ctx) => runUnitCore(events, fn, ctx);
 
   for (const account of accounts || []) {
     const accountId = String((account && (account.accountId || account.id)) || "").trim();
@@ -230,23 +178,4 @@ export async function runReportMaterialization(
     + `planned ${summary.planned}, error ${summary.error} across ${summary.accounts} accounts; tokens ${summary.tokens}`);
 
   return { region: region || null, ceiling: effectiveCeiling, dryRun, events, summary };
-}
-
-export function summarize(events) {
-  const s = { accounts: 0, units: 0, materialized: 0, unchanged: 0, unavailable: 0, planned: 0, locked: 0, error: 0, skipped: 0, tokens: 0 };
-  const accounts = new Set();
-  for (const e of events || []) {
-    s.units += 1;
-    if (e.account && e.account !== "*") accounts.add(e.account);
-    s.tokens += Number(e.tokens || 0);
-    if (e.status === "materialized") s.materialized += 1;
-    else if (e.status === "unchanged") s.unchanged += 1;
-    else if (e.status === "unavailable") s.unavailable += 1;
-    else if (e.status === "planned") s.planned += 1;
-    else if (e.status === "locked-skip") s.locked += 1;
-    else if (e.status === "error") s.error += 1;
-    else if (e.status === "skipped") s.skipped += 1;
-  }
-  s.accounts = accounts.size;
-  return s;
 }
