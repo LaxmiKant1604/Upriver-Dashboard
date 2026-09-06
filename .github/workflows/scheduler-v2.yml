@@ -74,6 +74,10 @@ jobs:
     outputs:
       region: ${{ steps.cfg.outputs.region }}
       asof: ${{ steps.cfg.outputs.asof }}
+      # ONE shared inventory snapshot date (UTC today) computed exactly once here and consumed unchanged by BOTH the FBA
+      # job and the Listing Health v3 job, so FBA inventory and v3 always adopt a single inventory identity. It is
+      # DISTINCT from `asof` (D-1, for OLI/Ads). A watchdog re-dispatch for the same region+day recomputes the same value.
+      inventory_asof: ${{ steps.cfg.outputs.inventory_asof }}
       run_required: ${{ steps.guard.outputs.run_required }}
       already_published: ${{ steps.guard.outputs.already_published }}
       token_proceed: ${{ steps.tokengate.outputs.proceed }}
@@ -133,11 +137,16 @@ jobs:
             "us-ca")     tokenmin=10 ;;
           esac
           asof="$(date -u -d 'yesterday' +%Y-%m-%d)"
+          # ONE shared inventory snapshot date = UTC today, computed EXACTLY ONCE here. FBA inventory + Listing Health v3
+          # both adopt this identity; the downstream v3 job must NEVER recompute UTC today independently. Distinct from
+          # asof (D-1). Matches fbaInventoryAsOf() (UTC today) so the FBA inventory cache the v3 tranche reuses aligns.
+          inventory_asof="$(date -u +%Y-%m-%d)"
           # Durable operation identity is region + requestedAsOf (NOT the cron) so the primary + the watchdog share ONE
           # operation + one durable token/create budget (idempotent adoption).
           opkey="scheduled-fresh/$region/$asof"
           echo "region=$region" >> "$GITHUB_OUTPUT"
           echo "asof=$asof" >> "$GITHUB_OUTPUT"
+          echo "inventory_asof=$inventory_asof" >> "$GITHUB_OUTPUT"
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "tokenmin=$tokenmin" >> "$GITHUB_OUTPUT"
           echo "opkey=$opkey" >> "$GITHUB_OUTPUT"
@@ -146,9 +155,9 @@ jobs:
             echo "- event: ${{ github.event_name }} · cron: \`${{ github.event.schedule }}\` · dispatch identity: \`${{ inputs.dispatch_id }}\`";
             echo "- resolved region: **$region** (publishes ONLY this region; every other region is untouched)";
             echo "- head/workflow SHA: \`${{ github.sha }}\` · run id: ${{ github.run_id }} (attempt ${{ github.run_attempt }})";
-            echo "- requestedAsOf (D-1): $asof · refresh_mode: $mode · operation key: \`$opkey\` · token floor: $tokenmin";
+            echo "- requestedAsOf (D-1): $asof · inventoryAsOf (UTC today, shared FBA+v3): $inventory_asof · refresh_mode: $mode · operation key: \`$opkey\` · token floor: $tokenmin";
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "Resolved event=${{ github.event_name }} cron='${{ github.event.schedule }}' region=$region requestedAsOf=$asof mode=$mode opkey=$opkey tokenmin=$tokenmin"
+          echo "Resolved event=${{ github.event_name }} cron='${{ github.event.schedule }}' region=$region requestedAsOf=$asof inventoryAsOf=$inventory_asof mode=$mode opkey=$opkey tokenmin=$tokenmin"
 
       - name: Install dependencies
         run: npm ci
@@ -284,5 +293,55 @@ jobs:
           esac
           echo "maxtok=$maxtok" >> "$GITHUB_OUTPUT"
           echo "FBA region=$region ceiling=$maxtok"
+      # --inventory-as-of is the SHARED inventory_asof (UTC today) resolved once in the run job, so this FBA inventory
+      # fetch and the downstream Listing Health v3 job adopt ONE inventory identity (v3 reuses this exact cache).
       - name: FBA go-live for this region (batched fetch -> derive -> publish -> ownership -> ALWAYS safe-close)
-        run: node scripts/release/fba-plan-golive.mjs --mode=go-live --region=${{ needs.run.outputs.region }} --max-tokens=${{ steps.fcfg.outputs.maxtok }}
+        run: node scripts/release/fba-plan-golive.mjs --mode=go-live --region=${{ needs.run.outputs.region }} --max-tokens=${{ steps.fcfg.outputs.maxtok }} --inventory-as-of=${{ needs.run.outputs.inventory_asof }}
+
+  # Listing Health v3 SHADOW ingestion -- runs ONLY after THIS region's FBA inventory job SUCCEEDED, so v3's reuse-only
+  # inventory tranche adopts the fresh FBA Plan inventory cache (zero inventory creates). It is NOT a new scheduler
+  # owner: it is a dependent job of the SAME per-region workflow run, so it inherits the workflow-level per-region
+  # `concurrency` group -- a delayed native cron and its Cloudflare watchdog re-dispatch resolve to the same region,
+  # the same shared inventory_asof, and therefore the same operation id + request hashes (a replay is a zero-create,
+  # zero-duplicate-snapshot no-op via the durable dedicated cycle). The UI stays OFF (LISTING_HEALTH_V3 unchanged); this
+  # job only enables the INGESTION env gate, and only within itself. It creates ONLY Listings + Listings-Raw exports
+  # within the per-region ceiling (India=4, Europe-AU=8, US-CA=4); inventory / OLI / Product Catalog are zero-create.
+  listing-health-v3:
+    needs: [run, fba]
+    if: always() && needs.run.outputs.region != '' && needs.fba.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+      PRIORITY_OPERATOR: laxmikant@superboring.in
+      # The dedicated ingestion gate, enabled ONLY inside this job. It does NOT flip the UI flag LISTING_HEALTH_V3.
+      LISTING_HEALTH_V3_INGESTION_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Verify required secrets are present (fail fast, never print values)
+        run: |
+          set -uo pipefail
+          missing=""
+          for v in POSTGRES_URL SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY; do
+            if [ -z "${!v:-}" ]; then missing="$missing $v"; fi
+          done
+          if [ -z "${SUPABASE_URL:-}" ] && [ -z "${VITE_SUPABASE_URL:-}" ]; then missing="$missing SUPABASE_URL|VITE_SUPABASE_URL"; fi
+          if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
+          echo "All required secrets present."
+      - name: Install dependencies
+        run: npm ci
+      # --cycle-date AND the --confirm operation id BOTH use the SHARED inventory_asof from the run job (never a locally
+      # recomputed UTC today), so the v3 inventory identity matches the FBA cache and a watchdog replay is idempotent.
+      - name: Listing Health v3 shadow ingestion for this region (Listings + Listings-Raw only; inventory reuse-only)
+        run: node scripts/release/listing-health-v3-ingestion.mjs --region=${{ needs.run.outputs.region }} --mode=live --cycle-date=${{ needs.run.outputs.inventory_asof }} --confirm=listing-health-v3/${{ needs.run.outputs.region }}/${{ needs.run.outputs.inventory_asof }}

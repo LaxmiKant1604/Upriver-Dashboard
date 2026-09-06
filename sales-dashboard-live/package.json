@@ -131,7 +131,11 @@
     "test:fba-inventory-truncated": "node scripts/report-fba-inventory-truncated.test.js",
     "test:fba-inventory-overflow": "node scripts/report-fba-inventory-overflow.test.js",
     "test:fba-inventory-latest-snapshot": "node scripts/fba-inventory-latest-snapshot.test.js",
-    "test:lhv3-cycle-bucket-migration": "node scripts/listing-health-v3-cycle-bucket-migration.test.js"
+    "test:lhv3-cycle-bucket-migration": "node scripts/listing-health-v3-cycle-bucket-migration.test.js",
+    "test:listing-health-v3-finalize": "node scripts/report-listing-health-v3-finalize.test.js",
+    "test:listing-health-v3-identity-guard": "node scripts/report-listing-health-v3-identity-guard.test.js",
+    "test:lhv3-shared-inventory-date": "node scripts/lhv3-shared-inventory-date.test.js",
+    "test:scheduler-v2-lhv3-workflow": "node scripts/scheduler-v2-lhv3-workflow.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",

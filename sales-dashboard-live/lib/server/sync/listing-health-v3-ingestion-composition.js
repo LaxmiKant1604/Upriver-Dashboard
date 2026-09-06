@@ -197,11 +197,25 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     return { succeeded: res.succeeded || 0, blocked: res.blocked || 0, failed: res.failed || 0, drained: !!res.drained };
   };
 
+  // Guarded finalization of the dedicated listing-health-v3-<region> cycle -> the reviewed finalize_sync_cycle RPC via
+  // runtime.store.finalizeCycle. Returns a TYPED, replay-safe result: { disposition, status, cycleId }. `succeeded`
+  // (no source/report failures) is the ONLY full success; `partial`/`failed`/`open-work`/`not-found`/`invalid-status`
+  // are honest non-successes. An already-terminal succeeded cycle (a watchdog replay) returns disposition
+  // 'already-terminal' + status 'succeeded' -- a zero-create idempotent success.
+  const finalizeCycle = async ({ region, cycleDate }) => {
+    const cycleBucket = listingHealthV3CycleBucket(region);
+    const cyc = await runtime.store.getCycleByBucketDate(cycleBucket, cycleDate);
+    const cycleId = cyc && cyc.id;
+    if (!cycleId) return { disposition: "not-found", status: null, cycleId: null };
+    const disp = await runtime.store.finalizeCycle({ cycleId });
+    return { disposition: disp && disp.disposition, status: disp && disp.cycle ? disp.cycle.status : null, cycleId };
+  };
+
   return Object.freeze({
     operator, connections, runtime,
     discoverAccounts,
     buildPlan,
-    resolveCost, checkBalance, materialize, runSources, runReports,
+    resolveCost, checkBalance, materialize, runSources, runReports, finalizeCycle,
     getSourceExportCache: getExportCache,
     reservationSupported: typeof runtime.store.reserveExportCreate === "function",
     pricingKnown: true,

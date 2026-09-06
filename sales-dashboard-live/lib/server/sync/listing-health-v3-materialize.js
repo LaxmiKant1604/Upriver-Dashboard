@@ -72,6 +72,37 @@ export function listingHealthV3PerAccountReadHashes(args) {
   return by;
 }
 
+/**
+ * FUTURE ACCOUNT-IDENTITY GUARD (pure; no I/O). The per-account read hash is marketplace-INDEPENDENT (v3 has no
+ * marketplace-conditional contract), so two DISTINCT account records that share a rawSellerId within one connection
+ * (e.g. a future pan-EU seller id connected as multiple marketplace accounts) would resolve to ONE read identity and
+ * cross-contaminate their per-account aliases. This detects that BEFORE any export create and throws fail-closed,
+ * naming ONLY safe public account-id prefixes (never the rawSellerId, apiKey, org fingerprint, or marketplace). It does
+ * NOT redesign the shared request hashes -- it refuses to run when the current account population would collide.
+ * `v3Requests` are the plan's listing-health-v3 report requests (each with `owner.{accountId,rawSellerId,connectionId,
+ * marketplace}`); `connections` resolves each connection's apiKey.
+ */
+export function assertNoDuplicatePerAccountReadIdentities({ v3Requests = [], connections = [] } = {}) {
+  const apiKeyOf = (connectionId) => { const c = (connections || []).find((x) => x && x.id === connectionId); return c ? c.apiKey : null; };
+  const byIdentity = new Map(); // identityKey -> Set(public accountId)
+  for (const r of v3Requests || []) {
+    const owner = r && r.owner;
+    if (!owner || owner.rawSellerId == null || owner.accountId == null) continue;
+    const hashes = listingHealthV3PerAccountReadHashes({ apiKey: apiKeyOf(owner.connectionId), rawSellerId: owner.rawSellerId, marketplaceCountry: owner.marketplace || null });
+    // The identity a serve read resolves to: the connection + the tuple of marketplace-independent per-account hashes.
+    const identityKey = `${owner.connectionId}|${JSON.stringify(hashes)}`;
+    if (!byIdentity.has(identityKey)) byIdentity.set(identityKey, new Set());
+    byIdentity.get(identityKey).add(String(owner.accountId));
+  }
+  const collisions = [...byIdentity.values()]
+    .filter((ids) => ids.size > 1)
+    .map((ids) => [...ids].map((id) => String(id).slice(0, 8)).sort());
+  if (collisions.length) {
+    throw new Error(`listing-health-v3 duplicate per-account read identity: distinct accounts ${JSON.stringify(collisions)} resolve to ONE read hash (a shared seller id across marketplaces would cross-contaminate aliases). Refusing (fail closed, zero creates).`);
+  }
+  return { checked: (v3Requests || []).length, distinctIdentities: byIdentity.size };
+}
+
 const S = (v) => (v == null ? "" : String(v));
 function approxBytes(rows) { try { return Buffer.byteLength(JSON.stringify({ rows })); } catch { return 0; } }
 

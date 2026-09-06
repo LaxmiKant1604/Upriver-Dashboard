@@ -1,0 +1,62 @@
+// scheduler-v2 Listing Health v3 shadow-job SOURCE GUARDS -- Phases 1/4/5.
+//
+// Static assertions over .github/workflows/scheduler-v2.yml (+ feature-flags.js + the region ceiling constant): the v3
+// shadow job depends on [run, fba], runs only on a resolved region + fba success, shares ONE inventory_asof between the
+// FBA and v3 commands (never recomputing UTC today downstream), keeps the ceilings, enables the ingestion env gate ONLY
+// in its own job, never flips the UI flag, and adds NO second scheduler/cron owner. 7-bit ASCII, LF. ZERO I/O beyond
+// reading repo files.
+
+import assert from "node:assert/strict";
+import { writeSync, readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { LISTING_HEALTH_V3_REGION_EXPORT_CEILING } from "../lib/server/sync/listing-health-v3-materialize.js";
+
+let passed = 0;
+const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
+writeSync(1, "scheduler-v2-lhv3-workflow\n");
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(here, "..", "..");
+const wf = readFileSync(path.join(repoRoot, ".github/workflows/scheduler-v2.yml"), "utf8");
+const flags = readFileSync(path.join(here, "..", "src/lib/feature-flags.js"), "utf8");
+
+// Isolate the listing-health-v3 job block (from its key to end-of-file; it is the last job).
+const v3Idx = wf.indexOf("\n  listing-health-v3:");
+assert.ok(v3Idx > 0, "the workflow defines a listing-health-v3 job");
+const v3Job = wf.slice(v3Idx);
+const beforeV3 = wf.slice(0, v3Idx); // run + fba jobs
+
+/* ===================== A. dependency order + gate ===================== */
+ok("A: the v3 job needs BOTH run and fba", /needs:\s*\[run,\s*fba\]/.test(v3Job));
+ok("A: it is gated on a resolved region AND fba success", /needs\.run\.outputs\.region\s*!=\s*''/.test(v3Job) && /needs\.fba\.result\s*==\s*'success'/.test(v3Job));
+ok("A: the fba job itself only needs run (v3 runs strictly after fba)", /^\s{2}fba:\s*$/m.test(wf) && /\n  fba:\n[\s\S]*?needs:\s*run\b/.test(wf));
+
+/* ===================== B. ONE shared inventory_asof (UTC today), computed once, consumed by BOTH ===================== */
+ok("B: inventory_asof is computed exactly once as UTC today in the cfg step", /inventory_asof="\$\(date -u \+%Y-%m-%d\)"/.test(wf) && (wf.match(/date -u \+%Y-%m-%d/g) || []).length === 1);
+ok("B: inventory_asof is exposed as a run-job output", /inventory_asof:\s*\$\{\{\s*steps\.cfg\.outputs\.inventory_asof\s*\}\}/.test(wf));
+ok("B: the D-1 asof output is unchanged (yesterday, for OLI/Ads)", /asof="\$\(date -u -d 'yesterday' \+%Y-%m-%d\)"/.test(wf));
+ok("B: the FBA command receives the shared inventory_asof", /fba-plan-golive\.mjs[^\n]*--inventory-as-of=\$\{\{\s*needs\.run\.outputs\.inventory_asof\s*\}\}/.test(wf));
+ok("B: the v3 command's --cycle-date is the SAME shared inventory_asof", /listing-health-v3-ingestion\.mjs[^\n]*--cycle-date=\$\{\{\s*needs\.run\.outputs\.inventory_asof\s*\}\}/.test(v3Job));
+ok("B: the v3 --confirm operation id uses region + the SAME inventory_asof", /--confirm=listing-health-v3\/\$\{\{\s*needs\.run\.outputs\.region\s*\}\}\/\$\{\{\s*needs\.run\.outputs\.inventory_asof\s*\}\}/.test(v3Job));
+ok("B: the v3 job NEVER recomputes UTC today (no date -u inside the v3 job)", !/date -u/.test(v3Job));
+
+/* ===================== C. env gate scoped to the v3 job; UI flag never touched ===================== */
+ok("C: LISTING_HEALTH_V3_INGESTION_ENABLED=true is set (ingestion gate)", /LISTING_HEALTH_V3_INGESTION_ENABLED:\s*"true"/.test(v3Job));
+ok("C: the ingestion gate appears ONLY in the v3 job (not the run/fba jobs)", !/LISTING_HEALTH_V3_INGESTION_ENABLED/.test(beforeV3));
+ok("C: the workflow NEVER sets/flips the UI flag LISTING_HEALTH_V3 (exact env, not the _INGESTION_ suffix)", !/LISTING_HEALTH_V3\s*:/.test(wf) && !/LISTING_HEALTH_V3=/.test(wf));
+ok("C: the UI flag stays OFF in source", /export const LISTING_HEALTH_V3 = false;/.test(flags));
+ok("C: the v3 job pins the reviewed operator identity", /PRIORITY_OPERATOR:\s*laxmikant@superboring\.in/.test(v3Job));
+ok("C: the v3 job runs mode=live for the resolved region", /--mode=live/.test(v3Job) && /--region=\$\{\{\s*needs\.run\.outputs\.region\s*\}\}/.test(v3Job));
+
+/* ===================== D. no second cron / scheduler owner ===================== */
+ok("D: exactly ONE schedule block + exactly the three existing regional crons", (wf.match(/on:\n\s*schedule:/g) || []).length === 1 && (wf.match(/- cron:/g) || []).length === 3);
+ok("D: the three crons are unchanged (india 03:00 / europe-au 08:30 / us-ca 16:30 UTC)", wf.includes('- cron: "0 3 * * *"') && wf.includes('- cron: "30 8 * * *"') && wf.includes('- cron: "30 16 * * *"'));
+ok("D: the v3 job adds NO cron / schedule / workflow_dispatch of its own", !/cron:|schedule:|workflow_dispatch:/.test(v3Job));
+ok("D: the workflow-level per-region concurrency group is preserved (shared by all jobs incl. v3)", /concurrency:\n\s*#[\s\S]*?group:\s*scheduler-v2-/.test(wf) && /cancel-in-progress:\s*false/.test(wf));
+
+/* ===================== E. ceilings unchanged; inventory/OLI/catalog remain zero-create ===================== */
+ok("E: the region export ceilings are India=4, Europe-AU=8, US-CA=4", LISTING_HEALTH_V3_REGION_EXPORT_CEILING.india === 4 && LISTING_HEALTH_V3_REGION_EXPORT_CEILING["europe-au"] === 8 && LISTING_HEALTH_V3_REGION_EXPORT_CEILING["us-ca"] === 4);
+ok("E: the v3 command creates ONLY via the ingestion CLI (Listings + Listings-Raw; inventory reuse-only by contract)", /listing-health-v3-ingestion\.mjs/.test(v3Job) && !/--as-of=|fba-inventory|order-line|catalog|campaign|awd/i.test(v3Job));
+
+writeSync(1, `\nscheduler-v2-lhv3-workflow: ${passed} assertions passed\n`);

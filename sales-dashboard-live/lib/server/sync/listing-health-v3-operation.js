@@ -31,6 +31,7 @@ import { accountInScope, isRoutingScope } from "./scheduler-scope.js";
 import {
   listingHealthV3PlannedExports,
   assertListingHealthV3ExportCeiling,
+  assertNoDuplicatePerAccountReadIdentities,
 } from "./listing-health-v3-materialize.js";
 
 const S = (v) => (v == null ? "" : String(v));
@@ -106,15 +107,19 @@ export async function planListingHealthV3IngestionCost({ plan, getSourceExportCa
  *   checkBalance()                        -> { usable:number, reserve?:number }         (DataDoe usable balance)
  *   runSources({plan,region,cycleDate,operationId,budget}) -> { drained, creates, tokens, ... } (resumable source worker)
  *   materialize({plans,connections})      -> materialization summary                    (per-account aliases)
- *   runReports({plan,region,cycleDate})   -> { succeeded, ... }                         (shadow snapshot derive/save)
+ *   runReports({plan,region,cycleDate})   -> { succeeded, blocked, failed, drained }    (shadow snapshot derive/save)
+ *   finalizeCycle({region,cycleDate})     -> { disposition, status, cycleId }            (guarded finalize_sync_cycle)
  * Config: region, cycleDate, mode ("dry-run"|"live"), authorized (bool), gate ({enabled}), connections,
  *   ceiling (override), emergencyReserveTokens, reservationSupported (store capability), pricingKnown.
+ * A LIVE scheduled operation is a SUCCESS (ok:true, phase:"complete") ONLY when the dedicated cycle finalizes to a
+ * DURABLE terminal status "succeeded" (zero source/report failures). partial/failed/open-work/deferred all return
+ * ok:false so the CLI exits nonzero, while last-known-good is preserved (no snapshot is rolled back).
  */
 export async function runListingHealthV3Ingestion({
   region, cycleDate, mode = "dry-run",
   authorized = false, gate = null, connections = [],
   discoverAccounts, buildPlan = buildListingHealthV3Plan, resolveCost, checkBalance,
-  runSources, materialize, runReports,
+  runSources, materialize, runReports, finalizeCycle,
   ceiling = null, emergencyReserveTokens = V3_DEFAULT_EMERGENCY_RESERVE_TOKENS,
   reservationSupported = true, pricingKnown = true,
   now = () => Date.now(), log = () => {},
@@ -149,6 +154,12 @@ export async function runListingHealthV3Ingestion({
   try { plan = await buildPlan({ accounts: regionAccounts, connections, cycleDate, region: S(region) }); } catch (e) { return fail("plan", "plan build failed: " + safe(e)); }
   const v3Requests = (plan.reportRequests || []).filter((r) => r && r.reportKey === "listing-health-v3");
   if (!v3Requests.length) return fail("plan", "frozen plan contains no listing-health-v3 requests (fail closed)");
+
+  // 6b) FUTURE ACCOUNT-IDENTITY GUARD (pure; dry-run + live): refuse BEFORE any create if two distinct accounts would
+  //     resolve to one marketplace-independent per-account read hash (a shared seller id across marketplaces would
+  //     cross-contaminate aliases). Diagnostics name only safe public account-id prefixes.
+  try { assertNoDuplicatePerAccountReadIdentities({ v3Requests, connections }); }
+  catch (e) { return fail("identity", safe(e)); }
 
   // 7) validate ceiling + cost + pricing/reservation + balance BEFORE any POST.
   let ceilingCheck;
@@ -186,6 +197,9 @@ export async function runListingHealthV3Ingestion({
     return { ...ev, phase: "planned", ok: true, dryRun: true, creates: 0, tokens: 0, plannedCreates: Number(cost.creates || 0), estimatedTokens: Number(cost.estimatedTokens || 0), inventoryAdoptable: !!cost.inventoryAdoptable, note: gateEnabled ? "gate-enabled" : "gate-disabled (dry-run only)" };
   }
 
+  // A live run also REQUIRES the finalize collaborator (the durable success gate). Refuse before any create if missing.
+  if (typeof finalizeCycle !== "function") return fail("finalize", "finalizeCycle collaborator is required for a live run (fail closed)");
+
   // 8) run source jobs (listings + listings-raw CREATE within the frozen budget; inventory REUSE-ONLY). LKG preserved.
   let sourceRes;
   try { sourceRes = await runSources({ plan, region: S(region), cycleDate: S(cycleDate), operationId: ev.operationId, budget: cost }); }
@@ -193,22 +207,58 @@ export async function runListingHealthV3Ingestion({
   ev.creates = Number(sourceRes && sourceRes.creates || 0);
   ev.tokens = Number(sourceRes && sourceRes.tokens || 0);
   ev.drained = !!(sourceRes && sourceRes.drained);
+  ev.inventoryCreated = !!(sourceRes && sourceRes.inventoryCreated);
+  // CONTRACT: inventory is REUSE-ONLY. A v3 inventory CREATE is a hard violation of the zero-inventory-export contract
+  // (finalize counts inventory jobs as "succeeded" and would not distinguish create from reuse -- only this catches it).
+  if (ev.inventoryCreated) return fail("source", "inventory export was CREATED but v3 inventory must be reuse-only; fail closed (last-known-good preserved)");
 
   // 9) materialize validated batch results into isolated per-account aliases (newer-only overwrite).
   let matSummary = null;
   try { matSummary = await materialize({ plans: v3Requests, connections }); }
   catch (e) { return fail("materialize", "per-account materialization failed (last-known-good preserved): " + safe(e)); }
   ev.aliases = matSummary;
+  // A REJECTED (unattributable / cross-account) fragment is never reflected in the cycle job counters, so guard it here.
+  const matRejected = Number((matSummary && matSummary.rejected) || 0);
+  if (matRejected > 0) return fail("materialize", `materialization rejected ${matRejected} unattributable fragment(s); fail closed (last-known-good preserved)`);
 
-  // 10) INVENTORY REUSE gate: derive/publish the shadow snapshot ONLY when the current FBA Plan inventory cache is
-  //     fresh. Otherwise DEFER (never publish stale inventory as current); the previous shadow snapshot (LKG) stands.
+  // 10) INVENTORY REUSE gate: derive the shadow snapshot ONLY when the current FBA Plan inventory cache is fresh.
+  //     Otherwise DEFER -- do NOT finalize (the cycle stays running so a same-cycle retry can complete once inventory is
+  //     fresh) and return ok:false so the scheduled CLI exits nonzero. The previous shadow snapshot (LKG) stands.
   if (!cost.inventoryAdoptable) {
-    return { ...ev, phase: "deferred-inventory", ok: true, deferred: true, snapshots: 0, note: "current FBA Plan inventory unavailable -- snapshot derive deferred, last-known-good preserved" };
+    return { ...ev, phase: "deferred-inventory", ok: false, deferred: true, snapshots: 0, note: "current FBA Plan inventory unavailable -- snapshot derive deferred (cycle left open for retry); last-known-good preserved" };
   }
+
   // 11) run report jobs -> the scheduler-v2/listing-health-v3 SHADOW snapshot only. LKG preserved on any failure.
   let reportRes;
   try { reportRes = await runReports({ plan, region: S(region), cycleDate: S(cycleDate) }); }
   catch (e) { return fail("report", "shadow snapshot derive/save failed (last-known-good preserved): " + safe(e)); }
   ev.snapshots = Number(reportRes && reportRes.succeeded || 0);
-  return { ...ev, phase: "complete", ok: true, dryRun: false };
+  ev.reportBlocked = Number(reportRes && reportRes.blocked || 0);
+  ev.reportFailed = Number(reportRes && reportRes.failed || 0);
+  ev.reportDrained = !!(reportRes && reportRes.drained);
+
+  // 12) HONEST COMPLETION. Never return ok:true merely because runReports returned. Finalize the dedicated cycle and
+  //     use the DURABLE terminal status as the replay-safe source of truth: a LIVE scheduled operation SUCCEEDS only
+  //     when finalize_sync_cycle yields status "succeeded" (zero source AND report failures). open-work (undrained),
+  //     partial, failed, not-found and invalid-status are all ok:false; LKG is preserved (no snapshot is rolled back).
+  //     An already-terminal "succeeded" cycle (a watchdog replay) returns disposition 'already-terminal' + succeeded
+  //     -> a zero-create idempotent success.
+  let fin;
+  try { fin = await finalizeCycle({ region: S(region), cycleDate: S(cycleDate) }); }
+  catch (e) { return fail("finalize", "cycle finalization failed (last-known-good preserved): " + safe(e)); }
+  ev.finalizeDisposition = fin && fin.disposition;
+  ev.cycleStatus = fin && fin.status;
+  const finalized = !!fin && (fin.disposition === "finalized" || fin.disposition === "already-terminal");
+  if (finalized && fin.status === "succeeded") {
+    return { ...ev, phase: "complete", ok: true, dryRun: false, cycleStatus: "succeeded" };
+  }
+  if (fin && fin.disposition === "open-work") {
+    return { ...ev, phase: "incomplete", ok: false, note: "source/report work still open (cycle not drained) -- a retry will resume; last-known-good preserved" };
+  }
+  // partial | failed | not-found | invalid-status | finalized-but-not-succeeded -> honest non-success.
+  return {
+    ...ev, ok: false,
+    phase: finalized ? S(fin.status) : (fin && fin.disposition ? S(fin.disposition) : "finalize-failed"),
+    note: `cycle did not finalize as succeeded (disposition=${fin && fin.disposition}, status=${fin && fin.status}; reportBlocked=${ev.reportBlocked} reportFailed=${ev.reportFailed} reportDrained=${ev.reportDrained}); last-known-good preserved`,
+  };
 }

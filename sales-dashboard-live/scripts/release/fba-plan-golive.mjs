@@ -6,8 +6,12 @@
 // OLI/catalog derive), the four-gate CAS publisher, the guarded fba-plan control package, an apply-gates ->
 // publish -> read-back -> ownership -> ALWAYS-safe-close envelope, bounded by a hard token ceiling.
 //
-//   node scripts/release/fba-plan-golive.mjs --mode=dry-run   [--as-of=YYYY-MM-DD] [--max-blocked=2] [--region=india|europe-au|us-ca|all] [--bucket=us|non-us|both]
-//   node scripts/release/fba-plan-golive.mjs --mode=go-live   [--as-of=YYYY-MM-DD] [--max-tokens=80] [--max-blocked=2] [--region=...] [--bucket=...]
+//   node scripts/release/fba-plan-golive.mjs --mode=dry-run   [--as-of=YYYY-MM-DD] [--inventory-as-of=YYYY-MM-DD] [--max-blocked=2] [--region=india|europe-au|us-ca|all] [--bucket=us|non-us|both]
+//   node scripts/release/fba-plan-golive.mjs --mode=go-live   [--as-of=YYYY-MM-DD] [--inventory-as-of=YYYY-MM-DD] [--max-tokens=80] [--max-blocked=2] [--region=...] [--bucket=...]
+//
+// --inventory-as-of: OPTIONAL. Overrides the inventory snapshot date (default: fbaInventoryAsOf() = UTC today). The
+//   regional scheduler passes ONE shared inventory_asof so this FBA run and the downstream Listing Health v3 job adopt
+//   the SAME inventory identity. Existing manual callers that omit it keep the exact prior behaviour (UTC today).
 //
 // SCOPE: `--region` (a region india|europe-au|us-ca, or `all`) is the ACTIVE routing used by the regional
 // coordinator -- it takes precedence when present and runs exactly that region (or all three). `--bucket`
@@ -53,7 +57,14 @@ const {
 } = await import("../../lib/server/sync/fba-plan-operation.js");
 
 const CEILING = fbaServerCeiling();
-const inventoryAsOf = fbaInventoryAsOf();
+// Optional shared inventory snapshot date (regional scheduler passes ONE inventory_asof to both FBA and v3). Validate a
+// real calendar date; default to fbaInventoryAsOf() (UTC today) so existing manual callers are byte-identical.
+const inventoryAsOfArg = argOf("inventory-as-of");
+if (inventoryAsOfArg != null) {
+  const ok = /^\d{4}-\d{2}-\d{2}$/.test(inventoryAsOfArg) && new Date(`${inventoryAsOfArg}T00:00:00Z`).toISOString().slice(0, 10) === inventoryAsOfArg;
+  if (!ok) { console.error("STOP --inventory-as-of must be a real YYYY-MM-DD calendar date"); process.exit(2); }
+}
+const inventoryAsOf = inventoryAsOfArg || fbaInventoryAsOf();
 const OPERATOR = process.env.PRIORITY_OPERATOR || "laxmikant@superboring.in";
 const release = buildFbaPlanRelease({ operator: OPERATOR });
 

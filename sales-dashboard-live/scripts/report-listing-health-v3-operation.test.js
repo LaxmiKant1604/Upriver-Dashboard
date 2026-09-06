@@ -29,18 +29,27 @@ function withNoNetwork(fn) {
   return Promise.resolve(fn()).finally(() => { globalThis.fetch = realFetch; }).then((r) => ({ r, hits }));
 }
 
-// Injected collaborator spies.
-function spies({ accounts = usAccounts, cost = null, balance = { usable: 1000 }, inventoryAdoptable = true } = {}) {
-  const calls = { discover: 0, buildPlan: 0, resolveCost: 0, checkBalance: 0, runSources: 0, materialize: 0, runReports: 0 };
+// Injected collaborator spies. A LIVE happy path drains sources (inventory reuse-only, never created), materializes
+// with zero rejections, derives snapshots, and finalizes the dedicated cycle to a terminal "succeeded" status -- the
+// ONLY full success. `sourceOut`, `matOut`, `reportOut`, `finalize` are overridable to reproduce non-success paths.
+function spies({
+  accounts = usAccounts, cost = null, balance = { usable: 1000 }, inventoryAdoptable = true,
+  sourceOut = { drained: true, creates: 2, tokens: 4, inventoryCreated: false },
+  matOut = { accounts: 2, aliasesWritten: 2, emptyAliases: 0, rejected: 0, skippedStale: 0 },
+  reportOut = { succeeded: 2, blocked: 0, failed: 0, drained: true },
+  finalize = { disposition: "finalized", status: "succeeded", cycleId: "cyc-1" },
+} = {}) {
+  const calls = { discover: 0, buildPlan: 0, resolveCost: 0, checkBalance: 0, runSources: 0, materialize: 0, runReports: 0, finalizeCycle: 0 };
   return {
     calls,
     discoverAccounts: async () => { calls.discover += 1; return accounts; },
     buildPlan: (args) => { calls.buildPlan += 1; return buildListingHealthV3Plan(args); },
     resolveCost: async () => { calls.resolveCost += 1; return cost || { newExports: 2, reusedExports: 1, creates: 2, estimatedTokens: 4, inventoryAdoptable }; },
     checkBalance: async () => { calls.checkBalance += 1; return balance; },
-    runSources: async () => { calls.runSources += 1; return { drained: true, creates: 2, tokens: 4 }; },
-    materialize: async () => { calls.materialize += 1; return { accounts: 2, aliasesWritten: 2, emptyAliases: 0 }; },
-    runReports: async () => { calls.runReports += 1; return { succeeded: 2 }; },
+    runSources: async () => { calls.runSources += 1; return sourceOut; },
+    materialize: async () => { calls.materialize += 1; return matOut; },
+    runReports: async () => { calls.runReports += 1; return reportOut; },
+    finalizeCycle: async () => { calls.finalizeCycle += 1; return finalize; },
   };
 }
 const base = (over = {}) => ({ region: "us-ca", cycleDate, connections, ...over });
@@ -108,8 +117,8 @@ await (async () => {
 await (async () => {
   const s = spies();
   const r = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...s }));
-  ok("F: an authorized + gate-enabled live run executes sources -> materialize -> report jobs in order", s.calls.runSources === 1 && s.calls.materialize === 1 && s.calls.runReports === 1);
-  ok("F: it saves the v3 shadow snapshot(s) and reports complete", r.ok === true && r.phase === "complete" && r.snapshots === 2 && r.dryRun === false);
+  ok("F: an authorized + gate-enabled live run executes sources -> materialize -> report -> finalize in order", s.calls.runSources === 1 && s.calls.materialize === 1 && s.calls.runReports === 1 && s.calls.finalizeCycle === 1);
+  ok("F: it saves the v3 shadow snapshot(s) and reports complete ONLY on a terminal succeeded finalize", r.ok === true && r.phase === "complete" && r.snapshots === 2 && r.dryRun === false && r.cycleStatus === "succeeded");
 })();
 
 /* ===================== G. inventory reuse-only: missing fresh inventory DEFERS the derive (LKG preserved) ===================== */
@@ -117,7 +126,8 @@ await (async () => {
   const s = spies({ cost: { newExports: 2, reusedExports: 1, creates: 2, estimatedTokens: 4, inventoryAdoptable: false } });
   const r = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...s }));
   ok("G: with no fresh FBA Plan inventory, sources + materialization still run", s.calls.runSources === 1 && s.calls.materialize === 1);
-  ok("G: the snapshot derive is DEFERRED (never publishes stale inventory as current); LKG preserved", r.phase === "deferred-inventory" && r.deferred === true && s.calls.runReports === 0 && r.snapshots === 0);
+  ok("G: the snapshot derive is DEFERRED (never publishes stale inventory as current); LKG preserved; NOT finalized", r.phase === "deferred-inventory" && r.deferred === true && s.calls.runReports === 0 && r.snapshots === 0 && s.calls.finalizeCycle === 0);
+  ok("G: a deferral is ok:false (scheduled CLI exits nonzero; cycle left open for a same-cycle retry)", r.ok === false);
 })();
 
 /* ===================== H. freshness-aware cost (stale rejected / fresh reusable / next-cycle refresh / inventory) ===================== */
@@ -149,13 +159,14 @@ await (async () => {
   ok("H: estimated tokens = creates x observed per-export price (an estimate, not a guaranteed max)", costStale.estimatedTokens === 2 * costStale.creates && costStale.tokenPerExport === 2);
 })();
 
-/* ===================== I. partial source failure stays isolated (operator proceeds, LKG) ===================== */
+/* ===================== I. an UNDRAINED source pass is NOT a false success -- finalize reports open-work (ok:false) === */
 await (async () => {
-  const s = spies();
-  s.runSources = async () => { s.calls.runSources += 1; return { drained: false, creates: 1, tokens: 2, partialFailures: 1 }; };
+  // Old behaviour returned ok:true merely because runReports returned; the honest fix requires a terminal succeeded
+  // finalize. An undrained cycle finalizes to open-work -> ok:false, phase incomplete (a retry resumes; LKG preserved).
+  const s = spies({ sourceOut: { drained: false, creates: 1, tokens: 2, inventoryCreated: false }, finalize: { disposition: "open-work", status: "running", cycleId: "cyc-1" } });
   const r = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...s }));
-  ok("I: a partial (undrained) source pass does not abort the operator -- it still materializes + derives what is valid", r.ok === true && s.calls.materialize === 1 && s.calls.runReports === 1);
-  ok("I: the operator reports it did not fully drain (continuation is the caller's concern)", r.drained === false);
+  ok("I: an undrained source pass still materializes + attempts the derive, then finalizes honestly", s.calls.materialize === 1 && s.calls.runReports === 1 && s.calls.finalizeCycle === 1);
+  ok("I: open-work finalize is NOT a false success -- ok:false, phase incomplete (retry resumes; LKG preserved)", r.ok === false && r.phase === "incomplete" && r.drained === false);
 })();
 
 /* ===================== J. a thrown collaborator fails closed (LKG), never crashes ===================== */
