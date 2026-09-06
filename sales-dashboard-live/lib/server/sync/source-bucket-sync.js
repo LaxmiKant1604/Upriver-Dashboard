@@ -79,7 +79,7 @@ export function selectCatalogCarrierSeller(activeAccounts) {
   return canonical.length ? canonical[0] : null;
 }
 
-const FBA_SNAPSHOT_LOOKBACK_DAYS = 10; // mirrors fba-plan:inventory-health "range:asOf-10d..asOf"
+// FBA inventory is EXACTLY the single snapshot day [asOf .. asOf] (D-1) -- mirrors fba-plan:inventory-health.
 
 const isDateStr = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
@@ -164,7 +164,7 @@ export function resolvedFbaSnapshot({ apiKey, account, asOf, bucket }) {
   const options = optionsOf(c);
   const identity = sourceRequestIdentity({
     apiKey, sourceId, columns: c.columns, ids: [account.rawSellerId],
-    from: addDaysStr(asOf, -FBA_SNAPSHOT_LOOKBACK_DAYS), to: asOf, limit: c.limit, options,
+    from: asOf, to: asOf, limit: c.limit, options,
   });
   return {
     ...identity,
@@ -176,7 +176,7 @@ export function resolvedFbaSnapshot({ apiKey, account, asOf, bucket }) {
     marketplaceCountry: String(account.country),
     sellerOrVendorIds: [String(account.rawSellerId)],
     columns: c.columns,
-    from: addDaysStr(asOf, -FBA_SNAPSHOT_LOOKBACK_DAYS), to: asOf, options,
+    from: asOf, to: asOf, options,
   };
 }
 

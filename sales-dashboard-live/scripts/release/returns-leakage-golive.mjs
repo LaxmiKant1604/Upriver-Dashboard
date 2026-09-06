@@ -41,7 +41,13 @@ const log = (...a) => console.log(...a);
 
 // ---- imports (after env is set so supabase.js reads the right vars) ----
 const { runReturnsBucketCycle } = await import("../../lib/server/sync/returns-operation.js");
-const { fetchAccounts, fetchExportRows } = await import("../../lib/server/datadoe.js");
+const { fetchAccountsDetailed, fetchExportRows } = await import("../../lib/server/datadoe.js");
+const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
+// EXPORT-ELIGIBILITY GATE: returns/settlement exports run only for export-eligible primary accounts.
+const fetchAccounts = async (key) => {
+  const { getAccountOnboardingRows } = await import("../../lib/server/supabase.js");
+  return fetchExportEligibleAccounts(key, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows: getAccountOnboardingRows });
+};
 const { sourceRequestIdentity, organizationFingerprint } = await import("../../lib/server/source-identity.js");
 const { bucketForCountry } = await import("../../lib/server/sync/registry.js");
 const { getDataDoeTokenBalance, tokenGateDecision } = await import("../../lib/server/datadoe-usage.js");

@@ -44,8 +44,8 @@ ok("A: the v3 job needs BOTH run and fba", /needs:\s*\[run,\s*fba\]/.test(v3Job)
 ok("A: it is gated on a resolved region AND fba success", /needs\.run\.outputs\.region\s*!=\s*''/.test(v3Job) && /needs\.fba\.result\s*==\s*'success'/.test(v3Job));
 ok("A: the fba job itself only needs run (v3 runs strictly after fba)", /^\s{2}fba:\s*$/m.test(wf) && /\n  fba:\n[\s\S]*?needs:\s*run\b/.test(wf));
 
-/* ===================== B. ONE shared inventory_asof (UTC today), computed once, consumed by BOTH ===================== */
-ok("B: inventory_asof is computed exactly once as UTC today in the cfg step", /inventory_asof="\$\(date -u \+%Y-%m-%d\)"/.test(wf) && (wf.match(/date -u \+%Y-%m-%d/g) || []).length === 1);
+/* ===================== B. ONE shared inventory_asof (D-1, = asof), computed once, consumed by BOTH ===================== */
+ok("B: inventory_asof is bound exactly once to the D-1 asof in the cfg step (never recomputed)", /inventory_asof="\$asof"/.test(wf) && (wf.match(/inventory_asof="/g) || []).length === 1);
 ok("B: inventory_asof is exposed as a run-job output", /inventory_asof:\s*\$\{\{\s*steps\.cfg\.outputs\.inventory_asof\s*\}\}/.test(wf));
 ok("B: the D-1 asof output is unchanged (yesterday, for OLI/Ads)", /asof="\$\(date -u -d 'yesterday' \+%Y-%m-%d\)"/.test(wf));
 ok("B: the FBA command receives the shared inventory_asof", /fba-plan-golive\.mjs[^\n]*--inventory-as-of=\$\{\{\s*needs\.run\.outputs\.inventory_asof\s*\}\}/.test(wf));

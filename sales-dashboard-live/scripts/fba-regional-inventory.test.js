@@ -30,12 +30,14 @@ for (const r of plan.reportRequests) for (const s of r.sources) {
   assert(s.sellerOrVendorIds.length <= 5);
   assert(s.marketplacePairs.some((p) => p.sellerId === r.owner.rawSellerId && p.marketplace === r.owner.marketplace));
   assert.equal(s.freshnessNotBefore, "2026-09-04T00:00:00.000Z");
-  if (s.sourceKey === "fba-inventory-health") assert.equal(s.to, inventoryDate);
+  // Inventory is EXACTLY the single snapshot day [inventoryAsOf .. inventoryAsOf] -- never a lookback window.
+  if (s.sourceKey === "fba-inventory-health") { assert.equal(s.from, inventoryDate); assert.equal(s.to, inventoryDate); }
   else { assert.equal(s.from, null); assert.equal(s.to, null); }
 }
 assert(plan.reportRequests.some((r) => r.sources.some((s) => new Set(s.marketplacePairs.map((p) => p.marketplace)).size > 1)));
-assert.equal(fbaInventoryAsOf(Date.parse("2026-09-04T08:30:00Z")), inventoryDate);
-console.log("PASS regional packing, source eligibility, stable <=5 batches, current inventory window and no-date AWD");
+// fbaInventoryAsOf is the PREVIOUS UTC date (D-1): on 2026-09-05 it names the 2026-09-04 snapshot.
+assert.equal(fbaInventoryAsOf(Date.parse("2026-09-05T08:30:00Z")), inventoryDate);
+console.log("PASS regional packing, source eligibility, stable <=5 batches, exact single-day D-1 inventory window and no-date AWD");
 
 const req = plan.reportRequests[0];
 const health = req.sources.find((s) => s.sourceKey === "fba-inventory-health");
@@ -59,7 +61,7 @@ const statuses = {}; const loaded = {};
 for (const s of req.sources) {
   statuses[s.requestHash] = "succeeded";
   const rows = s.marketplacePairs.flatMap((p) => s.sourceKey === "fba-inventory-health"
-    ? [salesDate, inventoryDate].map((date) => ({ date, seller_or_vendor_id: p.sellerId, marketplace_country_code: p.marketplace, child_asin: "ASIN", sku: "SKU", available: date === salesDate ? 1000 : 12 }))
+    ? [{ date: inventoryDate, seller_or_vendor_id: p.sellerId, marketplace_country_code: p.marketplace, child_asin: "ASIN", sku: "SKU", available: 12 }]
     : [{ seller_or_vendor_id: p.sellerId, marketplace_country_code: p.marketplace, child_asin: "ASIN", sku: "SKU", awd_available_distributable_quantity: 7 }]);
   loaded[s.requestHash] = { rows, fetched_at: "2026-09-04T08:40:00Z" };
 }
@@ -74,7 +76,24 @@ assert.equal(result.payload.inventoryDate, inventoryDate);
 assert.equal(result.payload.rows[0].fbaAvailable, 12);
 assert.equal(result.payload.inventoryStale, false);
 assert.equal(result.payload.awdFetchedAt, "2026-09-04T08:40:00Z");
-console.log("PASS real assembly/derive: Sept 2 sales with Sept 4 stock, no historical stock addition");
+console.log("PASS real assembly/derive: Sept 2 sales with the exact Sept 4 (D-1) stock snapshot");
+
+// CROSS-DATE GUARD: a row dated OUTSIDE the exact single inventory day (even an in-the-past sales date) makes the
+// derive INVALID -- zero writes, LKG preserved. Inventory can therefore never be combined or summed across dates.
+{
+  const crossLoaded = { ...loaded };
+  for (const s of req.sources) {
+    if (s.sourceKey !== "fba-inventory-health") continue;
+    const rows = s.marketplacePairs.flatMap((p) => [salesDate, inventoryDate].map((date) => ({
+      date, seller_or_vendor_id: p.sellerId, marketplace_country_code: p.marketplace, child_asin: "ASIN", sku: "SKU", available: date === salesDate ? 1000 : 12,
+    })));
+    crossLoaded[s.requestHash] = { rows, fetched_at: "2026-09-04T08:40:00Z" };
+  }
+  const crossAssembled = assembleSources(req.sources, statuses, crossLoaded, {}, req.owner);
+  const crossResult = deriveReportSnapshot({ reportKey: "fba-plan", sources: crossAssembled.sources, context });
+  assert.equal(crossResult.status, "invalid", "a cross-date inventory row must invalidate the derive (never summed)");
+}
+console.log("PASS cross-date inventory row rejected: no cross-date combination or summation is possible");
 
 const expired = await planFbaBucketCost({ bucketAccounts: europe, connections, asOf: salesDate, inventoryAsOf: inventoryDate,
   getSourceExportCache: async () => ({ fetched_at: "2026-09-03T10:00:00Z" }) });

@@ -1,0 +1,69 @@
+name: account-onboarding
+
+# The 15-minute PRIMARY DataDoe account-onboarding DISCOVERY worker. It is NOT a second scheduler:
+#   - ZERO DataDoe exports STRUCTURALLY (its only DataDoe call is the zero-token directory GET; the
+#     worker module contains no export adapter/create path -- the runner also proves tokens spent = 0
+#     by re-reading the balance);
+#   - scheduler-v2 remains the ONE automatic owner of every paid source. This worker only maintains
+#     durable onboarding state (account_onboarding), atomically CLAIMS the bootstrap operation for a
+#     newly-ready account (account-bootstrap/<id>/<firstDiscoveredDate>; idempotent RPC), and merges
+#     visibility into the account-directory snapshot ("Setting up" for admins). The next scheduler-v2
+#     regional run then bootstraps the claimed account through the existing per-source machinery under
+#     the existing regional token ceilings.
+#   - ONE concurrency group (account-onboarding); a delayed/overlapping cron queues, never runs twice.
+# GitHub cron delivery is approximate (~every 15 minutes, sometimes delayed) -- the pass is idempotent
+# and a later pass observes the same state, so delay only postpones, never duplicates.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry-run (zero writes) | live (Supabase writes only; zero DataDoe exports)"
+        required: false
+        default: "live"
+        type: choice
+        options:
+          - dry-run
+          - live
+
+concurrency:
+  group: account-onboarding
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Verify required secrets are present (fail fast, never print values)
+        run: |
+          set -uo pipefail
+          missing=""
+          for v in SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY; do
+            if [ -z "${!v:-}" ]; then missing="$missing $v"; fi
+          done
+          if [ -z "${SUPABASE_URL:-}" ] && [ -z "${VITE_SUPABASE_URL:-}" ]; then missing="$missing SUPABASE_URL|VITE_SUPABASE_URL"; fi
+          if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
+          echo "All required secrets present."
+      - name: Install dependencies
+        run: npm ci
+      - name: Run one onboarding discovery pass (zero DataDoe exports; Supabase-only writes)
+        run: node scripts/release/account-onboarding-discovery.mjs --mode=${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'live' }}

@@ -74,9 +74,10 @@ jobs:
     outputs:
       region: ${{ steps.cfg.outputs.region }}
       asof: ${{ steps.cfg.outputs.asof }}
-      # ONE shared inventory snapshot date (UTC today) computed exactly once here and consumed unchanged by BOTH the FBA
-      # job and the Listing Health v3 job, so FBA inventory and v3 always adopt a single inventory identity. It is
-      # DISTINCT from `asof` (D-1, for OLI/Ads). A watchdog re-dispatch for the same region+day recomputes the same value.
+      # ONE shared inventory snapshot date (the previous UTC date, D-1) computed exactly once here and consumed
+      # unchanged by BOTH the FBA job and the Listing Health v3 job, so FBA inventory and v3 always adopt a single
+      # inventory identity (requested as EXACTLY [D-1 .. D-1]). It equals `asof` but stays a separate output so the
+      # inventory identity is threaded explicitly. A watchdog re-dispatch for the same region+day recomputes the same value.
       inventory_asof: ${{ steps.cfg.outputs.inventory_asof }}
       run_required: ${{ steps.guard.outputs.run_required }}
       already_published: ${{ steps.guard.outputs.already_published }}
@@ -137,10 +138,12 @@ jobs:
             "us-ca")     tokenmin=10 ;;
           esac
           asof="$(date -u -d 'yesterday' +%Y-%m-%d)"
-          # ONE shared inventory snapshot date = UTC today, computed EXACTLY ONCE here. FBA inventory + Listing Health v3
-          # both adopt this identity; the downstream v3 job must NEVER recompute UTC today independently. Distinct from
-          # asof (D-1). Matches fbaInventoryAsOf() (UTC today) so the FBA inventory cache the v3 tranche reuses aligns.
-          inventory_asof="$(date -u +%Y-%m-%d)"
+          # ONE shared inventory snapshot date = the previous UTC date (D-1), computed EXACTLY ONCE here. FBA
+          # inventory is requested as EXACTLY [D-1 .. D-1]; FBA + Listing Health v3 both adopt this single
+          # identity, and the downstream v3 job must NEVER recompute it independently. It equals asof (both are
+          # D-1) but stays a separate output so the inventory identity is always threaded explicitly. Matches
+          # fbaInventoryAsOf() (previous UTC date) so the FBA inventory cache the v3 tranche reuses aligns.
+          inventory_asof="$asof"
           # Durable operation identity is region + requestedAsOf (NOT the cron) so the primary + the watchdog share ONE
           # operation + one durable token/create budget (idempotent adoption).
           opkey="scheduled-fresh/$region/$asof"
@@ -155,7 +158,7 @@ jobs:
             echo "- event: ${{ github.event_name }} · cron: \`${{ github.event.schedule }}\` · dispatch identity: \`${{ inputs.dispatch_id }}\`";
             echo "- resolved region: **$region** (publishes ONLY this region; every other region is untouched)";
             echo "- head/workflow SHA: \`${{ github.sha }}\` · run id: ${{ github.run_id }} (attempt ${{ github.run_attempt }})";
-            echo "- requestedAsOf (D-1): $asof · inventoryAsOf (UTC today, shared FBA+v3): $inventory_asof · refresh_mode: $mode · operation key: \`$opkey\` · token floor: $tokenmin";
+            echo "- requestedAsOf (D-1): $asof · inventoryAsOf (D-1, shared FBA+v3): $inventory_asof · refresh_mode: $mode · operation key: \`$opkey\` · token floor: $tokenmin";
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Resolved event=${{ github.event_name }} cron='${{ github.event.schedule }}' region=$region requestedAsOf=$asof inventoryAsOf=$inventory_asof mode=$mode opkey=$opkey tokenmin=$tokenmin"
 
@@ -293,8 +296,9 @@ jobs:
           esac
           echo "maxtok=$maxtok" >> "$GITHUB_OUTPUT"
           echo "FBA region=$region ceiling=$maxtok"
-      # --inventory-as-of is the SHARED inventory_asof (UTC today) resolved once in the run job, so this FBA inventory
-      # fetch and the downstream Listing Health v3 job adopt ONE inventory identity (v3 reuses this exact cache).
+      # --inventory-as-of is the SHARED inventory_asof (D-1) resolved once in the run job, so this FBA inventory
+      # fetch (EXACTLY [D-1 .. D-1]) and the downstream Listing Health v3 job adopt ONE inventory identity (v3
+      # reuses this exact cache).
       - name: FBA go-live for this region (batched fetch -> derive -> publish -> ownership -> ALWAYS safe-close)
         run: node scripts/release/fba-plan-golive.mjs --mode=go-live --region=${{ needs.run.outputs.region }} --max-tokens=${{ steps.fcfg.outputs.maxtok }} --inventory-as-of=${{ needs.run.outputs.inventory_asof }}
 
@@ -342,7 +346,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
       # --cycle-date AND the --confirm operation id BOTH use the SHARED inventory_asof from the run job (never a locally
-      # recomputed UTC today), so the v3 inventory identity matches the FBA cache and a watchdog replay is idempotent.
+      # recomputed date), so the v3 inventory identity matches the FBA cache and a watchdog replay is idempotent.
       - name: Listing Health v3 shadow ingestion for this region (Listings + Listings-Raw only; inventory reuse-only)
         run: node scripts/release/listing-health-v3-ingestion.mjs --region=${{ needs.run.outputs.region }} --mode=live --cycle-date=${{ needs.run.outputs.inventory_asof }} --confirm=listing-health-v3/${{ needs.run.outputs.region }}/${{ needs.run.outputs.inventory_asof }}
 
@@ -386,7 +390,7 @@ jobs:
           echo "All required secrets present."
       - name: Install dependencies
         run: npm ci
-      # --as-of uses the SHARED inventory_asof (UTC today) from the run job as the future-guard ceiling; the derive
+      # --as-of uses the SHARED inventory_asof (D-1) from the run job as the future-guard ceiling; the derive
       # clamps down to each account's latest proven date, so no future or fabricated data can ever be materialized.
       - name: Materialize durable reports for this region (zero export; idempotent upsert)
         run: node scripts/release/report-materialization.mjs --region=${{ needs.run.outputs.region }} --mode=live --as-of=${{ needs.run.outputs.inventory_asof }}

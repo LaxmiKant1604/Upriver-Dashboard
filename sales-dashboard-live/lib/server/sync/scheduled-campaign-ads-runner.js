@@ -15,8 +15,9 @@
 
 import { runAdsSyncWithDeps, PRODUCTION_ADS_SYNC_DEPS } from "../ads-sync.js";
 import { getDataDoeConnections, classifyDirectoryAccounts } from "../datadoe-connections.js";
-import { fetchAccounts, fetchCompatibleSourceNames } from "../datadoe.js";
-import { getDailyAdsCoverage } from "../supabase.js";
+import { fetchAccountsDetailed, fetchCompatibleSourceNames } from "../datadoe.js";
+import { fetchExportEligibleAccounts } from "./account-onboarding.js";
+import { getDailyAdsCoverage, getAccountOnboardingRows } from "../supabase.js";
 import { evaluateSourceCoverage } from "./ppc-ads-loader.js";
 import { getDataDoeTokenBalance } from "../datadoe-usage.js";
 import {
@@ -62,7 +63,11 @@ export function campaignAdsWindow(asOf, runKind = "initial") {
  */
 export async function discoverRoutedAccounts({ deps = {} } = {}) {
   const getConnections = deps.getConnections || getDataDoeConnections;
-  const fetchAccts = deps.fetchAccounts || fetchAccounts;
+  // EXPORT-ELIGIBILITY GATE (default path): only export-eligible primary accounts are routed -- a
+  // DataDoe still-loading account never enters a Campaign Ads batch (its export would 400 and poison
+  // the whole <=5-seller batch). Tests may inject deps.fetchAccounts to bypass the gate.
+  const fetchAccts = deps.fetchAccounts
+    || ((apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows: getAccountOnboardingRows }));
   const connections = getConnections();
   const primaryConn = connections.find((c) => c && c.id === "primary");
   if (!primaryConn || !primaryConn.apiKey) { const e = new Error("CAMPAIGN_ADS_NO_PRIMARY_CONNECTION: no primary DataDoe connection / api key (fail closed)."); e.code = "CAMPAIGN_ADS_NO_PRIMARY"; throw e; }
@@ -111,16 +116,26 @@ export async function planCampaignAdsRegionRun({ region, asOf, runKind = "initia
     else unreadable.push(a);
   }
 
-  const covered = []; const pending = [];
+  // Per-account window kind: an account with NO durable Campaign coverage AT ALL is a NEW account and
+  // gets the INITIAL 56-inclusive-day window through the same asOf (its bootstrap history); every
+  // account with any prior coverage stays on the run's rolling window (daily 21d from the scheduler).
+  // After the initial window completes, its coverage exists, so every later run is rolling -- the
+  // "initial 56D then rolling 21D" contract with zero extra state.
+  const initialWin = campaignAdsWindow(S(win.to), "initial");
+  const covered = []; const pending = []; const initialPending = [];
   for (const a of compatible) {
+    let cov = null;
+    try { cov = await getCoverage(a.accountId, CAMPAIGN_ADS_GRAIN); } catch (_e) { cov = null; }
+    const neverCovered = !!cov && cov.read === "ok" && (!Array.isArray(cov.windows) || cov.windows.length === 0);
     let isCovered = false;
     try {
-      const cov = await getCoverage(a.accountId, CAMPAIGN_ADS_GRAIN);
       isCovered = !!cov && cov.read === "ok" && cov.status === "succeeded" && evaluateSourceCoverage(cov, win.from, win.to).proven === true;
     } catch (_e) { isCovered = false; }
-    (isCovered ? covered : pending).push(a);
+    if (isCovered) covered.push(a);
+    else if (neverCovered) initialPending.push(a);
+    else pending.push(a);
   }
-  return { region, window: win, regionAccounts, compatible, incompatible, unreadable, covered, pending, primaryConn };
+  return { region, window: win, initialWindow: initialWin, regionAccounts, compatible, incompatible, unreadable, covered, pending, initialPending, primaryConn };
 }
 
 /**
@@ -134,18 +149,26 @@ export async function planCampaignAdsRegionRun({ region, asOf, runKind = "initia
  */
 export async function runCampaignAdsRegionSlice({ region, asOf, runKind = "initial", windowOverride = null, maxCreates = null, maxFallbackCreates = null, plan = null, deps = {}, log = () => {} } = {}) {
   const p = plan || await planCampaignAdsRegionRun({ region, asOf, runKind, windowOverride, deps });
+  const initialPending = Array.isArray(p.initialPending) ? p.initialPending : [];
+  const pendingAll = [...p.pending, ...initialPending];
   if (!p.compatible.length) {
     return { phase: "complete", region: p.region, creates: 0, tokens: 0, batches: 0, covered: 0, incompatible: p.incompatible.length, rejected: [], transient: [], ambiguous: [], diagnostics: [], note: "no Amazon-Ads-compatible accounts in region" };
   }
-  if (!p.pending.length) {
+  if (!pendingAll.length) {
     return { phase: "complete", region: p.region, creates: 0, tokens: 0, batches: 0, covered: p.covered.length, incompatible: p.incompatible.length, rejected: [], transient: [], ambiguous: [], diagnostics: [], note: "already fully covered" };
   }
-  const batches = batchAccounts(p.pending, MAX_SELLERS_PER_BATCH);
+  // Rolling-window accounts batch together; never-covered NEW accounts batch SEPARATELY under the
+  // INITIAL 56-inclusive-day window (their bootstrap history). Each batch carries its own window; a
+  // create-time-4xx split child inherits its parent's window.
+  const batches = [
+    ...batchAccounts(p.pending, MAX_SELLERS_PER_BATCH).map((b) => ({ ...b, window: p.window })),
+    ...batchAccounts(initialPending, MAX_SELLERS_PER_BATCH).map((b) => ({ ...b, window: p.initialWindow || p.window })),
+  ];
   // Normal ceiling = one create per planned batch. FALLBACK ceiling = extra creates a create-time-4xx SPLIT may need,
   // bounded by the pending seller count (worst case: every rejected batch bisects down to single sellers). Both are
   // configurable; the combined hard ceiling is enforced BEFORE every POST (fail closed -> never spends past budget).
   const normalCeiling = maxCreates != null ? Math.max(0, Math.trunc(Number(maxCreates))) : batches.length;
-  const fallbackCeiling = maxFallbackCreates != null ? Math.max(0, Math.trunc(Number(maxFallbackCreates))) : p.pending.length;
+  const fallbackCeiling = maxFallbackCreates != null ? Math.max(0, Math.trunc(Number(maxFallbackCreates))) : pendingAll.length;
   // TWO independent budgets: a normal (depth-0) planned-batch create draws from normalCeiling; a SPLIT child create
   // (depth>0, born from a create-time-4xx) draws from the SEPARATE fallbackCeiling. Both refuse BEFORE the POST (fail
   // closed) so a split can never exhaust the normal budget and no budget can ever be exceeded.
@@ -164,11 +187,12 @@ export async function runCampaignAdsRegionSlice({ region, asOf, runKind = "initi
   };
   const workerDeps = { ...PRODUCTION_ADS_SYNC_DEPS, ...(deps.workerDeps || {}), createExport: guardedCreate };
   const runWorker = deps.runAdsSyncWithDeps || runAdsSyncWithDeps;
-  const countryOf = new Map(p.pending.map((a) => [S(a.accountId), S(a.marketplace).toUpperCase()]));
-  const runOne = (ids, depth = 0) => {
+  const countryOf = new Map(pendingAll.map((a) => [S(a.accountId), S(a.marketplace).toUpperCase()]));
+  const runOne = (ids, depth = 0, window = null) => {
     isFallbackRef.value = depth > 0; // split-child creates (depth>0) draw from the fallback budget; sequential, no interleave
     const countries = [...new Set(ids.map((id) => countryOf.get(S(id))).filter(Boolean))];
-    return runWorker(workerDeps, countries, [CAMPAIGN_ADS_GRAIN], { accountIds: ids, requiredCoverage: { from: p.window.from, to: p.window.to } });
+    const win = window || p.window; // per-batch window (initial 56d for never-covered accounts; rolling otherwise)
+    return runWorker(workerDeps, countries, [CAMPAIGN_ADS_GRAIN], { accountIds: ids, requiredCoverage: { from: win.from, to: win.to } });
   };
 
   const rec = await runCampaignAdsBatchesWithRecovery({ batches, runOne, classifyError: classifyThrownSourceError, log });
@@ -191,7 +215,7 @@ export async function runCampaignAdsRegionSlice({ region, asOf, runKind = "initi
   const assessment = assessCampaignAdsRegionCycle({ region: p.region, discoveredAccounts: covered, batchResults: rec.batchResults.filter((b) => !b.summary || b.summary.deferred !== true), creates, allowZeroBatches: covered.length === 0 });
   if (!assessment.ok && covered.length) return { phase: "sync", ok: false, region: p.region, problems: assessment.problems.slice(0, 6), creates, tokens };
   const accountedFor = new Set([...rec.covered, ...rejected, ...transient, ...ambiguous].map(S));
-  const unaccounted = p.pending.map((a) => S(a.accountId)).filter((id) => !accountedFor.has(id));
+  const unaccounted = pendingAll.map((a) => S(a.accountId)).filter((id) => !accountedFor.has(id));
   if (unaccounted.length) return { phase: "sync", ok: false, region: p.region, problems: ["accounts unaccounted for: " + unaccounted.length], creates, tokens };
   const isolatedCount = rejected.length + transient.length + ambiguous.length;
   if (isolatedCount) {
@@ -225,17 +249,18 @@ export async function runCampaignAdsRegionSlice({ region, asOf, runKind = "initi
  * deferred?, ceilingExhausted? }.
  */
 export async function runCampaignAdsBatchesWithRecovery({ batches, runOne, classifyError = classifyThrownSourceError, maxSplitDepth = 4, log = () => {} } = {}) {
-  const queue = (Array.isArray(batches) ? batches : []).map((b) => ({ ids: [...((b && b.allowlist) || b || [])].map(S).filter(nb), depth: 0 }));
+  // Each batch may carry its OWN window (per-account initial-56d vs rolling); splits inherit it.
+  const queue = (Array.isArray(batches) ? batches : []).map((b) => ({ ids: [...((b && b.allowlist) || b || [])].map(S).filter(nb), depth: 0, window: (b && b.window) || null }));
   const covered = new Set(); const rejected = []; const transient = []; const ambiguous = []; const budgetDeferred = [];
   const diagnostics = []; const batchResults = [];
   let ceilingExhausted = false;
   while (queue.length) {
-    const { ids, depth } = queue.shift();
+    const { ids, depth, window } = queue.shift();
     if (!ids.length) continue;
     if (ceilingExhausted) { for (const id of ids) budgetDeferred.push(id); continue; }
     let summary;
     try {
-      summary = await runOne(ids, depth);
+      summary = await runOne(ids, depth, window);
     } catch (error) {
       if (error && error.code === "CAMPAIGN_ADS_CEILING") {
         ceilingExhausted = true; for (const id of ids) budgetDeferred.push(id);
@@ -246,7 +271,7 @@ export async function runCampaignAdsBatchesWithRecovery({ batches, runOne, class
       diagnostics.push({ classification: cls.classification, stage: cls.stage, status: cls.status, batchSize: ids.length, sellers: ids, excerpt: cls.excerpt, terminal: cls.terminal, retryable: cls.retryable, ambiguous: cls.ambiguous });
       if (cls.classification === SOURCE_FAILURE.REQUEST_REJECTED && ids.length > 1 && depth < maxSplitDepth) {
         const halves = splitBatchAllowlist(ids);
-        for (const h of halves) queue.push({ ids: h, depth: depth + 1 });
+        for (const h of halves) queue.push({ ids: h, depth: depth + 1, window });
         log("split rejected batch (" + ids.length + " sellers) -> " + halves.map((h) => h.length).join("+"));
         continue;
       }

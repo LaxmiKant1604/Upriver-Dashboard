@@ -31,7 +31,13 @@ const cycleDate = addDays(requestedAsOf, 1);
 const adsFrom = addDays(requestedAsOf, -20); const adsTo = requestedAsOf;
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
-const { fetchAccounts, fetchCompatibleSourceNames } = await import("../../lib/server/datadoe.js");
+const { fetchAccountsDetailed, fetchCompatibleSourceNames } = await import("../../lib/server/datadoe.js");
+const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
+const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
+// EXPORT-ELIGIBILITY GATE: the readiness proof covers EXACTLY the export-eligible account set the
+// publish steps will use (same gate), so a still-loading/unclaimed account can never fail-close a
+// region's honest D-1 publication for the accounts that ARE ready.
+const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows });
 const { ASIN_ADS_SOURCE_NAME } = await import("../../lib/server/sync/scheduled-asin-ads-runner.js");
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, getOliCompleteness } = await import("../../lib/server/supabase.js");
 const { assessScheduledOliCycle } = await import("../../lib/server/sync/source-scheduled-oli.js");

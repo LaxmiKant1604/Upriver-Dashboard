@@ -8,7 +8,9 @@
 
 import pg from "pg";
 import { getDataDoeConnections, classifyDirectoryAccounts } from "../datadoe-connections.js";
-import { fetchAccounts as fetchDataDoeAccounts } from "../datadoe.js";
+import { fetchAccountsDetailed as fetchDataDoeAccountsDetailed } from "../datadoe.js";
+import { getAccountOnboardingRows } from "../supabase.js";
+import { fetchExportEligibleAccounts } from "./account-onboarding.js";
 import { accountInScope, isRoutingScope } from "./scheduler-scope.js";
 
 export const PRIORITY_CONTROL_ADVISORY_LOCK = Object.freeze([20260825, 2]);
@@ -25,7 +27,12 @@ export async function discoverPrimaryAccountIds(bucket = null) {
   if (bucket != null && !isRoutingScope(bucket)) throw new Error(`discoverPrimaryAccountIds bucket must be a routing scope (india|europe-au|us-ca|us|non-us; got "${bucket}") (fail closed).`);
   const connections = getDataDoeConnections();
   const primaryConn = connections.find((c) => c.id === "primary");
-  const rows = (await fetchDataDoeAccounts(primaryConn.apiKey)) || [];
+  // EXPORT-ELIGIBILITY GATE: controls/rollout open ONLY for export-eligible accounts -- a DataDoe
+  // still-loading or not-yet-claimed account never enters a publication scope (fails soft to
+  // readiness-only when the onboarding table is unreadable; loading accounts stay excluded either way).
+  const rows = (await fetchExportEligibleAccounts(primaryConn.apiKey, {
+    fetchDetailed: fetchDataDoeAccountsDetailed, readOnboardingRows: getAccountOnboardingRows,
+  })) || [];
   const { active } = classifyDirectoryAccounts(rows, connections);
   const ids = [];
   for (const a of active) {

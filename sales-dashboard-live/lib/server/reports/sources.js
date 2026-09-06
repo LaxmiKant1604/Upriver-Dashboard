@@ -96,15 +96,15 @@ export const LISTINGS_RAW = {
 };
 
 // FBA Inventory Health. defaultDataset, premium. INITIAL 1 day and
-// RECURRING_DAILY 1 day, so only a recent snapshot exists; keep the latest
-// snapshot date only. Carries the competitive prices used for Buy Box cause
-// attribution: your_price, sales_price, featuredoffer_price and
-// lowest_price_new_plus_shipping, plus `available` and `currency`.
+// RECURRING_DAILY 1 day. Every request asks for EXACTLY one snapshot day
+// ([D-1 .. D-1] -- the latest complete previous-day snapshot; the former
+// lookback-window field is removed). Carries the competitive prices used
+// for Buy Box cause attribution: your_price, sales_price, featuredoffer_price
+// and lowest_price_new_plus_shipping, plus `available` and `currency`.
 export const FBA_INVENTORY_HEALTH = {
   id: "44fc5ba0ce81a7807601f6d7a9b8b7aaec64be4c7e046ea30dc6864d1a4aa823",
   table: "amazon_fba_inventory_health",
   label: "FBA Inventory Health",
-  snapshotLookbackDays: 10,
 };
 
 // Returns (FBA & FBM). defaultDataset. INITIAL 60 days and RECURRING_DAILY 60,

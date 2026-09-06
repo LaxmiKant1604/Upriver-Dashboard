@@ -128,7 +128,8 @@ const fullCoverage = [{ from: "2024-01-01", to: asOf }];
 
 /* ===================== E. derive: parity, window/zero-export, coverage, inventory, raw, LKG ===================== */
 const baseListings = [listingRow(SELLER, "US", "A", { status: "Active", price: 25, fba: 30, channel: "AMAZON_NA" }), listingRow(SELLER, "US", "B", { status: "Inactive", price: 0, qty: 7, channel: "DEFAULT" })];
-const baseInv = [invRow("2026-09-03", SELLER, "US", "A", 30), invRow("2026-09-01", SELLER, "US", "A", 999)]; // newest 09-03
+// Inventory is EXACTLY the single requested snapshot day (inv = 2026-09-04); any other date is rejected.
+const baseInv = [invRow(inv, SELLER, "US", "A", 30)];
 const baseCat = [catRow("A", "BrandX"), catRow("B", "BrandY")];
 const baseOli = [oliRow("2026-09-01", "A", 100, 10), oliRow("2026-08-20", "A", 50, 5), oliRow("2026-09-02", "B", 200, 20), oliRow("2026-06-01", "A", 999, 99)];
 const ctx = (over = {}) => ({ to: asOf, inventoryAsOf: inv, rawSellerId: SELLER, accountId: SELLER, listingHealthV3DurableOli: durableOli({ rows: baseOli, coverageWindows: fullCoverage }), listingHealthV3DurableCatalog: durableCat(baseCat), ...over });
@@ -142,7 +143,12 @@ const deriveV3 = (sources, context) => deriveReportSnapshot({ reportKey: "listin
   ok("E: derive status derived; sales source is order-line-items (no Profit-by-SKU)", r30.status === "derived" && r30.payload.salesSource === "order-line-items");
   const a30 = r30.payload.rows.find((x) => x.sku === "A");
   ok("E: 30D OLI window sales/units for SKU-A = 150/15 (08-20 + 09-01, June excluded)", a30.sales === 150 && a30.units === 15);
-  ok("E: latest inventory only (SKU-A on-hand 30 from 09-03, not 999 from 09-01)", a30.onHandFba === 30 && a30.onHandFbaSource === "fba-snapshot");
+  ok("E: exact single-day (D-1) inventory (SKU-A on-hand 30 from the 09-04 snapshot)", a30.onHandFba === 30 && a30.onHandFbaSource === "fba-snapshot");
+
+  // Cross-date guard: an inventory row on ANY other day than the exact requested one invalidates the derive.
+  const crossed = v3Sources({ listings: baseListings, raw: [], inventory: [...baseInv, invRow("2026-09-01", SELLER, "US", "A", 999)] });
+  ok("E: an inventory row dated off the exact D-1 day => invalid (never folded or summed)",
+    deriveV3(crossed.sources, ctx({ windowPreset: "30D" })).status === "invalid");
 
   // WINDOW CHANGE with ZERO exports: 7D re-aggregates the SAME durable OLI (no fetch), different total.
   const realFetch = globalThis.fetch; let hits = 0; globalThis.fetch = () => { hits += 1; throw new Error("no network in derive"); };

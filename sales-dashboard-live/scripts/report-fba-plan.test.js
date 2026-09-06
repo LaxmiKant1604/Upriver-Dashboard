@@ -54,7 +54,7 @@ const WINS = [
   { from: "2025-07-01", to: "2025-07-31" },
   { from: "2025-08-01", to: "2025-08-06" }, // current MTD
 ];
-const INV_WINDOW = { from: "2025-07-27", to: ASOF }; // asOf - 10 days .. asOf
+const INV_WINDOW = { from: ASOF, to: ASOF }; // EXACTLY the single snapshot day [asOf .. asOf] (D-1)
 
 let hashSeq = 0;
 const frag = (requestKey, from, to, ids = [ID]) => ({ requestKey, requestHash: "h" + (hashSeq += 1), from, to, sellerOrVendorIds: ids });
@@ -166,8 +166,10 @@ const OLI = [
 const CATALOG = [{ child_asin: "ASIN1", product_brand: "Acme", product_name: "Widget" }, { child_asin: "ASIN2", product_brand: "Beta", product_name: "Gadget" }];
 const INV = [
   { date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-1", marketplace_country_code: "US", available: 100, reserved_customer_order: 4, reserved_fc_transfer: 8, reserved_fc_processing: 1, inbound_shipped: 5, inbound_received: 2, inbound_working: 0, product_name: "Widget Inv" },
-  { date: "2025-08-01", child_asin: "ASIN1", sku: "SKU-OLD", available: 999 }, // older snapshot -> ignored
 ];
+// A row from ANY other date (e.g. an older snapshot day) must now be REJECTED by the single-day window
+// validation -- it can never be silently ignored or summed (see the cross-date test below).
+const INV_WITH_CROSS_DATE_ROW = [...INV, { date: "2025-08-01", child_asin: "ASIN1", sku: "SKU-OLD", available: 999 }];
 const AWD = [{ marketplace_country_code: "US", child_asin: "ASIN1", sku: "SKU-1", awd_available_distributable_quantity: 42, awd_total_inbound_quantity: 15 }];
 
 // Hand-computed expected payload, transcribed from the api/datadoe.js `fba-plan` handler formula.
@@ -523,24 +525,24 @@ test("foldPlanAsinUnits: sums grouped child_asin units in first-seen order", () 
 
 group("fba-plan: exact inventory + AWD window pinning");
 
-test("fba-plan: the canonical inventory window IS addDaysStr(asOf,-10)..asOf and AWD is null/null", () => {
-  assert.equal(INV_WINDOW.from, addDaysStr(ASOF, -10));
+test("fba-plan: the canonical inventory window IS the EXACT single day asOf..asOf and AWD is null/null", () => {
+  assert.equal(INV_WINDOW.from, ASOF);
   assert.equal(INV_WINDOW.to, ASOF);
 });
 
-test("fba-plan: a SHORTENED inventory lookback (from > asOf-10) blocks; payload null", () => {
+test("fba-plan: ANY lookback window (from < asOf, e.g. the retired asOf-10 shape) blocks; payload null", () => {
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
-  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -9) };
+  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -10) };
   const res = deriveFba(planned, rows);
   assert.equal(res.status, "invalid");
   assert.equal(res.payload, null);
 });
 
-test("fba-plan: an EXTENDED inventory lookback (from < asOf-10) blocks", () => {
+test("fba-plan: a single-day window on the WRONG day (from = to = asOf-1) blocks", () => {
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
-  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -11) };
+  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -1), to: addDaysStr(ASOF, -1) };
   assert.equal(deriveFba(planned, rows).status, "invalid");
 });
 
@@ -565,10 +567,17 @@ test("fba-plan: EXACT canonical windows still derive the identical payload", () 
   assert.deepEqual(deriveFba(planned, rows).payload, EXPECTED);
 });
 
-test("planFbaPlan emits the canonical inventory (asOf-10..asOf) + no-date AWD windows the derivation requires", () => {
+test("fba-plan: an inventory row dated on ANY other day than the requested D-1 blocks (no cross-date fold)", () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV_WITH_CROSS_DATE_ROW, awdRows: AWD });
+  const res = deriveFba(planned, rows);
+  assert.equal(res.status, "invalid");
+  assert.equal(res.payload, null);
+});
+
+test("planFbaPlan emits the canonical single-day inventory (asOf..asOf) + no-date AWD windows the derivation requires", () => {
   const req = planFbaPlan({ accountId: ID, name: "Acme Co", country: "US", currency: "USD", connections: PL_CONN, asOf: ASOF });
   const inv = req.sources.find((s) => s.requestKey === "fba-plan:inventory-health");
-  assert.equal(inv.from, addDaysStr(ASOF, -10));
+  assert.equal(inv.from, ASOF);
   assert.equal(inv.to, ASOF);
   const awd = req.sources.find((s) => s.requestKey === "fba-plan:awd");
   assert.equal(awd.from, null);

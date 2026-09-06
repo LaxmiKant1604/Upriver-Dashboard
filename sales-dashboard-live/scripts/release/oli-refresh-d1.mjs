@@ -29,7 +29,15 @@ if (!isRoutingScope(bucket)) { console.error("STOP --bucket must be a routing sc
 if (!requestedAsOf || !/^\d{4}-\d{2}-\d{2}$/.test(requestedAsOf)) { console.error("STOP --requested-as-of must be YYYY-MM-DD (got: " + requestedAsOf + ")"); process.exit(2); }
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
-const { fetchAccounts } = await import("../../lib/server/datadoe.js");
+const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
+const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
+const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
+// EXPORT-ELIGIBILITY GATE: only export-eligible primary accounts are refreshed -- a DataDoe
+// still-loading account gets ZERO OLI create attempts (DataDoe hard-rejects them with HTTP 400).
+const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, {
+  fetchDetailed: fetchAccountsDetailed, readOnboardingRows,
+  onExcluded: (excluded, gateMode) => console.log(`onboarding gate (${gateMode}): excluded ${excluded.length} account(s): ${excluded.map((x) => `${x.accountId.slice(0, 8)}:${x.reason}`).join(", ")}`),
+});
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, openSupersedingSyncCycle, reserveOliFreshnessCreate, recordOliFreshnessExport, getOliCompleteness } = await import("../../lib/server/supabase.js");
 const { OLI_SOURCE_KEY, windowsProve } = await import("../../lib/server/sync/source-durable-model.js");

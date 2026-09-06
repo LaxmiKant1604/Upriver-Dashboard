@@ -404,7 +404,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       aggregations: null,
       orderByColumn: "date",
       orderByDirection: "DESC",
-      windowKind: "range:asOf-10d..asOf",
+      windowKind: "single-day:inventoryAsOf (D-1)",
       // LATEST-SNAPSHOT inventory: FBA Plan consumes ONLY the latest inventory date, so the source worker reduces a
       // single-seller payload to its latest PROVABLY-COMPLETE date (fitting the row cap + 8MB cache limit) instead of
       // hard-failing an oversized/cap-sized response -- NEVER summing across dates. Execution policy only (NOT part of
@@ -586,7 +586,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       aggregations: null,
       orderByColumn: "date",
       orderByDirection: "DESC",
-      windowKind: "range:asOf-10d..asOf (latest snapshot; shared FBA inventory export)",
+      windowKind: "single-day:asOf-1 (D-1 snapshot; shared FBA inventory export)",
       strict: true,
       dependencyMode: "staged",
       dependsOnRequestKey: "sales-movers:sales-latest-probe",
@@ -650,7 +650,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       aggregations: null,
       orderByColumn: "date",
       orderByDirection: "DESC",
-      windowKind: "range:asOf-10d..asOf (shared FBA inventory export)",
+      windowKind: "single-day:asOf-1 (D-1 snapshot; shared FBA inventory export)",
       strict: true,
     },
     {
@@ -774,7 +774,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       aggregations: null,
       orderByColumn: "date",
       orderByDirection: "DESC",
-      windowKind: "range:asOf-10d..asOf (shared FBA inventory export)",
+      windowKind: "single-day:asOf-1 (D-1 snapshot; shared FBA inventory export)",
       strict: true,
     },
     {
@@ -830,7 +830,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       aggregations: null,
       orderByColumn: "date",
       orderByDirection: "DESC",
-      windowKind: "range:asOf-10d..asOf (REUSES the fba-plan:inventory-health export identity)",
+      windowKind: "single-day:inventoryAsOf (D-1; REUSES the fba-plan:inventory-health export identity)",
       strict: true,
       // LATEST-SNAPSHOT inventory (same as fba-plan:inventory-health, whose export identity this REUSES): v3 consumes
       // only the latest inventory date. Kept in lockstep with fba-plan:inventory-health so the shared canonical job

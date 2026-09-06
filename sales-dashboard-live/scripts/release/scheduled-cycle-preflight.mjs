@@ -18,7 +18,11 @@ if (!isRoutingScope(bucket)) { console.error("STOP --bucket must be a routing sc
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
-const { fetchAccounts } = await import("../../lib/server/datadoe.js");
+const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
+const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
+const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
+// EXPORT-ELIGIBILITY GATE: the cycle preflight scopes to the SAME export-eligible set the run will use.
+const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows });
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows } = await import("../../lib/server/supabase.js");
 const { classifyScheduledOliCycle, assessDurableOliCoverageComplete } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");

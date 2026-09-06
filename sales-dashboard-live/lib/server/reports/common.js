@@ -112,14 +112,14 @@ export const INVENTORY_COLUMNS = [
  * which the UI must show as unavailable rather than as zero stock.
  */
 export async function fetchInventorySnapshot(apiKey, ids, asOf) {
-  // Strict on purpose. Ordering by date DESC puts the newest snapshot first, so
-  // hitting the cap only ever drops OLDER snapshots — unless the latest snapshot
-  // itself is bigger than the cap, in which case a SKU absent from the truncated
-  // result would look like zero stock and produce a false stockout claim. That
-  // is exactly the kind of confident-but-wrong output worth failing for.
+  // Strict on purpose. The window is EXACTLY the single previous day [asOf-1 .. asOf-1] (the latest
+  // complete D-1 snapshot; never a lookback range), so a payload at the cap is genuinely ambiguous and
+  // must fail: a SKU absent from a truncated result would look like zero stock and produce a false
+  // stockout claim. That is exactly the kind of confident-but-wrong output worth failing for.
+  const inventoryDay = addDaysStr(asOf, -1);
   const rows = await fetchExportRowsStrict(
     apiKey, FBA_INVENTORY_HEALTH.id, INVENTORY_COLUMNS, ids,
-    addDaysStr(asOf, -FBA_INVENTORY_HEALTH.snapshotLookbackDays), asOf, ROW_LIMITS.inventory,
+    inventoryDay, inventoryDay, ROW_LIMITS.inventory,
     { orderByColumn: "date", orderByDirection: "DESC" },
     "FBA inventory snapshot export"
   );

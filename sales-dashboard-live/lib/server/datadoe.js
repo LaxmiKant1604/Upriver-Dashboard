@@ -194,14 +194,24 @@ export async function ddFetch(url, options, attempt = 0) {
   return r;
 }
 
-export async function fetchAccounts(apiKey, attempt = 0) {
+/**
+ * The zero-token DataDoe account-directory GET, PRESERVING the readiness/progress evidence the raw
+ * response carries (previously dropped): per-connection `initialLoadComplete` (THE readiness bit -- a
+ * still-loading account must never receive a paid export; DataDoe hard-rejects such exports with HTTP
+ * 400), the `rowCount` progress proxies, the Ads-connection presence, `accountType` and `marketplaceId`.
+ * Returns the LEGACY normalized fields byte-identically PLUS a typed `readiness` object per account:
+ *   readiness: { sellerCentralReady, rowCount, sellerCentralRowCount, adsConnected, adsReady, adsRowCount, accountType, marketplaceId }
+ * `sellerCentralReady` is strictly `initialLoadComplete === true` -- an account is NEVER treated as
+ * ready merely because its ID exists in the directory.
+ */
+export async function fetchAccountsDetailed(apiKey, attempt = 0) {
   const r = await ddFetch(ENDPOINTS.sellers, { headers: authHeaders(apiKey) });
   if (!r.ok) {
     // Account discovery is an idempotent GET and DataDoe occasionally returns a brief 5xx while exports remain
     // healthy. Retry only this read-only directory call; create-export POSTs retain their strict no-retry rule.
     if ([500, 502, 503, 504].includes(r.status) && attempt < 3) {
       await sleep((attempt + 1) * 1000);
-      return fetchAccounts(apiKey, attempt + 1);
+      return fetchAccountsDetailed(apiKey, attempt + 1);
     }
     throw new Error(`DataDoe accounts request failed (${r.status}). Check the endpoint path in lib/server/datadoe.js against https://api.datadoe.com/api/v1/docs`);
   }
@@ -209,6 +219,8 @@ export async function fetchAccounts(apiKey, attempt = 0) {
   const list = body.data || body.results || (Array.isArray(body) ? body : []);
   return list.map((a) => {
     const profile = marketplaceProfile(a.marketplaceCountryCode, a.currency);
+    const sc = a.sellerCentralConnection && typeof a.sellerCentralConnection === "object" ? a.sellerCentralConnection : null;
+    const ads = a.amazonAdsConnection && typeof a.amazonAdsConnection === "object" ? a.amazonAdsConnection : null;
     return {
       id: a.id,
       name: a.name,
@@ -217,8 +229,26 @@ export async function fetchAccounts(apiKey, attempt = 0) {
       currency: profile.currency,
       locale: profile.locale,
       timeZone: profile.timeZone,
+      readiness: {
+        sellerCentralReady: sc ? sc.initialLoadComplete === true : false,
+        rowCount: numOrNull(a.rowCount),
+        sellerCentralRowCount: sc ? numOrNull(sc.rowCount) : null,
+        adsConnected: !!ads,
+        adsReady: ads ? ads.initialLoadComplete === true : false,
+        adsRowCount: ads ? numOrNull(ads.rowCount) : null,
+        accountType: String(a.accountType || "").trim() || null,
+        marketplaceId: String(a.marketplaceId || "").trim() || null,
+      },
     };
   });
+}
+
+// The LEGACY normalized directory read (no readiness fields), byte-identical output shape to before.
+// Every payload-facing consumer (selector snapshot, decoration) keeps this exact shape; readiness-aware
+// callers (the onboarding worker + the scheduled-export gates) use fetchAccountsDetailed instead.
+export async function fetchAccounts(apiKey, attempt = 0) {
+  const detailed = await fetchAccountsDetailed(apiKey, attempt);
+  return detailed.map(({ readiness: _readiness, ...account }) => account);
 }
 
 export async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit, options = {}) {

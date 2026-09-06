@@ -42,8 +42,12 @@ export function fbaCycleBucket(bucket) { return S(bucket).trim() + "-fba"; }
 
 // The server D-1 ceiling (never publish past yesterday). Server-resolved -- never taken from a request body.
 export function fbaServerCeiling(now = Date.now()) { return new Date(now - 86400000).toISOString().slice(0, 10); }
-// Inventory is a current snapshot, never capped by the sales coverage cutoff.
-export function fbaInventoryAsOf(now = Date.now()) { return new Date(now).toISOString().slice(0, 10); }
+// The ONE canonical FBA inventory snapshot date: the previous UTC date (D-1). Inventory is requested as
+// EXACTLY [D-1 .. D-1] (never a lookback window), so FBA Plan, Listing Health v3, Brand View inventory and
+// every materializer/read-back share a single proven snapshot-day identity. DataDoe stamps each daily
+// inventory snapshot with its own date, so the D-1 snapshot is complete by every regional run time; a
+// missing/empty D-1 fails closed downstream (LKG preserved, honestly stale -- never a fabricated zero).
+export function fbaInventoryAsOf(now = Date.now()) { return new Date(now - 86400000).toISOString().slice(0, 10); }
 
 /**
  * Resolve the coverage-maximizing go-live as-of + the included/blocked account split. Pure orchestration over

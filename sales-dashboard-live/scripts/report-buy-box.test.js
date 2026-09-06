@@ -99,7 +99,7 @@ function bbPlanned({ slices = [[], [], [], []], ordered = null, inventory = [], 
   const orderedSlices = ordered || canonicalOrderedFromDaily(slices, ids);
   SLICES.forEach((w, i) => { const f = frag("buy-box-loss:daily", w.from, w.to, ids); planned.push(f); rows[f.requestHash] = slices[i] || []; });
   OLI_SLICES.forEach((w, i) => { const f = frag("buy-box-loss:oli-sales", w.from, w.to, ids); planned.push(f); rows[f.requestHash] = orderedSlices[i] || []; });
-  const inv = frag("buy-box-loss:inventory", INV_FROM, ASOF, ids); planned.push(inv); rows[inv.requestHash] = inventory;
+  const inv = frag("buy-box-loss:inventory", INV_FROM, INV_FROM, ids); planned.push(inv); rows[inv.requestHash] = inventory; // EXACT single day [asOf-1 .. asOf-1]
   const cat = frag("buy-box-loss:catalog", null, null, ids); planned.push(cat); rows[cat.requestHash] = catalog;
   return { planned, rows };
 }
@@ -146,8 +146,8 @@ const FIXTURE = () => ({
     ],
   ],
   inventory: [
-    invRow("2025-08-08", "SKU-W", "ASIN-W", "USD", 5, { yourPrice: 19.99, salesPrice: 18.99, featuredOfferPrice: 17.99, lowestPriceNewPlusShipping: 20.5 }, 30, 10), // older snapshot -> dropped
-    invRow("2025-08-09", "SKU-W", "ASIN-W", "USD", 8, { yourPrice: 21.99, salesPrice: 20.99, featuredOfferPrice: 19.99, lowestPriceNewPlusShipping: 22.0 }, 40, 12), // latest
+    // EXACTLY the single previous day (asOf-1 = 2025-08-09); a row on any other date is now rejected.
+    invRow("2025-08-09", "SKU-W", "ASIN-W", "USD", 8, { yourPrice: 21.99, salesPrice: 20.99, featuredOfferPrice: 19.99, lowestPriceNewPlusShipping: 22.0 }, 40, 12),
     invRow("2025-08-09", "SKU-U", "ASIN-U", "USD", 0, null, 0, null), // genuine zero stock, null prices
   ],
   catalog: [
@@ -361,11 +361,11 @@ test("15e. a FUTURE daily date (2099-01-01) => invalid", () => {
   assert.equal(deriveBB(bbPlanned(withDailyRow(3, dailyRow("2099-01-01")))).status, "invalid");
 });
 
-test("15f. inventory row dated before asOf-10d or after asOf => invalid", () => {
+test("15f. inventory row dated off the exact single day (asOf-1) => invalid", () => {
   const before = bbPlanned({ ...FIXTURE(), inventory: [invRow(addDaysStr(INV_FROM, -1), "SKU-W", "ASIN-W", "USD", 8, null, 40, 12)] });
-  assert.equal(deriveBB(before).status, "invalid", "inventory before asOf-10d => invalid");
-  const after = bbPlanned({ ...FIXTURE(), inventory: [invRow(addDaysStr(ASOF, 1), "SKU-W", "ASIN-W", "USD", 8, null, 40, 12)] });
-  assert.equal(deriveBB(after).status, "invalid", "inventory after asOf => invalid");
+  assert.equal(deriveBB(before).status, "invalid", "inventory before the exact day => invalid");
+  const after = bbPlanned({ ...FIXTURE(), inventory: [invRow(ASOF, "SKU-W", "ASIN-W", "USD", 8, null, 40, 12)] });
+  assert.equal(deriveBB(after).status, "invalid", "inventory after the exact day (even asOf itself) => invalid");
 });
 
 test("15g. the exact Codex repro: daily 2099-01-01 + inventory 2099-01-02 no longer derives (=> invalid)", () => {
@@ -668,7 +668,7 @@ test("C1. default AND explicit planning include buy-box-loss; the plan holds exa
   const ordered = bb.sources.filter((s) => s.requestKey === "buy-box-loss:oli-sales");
   assert.deepEqual(ordered.map((s) => `${s.from}..${s.to}`), OLI_SLICES.map((s) => `${s.from}..${s.to}`), "six canonicalOliSlices ordered OLI slice windows");
   const inv = bb.sources.find((s) => s.requestKey === "buy-box-loss:inventory");
-  assert.deepEqual([inv.from, inv.to], [INV_FROM, ASOF], "inventory window asOf-10d..asOf");
+  assert.deepEqual([inv.from, inv.to], [INV_FROM, INV_FROM], "inventory window is the exact single day asOf-1..asOf-1");
   const cat = bb.sources.find((s) => s.requestKey === "buy-box-loss:catalog");
   assert.deepEqual([cat.from, cat.to], [null, null], "no-date catalog");
   // Report dependency map = all twelve canonical hashes; context carries the raw seller id + asOf.
@@ -777,7 +777,7 @@ async function main() {
   ({ runStagedSourceCycle } = await import("../lib/server/sync/source-sync-driver.js"));
   ({ addDaysStr, splitDateRangeByDays, canonicalOliSlices } = await import("../lib/server/date-windows.js"));
   FROM = addDaysStr(ASOF, -27);
-  INV_FROM = addDaysStr(ASOF, -10);
+  INV_FROM = addDaysStr(ASOF, -1); // the EXACT single D-1 snapshot day (from === to)
   SLICES = splitDateRangeByDays(FROM, ASOF, 7);
   OLI_SLICES = canonicalOliSlices(FROM, ASOF);
 

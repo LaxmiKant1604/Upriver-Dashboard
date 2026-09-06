@@ -60,7 +60,7 @@ function smPlanned({ probeRows, trafficRecent = [], trafficPrior = [], adsRecent
     const tp = frag("sales-movers:traffic", PRIOR.from, PRIOR.to, ids); planned.push(tp); rows[tp.requestHash] = trafficPrior;
     const ar = frag("sales-movers:ads", RECENT.from, RECENT.to, ids); planned.push(ar); rows[ar.requestHash] = adsRecent;
     const ap = frag("sales-movers:ads", PRIOR.from, PRIOR.to, ids); planned.push(ap); rows[ap.requestHash] = adsPrior;
-    const inv = frag("sales-movers:inventory", INV_FROM, ASOF, ids); planned.push(inv); rows[inv.requestHash] = inventory;
+    const inv = frag("sales-movers:inventory", INV_FROM, INV_FROM, ids); planned.push(inv); rows[inv.requestHash] = inventory; // EXACT single day [asOf-1 .. asOf-1]
     const cat = frag("sales-movers:catalog", null, null, ids); planned.push(cat); rows[cat.requestHash] = catalog;
   }
   return { planned, rows };
@@ -88,7 +88,7 @@ const FIXTURE = () => ({
   ],
   adsPrior: [{ child_asin: "A", currency: "USD", ad_spend_sum: 15, ad_sales_sum: 45, ad_clicks_sum: 80 }],
   inventory: [
-    { date: "2025-08-05", child_asin: "A", available: 5, inbound_shipped: 2, inbound_received: 1, days_of_supply: 10, units_shipped_t30: 30 },
+    // EXACTLY the single previous day (asOf-1 = 2025-08-09); a row on any other date is now rejected.
     { date: "2025-08-09", child_asin: "A", available: 8, inbound_shipped: 3, inbound_received: 0, days_of_supply: 12, units_shipped_t30: 40 },
     { date: "2025-08-09", child_asin: "B", available: 0, inbound_shipped: 0, inbound_received: 0, days_of_supply: null, units_shipped_t30: 0 },
   ],
@@ -489,7 +489,7 @@ async function main() {
   ({ salesMoversWindows } = await import("../lib/server/sync/report-source-contracts.js"));
   ({ sourceJobOwnerId } = await import("../lib/server/source-identity.js"));
   PROBE_FROM = addDaysStr(ASOF, -(4 + 7 * 3));
-  INV_FROM = addDaysStr(ASOF, -10);
+  INV_FROM = addDaysStr(ASOF, -1); // the EXACT single D-1 snapshot day (from === to)
   LATEST = "2025-08-08";
   ({ recent: RECENT, prior: PRIOR } = salesMoversWindows(LATEST));
 

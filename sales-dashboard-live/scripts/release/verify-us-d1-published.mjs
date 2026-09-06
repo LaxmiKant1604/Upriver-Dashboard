@@ -22,7 +22,12 @@ const ghSum = (value) => { const f = process.env.GITHUB_STEP_SUMMARY; if (f) app
 const short = (s) => String(s || "").slice(0, 8);
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
-const { fetchAccounts } = await import("../../lib/server/datadoe.js");
+const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
+const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
+const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
+// EXPORT-ELIGIBILITY GATE: the duplicate guard proves the SAME export-eligible account set the
+// publish pipeline uses, so a still-loading/unclaimed account can never keep a region "unpublished".
+const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows });
 const { selectPublishedUsD1Identities, US_PRIORITY_REPORT_KEYS } = await import("../../lib/server/sync/source-us-publication-guard.js");
 const { buildLiveReadback } = await import("../../lib/server/sync/source-priority-release-runner.js");
 const { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } = await import("../../lib/server/sync/report-publisher.js");

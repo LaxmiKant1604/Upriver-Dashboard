@@ -40,9 +40,10 @@ const BRAND_SALES_MONTH_START_LOOKBACK_DAYS = 420;
 // DESC; from/to null); only the catalog carries the 365-day window.
 const CONTENT_CHANGES_CATALOG_LOOKBACK_DAYS = 365;
 
-// FBA inventory-health lookback (days) -- byte-identical to the api/datadoe.js PLAN_INVENTORY_LOOKBACK_DAYS
-// constant, so the scheduled inventory window (asOf-10d..asOf) matches the live route exactly.
-const FBA_INVENTORY_LOOKBACK_DAYS = 10;
+// FBA inventory-health window: EXACTLY the single snapshot day [inventoryAsOf .. inventoryAsOf] (D-1,
+// resolved by fbaInventoryAsOf / the workflow's shared inventory_asof). The former 10-day lookback is
+// removed everywhere -- the request identity IS the snapshot date, so cached rows from another day can
+// never be mistaken for the requested day, and no cross-date rows can ever arrive.
 
 // Keyword Rank SQP + catalog lookbacks (days) -- byte-identical to the api/datadoe.js
 // SQP_WEEKLY_LOOKBACK_DAYS / SQP_MONTHLY_LOOKBACK_DAYS (the monthly SQP + 365-day catalog share the
@@ -54,19 +55,18 @@ const OPT_LOOKBACK_DAYS = 84;
 
 // Sales Movers lookbacks (days) -- byte-identical to the live builder/sources: the latest-completed-date
 // probe looks back (SALES_TRAFFIC.lagDays 4 + WINDOW_DAYS*3 = 25) days; the shared FBA inventory snapshot
-// looks back FBA_INVENTORY_HEALTH.snapshotLookbackDays (10). The recent/prior weeks come from
-// salesMoversWindows(latest); WINDOW_DAYS is 7.
+// is EXACTLY the single previous day [end-1 .. end-1] (fetchInventorySnapshot). The recent/prior weeks
+// come from salesMoversWindows(latest); WINDOW_DAYS is 7.
 const SM_LAG_DAYS = 4;
 const SM_WINDOW_DAYS = 7;
-const SM_INVENTORY_LOOKBACK_DAYS = 10;
 
 // Buy Box Loss lookbacks (days) -- byte-identical to the live builder/sources: buy-box.js WINDOW_DAYS (28)
 // + SLICE_DAYS (7) fetch the raw daily grain as four ordered 7-day slices; the shared FBA inventory
-// snapshot looks back FBA_INVENTORY_HEALTH.snapshotLookbackDays (10). So the scheduled windows match the
-// live route exactly, and the derivation (which recomputes the same windows) validates them by construction.
+// snapshot is EXACTLY the single previous day [end-1 .. end-1] (fetchInventorySnapshot). So the scheduled
+// windows match the live route exactly, and the derivation (which recomputes the same windows) validates
+// them by construction.
 const BB_WINDOW_DAYS = 28;
 const BB_SLICE_DAYS = 7;
-const BB_INVENTORY_LOOKBACK_DAYS = 10;
 
 // Returns & Refund Leakage lookback (days) -- byte-identical to the live builder/sources: returns.js
 // WINDOW_DAYS = RETURNS.historyDays (60). Returns, settlements and traffic all span [asOf-59d, asOf]; the
@@ -74,11 +74,10 @@ const BB_INVENTORY_LOOKBACK_DAYS = 10;
 const RET_WINDOW_DAYS = 60;
 
 // Listing Health lookbacks (days) -- byte-identical to the live builder/sources: listing-health.js
-// SALES_WINDOW_DAYS (30) for the trailing sales window, FBA_INVENTORY_HEALTH.snapshotLookbackDays (10) for
-// the shared inventory snapshot. Listings, Listings (Raw JSON) and the catalog are no-date. So the scheduled
-// windows match the live route exactly.
+// SALES_WINDOW_DAYS (30) for the trailing sales window; the shared inventory snapshot is EXACTLY the
+// single previous day [end-1 .. end-1] (fetchInventorySnapshot). Listings, Listings (Raw JSON) and the
+// catalog are no-date. So the scheduled windows match the live route exactly.
 const LH_SALES_WINDOW_DAYS = 30;
-const LH_INVENTORY_LOOKBACK_DAYS = 10;
 
 // Gate-6 Cycle-1 timeout remediation: DataDoe terminally TIMEOUTed the largest dated exports (whole-month
 // Sales&Traffic/order/settlement fragments, the 60-day Returns range). For sources whose rows are PER-DAY
@@ -339,7 +338,7 @@ export function planReconciliation({ accountId, country, currency, connections, 
 /**
  * Plan FBA Shipment Plan for ONE account. Emits the exact route windows from planMonthWindows(asOf):
  * monthly-units = 3 completed months + current MTD (one fragment each), a current-month daily-date
- * probe, a catalog over completed[0].from .. asOf, an inventory-health snapshot over asOf-10d..asOf,
+ * probe, a catalog over completed[0].from .. asOf, an inventory-health snapshot over EXACTLY asOf..asOf,
  * and -- for US accounts only -- the no-date AWD listing source. All for the one raw seller id.
  * `name` is the AUTHORITATIVE account name; `marketCountry` (raw) + `isUS` drive the US-only AWD +
  * per-row AWD payload fields. The AWD source is planned ONLY for US (the contract is US-conditional).
@@ -352,7 +351,7 @@ export function planFbaPlan({ accountId, name, country, currency, connections, a
   // the org Product Catalog snapshot via makeFbaPlanDurableContextLoader) -- NOT owned exports -- so the planner
   // emits NO OLI/catalog windows. Only the FBA Inventory Health snapshot + US-only AWD listing are owned exports.
   const windowsByRequestKey = {
-    "fba-plan:inventory-health": [{ from: addDaysStr(asOfStr, -FBA_INVENTORY_LOOKBACK_DAYS), to: asOfStr }],
+    "fba-plan:inventory-health": [{ from: asOfStr, to: asOfStr }],
   };
   // AWD is a no-date source for the AWD-CAPABLE marketplaces (US + EU5); supply its window only for those (the
   // contract's country gate would otherwise reject an inapplicable request key). US is byte-identical (awdCapable("US")
@@ -442,7 +441,7 @@ export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, 
         const pairs = owners.map((m) => ({ sellerId: m.scope.rawSellerId, marketplace: marketplaceCodeFor(m.scope.country) }));
         const markets = [...new Set(pairs.map((p) => p.marketplace))];
         const inventoryTo = owners[0].inventoryTo;
-        const windowsByRequestKey = { "fba-plan:inventory-health": [{ from: addDaysStr(inventoryTo, -FBA_INVENTORY_LOOKBACK_DAYS), to: inventoryTo }] };
+        const windowsByRequestKey = { "fba-plan:inventory-health": [{ from: inventoryTo, to: inventoryTo }] };
         if (awdCapableMarketplace(markets[0])) windowsByRequestKey["fba-plan:awd"] = [{ from: null, to: null }];
         const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey, ids: batchSellerIds(batch), windowsByRequestKey, marketplaceCountry: markets[0] }).filter((s) => s.requestKey === requestKey);
         const sources = resolved.map((s) => ({ ...s, marketplaceConstraint: markets.length === 1 ? markets[0] : null,
@@ -529,7 +528,7 @@ export function planListingHealthV3BucketBatched({ accounts = [], connections, a
         const windowsByRequestKey = {
           "listing-health-v3:listings": [{ from: null, to: null }],
           "listing-health-v3:listings-raw": [{ from: null, to: null }],
-          "listing-health-v3:inventory": [{ from: addDaysStr(inventoryTo, -FBA_INVENTORY_LOOKBACK_DAYS), to: inventoryTo }],
+          "listing-health-v3:inventory": [{ from: inventoryTo, to: inventoryTo }],
         };
         const resolved = reportSourceRequestHashes({ reportKey: "listing-health-v3", apiKey, ids: batchSellerIds(batch), windowsByRequestKey, marketplaceCountry: markets[0] }).filter((s) => keepRequestKeys.includes(s.requestKey));
         const sources = resolved.map((s) => ({ ...s, marketplaceConstraint: markets.length === 1 ? markets[0] : null,
@@ -611,7 +610,7 @@ export function planKeywordRank({ accountId, country, currency, connections, asO
  * global request-key signal). Always emits the probe (asOf-25d..asOf). ONLY when the typed probe signal is
  * a validated success with a real reported date (the contract's `validated_success` + `requireReportedDate`
  * staged activation) does it emit the downstream: two-window traffic + ads (recent/prior from
- * salesMoversWindows), the shared FBA inventory snapshot (asOf-10d..asOf), and the shared no-date catalog.
+ * salesMoversWindows), the shared single-day FBA inventory snapshot (asOf-1..asOf-1), and the shared no-date catalog.
  * A validated probe with NO date, or a failed/terminal/unvalidated probe, plans no downstream (the derive
  * then produces the honest dataUnavailable snapshot or the typed blocked/unavailable outcome). request_hash
  * + primary/dd-secondary isolation come from the shared resolver; the STAGED-cycle driver decides WHEN the
@@ -636,7 +635,7 @@ export function planSalesMovers({ accountId, country, currency, connections, asO
       const { recent, prior } = salesMoversWindows(probeSignal.latestReportedDate);
       windowsByRequestKey["sales-movers:traffic"] = [recent, prior];
       windowsByRequestKey["sales-movers:ads"] = [recent, prior];
-      windowsByRequestKey["sales-movers:inventory"] = [{ from: addDaysStr(end, -SM_INVENTORY_LOOKBACK_DAYS), to: end }];
+      windowsByRequestKey["sales-movers:inventory"] = [{ from: addDaysStr(end, -1), to: addDaysStr(end, -1) }];
       windowsByRequestKey["sales-movers:catalog"] = [{ from: null, to: null }];
     }
   }
@@ -748,8 +747,8 @@ export function planListingOptimizer({ accountId, country, currency, connections
  * Plan Buy Box Loss for ONE account. Emits the exact route windows: the raw daily grain (Profit by SKU &
  * Date) as FOUR ordered non-overlapping 7-day slices covering [asOf-27d, asOf] (splitDateRangeByDays, the
  * SAME helper the builder + derivation use, so the four slices agree by construction), the shared FBA
- * inventory snapshot over [asOf-10d, asOf], and the shared no-date catalog -- all for the one raw seller
- * id. All three sources are INDEPENDENTLY required (no probe / staged activation), so Buy Box uses the
+ * inventory snapshot over the single day [asOf-1, asOf-1], and the shared no-date catalog -- all for the
+ * one raw seller id. All three sources are INDEPENDENTLY required (no probe / staged activation), so Buy Box uses the
  * generic owner-scoped source cycle, never a dedicated staged-cycle driver. Shared inventory/catalog
  * canonical hashes dedupe with Sales Movers + other insight reports.
  */
@@ -764,7 +763,7 @@ export function planBuyBoxLoss({ accountId, country, currency, connections, asOf
   const windowsByRequestKey = {
     "buy-box-loss:daily": dailySlices,
     "buy-box-loss:oli-sales": canonicalOliSlices(from, end),
-    "buy-box-loss:inventory": [{ from: addDaysStr(end, -BB_INVENTORY_LOOKBACK_DAYS), to: end }],
+    "buy-box-loss:inventory": [{ from: addDaysStr(end, -1), to: addDaysStr(end, -1) }],
     "buy-box-loss:catalog": [{ from: null, to: null }],
   };
   const sources = reportSourceRequestHashes({
@@ -827,7 +826,7 @@ export function planReturnsLeakage({ accountId, country, currency, connections, 
 /**
  * Plan Listing Health for ONE account. Emits the exact route requests: the no-date Listings snapshot, the
  * no-date OPTIONAL Listings (Raw JSON) enrichment, the grouped 30d Sales `[asOf-29d, asOf]`, the shared FBA
- * inventory snapshot `[asOf-10d, asOf]`, and the shared no-date catalog -- all for the one raw seller id.
+ * inventory snapshot (the single day `[asOf-1, asOf-1]`), and the shared no-date catalog -- all for the one raw seller id.
  * All non-raw sources are INDEPENDENTLY required (no probe / staged activation); listings-raw degrades (does
  * not block). So Listing Health uses the generic owner-scoped source cycle, never a dedicated staged driver.
  * The inventory canonical hash dedupes with Sales Movers + Buy Box; the catalog dedupes with Sales Movers +
@@ -841,7 +840,7 @@ export function planListingHealth({ accountId, country, currency, connections, a
     "listing-health:listings": [{ from: null, to: null }],
     "listing-health:listings-raw": [{ from: null, to: null }],
     "listing-health:sales": [{ from: salesFrom, to: end }],
-    "listing-health:inventory": [{ from: addDaysStr(end, -LH_INVENTORY_LOOKBACK_DAYS), to: end }],
+    "listing-health:inventory": [{ from: addDaysStr(end, -1), to: addDaysStr(end, -1) }],
     "listing-health:catalog": [{ from: null, to: null }],
   };
   const sources = reportSourceRequestHashes({

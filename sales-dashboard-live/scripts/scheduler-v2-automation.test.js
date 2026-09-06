@@ -256,13 +256,23 @@ test("D2. workflow shape: INDEPENDENT per-region ordered pipeline -- per-region 
   assert.doesNotMatch(yml, /api\/cron\/sync/, "never drives the deprecated Vercel cron endpoint");
 });
 
-test("D3. exactly ONE reviewed scheduled workflow remains: scheduler-v2 (the 3-region coordinator). FBA now runs as its ISOLATED job; campaign-ads-golive + returns-leakage are MANUAL-ONLY", () => {
+test("D3. exactly ONE scheduled EXPORT owner remains: scheduler-v2. The only other scheduled workflow is the ZERO-EXPORT account-onboarding discovery worker; campaign-ads-golive + returns-leakage + fba-plan-golive stay MANUAL-ONLY", () => {
   const files = readdirSync(WORKFLOWS_DIR).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
   const scheduled = files.filter((f) => /\n\s*schedule:\s*\n/.test(readFileSync(resolve(WORKFLOWS_DIR, f), "utf8"))).sort();
-  // scheduler-v2 is the SOLE automatic scheduler (the ONE owner of every paid source). FBA moved from its own
-  // scheduled workflow into scheduler-v2's isolated fba job, so fba-plan-golive.yml is now manual-only. Campaign
-  // (campaign-ads-golive) + Returns (returns-leakage) are manual-only. No OTHER workflow may declare a schedule.
-  assert.deepEqual(scheduled, ["scheduler-v2.yml"], "exactly one scheduled workflow; got " + JSON.stringify(scheduled));
+  // scheduler-v2 is the SOLE automatic owner of every PAID source. The account-onboarding worker is the ONE
+  // other scheduled workflow and is structurally ZERO-EXPORT: it may run ONLY the discovery operator (whose
+  // module graph contains no export adapter/create path); it never invokes an export/release/golive script.
+  assert.deepEqual(scheduled, ["account-onboarding.yml", "scheduler-v2.yml"],
+    "exactly the scheduler + the zero-export onboarding worker are scheduled; got " + JSON.stringify(scheduled));
+  const onboarding = readFileSync(resolve(WORKFLOWS_DIR, "account-onboarding.yml"), "utf8");
+  const scriptCalls = [...onboarding.matchAll(/node scripts\/[^\s"']+/g)].map((m) => m[0]);
+  assert.deepEqual(scriptCalls, ["node scripts/release/account-onboarding-discovery.mjs"],
+    "the onboarding workflow runs ONLY the discovery operator (zero-export): " + JSON.stringify(scriptCalls));
+  assert.match(onboarding, /concurrency:\s*\n\s*group:\s*account-onboarding/, "one dedicated onboarding concurrency group");
+  assert.match(onboarding, /cancel-in-progress:\s*false/, "overlapping onboarding crons queue, never race");
+  for (const banned of ["fba-plan-golive", "priority-dashboards-release", "oli-refresh-d1", "campaign-ads", "listing-health-v3-ingestion", "returns-leakage"]) {
+    assert.ok(!onboarding.includes(banned), "onboarding workflow never invokes " + banned);
+  }
   for (const f of ["returns-leakage.yml", "campaign-ads-golive.yml", "fba-plan-golive.yml"]) {
     assert.ok(files.includes(f), f + " still exists (manual-only)");
   }

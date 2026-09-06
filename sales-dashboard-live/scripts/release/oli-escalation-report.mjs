@@ -18,7 +18,12 @@ const requestedAsOf = argOf("requested-as-of") || argOf("as-of") || (() => { con
 if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedAsOf)) { console.error("STOP --requested-as-of must be YYYY-MM-DD"); process.exit(2); }
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
-const { fetchAccounts } = await import("../../lib/server/datadoe.js");
+const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
+const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
+const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
+// EXPORT-ELIGIBILITY GATE: escalation reporting covers the export-eligible set only (a still-loading
+// account is expected to be behind D-1 and must not be flagged as an escalation).
+const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows });
 const { bucketForCountry } = await import("../../lib/server/sync/registry.js");
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 const { OLI_SOURCE_ID } = await import("../../lib/server/sync/registry.js").catch(() => ({ OLI_SOURCE_ID: "89b27535d2" }));

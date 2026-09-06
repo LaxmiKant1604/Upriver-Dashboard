@@ -470,7 +470,8 @@ export function isCompactInventorySnapshot(snapshot) {
 /**
  * PURE, STRICT validation + fold of FBA Inventory Health rows into the compact
  * brand-inventory payload. `invRows` are the raw source rows; `brandByAsin` is a Map
- * (or {asin:brand} object); `[from, to]` is the EXACT expected window (asOf-10d..asOf).
+ * (or {asin:brand} object); `[from, to]` is the EXACT expected window (the single D-1
+ * snapshot day: from === to).
  *
  * The whole payload is REFUSED (throws an admin-safe error) if ANY row is invalid, so a
  * malformed/truncated export is never saved and the previous snapshot is preserved:

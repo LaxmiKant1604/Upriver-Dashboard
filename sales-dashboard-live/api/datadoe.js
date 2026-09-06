@@ -47,6 +47,7 @@ import {
   getSourceOliSalesEstimateRows,
   getOliSkuAsinResolutionRows,
   getAccountDirectorySnapshotAccounts,
+  getAccountOnboardingRows,
   getSkuMovementIdentifiers,
   getSourceSnapshot,
   getSourceSnapshotPayload,
@@ -1842,7 +1843,26 @@ async function discoverConnectedAccounts(connections) {
     const discovered = await fetchAccountsRaw(connection.apiKey);
     accountsByConnection.push({ connection, accounts: discovered });
   }
-  return mergeDiscoveredDataDoeAccounts(accountsByConnection);
+  const merged = mergeDiscoveredDataDoeAccounts(accountsByConnection);
+  // ONBOARDING DECORATION: stamp settingUp/onboardingStatus from durable onboarding state so a manual
+  // Refresh never WIPES the flags the 15-minute discovery worker maintains -- without them, a still-
+  // loading account would look fully live in the selector AND leak into operator scope resolution
+  // (getAccountDirectorySnapshotAccounts excludes settingUp entries). Fail-soft: an unreadable table
+  // (pre-migration) decorates nothing (legacy behaviour, byte-identical payload fields).
+  try {
+    const { SERVING_STATUSES } = await import("../lib/server/sync/account-onboarding.js");
+    const onboardingRows = await getAccountOnboardingRows();
+    if (Array.isArray(onboardingRows)) {
+      const byAccount = new Map(onboardingRows.map((r) => [String(r.account_id), r]));
+      for (const account of merged) {
+        const row = byAccount.get(String(account.id));
+        if (!row) continue;
+        account.onboardingStatus = String(row.status || "");
+        account.settingUp = !SERVING_STATUSES.includes(String(row.status || ""));
+      }
+    }
+  } catch { /* decoration is best-effort; discovery itself never fails on it */ }
+  return merged;
 }
 
 // Amazon SP-API BRANDED_ITEM_CONTENT_CHANGE notifications. This real-time
@@ -2030,10 +2050,11 @@ const LISTINGS_AWD_COLUMNS = [
   "awd_available_distributable_quantity",
   "awd_total_inbound_quantity",
 ];
-// Inventory Health is a daily snapshot; look back a short window and keep the
-// latest snapshot date. DESC ordering guarantees the full latest snapshot is at
-// the front of the result, so the row limit only ever drops older snapshots.
-const PLAN_INVENTORY_LOOKBACK_DAYS = 10;
+// Inventory Health is a daily snapshot. Every request asks for EXACTLY the single previous UTC day
+// [D-1 .. D-1] -- the same canonical snapshot-day identity the scheduler uses (fbaInventoryAsOf), so a
+// manual browser refresh adopts the scheduler's cached export instead of creating a new one, and no
+// cross-date row can ever arrive. The former 10-day lookback constant is removed.
+const planInventoryDay = (now = Date.now()) => new Date(now - 86400000).toISOString().slice(0, 10);
 const PLAN_INVENTORY_ROW_LIMIT = 50000; // raised from 15000 so a marketplace-safe <=5-seller FBA Health batch of large-inventory accounts returns without truncation (parity with the fba-plan:inventory-health contract limit).
 
 const DASHBOARD_ROW_LIMIT = 5000;
@@ -3342,8 +3363,9 @@ async function handleDataDoe(req, res) {
       const inventoryDirectory = await getLatestReportSnapshot({ reportKey: "account-directory", accountId: "__account-directory__" }).catch(() => null);
       const accountCountry = (inventoryDirectory?.payload?.accounts || []).find((entry) => String(entry.id) === publicAccountId)?.country || null;
 
-      // The EXACT expected inventory window the fold validates every row against.
-      const inventoryFrom = addDaysStr(to, -PLAN_INVENTORY_LOOKBACK_DAYS);
+      // The EXACT expected inventory window the fold validates every row against: the single canonical
+      // previous UTC day (D-1), the same snapshot-day identity the scheduler fetches.
+      const inventoryDay = planInventoryDay();
       let payload;
       try {
         // No live Product Catalog fallback: brand-inventory uses ONLY the saved
@@ -3352,13 +3374,13 @@ async function handleDataDoe(req, res) {
         ({ payload } = await buildBrandInventorySnapshot({
           accountId: publicAccountId,
           accountCountry,
-          from: inventoryFrom,
-          to,
+          from: inventoryDay,
+          to: inventoryDay,
           rowLimit: PLAN_INVENTORY_ROW_LIMIT,
           getSnapshot: getLatestReportSnapshotHydrated,
           fetchInventoryRows: () => fetchExportRows(
             apiKey, FBA_HEALTH_SOURCE_ID, FBA_HEALTH_COLUMNS, sellerOrVendorIds,
-            inventoryFrom, to, PLAN_INVENTORY_ROW_LIMIT,
+            inventoryDay, inventoryDay, PLAN_INVENTORY_ROW_LIMIT,
             { orderByColumn: "date", orderByDirection: "DESC" }
           ),
         }));
@@ -3756,10 +3778,11 @@ async function handleDataDoe(req, res) {
         if (name && !nameByAsin.has(asin)) nameByAsin.set(asin, name);
       }
 
-      // 4) Latest FBA inventory-health snapshot, folded from SKU to ASIN.
+      // 4) The EXACT single previous-UTC-day (D-1) FBA inventory-health snapshot, folded from SKU to ASIN.
+      const planInvDay = planInventoryDay();
       const invRows = await fetchExportRows(
         apiKey, FBA_HEALTH_SOURCE_ID, FBA_HEALTH_COLUMNS, sellerOrVendorIds,
-        addDaysStr(String(to), -PLAN_INVENTORY_LOOKBACK_DAYS), String(to), PLAN_INVENTORY_ROW_LIMIT,
+        planInvDay, planInvDay, PLAN_INVENTORY_ROW_LIMIT,
         { orderByColumn: "date", orderByDirection: "DESC" }
       );
       let inventoryDate = null;

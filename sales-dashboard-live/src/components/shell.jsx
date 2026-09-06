@@ -381,8 +381,10 @@ export function AccountSelector({ accounts, value, onChange, flags, onRefresh, r
   const options = useMemo(() => accounts.map((account) => ({
     value: account.id,
     // The visible label keeps the flag + name + currency; search also matches marketplace + currency.
-    label: `${(flags[account.country] || "")} ${account.name} (${account.currency || "—"})`.trim(),
-    searchText: `${account.name || ""} ${account.country || ""} ${account.currency || ""}`,
+    // An onboarding account (DataDoe still loading, or bootstrap pending) is labelled "Setting up" so
+    // admins see it immediately without mistaking it for a fully-serving account.
+    label: `${(flags[account.country] || "")} ${account.name} (${account.currency || "—"})${account.settingUp === true ? " — Setting up" : ""}`.trim(),
+    searchText: `${account.name || ""} ${account.country || ""} ${account.currency || ""}${account.settingUp === true ? " setting up" : ""}`,
   })), [accounts, flags]);
   const refreshButton = onRefresh ? (
     <button

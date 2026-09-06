@@ -73,7 +73,7 @@ function lhPlanned({ listings = [], raw = [], sales = [], inventory = [], catalo
     else if (rawState === "pending") statusOverride[f.requestHash] = "pending";
   }
   add("listing-health:sales", SALES_FROM, ASOF, sales);
-  add("listing-health:inventory", INV_FROM, ASOF, inventory);
+  add("listing-health:inventory", INV_FROM, INV_FROM, inventory); // EXACT single day [asOf-1 .. asOf-1]
   add("listing-health:catalog", null, null, catalog);
   return { planned, rows, statusOverride, errorOverride };
 }
@@ -114,9 +114,9 @@ const FIXTURE = () => ({
     sale("", "ASIN-X", "USD", 99, 9, 9), // blank sku -> skipped
   ],
   inventory: [
-    inv("2025-08-08", "SKU-A", "ASIN-A", 70), // older snapshot -> dropped
-    inv("2025-08-09", "SKU-A", "ASIN-A", 75), // latest
-    inv("2025-08-09", "SKU-B", "ASIN-B", 0),  // genuine zero, latest
+    // EXACTLY the single previous day (asOf-1 = 2025-08-09); a row on any other date is now rejected.
+    inv("2025-08-09", "SKU-A", "ASIN-A", 75),
+    inv("2025-08-09", "SKU-B", "ASIN-B", 0),  // genuine zero
   ],
   catalog: [
     cat("ASIN-A", "P1", "Catalog A", "Acme"),
@@ -341,10 +341,10 @@ test("b2f. worker-level: a mixed-currency SKU => report NOT saved, prior last-kn
 
 group("listing-health derive: window + account validation fail closed");
 
-test("15. exact source windows (sales asOf-29d..asOf; inventory asOf-10d..asOf; no-date listings/raw/catalog)", () => {
+test("15. exact source windows (sales asOf-29d..asOf; inventory the single day asOf-1..asOf-1; no-date listings/raw/catalog)", () => {
   assert.equal(deriveLH(lhPlanned(FIXTURE())).status, "derived");
   assert.equal(SALES_FROM, addDaysStr(ASOF, -29));
-  assert.equal(INV_FROM, addDaysStr(ASOF, -10));
+  assert.equal(INV_FROM, addDaysStr(ASOF, -1));
 });
 
 test("16. wrong-window sales/inventory + dated no-date sources fail closed (invalid)", () => {
@@ -359,11 +359,11 @@ test("16. wrong-window sales/inventory + dated no-date sources fail closed (inva
   }
 });
 
-test("17. inventory ROW dates must be real calendar dates inside [asOf-10d, asOf] (never silently filtered)", () => {
+test("17. inventory ROW dates must be real calendar dates EXACTLY on the single day asOf-1 (never silently filtered)", () => {
   const bad = (date) => deriveLH(lhPlanned({ ...FIXTURE(), inventory: [inv(date, "SKU-A", "ASIN-A", 5)] })).status;
   assert.equal(bad("2025-02-30"), "invalid", "impossible date");
-  assert.equal(bad(addDaysStr(INV_FROM, -1)), "invalid", "before window");
-  assert.equal(bad(addDaysStr(ASOF, 1)), "invalid", "after asOf");
+  assert.equal(bad(addDaysStr(INV_FROM, -1)), "invalid", "before the exact day");
+  assert.equal(bad(ASOF), "invalid", "after the exact day (even asOf itself)");
   assert.equal(bad("2099-01-01"), "invalid", "future date");
 });
 
@@ -494,7 +494,7 @@ test("24. default AND explicit planning include listing-health; exactly FIVE can
     assert.deepEqual([srcOf(plan, key).from, srcOf(plan, key).to], [null, null], `${key} is no-date`);
   }
   assert.deepEqual([srcOf(plan, "listing-health:sales").from, srcOf(plan, "listing-health:sales").to], [SALES_FROM, ASOF]);
-  assert.deepEqual([srcOf(plan, "listing-health:inventory").from, srcOf(plan, "listing-health:inventory").to], [INV_FROM, ASOF]);
+  assert.deepEqual([srcOf(plan, "listing-health:inventory").from, srcOf(plan, "listing-health:inventory").to], [INV_FROM, INV_FROM]);
   const rj = plan.reportJobs.find((j) => j.reportKey === "listing-health");
   assert.equal(rj.dependsOn.length, 5);
   assert.deepEqual([...rj.dependsOn].sort(), plan.sourceJobs.map((j) => j.requestHash).sort());
@@ -696,7 +696,7 @@ async function main() {
   ({ planListingHealth, planBuyBoxLoss, planSalesMovers, planReturnsLeakage, buildShadowReportPlan, SHADOW_PLANNED_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
   ({ addDaysStr } = await import("../lib/server/date-windows.js"));
   SALES_FROM = addDaysStr(ASOF, -29);
-  INV_FROM = addDaysStr(ASOF, -10);
+  INV_FROM = addDaysStr(ASOF, -1); // the EXACT single D-1 snapshot day (from === to)
 
   let failures = 0;
   for (const t of tests) {

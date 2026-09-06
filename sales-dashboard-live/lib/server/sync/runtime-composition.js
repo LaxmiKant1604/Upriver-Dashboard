@@ -13,7 +13,8 @@
 // Every production primitive is INJECTABLE so the whole composition is deterministically offline-testable.
 
 import { getDataDoeConnections, mergeDiscoveredDataDoeAccounts } from "../datadoe-connections.js";
-import { fetchAccounts as fetchDataDoeAccounts } from "../datadoe.js";
+import { fetchAccounts as fetchDataDoeAccounts, fetchAccountsDetailed as fetchDataDoeAccountsDetailed } from "../datadoe.js";
+import { fetchExportEligibleAccounts } from "./account-onboarding.js";
 import { makeSupabaseSourceStore, makeDataDoeAdapter } from "./source-sync-driver.js";
 import { makeSupabaseReportStore, makeSourceRowLoader, makeShadowSnapshotSaver } from "./report-snapshot-store.js";
 import { makeDailyAdsContextLoader } from "./daily-ads-loader.js";
@@ -23,7 +24,7 @@ import { schedulerV2ReportControlCatalog, CONTROLLED_REPORT_KEYS, SCHEDULER_V2_R
 import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "./report-publisher.js";
 import { runSchedulerV2Shadow } from "./sync-dispatch.js";
 import { makeSourceTranche, isSourceTranche } from "./source-tranche.js";
-import { getAsinAdsDailyRows, getActiveAdsDailyRows, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings, getSchedulerAccountRollout, getSourceCoverageWindows, getSourceOliHistoryRows, getSourceSnapshot, getSourceSnapshotPayload } from "../supabase.js";
+import { getAccountOnboardingRows, getAsinAdsDailyRows, getActiveAdsDailyRows, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings, getSchedulerAccountRollout, getSourceCoverageWindows, getSourceOliHistoryRows, getSourceSnapshot, getSourceSnapshotPayload } from "../supabase.js";
 import { auditSchemaContract, schedulerV2SchemaObjects, REQUIRED_WRAPPER_EXPORTS } from "./schema-contract.js";
 
 // The complete set of Supabase wrappers the composed runtime depends on. Re-exported from the schema contract
@@ -93,7 +94,7 @@ export function combineStores(namedStores, { shared = [] } = {}) {
  * The account list read is a DataDoe accounts GET (never an export); it is WIRED here but NOT invoked until the
  * composed runtime is actually run (a future, approval-gated live step). `fetchAccounts` is injectable.
  */
-export function makeProductionDiscoverAccounts({ connections, fetchAccounts = fetchDataDoeAccounts } = {}) {
+export function makeProductionDiscoverAccounts({ connections, fetchAccounts = fetchDataDoeAccounts, fetchDetailed = fetchDataDoeAccountsDetailed, readOnboardingRows = getAccountOnboardingRows } = {}) {
   if (typeof fetchAccounts !== "function") {
     throw new Error("makeProductionDiscoverAccounts requires an injected fetchAccounts(apiKey) reader.");
   }
@@ -105,7 +106,17 @@ export function makeProductionDiscoverAccounts({ connections, fetchAccounts = fe
       if (!connection || !connection.apiKey) continue; // never fetch a connection without a configured key
       // No try/catch: a throw here propagates through the dispatcher's `await discoverAccounts()` and aborts
       // the whole invocation BEFORE step 4 (any source export). Fail closed, never a partial/guessed directory.
-      const accounts = await fetchAccounts(connection.apiKey);
+      //
+      // EXPORT-ELIGIBILITY GATE (primary connection): every scheduled/paid path composed over this provider
+      // must see ONLY export-eligible primary accounts -- a DataDoe still-loading account (initialLoadComplete
+      // false) gets ZERO paid export attempts (DataDoe hard-rejects them with HTTP 400 and one such seller
+      // poisons its whole <=5-seller batch), and an unclaimed/unbootstrapped new account waits for its atomic
+      // account-bootstrap claim. The gate FAILS SOFT to readiness-only when the onboarding table is
+      // unreadable (existing ready accounts keep publishing; loading accounts stay excluded). A CUSTOM
+      // injected fetchAccounts (tests) bypasses the gate and keeps the legacy behaviour byte-identical.
+      const accounts = connection.id === "primary" && fetchAccounts === fetchDataDoeAccounts
+        ? await fetchExportEligibleAccounts(connection.apiKey, { fetchDetailed, readOnboardingRows })
+        : await fetchAccounts(connection.apiKey);
       byConnection.push({ connection, accounts: accounts || [] });
     }
     return mergeDiscoveredDataDoeAccounts(byConnection);

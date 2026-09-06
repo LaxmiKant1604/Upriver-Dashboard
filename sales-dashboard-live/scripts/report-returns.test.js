@@ -516,7 +516,8 @@ test("f6. other adapters retain their existing latestDataDate results (the sourc
   // Blocker 1: buy-box ordered is the canonical OLI sales fragment sliced by canonicalOliSlices over the SAME
   // [asOf-27d, asOf] window; each canonical row carries a `date` inside its own slice window.
   canonicalOliSlices(addDaysStr(ASOF, -27), ASOF).forEach((w) => { const f = frag("buy-box-loss:oli-sales", w.from, w.to); planned.push(f); rows[f.requestHash] = [{ date: w.from, sku: "S", child_asin: "A", item_price_currency: "USD", total_sales_sum: 10, total_units_sum: 1 }]; });
-  const inv = frag("buy-box-loss:inventory", addDaysStr(ASOF, -10), ASOF); planned.push(inv); rows[inv.requestHash] = [{ date: ASOF, sku: "S", child_asin: "A", product_name: "P", currency: "USD", available: 5, units_shipped_t30: 1 }];
+  const invDay = addDaysStr(ASOF, -1); // EXACT single D-1 snapshot day
+  const inv = frag("buy-box-loss:inventory", invDay, invDay); planned.push(inv); rows[inv.requestHash] = [{ date: invDay, sku: "S", child_asin: "A", product_name: "P", currency: "USD", available: 5, units_shipped_t30: 1 }];
   const catF = frag("buy-box-loss:catalog", null, null); planned.push(catF); rows[catF.requestHash] = [{ child_asin: "A", parent_asin: "P", product_name: "P", product_brand: "B" }];
   const r = deriveReportSnapshot({ reportKey: "buy-box-loss", sources: buildSources(planned, rows), context: ctx() });
   assert.equal(r.status, "derived");

@@ -84,9 +84,9 @@ export { SOURCE_SYNC_OWNER_REPORT_KEY };
 export const DEFAULT_ROUTE_BUDGET_MS = 50_000; // under config.maxDuration = 60 with reserve headroom
 export const DEFAULT_ROUTE_RESERVE_MS = 5_000;
 
-// Mirrors the LIVE compact Brand View inventory contract (api/datadoe.js PLAN_INVENTORY_LOOKBACK_DAYS /
-// PLAN_INVENTORY_ROW_LIMIT): the exact [asOf-10d .. asOf] fold window and the truncation-refusal cap.
-const BRAND_INVENTORY_LOOKBACK_DAYS = 10;
+// Mirrors the LIVE compact Brand View inventory contract (api/datadoe.js PLAN_INVENTORY_ROW_LIMIT): the
+// EXACT single-day [asOf .. asOf] fold window (the durable FBA evidence is fetched as exactly that one
+// snapshot day) and the truncation-refusal cap.
 const BRAND_INVENTORY_ROW_LIMIT = 15000;
 
 // Round-5 blocker 4: ONE route-owned deadline. Symbol.for so a deadline created by the route and checked by
@@ -1261,7 +1261,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     // A contract refusal (missing brand map, truncation, invalid row) preserves the previous compact
     // snapshot and is recorded TYPED per account.
     const brandInventory = { saved: 0, skipped: [] };
-    const invWindow = { from: addDaysStr(asOfStr, -BRAND_INVENTORY_LOOKBACK_DAYS), to: asOfStr };
+    const invWindow = { from: asOfStr, to: asOfStr };
     const brandSalesByAccount = new Map(derived.brandView.snapshots.map((s) => [s.accountId, s]));
     try {
       for (const account of accounts) {

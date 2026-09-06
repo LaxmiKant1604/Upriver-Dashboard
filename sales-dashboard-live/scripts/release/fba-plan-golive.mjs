@@ -9,9 +9,10 @@
 //   node scripts/release/fba-plan-golive.mjs --mode=dry-run   [--as-of=YYYY-MM-DD] [--inventory-as-of=YYYY-MM-DD] [--max-blocked=2] [--region=india|europe-au|us-ca|all] [--bucket=us|non-us|both]
 //   node scripts/release/fba-plan-golive.mjs --mode=go-live   [--as-of=YYYY-MM-DD] [--inventory-as-of=YYYY-MM-DD] [--max-tokens=80] [--max-blocked=2] [--region=...] [--bucket=...]
 //
-// --inventory-as-of: OPTIONAL. Overrides the inventory snapshot date (default: fbaInventoryAsOf() = UTC today). The
-//   regional scheduler passes ONE shared inventory_asof so this FBA run and the downstream Listing Health v3 job adopt
-//   the SAME inventory identity. Existing manual callers that omit it keep the exact prior behaviour (UTC today).
+// --inventory-as-of: OPTIONAL. Overrides the inventory snapshot date (default: fbaInventoryAsOf() = the previous
+//   UTC date, D-1). Inventory is requested as EXACTLY [inventory-as-of .. inventory-as-of] (one snapshot day). The
+//   regional scheduler passes ONE shared inventory_asof (D-1) so this FBA run and the downstream Listing Health v3
+//   job adopt the SAME inventory identity. Manual callers that omit it get the same canonical D-1.
 //
 // SCOPE: `--region` (a region india|europe-au|us-ca, or `all`) is the ACTIVE routing used by the regional
 // coordinator -- it takes precedence when present and runs exactly that region (or all three). `--bucket`
@@ -58,7 +59,7 @@ const {
 
 const CEILING = fbaServerCeiling();
 // Optional shared inventory snapshot date (regional scheduler passes ONE inventory_asof to both FBA and v3). Validate a
-// real calendar date; default to fbaInventoryAsOf() (UTC today) so existing manual callers are byte-identical.
+// real calendar date; default to fbaInventoryAsOf() (the previous UTC date, D-1 -- the canonical single snapshot day).
 const inventoryAsOfArg = argOf("inventory-as-of");
 if (inventoryAsOfArg != null) {
   const ok = /^\d{4}-\d{2}-\d{2}$/.test(inventoryAsOfArg) && new Date(`${inventoryAsOfArg}T00:00:00Z`).toISOString().slice(0, 10) === inventoryAsOfArg;

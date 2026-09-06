@@ -142,7 +142,11 @@
     "test:listing-health-v3-preflight-defer": "node scripts/report-listing-health-v3-preflight-defer.test.js",
     "test:listing-health-v3-identity-guard": "node scripts/report-listing-health-v3-identity-guard.test.js",
     "test:lhv3-shared-inventory-date": "node scripts/lhv3-shared-inventory-date.test.js",
-    "test:scheduler-v2-lhv3-workflow": "node scripts/scheduler-v2-lhv3-workflow.test.js"
+    "test:scheduler-v2-lhv3-workflow": "node scripts/scheduler-v2-lhv3-workflow.test.js",
+    "test:account-onboarding": "node scripts/account-onboarding.test.js",
+    "test:account-onboarding-worker": "node scripts/account-onboarding-worker.test.js",
+    "test:campaign-initial-window": "node scripts/campaign-initial-window.test.js",
+    "test:fba-d1-guard": "node scripts/fba-d1-source-guard.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",

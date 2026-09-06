@@ -67,11 +67,10 @@ import { validatePpcSourceCoverage } from "./ppc-ads-loader.js";
 // planner gate, the live buildPpcPerformance, and the pure ppcPerformancePayload fold do.
 import { adsCurrencyEvidence } from "../currency.js";
 
-// FBA inventory-health lookback (days) -- byte-identical to the api/datadoe.js PLAN_INVENTORY_LOOKBACK_DAYS
-// constant. The derivation RECOMPUTES the expected inventory start as addDaysStr(asOf, -10) and pins
-// BOTH endpoints, so a planner/caller that shifts the snapshot window (a shortened or extended lookback)
-// is rejected -- the derivation never implicitly trusts the fragment's window.
-const FBA_INVENTORY_LOOKBACK_DAYS = 10;
+// FBA inventory-health window: EXACTLY the single snapshot day [inventoryAsOf .. inventoryAsOf] (D-1).
+// The derivation PINS from === to === inventoryAsOf, so a planner/caller that supplies any lookback
+// window (including the retired 10-day-lookback shape) is rejected -- the derivation never implicitly
+// trusts the fragment's window, and no row outside the exact requested day can ever be accepted.
 
 // Keyword Rank SQP + catalog lookbacks (days) -- byte-identical to the api/datadoe.js
 // SQP_WEEKLY_LOOKBACK_DAYS / SQP_MONTHLY_LOOKBACK_DAYS (the monthly SQP and the 365-day catalog share
@@ -89,20 +88,18 @@ const OPT_SQP_ENABLE_HINT = "In DataDoe, open Settings > Data tables and enable 
 const OPT_CATALOG_LABEL = "Product Catalog by ASIN";
 
 // Sales Movers constants -- byte-identical to the live builder/sources: SALES_TRAFFIC.lagDays (4),
-// sales-movers.js WINDOW_DAYS (7), FBA_INVENTORY_HEALTH.snapshotLookbackDays (10), SALES_TRAFFIC.label.
+// sales-movers.js WINDOW_DAYS (7), the single-day [asOf-1 .. asOf-1] inventory snapshot, SALES_TRAFFIC.label.
 // The derivation RECOMPUTES the probe/inventory windows from asOf and pins them, never trusting a caller.
 const SM_LAG_DAYS = 4;
 const SM_WINDOW_DAYS = 7;
-const SM_INVENTORY_LOOKBACK_DAYS = 10;
 const SM_SOURCE_LABEL = "Sales & Traffic by ASIN & Date";
 
 // Buy Box Loss constants -- byte-identical to the live builder/sources: buy-box.js WINDOW_DAYS (28) +
-// SLICE_DAYS (7), FBA_INVENTORY_HEALTH.snapshotLookbackDays (10), PROFIT_BY_SKU.label, and the fixed
+// SLICE_DAYS (7), the single-day [asOf-1 .. asOf-1] inventory snapshot, PROFIT_BY_SKU.label, and the fixed
 // price-source label. The derivation RECOMPUTES the four 7-day daily slices + the inventory window from
 // asOf and pins every endpoint, never trusting a caller's fragment windows.
 const BB_WINDOW_DAYS = 28;
 const BB_SLICE_DAYS = 7;
-const BB_INVENTORY_LOOKBACK_DAYS = 10;
 const BB_SOURCE_LABEL = "Profit by SKU & Date";
 const BB_PRICE_SOURCE_LABEL = "FBA Inventory Health";
 
@@ -117,11 +114,10 @@ const RET_RATE_LABEL = "Order Line Items";
 const RET_RATE_LAG_DAYS = 0;
 
 // Listing Health constants -- byte-identical to the live builder/sources: listing-health.js
-// SALES_WINDOW_DAYS (30), FBA_INVENTORY_HEALTH.snapshotLookbackDays (10), the source labels, and the
+// SALES_WINDOW_DAYS (30), the single-day [asOf-1 .. asOf-1] inventory snapshot, the source labels, and the
 // exact LISTINGS_RAW.enableHint shown when the optional Listings (Raw JSON) enrichment is disabled. The
 // derivation RECOMPUTES the sales/inventory windows from asOf and pins them, never trusting a caller.
 const LH_SALES_WINDOW_DAYS = 30;
-const LH_INVENTORY_LOOKBACK_DAYS = 10;
 const LH_SOURCE_LABEL = "Listings";
 const LH_SALES_SOURCE_LABEL = "Profit by SKU & Date";
 const LH_ISSUES_SOURCE_LABEL = "Listings (Raw JSON)";
@@ -518,12 +514,12 @@ const REGISTRY = {
         throw new Error("fba-plan requires the durable Product Catalog snapshot; it is missing, so the snapshot is blocked (previous data preserved).");
       }
       const catalogRows = singleAccountFragmentRows(durableCatalog, "fba-plan:catalog", rawSellerId, completed[0].from, current.to);
-      // Inventory window is EXACTLY [asOf - 10d .. asOf]. Recompute the expected start here and pin
-      // BOTH endpoints (a shortened or extended lookback fragment is rejected -> derive-invalid ->
+      // Inventory window is EXACTLY the single snapshot day [inventoryAsOf .. inventoryAsOf] (D-1). Pin
+      // BOTH endpoints to that one date (any lookback/shifted fragment is rejected -> derive-invalid ->
       // last-known-good preserved), never implicitly trusting the planner/caller.
       const inventoryAsOf = context.inventoryAsOf == null ? asOf : String(context.inventoryAsOf);
       if (!isValidCalendarDate(inventoryAsOf)) throw new Error("fba-plan inventoryAsOf must be a real calendar date.");
-      const expectedInventoryFrom = addDaysStr(inventoryAsOf, -FBA_INVENTORY_LOOKBACK_DAYS);
+      const expectedInventoryFrom = inventoryAsOf;
       const invRows = singleAccountFragmentRows(sources["fba-plan:inventory-health"], "fba-plan:inventory-health", rawSellerId, expectedInventoryFrom, inventoryAsOf);
       assertRowsInWindow(invRows, expectedInventoryFrom, inventoryAsOf, "fba-plan inventory");
 
@@ -804,9 +800,10 @@ const REGISTRY = {
       // Traffic + Ads: exactly two ordered single-account fragments [recent, prior].
       const trafficFrags = validateOrderedSingleAccountWindows(sources["sales-movers:traffic"], [recent, prior], rawSellerId, "sales-movers:traffic");
       const adsFrags = validateOrderedSingleAccountWindows(sources["sales-movers:ads"], [recent, prior], rawSellerId, "sales-movers:ads");
-      // Inventory: one single-account fragment over [asOf-10d, asOf] (pin both endpoints).
-      const inventoryFrom = addDaysStr(asOf, -SM_INVENTORY_LOOKBACK_DAYS);
-      const inventoryRows = singleAccountFragmentRows(sources["sales-movers:inventory"], "sales-movers:inventory", rawSellerId, inventoryFrom, asOf);
+      // Inventory: one single-account fragment over EXACTLY the single previous day [asOf-1, asOf-1]
+      // (pin both endpoints to that one date).
+      const inventoryDay = addDaysStr(asOf, -1);
+      const inventoryRows = singleAccountFragmentRows(sources["sales-movers:inventory"], "sales-movers:inventory", rawSellerId, inventoryDay, inventoryDay);
       // Catalog: exactly one single-account no-date fragment.
       const catalogRows = noDateFragmentRows(sources["sales-movers:catalog"], "sales-movers:catalog", rawSellerId);
       // Every saved fragment row must be a plain object.
@@ -840,7 +837,7 @@ const REGISTRY = {
   // report PENDING until every slice + inventory + catalog succeeds, so a failed/terminal/truncated/
   // missing required source never saves (last-known-good preserved). Windows are RECOMPUTED from asOf and
   // pinned positionally: exactly four ordered non-overlapping 7-day slices covering [asOf-27d, asOf], the
-  // inventory [asOf-10d, asOf], and one no-date catalog -- a wrong/missing/duplicate/reordered/overlapping/
+  // single-day inventory [asOf-1, asOf-1], and one no-date catalog -- a wrong/missing/duplicate/reordered/overlapping/
   // partial/extra/cross-account/malformed fragment throws => derive-invalid => zero writes, LKG preserved.
   // buybox_percentage is a ratio (page-view weighted, unweighted-mean fallback); null observations are
   // excluded; currencies never merge. ZERO DataDoe/network calls (pure).
@@ -879,18 +876,19 @@ const REGISTRY = {
         if (!Array.isArray(f.rows)) throw new Error(`buy-box-loss:oli-sales fragment ${f.from}..${f.to} has no validated row array; snapshot blocked.`);
         assertRowsInWindow(f.rows, expectedOliSlices[i].from, expectedOliSlices[i].to, `buy-box-loss oli-sales slice ${f.from}..${f.to}`);
       });
-      // Inventory: one single-account fragment over [asOf-10d, asOf] (pin both endpoints).
-      const inventoryFrom = addDaysStr(asOf, -BB_INVENTORY_LOOKBACK_DAYS);
-      const inventoryRows = singleAccountFragmentRows(sources["buy-box-loss:inventory"], "buy-box-loss:inventory", rawSellerId, inventoryFrom, asOf);
+      // Inventory: one single-account fragment over EXACTLY the single previous day [asOf-1, asOf-1]
+      // (pin both endpoints to that one date).
+      const inventoryDay = addDaysStr(asOf, -1);
+      const inventoryRows = singleAccountFragmentRows(sources["buy-box-loss:inventory"], "buy-box-loss:inventory", rawSellerId, inventoryDay, inventoryDay);
       // Catalog: exactly one single-account no-date fragment.
       const catalogRows = noDateFragmentRows(sources["buy-box-loss:catalog"], "buy-box-loss:catalog", rawSellerId);
       // Bind EVERY source ROW to its validated window, not just the fragment metadata: each daily row must
       // be a plain object with a real calendar date INSIDE ITS OWN seven-day slice (never merely inside the
-      // 28-day range -- a row in the wrong slice is rejected), and each inventory row must carry a real date
-      // inside [asOf-10d, asOf]. One malformed/impossible/future/out-of-window/wrong-slice row => invalid
+      // 28-day range -- a row in the wrong slice is rejected), and each inventory row must carry the exact
+      // single inventory date (asOf-1). One malformed/impossible/future/out-of-window/wrong-slice row => invalid
       // (zero writes, LKG preserved); bad rows are NEVER silently filtered. Catalog rows are no-date.
       dailyFrags.forEach((f, i) => assertRowsInWindow(f.rows, expectedSlices[i].from, expectedSlices[i].to, `buy-box-loss daily slice ${i}`));
-      assertRowsInWindow(inventoryRows, inventoryFrom, asOf, "buy-box-loss inventory");
+      assertRowsInWindow(inventoryRows, inventoryDay, inventoryDay, "buy-box-loss inventory");
       assertPlainObjectRows(catalogRows, "buy-box-loss catalog");
       return buyBoxLossPayload({
         accountId: publicAccountId, asOf, from, windowDays: BB_WINDOW_DAYS, sliceDays: BB_SLICE_DAYS,
@@ -983,7 +981,7 @@ const REGISTRY = {
   // grouped 30d Sales, the shared FBA inventory snapshot, the shared no-date catalog, and the OPTIONAL
   // no-date Listings (Raw JSON) enrichment. The four non-raw sources are required (fetch gate keeps the
   // report PENDING until each succeeds); `listing-health:listings-raw` is OPTIONAL + degradable. Windows
-  // are RECOMPUTED from asOf and pinned; inventory ROW dates are validated real + inside [asOf-10d, asOf];
+  // are RECOMPUTED from asOf and pinned; inventory ROW dates are validated real + exactly asOf-1 (single day);
   // a wrong-window/cross-account/malformed/bad-date fragment => invalid (LKG, zero writes); a missing/failed
   // required source => unavailable (LKG). Currencies never merge; buy box is never evaluated. ZERO DataDoe/
   // network calls (pure).
@@ -1002,7 +1000,7 @@ const REGISTRY = {
       const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
       const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
       const salesFrom = addDaysStr(asOf, -(LH_SALES_WINDOW_DAYS - 1));
-      const inventoryFrom = addDaysStr(asOf, -LH_INVENTORY_LOOKBACK_DAYS);
+      const inventoryDay = addDaysStr(asOf, -1);
       // The FOUR required sources must be a validated saved array (never an empty-success coercion).
       for (const key of ["listing-health:listings", "listing-health:sales", "listing-health:inventory", "listing-health:catalog"]) {
         const s = sources[key];
@@ -1013,9 +1011,10 @@ const REGISTRY = {
       // Listings + Catalog: exactly one single-account NO-DATE fragment each (from === null, to === null).
       const listingRows = noDateFragmentRows(sources["listing-health:listings"], "listing-health:listings", rawSellerId);
       const catalogRows = noDateFragmentRows(sources["listing-health:catalog"], "listing-health:catalog", rawSellerId);
-      // Sales: one single-account fragment over [asOf-29d, asOf]. Inventory: one over [asOf-10d, asOf].
+      // Sales: one single-account fragment over [asOf-29d, asOf]. Inventory: one over EXACTLY the single
+      // previous day [asOf-1, asOf-1].
       const salesRows = singleAccountFragmentRows(sources["listing-health:sales"], "listing-health:sales", rawSellerId, salesFrom, asOf);
-      const inventoryRows = singleAccountFragmentRows(sources["listing-health:inventory"], "listing-health:inventory", rawSellerId, inventoryFrom, asOf);
+      const inventoryRows = singleAccountFragmentRows(sources["listing-health:inventory"], "listing-health:inventory", rawSellerId, inventoryDay, inventoryDay);
       // Optional Listings (Raw JSON) enrichment -- EXACT state handling:
       //   validated success (incl. empty rows) => issuesAvailable true (build the raw fold);
       //   the approved degraded/disabled availabilityPolicy => save a valid snapshot with issuesAvailable
@@ -1038,12 +1037,12 @@ const REGISTRY = {
         throw deriveError("listing-health:listings-raw is not a validated success and not the approved degraded/disabled state (pending/missing/failed/unreadable); last-known-good preserved.", "unavailable");
       }
       // Row-level validation: every listings / sales / catalog / raw row must be a plain object; every
-      // inventory row must carry a real calendar date inside [asOf-10d, asOf] (never silently filtered).
+      // inventory row must carry the exact single inventory date (asOf-1; never silently filtered).
       assertPlainObjectRows(listingRows, "listing-health listings");
       assertPlainObjectRows(salesRows, "listing-health sales");
       assertPlainObjectRows(catalogRows, "listing-health catalog");
       assertPlainObjectRows(rawRows, "listing-health listings-raw");
-      assertRowsInWindow(inventoryRows, inventoryFrom, asOf, "listing-health inventory");
+      assertRowsInWindow(inventoryRows, inventoryDay, inventoryDay, "listing-health inventory");
       // B2 fail-closed currency isolation: the route payload folds sales by SKU only, so a SKU split across
       // currencies (or a listing currency conflicting with its single sales currency) would silently merge
       // money. Reject BEFORE folding => typed invalid, zero writes, LKG preserved (route core unchanged).
@@ -1092,13 +1091,13 @@ const REGISTRY = {
       }
       // Listings is a single-account NO-DATE fragment (already isolated to this owner by the worker).
       const listingRows = noDateFragmentRows(sources["listing-health-v3:listings"], "listing-health-v3:listings", rawSellerId);
-      // Inventory is the LATEST snapshot, INDEPENDENT of the sales window: its window is [inventoryAsOf-10d,
-      // inventoryAsOf] (inventoryAsOf defaults to asOf but may lead it), recomputed + pinned here (never trusted).
+      // Inventory is EXACTLY the single snapshot day [inventoryAsOf .. inventoryAsOf] (D-1), INDEPENDENT of
+      // the sales window (inventoryAsOf defaults to asOf but may lead it), recomputed + pinned here (never
+      // trusted). Both endpoints are the ONE date, so no cross-date row can ever be accepted or summed.
       const inventoryAsOf = context.inventoryAsOf == null ? asOf : String(context.inventoryAsOf);
       if (!isValidCalendarDate(inventoryAsOf)) throw new Error("listing-health-v3 inventoryAsOf must be a real calendar date.");
-      const inventoryFrom = addDaysStr(inventoryAsOf, -LH_INVENTORY_LOOKBACK_DAYS);
-      const inventoryRows = singleAccountFragmentRows(sources["listing-health-v3:inventory"], "listing-health-v3:inventory", rawSellerId, inventoryFrom, inventoryAsOf);
-      assertRowsInWindow(inventoryRows, inventoryFrom, inventoryAsOf, "listing-health-v3 inventory");
+      const inventoryRows = singleAccountFragmentRows(sources["listing-health-v3:inventory"], "listing-health-v3:inventory", rawSellerId, inventoryAsOf, inventoryAsOf);
+      assertRowsInWindow(inventoryRows, inventoryAsOf, inventoryAsOf, "listing-health-v3 inventory");
       // Optional Listings (Raw JSON): validated success => enrich; approved degraded/disabled => issuesAvailable false;
       // anything else (pending/failed/unreadable) => unavailable (LKG preserved). Mirrors the v1 raw policy exactly.
       const rawSource = sources["listing-health-v3:listings-raw"];

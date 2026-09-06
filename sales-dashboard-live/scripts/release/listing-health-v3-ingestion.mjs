@@ -30,8 +30,10 @@ const AUTHORIZED_OPERATOR = "laxmikant@superboring.in";
 const operator = process.env.PRIORITY_OPERATOR || argOf("operator") || AUTHORIZED_OPERATOR;
 const emergencyReserveTokens = Number(argOf("reserve") || 200); // meaningful emergency reserve (>> the ~8-token canary)
 
-const serverToday = () => new Date().toISOString().slice(0, 10);
-const cycleDate = argOf("cycle-date") || serverToday();
+// Default cycle date = the previous UTC date (D-1): the canonical shared inventory snapshot day
+// (fbaInventoryAsOf parity), so an omitted --cycle-date still matches the FBA inventory cache identity.
+const serverD1 = () => new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+const cycleDate = argOf("cycle-date") || serverD1();
 
 if (!["india", "europe-au", "us-ca"].includes(region)) { console.error("STOP --region must be india | europe-au | us-ca"); process.exit(2); }
 if (mode !== "dry-run" && mode !== "live") { console.error("STOP --mode must be dry-run | live"); process.exit(2); }

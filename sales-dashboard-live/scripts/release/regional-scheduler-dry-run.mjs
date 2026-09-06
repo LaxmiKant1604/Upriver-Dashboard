@@ -19,7 +19,15 @@ const regionArg = (argOf("region") || "all").toLowerCase();
 if (regionArg !== "all" && !REGION_SCOPES.includes(regionArg)) { console.error("STOP --region must be india | europe-au | us-ca | all (got: " + regionArg + ")"); process.exit(2); }
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
-const { fetchAccounts } = await import("../../lib/server/datadoe.js");
+const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
+const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
+const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
+// EXPORT-ELIGIBILITY GATE (dry-run parity with the live scheduler): show exactly the gated account set
+// plus the typed exclusions, so the dry-run rehearses the real scope.
+const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, {
+  fetchDetailed: fetchAccountsDetailed, readOnboardingRows,
+  onExcluded: (excluded, gateMode) => console.log(`onboarding gate (${gateMode}): excluded ${excluded.length} account(s): ${excluded.map((x) => `${x.accountId.slice(0, 8)}:${x.reason}`).join(", ")}`),
+});
 const { routeAccounts, batchAccounts, REGION_SCHEDULE, MAX_SELLERS_PER_BATCH } = await import("../../lib/server/sync/campaign-region-routing.js");
 const { OLI_TOKENS_PER_CREATE } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { getDataDoeTokenBalance } = await import("../../lib/server/datadoe-usage.js");

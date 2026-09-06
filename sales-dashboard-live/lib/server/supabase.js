@@ -1161,6 +1161,80 @@ export async function getAccountDirectoryRows(accountIds) {
   return request(`/rest/v1/account_directory?${params}`);
 }
 
+/* ===================== ACCOUNT ONBOARDING (Primary DataDoe automatic onboarding) =====================
+ * Durable onboarding state for every PRIMARY account (supabase/migrations/20260919_account_onboarding.sql).
+ * Service-role only writes; the atomic bootstrap claim goes through the SECURITY DEFINER RPC. All readers
+ * FAIL SOFT to null so the export-eligibility gate can degrade to its readiness-only mode (loading accounts
+ * stay excluded; existing ready accounts keep publishing) while the migration is pending or a read fails. */
+
+// All onboarding rows, or NULL when the table is unreadable/absent (fail-soft -- caller degrades).
+export async function getAccountOnboardingRows() {
+  try {
+    const params = new URLSearchParams({
+      select: "account_id,connection_id,name,marketplace_country_code,marketplace_id,region,status,"
+        + "datadoe_ready,datadoe_row_count,seller_central_row_count,ads_connected,ads_ready,ads_row_count,"
+        + "sources,failure_code,operation_id,first_discovered_at,last_seen_at,ready_at,bootstrap_started_at,"
+        + "bootstrap_completed_at,last_attempt_at,next_retry_at,updated_at",
+      order: "account_id.asc",
+    });
+    const rows = await request(`/rest/v1/account_onboarding?${params}`);
+    return Array.isArray(rows) ? rows : null;
+  } catch {
+    return null;
+  }
+}
+
+// Idempotent upsert of onboarding rows (merge-duplicates on account_id). `first_discovered_at` is
+// intentionally NOT in the payload so a conflict update preserves the original discovery time, and
+// `operation_id`/`bootstrap_started_at` are NEVER written here -- only the claim RPC owns them.
+export async function upsertAccountOnboardingRows(rows) {
+  if (!rows || !rows.length) return;
+  const body = rows.map((r) => {
+    const { first_discovered_at: _fd, operation_id: _op, bootstrap_started_at: _bs, ...owned } = r;
+    return owned;
+  });
+  await request("/rest/v1/account_onboarding?on_conflict=account_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body,
+  });
+}
+
+// The ATOMIC bootstrap claim (SECURITY DEFINER RPC): transitions ready_for_bootstrap -> bootstrapping
+// exactly once per account; the same operation id is idempotent ('already-claimed'), a different one is
+// refused ('held'). Returns the RPC's typed jsonb disposition.
+export async function claimAccountBootstrap({ accountId, operationId }) {
+  const rows = await request("/rest/v1/rpc/claim_account_bootstrap", {
+    method: "POST",
+    body: { p_account_id: accountId, p_operation_id: operationId },
+  });
+  return rows || null;
+}
+
+// Distinct (account_id, report_key) presence pairs for the given accounts/keys -- the onboarding
+// worker's zero-cost durable-evidence probe (grading bootstrapping -> partially_ready -> ready).
+// EXACT per-pair existence reads (limit=1): a bulk read of the raw snapshot rows can exceed the
+// PostgREST row cap and silently truncate pairs (proven on the 34-account seed rehearsal), which
+// would falsely grade a fully-serving account as partial. Steady state probes only a handful of
+// accounts, so the pair fan-out stays tiny; the one-time seed pass is bounded (accounts x keys).
+export async function getReportSnapshotPresence({ accountIds, reportKeys }) {
+  if (!accountIds?.length || !reportKeys?.length) return [];
+  const pairs = [];
+  for (const accountId of accountIds) {
+    for (const reportKey of reportKeys) {
+      const params = new URLSearchParams({
+        select: "id",
+        account_id: `eq.${accountId}`,
+        report_key: `eq.${reportKey}`,
+        limit: "1",
+      });
+      const rows = await request(`/rest/v1/report_snapshots?${params}`);
+      if (Array.isArray(rows) && rows.length) pairs.push({ accountId, reportKey });
+    }
+  }
+  return pairs;
+}
+
 /**
  * The latest org-wide ACCOUNT-DIRECTORY snapshot accounts (report_snapshots, report_key 'account-directory').
  * This is the COMPLETE, authoritative directory (every primary account with its marketplace country + currency)
@@ -1179,12 +1253,19 @@ export async function getAccountDirectorySnapshotAccounts() {
   const rows = await request(`/rest/v1/report_snapshots?${query}`);
   const payload = rows && rows[0] ? rows[0].payload : null;
   const accounts = Array.isArray(payload && payload.accounts) ? payload.accounts : (Array.isArray(payload) ? payload : []);
-  return accounts.map((a) => ({
-    accountId: String((a && (a.accountId || a.id || a.account_id)) || "").trim(),
-    country: String((a && (a.country || a.marketCountry || a.marketplace)) || "").trim(),
-    currency: (a && a.currency) || null,
-    name: (a && a.name) || null,
-  })).filter((a) => a.accountId);
+  return accounts
+    // A "Setting up" entry (merged by the onboarding discovery worker before the account is export-
+    // eligible) is VISIBLE to admins in the selector but must NEVER seed an operator/scheduler scope:
+    // it has no durable evidence yet and a paid export for it would be premature (or, while DataDoe is
+    // still loading it, hard-rejected with HTTP 400). Legacy entries have no settingUp field and are
+    // included unchanged.
+    .filter((a) => !(a && a.settingUp === true))
+    .map((a) => ({
+      accountId: String((a && (a.accountId || a.id || a.account_id)) || "").trim(),
+      country: String((a && (a.country || a.marketCountry || a.marketplace)) || "").trim(),
+      currency: (a && a.currency) || null,
+      name: (a && a.name) || null,
+    })).filter((a) => a.accountId);
 }
 
 export async function insertSyncRun({ bucket, trigger, createdBy = null }) {
