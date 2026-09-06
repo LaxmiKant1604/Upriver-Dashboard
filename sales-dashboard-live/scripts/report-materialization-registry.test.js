@@ -102,4 +102,53 @@ throwsWith("F: a declared capability that disagrees with REPORT_CAPABILITIES fai
   ok("H: brand-accessible reports remain brand-accessible in the registry (capability parity)", Object.entries(REPORT_MATERIALIZATION).every(([a, e]) => isBrandAccessible(e.capability) === isBrandAccessible(REPORT_CAPABILITIES[a])));
 })();
 
+/* ===================== I. PHASE 3 read-only invariants (browser-triggered writes) ===================== */
+(() => {
+  // Every report declares clientOpenTriggeredWrite, and after Phase 3 it is FALSE for ALL of them (the two brand-view
+  // auto-converge effects now poll read-only).
+  ok("I: every entry declares clientOpenTriggeredWrite=false (no browser converge/poll calls the write endpoint)",
+    Object.values(REPORT_MATERIALIZATION).every((e) => e.clientOpenTriggeredWrite === false));
+  ok("I: the live registry reports pageOpenWriters count equal to the grandfathered allowlist size (5)",
+    validateReportMaterializationRegistry().pageOpenWriters === 5);
+})();
+
+// A NEW report cannot ship a page-open snapshot write (not in the shrinking grandfathered allowlist).
+throwsWith("I: a NEW report with pageOpenWrite=true (not grandfathered) fails", () => {
+  const reg = clone();
+  reg["shiny-new"] = {
+    ...clone()["sku-movement"], reportKey: "shiny-new", capability: CAPABILITY.BRAND_FILTERABLE,
+    serveMode: "self-heal-write-on-read", materializationOwner: "serve:self-heal", pageOpenWrite: true, clientOpenTriggeredWrite: false,
+  };
+  validateReportMaterializationRegistry({ registry: reg, capabilities: { ...REPORT_CAPABILITIES, "shiny-new": CAPABILITY.BRAND_FILTERABLE } });
+}, /NOT in PAGE_OPEN_WRITE_GRANDFATHERED/);
+
+// A report may never reintroduce a client-open-triggered (browser page-open) write.
+throwsWith("I: a report that flags clientOpenTriggeredWrite=true fails (allowlist is empty)", () => {
+  const reg = clone(); reg["brand-view"].clientOpenTriggeredWrite = true;
+  validateReportMaterializationRegistry({ registry: reg });
+}, /clientOpenTriggeredWrite:true/);
+
+// The write flag cannot hide behind a read-looking serve mode (biconditional).
+throwsWith("I: pageOpenWrite=true with a non-self-heal serve mode fails", () => {
+  const reg = clone(); reg["brand-sales"].pageOpenWrite = true; // brand-sales serveMode is read-snapshot
+  validateReportMaterializationRegistry({ registry: reg });
+}, /page-open write must serve via self-heal-write-on-read/);
+
+throwsWith("I: a self-heal serve mode with pageOpenWrite=false fails", () => {
+  const reg = clone(); reg["brand-inventory"].serveMode = "self-heal-write-on-read"; // pageOpenWrite is false
+  validateReportMaterializationRegistry({ registry: reg });
+}, /self-heal serve DOES write on a read miss/);
+
+// The grandfather must stay in lockstep: making a grandfathered report read-only without shrinking the allowlist fails.
+throwsWith("I: flipping a grandfathered report to read-only without shrinking the allowlist fails (lockstep)", () => {
+  const reg = clone(); reg["daily"].pageOpenWrite = false; reg["daily"].serveMode = "read-snapshot"; // now not a page-open writer
+  validateReportMaterializationRegistry({ registry: reg });
+}, /must EQUAL the set of reports declaring pageOpenWrite:true/);
+
+// A NON-self-heal materialization owner that still flags a page-open write is caught (owner->write consistency).
+throwsWith("I: a serve:self-heal owner with pageOpenWrite not true fails", () => {
+  const reg = clone(); reg["brand-directory"].pageOpenWrite = false; reg["brand-directory"].serveMode = "read-snapshot";
+  validateReportMaterializationRegistry({ registry: reg });
+}, /must EQUAL the set of reports declaring pageOpenWrite:true|self-heal owner writes on a read miss/);
+
 writeSync(1, `\nreport-materialization-registry: ${passed} assertions passed\n`);

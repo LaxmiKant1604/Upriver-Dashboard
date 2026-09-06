@@ -345,3 +345,48 @@ jobs:
       # recomputed UTC today), so the v3 inventory identity matches the FBA cache and a watchdog replay is idempotent.
       - name: Listing Health v3 shadow ingestion for this region (Listings + Listings-Raw only; inventory reuse-only)
         run: node scripts/release/listing-health-v3-ingestion.mjs --region=${{ needs.run.outputs.region }} --mode=live --cycle-date=${{ needs.run.outputs.inventory_asof }} --confirm=listing-health-v3/${{ needs.run.outputs.region }}/${{ needs.run.outputs.inventory_asof }}
+
+  # Report materialization -- scheduler-OWNED, ZERO-EXPORT derivation of the durable reports that would otherwise
+  # self-heal on a browser GET (brand-view-brands, sku-movement per brand incl. ALL, returns-leakage). It depends ONLY
+  # on the `run` job (the durable brand-sales / daily / OLI / catalog sources), NOT on `fba`, so an FBA failure can
+  # never block these sales/returns reports. `if: always()` + LKG-preserving + idempotent-upsert means it is safe to
+  # run every dispatch: a re-run whose durable evidence has not advanced writes nothing (unchanged), and a watchdog
+  # replay produces no duplicate snapshot. There is NO DataDoe adapter on this path -- it is structurally incapable of
+  # creating an export or spending a token (the runner fails if it observes a non-zero token count). The DataDoe key
+  # is present only so the operator can resolve the primary organization fingerprint for its durable reads.
+  materialize:
+    needs: [run]
+    if: always() && needs.run.outputs.region != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      PRIORITY_OPERATOR: laxmikant@superboring.in
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Verify required secrets are present (fail fast, never print values)
+        run: |
+          set -uo pipefail
+          missing=""
+          for v in POSTGRES_URL SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY; do
+            if [ -z "${!v:-}" ]; then missing="$missing $v"; fi
+          done
+          if [ -z "${SUPABASE_URL:-}" ] && [ -z "${VITE_SUPABASE_URL:-}" ]; then missing="$missing SUPABASE_URL|VITE_SUPABASE_URL"; fi
+          if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
+          echo "All required secrets present."
+      - name: Install dependencies
+        run: npm ci
+      # --as-of uses the SHARED inventory_asof (UTC today) from the run job as the future-guard ceiling; the derive
+      # clamps down to each account's latest proven date, so no future or fabricated data can ever be materialized.
+      - name: Materialize durable reports for this region (zero export; idempotent upsert)
+        run: node scripts/release/report-materialization.mjs --region=${{ needs.run.outputs.region }} --mode=live --as-of=${{ needs.run.outputs.inventory_asof }}

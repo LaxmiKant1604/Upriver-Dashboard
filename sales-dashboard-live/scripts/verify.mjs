@@ -55,6 +55,8 @@ const SUITES = [
   "test:fba-inventory-latest-snapshot",
   "test:lhv3-cycle-bucket-migration",
   "test:report-materialization-registry",
+  "test:report-materialization-operation",
+  "test:brand-view-readonly",
   "test:listing-health-v3-finalize",
   "test:listing-health-v3-preflight-defer",
   "test:listing-health-v3-identity-guard",

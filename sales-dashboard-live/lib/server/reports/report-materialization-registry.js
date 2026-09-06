@@ -45,8 +45,23 @@ export const REGIONAL_SCHEDULING = Object.freeze(["per-region-daily", "shadow", 
 export const REQUIRED_DECLARATION_FIELDS = Object.freeze([
   "reportKey", "reportVersion", "requiredSources", "optionalSources", "sourceOwner", "materializationOwner",
   "grain", "freshness", "provenanceFields", "lkgPolicy", "regionalScheduling", "capability", "serveMode",
-  "bucket", "pageOpenWrite", "notes",
+  "bucket", "pageOpenWrite", "clientOpenTriggeredWrite", "notes",
 ]);
+
+// GRANDFATHERED page-open writes (Phase 3). The EXACT, named set of reports whose plain-GET serve path STILL writes a
+// snapshot on a read miss (zero DataDoe self-heal), pending their move fully into the scheduler-owned materializer.
+// This is a SHRINKING allowlist: as each report's serve is made read-only, it is removed from here AND its
+// pageOpenWrite is flipped to false, and the guard asserts the two stay in lockstep (the set of pageOpenWrite:true
+// reports must EQUAL this allowlist). A NEW report can never appear here without a deliberate, reviewable edit that a
+// reviewer will reject -- so a new report is structurally prevented from shipping a page-open write. DO NOT ADD.
+export const PAGE_OPEN_WRITE_GRANDFATHERED = Object.freeze([
+  "daily", "sku-movement", "returns-leakage", "brand-view-brands", "brand-directory",
+]);
+
+// Client-open-triggered writes (a browser page-open/converge effect that calls the WRITE endpoint refresh=1). Phase 3
+// removed the last two (BrandView + BrandPortfolio auto-converge now poll read-only), so this allowlist is EMPTY and
+// every report must declare clientOpenTriggeredWrite:false. It stays empty: no report may reintroduce a client-open write.
+export const CLIENT_OPEN_TRIGGERED_WRITE_GRANDFATHERED = Object.freeze([]);
 
 // A source key is durable/scheduled evidence a derive reads. (These are `sourceKey` values from the source contracts /
 // the durable stores -- NOT DataDoe request keys.)
@@ -78,7 +93,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at", "salesSource", "currencies"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["brand-sales"],
-    serveMode: "read-snapshot", bucket: "A", pageOpenWrite: false,
+    serveMode: "read-snapshot", bucket: "A", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "Dashboard/Account. Ads is optional (merged at account grain in Daily; brand attribution needs campaign_brand_mapping).",
   },
   "daily": {
@@ -88,7 +103,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at", "salesWindowStatus", "coverage"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["daily"],
-    serveMode: "self-heal-write-on-read", bucket: "A", pageOpenWrite: true,
+    serveMode: "self-heal-write-on-read", bucket: "A", pageOpenWrite: true, clientOpenTriggeredWrite: false,
     notes: "Scheduler-published AND self-heals+writes on a read miss (zero DataDoe). pageOpenWrite=true -> a candidate to move fully into the scheduler so GET is read-only.",
   },
   "brand-inventory": {
@@ -98,7 +113,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "latest-snapshot" },
     provenanceFields: ["source_refreshed_at", "inventorySnapshotDate"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["brand-inventory"],
-    serveMode: "read-snapshot", bucket: "A", pageOpenWrite: false,
+    serveMode: "read-snapshot", bucket: "A", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "Compact FBA inventory snapshot (SOURCE_PROMOTED). Latest inventory date only; never summed across dates.",
   },
   "fba-plan": {
@@ -108,7 +123,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 24, coverage: "latest-snapshot" },
     provenanceFields: ["source_refreshed_at", "inventorySnapshotDate", "asOf"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["fba-plan"],
-    serveMode: "read-snapshot-else-waiting", bucket: "A", pageOpenWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "A", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "Published by the scheduler-v2 fba job per region (AWD optional, US+EU5). Also the FBA fallback for Brand View.",
   },
   "sku-movement": {
@@ -118,7 +133,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 24, coverage: "selectable-window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["sku-movement"],
-    serveMode: "self-heal-write-on-read", bucket: "B", pageOpenWrite: true,
+    serveMode: "self-heal-write-on-read", bucket: "B", pageOpenWrite: true, clientOpenTriggeredWrite: false,
     notes: "Sources scheduled; report self-heals+writes on read from durable OLI/Catalog (zero DataDoe). Move to scheduler to make GET read-only.",
   },
   "returns-leakage": {
@@ -128,7 +143,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 168, coverage: "durable-history" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "manual-only", capability: REPORT_CAPABILITIES["returns-leakage"],
-    serveMode: "self-heal-write-on-read", bucket: "B", pageOpenWrite: true,
+    serveMode: "self-heal-write-on-read", bucket: "B", pageOpenWrite: true, clientOpenTriggeredWrite: false,
     notes: "Returns workflow is manual-only (crons removed); report self-heals+writes on a read miss from durable Returns/Settlement/OLI.",
   },
   "brand-view": {
@@ -138,7 +153,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["adsAvailable", "fbaAvailable", "inventoryScope", "updating"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["brand-view"],
-    serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false,
+    serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "Aggregation of the scheduler-materialized brand-sales/brand-inventory + durable ads; serves LKG + updating when stale.",
   },
   "brand-view-portfolio": {
@@ -148,7 +163,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-region", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["adsAvailable", "fbaAvailable", "updating"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["brand-view-portfolio"],
-    serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false,
+    serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "Cross-account per-region Brand View. Never rebuilds inline on read (deferRebuildOnRead); serves LKG + updating.",
   },
   "brand-portfolio": {
@@ -158,7 +173,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["brand-portfolio"],
-    serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false,
+    serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "Legacy brand portfolio aggregation of brand-sales + fba-plan.",
   },
   "brand-view-brands": {
@@ -168,7 +183,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["brand-view-brands"],
-    serveMode: "self-heal-write-on-read", bucket: "B", pageOpenWrite: true,
+    serveMode: "self-heal-write-on-read", bucket: "B", pageOpenWrite: true, clientOpenTriggeredWrite: false,
     notes: "Brand dropdown directory; writes on a read miss (zero DataDoe) from brand-sales membership.",
   },
   "brand-directory": {
@@ -178,7 +193,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "organization", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["brand-directory"],
-    serveMode: "self-heal-write-on-read", bucket: "B", pageOpenWrite: true,
+    serveMode: "self-heal-write-on-read", bucket: "B", pageOpenWrite: true, clientOpenTriggeredWrite: false,
     notes: "Account/brand selector; rebuilds+writes on read when the brand-sales fingerprint changes (zero DataDoe). Refresh (Catalog export) is admin-gated.",
   },
   "oli-quality": {
@@ -188,7 +203,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "derive-fresh-each-read",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["oli-quality"],
-    serveMode: "derive-at-serve", bucket: "B", pageOpenWrite: false,
+    serveMode: "derive-at-serve", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "Pure read-derive from the durable OLI table; never stored, never DataDoe.",
   },
   "oli-quality-summary": {
@@ -198,7 +213,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "derive-fresh-each-read",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["oli-quality-summary"],
-    serveMode: "derive-at-serve", bucket: "B", pageOpenWrite: false,
+    serveMode: "derive-at-serve", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "Account-wide OLI quality summary; pure read-derive, never stored.",
   },
   "listing-health-v3": {
@@ -208,7 +223,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 24, coverage: "latest-snapshot" },
     provenanceFields: ["inventory", "salesWindowStatus", "coverage", "evidence"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "shadow", capability: REPORT_CAPABILITIES["listing-health-v3"],
-    serveMode: "derive-at-serve", bucket: "B", pageOpenWrite: false,
+    serveMode: "derive-at-serve", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "SHADOW ingestion writes durable per-account aliases; serve derives read-only from them + durable OLI. UI flag LISTING_HEALTH_V3 is OFF.",
   },
   // ----- reports with NO live scheduler owner: materialized only by an explicit user Refresh (DataDoe) today. Declared
@@ -220,7 +235,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["sales"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "Multi-account dashboard aggregate; no live scheduler owner -> only a user Refresh (DataDoe) materializes it.",
   },
   "reconciliation": {
@@ -230,7 +245,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "6-month" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["reconciliation"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "registry enabled:false; materialized only by a user Refresh (6 monthly settlement batches, DataDoe).",
   },
   "sku-pl": {
@@ -240,7 +255,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["sku-pl"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "registry enabled:false; user-Refresh only.",
   },
   "keyword-rank": {
@@ -250,7 +265,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "shadow", capability: REPORT_CAPABILITIES["keyword-rank"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "Search Query Performance; enabled:false + shadow cycle only; user-Refresh materializes it.",
   },
   "content-changes": {
@@ -260,7 +275,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["content-changes"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "registry enabled:false; user-Refresh only.",
   },
   "sales-movers": {
@@ -270,7 +285,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "7d-compare" },
     provenanceFields: ["source_refreshed_at", "salesLatestDate"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "shadow", capability: REPORT_CAPABILITIES["sales-movers"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "enabled:false + shadow cycle; user-Refresh materializes it.",
   },
   "listing-health": {
@@ -280,7 +295,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "latest-snapshot" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["listing-health"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "v1 Listing Health; enabled:false; user-Refresh only. (v3 is the scheduled successor, UI-off.)",
   },
   "buy-box-loss": {
@@ -290,7 +305,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["buy-box-loss"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "enabled:false; user-Refresh only.",
   },
   "ppc-performance": {
@@ -300,7 +315,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "shadow", capability: REPORT_CAPABILITIES["ppc-performance"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "Ads source IS scheduled; the ppc-performance snapshot itself has no live publisher (superseded by the Campaign Ads workspace view).",
   },
   "listing-optimizer": {
@@ -310,7 +325,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "shadow", capability: REPORT_CAPABILITIES["listing-optimizer"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "enabled:false + shadow cycle; user-Refresh only.",
   },
 });
@@ -331,6 +346,14 @@ export const NON_REPORT_ACTIONS = Object.freeze(
  *  7. where the reportKey has a REPORT_SOURCE_CONTRACT, every OWNED contract sourceKey is declared as a dependency
  *     (required OR optional) -- the report must not omit a source its own contract fetches. (Derived deps like OLI/
  *     Catalog may additionally be declared even when the contract does not own them.)
+ *  8. clientOpenTriggeredWrite is a boolean.
+ *  9. write-flag <-> serve-mode/owner consistency: pageOpenWrite:true IFF serveMode==="self-heal-write-on-read" IFF
+ *     materializationOwner==="serve:self-heal" (a page-open write can never hide behind a read-looking declaration).
+ * 10. a page-open write is allowed ONLY for a report in PAGE_OPEN_WRITE_GRANDFATHERED, and a client-open-triggered
+ *     write is allowed for NONE -- so a NEW report cannot ship either kind of browser-triggered write.
+ * 11. the write allowlist stays in EXACT lockstep with the declared flags (the pageOpenWrite:true set EQUALS
+ *     PAGE_OPEN_WRITE_GRANDFATHERED; no report declares clientOpenTriggeredWrite:true) -- so the grandfather can only
+ *     SHRINK as serve paths are made read-only, never grow.
  */
 export function validateReportMaterializationRegistry({
   capabilities = REPORT_CAPABILITIES, capabilityEnum = CAPABILITY,
@@ -381,6 +404,39 @@ export function validateReportMaterializationRegistry({
         problems.push(`"${a}" omits contract-owned source "${cs}" from its declared dependencies (${[...declared].join(",")})`);
       }
     }
+    // 8. clientOpenTriggeredWrite is a boolean (does a browser page-open/converge effect call the WRITE endpoint?).
+    if (typeof e.clientOpenTriggeredWrite !== "boolean") problems.push(`"${a}" clientOpenTriggeredWrite must be a boolean`);
+    // 9. write-flag <-> serve-mode consistency (biconditional): a page-open write is EXACTLY a self-heal serve, so no
+    //    report can hide a write behind a read-looking serve mode, nor claim a self-heal serve while flagging read-only.
+    //    (The owner is NOT biconditional: "daily" is a legit hybrid -- ALL-brand is scheduler-materialized, so its
+    //    owner is scheduler-v2:priority, while its named-brand read still self-heals+writes, so pageOpenWrite=true. But
+    //    a serve:self-heal OWNER always writes on read, so that direction IS enforced.)
+    const selfHealMode = e.serveMode === "self-heal-write-on-read";
+    if (e.pageOpenWrite === true && !selfHealMode) problems.push(`"${a}" pageOpenWrite=true but serveMode is "${e.serveMode}" (a page-open write must serve via self-heal-write-on-read)`);
+    if (e.pageOpenWrite === false && selfHealMode) problems.push(`"${a}" serveMode is self-heal-write-on-read but pageOpenWrite=false (a self-heal serve DOES write on a read miss)`);
+    if (e.materializationOwner === "serve:self-heal" && e.pageOpenWrite !== true) problems.push(`"${a}" materializationOwner is serve:self-heal but pageOpenWrite is not true (a self-heal owner writes on a read miss)`);
+    // 10. a page-open / client-open write is allowed ONLY for a grandfathered report -> a NEW report is structurally
+    //     prevented from shipping either kind of browser-triggered write.
+    if (e.pageOpenWrite === true && !PAGE_OPEN_WRITE_GRANDFATHERED.includes(a)) {
+      problems.push(`"${a}" has pageOpenWrite=true but is NOT in PAGE_OPEN_WRITE_GRANDFATHERED -- a new report may not depend on a page-open snapshot write; make its GET read-only (scheduler-materialized) instead`);
+    }
+    if (e.clientOpenTriggeredWrite === true && !CLIENT_OPEN_TRIGGERED_WRITE_GRANDFATHERED.includes(a)) {
+      problems.push(`"${a}" has clientOpenTriggeredWrite=true but is NOT in CLIENT_OPEN_TRIGGERED_WRITE_GRANDFATHERED (which is empty) -- a browser page-open/converge effect must never call the write endpoint; poll read-only instead`);
+    }
+  }
+
+  // 11. the write allowlists must stay in EXACT lockstep with the declared write flags -- the set of reports whose
+  //     pageOpenWrite is true must EQUAL PAGE_OPEN_WRITE_GRANDFATHERED (so the allowlist can neither grow silently nor
+  //     keep a stale entry once a report is made read-only), and clientOpenTriggeredWrite must be true for NONE.
+  const declaredPageOpenWriters = Object.entries(registry).filter(([a, e]) => reportSet.has(a) && e.pageOpenWrite === true).map(([a]) => a).sort();
+  const grandfathered = [...PAGE_OPEN_WRITE_GRANDFATHERED].sort();
+  if (JSON.stringify(declaredPageOpenWriters) !== JSON.stringify(grandfathered)) {
+    problems.push(`PAGE_OPEN_WRITE_GRANDFATHERED [${grandfathered.join(",")}] must EQUAL the set of reports declaring pageOpenWrite:true [${declaredPageOpenWriters.join(",")}] -- update BOTH in lockstep (remove a report from the allowlist only when its GET is made read-only)`);
+  }
+  for (const a of PAGE_OPEN_WRITE_GRANDFATHERED) if (!reportSet.has(a)) problems.push(`PAGE_OPEN_WRITE_GRANDFATHERED lists "${a}", which is not a registered report action`);
+  const declaredClientWriters = Object.entries(registry).filter(([a, e]) => reportSet.has(a) && e.clientOpenTriggeredWrite === true).map(([a]) => a).sort();
+  if (declaredClientWriters.length !== 0) {
+    problems.push(`no report may declare clientOpenTriggeredWrite:true (Phase 3 made every browser converge/poll read-only); offenders: [${declaredClientWriters.join(",")}]`);
   }
 
   if (problems.length) {
@@ -388,5 +444,5 @@ export function validateReportMaterializationRegistry({
     err.problems = problems;
     throw err;
   }
-  return { ok: true, reports: reportActions.length };
+  return { ok: true, reports: reportActions.length, pageOpenWriters: declaredPageOpenWriters.length };
 }

@@ -167,9 +167,12 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
     return () => { active = false; };
   }, [applyReport, loadReport, reportParams]);
 
-  // Auto-converge an `updating` single-account Brand View: trigger the (cheap) zero-export rebuild, re-apply,
-  // bounded attempts. The account's brand-sales advanced past the assembly, so the rebuild republishes the
-  // fresh exact-identity snapshot with no user action; the LKG stays on screen meanwhile.
+  // Auto-converge an `updating` single-account Brand View by POLLING the saved snapshot READ-ONLY (loadReport):
+  // the regional scheduler now OWNS materialization, so opening or converging a page never triggers a server-side
+  // rebuild, snapshot write, lock, or DataDoe activity. The account's brand-sales advanced past the assembly; the
+  // scheduler republishes the fresh exact-identity snapshot, and this bounded read-only poll picks it up with no
+  // user action. The LKG stays on screen meanwhile. The explicit Refresh button (onRefresh) remains the only path
+  // that requests a rebuild, and only on a real click.
   useEffect(() => {
     if (!updating || !reportParams || refreshGuard.current) return undefined;
     if (rebuildAttempts.current >= 6) return undefined;
@@ -178,16 +181,13 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
     const timer = setTimeout(async () => {
       rebuildAttempts.current += 1;
       try {
-        const { body, cachedAt } = await refreshReport(reportParams);
+        const { body, cachedAt } = await loadReport(reportParams);
         if (active) applyReport(body, cachedAt);
-      } catch {
-        try { const { body, cachedAt } = await loadReport(reportParams); if (active) applyReport(body, cachedAt); }
-        catch { /* transient; the next attempt retries */ }
-      }
+      } catch { /* transient; the next read-only poll retries */ }
     }, delay);
     return () => { active = false; clearTimeout(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [updating, reportParams, applyReport, refreshReport, loadReport]);
+  }, [updating, reportParams, applyReport, loadReport]);
 
   /* ------------------------------- refresh ------------------------------ */
   const onRefresh = useCallback(async () => {

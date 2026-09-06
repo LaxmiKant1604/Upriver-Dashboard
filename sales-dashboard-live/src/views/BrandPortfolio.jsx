@@ -109,28 +109,26 @@ export default function BrandPortfolio({
     setStaleScope(body.snapshot?.staleScope ? body.snapshot.savedForParams || {} : null);
   }, []);
 
-  // Auto-converge an `updating` Brand View: trigger the bounded zero-export rebuild (refresh), then re-apply.
-  // A rebuild that runs out of the route budget returns `updating` again -> this re-fires (bounded attempts) so
-  // the fresh snapshot eventually replaces the LKG with no user action. One rebuild at a time (server lock); a
-  // concurrent holder (409) falls back to a plain read poll.
+  // Auto-converge an `updating` Brand View by POLLING the saved snapshot READ-ONLY (loadReport). The regional
+  // scheduler now OWNS materialization, so converging a page never triggers a server rebuild, snapshot write, lock,
+  // or DataDoe activity. When the scheduler republishes the fresh snapshot, this bounded read-only poll replaces
+  // the LKG with no user action; if it does not converge within the bounded attempts, the LKG stays on screen and
+  // the explicit Refresh button (the only rebuild path, and only on a real click) remains available.
   useEffect(() => {
     if (!updating || !reportParams || refreshGuard.current) return undefined;
-    if (rebuildAttempts.current >= 6) return undefined; // give up auto-rebuild; the Refresh button still works
+    if (rebuildAttempts.current >= 6) return undefined; // give up auto-poll; the Refresh button still works
     let active = true;
     const delay = rebuildAttempts.current === 0 ? 400 : 3500;
     const timer = setTimeout(async () => {
       rebuildAttempts.current += 1;
       try {
-        const { body, cachedAt } = await refreshReport(reportParams);
+        const { body, cachedAt } = await loadReport(reportParams);
         if (active) applyReport(body, cachedAt);
-      } catch {
-        try { const { body, cachedAt } = await loadReport(reportParams); if (active) applyReport(body, cachedAt); }
-        catch { /* transient; the next attempt retries */ }
-      }
+      } catch { /* transient; the next read-only poll retries */ }
     }, delay);
     return () => { active = false; clearTimeout(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [updating, reportParams, applyReport, refreshReport, loadReport]);
+  }, [updating, reportParams, applyReport, loadReport]);
 
   // Changing brand must clear the previous brand's numbers before the next
   // request lands, so two brands can never be on screen at once.

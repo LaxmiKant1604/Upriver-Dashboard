@@ -21,11 +21,18 @@ const repoRoot = path.resolve(here, "..", "..");
 const wf = readFileSync(path.join(repoRoot, ".github/workflows/scheduler-v2.yml"), "utf8");
 const flags = readFileSync(path.join(here, "..", "src/lib/feature-flags.js"), "utf8");
 
-// Isolate the listing-health-v3 job block (from its key to end-of-file; it is the last job).
+// Isolate the listing-health-v3 job block (from its key to the NEXT job key, if any).
 const v3Idx = wf.indexOf("\n  listing-health-v3:");
 assert.ok(v3Idx > 0, "the workflow defines a listing-health-v3 job");
-const v3Job = wf.slice(v3Idx);
+const matCommentIdx = wf.indexOf("\n  # Report materialization");
+const matIdx = wf.indexOf("\n  materialize:");
+// End the v3 block at the START of the materialize block (its leading comment precedes the job key), so the
+// materialize job's docs never leak into the v3 assertions.
+const v3End = matCommentIdx > v3Idx ? matCommentIdx : (matIdx > v3Idx ? matIdx : wf.length);
+const v3Job = wf.slice(v3Idx, v3End);
 const beforeV3 = wf.slice(0, v3Idx); // run + fba jobs
+// The zero-export report materialization job (added after the v3 job). From its key to end-of-file (it is the last job).
+const matJob = matIdx > 0 ? wf.slice(matIdx) : "";
 
 /* ===================== A. dependency order + gate ===================== */
 ok("A: the v3 job needs BOTH run and fba", /needs:\s*\[run,\s*fba\]/.test(v3Job));
@@ -58,5 +65,14 @@ ok("D: the workflow-level per-region concurrency group is preserved (shared by a
 /* ===================== E. ceilings unchanged; inventory/OLI/catalog remain zero-create ===================== */
 ok("E: the region export ceilings are India=4, Europe-AU=8, US-CA=4", LISTING_HEALTH_V3_REGION_EXPORT_CEILING.india === 4 && LISTING_HEALTH_V3_REGION_EXPORT_CEILING["europe-au"] === 8 && LISTING_HEALTH_V3_REGION_EXPORT_CEILING["us-ca"] === 4);
 ok("E: the v3 command creates ONLY via the ingestion CLI (Listings + Listings-Raw; inventory reuse-only by contract)", /listing-health-v3-ingestion\.mjs/.test(v3Job) && !/--as-of=|fba-inventory|order-line|catalog|campaign|awd/i.test(v3Job));
+
+/* ===================== F. the zero-export report materialization job (Phase 3) ===================== */
+ok("F: a materialize job exists", matJob.length > 0 && /^\s{2}materialize:\s*$/m.test(matJob));
+ok("F: materialize depends ONLY on run (NOT fba) so an FBA failure never blocks sales/returns reports", /needs:\s*\[run\]/.test(matJob) && !/needs:\s*\[run,\s*fba\]/.test(matJob));
+ok("F: materialize runs if:always on a resolved region (independent of fba result)", /if:\s*always\(\)\s*&&\s*needs\.run\.outputs\.region\s*!=\s*''/.test(matJob) && !/needs\.fba\.result/.test(matJob));
+ok("F: materialize invokes the zero-export report-materialization CLI in live mode for the region", /report-materialization\.mjs[^\n]*--mode=live/.test(matJob) && /report-materialization\.mjs[^\n]*--region=\$\{\{\s*needs\.run\.outputs\.region\s*\}\}/.test(matJob));
+ok("F: materialize passes the SHARED inventory_asof ceiling (never recomputes UTC today)", /report-materialization\.mjs[^\n]*--as-of=\$\{\{\s*needs\.run\.outputs\.inventory_asof\s*\}\}/.test(matJob) && !/date -u/.test(matJob));
+ok("F: materialize creates NO DataDoe export CLI / cron / dispatch (it never spends a token)", !/ingestion\.mjs|fba-plan-golive\.mjs|cron:|schedule:|workflow_dispatch:/.test(matJob));
+ok("F: materialize does NOT enable the ingestion gate or flip the UI flag", !/LISTING_HEALTH_V3_INGESTION_ENABLED/.test(matJob) && !/LISTING_HEALTH_V3\s*:/.test(matJob));
 
 writeSync(1, `\nscheduler-v2-lhv3-workflow: ${passed} assertions passed\n`);
