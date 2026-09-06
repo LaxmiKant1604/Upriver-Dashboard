@@ -133,6 +133,7 @@
     "test:fba-inventory-latest-snapshot": "node scripts/fba-inventory-latest-snapshot.test.js",
     "test:lhv3-cycle-bucket-migration": "node scripts/listing-health-v3-cycle-bucket-migration.test.js",
     "test:listing-health-v3-finalize": "node scripts/report-listing-health-v3-finalize.test.js",
+    "test:listing-health-v3-preflight-defer": "node scripts/report-listing-health-v3-preflight-defer.test.js",
     "test:listing-health-v3-identity-guard": "node scripts/report-listing-health-v3-identity-guard.test.js",
     "test:lhv3-shared-inventory-date": "node scripts/lhv3-shared-inventory-date.test.js",
     "test:scheduler-v2-lhv3-workflow": "node scripts/scheduler-v2-lhv3-workflow.test.js"

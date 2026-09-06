@@ -125,9 +125,9 @@ await (async () => {
 await (async () => {
   const s = spies({ cost: { newExports: 2, reusedExports: 1, creates: 2, estimatedTokens: 4, inventoryAdoptable: false } });
   const r = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...s }));
-  ok("G: with no fresh FBA Plan inventory, sources + materialization still run", s.calls.runSources === 1 && s.calls.materialize === 1);
-  ok("G: the snapshot derive is DEFERRED (never publishes stale inventory as current); LKG preserved; NOT finalized", r.phase === "deferred-inventory" && r.deferred === true && s.calls.runReports === 0 && r.snapshots === 0 && s.calls.finalizeCycle === 0);
-  ok("G: a deferral is ok:false (scheduled CLI exits nonzero; cycle left open for a same-cycle retry)", r.ok === false);
+  ok("G: with no fresh FBA Plan inventory, the deferral happens BEFORE any source/materialize work (no paid export)", s.calls.runSources === 0 && s.calls.materialize === 0 && s.calls.checkBalance === 0);
+  ok("G: the derive is DEFERRED (never publishes stale inventory as current); no report, no finalize; LKG preserved", r.phase === "deferred-inventory" && r.deferred === true && s.calls.runReports === 0 && r.snapshots === 0 && s.calls.finalizeCycle === 0);
+  ok("G: a deferral is ok:false with zero creates/tokens (scheduled CLI exits nonzero; NO v3 cycle opened)", r.ok === false && r.creates === 0 && r.tokens === 0);
 })();
 
 /* ===================== H. freshness-aware cost (stale rejected / fresh reusable / next-cycle refresh / inventory) ===================== */

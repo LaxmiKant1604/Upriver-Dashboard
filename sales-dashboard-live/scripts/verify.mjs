@@ -55,6 +55,7 @@ const SUITES = [
   "test:fba-inventory-latest-snapshot",
   "test:lhv3-cycle-bucket-migration",
   "test:listing-health-v3-finalize",
+  "test:listing-health-v3-preflight-defer",
   "test:listing-health-v3-identity-guard",
   "test:lhv3-shared-inventory-date",
   "test:scheduler-v2-lhv3-workflow",

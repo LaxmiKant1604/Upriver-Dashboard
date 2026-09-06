@@ -96,7 +96,8 @@ await (async () => {
 await (async () => {
   const c = live({ inventoryAdoptable: false });
   const r = await run(c);
-  ok("F: inventory-not-adoptable defers -> ok:false, phase deferred-inventory, NO report, NO finalize (retry-safe)", r.ok === false && r.phase === "deferred-inventory" && r.deferred === true && c.calls.runReports === 0 && c.calls.finalizeCycle === 0);
+  ok("F: inventory-not-adoptable defers BEFORE any work -> ok:false, phase deferred-inventory, zero creates/tokens/snapshots", r.ok === false && r.phase === "deferred-inventory" && r.deferred === true && r.creates === 0 && r.tokens === 0 && r.snapshots === 0);
+  ok("F: the deferral runs NO source/materialize/report/finalize (no v3 cycle opened; retry-safe)", c.calls.runSources === 0 && c.calls.materialize === 0 && c.calls.runReports === 0 && c.calls.finalizeCycle === 0);
 })();
 
 writeSync(1, `\nreport-listing-health-v3-finalize: ${passed} assertions passed\n`);

@@ -176,6 +176,21 @@ export async function runListingHealthV3Ingestion({
   if (Number(cost.creates || 0) > Number(ceilingCheck.ceiling)) {
     return fail("ceiling", `freshness-aware create count ${cost.creates} exceeds the region ceiling ${ceilingCheck.ceiling}; refusing (fail closed)`);
   }
+  ev.inventoryAdoptable = !!cost.inventoryAdoptable;
+
+  // P1 ORDERING GATE (LIVE only): DEFER on non-adoptable FBA Plan inventory IMMEDIATELY after cost/ceiling validation
+  // and BEFORE the balance check, runSources, openCycle/persistBudget, any export reservation/POST, materialize,
+  // reports, or finalize. This GUARANTEES no paid Listings/Listings-Raw export -- and NO v3 cycle -- is ever opened
+  // when the required inventory is unavailable (the FBA job can report success while one regional account lacks
+  // adoptable inventory). Returns a typed deferred-inventory result with creates=0, tokens=0, snapshots=0; LKG stands.
+  // Dry-run is unaffected: it falls through to the planned return below, which reports inventoryAdoptable + cost.
+  if (!dryRun && !cost.inventoryAdoptable) {
+    return {
+      ...ev, phase: "deferred-inventory", ok: false, deferred: true, dryRun: false,
+      creates: 0, tokens: 0, snapshots: 0, inventoryAdoptable: false,
+      note: "current FBA Plan inventory unavailable -- deferred BEFORE any cycle/create (no v3 cycle opened, zero creates/tokens); last-known-good preserved",
+    };
+  }
   if (!dryRun) {
     if (pricingKnown !== true) return fail("budget", "DataDoe pricing state is unknown; refusing to create (fail closed)");
     if (reservationSupported !== true) return fail("budget", "atomic pre-POST create reservation is unavailable; refusing to create (fail closed)");
@@ -221,12 +236,11 @@ export async function runListingHealthV3Ingestion({
   const matRejected = Number((matSummary && matSummary.rejected) || 0);
   if (matRejected > 0) return fail("materialize", `materialization rejected ${matRejected} unattributable fragment(s); fail closed (last-known-good preserved)`);
 
-  // 10) INVENTORY REUSE gate: derive the shadow snapshot ONLY when the current FBA Plan inventory cache is fresh.
-  //     Otherwise DEFER -- do NOT finalize (the cycle stays running so a same-cycle retry can complete once inventory is
-  //     fresh) and return ok:false so the scheduled CLI exits nonzero. The previous shadow snapshot (LKG) stands.
-  if (!cost.inventoryAdoptable) {
-    return { ...ev, phase: "deferred-inventory", ok: false, deferred: true, snapshots: 0, note: "current FBA Plan inventory unavailable -- snapshot derive deferred (cycle left open for retry); last-known-good preserved" };
-  }
+  // 10) INVARIANT (defense in depth): a LIVE run proved inventory adoptability at the pre-create gate ABOVE, before any
+  //     cycle/create. Reaching here with non-adoptable inventory would mean paid work happened before readiness -- the
+  //     exact P1 this ordering fix removes. It is unreachable in the normal flow; assert it can never permit a stale
+  //     derive (guards against a future re-ordering re-introducing the defect).
+  if (!cost.inventoryAdoptable) return fail("invariant", "inventory adoptability regressed after the pre-create gate; refusing to derive on stale inventory (fail closed; should be unreachable)");
 
   // 11) run report jobs -> the scheduler-v2/listing-health-v3 SHADOW snapshot only. LKG preserved on any failure.
   let reportRes;
