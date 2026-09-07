@@ -28,7 +28,7 @@ import { getSourceExportCache, saveSourceExportCache, getSourceExportCacheMeta, 
 import { getDataDoeTokenBalance } from "../datadoe-usage.js";
 import { discoverPrimaryAccountIds } from "./priority-control-pg-store.js";
 import { buildListingHealthV3Plan, planListingHealthV3IngestionCost } from "./listing-health-v3-operation.js";
-import { materializeListingHealthV3PerAccount, LISTING_HEALTH_V3_REGION_EXPORT_CEILING } from "./listing-health-v3-materialize.js";
+import { materializeListingHealthV3PerAccount, LISTING_HEALTH_V3_REGION_EXPORT_CEILING, expectedListingHealthV3NewExports } from "./listing-health-v3-materialize.js";
 import { planFbaPlanBucketBatched } from "./report-planner.js";
 import { fbaCycleBucket } from "./fba-plan-operation.js";
 import { defaultInventoryBatchesOf, overflowSellersFromTruncated, readRecentTruncatedInventoryHashes, DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS } from "./fba-inventory-overflow.js";
@@ -135,14 +135,28 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
 
   const runSources = async ({ plan, region, cycleDate }) => {
     const cycleBucket = listingHealthV3CycleBucket(region);
-    const ceiling = regionCeilings[region];
     const NEW = makeSourceTranche({ sourceKeys: [...V3_NEW_SOURCE_KEYS], name: `lhv3-new#${region}` });
     const INV = makeSourceTranche({ sourceKeys: [V3_INVENTORY_SOURCE_KEY], name: `lhv3-inv#${region}` });
     // Freeze the create budget for the NEW tranche ONLY (listings + listings-raw). Inventory is never in it.
     const plannedJobs = resolveFromGenericPlan(plan)().sourceJobs;
     const frozen = computeFrozenTrancheBudget({ plannedJobs, sourceTranche: NEW, isPremiumOf: budgetPlanner.isPremiumOf, trancheKey: `lhv3-new#${region}` });
-    if (typeof ceiling !== "number" || frozen.maxCreates > ceiling) {
-      throw new Error(`listing-health-v3 ingestion: frozen create count ${frozen.maxCreates} exceeds region "${region}" ceiling ${ceiling}; refusing (fail closed).`);
+    // STRUCTURAL DRIFT GUARD (P1): the frozen NEW-create count must equal the exact expected 2-per-<=5-seller-batch
+    // count for the plan's distinct accounts. A plan fanning out MORE creates than the membership justifies is drift
+    // and fails closed. This is NOT the obsolete fixed 4/8/4 assumption (removed): the AUTHORIZED spending limit is
+    // the frozen tranche budget's maxCreates + the atomic pre-POST reservation + the runner's DataDoe balance gate.
+    const acctIds = new Set();
+    for (const j of plannedJobs || []) {
+      const ids = Array.isArray(j && j.sellerOrVendorIds) ? j.sellerOrVendorIds
+        : (j && j.owner ? [j.owner.accountId ?? j.owner.rawSellerId]
+          : [j && (j.accountId ?? j.rawSellerId)]);
+      for (const id of ids) { const s = String(id ?? "").trim(); if (s) acctIds.add(s); }
+    }
+    const expectedNew = expectedListingHealthV3NewExports(acctIds.size);
+    // Only drift-fail when the account count is DETERMINABLE (size>0); an indeterminate count is bounded by the
+    // frozen tranche budget + the atomic pre-POST reservation, never a fabricated 0-expectation that would refuse
+    // a legitimate plan.
+    if (expectedNew != null && acctIds.size > 0 && frozen.maxCreates > expectedNew) {
+      throw new Error(`listing-health-v3 ingestion: frozen create count ${frozen.maxCreates} exceeds the structural expectation ${expectedNew} (2 x ceil(${acctIds.size} accounts / 5)) -- drift, fail closed.`);
     }
     // Persist the frozen budget on the namespaced cycle BEFORE any create (idempotent).
     const cycleId = await runtime.store.openCycle({ bucket: cycleBucket, cycleDate, trigger: "manual" });

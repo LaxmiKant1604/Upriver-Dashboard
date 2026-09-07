@@ -148,12 +148,22 @@ await (async () => {
     out.length === 1 && out[0].id === "acct-live" && !("readiness" in out[0]));
   ok("E: exclusions are reported typed (never silently dropped)",
     reported && reported.gateMode === "onboarding" && reported.excluded[0].accountId === "acct-load");
-  const failSoft = await fetchExportEligibleAccounts("key", {
+  // P0-A: on the PAID default (requireAuthoritativeScope=true), a throwing onboarding read with NO established
+  // evidence yields ZERO eligible -- ownership is unprovable, so no readiness-only exposure on a paid path.
+  const noScope = await fetchExportEligibleAccounts("key", {
     fetchDetailed: async () => accounts,
     readOnboardingRows: async () => { throw new Error("table missing"); },
   });
-  ok("E: a THROWING onboarding read fails soft to readiness-only (ready account still served)",
-    failSoft.length === 1 && failSoft[0].id === "acct-live");
+  ok("E(P0-A): a throwing onboarding read with NO established evidence fails CLOSED on the paid path (zero eligible, never readiness-only)",
+    noScope.length === 0);
+  // But established directory evidence still serves the existing account (the outage stays fixed safely).
+  const viaEstablished = await fetchExportEligibleAccounts("key", {
+    fetchDetailed: async () => accounts,
+    readOnboardingRows: async () => { throw new Error("table missing"); },
+    readEstablishedAccountIds: async () => [{ accountId: "acct-live" }],
+  });
+  ok("E(P0-A): with durable established evidence the existing account is still served (reconciled) despite an unreadable onboarding table",
+    viaEstablished.length === 1 && viaEstablished[0].id === "acct-live");
 })();
 
 /* ===================== F. ready-but-missing account becomes VISIBLE (the Cruchlorent/Rugs4Less repro) ===================== */

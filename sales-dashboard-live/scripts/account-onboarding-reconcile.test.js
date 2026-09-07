@@ -99,18 +99,19 @@ const exReasons = (r) => r.excluded.map((e) => e.accountId + ":" + e.reason);
     !EXPORT_ELIGIBLE_STATUSES.includes(ONBOARDING_STATUS.READY_FOR_BOOTSTRAP) && EXPORT_ELIGIBLE_STATUSES.includes(ONBOARDING_STATUS.READY));
 }
 
-/* ===== F. fetchExportEligibleAccounts threads the established reader FAIL-SOFT (never hard-fails discovery) ===== */
+/* ===== F. fetchExportEligibleAccounts is a PAID path: FAIL-CLOSED when ownership is unprovable (P0-A) ===== */
 {
   const detailed = [ready("US1"), ready("US2")];
-  // Established reader THROWS => established=null => empty table still falls back to readiness-only (outage still fixed).
+  // P0-A: onboarding read AND established reader BOTH unavailable (throw) on the PAID default
+  // (requireAuthoritativeScope=true) => ownership unprovable => ZERO eligible (never readiness-only exposure).
   const out1 = await fetchExportEligibleAccounts("key", {
     fetchDetailed: async () => detailed,
-    readOnboardingRows: async () => [],
+    readOnboardingRows: async () => { throw new Error("onboarding read boom"); },
     readEstablishedAccountIds: async () => { throw new Error("directory read boom"); },
   });
-  ok("F1: a throwing established reader is fail-soft (established=null); an empty table still yields readiness-only eligibility",
-    JSON.stringify(out1.map((a) => a.accountId || a.id).sort()) === JSON.stringify(["US1", "US2"]));
-  // Established reader returns directory-shaped rows => reconciles established ids from an empty table.
+  ok("F1: on the PAID default, an unavailable onboarding read AND unavailable established evidence yields ZERO eligible (no readiness-only exposure)",
+    out1.length === 0);
+  // Established reader returns directory-shaped rows => reconciles ONLY those established ids from an empty table.
   const out2 = await fetchExportEligibleAccounts("key", {
     fetchDetailed: async () => detailed,
     readOnboardingRows: async () => [],
@@ -118,6 +119,32 @@ const exReasons = (r) => r.excluded.map((e) => e.accountId + ":" + e.reason);
   });
   ok("F2: the established reader accepts {accountId} directory rows and reconciles only those ids (US1 in, US2 not exposed)",
     JSON.stringify(out2.map((a) => a.accountId || a.id)) === JSON.stringify(["US1"]));
+  // Visibility path (requireAuthoritativeScope=false) still fail-soft to readiness-only for DISPLAY only.
+  const vis = await fetchExportEligibleAccounts("key", {
+    fetchDetailed: async () => detailed,
+    readOnboardingRows: async () => [],
+    requireAuthoritativeScope: false,
+  });
+  ok("F3: the visibility path (requireAuthoritativeScope=false) still fail-soft to readiness-only for display",
+    JSON.stringify(vis.map((a) => a.accountId || a.id).sort()) === JSON.stringify(["US1", "US2"]));
+}
+
+/* ===== H. P0-A: no authoritative scope on a paid path defers (zero eligible, typed) ===== */
+{
+  const acc = [ready("US1"), ready("US2")];
+  // Empty onboarding + no established evidence + paid path => no-authoritative-scope, ZERO eligible.
+  const deferred = filterExportEligibleAccounts({ detailedAccounts: acc, onboardingRows: [], requireAuthoritativeScope: true });
+  ok("H1: PAID path with NO authoritative scope (empty onboarding + no established) => zero eligible, gateMode 'no-authoritative-scope' (defers before any cycle/export)",
+    deferred.eligible.length === 0 && deferred.gateMode === "no-authoritative-scope" && deferred.hasAuthoritativeScope === false
+    && deferred.excluded.every((e) => e.reason === "NO_AUTHORITATIVE_SCOPE"));
+  // Established evidence present => existing account stays eligible; a brand-new id stays blocked.
+  const scoped = filterExportEligibleAccounts({ detailedAccounts: acc, onboardingRows: [], establishedAccountIds: ["US1"], requireAuthoritativeScope: true });
+  ok("H2: with established evidence the existing account (US1) stays scheduler-eligible while the brand-new id (US2) is blocked (NOT_ONBOARDED)",
+    JSON.stringify(ids(scoped.eligible)) === JSON.stringify(["US1"]) && scoped.hasAuthoritativeScope === true
+    && scoped.excluded.some((e) => e.accountId === "US2" && e.reason === EXCLUDE_NOT_ONBOARDED));
+  // A brand-new account never reaches a paid path directly regardless of readiness -- it must be onboarded first.
+  ok("H3: a brand-new ready account is NEVER directly paid-eligible without an onboarding row or established evidence (requires the onboarding state machine)",
+    filterExportEligibleAccounts({ detailedAccounts: [ready("BRAND-NEW")], onboardingRows: [], requireAuthoritativeScope: true }).eligible.length === 0);
 }
 
 /* ===== G. Source guard: the paid dispatch paths thread the established reader ===== */

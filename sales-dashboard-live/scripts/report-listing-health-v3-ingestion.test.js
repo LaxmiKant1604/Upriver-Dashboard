@@ -7,7 +7,7 @@
 // work. 7-bit ASCII, LF.
 
 import assert from "node:assert/strict";
-import { writeSync } from "node:fs";
+import { writeSync, readFileSync } from "node:fs";
 import { buildListingHealthV3IngestionRelease, listingHealthV3CycleBucket } from "../lib/server/sync/listing-health-v3-ingestion-composition.js";
 import { runListingHealthV3Ingestion } from "../lib/server/sync/listing-health-v3-operation.js";
 
@@ -81,12 +81,21 @@ await (async () => {
   ok("A: observed token estimate = 4 creates x 2 (an estimate, not a guaranteed max)", res.tokens === 8);
 })();
 
-/* ===================== B. ceiling fail-closed BEFORE any pass ===================== */
+/* ===================== B. P1: obsolete fixed 4/8/4 removed; authorization = frozen budget + structural drift guard ===================== */
 await (async () => {
   const plan = await makeFakeRelease().release.buildPlan({ accounts: IN8, connections, cycleDate, region: "india" });
-  const { release, calls } = makeFakeRelease({ ceiling: 1 }); // artificially below the 4 planned creates
-  await throwsAsync("B: a frozen create count above the region ceiling throws BEFORE any source pass", () => release.runSources({ plan, region: "india", cycleDate }));
-  ok("B: no source pass ran when the ceiling gate failed", calls.sourceCycle.length === 0);
+  // The obsolete fixed regional ceiling is REMOVED: a low legacy `ceiling` no longer hard-fails a VALID plan.
+  // The authorization is the frozen tranche budget's maxCreates (= the exact structural count) + the atomic
+  // pre-POST reservation (never a fixed 4/8/4 assumption). An 8-account plan freezes maxCreates=4 and proceeds.
+  const { release, calls } = makeFakeRelease({ ceiling: 1 }); // legacy ceiling param is now ignored
+  await release.runSources({ plan, region: "india", cycleDate });
+  ok("B(P1): the obsolete fixed regional ceiling is gone -- a valid 8-account plan proceeds and freezes the exact structural maxCreates=4 (authorization = frozen budget + reservation), both source passes ran",
+    calls.persistBudget.length === 1 && calls.persistBudget[0].maxCreates === 4 && calls.sourceCycle.length === 2);
+  // The composition keeps a STRUCTURAL DRIFT guard (frozen.maxCreates > 2 x ceil(accounts/5) => fail closed).
+  const comp = readFileSync(new URL("../lib/server/sync/listing-health-v3-ingestion-composition.js", import.meta.url), "utf8");
+  ok("B(P1): a structural drift guard (expectedListingHealthV3NewExports) replaces the fixed ceiling and fails closed on over-fan-out; no fixed regionCeilings[region] throw remains",
+    comp.includes("expectedListingHealthV3NewExports") && /frozen\.maxCreates > expectedNew/.test(comp)
+    && !/frozen\.maxCreates > ceiling/.test(comp));
 })();
 
 /* ===================== C. report wiring -> shadow saver + derived-context loader ===================== */

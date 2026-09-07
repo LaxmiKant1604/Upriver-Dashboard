@@ -99,10 +99,19 @@ await (async () => {
   const sCeil = spies({ cost: { newExports: 2, reusedExports: 1, creates: 99, estimatedTokens: 198, inventoryAdoptable: true } });
   const rCeil = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...sCeil }));
   ok("E: a freshness-aware create count above the region ceiling fails closed BEFORE any source run", rCeil.ok === false && rCeil.phase === "ceiling" && sCeil.calls.runSources === 0);
-  // insufficient balance (usable - reserve < estimated)
+  // P1: required tokens exceed the AUTHORIZED budget (usable - reserve) => TYPED awaiting-budget, ZERO creates,
+  // BEFORE any source run/reservation/POST (not a generic failure).
   const sBal = spies({ balance: { usable: 10, reserve: 50 } });
   const rBal = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...sBal }));
-  ok("E: insufficient usable balance (below the emergency reserve) fails closed before any source run", rBal.ok === false && rBal.phase === "balance" && sBal.calls.runSources === 0);
+  ok("E(P1): required spend above the authorized DataDoe budget returns TYPED awaiting-budget (deferred, zero creates) before any source run",
+    rBal.ok === false && rBal.phase === "awaiting-budget" && rBal.awaitingBudget === true && rBal.deferred === true
+    && rBal.creates === 0 && rBal.tokens === 0 && sBal.calls.runSources === 0
+    && rBal.requiredTokens === 4 && rBal.authorizedTokens === -40);
+  // P1: required WITHIN the authorized budget proceeds using the exact frozen plan (control -- runs sources).
+  const sOk = spies({ balance: { usable: 500, reserve: 50 } });
+  const rOk = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...sOk }));
+  ok("E(P1): required spend WITHIN the authorized budget proceeds (runs sources; not deferred)",
+    rOk.awaitingBudget !== true && sOk.calls.runSources >= 1 && rOk.authorizedTokens === 450);
   // unknown pricing
   const sPrice = spies();
   const rPrice = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, pricingKnown: false, ...sPrice }));

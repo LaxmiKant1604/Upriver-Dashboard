@@ -202,12 +202,25 @@ export async function runListingHealthV3Ingestion({
     try { bal = await checkBalance(); } catch (e) { return fail("balance", "balance check failed (fail closed): " + safe(e)); }
     if (!bal || typeof bal.usable !== "number" || !Number.isFinite(bal.usable)) return fail("balance", "usable DataDoe balance is unknown (fail closed)");
     const reserve = typeof bal.reserve === "number" ? bal.reserve : Number(emergencyReserveTokens);
-    // estimatedTokens is an OBSERVED estimate, never a guaranteed max (rowCountBilling=true) -- require headroom above
-    // the emergency reserve so a heavier-than-expected bill cannot exhaust the account.
-    if (bal.usable - reserve < Number(cost.estimatedTokens || 0)) {
-      return fail("balance", `insufficient usable balance: ${bal.usable} - reserve ${reserve} < estimated ${cost.estimatedTokens} tokens (observed estimate, not a guaranteed max); refusing`);
-    }
     ev.usableBalance = bal.usable; ev.emergencyReserve = reserve;
+    // AUTHORIZED BUDGET (P1): the STRUCTURAL required spend (creates = 2 per <=5-seller batch; tokens = the
+    // freshness-aware estimate) is compared to the AUTHORIZED maximum from the durable DataDoe token budget
+    // (usable MINUS the emergency reserve that protects other reports' spend). Account growth scales the required
+    // spend but can NEVER silently authorize unlimited exports: when required > authorized this returns a TYPED
+    // awaiting-budget deferral BEFORE any cycle/reservation/POST (zero creates, LKG preserved) -- an operator must
+    // fund/review to raise the authorized budget. estimatedTokens is an OBSERVED estimate (rowCountBilling=true),
+    // so requiring headroom above the reserve also stops a heavier-than-expected bill from exhausting the account.
+    const requiredCreates = Number(ceilingCheck.newExports || 0);
+    const requiredTokens = Number(cost.estimatedTokens || 0);
+    const authorizedTokens = bal.usable - reserve;
+    ev.requiredCreates = requiredCreates; ev.requiredTokens = requiredTokens; ev.authorizedTokens = authorizedTokens;
+    if (requiredTokens > authorizedTokens) {
+      return {
+        ...ev, phase: "awaiting-budget", ok: false, deferred: true, awaitingBudget: true,
+        creates: 0, tokens: 0, snapshots: 0,
+        note: `required ${requiredCreates} create(s) / ${requiredTokens} token(s) exceed the authorized DataDoe budget (usable ${bal.usable} - reserve ${reserve} = ${authorizedTokens}); deferred BEFORE any cycle/reservation/POST (zero creates); last-known-good preserved. Fund/review to authorize.`,
+      };
+    }
   }
 
   // DRY-RUN stops here -- ZERO creates, writes, and tokens.

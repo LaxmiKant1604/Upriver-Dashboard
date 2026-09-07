@@ -169,6 +169,11 @@ function makeStore() {
       b.spentCreates += 1; b.spentTokens += cost;
       return "reserved";
     },
+    // P0-B continuation readers (mirror the real supabase getCycleByBucketDate / getSourceTrancheBudget[Hashes]).
+    getCycleByBucketDate(bucket, cycleDate) { const c = cycles.get(bucket + "|" + cycleDate); return c ? { id: c.id, bucket: c.bucket, status: c.status } : null; },
+    getBudget({ cycleId, trancheKey }) { const b = budgets.get(bkey(cycleId, trancheKey)); return b ? { cycle_id: cycleId, tranche_key: trancheKey, plan_fingerprint: b.planFingerprint, max_creates: b.maxCreates, max_tokens: b.maxTokens, spent_creates: b.spentCreates, spent_tokens: b.spentTokens } : null; },
+    getBudgetHashes({ cycleId, trancheKey }) { const b = budgets.get(bkey(cycleId, trancheKey)); return b ? [...b.cost.entries()].map(([request_hash, token_cost]) => ({ request_hash, token_cost })) : []; },
+    listCycleOwners(cycleId) { return ownerRows(cycleId).map((m) => ({ ...m })); },
   };
 }
 
@@ -649,6 +654,58 @@ test("F3. the WRONG Ads grain THROWS (overlapping grains are never mixed); Brand
   const bv = dash.brandViewReadiness({ ...base, asinAds: { grain: "campaign-performance-v1", read: "ok", windows: [{ from: "2026-08-01", to: "2026-08-15" }] } });
   assert.equal(bv.ready, true, "Brand View is ready on the SAME OLI/catalog evidence Daily used (one evidence set, two dashboards)");
   assert.equal(bv.adsReady, true);
+});
+
+/* ================================= G. P0-B frozen-cycle continuation ================================= */
+group("G. frozen-cycle continuation reuses the frozen plan+budget (membership change never drifts)");
+
+test("G1. a fresh cycle then a continuation with a NEW account: no PLAN_BUDGET_MISMATCH; frozen OLI budget reused; the new account defers to the next cycle", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const FOUR = [1, 2, 3, 4].map(acct);
+  const oliTranche = "source-sync:order-line-items";
+  const store = makeStore();
+  // Pass 1 (FRESH cycle): freezes the OLI tranche budget for the 3-account membership.
+  const h1 = runHarness({ accounts: THREE, store });
+  const r1 = await h1.run();
+  const cycleId = r1.cycleId;
+  assert.ok(cycleId, "pass 1 opened a cycle");
+  const b1 = store._budget(cycleId, oliTranche);
+  assert.ok(b1 && b1.planFingerprint, "pass 1 froze the OLI tranche budget");
+  const fp1 = b1.planFingerprint;
+  // The cycle head is a CONTINUATION head (running/pending, not finalized) after pass 1.
+  const head = store.getCycleByBucketDate(BUCKET, CYCLE_DATE);
+  assert.ok(head && ["running", "pending"].includes(head.status), "the cycle head is a continuation head after pass 1");
+
+  // Pass 2 (CONTINUATION): a 4th account connected mid-cycle. It must NOT drift the frozen budget.
+  const h2 = runHarness({ accounts: FOUR, store, dd: h1.dd });
+  let threw = null;
+  try { await h2.run(); } catch (e) { threw = e; }
+  assert.equal(threw, null, "pass 2 (continuation) did NOT throw PLAN_BUDGET_MISMATCH: " + (threw ? String((threw && threw.message) || threw) : ""));
+  const b2 = store._budget(cycleId, oliTranche);
+  assert.equal(b2.planFingerprint, fp1, "the frozen OLI budget fingerprint is UNCHANGED -- reused verbatim, never recomputed from the new membership");
+  assert.equal(b2.maxCreates, b1.maxCreates, "the frozen OLI create ceiling is unchanged (the new account never widened it)");
+  // The new account's seller (S04) was NEVER exported (it defers to the next NEW cycle).
+  const s04Exported = h1.dd.createSeq.some((c) => (c.ids || []).includes("S04"));
+  assert.equal(s04Exported, false, "the mid-cycle new account (S04) was never exported -- it joins the next cycle only");
+  // The frozen accounts' owners remain exactly the 3 originals (no A04 owner was added to the frozen cycle).
+  const ownerAccts = new Set(store.listCycleOwners(cycleId).map((o) => o.account_id));
+  assert.equal(ownerAccts.has("A04"), false, "A04 was never added as an owner of the frozen cycle");
+});
+
+test("G2. a continuation with the SAME membership reuses the frozen budget idempotently (no new creates, no throw)", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const oliTranche = "source-sync:order-line-items";
+  const store = makeStore();
+  const h1 = runHarness({ accounts: THREE, store });
+  const r1 = await h1.run();
+  const fp1 = store._budget(r1.cycleId, oliTranche).planFingerprint;
+  const creates1 = h1.dd.totalCreates();
+  const h2 = runHarness({ accounts: THREE, store, dd: h1.dd });
+  let threw = null;
+  try { await h2.run(); } catch (e) { threw = e; }
+  assert.equal(threw, null, "same-membership continuation never throws");
+  assert.equal(store._budget(r1.cycleId, oliTranche).planFingerprint, fp1, "same frozen fingerprint");
+  assert.equal(h1.dd.totalCreates(), creates1, "an idempotent same-membership continuation creates NO new exports");
 });
 
 async function main() {

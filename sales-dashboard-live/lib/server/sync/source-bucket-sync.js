@@ -397,26 +397,53 @@ export async function runBucketSourceSync({
   }
   const outOfTime = () => deadlineMs !== Infinity && clock() >= deadlineMs - reserveMs;
 
+  const nowIso = () => new Date(clock()).toISOString();
+
+  // Head-aware ACTIVE cycle resolution, ONCE for the whole run (BEFORE planning so a continuation can plan from the
+  // frozen membership): when a running/pending head already exists for the slot -- a base cycle in progress OR a
+  // superseding attempt an operator created to take over a stale terminal slot -- every write in this run (the
+  // frozen budget persist AND the source jobs) MUST target THAT cycle, so the budget and the create-reservation
+  // share one cycle_id. Resolved to null when no active head exists (a fresh BASE cycle is opened on the first
+  // write). A missing getCycleByBucketDate capability (test doubles) keeps the old base path.
+  const cycleKeyBucket = cycleBucket || bucket;
+  let activeCycleId = null;
+  if (typeof store.getCycleByBucketDate === "function") {
+    try { const h = await store.getCycleByBucketDate(cycleKeyBucket, cycleDate); if (h && h.id && ["running", "pending"].includes(String(h.status))) activeCycleId = h.id; } catch (_e) { activeCycleId = null; }
+  }
+
+  // P0-B FROZEN-CYCLE CONTINUATION: on a continuation, RE-PLAN from the cycle's ALREADY-FROZEN membership (the
+  // accounts whose source-job OWNERS were persisted when the cycle opened) -- NEVER from current discovery. Because
+  // assignAccountBatches is deterministic, the frozen accounts reproduce the EXACT frozen batches + request hashes,
+  // so the persisted tranche budget matches and is reused verbatim (never recomputed/overwritten) -- this is what
+  // eliminates the mid-cycle PLAN_BUDGET_MISMATCH. An account CONNECTED AFTER the freeze is absent from the frozen
+  // membership, so it is excluded from THIS cycle's plan (never upserted/reserved/created) and joins the NEXT new
+  // cycle. Falls back to current discovery when no frozen owners are readable (a fresh cycle, or a test double).
+  let planningAccounts = accounts;
+  let isContinuation = false;
+  if (budgets && activeCycleId && typeof store.listCycleOwners === "function") {
+    let frozenAccountIds = null;
+    try {
+      const owners = (await store.listCycleOwners(activeCycleId)) || [];
+      const ids = new Set(owners.map((o) => String((o && (o.account_id ?? o.accountId)) || "")).filter(Boolean));
+      if (ids.size > 0) frozenAccountIds = ids;
+    } catch (_e) { frozenAccountIds = null; }
+    if (frozenAccountIds) {
+      const scoped = (accounts || []).filter((a) => frozenAccountIds.has(String((a && (a.accountId ?? a.id)) || "")));
+      // Only apply the frozen-membership scope when it yields a NON-EMPTY intersection. An empty intersection means
+      // the frozen owners cannot be matched to the current accounts (or every frozen account disconnected); in that
+      // case fall back to the pre-continuation behavior rather than planning from an empty set (fail closed upstream).
+      if (scoped.length > 0) { planningAccounts = scoped; isContinuation = true; }
+    }
+  }
+
   const plan = planBucketSourceSync({
-    apiKey, bucket, accounts, existingMembership, coverageByAccountId,
+    apiKey, bucket, accounts: planningAccounts, existingMembership, coverageByAccountId,
     catalogSnapshot, fbaSnapshotsByAccount, pausedSources, asOf, today,
     catalogCarrierSeller,
     forceCatalogRefresh,
   });
   const allPlannedJobs = plan.families.flatMap((f) => f.plannedJobs);
   const ownerIds = [...new Set(allPlannedJobs.map((j) => j.owner.ownerId))];
-  const nowIso = () => new Date(clock()).toISOString();
-
-  // Head-aware ACTIVE cycle resolution, ONCE for the whole run: when a running/pending head already exists for the
-  // slot -- a base cycle in progress OR a superseding attempt an operator created to take over a stale terminal slot
-  // -- every write in this run (the frozen budget persist AND the source jobs) MUST target THAT cycle, so the budget
-  // and the create-reservation share one cycle_id. Resolved to null when no active head exists (a fresh BASE cycle is
-  // opened on the first write). A missing getCycleByBucketDate capability (test doubles) keeps the old base path.
-  const cycleKeyBucket = cycleBucket || bucket;
-  let activeCycleId = null;
-  if (typeof store.getCycleByBucketDate === "function") {
-    try { const h = await store.getCycleByBucketDate(cycleKeyBucket, cycleDate); if (h && h.id && ["running", "pending"].includes(String(h.status))) activeCycleId = h.id; } catch (_e) { activeCycleId = null; }
-  }
 
   const rollup = {
     bucket, cycleId: null, plan: plan.summary, skippedPaused: plan.skippedPaused,
@@ -452,24 +479,38 @@ export async function runBucketSourceSync({
     // Frozen family ceiling (Blocker 4d): computed from THIS bucket plan's family jobs, persisted before the
     // first create. FBA is premium (5 tokens/create); OLI + catalog standard (2). Registry-priced.
     const tranche = makeSourceTranche({ name: family.sourceKey, sourceKeys: [family.sourceKey] });
+    const trancheKey = `source-sync:${family.sourceKey}`;
     let budget = null;
     if (budgets && typeof store.persistBudget === "function") {
-      const frozen = computeFrozenTrancheBudget({
-        plannedJobs: family.plannedJobs, sourceTranche: tranche,
-        isPremiumOf: registryIsPremiumOf, trancheKey: `source-sync:${family.sourceKey}`,
-      });
-      if (frozen.maxCreates > 0) {
-        const cycleId = activeCycleId || await store.openCycle({ bucket: cycleKeyBucket, cycleDate, scheduledAt, trigger });
-        rollup.cycleId = rollup.cycleId || cycleId;
-        const ack = await store.persistBudget({
-          cycleId, trancheKey: frozen.trancheKey, planFingerprint: frozen.planFingerprint,
-          maxCreates: frozen.maxCreates, maxTokens: frozen.maxTokens,
-          hashes: frozen.hashes.map((h) => ({ requestHash: h.requestHash, tokenCost: h.tokenCost })),
+      // CONTINUATION: LOAD + REUSE the already-persisted frozen budget verbatim (never recompute/re-persist from
+      // current discovery). The plan was re-derived from the frozen membership above, so the frozen hashes are the
+      // exact ones this pass will reserve against; a genuine structural/pricing drift still fails closed at reserve.
+      let frozenRow = null;
+      if (isContinuation && typeof store.getBudget === "function") {
+        try { frozenRow = await store.getBudget({ cycleId: activeCycleId, trancheKey }); } catch (_e) { frozenRow = null; }
+      }
+      if (frozenRow && frozenRow.plan_fingerprint) {
+        rollup.cycleId = rollup.cycleId || activeCycleId;
+        budget = { trancheKey, planFingerprint: String(frozenRow.plan_fingerprint) };
+      } else {
+        // NEW cycle OR first freeze of this family this cycle: compute + persist from the current plan.
+        const frozen = computeFrozenTrancheBudget({
+          plannedJobs: family.plannedJobs, sourceTranche: tranche,
+          isPremiumOf: registryIsPremiumOf, trancheKey,
         });
-        if (ack !== "created" && ack !== "exists") {
-          throw new Error(`runBucketSourceSync: malformed budget acknowledgement "${ack}" (fail closed).`);
+        if (frozen.maxCreates > 0) {
+          const cycleId = activeCycleId || await store.openCycle({ bucket: cycleKeyBucket, cycleDate, scheduledAt, trigger });
+          rollup.cycleId = rollup.cycleId || cycleId;
+          const ack = await store.persistBudget({
+            cycleId, trancheKey: frozen.trancheKey, planFingerprint: frozen.planFingerprint,
+            maxCreates: frozen.maxCreates, maxTokens: frozen.maxTokens,
+            hashes: frozen.hashes.map((h) => ({ requestHash: h.requestHash, tokenCost: h.tokenCost })),
+          });
+          if (ack !== "created" && ack !== "exists") {
+            throw new Error(`runBucketSourceSync: malformed budget acknowledgement "${ack}" (fail closed).`);
+          }
+          budget = { trancheKey: frozen.trancheKey, planFingerprint: frozen.planFingerprint };
         }
-        budget = { trancheKey: frozen.trancheKey, planFingerprint: frozen.planFingerprint };
       }
     }
 

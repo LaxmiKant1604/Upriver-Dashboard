@@ -74,6 +74,11 @@ export const UNSUPPORTED_MARKETPLACE = "UNSUPPORTED_MARKETPLACE";
 export const EXCLUDE_DATADOE_NOT_READY = "DATADOE_NOT_READY";
 export const EXCLUDE_NOT_ONBOARDED = "NOT_ONBOARDED";
 export const EXCLUDE_STATUS_PREFIX = "ONBOARDING_";
+// A PAID path found NO authoritative ownership scope (neither onboarding rows nor established directory
+// evidence). Account ownership cannot be proven, so the account is excluded from every paid export path
+// (the scheduler defers before opening a cycle). This is DISTINCT from NOT_ONBOARDED (a brand-new account in
+// an initialised subsystem) -- it means the ownership evidence itself is unavailable/empty.
+export const EXCLUDE_NO_AUTHORITATIVE_SCOPE = "NO_AUTHORITATIVE_SCOPE";
 
 // The durable bootstrap operation identity: one per (account, first-discovered date). Repeated polls,
 // concurrent workers, restarts and watchdogs all derive the SAME id, so the claim RPC converges them
@@ -226,25 +231,32 @@ export function classifyOnboardingAccount({ discovered, existing = null, evidenc
  *                          tracking existed) -- but a BRAND-NEW id (not established) is NEVER auto-exposed;
  *                          it must flow through discovery -> onboarding. Array or Set.
  *
- * FAIL DIRECTION (fix): an EMPTY onboarding array is NOT authoritative evidence that established accounts
- * are un-onboarded -- it means the onboarding subsystem is uninitialised for these accounts. An empty (or
- * unreadable) table therefore falls back to readiness-only (established-scoped when the established set is
- * supplied), never a blanket NOT_ONBOARDED exclusion of every existing account. A NON-empty table gates
- * strictly per row, and a no-row account is reconciled only when established.
+ * AUTHORITATIVE SCOPE (P0-A): the ONLY proofs of account ownership are (a) an onboarding row, or (b) durable
+ * account-directory established evidence. An EMPTY onboarding array is NOT authoritative (the subsystem is
+ * uninitialised); an established account with no row is RECONCILED (it was live before onboarding tracking).
+ * A BRAND-NEW id (not established, no row) is NEVER auto-exposed -- it flows through discovery -> onboarding.
  *
- * Returns { eligible (DETAILED rows, order preserved), excluded: [{accountId, name, reason}],
- *           reconciled: [{accountId, name}], gateMode: 'onboarding' | 'reconcile' | 'readiness-only' }.
+ * `requireAuthoritativeScope` (set TRUE on every PAID path): when NEITHER onboarding rows NOR established
+ * evidence exist, ownership cannot be proven, so NO account is eligible -- the gate returns a typed
+ * 'no-authoritative-scope' result (zero eligible) and the paid scheduler defers before opening a cycle or
+ * creating an export. It is NEVER readiness-only on a paid path. Discovery/visibility callers may leave it
+ * false to fail-soft to readiness-only for display only (zero-token, never a paid export).
+ *
+ * Returns { eligible, excluded:[{accountId,name,reason}], reconciled:[{accountId,name}],
+ *           gateMode: 'onboarding' | 'reconcile' | 'readiness-only' | 'no-authoritative-scope',
+ *           hasAuthoritativeScope: boolean }.
  */
-export function filterExportEligibleAccounts({ detailedAccounts, onboardingRows = null, establishedAccountIds = null } = {}) {
+export function filterExportEligibleAccounts({ detailedAccounts, onboardingRows = null, establishedAccountIds = null, requireAuthoritativeScope = false } = {}) {
   // An EMPTY array is treated like an absent table (not authoritative) -- this is the load-bearing fix.
   const rows = Array.isArray(onboardingRows) && onboardingRows.length > 0 ? onboardingRows : null;
   const byAccount = rows ? new Map(rows.map((r) => [S(r.account_id), r])) : null;
-  // An EMPTY established set is NOT a signal (e.g. the account-directory snapshot is absent) -- treat it as null so
-  // the empty-table readiness-only fallback still applies (never a blanket exclusion when we simply have no signal).
+  // An EMPTY established set is NOT a signal (e.g. the account-directory snapshot is absent) -- treat it as null.
   const establishedSet = establishedAccountIds instanceof Set
     ? establishedAccountIds
     : (Array.isArray(establishedAccountIds) ? new Set(establishedAccountIds.map((x) => S(x))) : null);
   const established = establishedSet && establishedSet.size > 0 ? establishedSet : null;
+  // Ownership is provable only from onboarding rows OR established directory evidence.
+  const hasAuthoritativeScope = !!byAccount || !!established;
   const eligible = [];
   const excluded = [];
   const reconciled = [];
@@ -270,13 +282,21 @@ export function filterExportEligibleAccounts({ detailedAccounts, onboardingRows 
       else excluded.push({ accountId, name, reason: EXCLUDE_NOT_ONBOARDED });
       continue;
     }
-    // No established-set signal: an absent/empty table is readiness-only (fail-soft, pre-onboarding baseline);
-    // a populated table treats a no-row account as brand-new (route through onboarding).
-    if (!byAccount) { eligible.push(account); continue; }
-    excluded.push({ accountId, name, reason: EXCLUDE_NOT_ONBOARDED });
+    if (byAccount) {
+      // Populated onboarding table, no row for this account => brand-new => route through onboarding.
+      excluded.push({ accountId, name, reason: EXCLUDE_NOT_ONBOARDED });
+      continue;
+    }
+    // NO authoritative scope at all (empty/absent onboarding AND no established evidence):
+    //   - PAID path: ownership unprovable -> exclude (typed no-authoritative-scope); the scheduler defers.
+    //   - visibility path (requireAuthoritativeScope=false): fail-soft readiness-only for DISPLAY only.
+    if (requireAuthoritativeScope) { excluded.push({ accountId, name, reason: EXCLUDE_NO_AUTHORITATIVE_SCOPE }); continue; }
+    eligible.push(account);
   }
-  const gateMode = established ? "reconcile" : (byAccount ? "onboarding" : "readiness-only");
-  return { eligible, excluded, reconciled, gateMode };
+  const gateMode = (requireAuthoritativeScope && !hasAuthoritativeScope)
+    ? "no-authoritative-scope"
+    : (established ? "reconcile" : (byAccount ? "onboarding" : "readiness-only"));
+  return { eligible, excluded, reconciled, gateMode, hasAuthoritativeScope };
 }
 
 /**
@@ -535,16 +555,17 @@ export function mergeOnboardingIntoDirectorySnapshot({ priorAccounts, detailedAc
  * fetchAccounts for every included account, so downstream payloads/hashes are unchanged.
  * `onExcluded(excluded, gateMode)` lets operators surface the typed exclusions.
  */
-export async function fetchExportEligibleAccounts(apiKey, { fetchDetailed, readOnboardingRows, readEstablishedAccountIds = null, onExcluded = null } = {}) {
+export async function fetchExportEligibleAccounts(apiKey, { fetchDetailed, readOnboardingRows, readEstablishedAccountIds = null, onExcluded = null, requireAuthoritativeScope = true } = {}) {
   if (typeof fetchDetailed !== "function" || typeof readOnboardingRows !== "function") {
     throw new Error("fetchExportEligibleAccounts requires injected fetchDetailed + readOnboardingRows (fail closed).");
   }
   const detailed = (await fetchDetailed(apiKey)) || [];
   let onboardingRows = null;
-  try { onboardingRows = await readOnboardingRows(); } catch { onboardingRows = null; } // fail-soft -> readiness-only
+  try { onboardingRows = await readOnboardingRows(); } catch { onboardingRows = null; } // fail-soft (no rows read)
   // OPTIONAL established-account signal (durable account-directory snapshot). Fail-soft: on any error the
-  // established set is null and the gate falls back to readiness-only on an empty/absent table -- it NEVER
-  // hard-fails discovery, and it NEVER exposes a brand-new id (that path only reconciles established ones).
+  // established set is null. This helper is a PAID path, so requireAuthoritativeScope defaults TRUE: with NEITHER
+  // onboarding rows NOR established evidence, ZERO accounts are eligible (typed no-authoritative-scope) -- a
+  // brand-new id is NEVER exposed and the scheduler defers before any cycle/export.
   let establishedAccountIds = null;
   if (typeof readEstablishedAccountIds === "function") {
     try {
@@ -554,7 +575,7 @@ export async function fetchExportEligibleAccounts(apiKey, { fetchDetailed, readO
         : null;
     } catch { establishedAccountIds = null; }
   }
-  const { eligible, excluded, gateMode } = filterExportEligibleAccounts({ detailedAccounts: detailed, onboardingRows, establishedAccountIds });
+  const { eligible, excluded, gateMode } = filterExportEligibleAccounts({ detailedAccounts: detailed, onboardingRows, establishedAccountIds, requireAuthoritativeScope });
   if (excluded.length && typeof onExcluded === "function") {
     try { onExcluded(excluded, gateMode); } catch { /* reporting must never fail discovery */ }
   }
