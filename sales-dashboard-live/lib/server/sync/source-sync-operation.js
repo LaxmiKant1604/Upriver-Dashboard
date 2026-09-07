@@ -171,6 +171,14 @@ export async function runReleaseSlice({ bucket, release, controls, readbackLive,
       const accountId = remaining[0];
       const res = await release.publishAccount(accountId);
       const rs = (res && res.results) || [];
+      // WRITE-BOUNDARY FENCING (Round-9 P0-B, property 7): the route's priority release is control-enabled, so
+      // EACH report write fences the control fence inside the report_snapshots CAS. A 'lease-lost' disposition
+      // means the write wrote ZERO rows -- STOP with typed retryable contention (not a generic publish failure).
+      if (rs.some((r) => r && S(r.disposition) === "lease-lost")) {
+        return { phase: "contention", ok: false, leaseLost: true, status: "CONTROL_LEASE_LOST",
+          problems: ["CONTROL_LEASE_LOST: a report write for " + accountId + " lost the control-plane fence at the write boundary -- LKG preserved; retryable."],
+          published: published.length, total: accounts.length };
+      }
       const bad = rs.filter((r) => !(r && OK_PUBLISH.has(S(r.disposition))));
       if (rs.length !== PRIORITY_DASHBOARDS.publishOrder.length || bad.length) {
         return { phase: "publish", ok: false, problems: ["publish failed (" + S(bad[0] && bad[0].reportKey) + ": " + S(bad[0] && bad[0].disposition) + ")"], published: published.length, total: accounts.length };

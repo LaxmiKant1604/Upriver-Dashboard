@@ -1,22 +1,27 @@
 name: account-onboarding
 
-# The 15-minute PRIMARY DataDoe account-onboarding DISCOVERY worker. It is NOT a second scheduler:
-#   - ZERO DataDoe exports STRUCTURALLY (its only DataDoe call is the zero-token directory GET; the
-#     worker module contains no export adapter/create path -- the runner also proves tokens spent = 0
-#     by re-reading the balance);
-#   - scheduler-v2 remains the ONE automatic owner of every paid source. This worker only maintains
-#     durable onboarding state (account_onboarding), atomically CLAIMS the bootstrap operation for a
-#     newly-ready account (account-bootstrap/<id>/<firstDiscoveredDate>; idempotent RPC), and merges
-#     visibility into the account-directory snapshot ("Setting up" for admins). The next scheduler-v2
-#     regional run then bootstraps the claimed account through the existing per-source machinery under
-#     the existing regional token ceilings.
+# The PRIMARY DataDoe account-onboarding DISCOVERY worker (every 30 minutes). It is NOT a second scheduler:
+#   - ZERO DataDoe TOKENS STRUCTURALLY (its only DataDoe call is the zero-token directory GET; the
+#     worker module graph contains no export adapter/create path -- regression-guarded);
+#   - scheduler-v2 remains the ONE automatic owner of every paid source. This worker maintains durable
+#     onboarding state (account_onboarding), atomically CLAIMS the bootstrap operation for a newly-ready
+#     account (account-bootstrap/<id>/<firstDiscoveredDate>; idempotent RPC), merges visibility into the
+#     account-directory snapshot ("Setting up" for admins), and -- under the DURABLE per-region dispatch
+#     LEASE (bounded backoff; at most one active lease; completion is terminal) -- triggers ONE
+#     scheduler-v2 run_scope=bootstrap dispatch per pending wave, whose account set the BACKEND resolves
+#     from account_onboarding and whose paid steps are gated by the enforced onboarding-wave budget.
 #   - ONE concurrency group (account-onboarding); a delayed/overlapping cron queues, never runs twice.
-# GitHub cron delivery is approximate (~every 15 minutes, sometimes delayed) -- the pass is idempotent
-# and a later pass observes the same state, so delay only postpones, never duplicates.
+#
+# COST (measured; distinguish the three): DataDoe tokens = 0 structurally. GitHub Actions: each run bills
+# ~1 minute (per-job round-up; measured runner overhead ~14s + a 5-15s steady-state pass), so */30 =
+# ~48 min/day ~= 1,450 min/month on this PRIVATE repo (vs ~2,900 at */15 -- cadence deliberately halved;
+# bootstrap reactivity comes from the claim->dispatch lease, not the polling cadence). Database usage:
+# ~4-10 PostgREST reads + material-change-only writes per pass. GitHub cron delivery is approximate --
+# the pass is idempotent and a later pass observes the same durable state, so delay only postpones.
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -34,6 +39,12 @@ concurrency:
 
 permissions:
   contents: read
+  # actions:write lets a FRESHLY-CLAIMED account's region get ONE immediate scheduler-v2
+  # workflow_dispatch (the same entry the Cloudflare watchdog uses), so a newly-ready account's
+  # bootstrap normally starts within one polling interval instead of waiting for the daily cron.
+  # The dispatched run is the EXISTING per-region pipeline under its own concurrency group,
+  # duplicate guard and token ceilings -- this worker itself still performs zero paid work.
+  actions: write
 
 jobs:
   discover:
@@ -48,6 +59,9 @@ jobs:
       VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      # The workflow-scoped token (actions:write) used ONLY for the immediate per-region
+      # scheduler-v2 workflow_dispatch after a fresh bootstrap claim. Never printed.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

@@ -51,6 +51,9 @@ export async function runSalesMoversShadowCycle({
   clock = () => Date.now(), deadlineMs = Infinity, reserveMs = 3_000, maxJobs = Infinity, maxRounds = 2,
   sourceTranche = null, // BUILD-TIME source-tranche selector (Part A); passed through to runSourceJobs.
   reuseOnly = false,    // BUILD-TIME reuseOnly rehearsal flag (Blocker 3); passed through to runSourceJobs.
+  // ONE explicit inventory snapshot day (D-1) threaded into every planSalesMovers call this cycle makes.
+  // null defaults inside the planner to each account's report asOf (already D-1 on a scheduled run).
+  inventoryAsOf = null,
 }) {
   // Primary-only safety: partition the directory against the CONFIGURED connections BEFORE any planning. A
   // stale `dd-secondary:` account (secondary org retired) is never planned, never routed to the primary
@@ -104,7 +107,7 @@ export async function runSalesMoversShadowCycle({
   const planRound = () => state.map((st) => {
     const plan = planSalesMovers({
       accountId: st.account.accountId, country: st.account.country, currency: st.account.currency,
-      connections, asOf: st.asOf, probeSignal: st.probeSignal,
+      connections, asOf: st.asOf, inventoryAsOf, probeSignal: st.probeSignal,
     });
     const pr = plan.sources.find((s) => s.requestKey === PROBE_KEY);
     if (pr) st.probeHash = pr.requestHash;
@@ -180,7 +183,7 @@ export async function runSalesMoversShadowCycle({
       if (!p || p.status !== "success" || p.validated !== true) continue; // probe unresolved -> defer
       const finalPlan = planSalesMovers({
         accountId: st.account.accountId, country: st.account.country, currency: st.account.currency,
-        connections, asOf: st.asOf, probeSignal: p,
+        connections, asOf: st.asOf, inventoryAsOf, probeSignal: p,
       });
       const src0 = finalPlan.sources[0];
       if (!src0) continue;
@@ -210,18 +213,18 @@ export async function runSalesMoversShadowCycle({
   // succeeded source job and the report FETCH GATE keeps the report PENDING (no derive/failure/snapshot)
   // until a later invocation stages + succeeds it -- then the SAME cycle derives + saves exactly once. A
   // failed/terminal probe still yields the approved honest blocked/unavailable outcome via the gate.
-  rollup.plannedReports = buildFinalReports({ state, connections, bucket });
+  rollup.plannedReports = buildFinalReports({ state, connections, bucket, inventoryAsOf });
   return rollup;
 }
 
 // Return the canonical sales-movers report request per account for the account's currently resolved probe:
 // the probe always; + two-window traffic/ads + shared inventory/catalog when the probe validated with a
 // date. Each source is REQUIRED and listed regardless of whether it has been staged yet. Pure; no I/O.
-function buildFinalReports({ state, connections, bucket }) {
+function buildFinalReports({ state, connections, bucket, inventoryAsOf = null }) {
   return state.map((st) => {
     const plan = planSalesMovers({
       accountId: st.account.accountId, country: st.account.country, currency: st.account.currency,
-      connections, asOf: st.asOf, probeSignal: st.probeSignal,
+      connections, asOf: st.asOf, inventoryAsOf, probeSignal: st.probeSignal,
     });
     const sources = plan.sources.map((s) => ({ ...s, optional: false }));
     return {

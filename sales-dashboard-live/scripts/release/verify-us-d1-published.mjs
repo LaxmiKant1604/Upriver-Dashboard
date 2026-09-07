@@ -14,12 +14,24 @@ loadReleaseEnv();
 const argOf = (name) => { const a = process.argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.split("=").slice(1).join("=") : null; };
 const bucket = argOf("bucket");
 const requestedAsOf = argOf("requested-as-of");
+const accountScope = argOf("account-scope") || "full";
 if (!isRoutingScope(bucket)) { console.error("STOP --bucket must be a routing scope (india|europe-au|us-ca|us|non-us; got=" + bucket + ")."); process.exit(2); }
 if (!/^\d{4}-\d{2}-\d{2}$/.test(String(requestedAsOf || ""))) { console.error("STOP --requested-as-of must be YYYY-MM-DD."); process.exit(2); }
 
 const ghOut = (key, value) => { const f = process.env.GITHUB_OUTPUT; if (f) appendFileSync(f, key + "=" + value + "\n"); };
 const ghSum = (value) => { const f = process.env.GITHUB_STEP_SUMMARY; if (f) appendFileSync(f, value + "\n"); };
 const short = (s) => String(s || "").slice(0, 8);
+
+// BOOTSTRAP scope: a bootstrap dispatch exists precisely because its claimed accounts have NO published
+// D-1 yet -- the full-region "already published" read-back does not apply. Emit run_required=true so the
+// bootstrap-scoped source steps proceed (their own scope + wave budget bound everything downstream).
+if (accountScope === "bootstrap") {
+  ghOut("run_required", "true");
+  ghOut("already_published", "false");
+  ghSum("### duplicate guard: BOOTSTRAP scope -- run required (claimed onboarding accounts have no published D-1)");
+  console.log("BOOTSTRAP scope: duplicate guard bypassed (run_required=true); downstream steps are bootstrap-scoped + budget-gated.");
+  process.exit(0);
+}
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");

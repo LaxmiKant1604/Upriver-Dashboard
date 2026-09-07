@@ -494,11 +494,13 @@ test("24. default AND explicit planning include listing-health; exactly FIVE can
     assert.deepEqual([srcOf(plan, key).from, srcOf(plan, key).to], [null, null], `${key} is no-date`);
   }
   assert.deepEqual([srcOf(plan, "listing-health:sales").from, srcOf(plan, "listing-health:sales").to], [SALES_FROM, ASOF]);
-  assert.deepEqual([srcOf(plan, "listing-health:inventory").from, srcOf(plan, "listing-health:inventory").to], [INV_FROM, INV_FROM]);
+  // The PLANNER models the SCHEDULED path where asOf is ALREADY D-1: its explicit inventoryAsOf
+  // defaults to asOf itself (a scheduled plan must NEVER resolve asOf-1 = D-2).
+  assert.deepEqual([srcOf(plan, "listing-health:inventory").from, srcOf(plan, "listing-health:inventory").to], [ASOF, ASOF]);
   const rj = plan.reportJobs.find((j) => j.reportKey === "listing-health");
   assert.equal(rj.dependsOn.length, 5);
   assert.deepEqual([...rj.dependsOn].sort(), plan.sourceJobs.map((j) => j.requestHash).sort());
-  assert.deepEqual(lh.context, { to: ASOF, rawSellerId: ID });
+  assert.deepEqual(lh.context, { to: ASOF, inventoryAsOf: ASOF, rawSellerId: ID });
   // listings-raw is OPTIONAL; the four others are required.
   assert.equal(srcOf(plan, "listing-health:listings-raw").optional, true, "listings-raw is the optional source");
   assert.ok(["listing-health:listings", "listing-health:sales", "listing-health:inventory", "listing-health:catalog"].every((k) => srcOf(plan, k).optional === false), "the four non-raw sources are required");

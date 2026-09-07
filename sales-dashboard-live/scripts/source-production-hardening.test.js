@@ -1348,7 +1348,9 @@ test("T1. blocker 1: CLAIM-BEFORE-SAVE lineage with exact depends_on hashes; the
       return s ? { params_hash: s.paramsHash, params: s.params, payload: s.payload, payload_storage_path: null, source_refreshed_at: s.sourceRefreshedAt } : null;
     },
     loadStoragePayload: async () => null,
-    publishLive: async (args) => { published.push(args); return { outcome: "inserted" }; },
+    // Round-10: buildSchedulerV2Publisher is ALWAYS fenced -- supply a valid control fence + the fenced CAS double.
+    getControlFence: () => ({ ownerToken: "test-owner", generation: 1 }),
+    publishLiveFenced: async (args) => { published.push(args); return { outcome: "inserted" }; },
   });
   const res = await publisher.publish("brand-sales", "A01");
   assert.equal(res.disposition, "published", JSON.stringify(res));
@@ -1689,7 +1691,9 @@ test("U3. fix 3: brand-inventory promotes through the REAL publisher composition
       return sv ? { params_hash: sv.paramsHash, params: sv.params, payload: sv.payload, payload_storage_path: null, source_refreshed_at: sv.sourceRefreshedAt } : null;
     },
     loadStoragePayload: async () => null,
-    publishLive: async (args) => {
+    // Round-10: buildSchedulerV2Publisher is ALWAYS fenced -- supply a valid control fence + the fenced CAS double.
+    getControlFence: () => ({ ownerToken: "test-owner", generation: 1 }),
+    publishLiveFenced: async (args) => {
       liveRows.set(args.reportKey + "|" + args.accountId, {
         report_key: args.reportKey, params: args.params, params_hash: args.paramsHash,
         payload: args.payload, source_refreshed_at: args.sourceRefreshedAt,

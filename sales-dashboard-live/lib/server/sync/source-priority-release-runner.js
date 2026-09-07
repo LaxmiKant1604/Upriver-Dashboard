@@ -68,7 +68,10 @@ function threeResultProblems(frozenKeys, envelope, accountId, okDispositions) {
  *   log(message)       -- optional progress line.
  */
 export async function runPriorityDashboardsRelease(deps = {}) {
-  const { release, reconcile, readbackLive, assertNoCron, log = () => {}, bucket = null, strictD1 = false } = deps;
+  // verifyLease (Round-8 blocker 1): an optional control-lease HEARTBEAT called immediately BEFORE each account's
+  // publish. { ok:false } => the operation lost the lease -> STOP, publish nothing further, return typed
+  // retryable contention (LKG preserved). Default null => no fencing (byte-identical natural behavior).
+  const { release, reconcile, readbackLive, assertNoCron, verifyLease = null, log = () => {}, bucket = null, strictD1 = false } = deps;
   if (!release || typeof release.deriveBucket !== "function" || typeof release.finalizeBucket !== "function"
       || typeof release.preflightAccount !== "function" || typeof release.publishAccount !== "function") {
     throw new Error("runPriorityDashboardsRelease requires a release with deriveBucket/finalizeBucket/preflightAccount/publishAccount (fail closed).");
@@ -144,13 +147,16 @@ export async function runPriorityDashboardsRelease(deps = {}) {
   const tokensSpent = reservation ? Number(reservation.tokensSpent) : 0;
   if (tokensSpent > PRIORITY_DASHBOARDS.maxTokens) return fail("token-ceiling", "reservation tokens_spent " + S(tokensSpent) + " > " + PRIORITY_DASHBOARDS.maxTokens);
 
-  // (3) finalize each targeted priority cycle; collect the proven account scope (this bucket's accounts only).
+  // (3) finalize each targeted priority cycle; collect the proven account scope (this bucket's accounts only)
+  //     AND the ACTUAL durable cycle id per account (Round-7 blocker 2 provenance: the publication manifest
+  //     records this real sync_cycles id, never a bucket label).
   const accounts = new Set();
+  const cycleIdByAccount = new Map();
   for (const b of targetBuckets) {
     const fin = await release.finalizeBucket(b);
     if (!fin || !OK_FINALIZE.has(S(fin.disposition))) return fail("finalize:" + b, "finalize refused: " + S(fin && (fin.reason || fin.disposition)));
-    for (const a of fin.accounts || []) accounts.add(S(a));
-    log("finalize ok: " + b + " (" + (fin.accounts ? fin.accounts.length : 0) + " accounts, " + S(fin.cycleStatus) + ")");
+    for (const a of fin.accounts || []) { accounts.add(S(a)); cycleIdByAccount.set(S(a), S(fin.cycleId)); }
+    log("finalize ok: " + b + " (" + (fin.accounts ? fin.accounts.length : 0) + " accounts, " + S(fin.cycleStatus) + ", cycle " + S(fin.cycleId).slice(0, 8) + ")");
   }
   const accountList = [...accounts].sort();
   if (!accountList.length) return fail("scope", "no proven accounts to publish");
@@ -175,7 +181,24 @@ export async function runPriorityDashboardsRelease(deps = {}) {
   //     BEFORE the read-back (never a partial / false success -- e.g. results=[] can NEVER return code 0).
   const published = [];
   for (const accountId of accountList) {
+    // FENCING (blocker 1): renew + prove we still own the unexpired control lease IMMEDIATELY before publishing
+    // this account. If lost (expired/reclaimed/taken over), STOP -- publish nothing further (LKG preserved).
+    if (typeof verifyLease === "function") {
+      let fence;
+      try { fence = await verifyLease(); } catch (e) { fence = { ok: false, reason: "renew-threw:" + S(e && e.message ? e.message : e) }; }
+      if (!fence || fence.ok !== true) {
+        return { code: 1, ok: false, stage: "contention", status: "CONTROL_LEASE_LOST", leaseLost: true,
+          problems: ["CONTROL_LEASE_LOST: the control-plane lease was lost mid-publish (" + S(fence && fence.reason) + ") after " + published.length + " publications -- stopping; LKG preserved; retryable."] };
+      }
+    }
     const res = await release.publishAccount(accountId);
+    // WRITE-BOUNDARY FENCING (Round-9 P0-A, property 7): EACH report write fences the control fence inside the
+    // report_snapshots CAS. A 'lease-lost' disposition means the write wrote ZERO rows (lease superseded/expired/
+    // reclaimed) -- STOP with typed retryable contention, never a hard publish failure (LKG preserved).
+    if (Array.isArray(res && res.results) && res.results.some((r) => r && r.disposition === "lease-lost")) {
+      return { code: 1, ok: false, stage: "contention", status: "CONTROL_LEASE_LOST", leaseLost: true,
+        problems: ["CONTROL_LEASE_LOST: a report write for " + accountId + " lost the control-plane fence at the write boundary after " + published.length + " publications -- stopping; LKG preserved; retryable."] };
+    }
     const probs = threeResultProblems(FROZEN, res, accountId, OK_PUBLISH);
     if (probs.length) return fail("publish", probs);
     for (const r of res.results) published.push({ reportKey: S(r.reportKey), accountId, liveReportKey: S(r.liveReportKey), paramsHash: S(r.paramsHash), disposition: r.disposition });
@@ -195,7 +218,14 @@ export async function runPriorityDashboardsRelease(deps = {}) {
   const cron1 = await assertNoCron();
   if (!cron1 || cron1.ok !== true) return fail("assert-no-cron-final", (cron1 && cron1.reason) || "cron appeared");
 
-  return { code: 0, ok: true, stage: "complete", evidence: { bucket: bucket || "both", accounts: accountList.length, published: published.length, tokensSpent, effectivePublishAsOf: effectiveByBucket } };
+  return {
+    code: 0, ok: true, stage: "complete",
+    evidence: { bucket: bucket || "both", accounts: accountList.length, published: published.length, tokensSpent, effectivePublishAsOf: effectiveByBucket },
+    // The EXACT live identities this release produced (Round-6 blocker 7 manifest) + the ACTUAL durable cycle
+    // id that produced each (Round-7 blocker 2 provenance): [{ reportKey, accountId, liveReportKey, paramsHash,
+    // cycleId }]. Additive -- the natural path ignores it.
+    publishedIdentities: published.map((p) => ({ reportKey: p.reportKey, accountId: p.accountId, liveReportKey: p.liveReportKey, paramsHash: p.paramsHash, cycleId: S(cycleIdByAccount.get(p.accountId)) })),
+  };
 }
 
 /**

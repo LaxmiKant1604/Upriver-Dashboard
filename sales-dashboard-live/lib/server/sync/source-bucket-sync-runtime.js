@@ -553,7 +553,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     };
   };
 
-  const run = async ({ bucket, asOf = null, today = null, cycleDate = null, reuseOnly = false, onlySourceKey = null, deadline = null, preflight = null, forceFreshOli = false } = {}) => {
+  const run = async ({ bucket, asOf = null, today = null, cycleDate = null, cycleBucket = null, reuseOnly = false, onlySourceKey = null, deadline = null, preflight = null, forceFreshOli = false } = {}) => {
     if (!isRoutingScope(bucket)) {
       throw new Error(`buildBucketSourceSyncRuntime.run requires a routing scope (region india|europe-au|us-ca or legacy us|non-us; got "${bucket}").`);
     }
@@ -787,7 +787,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         store, dataDoe,
         replaceHistoryWindow: trackedReplaceHistory, persistSnapshot: trackedPersistSnapshot, updateRunStatus: boundedUpdateRunStatus,
         recordCompleteness: recordOliCompleteness,
-        cycleDate: cycleDate || todayStr, trigger: "manual",
+        cycleDate: cycleDate || todayStr, cycleBucket, trigger: "manual",
         clock, wait: null, cooldownMs: 0, // ONE bounded manual pass; the scheduler owns cadence/cooldown
         deadlineMs: dl.deadlineMs, reserveMs: dl.reserveMs,
         reuseOnly,

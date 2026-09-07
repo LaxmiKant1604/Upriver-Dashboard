@@ -1211,6 +1211,179 @@ export async function claimAccountBootstrap({ accountId, operationId }) {
   return rows || null;
 }
 
+// The ATOMIC per-region-wave dispatch LEASE (SECURITY DEFINER RPC): APPEND-ONLY by (region, dispatch_id);
+// at most ONE active execution per region; bounded backoff prevents dispatch spam; 'completed' is
+// terminal for the wave; the stored wave scope (wave_key/account_ids/operation_ids) is IMMUTABLE. Typed
+// jsonb dispositions: leased | not-due | completed | region-busy | refused(WAVE_IDENTITY_MISMATCH).
+export async function leaseOnboardingDispatch({ region, dispatchId, waveKey, accountIds, operationIds }) {
+  const rows = await request("/rest/v1/rpc/lease_onboarding_dispatch", {
+    method: "POST",
+    body: { p_region: region, p_dispatch_id: dispatchId, p_wave_key: waveKey, p_account_ids: accountIds || [], p_operation_ids: operationIds || [] },
+  });
+  return rows || null;
+}
+
+// Durable, idempotent AWAITING-BUDGET hold (SECURITY DEFINER RPC): a claimed wave with no authorized
+// budget is recorded (append-only by (region, dispatch_id)) and NEVER dispatched; an existing row for
+// the same identity in a later state is left untouched; OTHER waves' rows are never modified. Typed
+// jsonb dispositions: awaiting-budget | unchanged.
+export async function markOnboardingDispatchAwaitingBudget({ region, dispatchId, waveKey, accountIds, operationIds }) {
+  const rows = await request("/rest/v1/rpc/mark_onboarding_dispatch_awaiting_budget", {
+    method: "POST",
+    body: { p_region: region, p_dispatch_id: dispatchId, p_wave_key: waveKey, p_account_ids: accountIds || [], p_operation_ids: operationIds || [] },
+  });
+  return rows || null;
+}
+
+// The bootstrap RUN's durable acknowledgement (SECURITY DEFINER RPC), keyed by its dispatch identity:
+// phase 'running' (extends the lease horizon), 'completed' (terminal; only after successful scoped
+// source processing) or 'failed' (retryable after bounded backoff). Typed jsonb dispositions:
+// acked | already-completed | not-found.
+export async function ackOnboardingDispatch({ region, dispatchId, phase, note, runToken }) {
+  const rows = await request("/rest/v1/rpc/ack_onboarding_dispatch", {
+    method: "POST",
+    body: { p_region: region, p_dispatch_id: dispatchId, p_phase: phase, p_note: note ?? null, p_run_token: runToken },
+  });
+  return rows || null;
+}
+
+// (Round-7 blocker 3) recordOnboardingUnavailable / getOnboardingUnavailable were REMOVED with the
+// account_onboarding_unavailable table -- fba-plan never self-declares "source unavailable" (an empty
+// validated D-1 inventory is a VALID published snapshot; a missing/failed source blocks and preserves LKG),
+// so completion is proven ONLY by the publication manifest.
+
+export async function recordOnboardingDispatchError({ region, dispatchId, error }) {
+  const rows = await request("/rest/v1/rpc/record_onboarding_dispatch_error", {
+    method: "POST",
+    body: { p_region: region, p_dispatch_id: dispatchId, p_error: error },
+  });
+  return rows || null;
+}
+
+export async function completeOnboardingDispatch({ region, dispatchId }) {
+  const rows = await request("/rest/v1/rpc/complete_onboarding_dispatch", {
+    method: "POST",
+    body: { p_region: region, p_dispatch_id: dispatchId },
+  });
+  return rows || null;
+}
+
+// Record ONE durable publication-manifest row: the EXACT live identity (params_hash + coversAsOf) + the
+// PROVENANCE (real durable cycle_id + operation_key + the ACTIVE run_token) the wave produced for a (report,
+// account). The RPC rejects blank provenance, a bucket-label cycle_id, an unknown dispatch, an out-of-membership
+// account, and a run_token that is not the dispatch's active attempt (returns 'stale-run-token'). The
+// completion proof re-reads by this exact identity (never the newest) and compares the run_token.
+export async function recordOnboardingPublication({ region, dispatchId, accountId, reportKey, paramsHash, coversAsOf, cycleId, cycleBucket, operationKey, runToken }) {
+  const rows = await request("/rest/v1/rpc/record_onboarding_publication", {
+    method: "POST",
+    body: { p_region: region, p_dispatch_id: dispatchId, p_account_id: accountId, p_report_key: reportKey, p_params_hash: paramsHash, p_covers_asof: coversAsOf, p_cycle_id: cycleId ?? "", p_cycle_bucket: cycleBucket ?? "", p_operation_key: operationKey ?? "", p_run_token: runToken ?? "" },
+  });
+  return rows || null;
+}
+
+// The publication-manifest rows for an EXACT (region, dispatch_id) -- read by the completion verifier.
+// STRICT read: a transport failure throws (fail closed). Returns
+// [{ account_id, report_key, params_hash, covers_asof, cycle_id, operation_key, run_token }].
+export async function getOnboardingPublication({ region, dispatchId }) {
+  const params = new URLSearchParams({
+    select: "account_id,report_key,params_hash,covers_asof,cycle_id,operation_key,run_token",
+    region: `eq.${region}`,
+    dispatch_id: `eq.${dispatchId}`,
+  });
+  const rows = await request(`/rest/v1/account_onboarding_publication?${params}`);
+  return Array.isArray(rows) ? rows : [];
+}
+
+// Round-8/11 blocker 1: standalone (non-transactional) control-plane lease HEARTBEAT helpers over the SECURITY
+// DEFINER RPCs -- used by the publish-phase fence (outside the control transaction). renew extends the EXACT
+// immutable fence (returns 'renewed' or 'lost'); read reconciles. Round-11 P0-A: there is DELIBERATELY NO
+// standalone acquire wrapper -- a publication path must NEVER re-acquire the control-plane lease (it would
+// mint a NEW generation and could publish under controls another generation opened). The ONLY place a lease is
+// ACQUIRED is INSIDE the guarded control transaction (runControlPackageTransaction apply/reclaim, via the pg
+// store's acquireControlLease); publication renews the generation the matching --apply emitted.
+export async function renewControlPlaneLease({ ownerToken, generation, ttlSeconds }) {
+  return await request("/rest/v1/rpc/renew_control_plane_lease", {
+    method: "POST", body: { p_owner_token: ownerToken, p_generation: generation == null ? null : Number(generation), p_ttl_seconds: Number(ttlSeconds) || 900 },
+  });
+}
+export async function readControlPlaneLease() {
+  return await request("/rest/v1/rpc/read_control_plane_lease", { method: "POST", body: {} });
+}
+
+// The dispatch-wave rows (read-only; every write goes through the lease/mark/ack/error/complete RPCs).
+// Fail-soft: null when unreadable -- the worker then skips completion detection for the pass.
+export async function getOnboardingDispatchRows() {
+  try {
+    const params = new URLSearchParams({
+      select: "region,dispatch_id,wave_key,status,attempts,last_attempt_at,last_error,next_retry_at,account_ids,operation_ids,updated_at",
+      order: "region.asc,updated_at.desc",
+    });
+    const rows = await request(`/rest/v1/account_onboarding_dispatch?${params}`);
+    return Array.isArray(rows) ? rows : null;
+  } catch {
+    return null;
+  }
+}
+
+// The ONE durable dispatch wave row for an EXACT (region, dispatch_id) -- the authoritative, IMMUTABLE
+// scope the bootstrap workflow step resolves its account/operation set from. STRICT read: a transport
+// failure throws (fail closed; a bootstrap step must never widen scope on an unreadable row). Returns
+// the row or null when the wave does not exist.
+export async function getOnboardingDispatchRow({ region, dispatchId }) {
+  const params = new URLSearchParams({
+    select: "region,dispatch_id,wave_key,status,attempts,last_error,next_retry_at,active_run_token,account_ids,operation_ids,updated_at",
+    region: `eq.${region}`,
+    dispatch_id: `eq.${dispatchId}`,
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/account_onboarding_dispatch?${params}`);
+  return Array.isArray(rows) ? (rows[0] || null) : null;
+}
+
+// The durable onboarding-wave BUDGET (the ENFORCED paid ceiling). Fail-soft read: null when the table is
+// unreadable/absent -- every bootstrap-scoped paid operator treats null/absent as NOT AUTHORIZED (refuse
+// before any create POST).
+export async function getOnboardingBudget(budgetKey) {
+  try {
+    const params = new URLSearchParams({
+      select: "budget_key,authorized_tokens,plan_fingerprint,status,reserved_tokens,spent_tokens,reservations,approved_plan,wave_accounts,wave_operations,wave_regions,updated_at",
+      budget_key: `eq.${budgetKey}`,
+      limit: "1",
+    });
+    const rows = await request(`/rest/v1/account_onboarding_budget?${params}`);
+    return Array.isArray(rows) ? (rows[0] || null) : null;
+  } catch {
+    return null;
+  }
+}
+
+// The ATOMIC, DRIFT-VALIDATED, RETRY-SAFE pre-POST reservation against the wave budget (SECURITY
+// DEFINER RPC). Every reservation carries the step type, region, exact account-set hash, plan
+// fingerprint AND the per-step plan hash (which binds dates/windows/sources/batches/membership); the
+// RPC validates all of them against the wave's APPROVED plan, reserves the approved CEILING, and tracks
+// CUMULATIVE actuals so a retry reuses the one reservation. tokens/creates = THIS attempt's plan.
+// Typed dispositions: reserved | already-reserved (retry reuses; fits remaining headroom) | refused
+// (PLAN_DRIFT / BUDGET_NOT_AUTHORIZED / BUDGET_CLOSED / BUDGET_EXCEEDED -- refuse BEFORE any create).
+export async function reserveOnboardingSpend({ budgetKey, ref, stepType, region, accountSetHash, planFingerprint, stepPlanHash, tokens, creates }) {
+  const rows = await request("/rest/v1/rpc/reserve_onboarding_spend", {
+    method: "POST",
+    body: {
+      p_budget_key: budgetKey, p_ref: ref, p_step_type: stepType, p_region: region,
+      p_account_set_hash: accountSetHash, p_plan_fingerprint: planFingerprint, p_step_plan_hash: stepPlanHash,
+      p_tokens: tokens, p_creates: creates,
+    },
+  });
+  return rows || null;
+}
+
+export async function recordOnboardingSpendActual({ budgetKey, ref, actualTokens, actualCreates }) {
+  const rows = await request("/rest/v1/rpc/record_onboarding_spend_actual", {
+    method: "POST",
+    body: { p_budget_key: budgetKey, p_ref: ref, p_actual_tokens: actualTokens, p_actual_creates: actualCreates },
+  });
+  return rows || null;
+}
+
 // Distinct (account_id, report_key) presence pairs for the given accounts/keys -- the onboarding
 // worker's zero-cost durable-evidence probe (grading bootstrapping -> partially_ready -> ready).
 // EXACT per-pair existence reads (limit=1): a bulk read of the raw snapshot rows can exceed the
@@ -4052,6 +4225,45 @@ export async function publishLiveSnapshotIfNewer({ reportKey, accountId, paramsH
     return classifyNonOlder(live2);
   }
   return classifyNonOlder(live);
+}
+
+// Round-9 P0-A WRITE-BOUNDARY FENCED live CAS. Unlike publishLiveSnapshotIfNewer (a multi-request PostgREST CAS
+// whose fence could only be checked BEFORE the request), this routes the control-plane live write through the
+// ATOMIC cas_report_snapshot_if_newer_fenced RPC: the exact fence {ownerToken, generation, unexpired lease} is
+// proven INSIDE THE SAME PostgreSQL transaction as the CAS write. On mismatch/expiry it returns
+// { outcome: 'lease-lost' } with ZERO rows written. Otherwise the CAS semantics are IDENTICAL (inserted /
+// replaced / newer-live, and EQUAL freshness resolved STORAGE-FIRST here to already-current | conflict). Every
+// control-enabled (Gate-7) publisher uses THIS; a blank fence fails closed as 'lease-lost'.
+export async function publishLiveSnapshotFencedIfNewer({ reportKey, accountId, paramsHash, params, payload, payloadBytes, sourceRefreshedAt, ownerToken, generation }, { signal = null } = {}) {
+  const candParams = params || {};
+  const candPayload = payload == null ? null : payload;
+  const rpc = await request("/rest/v1/rpc/cas_report_snapshot_if_newer_fenced", {
+    method: "POST",
+    signal,
+    body: {
+      p_report_key: reportKey, p_account_id: accountId, p_params_hash: paramsHash,
+      p_params: candParams, p_payload: candPayload, p_payload_storage_path: null,
+      p_payload_bytes: payloadBytes || 0, p_source_refreshed_at: sourceRefreshedAt ?? null,
+      p_owner_token: ownerToken ?? "", p_generation: generation == null ? null : Number(generation),
+    },
+  });
+  const value = Array.isArray(rpc) ? rpc[0] : rpc;
+  const disposition = value && typeof value === "object" && !Array.isArray(value) ? value.disposition : null;
+  // FENCE LOST at the write boundary -> zero rows written; the caller stops and returns typed contention.
+  if (disposition === "lease-lost") return { outcome: "lease-lost", reason: value && value.reason };
+  if (disposition === "inserted" || disposition === "replaced" || disposition === "newer-live") return { outcome: disposition };
+  if (disposition !== "equal") return { outcome: "conflict" }; // invalid-freshness / vanished / cas-miss / unknown
+  // EQUAL freshness: STORAGE-FIRST content-identity proof (identical to the shadow path).
+  if (canonicalJsonString(value.params) !== canonicalJsonString(candParams)) return { outcome: "conflict" };
+  const storagePath = typeof value.payload_storage_path === "string" ? value.payload_storage_path.trim() : "";
+  let livePayload;
+  if (storagePath !== "") {
+    try { livePayload = await getReportSnapshotStoragePayload(storagePath, { signal }); }
+    catch (_e) { return { outcome: "conflict" }; }
+  } else { livePayload = value.payload; }
+  if (livePayload == null || candPayload == null) return { outcome: "conflict" };
+  if (canonicalJsonString(livePayload) !== canonicalJsonString(candPayload)) return { outcome: "conflict" };
+  return { outcome: "already-current" };
 }
 
 // Round-9 finding 4 + round-10 blockers 1/2: the reviewed atomic freshness/CAS for a SHADOW report_snapshots

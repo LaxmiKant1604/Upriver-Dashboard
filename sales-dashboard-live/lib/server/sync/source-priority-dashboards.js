@@ -197,6 +197,22 @@ export function buildPriorityDashboardsRelease({
   // so Daily + Brand View publish the estimate-included Total Sales. Offline harnesses pass false to prove the
   // priced derive is byte-identical (the estimate layer is purely additive) and to avoid touching the estimate tables.
   enableSalesEstimates = true,
+  // TRUSTED, BUILD-TIME-ONLY DEDICATED CYCLE NAMESPACE (e.g. "bootstrap-india"). When set, deriveBucket +
+  // finalizeBucket operate on a DEDICATED sync_cycles bucket -- exactly like FBA's "<region>-fba" -- so a
+  // scoped bootstrap publication NEVER collides with (or short-circuits on) the natural (region, today)
+  // daily cycle. null => the scheduler-v2 daily path is byte-identical (the cycle bucket IS the region).
+  cycleBucket = null,
+  // TRUSTED, BUILD-TIME-ONLY SCOPED discovery override: when set, the runtime discovers EXACTLY these
+  // accounts (a bootstrap publication passes ONLY its immutable dispatch set), so the derive/finalize/
+  // publish covers exactly them and nothing outside the wave. null => the runtime's real full-region
+  // discovery (unchanged). This is a runtime seam only -- the finalizer's exact-count proofs still hold
+  // against whatever discovery returns, so no full-region contract is weakened.
+  fetchAccounts = null,
+  // Round-9 P0-A + P0-B: an OPTIONAL control-fence provider () => {ownerToken, generation} | null. When set,
+  // the release's publisher becomes CONTROL-ENABLED -- EVERY report write fences the exact captured fence inside
+  // the report_snapshots CAS and FAILS CLOSED (lease-lost) when no live fence exists. null => unfenced (the
+  // natural non-bootstrap path is byte-identical).
+  getControlFence = null,
 } = {}) {
   if (typeof buildRuntime !== "function") throw new Error("buildPriorityDashboardsRelease requires buildRuntime (fail closed).");
   if (asOfOverride != null && !/^\d{4}-\d{2}-\d{2}$/.test(String(asOfOverride))) throw new Error("buildPriorityDashboardsRelease asOfOverride must be a YYYY-MM-DD date (fail closed).");
@@ -204,8 +220,10 @@ export function buildPriorityDashboardsRelease({
   if (typeof buildPublisher !== "function") throw new Error("buildPriorityDashboardsRelease requires buildPublisher (fail closed).");
   if (typeof listReportJobs !== "function") throw new Error("buildPriorityDashboardsRelease requires listReportJobs (fail closed).");
   if (typeof getCycleByBucketDate !== "function") throw new Error("buildPriorityDashboardsRelease requires getCycleByBucketDate (fail closed).");
+  if (cycleBucket != null && !(typeof cycleBucket === "string" && cycleBucket.trim())) throw new Error("buildPriorityDashboardsRelease cycleBucket must be a non-blank string when set (fail closed).");
   assertPriorityOperationKey(operationKey); // validate the reservation operation key (default v2 | scheduled/YYYY-MM-DD)
   const REPORT_SET = new Set(PRIORITY_DASHBOARDS.reportKeys);
+  const cycleBucketFor = (bucket) => (cycleBucket != null ? cycleBucket : bucket);
 
   // priorityMode is bound at BUILD time; the guarded adapter enforces the durable one-Catalog-export ceiling.
   const runtime = buildRuntime({
@@ -213,9 +231,13 @@ export function buildPriorityDashboardsRelease({
     budgetMs,
     asOfOverride,
     enableSalesEstimates,
+    ...(typeof fetchAccounts === "function" ? { fetchAccounts } : {}),
     makeAdapter: (connections) => makeDurableCatalogGuard({ inner: makeInnerAdapter(connections), reservation, operationKey }),
   });
-  const publisher = buildPublisher(); // frozen production publisher; the composed surface is publish(rk, acct)
+  // Round-10: buildSchedulerV2Publisher is ALWAYS fenced. Thread getControlFence through unconditionally -- when
+  // it is null (no fence provider), EVERY live write fails closed (lease-lost), so a bare release without a
+  // control fence can never write through the Gate-7 composition.
+  const publisher = buildPublisher({ getControlFence });
   const store = makeStore({ deadline: null });
   const refuse = (reason, detail) => (detail === undefined ? { disposition: "refused", reason } : { disposition: "refused", reason, detail });
 
@@ -234,12 +256,12 @@ export function buildPriorityDashboardsRelease({
     // finalizeBucket still INDEPENDENTLY re-proves the durable scope before accepting it. A running/absent cycle
     // derives normally. getCycleByBucketDate fails closed (throws) on >1 cycle for the (bucket, date).
     const sig = deadline && deadline.signal ? { signal: deadline.signal } : {};
-    const existingCycle = await getCycleByBucketDate(bucket, S(preflight.today), sig);
+    const existingCycle = await getCycleByBucketDate(cycleBucketFor(bucket), S(preflight.today), sig);
     const existingStatus = existingCycle ? S(existingCycle.status) : null;
     if (existingStatus === "succeeded" || existingStatus === "partial") {
       return { rollup: { stopped: false, continuationRequired: false, globalDrained: true, alreadyComplete: true, cycleId: S(existingCycle.id), cycleStatus: existingStatus, derived: { skipped: null, lineage: [] } } };
     }
-    const rollup = await runtime.run({ bucket, deadline, preflight });
+    const rollup = await runtime.run({ bucket, deadline, preflight, ...(cycleBucket != null ? { cycleBucket } : {}) });
     return { rollup };
   }
 
@@ -259,10 +281,12 @@ export function buildPriorityDashboardsRelease({
     const cycleDate = S(preflight.today);
     if (!nb(cycleDate)) return refuse("no-cycle-date");
 
-    // (2) reconstruct + verify the CYCLE ROW itself: exact bucket, running status, reviewed manual trigger.
-    const cycle = await getCycleByBucketDate(bucket, cycleDate, sig);
+    // (2) reconstruct + verify the CYCLE ROW itself: exact (dedicated) bucket, running status, reviewed
+    // manual trigger. In a scoped bootstrap release the cycle lives under the dedicated cycle bucket.
+    const cycleKeyBucket = cycleBucketFor(bucket);
+    const cycle = await getCycleByBucketDate(cycleKeyBucket, cycleDate, sig);
     if (!cycle || !nb(S(cycle.id))) return refuse("cycle-not-found");
-    if (S(cycle.bucket) !== bucket) return refuse("cycle-bucket-mismatch");
+    if (S(cycle.bucket) !== cycleKeyBucket) return refuse("cycle-bucket-mismatch");
     // RESUMABLE: 'running' finalizes here; an ALREADY-terminal 'succeeded'/'partial' cycle (a prior release pass
     // finalized it) is accepted IDEMPOTENTLY -- but only AFTER the SAME strict durable-scope proofs below; any
     // other status is refused.

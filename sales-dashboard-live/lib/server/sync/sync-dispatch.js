@@ -380,6 +380,10 @@ export async function runSchedulerV2Shadow({
         accounts: bucketAccounts, connections, asOf, asOfFor, store, dataDoe,
         bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly,
       };
+      // ONE explicit inventory snapshot day (D-1): the Sales Movers staged cycle consumes the SAME
+      // threaded inventoryAsOf the generic plan and the batched FBA/v3 planners use, so the dispatcher
+      // can never let a staged runner infer the inventory date from its report asOf ambiguously.
+      if (unit.reportKey === "sales-movers") args.inventoryAsOf = inventoryAsOf;
       if (unit.reportKey === "ppc-performance") Object.assign(args, ppcAdsProviders);
       res = await runner(args);
       collectedReports.push(...(res.plannedReports || []));

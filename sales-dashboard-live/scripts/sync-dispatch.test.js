@@ -222,6 +222,7 @@ function dispatch(over = {}) {
     // account participates) are preserved for the existing suite; gate-specific tests override it.
     loadAccountRollout: "loadAccountRollout" in over ? over.loadAccountRollout : (async () => ({ read: "ok", allPrimary: true, enabledAccountIds: [] })),
     maxJobs: over.maxJobs, deadlineMs: over.deadlineMs, clock: over.clock,
+    inventoryAsOf: over.inventoryAsOf,
   });
   return { store, dd, saver, promise: p };
 }
@@ -267,6 +268,55 @@ test("an unsupported/ambiguous report key fails closed BEFORE any cycle or token
 test("dispatching ppc-performance without its persisted-Ads readers fails closed", async () => {
   const { promise } = dispatch({ manualReportKeys: ["ppc-performance"], controlCatalog: mkCatalog(["ppc-performance"]) });
   await assert.rejects(promise, /ppc-performance requires injected ppcAdsProviders.*fail closed/s);
+});
+
+/* ============================= inventoryAsOf threading (staged runner) ============================= */
+
+group("scheduler-v2 dispatch: ONE explicit inventoryAsOf reaches the staged Sales Movers cycle");
+
+// A Sales-Movers-shaped DataDoe double: a DATED probe (so the staged downstream genuinely activates)
+// and per-key rows; every create's EXACT requested window (fetchParams.from/to) is captured.
+function makeSalesMoversDataDoe(inventoryDate) {
+  const base = makeDataDoe();
+  const created = [];
+  const rowsFor = (job) => {
+    const rk = job.requestKey;
+    if (rk === "sales-movers:sales-latest-probe") return [{ date: "2025-08-08", units_sum: 5 }];
+    if (rk === "sales-movers:traffic") return [{ child_asin: "A", product_name: "W", sales_sum: 1, units_sum: 1, orders_sum: 1, sessions_sum: 1, page_views_sum: 1, units_shipped_sum: 1, units_refunded_sum: 0 }];
+    if (rk === "sales-movers:ads") return [{ child_asin: "A", currency: "USD", ad_spend_sum: 1, ad_sales_sum: 1, ad_clicks_sum: 1 }];
+    if (rk === "sales-movers:inventory") return [{ date: inventoryDate, child_asin: "A", available: 5, inbound_shipped: 0, inbound_received: 0, days_of_supply: 9, units_shipped_t30: 1 }];
+    return [{ child_asin: "A", parent_asin: "P", product_name: "W", product_brand: "B" }];
+  };
+  return {
+    created,
+    async create(job) { created.push({ requestKey: job.requestKey, from: job.fetchParams?.from ?? null, to: job.fetchParams?.to ?? null }); return base.create(job); },
+    async poll() {},
+    async download(job) { return rowsFor(job); },
+  };
+}
+
+test("(inventoryAsOf threaded) the REAL dispatcher passes inventoryAsOf into runSalesMoversShadowCycle; the staged inventory export uses it EXACTLY", async () => {
+  // Deliberately DIFFERENT dates: report/sales asOf vs the explicit inventory snapshot day. The staged
+  // runner must use the threaded inventoryAsOf -- never the report asOf, and never asOf-1 (D-2).
+  const INV = "2025-08-07";
+  assert.notEqual(INV, ASOF); assert.notEqual(INV, "2025-08-09"); // != asOf and != asOf-1
+  const store = makeStore();
+  const dd = makeSalesMoversDataDoe(INV);
+  const r = await dispatch({ store, dataDoe: dd, inventoryAsOf: INV, manualReportKeys: ["sales-movers"], controlCatalog: mkCatalog(["sales-movers"]) }).promise;
+  assert.ok(r.perUnit.some((u) => u.unit === "sales-movers"), "sales-movers ran through its staged cycle unit");
+  const inv = dd.created.filter((c) => c.requestKey === "sales-movers:inventory");
+  assert.equal(inv.length, 1, "exactly one staged inventory export");
+  assert.deepEqual([inv[0].from, inv[0].to], [INV, INV], "the staged inventory window IS the threaded inventoryAsOf (single day)");
+  assert.ok(!dd.created.some((c) => c.from === "2025-08-09" || c.to === "2025-08-09"), "nothing inferred asOf-1 (no ambiguous inventory date)");
+});
+
+test("(inventoryAsOf default) with NO threaded inventoryAsOf the staged inventory day is the report asOf ITSELF -- an unambiguous default, never asOf-1", async () => {
+  const store = makeStore();
+  const dd = makeSalesMoversDataDoe(ASOF);
+  await dispatch({ store, dataDoe: dd, manualReportKeys: ["sales-movers"], controlCatalog: mkCatalog(["sales-movers"]) }).promise;
+  const inv = dd.created.filter((c) => c.requestKey === "sales-movers:inventory");
+  assert.equal(inv.length, 1);
+  assert.deepEqual([inv[0].from, inv[0].to], [ASOF, ASOF], "default inventory day === the report asOf (already D-1 on a scheduled run)");
 });
 
 /* ============================= controls / readiness ============================= */

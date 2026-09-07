@@ -800,9 +800,13 @@ const REGISTRY = {
       // Traffic + Ads: exactly two ordered single-account fragments [recent, prior].
       const trafficFrags = validateOrderedSingleAccountWindows(sources["sales-movers:traffic"], [recent, prior], rawSellerId, "sales-movers:traffic");
       const adsFrags = validateOrderedSingleAccountWindows(sources["sales-movers:ads"], [recent, prior], rawSellerId, "sales-movers:ads");
-      // Inventory: one single-account fragment over EXACTLY the single previous day [asOf-1, asOf-1]
-      // (pin both endpoints to that one date).
-      const inventoryDay = addDaysStr(asOf, -1);
+      // Inventory: one single-account fragment over EXACTLY the single snapshot day (D-1), pinned to the
+      // planner's explicit context.inventoryAsOf. The scheduler's report asOf is ALREADY D-1, so the
+      // explicit value equals asOf there -- NEVER asOf-1 (that would accept a D-2 fragment). The -1
+      // fallback serves only a context WITHOUT the explicit value (a browser-parity fixture where asOf
+      // is TODAY, or a job planned before this field existed).
+      const inventoryDay = context.inventoryAsOf != null ? String(context.inventoryAsOf) : addDaysStr(asOf, -1);
+      if (!isValidCalendarDate(inventoryDay)) throw new Error("sales-movers inventoryAsOf must be a real calendar date.");
       const inventoryRows = singleAccountFragmentRows(sources["sales-movers:inventory"], "sales-movers:inventory", rawSellerId, inventoryDay, inventoryDay);
       // Catalog: exactly one single-account no-date fragment.
       const catalogRows = noDateFragmentRows(sources["sales-movers:catalog"], "sales-movers:catalog", rawSellerId);
@@ -876,9 +880,12 @@ const REGISTRY = {
         if (!Array.isArray(f.rows)) throw new Error(`buy-box-loss:oli-sales fragment ${f.from}..${f.to} has no validated row array; snapshot blocked.`);
         assertRowsInWindow(f.rows, expectedOliSlices[i].from, expectedOliSlices[i].to, `buy-box-loss oli-sales slice ${f.from}..${f.to}`);
       });
-      // Inventory: one single-account fragment over EXACTLY the single previous day [asOf-1, asOf-1]
-      // (pin both endpoints to that one date).
-      const inventoryDay = addDaysStr(asOf, -1);
+      // Inventory: one single-account fragment over EXACTLY the single snapshot day (D-1), pinned to the
+      // planner's explicit context.inventoryAsOf (equal to asOf on a scheduled run -- NEVER asOf-1,
+      // which would accept a D-2 fragment). The -1 fallback serves only a context WITHOUT the explicit
+      // value (a browser-parity fixture where asOf is TODAY, or a pre-existing queued job).
+      const inventoryDay = context.inventoryAsOf != null ? String(context.inventoryAsOf) : addDaysStr(asOf, -1);
+      if (!isValidCalendarDate(inventoryDay)) throw new Error("buy-box-loss inventoryAsOf must be a real calendar date.");
       const inventoryRows = singleAccountFragmentRows(sources["buy-box-loss:inventory"], "buy-box-loss:inventory", rawSellerId, inventoryDay, inventoryDay);
       // Catalog: exactly one single-account no-date fragment.
       const catalogRows = noDateFragmentRows(sources["buy-box-loss:catalog"], "buy-box-loss:catalog", rawSellerId);
@@ -1000,7 +1007,11 @@ const REGISTRY = {
       const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
       const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
       const salesFrom = addDaysStr(asOf, -(LH_SALES_WINDOW_DAYS - 1));
-      const inventoryDay = addDaysStr(asOf, -1);
+      // EXACT single snapshot day (D-1): the planner's explicit context.inventoryAsOf (equal to asOf on
+      // a scheduled run -- NEVER asOf-1, which would accept a D-2 fragment); -1 fallback only for a
+      // context without the explicit value (browser-parity fixtures / pre-existing queued jobs).
+      const inventoryDay = context.inventoryAsOf != null ? String(context.inventoryAsOf) : addDaysStr(asOf, -1);
+      if (!isValidCalendarDate(inventoryDay)) throw new Error("listing-health inventoryAsOf must be a real calendar date.");
       // The FOUR required sources must be a validated saved array (never an empty-success coercion).
       for (const key of ["listing-health:listings", "listing-health:sales", "listing-health:inventory", "listing-health:catalog"]) {
         const s = sources[key];

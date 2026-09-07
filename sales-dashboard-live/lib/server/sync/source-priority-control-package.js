@@ -161,15 +161,47 @@ export function buildPrioritySafeClosePackage({ operator = "", controlledReportK
  * an ordinary failure (code 1); a lost/failed acknowledgement of the commit ITSELF returns typed COMMIT_UNKNOWN
  * (code 3) WITHOUT a rollback or retry, and demands a read-only reconciliation before any further action.
  */
-export async function runControlPackageTransaction({ store, pkg, mode, controlledReportKeys = CONTROLLED_REPORT_KEYS } = {}) {
+export async function runControlPackageTransaction({ store, pkg, mode, controlledReportKeys = CONTROLLED_REPORT_KEYS, ownerToken = "", ownerGeneration = null, operationKey = "", leaseTtlSeconds = 900 } = {}) {
   if (!store || typeof store.begin !== "function") throw new Error("runControlPackageTransaction requires a transactional store (fail closed).");
   if (!pkg) throw new Error("runControlPackageTransaction requires a built package (fail closed).");
-  if (mode !== "apply" && mode !== "rollback") throw new Error("runControlPackageTransaction mode must be 'apply' | 'rollback' (fail closed).");
+  // 'reclaim' (Round-8 blocker 1): the explicit expired-lease CLEANUP -- it safe-closes stale global controls
+  // ONLY when NO current owner exists (the lease is free/expired). It ACQUIRES the lease first, so a LIVE owner
+  // blocks it (typed lease-held, zero writes) and it can never close a live owner's controls.
+  if (mode !== "apply" && mode !== "rollback" && mode !== "reclaim") throw new Error("runControlPackageTransaction mode must be 'apply' | 'rollback' | 'reclaim' (fail closed).");
+  const isClose = mode === "rollback" || mode === "reclaim";
   // Reject a blank/noncanonical operator BEFORE BEGIN -- every audited revocation must carry a real principal.
   if (!isCanonicalOperator(pkg.operator)) throw new Error("runControlPackageTransaction requires a canonical operator id (fail closed, before BEGIN).");
   if (mode === "apply" && (!pkg.post || !Array.isArray(pkg.accounts) || !pkg.accounts.length)) throw new Error("runControlPackageTransaction apply requires a discovered account package (fail closed).");
   const operator = S(pkg.operator);
   const controlled = uniqSort(controlledReportKeys);
+  let leaseGeneration = null; // the fencing generation captured on apply/reclaim acquire
+
+  // OWNER-TOKEN LEASE (Round-7 blocker 1): the global control plane is a single shared resource. A
+  // lease-capable store (the pg store) REQUIRES an ownerToken and enforces exclusivity: apply acquires/renews
+  // the lease (held-by-another => abort with ZERO writes, no stomp); rollback (safe-close) proceeds ONLY when
+  // this owner currently holds the lease AT THE EXACT GENERATION -- verified atomically UNDER THE HELD LOCK --
+  // and RELEASES it. A stale/foreign operation can NEVER close another owner's controls.
+  //
+  // Round-12 (mandatory fix 2): a lease-enabled store must provide the COMPLETE, coherent lease interface. A
+  // PARTIAL implementation (e.g. one that offers assert but not the atomic lockAndVerifyControlLease) is REFUSED
+  // BEFORE BEGIN with zero writes -- so a missing atomic-lock method can never silently downgrade the safe-close
+  // to a non-locking check. Fully-absent lease methods stay backward-compatible (offline/no enforcement).
+  const LEASE_IFACE = ["acquireControlLease", "renewControlLease", "releaseControlLease", "assertControlLeaseOwner", "lockAndVerifyControlLease"];
+  const leaseMethodsPresent = store ? LEASE_IFACE.filter((m) => typeof store[m] === "function") : [];
+  if (leaseMethodsPresent.length > 0 && leaseMethodsPresent.length < LEASE_IFACE.length) {
+    throw new Error("runControlPackageTransaction: a lease-enabled store must provide the COMPLETE coherent lease interface [" + LEASE_IFACE.join(", ") + "]; this store is PARTIAL (missing: " + LEASE_IFACE.filter((m) => !leaseMethodsPresent.includes(m)).join(", ") + ") -- refusing BEFORE BEGIN with zero writes (a missing atomic lock must never disable fencing).");
+  }
+  const leaseCapable = leaseMethodsPresent.length === LEASE_IFACE.length;
+  const owner = S(ownerToken).trim();
+  if (leaseCapable && !owner) throw new Error("runControlPackageTransaction requires an ownerToken when the store enforces the control-plane lease (fail closed, before BEGIN).");
+  // Round-10: the fence generation is MANDATORY (a positive safe integer). A ROLLBACK against a lease-capable
+  // store REQUIRES a valid ownerGeneration BEFORE BEGIN -- the owner-only rollback is removed, so a
+  // stale/missing generation can never close/release a newer lease. (apply/reclaim acquire their own
+  // generation; the acquire result is validated below.)
+  const validGen = (g) => Number.isSafeInteger(g) && g > 0;
+  if (leaseCapable && mode === "rollback" && !validGen(ownerGeneration)) {
+    throw new Error("runControlPackageTransaction rollback requires a valid ownerGeneration (positive integer) when the store enforces the control-plane lease (fail closed, before BEGIN).");
+  }
 
   const controlledSet = new Set(controlled);
   const enabledRollout = async () => (await store.rolloutRows()).filter((r) => r.enabled === true).map((r) => S(r.account_id));
@@ -187,6 +219,40 @@ export async function runControlPackageTransaction({ store, pkg, mode, controlle
   let phase = "pre-commit";
   await store.begin();
   try {
+    // ---- LEASE (blocker 1): acquire/renew on apply; require ownership on rollback; acquire-if-free on reclaim
+    //      -- BEFORE any write ----
+    if (leaseCapable) {
+      if (mode === "apply" || mode === "reclaim") {
+        // apply: the operation acquires/renews and HOLDS the lease through publish + safe-close.
+        // reclaim: acquire ONLY if the lease is free/expired -- a live owner blocks it (never closes it).
+        const acq = await store.acquireControlLease(owner, operationKey, leaseTtlSeconds);
+        if (!acq || acq.disposition !== "acquired") {
+          throw new Error("CONTROL_LEASE_HELD: the global control plane is owned by another operation (" + S(acq && acq.owner_token).slice(0, 16) + ") -- refusing " + mode + " (zero writes).");
+        }
+        // Round-10 (blocker 2): FAIL CLOSED if the database did not return a VALID generation -- never enable
+        // controls and continue with a null/invalid fence. The catch rolls back (zero writes).
+        leaseGeneration = Number(acq.generation);
+        if (!validGen(leaseGeneration)) {
+          throw new Error("CONTROL_LEASE_NO_GENERATION: acquire did not return a valid fencing generation (" + S(acq && acq.generation) + ") -- refusing " + mode + " (zero writes).");
+        }
+      } else {
+        // rollback / safe-close: NEVER close another owner's controls. Only the current owner AT THE EXPECTED
+        // GENERATION may safe-close (and it then releases). A non-owner OR a SUPERSEDED generation is a TYPED
+        // NON-SUCCESS skip -- not a global close, not a release of the newer lease.
+        // Round-11/12 P0-B ATOMICITY (mandatory, NO fallback): verify ownership UNDER A HELD LOCK.
+        // lockAndVerifyControlLease takes the control-plane advisory lock + a FOR UPDATE row lock, held for THIS
+        // transaction through the safe-close writes + release + commit, and checks the EXACT owner + generation +
+        // unexpired (post-lock wall clock) so a takeover cannot occur between verification and safe-close. The
+        // COMPLETE-interface guard above guarantees this method exists on any lease-capable store -- there is no
+        // non-locking assert fallback (which could see a lease that expired during the lock wait as still held).
+        if ((await store.lockAndVerifyControlLease(owner, ownerGeneration)) !== true) {
+          phase = "commit";
+          await store.commit();
+          return { committed: false, mode, code: 0, skipped: "lease-not-owner", leaseNotOwner: true, problems: [] };
+        }
+      }
+    }
+
     // ---- PRE assertions (both modes) ----
     if ((await store.readAllPrimary()) !== false) throw new Error("PRE: all_primary must be false");
     if ((await store.hasCron()) === true) throw new Error("PRE: a scheduler cron exists");
@@ -229,10 +295,24 @@ export async function runControlPackageTransaction({ store, pkg, mode, controlle
     if ((await store.hasCron()) === true) throw new Error("POST: a scheduler cron appeared");
     if (problems.length) throw new Error("POST: " + problems.join("; "));
 
+    // ---- LEASE RELEASE (blocker 1 + Round-9 P1-C + Round-11 P0-B): a successful safe-close (rollback OR reclaim)
+    //      RELEASES the lease in the SAME transaction, checking BOTH owner_token AND generation. A rollback
+    //      releases the CALLER'S fence generation; a reclaim releases the generation IT just acquired. Round-11
+    //      P0-B item 5: the release result is CHECKED -- ONLY disposition='released' may commit; a not-owner /
+    //      generation-superseded / invalid-generation / any unexpected result THROWS here (phase is still
+    //      pre-commit), so the WHOLE control transaction rolls back every safe-close write and reports non-success
+    //      (never committed:true when the release failed).
+    if (leaseCapable && isClose) {
+      const rel = await store.releaseControlLease(owner, mode === "reclaim" ? leaseGeneration : ownerGeneration);
+      if (!rel || rel.disposition !== "released") {
+        throw new Error("CONTROL_LEASE_RELEASE_FAILED: release returned '" + S(rel && (rel.disposition || rel.reason)) + "' (not 'released') -- rolling back every safe-close write (the lease was taken over / superseded).");
+      }
+    }
+
     // ---- COMMIT: once ATTEMPTED, a lost/failed ack is COMMIT_UNKNOWN (never rollback, never retry) ----
     phase = "commit";
     await store.commit();
-    return { committed: true, mode, code: 0, problems: [] };
+    return { committed: true, mode, code: 0, problems: [], ...(leaseCapable && mode === "apply" ? { ownerToken: owner, leaseGeneration } : {}) };
   } catch (e) {
     const msg = (e && e.message) || String(e);
     if (phase === "commit") {
@@ -258,15 +338,15 @@ export async function runControlPackageTransaction({ store, pkg, mode, controlle
  * NEVER calls discoverAccounts (it works even if DataDoe is down -- zero DataDoe calls, no account list).
  * "dry-run" returns the plan with no writes. Returns the transaction result (or { dryRun:true, pkg }).
  */
-export async function runControlPackageCli({ mode, operator, discoverAccounts, connectStore, controlledReportKeys = CONTROLLED_REPORT_KEYS, buildApplyPackage = buildPriorityControlPackage, log = () => {} } = {}) {
-  if (mode !== "apply" && mode !== "rollback" && mode !== "dry-run") throw new Error("runControlPackageCli mode must be apply|rollback|dry-run (fail closed).");
+export async function runControlPackageCli({ mode, operator, discoverAccounts, connectStore, controlledReportKeys = CONTROLLED_REPORT_KEYS, buildApplyPackage = buildPriorityControlPackage, ownerToken = "", ownerGeneration = null, operationKey = "", leaseTtlSeconds = 900, log = () => {} } = {}) {
+  if (mode !== "apply" && mode !== "rollback" && mode !== "dry-run" && mode !== "reclaim") throw new Error("runControlPackageCli mode must be apply|rollback|dry-run|reclaim (fail closed).");
   if (!isCanonicalOperator(operator)) throw new Error("runControlPackageCli requires a canonical operator id (fail closed).");
   let pkg;
-  if (mode === "rollback") {
+  if (mode === "rollback" || mode === "reclaim") {
     // DISCOVERY-INDEPENDENT: no DataDoe call, no account list -- the safe-close is global (it closes EVERY control,
     // so one shared safe-close correctly closes the priority OR the fba-plan apply -- there is only one thing open).
     pkg = buildPrioritySafeClosePackage({ operator, controlledReportKeys });
-    log("SAFE-CLOSE (--rollback): no DataDoe discovery required; disabling every priority control globally.");
+    log((mode === "reclaim" ? "RECLAIM (expired-lease cleanup): safe-close stale controls ONLY if no live owner." : "SAFE-CLOSE (--rollback)") + ": no DataDoe discovery required; disabling every priority control globally.");
   } else {
     if (typeof discoverAccounts !== "function") throw new Error("runControlPackageCli apply/dry-run requires discoverAccounts (fail closed).");
     const accounts = await discoverAccounts();
@@ -279,7 +359,7 @@ export async function runControlPackageCli({ mode, operator, discoverAccounts, c
   if (typeof connectStore !== "function") throw new Error("runControlPackageCli requires connectStore for a live apply/rollback (fail closed).");
   const store = await connectStore();
   try {
-    return await runControlPackageTransaction({ store, pkg, mode, controlledReportKeys });
+    return await runControlPackageTransaction({ store, pkg, mode, controlledReportKeys, ownerToken, ownerGeneration, operationKey, leaseTtlSeconds });
   } finally {
     if (store && typeof store.end === "function") { try { await store.end(); } catch { /* ignore */ } }
   }

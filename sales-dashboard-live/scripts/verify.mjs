@@ -56,6 +56,8 @@ const SUITES = [
   "test:fba-d1-guard",
   "test:account-onboarding",
   "test:account-onboarding-worker",
+  "test:account-onboarding-bootstrap",
+  "test:round11-publication-fence",
   "test:lhv3-cycle-bucket-migration",
   "test:report-materialization-registry",
   "test:report-materialization-operation",

@@ -241,8 +241,10 @@ test("D2. workflow shape: INDEPENDENT per-region ordered pipeline -- per-region 
     assert.match(before, /steps\.campaign\.outcome == 'success'/, step + " requires successful Campaign Ads");
     assert.match(before, /steps\.readiness\.outputs\.proceed == 'true'/, step + " requires strict D-1 readiness");
   }
-  // safe-close ALWAYS after any pipeline execution (all regions), gated only by the duplicate guard's run_required.
-  assert.match(yml, /if:\s*always\(\) && steps\.guard\.outputs\.run_required == 'true'\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS after a pipeline execution");
+  // Round-10 (blocker 4): safe-close runs after any pipeline execution, but ONLY when the matching --apply (full
+  // OR bootstrap) actually succeeded and emitted a valid fencing generation -- so it never runs with a
+  // blank/owner-only generation; an apply that never emitted a generation leaves cleanup to expiry/reclaim.
+  assert.match(yml, /if:\s*always\(\) && steps\.guard\.outputs\.run_required == 'true' && \(steps\.full_controls\.outputs\.generation != '' \|\| steps\.bootstrap_controls\.outputs\.generation != ''\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close after a pipeline execution, gated on a matching apply that emitted a valid generation");
   // date-scoped operation key uses the requestedAsOf (shared Catalog reservation across ALL regions on a date).
   assert.match(yml, /--operation-key=priority-dashboards\/scheduled\/\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "date-scoped (requestedAsOf) operation key");
   // FBA now runs as an ISOLATED, needs-gated job (independent failure boundary) -- NOT a step of the publish job.

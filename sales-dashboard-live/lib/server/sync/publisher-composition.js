@@ -19,6 +19,7 @@ import { fetchAccounts as fetchDataDoeAccounts } from "../datadoe.js";
 import {
   getReportSyncSettings, getSourcePromotedPublishSettings, getSchedulerAccountRollout, getSchedulerPublishApproval,
   getLatestSyncReportJob, getReportSnapshot, getReportSnapshotStoragePayload, publishLiveSnapshotIfNewer,
+  publishLiveSnapshotFencedIfNewer,
 } from "../supabase.js";
 
 /**
@@ -41,6 +42,15 @@ export function buildSchedulerV2Publisher(overrides = {}) {
     getSnapshot = getReportSnapshot,
     loadStoragePayload = getReportSnapshotStoragePayload,
     publishLive = publishLiveSnapshotIfNewer,
+    // Round-9/10 P0-A: buildSchedulerV2Publisher IS a Gate-7 publisher, so EVERY live write goes through the
+    // WRITE-BOUNDARY-FENCED CAS -- which enforces the exact {ownerToken, positive-integer generation, unexpired
+    // lease} inside the SAME DB transaction as the report_snapshots mutation and returns 'lease-lost' (zero rows)
+    // on mismatch. getControlFence is REQUIRED: with NO valid fence (missing provider, blank token, or an
+    // invalid/missing generation) EVERY publish returns 'lease-lost' and writes zero rows. The UNFENCED CAS is
+    // NEVER used here -- direct unfenced helpers exist only for genuinely unrelated writers (e.g. returns-leakage)
+    // that do NOT pass through this composition.
+    publishLiveFenced = publishLiveSnapshotFencedIfNewer,
+    getControlFence = null,
     // BUILD-TIME test seam only (like every override above): production callers pass nothing and get the
     // frozen production readiness set (post-Gate-7b: the 13 approved keys) -- the composed publish() surface
     // has no way to supply or widen this, and gates 2-4 (durable enable + approval) still gate every publish.
@@ -66,6 +76,16 @@ export function buildSchedulerV2Publisher(overrides = {}) {
     return discovery;
   };
 
+  // ALWAYS-FENCED write path (Round-10, property 5): EVERY live write fences the exact captured fence at the DB
+  // write boundary and FAILS CLOSED (lease-lost, zero rows) when there is no VALID live fence -- no getControlFence
+  // provider, a blank owner token, or a generation that is not a positive safe integer. The composition NEVER
+  // falls back to the unfenced CAS.
+  const validGen = (g) => Number.isSafeInteger(g) && g > 0;
+  const fencedPublishLive = async (args, opts) => {
+    const fence = typeof getControlFence === "function" ? getControlFence() : null;
+    if (!fence || !fence.ownerToken || !validGen(fence.generation)) return { outcome: "lease-lost", reason: "no-fence" };
+    return publishLiveFenced({ ...args, ownerToken: fence.ownerToken, generation: fence.generation }, opts);
+  };
   const deps = Object.freeze({
     codeReadyKeys,
     getReportSyncSettings: getSettings,
@@ -76,7 +96,7 @@ export function buildSchedulerV2Publisher(overrides = {}) {
     getLatestReportJob: (reportKey, accountId) => getJob(reportKey, accountId),
     getShadowSnapshot: (shadowKey, accountId, paramsHash) => getSnapshot({ reportKey: shadowKey, accountId, paramsHash }),
     loadStoragePayload,
-    publishLive,
+    publishLive: fencedPublishLive,
   });
 
   return Object.freeze({

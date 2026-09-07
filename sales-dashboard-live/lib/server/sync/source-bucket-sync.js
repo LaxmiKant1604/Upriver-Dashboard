@@ -369,6 +369,11 @@ export async function runBucketSourceSync({
   store, dataDoe,
   replaceHistoryWindow = null, persistSnapshot = null, updateRunStatus = null, recordCompleteness = null,
   cycleDate, scheduledAt = null, trigger = "manual",
+  // OPTIONAL cycle-bucket NAMESPACE (defaults to `bucket`, so the scheduler-v2 daily path is byte-identical).
+  // A dedicated operator (FBA Plan; the bootstrap publication) passes e.g. "bootstrap-india" so ITS
+  // sync_cycles row never collides with the scheduler-v2 daily (bucket, cycle_date) cycle. ONLY the cycle
+  // key is namespaced; account scope + every source request identity stays the real `bucket`.
+  cycleBucket = null,
   clock = () => Date.now(), wait = null, cooldownMs = 60_000,
   // Finding 3: the serverless execution budget. deadlineMs/reserveMs thread into every runSourceJobs pass
   // AND gate the family loop itself, so one bounded invocation stops with a RESUMABLE typed rollup
@@ -407,9 +412,10 @@ export async function runBucketSourceSync({
   // -- every write in this run (the frozen budget persist AND the source jobs) MUST target THAT cycle, so the budget
   // and the create-reservation share one cycle_id. Resolved to null when no active head exists (a fresh BASE cycle is
   // opened on the first write). A missing getCycleByBucketDate capability (test doubles) keeps the old base path.
+  const cycleKeyBucket = cycleBucket || bucket;
   let activeCycleId = null;
   if (typeof store.getCycleByBucketDate === "function") {
-    try { const h = await store.getCycleByBucketDate(bucket, cycleDate); if (h && h.id && ["running", "pending"].includes(String(h.status))) activeCycleId = h.id; } catch (_e) { activeCycleId = null; }
+    try { const h = await store.getCycleByBucketDate(cycleKeyBucket, cycleDate); if (h && h.id && ["running", "pending"].includes(String(h.status))) activeCycleId = h.id; } catch (_e) { activeCycleId = null; }
   }
 
   const rollup = {
@@ -453,7 +459,7 @@ export async function runBucketSourceSync({
         isPremiumOf: registryIsPremiumOf, trancheKey: `source-sync:${family.sourceKey}`,
       });
       if (frozen.maxCreates > 0) {
-        const cycleId = activeCycleId || await store.openCycle({ bucket, cycleDate, scheduledAt, trigger });
+        const cycleId = activeCycleId || await store.openCycle({ bucket: cycleKeyBucket, cycleDate, scheduledAt, trigger });
         rollup.cycleId = rollup.cycleId || cycleId;
         const ack = await store.persistBudget({
           cycleId, trancheKey: frozen.trancheKey, planFingerprint: frozen.planFingerprint,
@@ -474,7 +480,7 @@ export async function runBucketSourceSync({
     while (continuations < maxContinuationsPerFamily) {
       const res = await runSourceJobs({
         store, dataDoe, plannedJobs: allPlannedJobs, ownerIds,
-        bucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs,
+        bucket, cycleBucket, cycleDate, scheduledAt, trigger, clock, deadlineMs, reserveMs,
         sourceTranche: tranche, reuseOnly, budget, forceFreshOli, cycleId: activeCycleId,
       });
       continuations += 1;

@@ -668,14 +668,16 @@ test("C1. default AND explicit planning include buy-box-loss; the plan holds exa
   const ordered = bb.sources.filter((s) => s.requestKey === "buy-box-loss:oli-sales");
   assert.deepEqual(ordered.map((s) => `${s.from}..${s.to}`), OLI_SLICES.map((s) => `${s.from}..${s.to}`), "six canonicalOliSlices ordered OLI slice windows");
   const inv = bb.sources.find((s) => s.requestKey === "buy-box-loss:inventory");
-  assert.deepEqual([inv.from, inv.to], [INV_FROM, INV_FROM], "inventory window is the exact single day asOf-1..asOf-1");
+  // The PLANNER models the SCHEDULED path where asOf is ALREADY D-1: its explicit inventoryAsOf
+  // defaults to asOf itself (a scheduled plan must NEVER resolve asOf-1 = D-2).
+  assert.deepEqual([inv.from, inv.to], [ASOF, ASOF], "planned inventory window is the exact single day asOf..asOf (scheduled asOf IS D-1)");
   const cat = bb.sources.find((s) => s.requestKey === "buy-box-loss:catalog");
   assert.deepEqual([cat.from, cat.to], [null, null], "no-date catalog");
   // Report dependency map = all twelve canonical hashes; context carries the raw seller id + asOf.
   const rj = plan.reportJobs.find((j) => j.reportKey === "buy-box-loss");
   assert.equal(rj.dependsOn.length, 12, "report depends on all twelve canonical sources");
   assert.deepEqual([...rj.dependsOn].sort(), plan.sourceJobs.map((j) => j.requestHash).sort(), "report deps == the twelve canonical hashes");
-  assert.deepEqual(bb.context, { to: ASOF, rawSellerId: ID }, "context carries asOf + raw seller id");
+  assert.deepEqual(bb.context, { to: ASOF, inventoryAsOf: ASOF, rawSellerId: ID }, "context carries asOf + the explicit inventory snapshot day + raw seller id");
   // Owner metadata: every planned source job is owned by the buy-box-loss owner, recomputed + validated.
   const jobs = resolveFromPlan(plan)().sourceJobs;
   assert.equal(jobs.length, 12);

@@ -197,7 +197,13 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
         // The reviewed fba-plan RELEASE SEAM wires runtime/publisher/controls/read-back/ownership (the route
         // never touches the publisher composition, the CAS primitive, or the control internals itself).
         const { buildFbaPlanRelease } = await import("../../lib/server/sync/fba-plan-release-composition.js");
-        const release = buildFbaPlanRelease({ operator });
+        // Round-8 blocker 2: a CRYPTOGRAPHICALLY-UNIQUE token PER HTTP EXECUTION (never derived from
+        // operator/bucket). Each bounded slice fully applies -> publishes -> safe-closes -> RELEASES the lease,
+        // so successive polls each re-acquire cleanly; two concurrent same-admin+bucket requests get DIFFERENT
+        // tokens and contend -- one wins, the other defers WITHOUT altering the winner's controls.
+        const { randomUUID } = await import("node:crypto");
+        const controlOwnerToken = "route-fba:" + bucket + ":" + randomUUID();
+        const release = buildFbaPlanRelease({ operator, ownerToken: controlOwnerToken, controlOperationKey: "route-fba/" + bucket });
         try {
           // Respect an explicit source pause (parity with the OLI path): an admin who paused this FBA source must
           // not have it synced. Fail closed on an unreadable control table (never a silent create).
@@ -230,8 +236,15 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
             bucket, asOf: scope.asOf, inventoryAsOf, includedIds, bucketAccounts, cost, maxTokens,
             runtime: release.runtime, publisher: release.publisher, controls: release.controls,
             readbackLive: release.readbackLive, ownershipBackfill: release.ownershipBackfill,
+            verifyLease: release.verifyLease,
             trigger: "vercel", deadlineMs: fbaDeadline.deadlineMs, reserveMs: fbaDeadline.reserveMs, outOfTime: fbaDeadline.outOfTime,
           });
+          // P1-D: a lost control-lease fence (write-boundary or heartbeat) is a TYPED RETRYABLE 409, never a
+          // generic 500 or a silent continuation.
+          if (result.leaseLost === true || result.phase === "contention") {
+            res.status(409).json({ operation: { phase: "contention", ok: false, retryable: true, status: "CONTROL_LEASE_LOST", problems: result.problems || [] }, result: { fbaPlan: { operationId: result.operationId } }, status: await boundedStatusFn(fbaDeadline) });
+            return;
+          }
           const operation = result.phase === "complete" && result.ok === true
             ? { phase: "complete", ok: true, published: result.published, readback: result.readback, accounts: result.accounts, batches: result.batches, creates: result.creates, tokens: result.tokens, blocked: result.blocked }
             : result.continuationRequired === true
@@ -243,7 +256,14 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
           // Safety net: the core ALWAYS safe-closes in its own finally, but a throw before/around a pass could
           // leave gates open -- close them explicitly (idempotent) through the same release seam before surfacing.
           try { await release.controls.close(); } catch { /* the original error is surfaced below */ }
-          res.status(error?.status || 500).json({ operation: { phase: "sync", ok: false, problems: [String(error?.message || "fba sync failed")] } });
+          // P1-D: a control-lease HELD/LOST is a TYPED RETRYABLE contention (423 Locked -- another operation owns
+          // the global control plane), never a generic 500. The client retries; nothing was overwritten.
+          const msg = String(error?.message || "fba sync failed");
+          if (/CONTROL_LEASE_HELD|CONTROL_LEASE_LOST/.test(msg)) {
+            res.status(423).json({ operation: { phase: "contention", ok: false, retryable: true, status: "CONTROL_LEASE_HELD", problems: [msg] } });
+            return;
+          }
+          res.status(error?.status || 500).json({ operation: { phase: "sync", ok: false, problems: [msg] } });
           return;
         }
       }
@@ -336,7 +356,16 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
           const { CONTROLLED_REPORT_KEYS } = await import("../../lib/server/sync/report-controls.js");
           const { connectPriorityControlStore, discoverPrimaryAccountIds } = await import("../../lib/server/sync/priority-control-pg-store.js");
           const sbMod = await import("../../lib/server/supabase.js");
-          const release = buildPriorityDashboardsRelease({ budgetMs: remainingMs(), asOfOverride: request.asOf, operationKey: request.operationKey });
+          const operator = access.userId ? "admin:" + String(access.userId) : "admin:data-sync-center";
+          // Round-8 blocker 2: a CRYPTOGRAPHICALLY-UNIQUE token per HTTP execution (never derived from
+          // operator/bucket). Each release slice applies -> publishes -> safe-closes -> releases, so two
+          // concurrent same-admin+bucket requests get different tokens and one defers without altering the other.
+          const { randomUUID: randomPriorityToken } = await import("node:crypto");
+          const priorityOwnerToken = "route-priority:" + bucket + ":" + randomPriorityToken();
+          // Round-9 P0-A/P0-B: the fence captured at controls.apply. getControlFence makes the release's publisher
+          // control-enabled, so EVERY priority report write fences this exact fence inside the report_snapshots CAS.
+          let priorityFence = null;
+          const release = buildPriorityDashboardsRelease({ budgetMs: remainingMs(), asOfOverride: request.asOf, operationKey: request.operationKey, getControlFence: () => priorityFence });
           const readbackLive = buildLiveReadback({
             getReportSnapshot: sbMod.getReportSnapshot,
             loadStoragePayload: sbMod.getReportSnapshotStoragePayload,
@@ -344,18 +373,39 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
             reportDerivations: REPORT_DERIVATIONS,
             computeHash: paramsHashFor,
           });
-          const operator = access.userId ? "admin:" + String(access.userId) : "admin:data-sync-center";
           const controls = {
             apply: async () => {
-              const r = await runControlPackageCli({ mode: "apply", operator, discoverAccounts: discoverPrimaryAccountIds, connectStore: connectPriorityControlStore, controlledReportKeys: CONTROLLED_REPORT_KEYS });
-              if (!r || r.committed !== true) throw new Error("controls apply did not commit");
+              const r = await runControlPackageCli({ mode: "apply", operator, discoverAccounts: discoverPrimaryAccountIds, connectStore: connectPriorityControlStore, controlledReportKeys: CONTROLLED_REPORT_KEYS, ownerToken: priorityOwnerToken, operationKey: "route-priority/" + bucket });
+              if (!r || r.committed !== true) throw new Error("controls apply did not commit" + (r && r.problem ? ": " + r.problem : ""));
+              // Round-10 (blocker 6): require a VALID fencing generation IMMEDIATELY -- never continue with a null fence.
+              const g = Number(r.leaseGeneration);
+              if (!(Number.isSafeInteger(g) && g > 0)) throw new Error("CONTROL_LEASE_NO_GENERATION: controls apply returned no valid fencing generation -- refusing to publish (fail closed).");
+              priorityFence = { ownerToken: priorityOwnerToken, generation: g };
             },
             close: async () => {
-              const r = await runControlPackageCli({ mode: "rollback", operator, connectStore: connectPriorityControlStore, controlledReportKeys: CONTROLLED_REPORT_KEYS });
+              const r = await runControlPackageCli({ mode: "rollback", operator, connectStore: connectPriorityControlStore, controlledReportKeys: CONTROLLED_REPORT_KEYS, ownerToken: priorityOwnerToken, ownerGeneration: priorityFence ? priorityFence.generation : null, operationKey: "route-priority/" + bucket });
+              if (r && r.skipped === "lease-not-owner") { priorityFence = null; return; } // lost the lease: closes nothing (correct no-op)
               if (!r || r.committed !== true) throw new Error("SAFE-CLOSE did not commit -- verify controls");
+              priorityFence = null;
             },
           };
-          const rel = await runReleaseSlice({ bucket, release, controls, readbackLive, outOfTime: deadline.outOfTime });
+          let rel;
+          try {
+            rel = await runReleaseSlice({ bucket, release, controls, readbackLive, outOfTime: deadline.outOfTime });
+          } catch (relErr) {
+            // P1-D: apply could not acquire the global lease (another operation owns it) -> TYPED RETRYABLE 423.
+            const rm = String(relErr?.message || "release slice failed");
+            if (/CONTROL_LEASE_HELD|CONTROL_LEASE_LOST/.test(rm)) {
+              res.status(423).json({ operation: { phase: "contention", ok: false, retryable: true, status: "CONTROL_LEASE_HELD", problems: [rm] }, result, status: await boundedStatusFn(deadline) });
+              return;
+            }
+            throw relErr;
+          }
+          // P1-D: control-lease contention (fence lost mid-publish) is a TYPED RETRYABLE 409, never a generic 500.
+          if (rel.leaseLost === true || rel.status === "CONTROL_LEASE_LOST") {
+            res.status(409).json({ operation: { phase: "contention", ok: false, retryable: true, status: "CONTROL_LEASE_LOST", problems: rel.problems || [] }, result, status: await boundedStatusFn(deadline) });
+            return;
+          }
           operation = rel.phase === "complete" && rel.ok === true
             ? { phase: "complete", ok: true, published: rel.published, readback: rel.readback }
             : rel.continuationRequired === true

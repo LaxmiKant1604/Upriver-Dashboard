@@ -200,7 +200,8 @@ async function main() {
     assert.match(cli, /D1_FINAL/, "a fully-itemized D-1 success summary");
     assert.match(cli, /DATADOE_D1_NOT_READY/, "a distinct lagged/gapped-LKG summary still exists for interior gaps");
     assert.match(cli, /requireD1:\s*true/, "the CLI still gates the NON-defect accounts strictly on the D-1 window");
-    assert.match(yml, /if:\s*always\(\) && steps\.guard\.outputs\.run_required == 'true'\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS for a pipeline execution");
+    // Round-10 (blocker 4): safe-close runs when a matching --apply emitted a valid fencing generation (never blank).
+    assert.match(yml, /if:\s*always\(\) && steps\.guard\.outputs\.run_required == 'true' && \(steps\.full_controls\.outputs\.generation != '' \|\| steps\.bootstrap_controls\.outputs\.generation != ''\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close when a matching apply emitted a generation");
   });
 
   test("14. schedules: the three regional primaries; each cron deterministically maps to one region; SHA/event/cron in the summary", () => {

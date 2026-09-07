@@ -90,5 +90,43 @@ export async function connectPriorityControlStore() {
     dispatchRows: async () => (await q("select report_key, schedule_enabled from public.report_sync_settings")).rows,
     promotedRows: async () => (await q("select report_key, publish_enabled from public.source_promoted_publish_settings")).rows,
     approvalRows: async () => (await q("select report_key, account_id, approved from public.scheduler_publish_approvals")).rows,
+    // Round-7 blocker 1: the DB-backed control-plane owner lease. Called INSIDE the control transaction (after
+    // begin()), so each acquire/release is committed/rolled-back atomically WITH the apply/safe-close it guards.
+    // acquire => CAS acquire/renew (returns the fencing generation); release => release only if owner; assert =>
+    // is-owner; renew (Round-8 blocker 1) => heartbeat that extends the lease ONLY if the caller still holds the
+    // EXACT captured fence (owner_token + generation) and it is unexpired, else 'lost'.
+    acquireControlLease: async (ownerToken, operationKey, ttlSeconds) =>
+      (await q("select public.acquire_control_plane_lease($1, $2, $3::int) as r", [ownerToken, operationKey || "", Number(ttlSeconds) || 900])).rows[0].r,
+    // Round-10: the generation is MANDATORY -- a positive safe integer. renew/release/assert REJECT an
+    // invalid generation (NULL/undefined/zero/negative/fractional/NaN/string) BEFORE any SQL, so a stale/missing
+    // generation can never renew, release, or be asserted as owner (zero SQL side effects).
+    renewControlLease: async (ownerToken, generation, ttlSeconds) => {
+      if (!(Number.isSafeInteger(generation) && generation > 0)) return { disposition: "lost", reason: "invalid-generation" };
+      return (await q("select public.renew_control_plane_lease($1, $2::bigint, $3::int) as r", [ownerToken, Number(generation), Number(ttlSeconds) || 900])).rows[0].r;
+    },
+    releaseControlLease: async (ownerToken, generation) => {
+      if (!(Number.isSafeInteger(generation) && generation > 0)) return { disposition: "not-owner", reason: "invalid-generation" };
+      return (await q("select public.release_control_plane_lease($1, $2::bigint) as r", [ownerToken, Number(generation)])).rows[0].r;
+    },
+    assertControlLeaseOwner: async (ownerToken, generation) => {
+      if (!(Number.isSafeInteger(generation) && generation > 0)) return false; // a missing/invalid generation is NEVER the owner
+      const r = (await q("select public.read_control_plane_lease() as r")).rows[0].r;
+      return !!r && r.held === true && String(r.owner_token) === String(ownerToken) && Number(r.generation) === Number(generation);
+    },
+    // Round-11 P0-B: ATOMIC ownership verification for the safe-close. Takes the control-plane advisory lock AND
+    // a FOR UPDATE row lock on control_plane_lease IN THE CURRENT TRANSACTION, then verifies exact owner_token +
+    // generation + unexpired lease UNDER those locks. Both locks are held until the transaction COMMITs/ROLLBACKs,
+    // so no acquire/renew/release/reclaim can take over between this verification and the safe-close writes +
+    // release + commit (a concurrent lease op blocks on the SAME advisory lock / row lock). Returns true/false.
+    lockAndVerifyControlLease: async (ownerToken, generation) => {
+      if (!(Number.isSafeInteger(generation) && generation > 0)) return false;
+      await q("select pg_advisory_xact_lock(hashtext('control-plane-lease'))");
+      // STALE-CLOCK FIX: `held` is computed against clock_timestamp() (the true WALL clock at the moment the row
+      // lock is granted), NOT now()/transaction_timestamp() (fixed at BEGIN). The FOR UPDATE can block behind a
+      // concurrent lease op; if the lease expired WHILE we waited, `held` is false and the safe-close refuses.
+      const r = await q("select owner_token, generation, (expires_at is not null and expires_at > clock_timestamp()) as held from public.control_plane_lease where id = 1 for update");
+      const row = r.rows[0];
+      return !!row && row.held === true && String(row.owner_token) === String(ownerToken) && Number(row.generation) === Number(generation);
+    },
   };
 }

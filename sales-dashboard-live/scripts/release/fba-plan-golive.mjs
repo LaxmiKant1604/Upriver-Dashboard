@@ -65,14 +65,61 @@ if (inventoryAsOfArg != null) {
   const ok = /^\d{4}-\d{2}-\d{2}$/.test(inventoryAsOfArg) && new Date(`${inventoryAsOfArg}T00:00:00Z`).toISOString().slice(0, 10) === inventoryAsOfArg;
   if (!ok) { console.error("STOP --inventory-as-of must be a real YYYY-MM-DD calendar date"); process.exit(2); }
 }
-const inventoryAsOf = inventoryAsOfArg || fbaInventoryAsOf();
+let inventoryAsOf = inventoryAsOfArg || fbaInventoryAsOf();
+// --account-scope: 'full' (default) | 'bootstrap' (ONLY the accounts the dispatch WAVE authorized,
+// resolved from the IMMUTABLE (region, --dispatch-id) row -- never workflow inputs -- and gated by the
+// ENFORCED wave budget before any create). inventoryAsOf is PINNED from the approved plan in bootstrap mode.
+const accountScope = argOf("account-scope") || "full";
+const dispatchId = argOf("dispatch-id");
+if (accountScope !== "full" && accountScope !== "bootstrap") { console.error("STOP --account-scope must be full | bootstrap"); process.exit(2); }
+if (accountScope === "bootstrap" && (!regionArg || regionArg === "all")) { console.error("STOP --account-scope=bootstrap requires ONE explicit --region"); process.exit(2); }
+if (accountScope === "bootstrap" && !dispatchId) { console.error("STOP --account-scope=bootstrap requires --dispatch-id (the immutable wave identity)"); process.exit(2); }
 const OPERATOR = process.env.PRIORITY_OPERATOR || "laxmikant@superboring.in";
-const release = buildFbaPlanRelease({ operator: OPERATOR });
+// Round-7 blocker 1+2: the control-plane owner-lease token AND the publication-manifest run token. In the
+// workflow this is github run_id-run_attempt (the SAME token as the priority --apply/--rollback steps + the
+// dispatch's active_run_token), so the FBA operation serializes on the global control-plane lease with the
+// priority publication and its manifest rows bind to the active attempt. A manual CLI run gets a
+// process-stable token (unique per run) so the lease still serializes it against concurrent operations.
+const runToken = (argOf("run-token") || "").trim() || ("fba-golive/" + (scopeLabel || "all") + "/" + process.pid + "-" + Date.now());
+const { resolveBootstrapScopeByDispatch, gateOnboardingBudget, recordOnboardingActualSpend, findApprovedStepEntry, bootstrapStepRef, assertBootstrapStepPlan, fbaPlanStructure } = await import("../../lib/server/sync/account-onboarding-bootstrap.js");
+const { bootstrapFbaCycleBucket, dispatchMembershipHash } = await import("../../lib/server/sync/account-onboarding.js");
+const { getDataDoeConnections } = await import("../../lib/server/datadoe-connections.js");
 
-// ---------------- Stage 0: discover primaries + their authoritative directory metadata (ZERO DataDoe) --------
-const accounts = await release.loadAccounts();
+// ---------------- Stage 0: BOOTSTRAP -- resolve the FROZEN wave scope BEFORE building the release, so the
+// whole FBA release (runtime rollout, control discovery, source planning, fetching, deriving, publishing,
+// readback, ownership) is constrained to EXACTLY frozenAccountIds via accountScopeIds. inventoryAsOf +
+// the wave-bound FBA cycle are pinned here too.
+let accounts;
+let bootstrapScope = null;   // resolveBootstrapScopeByDispatch result (bootstrap mode only)
+let bootstrapEntry = null;   // approved plan entry for (fba, region)
+let bootstrapCycleBucket = null; // the WAVE-BOUND FBA cycle bucket (bootstrap-fba-<region>-<hash16>)
+let release;
+if (accountScope === "bootstrap") {
+  const primaryConn = getDataDoeConnections().find((c) => c.id === "primary");
+  bootstrapScope = await resolveBootstrapScopeByDispatch({ apiKey: primaryConn.apiKey, region: regionArg, dispatchId });
+  if (!bootstrapScope.ok) { console.error("STOP BOOTSTRAP_SCOPE_UNRESOLVED (" + bootstrapScope.reason + ") for " + regionArg + "/" + dispatchId + " -- ZERO exports (fail closed)."); process.exit(1); }
+  bootstrapEntry = findApprovedStepEntry(bootstrapScope.approvedPlan, "fba", regionArg);
+  if (!bootstrapEntry) { console.error("STOP BOOTSTRAP_STEP_NOT_APPROVED: no approved 'fba' plan entry for " + regionArg + " (fail closed)."); process.exit(1); }
+  // DEFER THE ENTIRE WAVE if any frozen account is not currently DataDoe-ready (never a ready subset).
+  if (!bootstrapScope.allReady) {
+    log("BOOTSTRAP_WAVE_DEFERRED: " + bootstrapScope.deferred.length + " of " + bootstrapScope.frozenAccountIds.length + " frozen account(s) not DataDoe-ready -- ENTIRE wave deferred (ZERO creates).");
+    process.exit(0);
+  }
+  inventoryAsOf = String(bootstrapEntry.inventoryAsOf || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(inventoryAsOf)) { console.error("STOP BOOTSTRAP_BAD_PIN: approved fba inventoryAsOf is not a date (" + inventoryAsOf + ")"); process.exit(1); }
+  bootstrapCycleBucket = bootstrapFbaCycleBucket(regionArg, dispatchMembershipHash(dispatchId));
+  // BUILD the release SCOPED to exactly the frozen accounts (blocker 1): the runtime rollout override +
+  // control discovery + ownership are constrained here, so no outside-wave account is fetched/derived/
+  // published/controlled.
+  release = buildFbaPlanRelease({ operator: OPERATOR, accountScopeIds: bootstrapScope.frozenAccountIds, ownerToken: runToken, controlOperationKey: "fba-plan/bootstrap/" + regionArg + "/" + dispatchId.slice(-8) });
+  accounts = bootstrapScope.accounts.map((a) => ({ accountId: String(a.id), country: String(a.country || ""), currency: a.currency || null, name: a.name || null }));
+  if (!accounts.length) { log("BOOTSTRAP_SCOPE_EMPTY: no ready bootstrap accounts in " + regionArg + " (deferred " + bootstrapScope.deferred.length + ") -- ZERO creates, ZERO tokens."); process.exit(0); }
+} else {
+  release = buildFbaPlanRelease({ operator: OPERATOR, ownerToken: runToken, controlOperationKey: "fba-plan/" + (scopeLabel || "all") });
+  accounts = await release.loadAccounts();
+}
 if (!accounts.length) { console.error("STOP no primary accounts with directory metadata discovered."); process.exit(1); }
-log("discovered " + accounts.length + " primary accounts with metadata");
+log("discovered " + accounts.length + " primary accounts with metadata" + (accountScope === "bootstrap" ? " (bootstrap scope)" : ""));
 
 // ---------------- Stage 1: resolve the coverage-maximizing go-live as-of (SHARED core) ----------------
 log("inventory requested through " + inventoryAsOf + "; sales coverage resolved independently per region");
@@ -84,6 +131,12 @@ for (const bucket of selectedScopes) {
   const bucketAccounts = fbaBucketAccounts(accounts, bucket);
   if (!bucketAccounts.length) continue;
   const scope = await resolveFbaPlanScope({ accounts: bucketAccounts, connections: release.connections, asOfArg, maxBlocked, ceiling: CEILING, readers: release.scopeReaders });
+  if (!scope.asOf && accountScope === "bootstrap") {
+    // A claimed account whose OLI bootstrap has not landed yet has no coverage: a GREEN typed skip
+    // (zero creates; the lease backoff / next natural run retries once OLI coverage exists).
+    log("BOOTSTRAP_FBA_WAITING_FOR_OLI: no durable sales coverage yet for the bootstrap accounts -- ZERO creates; retry after the OLI bootstrap lands.");
+    process.exit(0);
+  }
   if (!scope.asOf) { console.error("STOP " + bucket + " has no durable sales coverage; inventory export not started."); process.exit(1); }
   // Adaptive self-heal: proactively route proven-overflow sellers (recent terminal TRUNCATED inventory evidence) into
   // single-seller inventory jobs so a persistently-oversized batch does not waste one failed export every cycle. Empty
@@ -106,8 +159,47 @@ if (mode === "dry-run") { log("DRY-RUN complete: ZERO creates, ZERO control chan
 // ---------------- go-live: HARD total token gate BEFORE any create / control change ----------------
 if (totalTokens > maxTokens) { console.error("STOP the plan costs " + totalTokens + " tokens > the " + maxTokens + "-token ceiling; refusing to start (zero creates, zero control changes)."); process.exit(1); }
 
+// BOOTSTRAP BUDGET GATE (before ANY create/control change): reserve this attempt's adoption-aware
+// planned cost against the durable WAVE budget, bound to the wave key + account-set hash + approved plan
+// fingerprint + the approved STEP PLAN HASH (pins inventoryAsOf/source). The ref is DATE-FREE so a retry
+// REUSES the ONE reservation (cumulative actuals capped by the approved ceiling). Refusal stops cold.
+let fbaBudgetRef = null;
+if (accountScope === "bootstrap") {
+  // RECOMPUTE the fba step plan hash from the EXACT DEFAULT (no-overflow) runtime FBA plan STRUCTURE
+  // (frozen sellers, marketplace pairs, default <=5 batches, request hashes, source keys, row limits,
+  // inventoryAsOf) + the reviewed adaptiveSplitAllowed envelope, and REQUIRE it to equal the approved
+  // hash -- NEVER echo. A modified seller/pair/batch/request/limit/date is drift; a legitimate overflow
+  // split at execution is not. (The default plan is deterministic; the sales asOf never enters it.)
+  const bootBucket = selectedScopes[0];
+  const bp = bucketPlan.get(bootBucket);
+  const { plan: defaultFbaPlan } = await planFbaBucketCost({ bucketAccounts: bp.bucketAccounts, connections: release.connections, asOf: bp.scope.asOf, inventoryAsOf, getSourceExportCache: release.getSourceExportCache, overflowSellers: new Set() });
+  const structure = fbaPlanStructure(defaultFbaPlan, inventoryAsOf);
+  const chk = assertBootstrapStepPlan(bootstrapEntry, {
+    step: "fba", region: regionArg, accounts: bootstrapScope.frozenAccountIds, operationIds: bootstrapScope.operationIds,
+    accountSetHash: bootstrapScope.accountSetHash, inventoryAsOf,
+    sourceKeys: ["fba-inventory-health"], windows: [{ sourceKey: "fba-inventory-health", from: inventoryAsOf, to: inventoryAsOf }],
+    structure,
+  });
+  if (!chk.ok) { console.error("STOP BOOTSTRAP_STEP_PLAN_DRIFT (" + chk.reason + "): the runtime FBA plan structure does not match the approved stepPlanHash -- ZERO creates (fail closed before any reservation/POST)."); process.exit(1); }
+  fbaBudgetRef = bootstrapStepRef({ step: "fba", region: regionArg, stepPlanHash: chk.stepPlanHash });
+  const gate = await gateOnboardingBudget({
+    waveKey: bootstrapScope.waveKey, ref: fbaBudgetRef, stepType: "fba", region: regionArg,
+    accountSetHash: bootstrapScope.accountSetHash, stepPlanHash: chk.stepPlanHash,
+    plannedTokens: totalTokens, plannedCreates: totalCreates,
+  });
+  if (!gate.ok) {
+    console.error("STOP ONBOARDING_BUDGET_REFUSED (" + gate.refusal + (gate.detail ? "/" + gate.detail : "") + "): planned " + totalTokens + " token(s) for " + fbaBudgetRef + " (wave " + bootstrapScope.waveKey + ") -- ZERO creates issued (fail closed before any POST).");
+    process.exit(1);
+  }
+  log("onboarding budget " + gate.disposition + " for " + fbaBudgetRef + ": planned " + totalTokens + " token(s) (reserved " + gate.reservedTokens + "/" + gate.authorizedTokens + "); deferred " + bootstrapScope.deferred.length + " not-ready account(s)");
+}
+
 // ---------------- go-live: run each SELECTED bucket to completion via the SHARED bounded pass ----------------
 let anyPublished = 0; let anyFailure = false;
+// Per-wave fba-plan publication identities (blocker 2): the EXACT live identity + the ACTUAL durable cycle id
+// + operation identity this operation produced. There is NO "source-incapable" evidence (blocker 3): an
+// empty-inventory account still PUBLISHES (inventoryAvailable:false) and earns a manifest identity here.
+const waveFbaPublished = []; // [{ accountId, liveReportKey, paramsHash, cycleId, operationId }]
 try {
   for (const bucket of selectedScopes) {
     if (!bucketPlan.has(bucket)) continue;
@@ -124,8 +216,13 @@ try {
         bucket, asOf, inventoryAsOf, includedIds, bucketAccounts, cost, maxTokens,
         runtime: release.runtime, publisher: release.publisher, controls: release.controls,
         readbackLive: release.readbackLive, ownershipBackfill: release.ownershipBackfill,
+        verifyLease: release.verifyLease,
         trigger: "github", deadlineMs: Infinity, reserveMs: 0, outOfTime: () => false,
         overflowSellers,
+        // BOOTSTRAP: a WAVE-BOUND FBA cycle (no collision with a terminal natural <region>-fba cycle) +
+        // STRICT per-account honesty (any failed included account makes the whole result partial, so the
+        // wave stays incomplete/retryable and never falsely completes).
+        ...(accountScope === "bootstrap" ? { cycleBucketOverride: bootstrapCycleBucket, strict: true } : {}),
         log: (m) => log(m),
       });
       log(bucket + " pass " + pass + ": phase=" + result.phase + " published=" + result.published + " readback=" + result.readback + (result.continuationRequired ? " (continuation)" : "") + (result.problems ? " problems=" + JSON.stringify(result.problems) : ""));
@@ -135,10 +232,22 @@ try {
     }
     if (result && result.phase === "complete" && result.ok === true) {
       anyPublished += result.published;
+      for (const pi of (Array.isArray(result.publishedIdentities) ? result.publishedIdentities : [])) {
+        if (pi.liveReportKey && pi.paramsHash) waveFbaPublished.push({ accountId: String(pi.accountId), liveReportKey: String(pi.liveReportKey), paramsHash: String(pi.paramsHash), cycleId: String(result.cycleId || ""), operationId: String(result.operationId || "") });
+      }
       log(bucket + " DONE: fba-plan published for " + result.published + " accounts (read back " + result.readback + "); controls safe-closed.");
     } else {
       anyFailure = true;
-      console.error("STOP " + bucket + " did not complete: phase=" + (result && result.phase) + " problems=" + JSON.stringify(result && result.problems));
+      console.error("STOP " + bucket + " did not complete: phase=" + (result && result.phase) + (result && result.failedAccounts ? " failedAccounts=" + JSON.stringify(result.failedAccounts) : "") + " problems=" + JSON.stringify(result && result.problems));
+    }
+    // AGGREGATE budget tracking (bootstrap scope): record the ACTUAL creates/tokens this run spent.
+    // An 'over-reservation' answer is surfaced LOUDLY (never silent).
+    if (fbaBudgetRef && result) {
+      const rec = await recordOnboardingActualSpend({ waveKey: bootstrapScope.waveKey, ref: fbaBudgetRef, actualTokens: Number(result.tokens) || 0, actualCreates: Number(result.creates) || 0 });
+      if (rec && rec.disposition === "over-reservation") {
+        console.error("WARNING ONBOARDING_OVER_RESERVATION: " + fbaBudgetRef + " actuals " + (Number(result.tokens) || 0) + " tok/" + (Number(result.creates) || 0)
+          + " creates EXCEEDED reservation " + rec.reserved_tokens + " tok/" + rec.reserved_creates + " -- investigate before the next wave step.");
+      }
     }
   }
 } catch (e) {
@@ -149,5 +258,23 @@ try {
   process.exit(1);
 }
 if (anyFailure && !anyPublished) { console.error("STOP zero accounts published live -- see problems above."); process.exit(1); }
+
+// BOOTSTRAP fba-plan PUBLICATION MANIFEST (blocker 7 + Round-7 blocker 2 PROVENANCE): record the EXACT live
+// fba-plan identity per published frozen account -- with the ACTUAL durable cycle id (result.cycleId, never a
+// bucket label), the operation identity, and the ACTIVE run token -- so the completion proof re-reads by exact
+// identity (never the newest) and rejects a stale/superseded attempt. Only on a fully-successful FBA go-live.
+if (accountScope === "bootstrap" && !anyFailure && waveFbaPublished.length) {
+  try {
+    const { recordOnboardingPublication } = await import("../../lib/server/supabase.js");
+    let recorded = 0; let staleToken = 0;
+    for (const p of waveFbaPublished) {
+      if (!p.cycleId || /^bootstrap(-fba)?-/.test(p.cycleId)) { console.error("WARNING skipping fba-plan manifest for " + String(p.accountId).slice(0, 8) + ": missing/label cycle id (" + p.cycleId + ")"); continue; }
+      const rec = await recordOnboardingPublication({ region: regionArg, dispatchId, accountId: p.accountId, reportKey: p.liveReportKey, paramsHash: p.paramsHash, coversAsOf: inventoryAsOf, cycleId: p.cycleId, cycleBucket: bootstrapCycleBucket, operationKey: p.operationId, runToken });
+      if (rec && rec.disposition === "stale-run-token") { staleToken += 1; continue; }
+      recorded += 1;
+    }
+    log("recorded " + recorded + " fba-plan publication-manifest identit(ies) at " + inventoryAsOf + (staleToken ? " (" + staleToken + " refused: not the active run token)" : "") + ".");
+  } catch (e) { console.error("WARNING could not record fba-plan publication manifest: " + (e && e.message ? e.message : e)); }
+}
 log("DONE: fba-plan published for " + anyPublished + " accounts total (inventory requested through " + inventoryAsOf + "); controls safe-closed.");
 process.exit(anyFailure ? 1 : 0);

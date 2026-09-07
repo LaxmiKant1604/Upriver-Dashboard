@@ -506,7 +506,9 @@ function realPublisher(cycleStatus) {
     getApproval: async () => ({ read: "ok", approved: true }),
     getJob: async (rk) => ({ cycle_id: "cyc", validated: true, snapshot_params_hash: hashFor(rk), derive_status: "succeeded", save_status: "succeeded", cycle_status: cycleStatus }),
     getSnapshot: async ({ reportKey }) => { const rk = reportKey.replace("scheduler-v2/", ""); return { params_hash: hashFor(rk), params: SPECS[rk].params, payload: SPECS[rk].payload, payload_storage_path: null, source_refreshed_at: TS }; },
-    publishLive: async () => ({ outcome: "inserted" }),
+    // Round-10: buildSchedulerV2Publisher is ALWAYS fenced -- supply a valid control fence + the fenced CAS double.
+    getControlFence: () => ({ ownerToken: "test-owner", generation: 1 }),
+    publishLiveFenced: async () => ({ outcome: "inserted" }),
   });
 }
 function releaseWithPublisher(pub) {

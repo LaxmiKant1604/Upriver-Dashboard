@@ -14,7 +14,16 @@ loadReleaseEnv();
 
 const argOf = (name) => { const a = process.argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.split("=").slice(1).join("=") : null; };
 const bucket = argOf("bucket");
+const accountScope = argOf("account-scope") || "full";
 if (!isRoutingScope(bucket)) { console.error("STOP --bucket must be a routing scope (india|europe-au|us-ca|us|non-us; got: " + bucket + ")"); process.exit(2); }
+
+// BOOTSTRAP scope: a same-date TERMINAL daily cycle is EXPECTED (the natural run already finished) and
+// is handled by the OLI operator's durable SUPERSEDING-attempt model -- a collision refusal here would
+// wrongly block every bootstrap dispatch. The preflight is therefore a typed no-op for bootstrap scope.
+if (accountScope === "bootstrap") {
+  console.log("cycle-preflight[" + bucket + "]: BOOTSTRAP scope -- preflight no-op (the superseding-attempt model owns same-date terminal heads).");
+  process.exit(0);
+}
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");

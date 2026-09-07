@@ -102,7 +102,11 @@ if (request.sourceKey === "ads-campaign-date") {
 }
 
 // ---------------- Stage 2: derive + publish EVERY affected dashboard (same evidence, zero new exports) ----------
-const release = buildPriorityDashboardsRelease({ asOfOverride: request.asOf, operationKey: request.operationKey });
+// Round-9 P0-A: the control fence captured at apply. getControlFence reads this MUTABLE reference so EVERY report
+// write goes through the WRITE-BOUNDARY-FENCED CAS (control-enabled publisher).
+let manualFence = null;
+const getControlFence = () => manualFence;
+const release = buildPriorityDashboardsRelease({ asOfOverride: request.asOf, operationKey: request.operationKey, getControlFence });
 const readbackLive = buildLiveReadback({
   getReportSnapshot: sb.getReportSnapshot,
   loadStoragePayload: sb.getReportSnapshotStoragePayload,
@@ -114,14 +118,25 @@ const OPERATOR = process.env.PRIORITY_OPERATOR || "laxmikant@superboring.in";
 // The SAME reviewed pg store + discovery the control-package CLI uses (moved verbatim into the shared lib).
 const connectStore = connectPriorityControlStore;
 const discoverAccounts = discoverPrimaryAccountIds;
+// Round-7 blocker 1: a process-stable control-plane owner token so this manual operator serializes on the
+// same global lease as the scheduler + route (a manual run can never overwrite/close another owner's controls).
+const OWNER_TOKEN = "manual-source-sync/" + process.pid + "-" + Date.now();
+// Round-9 P1-C: apply captures the fence generation into manualFence (declared above with getControlFence);
+// close passes it so a superseded generation can never close/release a newer lease.
 const controls = {
   apply: async () => {
-    const r = await runControlPackageCli({ mode: "apply", operator: OPERATOR, discoverAccounts, connectStore, controlledReportKeys: CONTROLLED_REPORT_KEYS, log: (m) => log("controls: " + m) });
+    const r = await runControlPackageCli({ mode: "apply", operator: OPERATOR, discoverAccounts, connectStore, controlledReportKeys: CONTROLLED_REPORT_KEYS, ownerToken: OWNER_TOKEN, operationKey: "manual-source-sync", log: (m) => log("controls: " + m) });
     if (!r || r.committed !== true) throw new Error("controls apply did not commit (code " + (r && r.code) + ")");
+    // Round-10 (blocker 6): require a VALID fencing generation IMMEDIATELY -- never continue with a null fence.
+    const g = Number(r.leaseGeneration);
+    if (!(Number.isSafeInteger(g) && g > 0)) throw new Error("controls apply returned no valid fencing generation -- refusing to publish (fail closed).");
+    manualFence = { ownerToken: OWNER_TOKEN, generation: g };
   },
   close: async () => {
-    const r = await runControlPackageCli({ mode: "rollback", operator: OPERATOR, connectStore, controlledReportKeys: CONTROLLED_REPORT_KEYS, log: (m) => log("controls: " + m) });
+    const r = await runControlPackageCli({ mode: "rollback", operator: OPERATOR, connectStore, controlledReportKeys: CONTROLLED_REPORT_KEYS, ownerToken: OWNER_TOKEN, ownerGeneration: manualFence ? manualFence.generation : null, operationKey: "manual-source-sync", log: (m) => log("controls: " + m) });
+    if (r && r.skipped === "lease-not-owner") { manualFence = null; return; }
     if (!r || r.committed !== true) throw new Error("SAFE-CLOSE did not commit (code " + (r && r.code) + ") -- verify controls manually");
+    manualFence = null;
   },
 };
 

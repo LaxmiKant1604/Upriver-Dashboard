@@ -146,7 +146,9 @@
     "test:account-onboarding": "node scripts/account-onboarding.test.js",
     "test:account-onboarding-worker": "node scripts/account-onboarding-worker.test.js",
     "test:campaign-initial-window": "node scripts/campaign-initial-window.test.js",
-    "test:fba-d1-guard": "node scripts/fba-d1-source-guard.test.js"
+    "test:fba-d1-guard": "node scripts/fba-d1-source-guard.test.js",
+    "test:account-onboarding-bootstrap": "node scripts/account-onboarding-bootstrap.test.js",
+    "test:round11-publication-fence": "node scripts/round11-publication-fence.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.4",

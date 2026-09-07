@@ -36,8 +36,12 @@ const matInvCommentIdx = wf.indexOf("\n  # FBA-aware Brand View materialization"
 const matInvIdx = wf.indexOf("\n  materialize-inventory:");
 const matEnd = matInvCommentIdx > matIdx ? matInvCommentIdx : (matInvIdx > matIdx ? matInvIdx : wf.length);
 const matJob = matIdx > 0 ? wf.slice(matIdx, matEnd) : "";
-// The FBA-aware Brand View materialization job (the missing backend producer for brand-view + brand-view-portfolio).
-const matInvJob = matInvIdx > 0 ? wf.slice(matInvIdx) : "";
+// The FBA-aware Brand View materialization job (the missing backend producer for brand-view + brand-view-portfolio),
+// bounded at the START of the bootstrap-ack block (the onboarding dispatch acknowledgement job that follows it).
+const ackCommentIdx = wf.indexOf("\n  # BOOTSTRAP ack (completed | failed)");
+const ackIdx = wf.indexOf("\n  bootstrap-ack:");
+const matInvEnd = ackCommentIdx > matInvIdx ? ackCommentIdx : (ackIdx > matInvIdx ? ackIdx : wf.length);
+const matInvJob = matInvIdx > 0 ? wf.slice(matInvIdx, matInvEnd) : "";
 
 /* ===================== A. dependency order + gate ===================== */
 ok("A: the v3 job needs BOTH run and fba", /needs:\s*\[run,\s*fba\]/.test(v3Job));

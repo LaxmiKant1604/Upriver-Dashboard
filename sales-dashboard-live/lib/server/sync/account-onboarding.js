@@ -31,10 +31,12 @@
 // injectable readers). No DataDoe export adapter is imported anywhere here -- the worker path is
 // structurally incapable of creating an export or spending a token.
 
+import { createHash } from "node:crypto";
 import { regionForMarketplace, REGIONS } from "./campaign-region-routing.js";
 
 const S = (v) => (v == null ? "" : String(v).trim());
 const isoNow = (now) => new Date(now == null ? Date.now() : now).toISOString();
+const sha256 = (value) => createHash("sha256").update(value, "utf8").digest("hex");
 
 export const ONBOARDING_STATUS = Object.freeze({
   DISCOVERED: "discovered",
@@ -241,6 +243,217 @@ export function filterExportEligibleAccounts({ detailedAccounts, onboardingRows 
     else excluded.push({ accountId, name, reason: EXCLUDE_STATUS_PREFIX + S(row.status).toUpperCase() });
   }
   return { eligible, excluded, gateMode: byAccount ? "onboarding" : "readiness-only" };
+}
+
+/**
+ * PURE bootstrap-scope filter: the TRUSTED account set a scheduler-v2 bootstrap run may spend tokens on.
+ * An account is bootstrap-pending ONLY when its durable onboarding row proves an atomic claim
+ * (status === 'bootstrapping' with a non-blank operation_id) AND DataDoe readiness is POSITIVELY complete
+ * AND (when a region is given) its durable region matches. NOTHING here comes from user input, and there
+ * is NO fail-soft: a bootstrap scope without readable onboarding rows is an EMPTY authorization -- the
+ * caller must fail closed (zero accounts => zero exports), never fall back to a wider set.
+ * Returns { accounts (DETAILED rows), operationIds }. The wave/dispatch IDENTITY is NOT derived here:
+ * computeOnboardingWaveIdentity (account-onboarding-bootstrap.js) is the single source -- it hashes the
+ * sorted claimed membership so a membership change mints a NEW wave key + dispatch id.
+ */
+export function filterBootstrapPendingAccounts({ detailedAccounts, onboardingRows, region = null } = {}) {
+  if (!Array.isArray(onboardingRows)) {
+    throw new Error("BOOTSTRAP_SCOPE_UNAVAILABLE: account_onboarding rows are required for a bootstrap scope (fail closed; zero accounts, zero exports).");
+  }
+  const byAccount = new Map(onboardingRows.map((r) => [S(r.account_id), r]));
+  const accounts = [];
+  const operationIds = [];
+  for (const account of detailedAccounts || []) {
+    const accountId = S(account && account.id);
+    if (!accountId || accountId.includes(":")) continue;
+    const row = byAccount.get(accountId);
+    if (!row) continue;
+    if (S(row.status) !== ONBOARDING_STATUS.BOOTSTRAPPING) continue;
+    if (!S(row.operation_id)) continue;                       // the atomic claim IS the authorization
+    if (!accountDataDoeReady(account)) continue;              // an in-progress account spends nothing
+    if (region != null && S(row.region) !== S(region)) continue;
+    accounts.push(account);
+    operationIds.push(S(row.operation_id));
+  }
+  return { accounts, operationIds: operationIds.sort() };
+}
+
+// The three onboarding routing regions (pinned by tests to campaign-region-routing REGIONS).
+export const ONBOARDING_REGIONS = Object.freeze(["india", "europe-au", "us-ca"]);
+
+// The WAVE-BOUND bootstrap-publication cycle bucket -- bootstrap-<region>-<membership-hash-16> -- so a
+// scoped bootstrap publication's sync_cycles row (a) never collides with the natural (region, cycle_date)
+// daily cycle AND (b) never collides with a DIFFERENT wave in the same region on the same day, while a
+// RETRY of the SAME dispatch (same membership hash) reuses ITS OWN cycle. The value is NOT arbitrary: it
+// matches the reviewed CHECK/open_sync_cycle pattern ^bootstrap-(india|europe-au|us-ca)-[0-9a-f]{16}$.
+// The membership hash is the dispatch identity's own hash (the 16 hex after the last "/").
+export function bootstrapCycleBucket(region, membershipHash) {
+  const r = S(region);
+  if (!ONBOARDING_REGIONS.includes(r)) throw new Error(`bootstrapCycleBucket requires a routing region (india|europe-au|us-ca; got "${r}") (fail closed).`);
+  const h = S(membershipHash).toLowerCase();
+  if (!/^[0-9a-f]{16}$/.test(h)) throw new Error(`bootstrapCycleBucket requires a 16-hex membership hash (got "${membershipHash}") (fail closed).`);
+  return `bootstrap-${r}-${h}`;
+}
+
+// The WAVE-BOUND bootstrap-FBA-inventory cycle bucket -- bootstrap-fba-<region>-<membership-hash-16> --
+// so a scoped bootstrap FBA go-live's dedicated inventory cycle never collides with (or is blocked by) the
+// natural <region>-fba cycle, and two different same-region/day waves get distinct FBA cycles while a
+// retry of the SAME dispatch reuses its own. Matches the reviewed CHECK/open_sync_cycle -fba pattern.
+export function bootstrapFbaCycleBucket(region, membershipHash) {
+  const r = S(region);
+  if (!ONBOARDING_REGIONS.includes(r)) throw new Error(`bootstrapFbaCycleBucket requires a routing region (india|europe-au|us-ca; got "${r}") (fail closed).`);
+  const h = S(membershipHash).toLowerCase();
+  if (!/^[0-9a-f]{16}$/.test(h)) throw new Error(`bootstrapFbaCycleBucket requires a 16-hex membership hash (got "${membershipHash}") (fail closed).`);
+  return `bootstrap-fba-${r}-${h}`;
+}
+
+// The 16-hex membership hash embedded in a wave dispatch id (onboarding-bootstrap/<region>/<hash16>).
+// Returns "" when the id is not a canonical wave dispatch id (fail closed at the caller).
+export function dispatchMembershipHash(dispatchId) {
+  const m = /^onboarding-bootstrap\/(?:india|europe-au|us-ca)\/([0-9a-f]{16})$/.exec(S(dispatchId));
+  return m ? m[1] : "";
+}
+
+/**
+ * The CANONICAL, REGION-LOCAL, IMMUTABLE wave identity: derived ONLY from ONE region's durable claim
+ * state (that region's 'bootstrapping' rows' immutable operation ids + trusted account ids, sorted,
+ * plus the region itself). Waves are PER REGION: a newly claimed account in ANOTHER region can never
+ * change, restart, or re-key this region's wave, dispatch identity, budget, or attempt counters.
+ * Within a region, a newly claimed account changes that region's membership -> a DIFFERENT wave key +
+ * dispatch id -> the old authorization can never cover it (BUDGET_NOT_AUTHORIZED until the new wave is
+ * approved) and the old queued/running dispatch row is never overwritten (append-only by
+ * (region, dispatch_id)). The approved plan fingerprint is bound to the wave by the budget ROW
+ * (mandatory, non-blank, validated on every reservation) rather than folded into the key -- the
+ * discovery worker must be able to LOCATE the wave's budget row before any plan exists in order to hold
+ * dispatches in awaiting-budget. PURE (no transport): lives here so the structurally zero-export
+ * discovery worker can import it.
+ * Returns { region, waveKey, membershipHash, accounts, operations, dispatchId };
+ * waveKey/dispatchId are null when the region has nothing claimed.
+ */
+export function computeOnboardingWaveIdentity(onboardingRows, region) {
+  if (!Array.isArray(onboardingRows)) {
+    throw new Error("computeOnboardingWaveIdentity requires readable account_onboarding rows (fail closed).");
+  }
+  const r = S(region);
+  if (!ONBOARDING_REGIONS.includes(r)) {
+    throw new Error(`computeOnboardingWaveIdentity requires a routing region (india|europe-au|us-ca; got "${r}") (fail closed).`);
+  }
+  const entries = onboardingRows
+    .filter((row) => S(row.status) === ONBOARDING_STATUS.BOOTSTRAPPING && S(row.operation_id) !== "" && S(row.account_id) !== "" && S(row.region) === r)
+    .map((row) => ({ accountId: S(row.account_id), operationId: S(row.operation_id) }))
+    .sort((a, b) => a.accountId.localeCompare(b.accountId));
+  if (!entries.length) return { region: r, waveKey: null, membershipHash: null, accounts: [], operations: [], dispatchId: null };
+  const accounts = entries.map((e) => e.accountId);
+  const operations = entries.map((e) => e.operationId).sort();
+  const membershipHash = sha256(JSON.stringify({ accounts, operations, region: r }));
+  return {
+    region: r,
+    waveKey: `onboarding-wave/${r}/${membershipHash.slice(0, 32)}`,
+    membershipHash,
+    accounts,
+    operations,
+    // The dispatch identity carries the region-local membership, so an acknowledged/queued run is
+    // bound to exactly this wave: an in-region membership change mints a NEW dispatch identity.
+    dispatchId: `onboarding-bootstrap/${r}/${membershipHash.slice(0, 16)}`,
+  };
+}
+
+// Every region's current wave identity (region -> identity; only regions with claims appear).
+export function computeAllRegionOnboardingWaves(onboardingRows) {
+  const waves = new Map();
+  for (const region of ONBOARDING_REGIONS) {
+    const wave = computeOnboardingWaveIdentity(onboardingRows, region);
+    if (wave.waveKey) waves.set(region, wave);
+  }
+  return waves;
+}
+
+// The canonical per-step account-set hash (sorted account ids) every reservation carries + validates.
+export function bootstrapAccountSetHash(accountIds) {
+  const ids = [...new Set((accountIds || []).map(S).filter(Boolean))].sort();
+  return sha256(JSON.stringify(ids));
+}
+
+/**
+ * The CANONICAL PER-STEP PLAN HASH: sha256 over the STRUCTURAL binding of one step's approved work --
+ *   step (oli|campaign|fba|catalog|publish), region,
+ *   wave accounts (sorted) + operation ids (sorted) + accountSetHash,
+ *   planAsOf + inventoryAsOf (the exact approved reference dates),
+ *   sourceKeys (sorted; the report family/source identity),
+ *   windows (the exact approved from/to per source, or the no-date snapshot identity string),
+ *   requestHashes (sorted; the deterministic planned export request identities) +
+ *   batchMembership (the sorted planned <=5-seller account batches),
+ *   limits (sorted; per-source row/seller caps that shape the request identity).
+ * DELIBERATELY EXCLUDES the coverage-dependent planned creates/tokens (the reservation CEILING) -- those
+ * shrink on a legitimate retry as durable coverage advances, so folding them in would make a retry drift.
+ * The ceiling is bound instead by the reservation (attempt + cumulative <= ceiling) and by the plan
+ * FINGERPRINT (which includes plannedCreates/plannedTokens per entry). The run-time operator RECOMPUTES
+ * this STRUCTURAL hash from its ACTUAL planned work (frozen accounts, pinned dates/windows, live seller
+ * batches, request identities, limits) and requires it to equal the approved entry's stepPlanHash BEFORE
+ * any reservation/POST -- so a modified runtime account, batch, date, window, source, or request identity
+ * is PLAN_DRIFT even when the token counts happen to match.
+ */
+export function onboardingStepPlanHash(step) {
+  const s = step || {};
+  const sortedStr = (xs) => [...new Set((Array.isArray(xs) ? xs : []).map(S).filter(Boolean))].sort();
+  const canonical = {
+    step: S(s.step), region: S(s.region),
+    accounts: sortedStr(s.accounts), operationIds: sortedStr(s.operationIds),
+    accountSetHash: S(s.accountSetHash),
+    planAsOf: S(s.planAsOf), inventoryAsOf: S(s.inventoryAsOf),
+    sourceKeys: sortedStr(s.sourceKeys),
+    windows: (Array.isArray(s.windows) ? s.windows : [])
+      .map((w) => ({ sourceKey: S(w && w.sourceKey), from: S(w && w.from), to: S(w && w.to), snapshotIdentity: S(w && w.snapshotIdentity) }))
+      .sort((a, b) => (a.sourceKey + "|" + a.from + "|" + a.to).localeCompare(b.sourceKey + "|" + b.from + "|" + b.to)),
+    requestHashes: sortedStr(s.requestHashes),
+    batchMembership: (Array.isArray(s.batchMembership) ? s.batchMembership : [])
+      .map((batch) => sortedStr(batch).join(","))
+      .sort(),
+    limits: (Array.isArray(s.limits) ? s.limits : []).map((l) => Number(l) || 0).sort((a, b) => a - b),
+    // OPTIONAL canonical STRUCTURE object (the FBA plan structure: sellers, marketplace pairs, default
+    // batches, request hashes, source keys, row limits, inventoryAsOf, adaptiveSplitAllowed). It is
+    // canonicalized here (deterministic key order + sorted arrays) so a modified seller/pair/batch/request/
+    // limit is bound; absent for non-FBA steps.
+    structure: canonicalizeStructure(s.structure),
+  };
+  return sha256(JSON.stringify(canonical));
+}
+
+// Deterministic canonicalization of an arbitrary plain structure object (sorted keys; arrays of strings
+// sorted; arrays of arrays joined+sorted; primitives passed through). null/undefined => null.
+function canonicalizeStructure(v) {
+  if (v == null) return null;
+  if (Array.isArray(v)) {
+    const items = v.map((x) => (Array.isArray(x) ? [...x].map(S).sort().join(",") : (x && typeof x === "object" ? JSON.stringify(canonicalizeStructure(x)) : S(x))));
+    return items.sort();
+  }
+  if (typeof v === "object") {
+    const out = {};
+    for (const k of Object.keys(v).sort()) out[k] = canonicalizeStructure(v[k]);
+    return out;
+  }
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v;
+  return S(v);
+}
+
+/**
+ * The canonical APPROVED-PLAN fingerprint: sha256 over the sorted per-step plan entries
+ * [{ step, region, accountSetHash, stepPlanHash, plannedCreates, plannedTokens }] -- stepPlanHash folds
+ * the FULL approved work (dates, windows, sources, request hashes, batches, membership) into the
+ * fingerprint, so ANY parameter change changes the fingerprint even at identical token counts. The
+ * dry-run planner emits it; the authorization operator records it (mandatory, non-blank); every
+ * reservation is validated against the stored approved plan entry for its (step, region).
+ */
+export function onboardingPlanFingerprint(steps) {
+  const canonical = (Array.isArray(steps) ? steps : [])
+    .map((s) => ({
+      step: S(s.step), region: S(s.region), accountSetHash: S(s.accountSetHash),
+      stepPlanHash: S(s.stepPlanHash),
+      plannedCreates: Number(s.plannedCreates) || 0, plannedTokens: Number(s.plannedTokens) || 0,
+    }))
+    .sort((a, b) => (a.step + "|" + a.region).localeCompare(b.step + "|" + b.region));
+  return sha256(JSON.stringify(canonical));
 }
 
 /**

@@ -23,9 +23,11 @@ loadReleaseEnv();
 
 const argOf = (name) => { const a = process.argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.split("=").slice(1).join("=") : null; };
 const bucket = argOf("bucket");
+const accountScope = argOf("account-scope") || "full";
 if (!isRoutingScope(bucket)) { console.error("STOP --bucket must be a routing scope (india|europe-au|us-ca|us|non-us; got: " + bucket + ")"); process.exit(2); }
 const requestedAsOf = argOf("requested-as-of") || argOf("as-of") || (() => { const d = new Date(); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); })();
 if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedAsOf)) { console.error("STOP --requested-as-of must be YYYY-MM-DD (got: " + requestedAsOf + ")"); process.exit(2); }
+if (accountScope !== "full" && accountScope !== "bootstrap") { console.error("STOP --account-scope must be full | bootstrap (got: " + accountScope + ")"); process.exit(2); }
 const addDays = (ymd, n) => { const d = new Date(`${ymd}T00:00:00.000Z`); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
 const cycleDate = addDays(requestedAsOf, 1);
 const adsFrom = addDays(requestedAsOf, -20); const adsTo = requestedAsOf;
@@ -34,10 +36,19 @@ const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../..
 const { fetchAccountsDetailed, fetchCompatibleSourceNames } = await import("../../lib/server/datadoe.js");
 const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
 const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
-// EXPORT-ELIGIBILITY GATE: the readiness proof covers EXACTLY the export-eligible account set the
-// publish steps will use (same gate), so a still-loading/unclaimed account can never fail-close a
-// region's honest D-1 publication for the accounts that ARE ready.
-const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows });
+const { resolveBootstrapScope } = await import("../../lib/server/sync/account-onboarding-bootstrap.js");
+// ACCOUNT SCOPE:
+//   full      -> EXPORT-ELIGIBILITY GATE: the readiness proof covers EXACTLY the export-eligible
+//                account set the publish steps will use (same gate), so a still-loading/unclaimed
+//                account can never fail-close a region's honest D-1 publication.
+//   bootstrap -> the REAL readiness assessment over ONLY the region's atomically-claimed onboarding
+//                accounts (durable account_onboarding evidence, fail-closed): the SAME D-1 coverage/
+//                provenance/completeness gates apply to the trusted set, so a bootstrap run publishes
+//                its accounts' dashboards automatically the moment their sources prove D-1 -- and
+//                fails closed (typed, LKG untouched) while they do not.
+const fetchAccounts = accountScope === "bootstrap"
+  ? async (apiKey) => (await resolveBootstrapScope(apiKey, { region: bucket })).accounts
+  : (apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows });
 const { ASIN_ADS_SOURCE_NAME } = await import("../../lib/server/sync/scheduled-asin-ads-runner.js");
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, getOliCompleteness } = await import("../../lib/server/supabase.js");
 const { assessScheduledOliCycle } = await import("../../lib/server/sync/source-scheduled-oli.js");
@@ -57,9 +68,15 @@ const { active } = classifyDirectoryAccounts(rows, connections);
 const seen = new Set();
 const discovered = [];
 for (const a of active) { const id = String((a && (a.accountId ?? a.id)) || "").trim(); const country = String((a && a.country) || "").toUpperCase(); if (!id || id.includes(":") || seen.has(id)) continue; if (!accountInScope(bucket, country)) continue; seen.add(id); discovered.push({ accountId: id }); }
+if (!discovered.length && accountScope === "bootstrap") {
+  // NOTHING claimed in this region: a valid green no-op -- no publish steps run, LKG untouched.
+  ghOut("proceed", "false"); ghOut("status", "BOOTSTRAP_SCOPE_EMPTY"); ghOut("effective_asof", ""); ghOut("requested_asof", requestedAsOf);
+  log("BOOTSTRAP_SCOPE_EMPTY: no claimed bootstrap accounts in " + bucket + " -- nothing to assess or publish.");
+  process.exit(0);
+}
 if (!discovered.length) { console.error("STOP no discovered " + bucket + " primary accounts"); process.exit(1); }
 const ids = discovered.map((a) => a.accountId);
-log(discovered.length + " primary accounts; ASIN-Ads window [" + adsFrom + ".." + adsTo + "]; cycle date " + cycleDate);
+log(discovered.length + " primary accounts (" + accountScope + " scope); ASIN-Ads window [" + adsFrom + ".." + adsTo + "]; cycle date " + cycleDate);
 
 const oliStart = sourceRegistryEntry("order-line-items").initialBackfill.start;
 const orgFp = primaryConn.organizationFingerprint || organizationFingerprint(primaryConn.apiKey);

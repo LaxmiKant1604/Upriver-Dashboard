@@ -84,6 +84,569 @@ europe-au superseding cycle 05ce4abb (running, 8 failed 400 jobs) left as-is -- 
 stale heads; legacy v1 api/cron sync path left ungated (unreachable); Reelleo/dd-secondary + fx-rates cache
 items unchanged (out of scope).
 
+### Codex-review revision (2026-09-07, WORKING TREE on top of 56b92e9 -- uncommitted, approval-gated)
+
+- **P0 fixed -- scheduled D-2 inventory defect**: the insight planners subtracted 1 from an asOf that is
+  ALREADY D-1 on scheduled runs (reproduced: buy-box/listing-health planned [2026-09-05..2026-09-05] for a
+  2026-09-07 run). Fix: ONE explicit `inventoryAsOf` threaded through buildShadowReportPlan -> the per-account
+  planners (planSalesMovers/planBuyBoxLoss/planListingHealth gain the param; window = [invAsOf..invAsOf];
+  default = the report asOf ITSELF, never asOf-1) + runSalesMoversShadowCycle (all 3 planSalesMovers calls +
+  buildFinalReports) + context (`context.inventoryAsOf`, pinned by the derives; the -1 fallback survives ONLY
+  for a context without the field: browser-parity fixtures where asOf=TODAY, and pre-deploy queued jobs).
+  Browser builders unchanged (TODAY-1 = D-1 was already correct). FBA Plan + v3 identity untouched.
+  Fixed-clock integration proof (fba-d1-source-guard D, 37 asserts total): at 2026-09-07T09:00Z the ENTIRE
+  scheduled surface (generic plan + fba batched + v3 batched + staged sales-movers) requests EXACTLY
+  [2026-09-06..2026-09-06]; NOTHING resolves 2026-09-05; the REAL browser builder (fetchInventorySnapshot with
+  an intercepted create POST) requests the SAME window and resolves the SAME canonical request hash.
+- **P1 fixed -- immediate claimed-account bootstrap**: after a FRESH atomic claim the worker dispatches ONE
+  scheduler-v2 workflow_dispatch for the claimed account's TRUSTED region (from onboarding state, never user
+  input; dispatch_id onboarding-bootstrap/<region>/<date>), so bootstrap normally starts within one polling
+  interval. Scheduler-v2 stays the ONLY paid owner (per-region concurrency + duplicate guard + cycle
+  idempotence + ceilings absorb replays); replay/held/dry-run/loading never dispatch; two same-region claims
+  dispatch once; a dispatch failure is typed fail-soft (claim stands; natural run resumes). Wiring: worker
+  deps.dispatchBootstrapRun (GitHub REST, GITHUB_TOKEN w/ actions:write added to account-onboarding.yml;
+  local CLI without a token records dispatch-unavailable). Worker suite now 29 asserts.
+- **P1 quantified -- GitHub Actions usage (measured, NOT "zero cost"; DataDoe tokens vs Actions minutes vs DB
+  usage are distinct)**: repo is PRIVATE (LaxmiKant1604/Upriver-Dashboard). Measured on a real runner: setup
+  2s + checkout 3s + setup-node 4s + npm ci 5s (cached lockfile); worker pass steady-state ~5-15s (seed-shaped
+  pass measured 97s once) -> a worker run bills 1 min (per-job round-up dominates; npm ci is NOT the cost
+  driver, so it is retained). */15 = 96 runs/day ~= 2,880-2,976 min/month; */30 ~= 1,440-1,488; hourly ~= 720-744.
+  Existing scheduler-v2 usage measured: one full regional run bills ~22 job-min (4:09+3:45+4:20+0:19+6:46,
+  rounded per job) x ~4-6 runs/day ~= 2,500-4,000 min/month TODAY -- the account already sustains this
+  (billing API needs the gh `user` scope; unreadable here). Native crons on this repo fire HOURS late
+  (measured: the 08:30 cron at 12:12Z -- which IS the "12:14Z" incident run -- and 16:30 at 18:31Z), so */15
+  is nominal; bootstrap reactivity now comes from the claim->dispatch, not worker cadence. DECISION LEFT TO
+  APPROVAL: keep */15 (~96 min/day) or halve to */30. DataDoe tokens from the worker: 0 (structurally).
+  Database usage: steady-state ~4-10 PostgREST reads + material-change-only writes per pass.
+- **Exact paid-export plan for the 11 loading accounts** (grounded in the REAL windows DataDoe already
+  received on the 2026-09-06 attempts): 10 aHeal (europe-au): OLI 8 creates/16 tok ([5,5] batches; measured
+  split 2025-01-01..2025-08-09 / 2025-08-10..2026-03-17 / 2026-03-18..D-1) + Campaign-initial 2/4 + FBA D-1
+  2/10 + AWD-Listings (IT/ES/DE/FR/UK) 1/5 + v3 4/8 (would exceed the europe-au v3 8-export ceiling -> v3
+  defers, honest) = 17 creates / 43 tokens. SIMPLIFY (us-ca): OLI 2/4 + Campaign 1/2 + FBA 1/5 + Listings/AWD
+  1/5 + v3 2/4 = 7 creates / 20 tokens. NOTE: paid authorization is NOT being requested with these numbers --
+  a FRESH exact dry-run plan is produced at authorization time (accounts may become ready separately).
+
+### Codex-review revision ROUND 2 (2026-09-07, WORKING TREE -- uncommitted, approval-gated)
+
+- **B1 inventoryAsOf threading COMPLETE**: runSchedulerV2Shadow now passes inventoryAsOf into the staged
+  Sales Movers runner (sync-dispatch.js STAGED args). Dispatcher-level proof (sync-dispatch.test.js, 39):
+  with asOf 2025-08-10 and a deliberately different inventoryAsOf 2025-08-07, the REAL dispatcher's staged
+  inventory create is EXACTLY [08-07..08-07] (captured at the adapter's fetchParams) and nothing infers
+  asOf-1; with NO threaded value the default is the report asOf ITSELF (unambiguous; on scheduled runs asOf
+  IS D-1). The derive-side -1 fallback remains ONLY for contexts without the explicit field (documented:
+  browser-parity fixtures + pre-deploy queued jobs).
+- **B2 bootstrap scope**: scheduler-v2.yml gains run_scope=full|bootstrap (scheduled = ALWAYS full). In
+  bootstrap scope every paid step resolves its account set in the BACKEND from durable account_onboarding
+  (status 'bootstrapping' + non-blank operation_id + DataDoe-ready + region match -- lib/server/sync/
+  account-onboarding-bootstrap.js resolveBootstrapScope; account IDs NEVER from inputs; unreadable rows =
+  EMPTY authorization, fail closed): oli-refresh-d1/campaign/fba take --account-scope=bootstrap; the
+  duplicate guard emits run_required=true (claimed accounts have no published D-1), the cycle preflight
+  no-ops (the superseding model owns same-date terminal heads), readiness emits typed
+  BOOTSTRAP_SCOPE_NO_PUBLISH proceed=false (sources only; publication on the next natural run); v3 is
+  skipped. Existing region accounts create zero exports (they are simply not in the resolved set; only
+  claimed accounts share a wave).
+- **B3 resumable dispatch**: durable per-region lease (account_onboarding_dispatch + lease/record-error/
+  complete SECURITY DEFINER RPCs, added to the UNAPPLIED migration 20260919): deterministic wave id
+  onboarding-bootstrap/<region>/<earliest bootstrap_started date>; lease grants AT MOST one active dispatch;
+  bounded backoff 30m,1h,2h,4h,6h-cap (no */30 spam); dispatch failures/unacknowledged waves retry on the
+  next due pass; completion (region has no bootstrapping accounts left) is terminal. Worker suite (35)
+  proves: API-failure -> next due pass retries; concurrent workers -> one dispatched + one not-due;
+  accepted replay -> not-due (idempotent); completion stops dispatches. Fixed en route: the worker's
+  post-upsert row view dropped claim-owned fields (operation_id/bootstrap_started_at) -- now merged.
+- **B4 ENFORCED wave budget**: account_onboarding_budget (+ reserve_onboarding_spend /
+  record_onboarding_spend_actual RPCs; INSERT-only authorization written by the new approval operator
+  scripts/release/authorize-onboarding-budget.mjs with an exact --confirm string). Every bootstrap-scoped
+  paid step builds its exact adoption-aware plan and reserves it BEFORE any create POST
+  (gateOnboardingBudget); refusals: BUDGET_NOT_AUTHORIZED (the default until approval -- paid bootstrap is
+  structurally locked), BUDGET_EXCEEDED, BUDGET_CLOSED. Retries share their reservation by ref (never
+  reset); actual creates/tokens are recorded per ref and aggregate across EU/US-CA dispatches
+  (spent_tokens). Bootstrap suite (35) proves scope + refusal + shared-retry + aggregate accounting +
+  migration ACL shape.
+- **Cadence**: onboarding worker cron switched to */30 (measured ~1 billed Actions min/run => ~1,450
+  min/month vs ~2,900 at */15; DataDoe tokens 0 structurally; reactivity comes from the claim->dispatch
+  lease, not polling cadence).
+
+### Codex-review revision ROUND 3 (2026-09-07, WORKING TREE -- uncommitted, approval-gated)
+
+Accepted from round 2: D-1 threading, trusted bootstrap account scope, */30 cadence. Round-3 blockers fixed:
+
+- **P0 wave-bound authorization (no static key)**: `ONBOARDING_WAVE_BUDGET_KEY` ("onboarding-wave/v1") is
+  GONE. The canonical wave identity is `computeOnboardingWaveIdentity(onboardingRows)` (now in the PURE core
+  lib/server/sync/account-onboarding.js so the zero-export worker can share it; re-exported from
+  account-onboarding-bootstrap.js): sha256 over the SORTED claimed membership {account ids, operation ids,
+  regions} -> waveKey `onboarding-wave/<hash32>` + per-region dispatchId
+  `onboarding-bootstrap/<region>/<hash16>`. A newly-claimed account changes the membership -> a DIFFERENT
+  waveKey/dispatchIds -> the old authorization can never cover it (BUDGET_NOT_AUTHORIZED) and a queued run
+  identity never covers a changed wave. Budget row (INSERT-only, service_role; one row per wave, NO
+  migration/manual SQL for future waves) stores wave_accounts/wave_operations/wave_regions + MANDATORY
+  non-blank plan_fingerprint (CHECK) + approved_plan jsonb ([{step, region, accountSetHash, plannedCreates,
+  plannedTokens}]). New zero-create planner scripts/release/onboarding-wave-plan.mjs emits the wave identity,
+  the per-step plan (oli ceiling formula / campaign normal+fallback / planFbaBucketCost adoption-aware), the
+  canonical `onboardingPlanFingerprint` and the plan JSON; reworked authorize-onboarding-budget.mjs REQUIRES
+  --wave-key + --plan-fingerprint + --plan-file + exact --confirm, RECOMPUTES the wave key from durable rows
+  (WAVE_MEMBERSHIP_CHANGED stop) and the fingerprint from the plan file, refuses tokens < plan total, and
+  never overwrites an existing key. Deviation (documented): the fingerprint binds via the budget ROW rather
+  than being folded into the key -- the worker must locate the row BEFORE any plan exists to hold
+  awaiting-budget; every reservation still validates the fingerprint, so a drifted plan can never spend.
+- **P0 drift-rejecting reservations**: `reserve_onboarding_spend` re-signed to (budget_key, ref, step_type,
+  region, account_set_hash, plan_fingerprint, tokens, creates). Validates: fingerprint == the row's approved
+  one; an EXISTING ref returns already-reserved ONLY on exact match of ALL fields (any difference =>
+  PLAN_DRIFT before a POST -- a later larger set/plan can never reuse a smaller reservation); a NEW ref must
+  match an approved_plan entry for (step, region) with the EXACT accountSetHash and planned spend <= approved
+  (larger => PLAN_DRIFT; smaller allowed -- durable coverage/cache adoption only shrinks retries); ceiling =>
+  BUDGET_EXCEEDED; reserved_tokens <= authorized_tokens is a table CHECK. Every operator ref embeds the
+  account-set identity (oli|campaign|fba/<region>/<accountSetHash12>/<date>) and passes
+  waveKey/stepType/region/accountSetHash through gateOnboardingBudget (which injects the ROW's fingerprint --
+  binding by construction). `record_onboarding_spend_actual` answers 'over-reservation' (with reserved vs
+  actual) whenever actuals exceed the step's reservation; all three operators surface it LOUDLY
+  (ONBOARDING_OVER_RESERVATION warning).
+- **P1 no dispatch while budget locked**: dispatch lifecycle statuses are now awaiting-budget | queued |
+  running | failed | completed. The worker computes the wave from the POST-claim durable view of EVERY
+  onboarding row (same hash the run's resolveBootstrapScope recomputes), reads the budget by waveKey ONCE,
+  and with no authorized row holds the wave durably via new RPC mark_onboarding_dispatch_awaiting_budget
+  (zero leases, zero workflow dispatches, zero Actions waste; discover/claim/"Setting up" all still happen).
+  After authorization the NEXT */30 pass leases + dispatches.
+- **P1 workflow acknowledgement**: a dispatch API 204 is only QUEUED (lease status 'queued'). New RPC
+  ack_onboarding_dispatch(region, dispatch_id, phase running|completed|failed) + operator
+  scripts/release/onboarding-dispatch-ack.mjs (ack is a RECEIPT: unreachable table never reds a run; the
+  lease horizon governs). scheduler-v2.yml bootstrap runs ack `running` right after cfg (extends the lease
+  horizon +3h so a live run is never redispatched) and a new `bootstrap-ack` job (needs [run, fba],
+  if always() + scope==bootstrap) acks `completed` ONLY when run AND fba both succeeded (run's honesty step
+  fails it on any OLI/Campaign source failure; readiness/publish run inside it) else `failed` -> bounded
+  backoff retry of the SAME wave. lease grants only for: awaiting-budget->authorized, failed past backoff,
+  or an EXPIRED queued/running lease (hung run); a NEW wave id restarts at attempt 1. Worker-side completion
+  is now GRADUATION-ONLY (every wave account reached partially_ready/ready = durable snapshot evidence);
+  absence of bootstrapping rows alone (e.g. blocked) leaves the wave open.
+- **P1 automatic dashboard publication**: verify-bucket-readiness bootstrap branch now runs the REAL D-1
+  assessment over the trusted set (BOOTSTRAP_SCOPE_NO_PUBLISH removed; empty set = typed green
+  BOOTSTRAP_SCOPE_EMPTY proceed=false), and priority-control-package.mjs gains --account-scope=bootstrap
+  (discovery := resolveBootstrapScope; EMPTY-SET GUARD so a bare wave can never reconcile the global controls
+  to nothing; workflow apply passes the scope). So ONE dispatched bootstrap run does: OLI backfill ->
+  readiness proof -> controls for EXACTLY the claimed set -> Daily+Brand Sales publish + live read-back ->
+  membership rebuild -> FBA (after OLI evidence) -> zero-export materializers (already if:always) -- the new
+  accounts' dashboards are readable WITHOUT waiting for the next natural regional run; v3 stays deferred.
+- **Tests** (all offline; migration RPC semantics modelled exactly): account-onboarding-bootstrap.test.js
+  rewritten (78) -- wave determinism/minting, PLAN_DRIFT matrix (existing-ref mismatch, larger set/plan, new
+  ref vs approved hash, unapproved step, forged fingerprint), old-wave+new-account => BUDGET_NOT_AUTHORIZED,
+  future wave = plain second INSERT while a closed wave stays closed, over-reservation loud, publication
+  package targets EXACTLY the trusted accounts, migration/wiring static guards (8-arg reserve ACL, ack RPCs,
+  workflow ack steps + control-scope). account-onboarding-worker.test.js (50) -- awaiting-budget hold ->
+  authorize -> next pass dispatches; running-ack extends horizon past the raw backoff (no duplicate
+  dispatch); failed-ack retries the SAME wave after bounded backoff; membership growth mints new ids
+  restarting at attempt 1; graduation-only completion (blocked wave stays open); closed budget still holds.
+  scheduler-v2-lhv3-workflow test re-bounded at the new bootstrap-ack job. **verify green: 163 steps / 139
+  suites incl. build:check (224s); git diff --check clean.** STILL: migration UNAPPLIED, nothing committed/
+  pushed/deployed/dispatched, DataDoe spend 0.
+
+### Codex-review revision ROUND 4 (2026-09-07, WORKING TREE -- uncommitted, approval-gated)
+
+Four P0 corrections on top of round 3 (each defect REPRODUCED first, then fixed). Migration 20260919 revised
+in place (still UNAPPLIED). **verify green: 163 steps / 139 suites incl. build:check; git diff --check clean.**
+
+- **P0-1 IMMUTABLE, REGION-LOCAL waves.** `computeOnboardingWaveIdentity(rows, region)` now hashes ONLY one
+  region's sorted claimed membership (accounts + immutable operation ids + region) -> `onboarding-wave/<region>
+  /<hash32>` + `onboarding-bootstrap/<region>/<hash16>`. Repro proved the old GLOBAL wave: a Europe claim
+  changed india's dispatch id/key; now it does NOT (region isolation, +computeAllRegionOnboardingWaves). The
+  dispatch table is APPEND-ONLY by PK (region, dispatch_id): a new wave is a NEW ROW, never overwriting a
+  queued/running/failed/completed one; a partial unique index `account_onboarding_dispatch_one_active(region)
+  where status in (queued,running)` enforces ONE active execution per region (lease returns `region-busy`
+  otherwise; an expired foreign lease is closed `failed` first). Each row stores the IMMUTABLE scope
+  (wave_key + account_ids + operation_ids). Every bootstrap workflow step now receives `--dispatch-id` and
+  resolves its set via `resolveBootstrapScopeByDispatch` (load the row -> validate the authorized budget's key
+  == the row's wave_key -> take accounts/operations FROM THE ROW -> RE-CHECK DataDoe readiness, DEFERRING a
+  flapped account, never widening -> never recompute membership from current status). The worker computes
+  waves per region and gates/leases each independently.
+- **P0-2 TRUE SCOPED PUBLICATION.** Repro proved the old workflow scoped priority-control-package but ran
+  priority-dashboards-release for the WHOLE region + collided on the (region, today) cycle. Fix: a DEDICATED
+  scoped path -- new `scripts/release/bootstrap-publish.mjs` builds the reviewed release composition with a
+  build-time `fetchAccounts` narrowed to EXACTLY the frozen wave accounts + a DEDICATED cycle bucket
+  `bootstrap-<region>` (migration widens sync_cycles CHECK + open_sync_cycle guard by the three, like
+  `<region>-fba`), so derive/finalize/publish/live-read-back cover only the wave and never touch the natural
+  daily cycle. `buildPriorityDashboardsRelease` gained build-time `cycleBucket` + `fetchAccounts` (byte-
+  identical when null; threaded through run()->runBucketSourceSync->openCycle via an additive `cycleBucket`).
+  priority-control-package opens controls by `--dispatch-id` (frozen set; empty-set guard). Completion is
+  gated by a READ-ONLY proof `verify-bootstrap-published.mjs`: `completed` is acked ONLY when run+fba are
+  green AND every FROZEN wave account has live Daily Reporting + Brand Sales + Brand Inventory (FBA present or
+  logged honest-unavailable); an empty/changed/missing scope acks `failed`, never `completed`. The natural
+  full-region path is gated `scope != 'bootstrap'` (byte-identical).
+- **P0-3 EXACT PLAN BINDING.** Repro proved the fingerprint bound only step/region/set/counts (different
+  dates/window/source hashed identically). New `onboardingStepPlanHash` folds the FULL approved work -- step,
+  region, wave accounts + operation ids, accountSetHash, planAsOf, inventoryAsOf, sourceKeys, per-source
+  windows (or a no-date snapshot identity), request hashes, batch membership, planned creates/tokens -- and is
+  carried in each approved_plan entry + folded into the fingerprint. `reserve_onboarding_spend` (now 9-arg)
+  validates `p_step_plan_hash` == the approved entry's; ANY changed date/window/source is `PLAN_DRIFT` before
+  a POST even at identical token counts. The planner (`buildOnboardingStepEntry`, shared by planner + runtime
+  operators) emits it; authorize re-derives + validates every step hash.
+- **P0-4 RETRY-SAFE RESERVATIONS.** Repro proved a smaller same-ref retry was `existing-ref-field-mismatch`
+  PLAN_DRIFT and actuals were last-write-wins. Fix: reserve books the APPROVED CEILING (not the attempt plan);
+  the ref is DATE-FREE `<step>/<region>/<stepPlanHash16>` so same-day/next-day/post-crash retries reuse the
+  ONE reservation; actuals ACCUMULATE; a retry is refused (`BUDGET_EXCEEDED`) BEFORE a POST only when its plan
+  + cumulative actuals would exceed the ceiling; cumulative over-ceiling is a loud `over-reservation`.
+  Operators pin planAsOf/inventoryAsOf from the approved entry (retry-stable dates).
+- **Tests:** account-onboarding-bootstrap.test.js rewritten (60) -- region-local/immutable waves, the frozen
+  by-dispatch scope + readiness-defer, the stepPlanHash primitive, the SQL-modelled retry-safe reserve/record,
+  and the 10 required regressions (frozen set / Europe-vs-India isolation / append-only / scoped publication /
+  completion-gated ack / smaller-retry reuse / changed-hash drift / loading=>zero / natural byte-identical /
+  full verify). account-onboarding-worker.test.js rewritten (40) -- append-only ledger, region isolation,
+  region-busy, graduation completion by row. Natural suites unchanged (source-priority-dashboards 115,
+  source-bucket-sync 19, fba-planning 21, etc.). STILL: migration UNAPPLIED, nothing committed/pushed/
+  deployed/dispatched, DataDoe spend 0.
+
+### Codex-review revision ROUND 5 (2026-09-07, WORKING TREE -- uncommitted, approval-gated)
+
+Six defect facets REPRODUCED against real code (round5-repro), then fixed with the smallest durable
+correction. Migration 20260919 revised in place (UNAPPLIED). **verify green: 163 steps / 139 suites incl.
+build:check; git diff --check clean; api/*.js still 12.**
+
+- **(1) SAME-DAY WAVE COLLISION** -- two waves in one region/day shared bucket bootstrap-<region> ->
+  the 2nd adopted the 1st's terminal cycle and finalize mismatched. FIX: WAVE-BOUND cycle identity
+  `bootstrapCycleBucket(region, membershipHash)` = bootstrap-<region>-<hash16> (hash = the dispatch id's
+  own membership hash). NOT arbitrary: a reviewed CHECK/open_sync_cycle PATTERN
+  `^bootstrap-(india|europe-au|us-ca)-[0-9a-f]{16}$`. Distinct waves -> distinct base cycles; a retry of
+  the SAME dispatch reuses its own; a different dispatch never does.
+- **(2) PARTIAL-READY WAVE** -- published the ready subset + terminalized the cycle, stranding deferred
+  accounts. FIX: resolveBootstrapScopeByDispatch returns `allReady`; if ANY frozen account is not
+  DataDoe-ready it defers the ENTIRE wave (accounts=[]) BEFORE any export/finalize/publish/materializer;
+  every operator + bootstrap-publish green-skip on !allReady; the whole wave completes on a later retry.
+- **(3) FALSE COMPLETION** -- verify-bootstrap-published checked snapshot PRESENCE, so a stale earlier-
+  date/earlier-wave snapshot passed and missing fba-plan was accepted blind. FIX: new shared, injectable
+  `verifyBootstrapCompletion` does an EXACT LIVE READ per frozen account (latest live row, provenance
+  version, coversAsOf==approved D-1 so a stale row FAILS, payload validity). FBA requires fba-plan fresh
+  at the EXACT inventory D-1 OR a DURABLE TYPED unavailable row for (region, dispatch, account,
+  'fba-plan', D-1) -- new table account_onboarding_unavailable + record_onboarding_unavailable RPC,
+  written by the FBA operator only after a FULLY SUCCESSFUL go-live. Absence alone fails.
+- **(4) PLAN-HASH ECHO** -- OLI/campaign/FBA/catalog echoed the stored approved stepPlanHash into the
+  gate, so a modified runtime account/batch/date/request was undetected. FIX: onboardingStepPlanHash is
+  now STRUCTURAL (drops the coverage-dependent creates/tokens so a legitimate retry never drifts); each
+  operator RECOMPUTES it from its actual runtime plan (frozen accounts + operation ids + pinned dates +
+  windows + live <=5 batch membership) via `assertBootstrapStepPlan` and STOPS on drift BEFORE any
+  reservation/POST -- never echoes. (OLI/campaign bind the deterministic frozen-set batches; FBA binds
+  accounts+inventoryAsOf+window and EXCLUDES seller batches, which adapt via legitimate overflow-splitting.)
+- **(5) OUTSIDE-WAVE WRITES** -- the two full-region materializers ran during bootstrap. FIX: both jobs
+  gated `scope != 'bootstrap'` (zero outside-wave snapshot writes; the wave's Brand View converges on the
+  next natural run). Natural path byte-identical.
+- **(stale/late ack)** -- an expired/superseded workflow could still ack 'completed'. FIX: dispatch table
+  gains active_run_token; the running-ack STAMPS this workflow run's token (github run_id-run_attempt), a
+  re-lease CLEARS it, and completed/failed are honored ONLY when the row is 'running' AND its token matches
+  -- else typed 'stale-ack' no-op. The workflow threads --run-token through all three acks.
+- **Tests:** account-onboarding-bootstrap.test.js (90) -- wave-bound cycle independence + retry-stability,
+  defer-entire-wave, recompute-vs-echo drift (batch/date/account rejected; counts excluded), fbaSellerBatches,
+  the stale-ack run-token model, and the EXACT-live-read completion proof (fresh completes; stale coversAsOf
+  fails; missing FBA without typed evidence fails, with evidence passes; older inventory fails). Worker (40)
+  + natural suites unchanged. STILL: migration UNAPPLIED, nothing committed/pushed/deployed/dispatched,
+  DataDoe spend 0.
+
+### Codex-review revision ROUND 6 (2026-09-07, WORKING TREE -- uncommitted, approval-gated)
+
+Seven blockers REPRODUCED against the REAL production compositions (buildFbaPlanRelease /
+advanceFbaPlanBucket / the migration source -- not simplified models), then fixed with the smallest durable
+correction. Migration 20260919 revised in place (UNAPPLIED). **verify green: 163 steps / 139 suites incl.
+build:check (91s); git diff --check clean; api/*.js still 12.** The durable regressions live in the REGISTERED
+suite scripts/account-onboarding-bootstrap.test.js (run under `npm run verify`); the reproduction was a
+throwaway scratchpad script (NOT a committed harness). (Round 7 later hardened these -- see below.)
+
+- **(1) BOOTSTRAP FBA FULL-REGION LEAK** -- `buildFbaPlanRelease` built a full-region runtime + control
+  package; the bootstrap FBA go-live ran `advanceFbaPlanBucket` with NO account-scope override, so runtime
+  discovery/fetch/derive/publish + control mutations + ownership spanned the WHOLE region. FIX: a trusted
+  build-time `accountScopeIds` on `buildFbaPlanRelease` -- when a non-empty frozen set is supplied it (a)
+  replaces the runtime's durable rollout with a frozen allowlist `{read:"ok", allPrimary:false,
+  enabledAccountIds:[...frozen]}` so the dispatcher's Gate-7 rollout FILTER (applied BEFORE any cycle/source
+  planning) scopes discovery->fetch->derive->publish to exactly the frozen set; (b) narrows the control
+  package's discovery + the ownership backfill's account list to the frozen set; (c) the directory loader
+  returns only frozen accounts. null/empty => byte-identical natural full-region behavior (no override,
+  discovery = full region). Proven against the REAL composition: scoped run touches EXACTLY the frozen ids;
+  natural run has NO override and full-region discovery.
+- **(2) FBA CYCLE COLLISION** -- bootstrap FBA reused the natural `<region>-fba` cycle, so a terminal
+  natural cycle blocked new accounts. FIX: `bootstrapFbaCycleBucket(region, membershipHash)` =
+  bootstrap-fba-<region>-<hash16>; `advanceFbaPlanBucket` gains `cycleBucketOverride` (default = natural
+  `<region>-fba`, byte-identical when absent). The reviewed CHECK/open_sync_cycle PATTERN widened to
+  `^bootstrap(-fba)?-(india|europe-au|us-ca)-[0-9a-f]{16}$` (both bucket + p_bucket sites). Proven: with the
+  override the FETCH + durable cycle lookup use the BOOTSTRAP bucket (never india-fba); distinct waves ->
+  distinct FBA cycles; a same-dispatch retry reuses its own.
+- **(3) FALSE TYPED UNAVAILABLE** -- the FBA operator wrote typed-unavailable from snapshot PRESENCE
+  (`getReportSnapshotPresence` + reason FBA_NO_LIVE_PLAN_AFTER_SUCCESSFUL_GOLIVE), so a skipped/failed
+  derive could masquerade as "unavailable". FIX: `advanceFbaPlanBucket` keeps a per-account outcome ledger
+  (`perAccount.sourceIncapable` = the publisher's typed `data-unavailable` disposition ONLY; everything else
+  = `failed`). The operator records typed-unavailable ONLY from `waveSourceIncapable` (the operation's
+  proven data-unavailable outcome), with a STRICT reason enum `FBA_SOURCE_DATA_UNAVAILABLE` bound to
+  cycle_id + operation_id; the presence-based writer is removed. report-publisher.js gains a DISTINCT
+  `data-unavailable` disposition (structurally valid but self-declared empty) split from `invalid-snapshot`.
+- **(4) PER-ACCOUNT FBA HONESTY** -- `advanceFbaPlanBucket` could return ok:true with an included account's
+  publish/readback failed. FIX: a `strict` mode (bootstrap only) -- ANY required included account that FAILED
+  (not published, not proven source-incapable) makes the whole result `phase:'partial' ok:false` with
+  `failedAccounts` (LKG untouched; the wave stays incomplete/retryable). A proven source-incapable
+  (data-unavailable) account is EXCLUDED, not failed. Natural (strict=false) stays LKG-tolerant/byte-identical.
+- **(5) ACTIVE RUN TOKEN** -- the running-ack overwrote `active_run_token` on a running row with a different
+  token, so a second concurrent run could steal the lease. FIX: the ack running branch now CLAIMS only from
+  `queued` or `running`+unset token (stamps the token); the SAME owner re-acking is idempotent (token
+  UNCHANGED); a DIFFERENT token on a running row returns `stale-ack` reason `lease-owned` and NEVER
+  overwrites the token; only an explicit expired-lease (`lease_onboarding_dispatch` clearing the token on a
+  new attempt) may reassign. A faithful offline model + a concurrent two-run regression prove the second
+  token cannot steal the lease.
+- **(6) EXACT FBA PLAN BINDING** -- the FBA approved_plan entry hashed EMPTY batchMembership/requestHashes/
+  limits. FIX: `fbaPlanStructure(plan, inventoryAsOf)` canonically binds sellers + marketplacePairs +
+  defaultBatches + requestHashes + sourceKeys + rowLimits + inventoryAsOf + adaptiveSplitAllowed (only
+  `/^fba-plan:/i` sources; inventory family `/inventory-health/i`); `onboardingStepPlanHash` folds a
+  canonicalized `structure`. The FBA operator recomputes the DEFAULT (no-overflow) plan structure and binds
+  it via `structure:` (never empty), rejecting runtime drift before reservation/controls/POST. Adaptive
+  overflow-splitting stays a legitimate variant (excluded from the default-structure gate).
+- **(7) EXACT COMPLETION** -- completion selected the newest snapshot. FIX: a new publication MANIFEST
+  (`account_onboarding_publication` PK region,dispatch_id,account_id,report_key + `record_onboarding_publication`
+  RPC) records the EXACT live identities the wave produced; `verifyBootstrapCompletion` re-reads each live
+  snapshot by the EXACT (report_key, account, params_hash) via `readByIdentity` (never the newest) and proves
+  manifest coversAsOf==approved D-1, live provenance (reportVersion), exact params.to==D-1, and a valid +
+  available payload. FBA completes ONLY via a manifest entry OR a typed-unavailable row (exact D-1 + strict
+  enum). Named failure modes: no-manifest-entry, manifest-stale-coversAsOf, no-live-snapshot-at-identity,
+  identity-mismatch, live-version, stale-coversAsOf, payload-contract, no-typed-unavailable.
+- **Tests:** account-onboarding-bootstrap.test.js (121) -- rewrote H to the MANIFEST API (every failure mode
+  a named regression), added section I (REAL-composition integration regressions: accountScopeIds leak-scope
+  + natural byte-identity, wave-bound FBA cycle via the real advanceFbaPlanBucket, strict-partial vs
+  LKG-tolerant honesty + data-unavailable!=failure, fbaPlanStructure binding), and rebuilt section G to the
+  round-6 lease model + concurrent two-run regression. gate7-rollout-publisher.test.js updated for the new
+  `data-unavailable` disposition (still never publishes; LKG untouched). Focused suites green
+  (account-onboarding-worker 40, fba-plan-operation 18, report-fba-plan 57, source-priority-dashboards 115,
+  schema-contract-mutation 67, scheduler-v2-lhv3-workflow 36, etc.). STILL: migration UNAPPLIED, nothing
+  committed/pushed/deployed/dispatched, DataDoe spend 0.
+
+### Codex-review revision ROUND 7 (2026-09-07, WORKING TREE -- uncommitted, approval-gated)
+
+Four senior release-blockers REPRODUCED FIRST against the REAL compositions (scratchpad/round7-repro drove
+runControlPackageTransaction + the real fbaPlanPayload derivation + the real record/verify shapes -> 11
+defects), then fixed. Migration 20260919 revised in place (UNAPPLIED). **verify green: 163 steps / 139 suites
+incl. build:check (209s); git diff --check clean; api/*.js still 12; DataDoe spend 0.**
+
+- **(1) GLOBAL CONTROL-PLANE RACE.** `runControlPackageTransaction` reconciles the COMPLETE GLOBAL rollout/
+  dispatch/promoted/approval sets (apply) and safe-CLOSES every control (rollback); scheduler-v2 concurrency is
+  PER-REGION and there is a NON-GitHub caller (api/admin/sources.js), so two ops stomp. REPRO (deterministic
+  interleave A-apply -> B-apply -> A-check -> A-close -> B-check against the REAL transaction): B.apply revoked
+  A's rollout/approvals mid-flight; A.close closed B's. FIX: a DB-backed owner-token LEASE/CAS (new
+  control_plane_lease table + acquire/release/read RPCs, TTL-reclaimed) enforced in the ONE transaction funnel:
+  apply acquires/renews (held-by-another -> CONTROL_LEASE_HELD, ZERO writes), rollback safe-closes+releases ONLY
+  when this owner holds it (a stale/foreign close is a committed no-op, `skipped:lease-not-owner`), idempotent
+  owner replay, fail-closed (a lease-capable store REQUIRES an ownerToken). Threaded through EVERY caller
+  (priority CLI, FBA release seam, manual operator, the route's FBA + priority controls) + the workflow
+  (`--owner-token`/`--run-token` = github run_id-run_attempt on apply/rollback/bootstrap-publish/fba go-live).
+  The lease CAS is MODELED offline (lease-capable in-memory store drives the REAL transaction; the SQL RPC
+  itself is static-guarded, NOT executed against a live DB -- the repo has no live-DB test harness).
+- **(2) MANIFEST PROVENANCE.** bootstrap-publish recorded a BUCKET LABEL (scope.cycleBucket) in cycle_id;
+  verifyBootstrapCompletion ignored cycle/operation/run; record_onboarding_publication was unconstrained. FIX:
+  the runner surfaces the ACTUAL durable cycle id (finalizeBucket.cycleId) per identity; the manifest gains a
+  run_token column + an FK to account_onboarding_dispatch; the RPC rejects blank cycle_id, a bucket-label
+  cycle_id, an unknown dispatch, an out-of-membership account, and a run_token != the dispatch's active_run_token
+  (returns `stale-run-token` -- a superseded attempt can neither complete nor OVERWRITE the live one).
+  verifyBootstrapCompletion now REQUIRES a real cycle id (no-cycle-provenance / cycle-is-bucket-label) and
+  compares expectedRunToken (superseded-attempt). Operators pass the real cycle id + `--run-token`.
+- **(3) FBA UNAVAILABLE CONTRACT.** PROVEN via the real fbaPlanPayload: an empty validated D-1 inventory is an
+  HONEST VALID snapshot (inventoryAvailable:false, NO dataUnavailable) that PUBLISHES (earns a manifest
+  identity); a missing/failed/truncated source THROWS in derive (blocked -> LKG preserved). fba-plan NEVER emits
+  dataUnavailable, so the publisher's data-unavailable disposition + the round-6 sourceIncapable /
+  FBA_SOURCE_DATA_UNAVAILABLE typed path was DEAD/misleading. FIX: REMOVED the dead path -- the
+  account_onboarding_unavailable table + record_onboarding_unavailable RPC + enum, the sourceIncapable ledger
+  (data-unavailable is now a FAILURE to retry), the fba-golive typed-unavailable writer, and the verifier's
+  unavailable branch (fba-plan is a first-class REQUIRED report, proven by its manifest identity like the rest).
+- **(4) TEST INTEGRITY.** The round-6 "real integration" FBA honesty test used a FAKE publisher and the
+  round6-verify-fixes claim cited a SCRATCHPAD file. FIX: the REGISTERED suite
+  scripts/account-onboarding-bootstrap.test.js (145 assertions, under `npm run verify`) now exercises the REAL
+  boundaries -- the real runControlPackageTransaction interleaving + stale-owner close (section I, blocker 1),
+  the real fbaPlanPayload empty/valid contract (blocker 3), the manifest provenance regressions (H, blocker 2),
+  plus source guards that the funnel enforces the lease + every caller threads a token + the global safe-close
+  cannot return for a non-owner. The scratchpad claim is corrected above. The SQL/RPC concurrency is honestly
+  marked as offline-modeled (no live-DB harness in this repo).
+- STILL: migration UNAPPLIED, nothing committed/pushed/deployed/dispatched, DataDoe spend 0.
+
+### Codex-review revision ROUND 8 (2026-09-07, WORKING TREE -- uncommitted, approval-gated)
+
+Four release-blockers REPRODUCED FIRST against the REAL compositions (scratchpad/round8-repro drove the real
+advanceFbaPlanBucket + runControlPackageTransaction + verifyBootstrapCompletion + the migration source -> 9
+defects), then fixed. Migration 20260919 revised in place (UNAPPLIED). **verify green: 163 steps / 139 suites
+incl. build:check (130s); git diff --check clean; api/*.js still 12; DataDoe spend 0.**
+
+- **(1) LEASE EXPIRY + PUBLICATION FENCING.** The Round-7 lease was checked only at control apply/close; the
+  PUBLISHER did not independently re-verify ownership, so after A's lease expired and B took over, A kept
+  publishing (proven: the real advanceFbaPlanBucket published all 8 accounts with no lease re-check). FIX: a
+  MONOTONIC fencing `generation` on control_plane_lease (bumped on every new grant/reclaim, kept on an
+  idempotent renew) + a `renew_control_plane_lease(owner, generation, ttl)` HEARTBEAT (extends ONLY the exact
+  unexpired fence, else 'lost'). apply RETURNS the fence; the publish paths (advanceFbaPlanBucket per chunk;
+  runPriorityDashboardsRelease per account) call an injected `verifyLease` heartbeat IMMEDIATELY before each
+  bounded publish unit -- on lost they STOP, publish nothing further, preserve LKG, and return a typed retryable
+  `contention`/CONTROL_LEASE_LOST. Wired: the FBA release exposes verifyLease (REST renew); fba-golive + the
+  route pass it; bootstrap-publish acquires-to-capture-the-fence then heartbeats. Plus an explicit expired-lease
+  CLEANUP: runControlPackageTransaction `reclaim` mode (+ CLI `--reclaim-stale`) that ACQUIRES only a
+  free/expired lease before safe-closing -- a LIVE owner blocks it, so a reclaim can never close a live owner's
+  controls. Default no-verifyLease = byte-identical natural behavior.
+- **(2) UNIQUE EXECUTION IDENTITIES.** The route DERIVED the owner token from operator+bucket (two concurrent
+  same-admin+bucket requests shared one token -> no mutual exclusion), and the manual CLI generated an unrelated
+  FALLBACK token (separate apply/rollback processes got different tokens -> rollback couldn't own the apply's
+  lease), and lease-not-owner was reported as committed success. FIX: the route mints a CRYPTOGRAPHICALLY-UNIQUE
+  per-HTTP-execution token (crypto.randomUUID) for both FBA + priority controls (each slice
+  apply->publish->safe-close->release, so successive polls re-acquire cleanly and two concurrent same-admin
+  requests contend, one defers); the manual priority CLI REQUIRES an explicit --owner-token for live
+  apply/rollback (NO fallback -- a separate apply/rollback must share the same token) + `reclaim` mints its own;
+  `lease-not-owner` is now a TYPED NON-SUCCESS (committed:false, skipped, leaseNotOwner) reported as "SKIPPED ...
+  not a committed safe-close", never "safe-close complete".
+- **(3) EXACT MANIFEST PROVENANCE.** account_onboarding_publication.cycle_id is now a real sync_cycles.id
+  (uuid) with an FK to public.sync_cycles(id) -- an arbitrary/nonexistent cycle fails the FK; the recording RPC
+  (now 10-arg with p_cycle_bucket) casts to uuid, requires the bucket to be a bootstrap bucket for the region,
+  and looks up sync_cycles to PROVE the cycle's bucket + cycle_date match the expected bootstrap bucket/D-1.
+  verifyBootstrapCompletion receives per-report `expectedProvenance` (cycleId + operationKey + runToken) and
+  compares EXACTLY (cycle-mismatch / operation-mismatch / run-token-mismatch); verify-bootstrap-published
+  resolves each report's expected durable cycle id (getBaseSyncCycleByBucketDate for the bootstrap priority + fba
+  buckets), deterministic operation key, and active run token. Arbitrary nonblank values fail.
+- **(4) VERIFICATION.** Registered real-composition regressions in scripts/account-onboarding-bootstrap.test.js
+  (168 assertions, under `npm run verify`): lease-expiry-during-publishing + heartbeat renewal + publish-nothing
+  on lost (real advanceFbaPlanBucket + verifyLease); reclaim refused-while-owned then closes-when-free +
+  typed lease-not-owner (real runControlPackageTransaction); exact manifest cycle/operation matching
+  (verifyBootstrapCompletion + expectedProvenance). Clearly separated: real production-composition tests (the
+  publish/transaction/verifier boundaries) vs SQL MODELS (the lease CAS + renew + reclaim modeled by an
+  in-memory fence store; the SQL RPC/FK static-guarded, NOT run vs a live DB -- no DB harness in repo) vs static
+  source guards (funnel + callers + workflow wiring).
+- STILL: migration UNAPPLIED, nothing committed/pushed/deployed/dispatched, DataDoe spend 0.
+
+### Codex-review revision ROUND 9 (2026-09-07, WORKING TREE -- uncommitted, approval-gated)
+
+The Round-8 heartbeat fenced BEFORE publish but not AT the report_snapshots write. Four control-plane fencing
+defects fixed. **verify green: 163 steps / 139 suites incl. build:check (215s); git diff --check clean;
+api/*.js still 12; DataDoe spend 0.** NO local Postgres/docker + NO disposable-DB harness in the repo, so the
+SQL RPCs are OFFLINE-MODELED (an in-memory fenced-CAS mirroring the RPC drives the REAL publisher composition) +
+STATIC-GUARDED -- explicitly NOT run against a live DB, NO SQL-runtime-proof claim.
+
+- **(P0-A) WRITE-BOUNDARY FENCING.** The lease was checked before publish but not ATOMICALLY at the write: an
+  owner could renew gen N, stall, expire, be superseded by gen N+1, then resume and still INSERT/PATCH the live
+  row. FIX: a new SECURITY DEFINER RPC `cas_report_snapshot_if_newer_fenced` that, in ONE transaction, row-locks
+  the control_plane_lease, proves {owner_token, generation, unexpired}, and ONLY THEN delegates to the reviewed
+  atomic `cas_report_snapshot_if_newer` (single-sourced CAS: inserted/replaced/newer-live/already-current/
+  equal-freshness-conflict preserved). On any mismatch/expiry it returns 'lease-lost' with ZERO rows written.
+  supabase.js gains `publishLiveSnapshotFencedIfNewer`; the publisher composition, when built control-enabled
+  (getControlFence), routes EVERY live write through the fenced CAS and FAILS CLOSED (lease-lost) when no live
+  fence exists (property 5). The publisher maps 'lease-lost' to a typed disposition; advanceFbaPlanBucket stops
+  on a PER-ACCOUNT 'lease-lost' inside a concurrent chunk (property 6). PROVEN write counts (gate7 EF1/EF2/EF4,
+  real publisher composition): valid fence => 1 row; superseded/expired/no fence => 0 rows.
+- **(P0-B) runReleaseSlice.** The admin-route priority path used runReleaseSlice, which had no fence support. FIX:
+  the route builds the priority release control-enabled (getControlFence captured at controls.apply), so every
+  report write is fenced; runReleaseSlice (and runPriorityDashboardsRelease) STOP on a write-boundary 'lease-lost'
+  with typed CONTROL_LEASE_LOST contention (property 7).
+- **(P1-C) generation in close/assert/release.** rollback/assert/release checked only ownerToken. FIX:
+  release_control_plane_lease is now (owner_token, generation) -- a superseded generation is refused
+  ('generation-superseded') and never releases the newer lease; the store's assert/release + runControl
+  PackageTransaction (ownerGeneration) + every close (FBA/priority/route/manual) pass the captured generation.
+  The generation is THREADED explicitly (property 9): --apply EMITS it (stdout + GITHUB_OUTPUT), --rollback
+  consumes --owner-generation, the workflow passes the matching apply's generation into safe-close.
+- **(P1-D) route contention.** The admin route now maps CONTROL_LEASE_HELD -> 423 and CONTROL_LEASE_LOST -> 409
+  (typed retryable), never a generic 500. Property 11: the natural priority path (priority-dashboards-release.mjs)
+  is ALSO fenced (acquire-to-capture the fence via --run-token) so stale open controls are inert everywhere.
+- **Tests:** gate7-rollout-publisher.test.js +5 (EF1-5: the REAL publisher composition fenced-writes -- valid=1
+  row, superseded/expired/no-fence=0 rows, natural unfenced byte-identical); account-onboarding-bootstrap.test.js
+  178 (I: real advanceFbaPlanBucket per-account write-fence contention + real runControlPackageTransaction P1-C
+  generation refusal; E: round-9 source guards). Separated: REAL-composition tests (publisher/advance/transaction)
+  vs SQL MODELS (in-memory fenced-CAS + lease; the RPC/FK static-guarded, NOT run vs a live DB) vs source guards.
+- STILL: migration UNAPPLIED, nothing committed/pushed/deployed/dispatched, DataDoe spend 0.
+
+### Codex-review revision ROUND 10 (2026-09-07, WORKING TREE -- uncommitted, approval-gated)
+
+Closed the nullable-generation + unfenced-Gate-7-publisher defects. **verify green: 163 steps / 139 suites incl.
+build:check (111s); git diff --check clean; api/*.js still 12; DataDoe spend 0.** NO live PG/DB harness, so the
+SQL is OFFLINE-MODELED + static-guarded -- NOT run vs PostgreSQL, no runtime-proof claim.
+
+- **(1) Fence generation MANDATORY everywhere.** SQL renew/release/cas_report_snapshot_if_newer_fenced now
+  REJECT a NULL/<=0 generation ('invalid-generation') and use EXACT equality (removed every `p_generation is
+  not null and ...` bypass). JS uses `Number.isSafeInteger(g) && g > 0` -- rejecting NULL/undefined/zero/
+  negative/fractional/NaN/string. A missing generation is typed lease-lost/not-owner with ZERO writes.
+- **(2) apply/acquire fail closed** if the DB returns no valid generation: runControlPackageTransaction throws
+  CONTROL_LEASE_NO_GENERATION after acquire (zero writes) rather than enabling controls with a null fence.
+- **(3) Rollback REQUIRES ownerGeneration.** The owner-only rollback is removed: runControlPackageTransaction
+  rejects a missing/invalid ownerGeneration BEFORE BEGIN. Reclaim still uses the generation it just acquired.
+  The pg store assert/release/renew wrappers reject an invalid generation BEFORE any SQL.
+- **(4) Workflow cleanup.** --apply EMITS its generation (stdout + GITHUB_OUTPUT); a GITHUB_OUTPUT write failure
+  is FATAL (never a silent fencing downgrade). The safe-close step runs ONLY when the matching apply emitted a
+  non-blank generation (`if: ... && (steps.full_controls.outputs.generation != '' || steps.bootstrap_controls
+  .outputs.generation != '')`), so it never runs with a blank/owner-only generation; otherwise cleanup is left
+  to the lease TTL / --reclaim-stale.
+- **(5) NO unfenced Gate-7 publication.** buildSchedulerV2Publisher is ALWAYS fenced (publishLive =
+  fencedPublishLive; the unfenced branch is gone); with no getControlFence or an invalid fence, EVERY publish
+  returns lease-lost and writes ZERO rows. priority-dashboards-release.mjs now REQUIRES --run-token for
+  publication. Direct unfenced helpers (publishLiveSnapshotIfNewer / saveShadowSnapshotIfNewer) remain ONLY for
+  genuinely-unrelated writers (returns-leakage) that do NOT pass through the Gate-7 composition.
+- **(6) Route/manual/FBA control apply** require a VALID returned generation IMMEDIATELY (fail closed at apply,
+  not at the first snapshot write).
+- **PROVEN write counts (gate7 EF1/EF5/EF6, REAL publisher composition):** valid positive-int fence => 1 row;
+  stale gen1 / NULL / undefined / zero / negative / fractional / NaN / string generation / no fence => lease-lost,
+  0 rows. Tests: gate7 51 (EF5 rewritten, EF6 added: every invalid generation writes zero); account-onboarding-
+  bootstrap 194 (I: in-memory RPC MODEL of the mandatory-generation renew/release/assert/fenced-CAS + rollback-
+  rejects-invalid-generation before BEGIN; E: round-10 source guards); the 4 workflow-shape suites updated to the
+  gated safe-close. EF fixtures thread a valid fence + publishLiveFenced.
+- STILL: migration UNAPPLIED, nothing committed/pushed/deployed/dispatched, DataDoe spend 0.
+
+### Codex-review revision ROUND 11 (2026-09-07, WORKING TREE -- uncommitted, approval-gated)
+
+Bound scheduler PUBLICATION to the EXACT generation the matching control --apply created, and made the safe-close
+ATOMIC with lease ownership. **verify green: 164 steps / 140 suites incl. build:check (203s); git diff --check
+clean; api/*.js still 12; DataDoe spend 0; node --check clean on every touched JS/MJS.** NO live PG/DB harness --
+SQL stays OFFLINE-MODELED + static-guarded, NOT run vs PostgreSQL (no runtime-proof claim). Migration 20260919
+UNTOUCHED this round + still UNAPPLIED.
+
+- **P0-A publication RENEWS the apply fence -- NEVER re-acquires.** Both `bootstrap-publish.mjs` and
+  `priority-dashboards-release.mjs` now REQUIRE `--owner-generation` (a positive safe int -- the EXACT generation
+  the matching `--apply` emitted) alongside `--run-token`, and call `renewControlPlaneLease(runToken,
+  ownerGeneration)`. renewed => publish under EXACTLY that immutable fence (owner+generation) via the write-boundary
+  fenced CAS + per-account heartbeat; NOT-renewed => CONTROL_LEASE_LOST, ZERO publication writes, `process.exit(1)`
+  (retryable) -- it never adopts/reads-back/replaces the generation and never re-acquires (which would mint a NEW
+  generation and publish under controls another generation opened). Removed the standalone `acquireControlPlaneLease`
+  REST wrapper from `supabase.js` (the ONLY acquire path left is INSIDE the guarded control transaction). The
+  workflow threads `--owner-generation=${{ steps.full_controls.outputs.generation }}` (full) and
+  `${{ steps.bootstrap_controls.outputs.generation }}` (bootstrap) into the two publication steps.
+- **P0-B safe-close ATOMIC + release-result CHECKED.** (item 4) The rollback/reclaim path verifies ownership via
+  the new pg-store `lockAndVerifyControlLease` -- it takes `pg_advisory_xact_lock(hashtext('control-plane-lease'))`
+  AND `SELECT ... FOR UPDATE` on `control_plane_lease` in the SAME transaction, held through the safe-close writes +
+  release + COMMIT, so no acquire/renew/release can wedge between verification and close (a concurrent lease op
+  blocks). Offline fakes without it fall back to the read-based `assertControlLeaseOwner`. (item 5) The
+  `releaseControlLease` RESULT is now CHECKED: ONLY `disposition==='released'` may commit; not-owner /
+  generation-superseded / invalid-generation / null / any unexpected result THROWS `CONTROL_LEASE_RELEASE_FAILED`
+  while phase is pre-commit, so the WHOLE control transaction rolls back every safe-close write and reports
+  non-success (never `committed:true` on a failed release).
+- **PROVEN before/after (new suite `round11-publication-fence.test.js`, 17 checks, REAL runControlPackageTransaction
+  + in-memory lease model):** publication under a lost/superseded/expired/wrong-generation fence => **0** report
+  writes + no re-acquire (before: acquire would mint gen3 and publish under another generation's controls); a failed
+  release => the safe-close writes are ROLLED BACK to their pre-tx state + `committed:false, code 1` (before:
+  committed:true despite the failed release); a superseded generation at verify => lease-not-owner skip, **0**
+  control writes; a concurrent takeover DURING the close is blocked, B can acquire only after commit; a valid
+  matching owner+gen still publishes/closes/releases. Updated the bootstrap E-guard (renew present, acquire ABSENT)
+  + the round-9/11 P1-C guard (ownership verify now via `verifyOwner(owner, ownerGeneration)` = lockAndVerify with
+  assert fallback). gate7 51 + account-onboarding-bootstrap 194 still green.
+- STILL: migration UNAPPLIED, nothing committed/pushed/deployed/dispatched, DataDoe spend 0.
+
+### Codex-review revision ROUND 12 (2026-09-07, WORKING TREE -- uncommitted, approval-gated) -- WITH REAL POSTGRES PROOF
+
+Closed the transaction-scoped-clock staleness + mandated the atomic safe-close. **verify green: 164 steps / 140
+suites incl. build:check (210s); git diff --check clean; api/*.js still 12; DataDoe spend 0; node --check clean.**
+This round the SQL is NO LONGER only modeled: a disposable **embedded-postgres (real PostgreSQL 18.4)** in an
+ISOLATED scratchpad executed migration 20260919 (twice = idempotent) and ran the concurrency proofs (repo
+package.json/node_modules UNTOUCHED; nothing installed into the repo).
+
+- **(Mandatory fix 1) STALE TRANSACTION CLOCK.** PostgreSQL `now()`/`transaction_timestamp()` is fixed at BEGIN;
+  the lease RPCs sampled it into `v_now` BEFORE `pg_advisory_xact_lock` + `SELECT ... FOR UPDATE` (both can BLOCK),
+  so a lease that expired WHILE waiting for the lock was judged on a stale clock -- it could be renewed / released /
+  safe-closed / fenced-published after expiry. FIX: `acquire/renew/release/cas_report_snapshot_if_newer_fenced`
+  now sample `v_now := clock_timestamp()` ONLY AFTER those locks are held, and every expiry decision + new lease
+  timestamp uses that post-lock wall clock; `read_control_plane_lease` reports expired/held via `clock_timestamp()`;
+  the pg-store `lockAndVerifyControlLease` computes `held` via `clock_timestamp()` in the FOR UPDATE row read.
+- **(Mandatory fix 2) ATOMIC SAFE-CLOSE MANDATORY.** Removed the non-locking assert fallback: the rollback verifies
+  ownership ONLY via `store.lockAndVerifyControlLease(owner, ownerGeneration)` (advisory + FOR UPDATE held through
+  release + COMMIT). A lease-enabled store must now provide the COMPLETE coherent interface
+  [acquire, renew, release, assert, lockAndVerify]; a PARTIAL store is REFUSED BEFORE BEGIN with zero writes (a
+  missing atomic lock can never silently downgrade fencing). All in-memory test stores updated to model the lock.
+- **REAL-POSTGRES EVIDENCE (scratchpad/pgproof, embedded-postgres 18.4, 16/16 passed):** idempotent migration
+  replay; grants (service_role executes all 5 RPCs, authenticated/anon NONE, lease table SELECT-only); REAL
+  advisory-lock serialization + FOR UPDATE blocking (a concurrent acquire BLOCKS, never races); **the decisive
+  before/after -- lock-wait crossing expiry: the FIXED renew returns lost/expired (lease NOT extended), while a
+  STALE copy sampling now() WRONGLY returns renewed**; fenced CAS writes 1 row on a valid fence and 0 rows on
+  superseded/expired/foreign (atomic in the write tx); rollback atomicity (an acquire that ROLLS BACK leaves the
+  lease untouched). Reproduce: `node scratchpad/pgproof/pgproof.mjs`.
+- **Offline regressions:** round11-publication-fence.test.js grew 17->22 (D1-D3 partial-store-fails-closed via the
+  REAL transaction; C7 clock_timestamp guard; C8 complete-interface guard; C9 every-RPC-samples-clock guard).
+  bootstrap 194 (3 in-memory lease stores completed to the mandatory interface). The in-memory model is labeled a
+  MODEL; the PostgreSQL run is the runtime proof.
+- STILL: migration UNAPPLIED, nothing committed/pushed/deployed/dispatched, DataDoe spend 0, token delta 0.
+
 ## Permission-cache scope isolation: fingerprint-keyed cache/coalescer + fail-closed purge (2026-09-04)
 
 Closed the two remaining permission-cache findings. Browser cache/in-flight only; no report math/UI/schedulers/grants

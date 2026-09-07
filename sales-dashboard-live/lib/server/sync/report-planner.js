@@ -616,9 +616,14 @@ export function planKeywordRank({ accountId, country, currency, connections, asO
  * + primary/dd-secondary isolation come from the shared resolver; the STAGED-cycle driver decides WHEN the
  * downstream exports are actually spent. Shared inventory/catalog identities dedupe with other reports.
  */
-export function planSalesMovers({ accountId, country, currency, connections, asOf, probeSignal = null }) {
+export function planSalesMovers({ accountId, country, currency, connections, asOf, inventoryAsOf = null, probeSignal = null }) {
   const scope = resolveAccountScope({ accountId, country, currency, connections });
   const end = String(asOf);
+  // ONE explicit inventory snapshot day (D-1). The scheduler's report asOf is ALREADY D-1, so the
+  // default is `end` itself -- NEVER end-1 (that would request D-2 on a scheduled run). An explicit
+  // inventoryAsOf (threaded from the trusted edge) always wins and is pinned into the context.
+  const invAsOf = inventoryAsOf == null ? end : String(inventoryAsOf);
+  if (!isValidCalendarDate(invAsOf)) throw new Error("planSalesMovers inventoryAsOf must be a real calendar date.");
   const probeFrom = addDaysStr(end, -(SM_LAG_DAYS + SM_WINDOW_DAYS * 3));
   const windowsByRequestKey = {
     "sales-movers:sales-latest-probe": [{ from: probeFrom, to: end }],
@@ -635,7 +640,7 @@ export function planSalesMovers({ accountId, country, currency, connections, asO
       const { recent, prior } = salesMoversWindows(probeSignal.latestReportedDate);
       windowsByRequestKey["sales-movers:traffic"] = [recent, prior];
       windowsByRequestKey["sales-movers:ads"] = [recent, prior];
-      windowsByRequestKey["sales-movers:inventory"] = [{ from: addDaysStr(end, -1), to: addDaysStr(end, -1) }];
+      windowsByRequestKey["sales-movers:inventory"] = [{ from: invAsOf, to: invAsOf }];
       windowsByRequestKey["sales-movers:catalog"] = [{ from: null, to: null }];
     }
   }
@@ -650,7 +655,7 @@ export function planSalesMovers({ accountId, country, currency, connections, asO
     connectionId: scope.connectionId,
     bucket: scope.bucket,
     sources: decorateSources(sources, { reportKey: "sales-movers", connectionId: scope.connectionId, bucket: scope.bucket }),
-    context: { to: end, rawSellerId: scope.rawSellerId },
+    context: { to: end, inventoryAsOf: invAsOf, rawSellerId: scope.rawSellerId },
   };
 }
 
@@ -752,9 +757,13 @@ export function planListingOptimizer({ accountId, country, currency, connections
  * generic owner-scoped source cycle, never a dedicated staged-cycle driver. Shared inventory/catalog
  * canonical hashes dedupe with Sales Movers + other insight reports.
  */
-export function planBuyBoxLoss({ accountId, country, currency, connections, asOf }) {
+export function planBuyBoxLoss({ accountId, country, currency, connections, asOf, inventoryAsOf = null }) {
   const scope = resolveAccountScope({ accountId, country, currency, connections });
   const end = String(asOf);
+  // ONE explicit inventory snapshot day (D-1). The scheduler's report asOf is ALREADY D-1, so the
+  // default is `end` itself -- NEVER end-1 (that would request D-2 on a scheduled run).
+  const invAsOf = inventoryAsOf == null ? end : String(inventoryAsOf);
+  if (!isValidCalendarDate(invAsOf)) throw new Error("planBuyBoxLoss inventoryAsOf must be a real calendar date.");
   const from = addDaysStr(end, -(BB_WINDOW_DAYS - 1));
   // The daily buy-box source keeps its four 7-day slices; the canonical OLI sales/units source is sliced
   // by canonicalOliSlices (Blocker 1) so its interior + asOf-boundary slices share request_hashes with the
@@ -763,7 +772,7 @@ export function planBuyBoxLoss({ accountId, country, currency, connections, asOf
   const windowsByRequestKey = {
     "buy-box-loss:daily": dailySlices,
     "buy-box-loss:oli-sales": canonicalOliSlices(from, end),
-    "buy-box-loss:inventory": [{ from: addDaysStr(end, -1), to: addDaysStr(end, -1) }],
+    "buy-box-loss:inventory": [{ from: invAsOf, to: invAsOf }],
     "buy-box-loss:catalog": [{ from: null, to: null }],
   };
   const sources = reportSourceRequestHashes({
@@ -777,7 +786,7 @@ export function planBuyBoxLoss({ accountId, country, currency, connections, asOf
     connectionId: scope.connectionId,
     bucket: scope.bucket,
     sources: decorateSources(sources, { reportKey: "buy-box-loss", connectionId: scope.connectionId, bucket: scope.bucket }),
-    context: { to: end, rawSellerId: scope.rawSellerId },
+    context: { to: end, inventoryAsOf: invAsOf, rawSellerId: scope.rawSellerId },
   };
 }
 
@@ -826,21 +835,26 @@ export function planReturnsLeakage({ accountId, country, currency, connections, 
 /**
  * Plan Listing Health for ONE account. Emits the exact route requests: the no-date Listings snapshot, the
  * no-date OPTIONAL Listings (Raw JSON) enrichment, the grouped 30d Sales `[asOf-29d, asOf]`, the shared FBA
- * inventory snapshot (the single day `[asOf-1, asOf-1]`), and the shared no-date catalog -- all for the one raw seller id.
+ * inventory snapshot (the EXACT single day [inventoryAsOf .. inventoryAsOf], D-1), and the shared no-date
+ * catalog -- all for the one raw seller id.
  * All non-raw sources are INDEPENDENTLY required (no probe / staged activation); listings-raw degrades (does
  * not block). So Listing Health uses the generic owner-scoped source cycle, never a dedicated staged driver.
  * The inventory canonical hash dedupes with Sales Movers + Buy Box; the catalog dedupes with Sales Movers +
  * Buy Box + Returns + other insight catalogs.
  */
-export function planListingHealth({ accountId, country, currency, connections, asOf }) {
+export function planListingHealth({ accountId, country, currency, connections, asOf, inventoryAsOf = null }) {
   const scope = resolveAccountScope({ accountId, country, currency, connections });
   const end = String(asOf);
+  // ONE explicit inventory snapshot day (D-1). The scheduler's report asOf is ALREADY D-1, so the
+  // default is `end` itself -- NEVER end-1 (that would request D-2 on a scheduled run).
+  const invAsOf = inventoryAsOf == null ? end : String(inventoryAsOf);
+  if (!isValidCalendarDate(invAsOf)) throw new Error("planListingHealth inventoryAsOf must be a real calendar date.");
   const salesFrom = addDaysStr(end, -(LH_SALES_WINDOW_DAYS - 1));
   const windowsByRequestKey = {
     "listing-health:listings": [{ from: null, to: null }],
     "listing-health:listings-raw": [{ from: null, to: null }],
     "listing-health:sales": [{ from: salesFrom, to: end }],
-    "listing-health:inventory": [{ from: addDaysStr(end, -1), to: addDaysStr(end, -1) }],
+    "listing-health:inventory": [{ from: invAsOf, to: invAsOf }],
     "listing-health:catalog": [{ from: null, to: null }],
   };
   const sources = reportSourceRequestHashes({
@@ -854,7 +868,7 @@ export function planListingHealth({ accountId, country, currency, connections, a
     connectionId: scope.connectionId,
     bucket: scope.bucket,
     sources: decorateSources(sources, { reportKey: "listing-health", connectionId: scope.connectionId, bucket: scope.bucket }),
-    context: { to: end, rawSellerId: scope.rawSellerId },
+    context: { to: end, inventoryAsOf: invAsOf, rawSellerId: scope.rawSellerId },
   };
 }
 
@@ -913,8 +927,11 @@ export function buildShadowReportPlan({ accounts = [], reportKeys = SHADOW_PLANN
     const asOf = typeof asOfFor === "function" ? asOfFor(account.country) : account.asOf;
     for (const reportKey of perAccountKeys) {
       // `name` is threaded for FBA Shipment Plan (its payload carries the authoritative account
-      // name); the other planners ignore it.
-      reportRequests.push(PLANNERS[reportKey]({ accountId: account.accountId, name: account.name, country: account.country, currency: account.currency, connections, asOf }));
+      // name); the other planners ignore it. `inventoryAsOf` is the ONE explicit inventory snapshot
+      // day (D-1) for the inventory-consuming planners (buy-box-loss / listing-health); planners
+      // without an inventory source ignore it, and a null defaults inside each planner to the
+      // report asOf (which on a scheduled run is ALREADY D-1 -- nothing may ever resolve D-2).
+      reportRequests.push(PLANNERS[reportKey]({ accountId: account.accountId, name: account.name, country: account.country, currency: account.currency, connections, asOf, inventoryAsOf }));
     }
   }
   if (keys.includes("fba-plan")) {

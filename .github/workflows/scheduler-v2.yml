@@ -53,6 +53,14 @@ on:
         description: "External scheduler identity used by the Cloudflare watchdog (external/<region>/<D-1>); ordinary manual runs may keep 'manual'."
         required: false
         default: "manual"
+      run_scope:
+        description: "full (default: the whole region) | bootstrap (ONLY the region's atomically-claimed onboarding accounts, resolved from durable account_onboarding state in the backend -- account IDs are NEVER taken from inputs -- with sources gated by the enforced onboarding-wave budget; no publish, no v3). Scheduled events are ALWAYS full."
+        required: false
+        default: "full"
+        type: choice
+        options:
+          - full
+          - bootstrap
 
 concurrency:
   # One in-flight run PER REGION (regions are independent); a re-dispatch of the same region queues behind its own run.
@@ -82,6 +90,7 @@ jobs:
       run_required: ${{ steps.guard.outputs.run_required }}
       already_published: ${{ steps.guard.outputs.already_published }}
       token_proceed: ${{ steps.tokengate.outputs.proceed }}
+      scope: ${{ steps.cfg.outputs.scope }}
       oli_ready: ${{ steps.guard.outputs.already_published == 'true' || steps.readiness.outputs.proceed == 'true' }}
       effective_asof: ${{ steps.readiness.outputs.effective_asof }}
     env:
@@ -122,15 +131,20 @@ jobs:
               "30 16 * * *") region="us-ca"     ;;
               *) echo "Unknown cron '${{ github.event.schedule }}' -- refusing (fail closed)." >&2; exit 1 ;;
             esac
-            # A SCHEDULED event is ALWAYS normal mode -- force-latest can be selected ONLY by workflow_dispatch.
+            # A SCHEDULED event is ALWAYS normal mode + FULL scope -- force-latest and the bootstrap scope
+            # can be selected ONLY by workflow_dispatch.
             mode="normal"
+            scope="full"
           else
             region="${{ github.event.inputs.region }}"
             mode="${{ github.event.inputs.refresh_mode }}"
+            scope="${{ github.event.inputs.run_scope }}"
             if [ -z "$mode" ]; then mode="normal"; fi
+            if [ -z "$scope" ]; then scope="full"; fi
           fi
           if [ "$region" != "india" ] && [ "$region" != "europe-au" ] && [ "$region" != "us-ca" ]; then echo "Invalid region '$region'." >&2; exit 1; fi
           if [ "$mode" != "normal" ] && [ "$mode" != "force-latest" ]; then echo "Invalid refresh_mode '$mode'." >&2; exit 1; fi
+          if [ "$scope" != "full" ] && [ "$scope" != "bootstrap" ]; then echo "Invalid run_scope '$scope'." >&2; exit 1; fi
           # Per-region balance FLOOR for the token gate (worst-case dry-run: india ~10, europe-au ~16, us-ca ~8 tokens).
           case "$region" in
             "india")     tokenmin=10 ;;
@@ -151,6 +165,7 @@ jobs:
           echo "asof=$asof" >> "$GITHUB_OUTPUT"
           echo "inventory_asof=$inventory_asof" >> "$GITHUB_OUTPUT"
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "scope=$scope" >> "$GITHUB_OUTPUT"
           echo "tokenmin=$tokenmin" >> "$GITHUB_OUTPUT"
           echo "opkey=$opkey" >> "$GITHUB_OUTPUT"
           {
@@ -158,12 +173,20 @@ jobs:
             echo "- event: ${{ github.event_name }} · cron: \`${{ github.event.schedule }}\` · dispatch identity: \`${{ inputs.dispatch_id }}\`";
             echo "- resolved region: **$region** (publishes ONLY this region; every other region is untouched)";
             echo "- head/workflow SHA: \`${{ github.sha }}\` · run id: ${{ github.run_id }} (attempt ${{ github.run_attempt }})";
-            echo "- requestedAsOf (D-1): $asof · inventoryAsOf (D-1, shared FBA+v3): $inventory_asof · refresh_mode: $mode · operation key: \`$opkey\` · token floor: $tokenmin";
+            echo "- requestedAsOf (D-1): $asof · inventoryAsOf (D-1, shared FBA+v3): $inventory_asof · refresh_mode: $mode · run_scope: $scope · operation key: \`$opkey\` · token floor: $tokenmin";
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Resolved event=${{ github.event_name }} cron='${{ github.event.schedule }}' region=$region requestedAsOf=$asof inventoryAsOf=$inventory_asof mode=$mode opkey=$opkey tokenmin=$tokenmin"
 
       - name: Install dependencies
         run: npm ci
+
+      # BOOTSTRAP ack (running): the dispatched run's durable START receipt, keyed by the exact dispatch
+      # identity + this workflow run's OWN token (github run_id-run_attempt). The ack STAMPS the token so
+      # only THIS run may later ack completed/failed -- a superseded/expired run's late ack is a typed
+      # stale-ack no-op. Full-scope + scheduled runs skip it; a manual run with no lease row is a green no-op.
+      - name: Acknowledge bootstrap dispatch (running)
+        if: steps.cfg.outputs.scope == 'bootstrap'
+        run: node scripts/release/onboarding-dispatch-ack.mjs --region=${{ steps.cfg.outputs.region }} --dispatch-id=${{ inputs.dispatch_id }} --phase=running --run-token=${{ github.run_id }}-${{ github.run_attempt }}
 
       # Per-REGION whole-workflow duplicate guard. A delayed GitHub cron and the +20min Cloudflare watchdog can both
       # dispatch the same region D-1. Before cycle/token/control I/O, prove the exact current region-account x 3-report
@@ -171,7 +194,7 @@ jobs:
       # creates/writes/tokens. Incomplete => continue through the unchanged fail-closed pipeline.
       - name: Prove this region's D-1 is not already fully published (read-only duplicate guard)
         id: guard
-        run: node scripts/release/verify-us-d1-published.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }}
+        run: node scripts/release/verify-us-d1-published.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }} --account-scope=${{ steps.cfg.outputs.scope }}
 
       - name: Report already-published no-op
         if: steps.guard.outputs.already_published == 'true'
@@ -180,7 +203,7 @@ jobs:
       # (step 1) cycle-identity preflight: a same-date terminal collision fails EARLY, before any token read.
       - name: Cycle-identity preflight (this region)
         if: steps.guard.outputs.run_required == 'true'
-        run: node scripts/release/scheduled-cycle-preflight.mjs --bucket=${{ steps.cfg.outputs.region }}
+        run: node scripts/release/scheduled-cycle-preflight.mjs --bucket=${{ steps.cfg.outputs.region }} --account-scope=${{ steps.cfg.outputs.scope }}
 
       # (step 2) Token gate: per-region balance floor. Unreadable balance hard-fails; insufficient tokens is a typed
       # safe skip (proceed=false) so every create/control step below is skipped.
@@ -192,11 +215,14 @@ jobs:
       # (step 3) Refresh OLI to D-1 for THIS region (supersede a stale terminal cycle + auto-escalate a fresh fetch of
       # the still-missing <=5-seller batches, within the region's derived create/token ceiling). Record its raw outcome
       # instead of aborting the job so the independent Campaign Ads and FBA pipelines still get their own attempt.
+      # In BOOTSTRAP scope, --dispatch-id binds every paid step to the IMMUTABLE (region, dispatch_id) wave
+      # row (the account set + pinned dates come from there, never from --requested-as-of); it is ignored in
+      # full scope. --requested-as-of stays for the natural path.
       - name: Refresh OLI to D-1 (supersede stale terminal cycle + auto-escalate fresh fetch)
         id: oli
         continue-on-error: true
         if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true'
-        run: node scripts/release/oli-refresh-d1.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }} --refresh-mode=${{ steps.cfg.outputs.mode }} --run-id=${{ github.run_id }}
+        run: node scripts/release/oli-refresh-d1.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }} --refresh-mode=${{ steps.cfg.outputs.mode }} --run-id=${{ github.run_id }} --account-scope=${{ steps.cfg.outputs.scope }} --dispatch-id=${{ inputs.dispatch_id }}
 
       # (step 4) Refresh CAMPAIGN Ads for THIS region ONCE (coverage mode, 21-day rolling window). Campaign is the ONLY
       # active Ads source and scheduler-v2 is its ONE automatic owner. Idempotent (already-covered => zero creates).
@@ -207,38 +233,64 @@ jobs:
         id: campaign
         continue-on-error: true
         if: always() && steps.guard.outputs.run_required == 'true' && steps.tokengate.outcome == 'success' && steps.tokengate.outputs.proceed == 'true'
-        run: node scripts/release/scheduled-campaign-ads-refresh.mjs --bucket=${{ steps.cfg.outputs.region }} --as-of=${{ steps.cfg.outputs.asof }}
+        run: node scripts/release/scheduled-campaign-ads-refresh.mjs --bucket=${{ steps.cfg.outputs.region }} --as-of=${{ steps.cfg.outputs.asof }} --account-scope=${{ steps.cfg.outputs.scope }} --dispatch-id=${{ inputs.dispatch_id }}
 
-      # (step 5) STRICT D-1 readiness proof (read-only). Publication requires EVERY account gapless through the EXACT
-      # requestedAsOf (D-1). A settlement tail (proven only through D-2), interior gap, blank provenance, or unreadable
-      # coverage is a typed DATADOE_D1_NOT_READY: fail closed BEFORE any control is opened, publish steps skipped, LKG retained.
+      # (step 5, FULL scope only) STRICT D-1 readiness proof (read-only). Publication requires EVERY account gapless
+      # through the EXACT requestedAsOf (D-1). A settlement tail, interior gap, blank provenance, or unreadable coverage
+      # is a typed DATADOE_D1_NOT_READY: fail closed BEFORE any control is opened. BOOTSTRAP scope skips this -- the
+      # scoped bootstrap publication proves readiness per account INSIDE its own derive/finalize (a not-ready account
+      # yields no validated report job -> finalize refuses -> the publication fails -> the run acks 'failed').
       - name: Prove previous-day (D-1) readiness for this region (read-only; strict)
         id: readiness
-        if: always() && steps.guard.outputs.run_required == 'true' && steps.tokengate.outcome == 'success' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success'
-        run: node scripts/release/verify-bucket-readiness.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }}
+        if: always() && steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outcome == 'success' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success'
+        run: node scripts/release/verify-bucket-readiness.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }} --account-scope=full
 
-      # (step 7) Open publication controls for ONLY this region's accounts x 3 keys (all_primary stays false).
+      # (step 7, FULL scope) Open publication controls for this region x 3 keys (all_primary stays false).
       - name: Open publication controls (this region only)
-        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
-        run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.region }}
+        id: full_controls
+        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
+        run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.region }} --account-scope=full --owner-token=${{ github.run_id }}-${{ github.run_attempt }}
 
-      # (steps 6/8/9/10) Catalog reuse/refresh (ONE create/day shared across ALL regions via the date-only operation
-      # key) + derive + preflight EVERY account in this region + publish this region x3 + live read-back. Reached ONLY
-      # after the strict D-1 proof; --strict-d1 fails closed (never publishes) if the derive would clamp below D-1.
+      # (steps 6/8/9/10, FULL scope) Catalog reuse/refresh + derive + preflight EVERY account in this region + publish
+      # this region x3 + live read-back. Reached ONLY after the strict D-1 proof; --strict-d1 fails closed below D-1.
       - name: Refresh Catalog + derive/preflight/publish this region at D-1 + live read-back
-        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
-        run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.region }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }} --strict-d1
+        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
+        run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.region }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }} --run-token=${{ github.run_id }}-${{ github.run_attempt }} --owner-generation=${{ steps.full_controls.outputs.generation }} --strict-d1
 
-      # (step 11) Rebuild + verify Brand View membership from ALL current brand-sales snapshots (this region's fresh +
-      # every other region's latest-known-good) -- Supabase-only, zero tokens.
+      # (step 11, FULL scope) Rebuild + verify Brand View membership from ALL current brand-sales snapshots.
       - name: Rebuild + verify Brand View membership (this region's fresh + others' LKG; Supabase-only)
-        if: steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
+        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
         run: node scripts/release/rebuild-brand-membership.mjs
 
-      # (step 12) Safe-close publication controls after every real pipeline attempt, idempotent + discovery-independent.
-      - name: Safe-close publication controls (ALWAYS, idempotent)
-        if: always() && steps.guard.outputs.run_required == 'true'
-        run: node scripts/release/priority-control-package.mjs --rollback
+      # ===================== BOOTSTRAP scope: TRUE SCOPED PUBLICATION of EXACTLY the wave accounts ==============
+      # (bootstrap step A) Open publication controls for EXACTLY the frozen dispatch-wave accounts (resolved from
+      # the IMMUTABLE (region, dispatch_id) row -- never recomputed). No unrelated account enters the scope; an
+      # empty ready set is a zero-write no-op.
+      - name: (bootstrap) Open publication controls for EXACTLY the dispatch-wave accounts
+        id: bootstrap_controls
+        if: steps.cfg.outputs.scope == 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success'
+        run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.region }} --account-scope=bootstrap --dispatch-id=${{ inputs.dispatch_id }} --owner-token=${{ github.run_id }}-${{ github.run_attempt }}
+
+      # (bootstrap step B) SCOPED publication: derive/finalize/publish/live-read-back EXACTLY the frozen wave
+      # accounts over the DEDICATED bootstrap-<region> cycle -- no collision with the natural daily cycle, no
+      # outside-wave account touched. A not-ready/missing account fails the derive/finalize (never a partial).
+      - name: (bootstrap) Scoped publication of the dispatch-wave dashboards
+        id: bootstrap_publish
+        if: steps.cfg.outputs.scope == 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success'
+        run: node scripts/release/bootstrap-publish.mjs --region=${{ steps.cfg.outputs.region }} --dispatch-id=${{ inputs.dispatch_id }} --run-token=${{ github.run_id }}-${{ github.run_attempt }} --owner-generation=${{ steps.bootstrap_controls.outputs.generation }} --strict-d1
+
+      # (bootstrap step C) Rebuild + verify Brand View membership (this region's fresh wave + others' LKG).
+      - name: (bootstrap) Rebuild + verify Brand View membership (Supabase-only)
+        if: steps.cfg.outputs.scope == 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.bootstrap_publish.outcome == 'success'
+        run: node scripts/release/rebuild-brand-membership.mjs
+
+      # (step 12) Safe-close publication controls -- ONLY when the matching --apply (full OR bootstrap) actually
+      # succeeded and EMITTED a valid fencing generation. Round-10 (blocker 4): the safe-close is GATED on a
+      # non-blank generation and passes the EXACT one, so it never runs with a blank/owner-only generation; if no
+      # apply emitted a generation (apply skipped/failed), cleanup is honestly left for the lease TTL / --reclaim-stale.
+      - name: Safe-close publication controls (only when apply emitted a generation)
+        if: always() && steps.guard.outputs.run_required == 'true' && (steps.full_controls.outputs.generation != '' || steps.bootstrap_controls.outputs.generation != '')
+        run: node scripts/release/priority-control-package.mjs --rollback --owner-token=${{ github.run_id }}-${{ github.run_attempt }} --owner-generation=${{ steps.full_controls.outputs.generation || steps.bootstrap_controls.outputs.generation }}
 
       - name: Report insufficient-tokens skip
         if: always() && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed != 'true' && steps.tokengate.outcome == 'success'
@@ -300,7 +352,7 @@ jobs:
       # fetch (EXACTLY [D-1 .. D-1]) and the downstream Listing Health v3 job adopt ONE inventory identity (v3
       # reuses this exact cache).
       - name: FBA go-live for this region (batched fetch -> derive -> publish -> ownership -> ALWAYS safe-close)
-        run: node scripts/release/fba-plan-golive.mjs --mode=go-live --region=${{ needs.run.outputs.region }} --max-tokens=${{ steps.fcfg.outputs.maxtok }} --inventory-as-of=${{ needs.run.outputs.inventory_asof }}
+        run: node scripts/release/fba-plan-golive.mjs --mode=go-live --region=${{ needs.run.outputs.region }} --max-tokens=${{ steps.fcfg.outputs.maxtok }} --inventory-as-of=${{ needs.run.outputs.inventory_asof }} --account-scope=${{ needs.run.outputs.scope }} --dispatch-id=${{ inputs.dispatch_id }} --run-token=${{ github.run_id }}-${{ github.run_attempt }}
 
   # Listing Health v3 SHADOW ingestion -- runs ONLY after THIS region's FBA inventory job SUCCEEDED, so v3's reuse-only
   # inventory tranche adopts the fresh FBA Plan inventory cache (zero inventory creates). It is NOT a new scheduler
@@ -312,7 +364,9 @@ jobs:
   # within the per-region ceiling (India=4, Europe-AU=8, US-CA=4); inventory / OLI / Product Catalog are zero-create.
   listing-health-v3:
     needs: [run, fba]
-    if: always() && needs.run.outputs.region != '' && needs.fba.result == 'success'
+    # A BOOTSTRAP-scoped run never ingests v3 (its per-region export ceiling belongs to the natural daily
+    # run; the new accounts' shadow snapshots land on the next full run instead).
+    if: always() && needs.run.outputs.region != '' && needs.fba.result == 'success' && needs.run.outputs.scope != 'bootstrap'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     defaults:
@@ -360,7 +414,10 @@ jobs:
   # is present only so the operator can resolve the primary organization fingerprint for its durable reads.
   materialize:
     needs: [run]
-    if: always() && needs.run.outputs.region != ''
+    # FULL-region materializers process EVERY region account and are SKIPPED in bootstrap scope (a
+    # bootstrap run must write ZERO snapshots outside its immutable wave; the wave's Brand View converges
+    # on the next natural run). Byte-identical for the natural (full) path.
+    if: always() && needs.run.outputs.region != '' && needs.run.outputs.scope != 'bootstrap'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     defaults:
@@ -404,7 +461,10 @@ jobs:
   # serve builders + identities, so a natural run converges the pages with no user interaction.
   materialize-inventory:
     needs: [run, fba, materialize]
-    if: always() && needs.run.outputs.region != ''
+    # SKIPPED in bootstrap scope (full-region Brand View producer; must write ZERO outside-wave snapshots).
+    # Byte-identical for the natural (full) path. (materialize is already bootstrap-skipped, so this job's
+    # needs on it resolves 'skipped' in bootstrap and the explicit guard keeps it off too.)
+    if: always() && needs.run.outputs.region != '' && needs.run.outputs.scope != 'bootstrap'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     defaults:
@@ -438,3 +498,50 @@ jobs:
       # marketplaceToday("IN")); no --as-of override. Zero export; converges brand-view + brand-view-portfolio.
       - name: Materialize Brand View + Portfolio for this region (zero export; idempotent upsert)
         run: node scripts/release/report-materialization-brandview.mjs --region=${{ needs.run.outputs.region }} --mode=live
+
+  # BOOTSTRAP ack (completed | failed) -- the dispatched run's durable FINISH receipt, keyed by the exact
+  # dispatch identity. 'completed' is acked ONLY when: the `run` job is green (its honesty step fails it on
+  # any OLI/Campaign source failure, and the scoped publication ran inside it) AND the `fba` job is green
+  # AND a READ-ONLY completion proof (verify-bootstrap-published) confirms EVERY frozen wave account has its
+  # required live dashboards (Daily Reporting + Brand Sales + Brand Inventory; FBA present or honest-
+  # unavailable). ANYTHING else -- a missing publication/read-back, a deferred account, an empty/changed
+  # scope -- acks 'failed' (retryable after the bounded backoff), NEVER 'completed'. Full-scope runs skip
+  # this job entirely.
+  bootstrap-ack:
+    needs: [run, fba]
+    if: always() && needs.run.outputs.scope == 'bootstrap'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install dependencies
+        run: npm ci
+      # The completion PROOF gate: only when the run + fba jobs are green does the read-only verify run;
+      # it exits nonzero unless every wave account is live. 'completed' is acked ONLY on its success.
+      - name: Prove every wave account's dashboards are live (read-only completion gate)
+        id: verify_published
+        continue-on-error: true
+        if: needs.run.result == 'success' && needs.fba.result == 'success'
+        run: node scripts/release/verify-bootstrap-published.mjs --region=${{ needs.run.outputs.region }} --dispatch-id=${{ inputs.dispatch_id }}
+      # The completed/failed ack carries the SAME run token the run job stamped at 'running' (github.run_id
+      # + run_attempt are constant across a workflow run's jobs), so it owns the lease; a superseded run's
+      # token would not match and its ack would be a stale-ack no-op.
+      - name: Acknowledge bootstrap dispatch (completed only when the completion proof passed)
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.run.result }}" = "success" ] && [ "${{ needs.fba.result }}" = "success" ] && [ "${{ steps.verify_published.outcome }}" = "success" ]; then
+            node scripts/release/onboarding-dispatch-ack.mjs --region=${{ needs.run.outputs.region }} --dispatch-id=${{ inputs.dispatch_id }} --phase=completed --run-token=${{ github.run_id }}-${{ github.run_attempt }}
+          else
+            node scripts/release/onboarding-dispatch-ack.mjs --region=${{ needs.run.outputs.region }} --dispatch-id=${{ inputs.dispatch_id }} --phase=failed --note=RUN_${{ needs.run.result }}_FBA_${{ needs.fba.result }}_VERIFY_${{ steps.verify_published.outcome }} --run-token=${{ github.run_id }}-${{ github.run_attempt }}
+          fi

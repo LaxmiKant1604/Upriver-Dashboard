@@ -174,8 +174,24 @@ export async function advanceFbaPlanBucket({
   // Adaptive self-heal: proven-overflow raw seller ids to isolate into single-seller inventory batches (empty =>
   // byte-identical default batching). Passed straight to the plan via runtime.run.
   overflowSellers = new Set(),
+  // OPTIONAL wave-bound cycle-bucket override (default: the natural <region>-fba cycle). A scoped bootstrap FBA
+  // go-live passes bootstrap-fba-<region>-<hash16> so its dedicated inventory cycle never collides with (or is
+  // blocked by) a terminal natural <region>-fba cycle. Absent => byte-identical natural behavior.
+  cycleBucketOverride = null,
+  // STRICT per-account honesty (bootstrap): when true, ANY required included account with a failed
+  // publish/readback disposition makes the whole result phase:'partial' ok:false (never ok:true with an
+  // unpublished required account). fba-plan has no legitimate "unavailable" outcome, so an empty-inventory
+  // account still PUBLISHES (inventoryAvailable:false) and is NOT failed; only a genuine failure fails.
+  // Default false => byte-identical natural behavior (LKG-tolerant per-account).
+  strict = false,
+  // Round-8 blocker 1 PUBLICATION FENCING: an injected control-lease HEARTBEAT. Called immediately BEFORE each
+  // bounded publish chunk; it must renew the exact fence this operation captured at controls.apply and return
+  // { ok:true } only while this operation still owns the unexpired lease. On { ok:false } (expired / reclaimed /
+  // taken over / renew error) the publisher STOPS immediately, publishes nothing further, preserves LKG, and
+  // returns a typed retryable contention result. Default null => no fencing (byte-identical natural behavior).
+  verifyLease = null,
 } = {}) {
-  const cycleBucket = fbaCycleBucket(bucket);
+  const cycleBucket = cycleBucketOverride || fbaCycleBucket(bucket);
   const cycleDate = inventoryAsOf || asOf;
   const included = [...new Set((includedIds || []).map(S).filter((x) => x))];
   const batches = cost && cost.sourceJobs != null ? cost.sourceJobs : null;
@@ -266,12 +282,21 @@ export async function advanceFbaPlanBucket({
   if (!cycle || !cycleId || S(cycle.id) !== S(cycleId) || !TERMINAL.has(S(cycle.status))) {
     return { ...base, phase: "sync", ok: false, problems: [bucket + " dedicated " + cycleBucket + " cycle is missing, mismatched, or non-terminal; refusing stale publication"] };
   }
+  base.cycleId = S(cycleId); // the durable FBA cycle this operation published from (evidence provenance)
 
   // ---------------- PUBLISH phase: open gates -> preflight+publish -> ALWAYS safe-close -> read-back ----------
   const published = [];
   const liveIdentity = new Map(); // accountId -> { liveReportKey, paramsHash }
   const problems = [];
   const processed = new Set(); // published (OK/already-current) OR conclusively failed this operation
+  // Per-account outcome ledger for THIS operation (Round-7, blocker 3 HONESTY): the fba-plan derivation NEVER
+  // emits a self-declared-unavailable payload -- an EMPTY validated D-1 inventory is an honest VALID snapshot
+  // (inventoryAvailable:false) that PUBLISHES (its manifest identity proves completion), and a
+  // missing/failed/truncated/malformed source THROWS in derive (blocked -> LKG preserved). So there is NO
+  // "source-incapable" outcome for fba-plan: any non-published disposition -- INCLUDING an unexpected
+  // 'data-unavailable' -- is a FAILURE to retry (LKG untouched), NEVER "permanently unavailable".
+  const failed = []; // [{ accountId, disposition }]
+  let leaseLost = null; // set if the control-lease fence heartbeat reports we lost the lease mid-publish
   await controls.apply();
   try {
     // ONE publish pass per account (publish() runs the SAME four gates internally and returns the exact live
@@ -287,21 +312,49 @@ export async function advanceFbaPlanBucket({
     const PUBLISH_CONCURRENCY = 6;
     for (let i = 0; i < included.length; i += PUBLISH_CONCURRENCY) {
       if (outOfTime()) break; // unprocessed accounts publish on the next poll
+      // FENCING (blocker 1): renew + prove we still own the unexpired control lease IMMEDIATELY before this
+      // chunk. If the fence is lost (expired / reclaimed / taken over), STOP -- publish nothing further.
+      if (typeof verifyLease === "function") {
+        let fence;
+        try { fence = await verifyLease(); } catch (e) { fence = { ok: false, reason: "renew-threw:" + S(e && e.message ? e.message : e) }; }
+        if (!fence || fence.ok !== true) { leaseLost = S(fence && fence.reason) || "lease-lost"; break; }
+      }
       const chunk = included.slice(i, i + PUBLISH_CONCURRENCY);
       const results = await Promise.all(chunk.map((accountId) => publisher.publish("fba-plan", accountId).then((r) => ({ accountId, r }))));
+      // WRITE-BOUNDARY FENCING (Round-9 P0-A, property 6): EACH account's publish fences the exact control fence
+      // INSIDE the report_snapshots CAS. A 'lease-lost' disposition means that write wrote ZERO rows because the
+      // lease was superseded/expired/reclaimed -- so this operation lost the lease MID-CHUNK. STOP: leave the
+      // lease-lost account unprocessed (retryable, LKG untouched), never counted as a per-account failure.
+      let chunkLeaseLost = null;
       for (const { accountId, r } of results) {
-        if (OK_PUBLISH.has(S(r.disposition)) && S(r.liveReportKey) && S(r.paramsHash)) {
+        const disp = S(r.disposition);
+        if (disp === "lease-lost") { chunkLeaseLost = S(r.reason) || "write-fence-lost"; continue; }
+        if (OK_PUBLISH.has(disp) && S(r.liveReportKey) && S(r.paramsHash)) {
           published.push(accountId);
           liveIdentity.set(accountId, { liveReportKey: S(r.liveReportKey), paramsHash: S(r.paramsHash) });
         } else {
-          problems.push(accountId.slice(0, 6) + ":" + S(r.disposition));
+          // ANY non-published disposition (skip / not-successful / conflict / publish-failed / an unexpected
+          // data-unavailable) is a FAILURE to retry -- fba-plan never has a legitimate "unavailable" outcome.
+          failed.push({ accountId, disposition: disp });
+          problems.push(accountId.slice(0, 6) + ":" + disp);
         }
         processed.add(accountId);
       }
+      if (chunkLeaseLost) { leaseLost = chunkLeaseLost; break; }
     }
   } finally {
     // ALWAYS safe-close -- success, failure, or slice-budget pause. The gates never survive past this pass.
+    // (If we LOST the lease, close is a no-op: this operation no longer owns the controls, so it closes nothing.)
     try { await controls.close(); } catch (e) { problems.push("SAFE-CLOSE:" + S(e && e.message ? e.message : e)); }
+  }
+
+  // FENCING (blocker 1): the lease was lost mid-publish. STOP -- publish nothing further, skip read-back/ownership.
+  // Accounts published in earlier chunks (while the fence was valid) stay live; the rest retry next slice/run.
+  // Typed RETRYABLE contention; LKG for the unpublished accounts is untouched.
+  if (leaseLost) {
+    base.published = published.length;
+    base.blocked = bucketAccounts.length - included.length;
+    return { ...base, phase: "contention", ok: false, leaseLost: true, continuationRequired: true, problems: problems.concat("control-lease-lost:" + leaseLost) };
   }
 
   base.published = published.length;
@@ -342,11 +395,32 @@ export async function advanceFbaPlanBucket({
   }
 
   const okReadback = typeof readbackLive === "function" ? readback === published.length : true;
+  // The per-account outcome the caller (bootstrap FBA operator) consumes. There is NO source-incapable class
+  // for fba-plan (blocker 3): completion is proven only by a published manifest identity; a failed account
+  // keeps the wave incomplete/retryable (LKG untouched).
+  base.perAccount = {
+    published: [...published],
+    failed: failed.map((x) => ({ ...x })),
+  };
+  // The EXACT live identities published (Round-6 blocker 7 manifest): [{ accountId, liveReportKey, paramsHash }].
+  base.publishedIdentities = published.map((accountId) => {
+    const id = liveIdentity.get(accountId) || {};
+    return { accountId, liveReportKey: S(id.liveReportKey), paramsHash: S(id.paramsHash) };
+  });
+  base.blockedIds = [...new Set(bucketAccounts.map((a) => S(a.accountId)))].filter((id) => !included.includes(id));
+
   if (!published.length) {
     return { ...base, phase: "publish", ok: false, problems: problems.length ? problems : ["zero accounts published live"] };
   }
   if (!okReadback) {
     return { ...base, phase: "readback", ok: false, problems: problems.length ? problems : ["live read-back mismatch"] };
+  }
+  // STRICT per-account honesty (bootstrap): ANY included account that FAILED to publish makes the whole
+  // result partial/failed -- never ok:true with an unpublished required account. LKG is untouched (no live
+  // write happened for a failed account). Natural (strict=false) keeps the LKG-tolerant behavior
+  // byte-identical (a per-account failure never fails the whole bucket).
+  if (strict && failed.length) {
+    return { ...base, phase: "partial", ok: false, problems, failedAccounts: failed.map((x) => x.accountId) };
   }
   return { ...base, phase: "complete", ok: true, problems: problems.length ? problems : undefined };
 }

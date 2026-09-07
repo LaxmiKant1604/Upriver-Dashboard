@@ -117,7 +117,8 @@ test("10. the release is --strict-d1 and its clamp gate is coverage-based (provi
 
 /* 18/19. controls always safe-close; post ASIN->Campaign cutover the scheduler refreshes Campaign Ads (active), never ASIN/FBA */
 test("18/19. controls safe-close ALWAYS; the scheduler refreshes the active Campaign Ads grain, never the retired ASIN Ads", () => {
-  assert.match(yml, /if:\s*always\(\) && steps\.guard\.outputs\.run_required == 'true'\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close ALWAYS when a pipeline run could have opened controls");
+  // Round-10 (blocker 4): safe-close runs when a matching --apply emitted a valid fencing generation (never blank).
+  assert.match(yml, /if:\s*always\(\) && steps\.guard\.outputs\.run_required == 'true' && \(steps\.full_controls\.outputs\.generation != '' \|\| steps\.bootstrap_controls\.outputs\.generation != ''\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close when a matching apply emitted a generation");
   assert.match(yml, /scheduled-campaign-ads-refresh\.mjs/, "the scheduler refreshes the ACTIVE Campaign Ads grain");
   assert.doesNotMatch(yml, /scheduled-asin-ads-refresh/i, "no retired ASIN Ads export step in the scheduler");
 });

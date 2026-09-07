@@ -243,11 +243,13 @@ async function main() {
   /* ============ 14-16: failure safety + no campaign/fba + manual dispatch parity (workflow shape) ============ */
   group("workflow: always-safe-close, isolated Campaign Ads/FBA, manual dispatch parity");
 
-  test("14. EVERY real pipeline failure safe-closes controls; the verified duplicate no-op stays zero-write", () => {
+  test("14. EVERY real pipeline failure safe-closes controls (when its apply emitted a generation); the verified duplicate no-op stays zero-write", () => {
+    // Round-10 (blocker 4): the safe-close runs after any pipeline attempt whose matching --apply succeeded and
+    // emitted a valid fencing generation (never a blank/owner-only generation).
     assert.match(
       yml,
-      /if:\s*always\(\)\s*&&\s*steps\.guard\.outputs\.run_required == 'true'\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/,
-      "every non-no-op region pipeline attempt safe-closes",
+      /if:\s*always\(\)\s*&&\s*steps\.guard\.outputs\.run_required == 'true' && \(steps\.full_controls\.outputs\.generation != '' \|\| steps\.bootstrap_controls\.outputs\.generation != ''\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/,
+      "every non-no-op region pipeline attempt (whose apply emitted a generation) safe-closes",
     );
     assert.match(yml, /already_published == 'true'[\s\S]*zero creates, zero controls, zero tokens/i, "the verified duplicate is explicitly zero-write");
   });

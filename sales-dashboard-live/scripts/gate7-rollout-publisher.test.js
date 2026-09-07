@@ -827,7 +827,6 @@ test("(E4) an unavailable/blocked/invalid/truncated/stale/null/malformed/mismatc
     ["wrong report version", { ...good, params: { ...good.params, reportVersion: SM + "/v2d-0" } }],
     ["wrong account identity", { ...good, params: { ...good.params, accountId: "US9" } }],
     ["payload fails the derivation validator", { ...good, payload: { accountId: "IN1", asOf: "2026-08-14" } }],
-    ["structurally-valid but UNAVAILABLE payload", { ...good, payload: { accountId: "IN1", asOf: "2026-08-14", dataUnavailable: true, rows: [], catalogBrands: [], salesLatestDate: null } }],
     ["null payload with NO storage pointer", { ...good, payload: null }],
     ["null payload with a BLANK storage pointer", { ...good, payload: null, payload_storage_path: "   " }],
     ["blank source_refreshed_at", { ...good, source_refreshed_at: "  " }],
@@ -838,6 +837,15 @@ test("(E4) an unavailable/blocked/invalid/truncated/stale/null/malformed/mismatc
     const { res, calls } = await pub({ shadow });
     assert.equal(res.disposition, "invalid-snapshot", label);
     assert.equal(calls.publish.length, 0, label + " never publishes");
+  }
+  // Round-6 (blocker 3/4): a structurally-VALID but self-declared-UNAVAILABLE payload is a DISTINCT typed
+  // disposition ('data-unavailable', not 'invalid-snapshot') -- but it STILL never publishes (LKG untouched),
+  // so the FBA honesty path can tell "no FBA inventory" apart from a malformed/failed snapshot.
+  {
+    const unavailable = { ...good, payload: { accountId: "IN1", asOf: "2026-08-14", dataUnavailable: true, rows: [], catalogBrands: [], salesLatestDate: null } };
+    const { res, calls } = await pub({ shadow: unavailable });
+    assert.equal(res.disposition, "data-unavailable", "a self-declared-unavailable payload is typed data-unavailable (not invalid-snapshot)");
+    assert.equal(calls.publish.length, 0, "data-unavailable never publishes -- live LKG untouched");
   }
 });
 
@@ -861,10 +869,11 @@ test("(E4b) storage-backed shadow payloads: the exact job-linked snapshot publis
   // (d) a hydrated payload that fails validation (e.g. truncated JSON shape) fails closed.
   const truncated = await pub({ shadow: stored, storagePayload: { accountId: "IN1" } });
   assert.equal(truncated.res.disposition, "invalid-snapshot");
-  // (e) a hydrated payload that declares itself UNAVAILABLE fails closed.
+  // (e) a hydrated payload that declares itself UNAVAILABLE is typed data-unavailable (Round-6 blocker 3/4) --
+  // structurally valid but self-declared-empty; it STILL never publishes (LKG untouched), just a distinct type.
   const unavailable = await pub({ shadow: stored, storagePayload: { accountId: "IN1", asOf: "2026-08-14", dataUnavailable: true, rows: [], catalogBrands: [], salesLatestDate: null } });
-  assert.equal(unavailable.res.disposition, "invalid-snapshot");
-  for (const r of [missing, broken, truncated, unavailable]) assert.equal(r.calls.publish.length, 0, "no failed hydration ever published");
+  assert.equal(unavailable.res.disposition, "data-unavailable");
+  for (const r of [missing, broken, truncated, unavailable]) assert.equal(r.calls.publish.length, 0, "no failed/unavailable hydration ever published");
 });
 
 test("(E5) publish EXACTLY ONCE with the EXACT live identity the frontend reads", async () => {
@@ -959,7 +968,9 @@ test("(EC2) a publish() caller cannot inject code readiness or any trusted colla
     getJob: fakes.deps.getLatestReportJob,
     getSnapshot: async ({ reportKey, accountId, paramsHash }) => fakes.deps.getShadowSnapshot(reportKey, accountId, paramsHash),
     loadStoragePayload: fakes.deps.loadStoragePayload,
-    publishLive: fakes.deps.publishLive,
+    // Round-10: the composition is ALWAYS fenced -- supply a valid fence + the fenced CAS double (records calls).
+    getControlFence: () => ({ ownerToken: "o", generation: 1 }),
+    publishLiveFenced: fakes.deps.publishLive,
     codeReadyKeys: [SM], // BUILD-TIME test seam (production passes nothing => frozen EMPTY)
   });
   // Injection attempts through the ONLY public surface: extra args are ignored; a non-string coerces to ""
@@ -975,6 +986,123 @@ test("(EC2) a publish() caller cannot inject code readiness or any trusted colla
   const r3 = await rt.publish(SM, "IN1");
   assert.equal(r3.disposition, "published");
   assert.equal(discoveries, 1, "ONE memoized fresh discovery served both publishes");
+});
+
+// =================================================================================================
+group("E2b. Round-9 WRITE-BOUNDARY FENCING (control-enabled publisher: the fence reaches the CAS write)");
+
+// Build the REAL publisher composition CONTROL-ENABLED (getControlFence) with an in-memory FENCED-CAS model that
+// faithfully mirrors cas_report_snapshot_if_newer_fenced: it proves the passed {ownerToken, generation} against a
+// modeled live lease INSIDE the (modeled) write and returns 'lease-lost' with ZERO writes on mismatch, else the
+// atomic CAS. (No live Postgres in this repo -- the SQL RPC itself is offline-modeled + static-guarded.)
+function buildFencedPublisher({ getControlFence, lease }) {
+  const fakes = mkPubDeps({});
+  const writes = [];
+  const fencedCas = async (args) => {
+    // ATOMIC fence + write: exactly what the RPC does. A superseded generation / owner / expiry writes nothing.
+    const live = lease();
+    if (!args.ownerToken) return { outcome: "lease-lost", reason: "no-fence" };
+    if (live.owner !== args.ownerToken) return { outcome: "lease-lost", reason: "owner-changed" };
+    if (args.generation != null && live.generation !== args.generation) return { outcome: "lease-lost", reason: "generation-superseded" };
+    if (live.expired) return { outcome: "lease-lost", reason: "expired" };
+    writes.push(args);
+    return { outcome: "inserted" };
+  };
+  const rt = buildSchedulerV2Publisher({
+    connections: [CONNS[0]],
+    fetchAccounts: async () => [{ id: "IN1", country: "IN", currency: "INR", name: "India One" }],
+    getAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: ["IN1"] }),
+    getSettings: fakes.deps.getReportSyncSettings,
+    getApproval: fakes.deps.getPublishApproval,
+    getJob: fakes.deps.getLatestReportJob,
+    getSnapshot: async ({ reportKey, accountId, paramsHash }) => fakes.deps.getShadowSnapshot(reportKey, accountId, paramsHash),
+    loadStoragePayload: fakes.deps.loadStoragePayload,
+    publishLiveFenced: fencedCas,
+    getControlFence,
+    codeReadyKeys: [SM],
+  });
+  return { rt, writes };
+}
+
+test("(EF1) a control-enabled publisher with a VALID fence publishes -- the fence (ownerToken + generation) reaches the CAS write", async () => {
+  const live = { owner: "A", generation: 1, expired: false };
+  const { rt, writes } = buildFencedPublisher({ getControlFence: () => ({ ownerToken: "A", generation: 1 }), lease: () => live });
+  const r = await rt.publish(SM, "IN1");
+  observedDispositions.add(r.disposition);
+  assert.equal(r.disposition, "published");
+  assert.equal(writes.length, 1, "exactly one fenced CAS write");
+  assert.equal(writes[0].ownerToken, "A"); assert.equal(writes[0].generation, 1);
+});
+
+test("(EF2) P0-A: after the owner is superseded (gen1 -> gen2) the fenced write returns lease-lost and writes ZERO rows (the stale owner cannot overwrite the live row)", async () => {
+  // A captured gen1; between capture and the write, B acquired gen2. The write carries A/gen1 -> fence lost.
+  const live = { owner: "B", generation: 2, expired: false };
+  const { rt, writes } = buildFencedPublisher({ getControlFence: () => ({ ownerToken: "A", generation: 1 }), lease: () => live });
+  const r = await rt.publish(SM, "IN1");
+  observedDispositions.add(r.disposition);
+  assert.equal(r.disposition, "lease-lost", "the write-boundary fence rejected the superseded owner");
+  assert.equal(writes.length, 0, "ZERO rows written -- the live LKG is untouched");
+});
+
+test("(EF3) P0-A: an EXPIRED lease at the write boundary returns lease-lost with zero writes", async () => {
+  const live = { owner: "A", generation: 1, expired: true };
+  const { rt, writes } = buildFencedPublisher({ getControlFence: () => ({ ownerToken: "A", generation: 1 }), lease: () => live });
+  const r = await rt.publish(SM, "IN1");
+  observedDispositions.add(r.disposition);
+  assert.equal(r.disposition, "lease-lost");
+  assert.equal(writes.length, 0);
+});
+
+test("(EF4) property 5: a control-enabled publisher with NO live fence FAILS CLOSED (lease-lost) and never reaches the CAS write", async () => {
+  const live = { owner: "A", generation: 1, expired: false };
+  const { rt, writes } = buildFencedPublisher({ getControlFence: () => null, lease: () => live });
+  const r = await rt.publish(SM, "IN1");
+  observedDispositions.add(r.disposition);
+  assert.equal(r.disposition, "lease-lost", "a null fence fails closed");
+  assert.equal(writes.length, 0, "the fenced CAS was never called");
+});
+
+test("(EF5) Round-10: buildSchedulerV2Publisher is a Gate-7 publisher -- with NO getControlFence it FAILS CLOSED (lease-lost) and writes ZERO rows (no unfenced fallback)", async () => {
+  const fakes = mkPubDeps({});
+  let anyWrite = 0;
+  const rt = buildSchedulerV2Publisher({
+    connections: [CONNS[0]],
+    fetchAccounts: async () => [{ id: "IN1", country: "IN", currency: "INR", name: "India One" }],
+    getAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: ["IN1"] }),
+    getSettings: fakes.deps.getReportSyncSettings, getApproval: fakes.deps.getPublishApproval, getJob: fakes.deps.getLatestReportJob,
+    getSnapshot: async ({ reportKey, accountId, paramsHash }) => fakes.deps.getShadowSnapshot(reportKey, accountId, paramsHash),
+    loadStoragePayload: fakes.deps.loadStoragePayload,
+    // A publishLive double AND a publishLiveFenced double are provided, but with NO getControlFence NEITHER is called.
+    publishLive: async () => { anyWrite += 1; return { outcome: "inserted" }; },
+    publishLiveFenced: async () => { anyWrite += 1; return { outcome: "inserted" }; },
+    codeReadyKeys: [SM],
+  });
+  const r = await rt.publish(SM, "IN1");
+  observedDispositions.add(r.disposition);
+  assert.equal(r.disposition, "lease-lost", "no getControlFence => the Gate-7 publisher fails closed (lease-lost)");
+  assert.equal(anyWrite, 0, "ZERO rows written -- the unfenced CAS is NEVER used in the Gate-7 composition");
+});
+
+test("(EF6) Round-10: an INVALID fence generation (0/negative/NaN/undefined) fails closed (lease-lost), zero writes", async () => {
+  const fakes = mkPubDeps({});
+  for (const badGen of [0, -1, 1.5, NaN, undefined, "1"]) {
+    let writes = 0;
+    const rt = buildSchedulerV2Publisher({
+      connections: [CONNS[0]],
+      fetchAccounts: async () => [{ id: "IN1", country: "IN", currency: "INR", name: "India One" }],
+      getAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: ["IN1"] }),
+      getSettings: fakes.deps.getReportSyncSettings, getApproval: fakes.deps.getPublishApproval, getJob: fakes.deps.getLatestReportJob,
+      getSnapshot: async ({ reportKey, accountId, paramsHash }) => fakes.deps.getShadowSnapshot(reportKey, accountId, paramsHash),
+      loadStoragePayload: fakes.deps.loadStoragePayload,
+      getControlFence: () => ({ ownerToken: "o", generation: badGen }),
+      publishLiveFenced: async () => { writes += 1; return { outcome: "inserted" }; },
+      codeReadyKeys: [SM],
+    });
+    const r = await rt.publish(SM, "IN1");
+    observedDispositions.add(r.disposition);
+    assert.equal(r.disposition, "lease-lost", "generation " + String(badGen) + " fails closed");
+    assert.equal(writes, 0, "generation " + String(badGen) + " writes zero rows");
+  }
 });
 
 // =================================================================================================

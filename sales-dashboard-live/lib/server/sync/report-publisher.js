@@ -126,21 +126,31 @@ export const SCHEDULER_LIVE_SNAPSHOT_CONTRACTS = Object.freeze({
 });
 
 // Typed safe dispositions (the ONLY values publishSchedulerV2Snapshot returns in `disposition`).
+// 'data-unavailable' is DISTINCT from 'invalid-snapshot': the derived payload is structurally VALID but
+// declares itself unavailable (e.g. an account with no FBA inventory) -- a legitimate source-capability
+// outcome, never a malformed/failed snapshot. Both stay NOT-published (identical live-LKG behavior);
+// only a caller that must distinguish source-incapability from failure (the bootstrap FBA honesty +
+// typed-unavailable evidence) reads the two apart.
 export const PUBLISH_DISPOSITIONS = Object.freeze([
   "published", "already-current", "newer-live", "publish-conflict",
   "unknown-report", "code-locked", "report-disabled", "account-disabled", "publish-not-approved",
-  "not-successful", "invalid-snapshot", "publish-failed",
+  "not-successful", "invalid-snapshot", "data-unavailable", "publish-failed",
+  // Round-9 P0-A: the WRITE-BOUNDARY fence proved the control lease was lost (expired/superseded/reclaimed) inside
+  // the CAS transaction, so ZERO rows were written -- a typed, retryable contention outcome (LKG untouched).
+  "lease-lost",
 ]);
 
 // The CAS primitive's typed outcome -> the publisher's typed disposition. EQUAL source freshness with
 // DIFFERENT content is a `publish-conflict` (never an unconditional overwrite): the primitive proved the
 // live row is not identical, so the safe remediation is a fresh shadow cycle with newer source evidence.
+// 'lease-lost' is the fenced-CAS outcome when the control fence no longer holds at the write boundary.
 const CAS_OUTCOME_DISPOSITION = Object.freeze({
   inserted: "published",
   replaced: "published",
   "newer-live": "newer-live",
   "already-current": "already-current",
   conflict: "publish-conflict",
+  "lease-lost": "lease-lost",
 });
 
 /**
@@ -264,10 +274,11 @@ export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId, p
       if (payload == null) return { disposition: "invalid-snapshot", ...base };
     }
     const payloadOk = !!entry && typeof entry.validatePayload === "function" && entry.validatePayload(payload) === true;
-    // A derived payload that DECLARES itself unavailable is structurally valid but must NEVER be promoted
-    // over the live row (the live LKG for that report/account stays untouched).
-    const availableOk = !(payload && payload.dataUnavailable === true);
-    if (!payloadOk || !availableOk) return { disposition: "invalid-snapshot", ...base };
+    if (!payloadOk) return { disposition: "invalid-snapshot", ...base };
+    // A derived payload that is structurally VALID but DECLARES itself unavailable is never promoted over
+    // the live row (LKG untouched) -- but it is a legitimate source-capability outcome, reported as the
+    // DISTINCT 'data-unavailable' disposition (not a failure) so the FBA honesty path can tell them apart.
+    if (payload && payload.dataUnavailable === true) return { disposition: "data-unavailable", ...base };
 
     // LIVE identity -- canonical mapping; a missing/malformed planned param fails closed.
     const liveParams = contract.liveParams(params);

@@ -22,22 +22,54 @@ loadReleaseEnv();
 
 const argOf = (name) => { const a = process.argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.split("=").slice(1).join("=") : null; };
 const bucket = argOf("bucket");
-const requestedAsOf = argOf("requested-as-of") || argOf("as-of");
+let requestedAsOf = argOf("requested-as-of") || argOf("as-of");
 const refreshMode = argOf("refresh-mode") || "normal";
 const runId = argOf("run-id");
+// --account-scope: 'full' (default; every export-eligible account) | 'bootstrap' (ONLY the accounts the
+// dispatch WAVE authorized, resolved from the IMMUTABLE (region, --dispatch-id) row in the backend --
+// NEVER from workflow inputs -- and gated by the ENFORCED wave budget before any create).
+const accountScope = argOf("account-scope") || "full";
+const dispatchId = argOf("dispatch-id");
 if (!isRoutingScope(bucket)) { console.error("STOP --bucket must be a routing scope (india|europe-au|us-ca|us|non-us; got: " + bucket + ")"); process.exit(2); }
-if (!requestedAsOf || !/^\d{4}-\d{2}-\d{2}$/.test(requestedAsOf)) { console.error("STOP --requested-as-of must be YYYY-MM-DD (got: " + requestedAsOf + ")"); process.exit(2); }
+if (accountScope !== "full" && accountScope !== "bootstrap") { console.error("STOP --account-scope must be full | bootstrap (got: " + accountScope + ")"); process.exit(2); }
+if (accountScope === "bootstrap" && !dispatchId) { console.error("STOP --account-scope=bootstrap requires --dispatch-id (the immutable wave identity)"); process.exit(2); }
+if (accountScope !== "bootstrap" && (!requestedAsOf || !/^\d{4}-\d{2}-\d{2}$/.test(requestedAsOf))) { console.error("STOP --requested-as-of must be YYYY-MM-DD (got: " + requestedAsOf + ")"); process.exit(2); }
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
 const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
 const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
-// EXPORT-ELIGIBILITY GATE: only export-eligible primary accounts are refreshed -- a DataDoe
-// still-loading account gets ZERO OLI create attempts (DataDoe hard-rejects them with HTTP 400).
-const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, {
-  fetchDetailed: fetchAccountsDetailed, readOnboardingRows,
-  onExcluded: (excluded, gateMode) => console.log(`onboarding gate (${gateMode}): excluded ${excluded.length} account(s): ${excluded.map((x) => `${x.accountId.slice(0, 8)}:${x.reason}`).join(", ")}`),
-});
+const { resolveBootstrapScopeByDispatch, gateOnboardingBudget, recordOnboardingActualSpend, findApprovedStepEntry, bootstrapStepRef, assertBootstrapStepPlan } = await import("../../lib/server/sync/account-onboarding-bootstrap.js");
+// ACCOUNT SCOPE:
+//   full      -> EXPORT-ELIGIBILITY GATE: only export-eligible primary accounts are refreshed -- a
+//                DataDoe still-loading account gets ZERO OLI create attempts (DataDoe 400s them).
+//   bootstrap -> the FROZEN account set of the dispatch WAVE (resolveBootstrapScopeByDispatch): the
+//                immutable (region, dispatch_id) row's accounts, re-checked for DataDoe readiness (a
+//                flapped account is DEFERRED, never dropped-to-widen). planAsOf is PINNED from the
+//                approved plan (so a next-day retry uses the SAME dates + SAME reservation).
+let bootstrapScope = null;   // resolveBootstrapScopeByDispatch result (bootstrap mode only)
+let bootstrapEntry = null;   // the approved plan entry for (oli, region)
+const fetchAccounts = accountScope === "bootstrap"
+  ? async (apiKey) => {
+    bootstrapScope = await resolveBootstrapScopeByDispatch({ apiKey, region: bucket, dispatchId });
+    if (!bootstrapScope.ok) { console.error("STOP BOOTSTRAP_SCOPE_UNRESOLVED (" + bootstrapScope.reason + ") for " + bucket + "/" + dispatchId + " -- ZERO exports (fail closed)."); process.exit(1); }
+    bootstrapEntry = findApprovedStepEntry(bootstrapScope.approvedPlan, "oli", bucket);
+    if (!bootstrapEntry) { console.error("STOP BOOTSTRAP_STEP_NOT_APPROVED: no approved 'oli' plan entry for " + bucket + " -- ZERO exports (fail closed)."); process.exit(1); }
+    // DEFER THE ENTIRE WAVE if any frozen account is not currently DataDoe-ready (never a ready subset).
+    if (!bootstrapScope.allReady) {
+      console.log("BOOTSTRAP_WAVE_DEFERRED: " + bootstrapScope.deferred.length + " of " + bootstrapScope.frozenAccountIds.length + " frozen account(s) not DataDoe-ready -- ENTIRE wave deferred (ZERO creates); a later retry completes when all are ready.");
+      console.log("RESULT " + JSON.stringify({ ok: true, bucket, accountScope, classification: "BOOTSTRAP_WAVE_DEFERRED", creates: 0, tokens: 0, deferred: bootstrapScope.deferred.length }));
+      process.exit(0);
+    }
+    // PIN the D-1 target from the approved plan (retry-stable across days).
+    requestedAsOf = String(bootstrapEntry.planAsOf || "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedAsOf)) { console.error("STOP BOOTSTRAP_BAD_PIN: approved oli planAsOf is not a date (" + requestedAsOf + ")"); process.exit(1); }
+    return bootstrapScope.accounts;
+  }
+  : (apiKey) => fetchExportEligibleAccounts(apiKey, {
+    fetchDetailed: fetchAccountsDetailed, readOnboardingRows,
+    onExcluded: (excluded, gateMode) => console.log(`onboarding gate (${gateMode}): excluded ${excluded.length} account(s): ${excluded.map((x) => `${x.accountId.slice(0, 8)}:${x.reason}`).join(", ")}`),
+  });
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, openSupersedingSyncCycle, reserveOliFreshnessCreate, recordOliFreshnessExport, getOliCompleteness } = await import("../../lib/server/supabase.js");
 const { OLI_SOURCE_KEY, windowsProve } = await import("../../lib/server/sync/source-durable-model.js");
@@ -51,20 +83,28 @@ const OLI = OLI_SOURCE_KEY;
 const log = (m) => console.log("oli-d1[" + bucket + "@" + requestedAsOf + "/" + refreshMode + "]: " + m);
 const BUDGET_MS = Number(process.env.SCHEDULED_OLI_BUDGET_MS || 70 * 60 * 1000);
 const MAX_ITERS = Number(process.env.SCHEDULED_OLI_MAX_ITERS || 200);
+
+// Discover EXACTLY this bucket's primary accounts (zero tokens). In bootstrap mode this ALSO resolves the
+// frozen dispatch scope + PINS requestedAsOf from the approved plan (before the operation identity below).
+const connections = getDataDoeConnections();
+const primaryConn = connections.find((c) => c.id === "primary");
+const rows = (await fetchAccounts(primaryConn.apiKey)) || [];
+
 // A normal (scheduled) run carries NO run_id (its operation identity is scheduled-fresh/<bucket>/<asOf>); only a
 // force-latest run uses the github.run_id. The workflow may always pass --run-id; it is ignored in normal mode.
 const effRunId = refreshMode === "force-latest" ? runId : null;
 const operationKey = freshnessOperationKey({ mode: refreshMode, bucket, requestedAsOf, runId: effRunId }); // validates mode + run_id
 const attemptKind = attemptKindForMode(refreshMode);
 log("operation key = " + operationKey);
-
-// Discover EXACTLY this bucket's primary accounts (zero tokens).
-const connections = getDataDoeConnections();
-const primaryConn = connections.find((c) => c.id === "primary");
-const rows = (await fetchAccounts(primaryConn.apiKey)) || [];
 const { active } = classifyDirectoryAccounts(rows, connections);
 const seen = new Set(); const discovered = [];
 for (const a of active) { const id = String((a && (a.accountId ?? a.id)) || "").trim(); const country = String((a && a.country) || "").toUpperCase(); if (!id || id.includes(":") || seen.has(id)) continue; if (!accountInScope(bucket, country)) continue; seen.add(id); discovered.push({ accountId: id }); }
+if (!discovered.length && accountScope === "bootstrap") {
+  // A bootstrap-scoped run with NOTHING claimed is a valid green no-op: zero accounts => zero exports.
+  log("BOOTSTRAP_SCOPE_EMPTY: no claimed bootstrap accounts in " + bucket + " -- ZERO creates, ZERO tokens.");
+  console.log("RESULT " + JSON.stringify({ ok: true, bucket, requestedAsOf, accountScope, classification: "BOOTSTRAP_SCOPE_EMPTY", creates: 0, tokens: 0 }));
+  process.exit(0);
+}
 if (!discovered.length) { console.error("STOP no discovered " + bucket + " primary accounts"); process.exit(1); }
 const ids = discovered.map((a) => a.accountId);
 const oliStart = sourceRegistryEntry(OLI).initialBackfill.start;
@@ -92,6 +132,36 @@ const ceilingTokens = ceilingCreates * OLI_TOKENS_PER_CREATE;
 log(cov0.missing.length + "/" + ids.length + " account(s) behind D-1 (unreadable=" + cov0.anyUnreadable + "); create ceiling=" + ceilingCreates + " (" + plan.maxCreates + " batches + " + cov0.missing.length + " behind)");
 if (cov0.durableComplete) { log("ALREADY_PUBLISHED_D1: durable coverage complete through D-1 -- ZERO creates, ZERO tokens (idempotent primary/fallback no-op)."); console.log("RESULT " + JSON.stringify({ ok: true, bucket, requestedAsOf, classification: "ALREADY_PUBLISHED_D1", creates: 0, tokens: 0, d1Complete: true, alreadyComplete: true })); process.exit(0); }
 if (cov0.anyUnreadable) { console.error("STOP OLI coverage unreadable -- fail closed (never classify freshness without evidence)."); process.exit(1); }
+
+// BOOTSTRAP BUDGET GATE (before ANY DataDoe work): reserve THIS attempt's coverage-derived spend
+// against the durable WAVE budget, bound to the wave key + account-set hash + approved plan fingerprint
+// + the approved STEP PLAN HASH (which pins the exact dates/window/source). The ref is DATE-FREE
+// (<step>/<region>/<stepPlanHash12>) so a same-day/next-day/post-crash retry REUSES the ONE reservation
+// (cumulative actuals can never exceed the approved ceiling). A refusal STOPS before any create POST.
+let budgetRef = "oli/" + bucket + "/" + requestedAsOf;
+if (accountScope === "bootstrap") {
+  // RECOMPUTE the step plan hash from the ACTUAL runtime plan (frozen accounts + operation ids + pinned
+  // window + live <=5-seller batch membership) and REQUIRE it to equal the approved hash BEFORE the
+  // reservation -- NEVER echo the stored hash. A modified runtime account/batch/date is drift here.
+  const runtimeBatches = (plan.batches || []).map((b) => (b.accounts || []).map((x) => String(x.accountId || x)).sort());
+  const chk = assertBootstrapStepPlan(bootstrapEntry, {
+    step: "oli", region: bucket, accounts: bootstrapScope.frozenAccountIds, operationIds: bootstrapScope.operationIds,
+    accountSetHash: bootstrapScope.accountSetHash, planAsOf: requestedAsOf,
+    sourceKeys: [OLI], windows: [{ sourceKey: OLI, from: oliStart, to: requestedAsOf }],
+    batchMembership: runtimeBatches, requestHashes: [], limits: [],
+  });
+  if (!chk.ok) { console.error("STOP BOOTSTRAP_STEP_PLAN_DRIFT (" + chk.reason + "): the runtime OLI plan does not match the approved stepPlanHash -- ZERO creates (fail closed before any reservation/POST)."); process.exit(1); }
+  budgetRef = bootstrapStepRef({ step: "oli", region: bucket, stepPlanHash: chk.stepPlanHash });
+  const gate = await gateOnboardingBudget({
+    waveKey: bootstrapScope.waveKey, ref: budgetRef, stepType: "oli", region: bucket,
+    accountSetHash: bootstrapScope.accountSetHash, stepPlanHash: chk.stepPlanHash, plannedTokens: ceilingTokens, plannedCreates: ceilingCreates,
+  });
+  if (!gate.ok) {
+    console.error("STOP ONBOARDING_BUDGET_REFUSED (" + gate.refusal + (gate.detail ? "/" + gate.detail : "") + "): planned " + ceilingTokens + " token(s) for " + budgetRef + " (wave " + bootstrapScope.waveKey + ") -- ZERO creates issued (fail closed before any POST).");
+    process.exit(1);
+  }
+  log("onboarding budget " + gate.disposition + " for " + budgetRef + ": runtime plan hash MATCHES approved; planned " + ceilingTokens + " token(s) (reserved " + gate.reservedTokens + "/" + gate.authorizedTokens + ")");
+}
 
 // Classify the (bucket, today) ACTIVE head. A terminal head below D-1 => SUPERSEDE; a running/pending head => run.
 const cycleDate = new Date().toISOString().slice(0, 10);
@@ -227,7 +297,17 @@ log("D-1 completeness: " + classification + " -- " + final + " final + " + provi
   + (realDefect ? " -- WARNING " + realDefect + " itemized-value defect account(s) keep LKG (escalate to DataDoe)" : ""));
 if (Object.keys(blockedCodes).length) log("fresh-fetch defect/status blocks: " + JSON.stringify(blockedCodes));
 log("assessment: creates=" + a.creates + "/" + a.ceilingCreates + " tokens=" + a.tokens + "/" + a.ceilingTokens + " ok=" + a.ok + " | coverage behind D-1: " + cov1.missing.length + "/" + ids.length);
-console.log("RESULT " + JSON.stringify({ ok: a.ok, bucket, requestedAsOf, operationKey, workingCycle: workingCycleId.slice(0, 8), creates: a.creates, tokens: a.tokens, ceilingTokens, classification, d1Complete, coverageBehindD1: cov1.missing.length, completeness: { provisional, final, sourceDefect: sourceDefect || realDefect, itemizedOrders, pendingOrders, pendingUnits, overallItemizedPct: overallPct }, blockedCodes, realDefect: realDefect > 0 }));
+// AGGREGATE budget tracking (bootstrap scope): record this step's ACTUAL creates/tokens against its
+// reservation (fail-soft accounting; the reservation already bounds the ceiling). An 'over-reservation'
+// answer is surfaced LOUDLY -- an actual may never silently exceed its reservation.
+if (accountScope === "bootstrap") {
+  const rec = await recordOnboardingActualSpend({ waveKey: bootstrapScope.waveKey, ref: budgetRef, actualTokens: a.tokens, actualCreates: a.creates });
+  if (rec && rec.disposition === "over-reservation") {
+    console.error("WARNING ONBOARDING_OVER_RESERVATION: " + budgetRef + " actuals " + a.tokens + " tok/" + a.creates
+      + " creates EXCEEDED reservation " + rec.reserved_tokens + " tok/" + rec.reserved_creates + " -- investigate before the next wave step.");
+  }
+}
+console.log("RESULT " + JSON.stringify({ ok: a.ok, bucket, requestedAsOf, accountScope, operationKey, workingCycle: workingCycleId.slice(0, 8), creates: a.creates, tokens: a.tokens, ceilingTokens, classification, d1Complete, coverageBehindD1: cov1.missing.length, completeness: { provisional, final, sourceDefect: sourceDefect || realDefect, itemizedOrders, pendingOrders, pendingUnits, overallItemizedPct: overallPct }, blockedCodes, realDefect: realDefect > 0 }));
 if (!a.ok) { console.error("STOP OLI assessment FAILED: " + a.problems.join(", ")); process.exit(1); }
 // GREEN exit for provisional: expected pending itemization is a SUCCESS (D1_PROVISIONAL publishes now), never a red run.
 process.exit(0);
