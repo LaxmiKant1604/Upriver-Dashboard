@@ -24,7 +24,7 @@ import { schedulerV2ReportControlCatalog, CONTROLLED_REPORT_KEYS, SCHEDULER_V2_R
 import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "./report-publisher.js";
 import { runSchedulerV2Shadow } from "./sync-dispatch.js";
 import { makeSourceTranche, isSourceTranche } from "./source-tranche.js";
-import { getAccountOnboardingRows, getAsinAdsDailyRows, getActiveAdsDailyRows, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings, getSchedulerAccountRollout, getSourceCoverageWindows, getSourceOliHistoryRows, getSourceSnapshot, getSourceSnapshotPayload } from "../supabase.js";
+import { getAccountOnboardingRows, getAccountDirectorySnapshotAccounts, getAsinAdsDailyRows, getActiveAdsDailyRows, getDailyAdsCoverage, getAdsDailySourceRows, getAdsSyncStates, getReportSyncSettings, getSchedulerAccountRollout, getSourceCoverageWindows, getSourceOliHistoryRows, getSourceSnapshot, getSourceSnapshotPayload } from "../supabase.js";
 import { auditSchemaContract, schedulerV2SchemaObjects, REQUIRED_WRAPPER_EXPORTS } from "./schema-contract.js";
 
 // The complete set of Supabase wrappers the composed runtime depends on. Re-exported from the schema contract
@@ -94,7 +94,7 @@ export function combineStores(namedStores, { shared = [] } = {}) {
  * The account list read is a DataDoe accounts GET (never an export); it is WIRED here but NOT invoked until the
  * composed runtime is actually run (a future, approval-gated live step). `fetchAccounts` is injectable.
  */
-export function makeProductionDiscoverAccounts({ connections, fetchAccounts = fetchDataDoeAccounts, fetchDetailed = fetchDataDoeAccountsDetailed, readOnboardingRows = getAccountOnboardingRows } = {}) {
+export function makeProductionDiscoverAccounts({ connections, fetchAccounts = fetchDataDoeAccounts, fetchDetailed = fetchDataDoeAccountsDetailed, readOnboardingRows = getAccountOnboardingRows, readEstablishedAccountIds = getAccountDirectorySnapshotAccounts } = {}) {
   if (typeof fetchAccounts !== "function") {
     throw new Error("makeProductionDiscoverAccounts requires an injected fetchAccounts(apiKey) reader.");
   }
@@ -115,7 +115,7 @@ export function makeProductionDiscoverAccounts({ connections, fetchAccounts = fe
       // unreadable (existing ready accounts keep publishing; loading accounts stay excluded). A CUSTOM
       // injected fetchAccounts (tests) bypasses the gate and keeps the legacy behaviour byte-identical.
       const accounts = connection.id === "primary" && fetchAccounts === fetchDataDoeAccounts
-        ? await fetchExportEligibleAccounts(connection.apiKey, { fetchDetailed, readOnboardingRows })
+        ? await fetchExportEligibleAccounts(connection.apiKey, { fetchDetailed, readOnboardingRows, readEstablishedAccountIds })
         : await fetchAccounts(connection.apiKey);
       byConnection.push({ connection, accounts: accounts || [] });
     }

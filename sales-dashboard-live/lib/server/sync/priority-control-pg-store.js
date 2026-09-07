@@ -9,7 +9,7 @@
 import pg from "pg";
 import { getDataDoeConnections, classifyDirectoryAccounts } from "../datadoe-connections.js";
 import { fetchAccountsDetailed as fetchDataDoeAccountsDetailed } from "../datadoe.js";
-import { getAccountOnboardingRows } from "../supabase.js";
+import { getAccountOnboardingRows, getAccountDirectorySnapshotAccounts } from "../supabase.js";
 import { fetchExportEligibleAccounts } from "./account-onboarding.js";
 import { accountInScope, isRoutingScope } from "./scheduler-scope.js";
 
@@ -29,9 +29,13 @@ export async function discoverPrimaryAccountIds(bucket = null) {
   const primaryConn = connections.find((c) => c.id === "primary");
   // EXPORT-ELIGIBILITY GATE: controls/rollout open ONLY for export-eligible accounts -- a DataDoe
   // still-loading or not-yet-claimed account never enters a publication scope (fails soft to
-  // readiness-only when the onboarding table is unreadable; loading accounts stay excluded either way).
+  // readiness-only when the onboarding table is unreadable/empty; loading accounts stay excluded either way).
+  // readEstablishedAccountIds RECONCILES accounts already proven established by the durable account-directory
+  // snapshot: an empty/partial onboarding table can never exclude an existing DataDoe-ready account, while a
+  // brand-new id is still routed through onboarding (never auto-exposed).
   const rows = (await fetchExportEligibleAccounts(primaryConn.apiKey, {
     fetchDetailed: fetchDataDoeAccountsDetailed, readOnboardingRows: getAccountOnboardingRows,
+    readEstablishedAccountIds: getAccountDirectorySnapshotAccounts,
   })) || [];
   const { active } = classifyDirectoryAccounts(rows, connections);
   const ids = [];

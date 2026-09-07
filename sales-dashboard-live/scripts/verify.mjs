@@ -55,6 +55,7 @@ const SUITES = [
   "test:fba-inventory-latest-snapshot",
   "test:fba-d1-guard",
   "test:account-onboarding",
+  "test:account-onboarding-reconcile",
   "test:account-onboarding-worker",
   "test:account-onboarding-bootstrap",
   "test:round11-publication-fence",

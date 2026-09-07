@@ -205,7 +205,7 @@ export async function advanceFbaPlanBucket({
     readback: 0,
     blocked: 0,
   };
-  if (!bucketAccounts.length) return { ...base, phase: "complete", ok: true, published: 0, note: "no-bucket-accounts" };
+  if (!bucketAccounts.length) return { ...base, phase: "complete", ok: true, complete: true, published: 0, note: "no-bucket-accounts" };
   if (typeof runtime?.run !== "function" || !runtime.store || typeof runtime.store.getCycleByBucketDate !== "function" || typeof runtime.store.finalizeCycle !== "function") {
     return { ...base, phase: "sync", ok: false, problems: ["fba runtime missing run/store.getCycleByBucketDate/finalizeCycle"] };
   }
@@ -410,17 +410,24 @@ export async function advanceFbaPlanBucket({
   base.blockedIds = [...new Set(bucketAccounts.map((a) => S(a.accountId)))].filter((id) => !included.includes(id));
 
   if (!published.length) {
-    return { ...base, phase: "publish", ok: false, problems: problems.length ? problems : ["zero accounts published live"] };
+    return { ...base, phase: "publish", ok: false, complete: false, problems: problems.length ? problems : ["zero accounts published live"] };
   }
   if (!okReadback) {
-    return { ...base, phase: "readback", ok: false, problems: problems.length ? problems : ["live read-back mismatch"] };
+    return { ...base, phase: "readback", ok: false, complete: false, problems: problems.length ? problems : ["live read-back mismatch"] };
   }
-  // STRICT per-account honesty (bootstrap): ANY included account that FAILED to publish makes the whole
-  // result partial/failed -- never ok:true with an unpublished required account. LKG is untouched (no live
-  // write happened for a failed account). Natural (strict=false) keeps the LKG-tolerant behavior
-  // byte-identical (a per-account failure never fails the whole bucket).
-  if (strict && failed.length) {
-    return { ...base, phase: "partial", ok: false, problems, failedAccounts: failed.map((x) => x.accountId) };
+  // HONEST COMPLETENESS: a region is COMPLETE only when EVERY included eligible account published at its exact
+  // live identity. `complete` = (no failed account); it is the ONLY completeness signal downstream may trust --
+  // NEVER the GitHub job's exit status. It is DISTINCT from `ok` (did the operation run without a hard error):
+  //   - STRICT (bootstrap): any failed account is ok:false + complete:false (the wave stays incomplete/retryable).
+  //   - NATURAL (strict=false): a per-account failure is LKG-tolerant (ok:true so siblings proceed and the failed
+  //     account's last-known-good is untouched) but is HONESTLY partial (complete:false + failedAccounts) -- it is
+  //     never reported as a green "complete" with unpublished accounts.
+  if (failed.length) {
+    return {
+      ...base, phase: "partial", ok: !strict, complete: false,
+      failedAccounts: failed.map((x) => x.accountId),
+      problems: problems.length ? problems : undefined,
+    };
   }
-  return { ...base, phase: "complete", ok: true, problems: problems.length ? problems : undefined };
+  return { ...base, phase: "complete", ok: true, complete: true, problems: problems.length ? problems : undefined };
 }

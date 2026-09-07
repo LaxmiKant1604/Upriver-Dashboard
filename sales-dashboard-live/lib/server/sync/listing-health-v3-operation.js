@@ -163,7 +163,10 @@ export async function runListingHealthV3Ingestion({
 
   // 7) validate ceiling + cost + pricing/reservation + balance BEFORE any POST.
   let ceilingCheck;
-  try { ceilingCheck = assertListingHealthV3ExportCeiling({ region: S(region), plans: v3Requests, ceiling }); }
+  // The ceiling is COMPUTED from the frozen plan's eligible account membership (2 creates per <=5-seller batch), so
+  // account growth scales the ceiling instead of hard-failing against a fixed 4/8/4 literal (an explicit `ceiling`
+  // still overrides for a reviewed test). A plan fanning out more creates than the membership justifies is drift.
+  try { ceilingCheck = assertListingHealthV3ExportCeiling({ region: S(region), plans: v3Requests, accountCount: regionAccounts.length, ceiling }); }
   catch (e) { return fail("ceiling", "export-ceiling gate failed (fail closed): " + safe(e)); }
   ev.newExports = ceilingCheck.newExports;
   ev.ceiling = ceilingCheck.ceiling;

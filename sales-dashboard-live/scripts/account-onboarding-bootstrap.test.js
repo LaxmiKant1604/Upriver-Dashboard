@@ -693,8 +693,14 @@ await (async () => {
   ok("I(blocker 4): STRICT mode returns phase=partial ok=false when an included account FAILED to publish (never a false complete)",
     strictRes.phase === "partial" && strictRes.ok === false && Array.isArray(strictRes.failedAccounts) && strictRes.failedAccounts.includes("bad-1"));
   const natRes = await advanceFbaPlanBucket({ bucket: "india", asOf: D_1(), inventoryAsOf: D_1(), includedIds: ["ok-1", "bad-1"], bucketAccounts: two, cost, maxTokens: 90, runtime, publisher: pubFail, controls, readbackLive: async () => ({ ok: true }) });
-  ok("I(blocker 4): natural (strict=false) FBA stays LKG-tolerant/byte-identical -- a per-account failure still completes",
-    natRes.phase === "complete" && natRes.ok === true);
+  ok("I(blocker 4 + honest completeness): natural (strict=false) FBA stays LKG-TOLERANT (ok:true, siblings proceed, published account is live) but is HONESTLY partial -- complete:false + failedAccounts, never a false-green 'complete'",
+    natRes.phase === "partial" && natRes.ok === true && natRes.complete === false
+    && Array.isArray(natRes.failedAccounts) && natRes.failedAccounts.includes("bad-1") && natRes.published === 1);
+  // The fully-published case is the ONLY complete:true outcome.
+  const allOk = { preflight: async () => ({ disposition: "ready" }), publish: async (_rk, a) => ({ disposition: "published", liveReportKey: "fba-plan", paramsHash: "h" + a }) };
+  const fullRes = await advanceFbaPlanBucket({ bucket: "india", asOf: D_1(), inventoryAsOf: D_1(), includedIds: ["ok-1", "bad-1"], bucketAccounts: two, cost, maxTokens: 90, runtime, publisher: allOk, controls, readbackLive: async () => ({ ok: true }) });
+  ok("I(honest completeness): a region is complete:true ONLY when EVERY included account published (2/2 -> phase=complete, ok=true, complete=true)",
+    fullRes.phase === "complete" && fullRes.ok === true && fullRes.complete === true && fullRes.published === 2);
   // Blocker 3 HONESTY: an (unexpected) data-unavailable disposition for fba-plan is a FAILURE to retry (LKG
   // untouched) -- NEVER "permanently source-incapable". There is no perAccount.sourceIncapable ledger.
   const pubIncap = { preflight: async () => ({ disposition: "ready" }), publish: async (_rk, a) => a === "ok-1" ? { disposition: "published", liveReportKey: "fba-plan", paramsHash: "h" } : { disposition: "data-unavailable" } };

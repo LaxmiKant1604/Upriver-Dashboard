@@ -27,9 +27,15 @@
 //   publish on a later run once their OLI catches up. The dedicated cycle (scope-fba, as-of) makes a replay
 //   (watchdog / retry) a zero-create idempotent no-op.
 
+import { appendFileSync } from "node:fs";
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
 import { REGION_SCOPES, isRegionScope } from "../../lib/server/sync/scheduler-scope.js";
 loadReleaseEnv();
+
+// HONEST COMPLETENESS signal: an EXPLICIT durable output, never inferred from the job's green status. Downstream
+// completeness (per-account) is proven from `fba_complete` + the logged per-account breakdown, not the exit code.
+const ghOut = (key, value) => { const f = process.env.GITHUB_OUTPUT; if (f) { try { appendFileSync(f, key + "=" + value + "\n"); } catch { /* summary must never fail the run */ } } };
+const ghSum = (line) => { const f = process.env.GITHUB_STEP_SUMMARY; if (f) { try { appendFileSync(f, line + "\n"); } catch { /* ignore */ } } };
 
 const argOf = (name) => { const a = process.argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.split("=").slice(1).join("=") : null; };
 const mode = argOf("mode");
@@ -195,7 +201,9 @@ if (accountScope === "bootstrap") {
 }
 
 // ---------------- go-live: run each SELECTED bucket to completion via the SHARED bounded pass ----------------
-let anyPublished = 0; let anyFailure = false;
+let anyPublished = 0; let anyFailure = false; let anyIncomplete = false;
+// Per-bucket published/expected/failed breakdown for the honest completeness report (never a green "complete").
+const bucketCompleteness = []; // [{ bucket, published, expected, failed }]
 // Per-wave fba-plan publication identities (blocker 2): the EXACT live identity + the ACTUAL durable cycle id
 // + operation identity this operation produced. There is NO "source-incapable" evidence (blocker 3): an
 // empty-inventory account still PUBLISHES (inventoryAvailable:false) and earns a manifest identity here.
@@ -227,18 +235,29 @@ try {
       });
       log(bucket + " pass " + pass + ": phase=" + result.phase + " published=" + result.published + " readback=" + result.readback + (result.continuationRequired ? " (continuation)" : "") + (result.problems ? " problems=" + JSON.stringify(result.problems) : ""));
       if (result.phase === "complete" && result.ok === true) break;
+      if (result.phase === "partial") break; // natural per-account partial (ok:true, complete:false) or strict (ok:false)
       if (result.ok === false) break;
       if (result.continuationRequired !== true) break;
     }
-    if (result && result.phase === "complete" && result.ok === true) {
-      anyPublished += result.published;
+    const bucketPublished = Number(result && result.published) || 0;
+    const bucketFailed = result && Array.isArray(result.failedAccounts) ? result.failedAccounts : [];
+    bucketCompleteness.push({ bucket, published: bucketPublished, expected: includedIds.length, failed: bucketFailed });
+    if (result && result.phase === "complete" && result.ok === true && result.complete === true) {
+      anyPublished += bucketPublished;
       for (const pi of (Array.isArray(result.publishedIdentities) ? result.publishedIdentities : [])) {
         if (pi.liveReportKey && pi.paramsHash) waveFbaPublished.push({ accountId: String(pi.accountId), liveReportKey: String(pi.liveReportKey), paramsHash: String(pi.paramsHash), cycleId: String(result.cycleId || ""), operationId: String(result.operationId || "") });
       }
-      log(bucket + " DONE: fba-plan published for " + result.published + " accounts (read back " + result.readback + "); controls safe-closed.");
+      log(bucket + " DONE: fba-plan published for " + bucketPublished + "/" + includedIds.length + " accounts (read back " + result.readback + "); controls safe-closed.");
+    } else if (result && result.phase === "partial" && result.ok === true) {
+      // NATURAL per-account partial: the published accounts are LIVE (counted); the failed accounts keep their
+      // last-known-good (no live write happened for them). The region is HONESTLY NOT complete -- this is never
+      // reported as a green "complete". Siblings still proceed (LKG-tolerant); completeness is the explicit signal.
+      anyPublished += bucketPublished;
+      anyIncomplete = true;
+      console.error("WARNING " + bucket + " PARTIAL: " + bucketPublished + "/" + includedIds.length + " accounts published live; failed=" + JSON.stringify(bucketFailed) + " (LKG preserved). Region FBA is NOT complete -- fba_complete=false.");
     } else {
       anyFailure = true;
-      console.error("STOP " + bucket + " did not complete: phase=" + (result && result.phase) + (result && result.failedAccounts ? " failedAccounts=" + JSON.stringify(result.failedAccounts) : "") + " problems=" + JSON.stringify(result && result.problems));
+      console.error("STOP " + bucket + " did not complete: phase=" + (result && result.phase) + (bucketFailed.length ? " failedAccounts=" + JSON.stringify(bucketFailed) : "") + " problems=" + JSON.stringify(result && result.problems));
     }
     // AGGREGATE budget tracking (bootstrap scope): record the ACTUAL creates/tokens this run spent.
     // An 'over-reservation' answer is surfaced LOUDLY (never silent).
@@ -276,5 +295,18 @@ if (accountScope === "bootstrap" && !anyFailure && waveFbaPublished.length) {
     log("recorded " + recorded + " fba-plan publication-manifest identit(ies) at " + inventoryAsOf + (staleToken ? " (" + staleToken + " refused: not the active run token)" : "") + ".");
   } catch (e) { console.error("WARNING could not record fba-plan publication manifest: " + (e && e.message ? e.message : e)); }
 }
-log("DONE: fba-plan published for " + anyPublished + " accounts total (inventory requested through " + inventoryAsOf + "); controls safe-closed.");
+// HONEST completeness: complete ONLY when no bucket hard-failed AND no bucket published a partial account set.
+// Emitted as an EXPLICIT durable signal + step summary -- downstream must read this, never the green job status.
+const fbaComplete = !anyFailure && !anyIncomplete;
+const completenessSummary = bucketCompleteness.map((b) => b.bucket + " " + b.published + "/" + b.expected + (b.failed.length ? " (failed " + b.failed.length + ")" : "")).join("; ");
+if (mode === "go-live") {
+  ghOut("fba_complete", fbaComplete ? "true" : "false");
+  ghOut("fba_published", String(anyPublished));
+  ghSum("### FBA go-live completeness\n- **fba_complete=" + fbaComplete + "** -- " + (completenessSummary || "(no buckets)") + "\n- Completeness is per-account (every eligible account published at its exact live identity); a green job is NOT completeness evidence.");
+}
+if (fbaComplete) {
+  log("DONE: fba-plan COMPLETE for " + anyPublished + " accounts total (" + (completenessSummary || "no buckets") + "; inventory requested through " + inventoryAsOf + "); controls safe-closed.");
+} else if (!anyFailure) {
+  console.error("PARTIAL: fba-plan published " + anyPublished + " account(s) but the region is NOT complete (" + completenessSummary + "); last-known-good preserved for unpublished accounts; fba_complete=false.");
+}
 process.exit(anyFailure ? 1 : 0);

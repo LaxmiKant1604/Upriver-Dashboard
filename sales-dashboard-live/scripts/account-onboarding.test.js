@@ -120,10 +120,18 @@ const detailed = (id, country, { ready = true, name = null, rowCount = 1000, ads
     soft.gateMode === "readiness-only"
     && soft.eligible.map((a) => a.id).join(",") === "acct-live,acct-new,acct-boot"
     && soft.excluded.length === 1 && soft.excluded[0].reason === EXCLUDE_DATADOE_NOT_READY);
-  // A brand-new account with NO onboarding row fails closed (no unclaimed bootstrap).
-  const noRow = filterExportEligibleAccounts({ detailedAccounts: [detailed("acct-ghost", "IN")], onboardingRows: [] });
-  ok("D: a discovered account with NO onboarding row is excluded (fail closed) until the worker classifies it",
+  // A brand-new account with NO onboarding row, in an INITIALISED (non-empty) table, fails closed
+  // (routed through onboarding; no unclaimed bootstrap). Setup uses a populated table so the strict
+  // onboarding gate applies -- an EMPTY table now means "subsystem uninitialised" (see the next case).
+  const noRow = filterExportEligibleAccounts({ detailedAccounts: [detailed("acct-ghost", "IN")], onboardingRows: [{ account_id: "other-acct", status: ONBOARDING_STATUS.READY }] });
+  ok("D: a brand-new account with NO onboarding row (initialised table) is excluded NOT_ONBOARDED until the worker classifies it",
     noRow.eligible.length === 0 && noRow.excluded[0].reason === EXCLUDE_NOT_ONBOARDED);
+  // FIX (US-CA outage): an EMPTY onboarding table is NOT authoritative evidence of exclusion -- it means the
+  // subsystem is uninitialised, so the gate falls back to readiness-only and never blanket-excludes existing
+  // DataDoe-ready accounts as NOT_ONBOARDED.
+  const emptyTable = filterExportEligibleAccounts({ detailedAccounts: [detailed("acct-ghost", "IN")], onboardingRows: [] });
+  ok("D: an EMPTY onboarding table falls back to readiness-only (existing DataDoe-ready accounts stay eligible; not blanket NOT_ONBOARDED)",
+    emptyTable.gateMode === "readiness-only" && emptyTable.eligible.length === 1 && emptyTable.excluded.length === 0);
 })();
 
 /* ===================== E. the composed gated fetch (legacy shape; typed reporting) ===================== */

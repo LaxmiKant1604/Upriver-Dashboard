@@ -217,16 +217,37 @@ export function classifyOnboardingAccount({ discovered, existing = null, evidenc
 
 /**
  * PURE export-eligibility gate over the PRIMARY detailed directory.
- *   detailedAccounts : fetchAccountsDetailed() rows (primary connection).
- *   onboardingRows   : account_onboarding rows, or null when the table is unreadable/absent.
+ *   detailedAccounts     : fetchAccountsDetailed() rows (primary connection).
+ *   onboardingRows       : account_onboarding rows, or null when the table is unreadable/absent.
+ *   establishedAccountIds: OPTIONAL ids of accounts already proven ESTABLISHED by the durable
+ *                          account-directory snapshot (previously synced/serving; excludes "Setting up"
+ *                          in-progress entries). When supplied, an ESTABLISHED DataDoe-ready account with
+ *                          no onboarding row is RECONCILED into eligibility (it was live before onboarding
+ *                          tracking existed) -- but a BRAND-NEW id (not established) is NEVER auto-exposed;
+ *                          it must flow through discovery -> onboarding. Array or Set.
+ *
+ * FAIL DIRECTION (fix): an EMPTY onboarding array is NOT authoritative evidence that established accounts
+ * are un-onboarded -- it means the onboarding subsystem is uninitialised for these accounts. An empty (or
+ * unreadable) table therefore falls back to readiness-only (established-scoped when the established set is
+ * supplied), never a blanket NOT_ONBOARDED exclusion of every existing account. A NON-empty table gates
+ * strictly per row, and a no-row account is reconciled only when established.
+ *
  * Returns { eligible (DETAILED rows, order preserved), excluded: [{accountId, name, reason}],
- *           gateMode: 'onboarding' | 'readiness-only' }.
+ *           reconciled: [{accountId, name}], gateMode: 'onboarding' | 'reconcile' | 'readiness-only' }.
  */
-export function filterExportEligibleAccounts({ detailedAccounts, onboardingRows = null } = {}) {
-  const rows = Array.isArray(onboardingRows) ? onboardingRows : null;
+export function filterExportEligibleAccounts({ detailedAccounts, onboardingRows = null, establishedAccountIds = null } = {}) {
+  // An EMPTY array is treated like an absent table (not authoritative) -- this is the load-bearing fix.
+  const rows = Array.isArray(onboardingRows) && onboardingRows.length > 0 ? onboardingRows : null;
   const byAccount = rows ? new Map(rows.map((r) => [S(r.account_id), r])) : null;
+  // An EMPTY established set is NOT a signal (e.g. the account-directory snapshot is absent) -- treat it as null so
+  // the empty-table readiness-only fallback still applies (never a blanket exclusion when we simply have no signal).
+  const establishedSet = establishedAccountIds instanceof Set
+    ? establishedAccountIds
+    : (Array.isArray(establishedAccountIds) ? new Set(establishedAccountIds.map((x) => S(x))) : null);
+  const established = establishedSet && establishedSet.size > 0 ? establishedSet : null;
   const eligible = [];
   const excluded = [];
+  const reconciled = [];
   for (const account of detailedAccounts || []) {
     const accountId = S(account && account.id);
     if (!accountId || accountId.includes(":")) continue; // primary-only; prefixed ids never reach a paid path here
@@ -236,13 +257,26 @@ export function filterExportEligibleAccounts({ detailedAccounts, onboardingRows 
       excluded.push({ accountId, name, reason: EXCLUDE_DATADOE_NOT_READY });
       continue;
     }
-    if (!byAccount) { eligible.push(account); continue; } // fail-soft: readiness-only mode
-    const row = byAccount.get(accountId);
-    if (!row) { excluded.push({ accountId, name, reason: EXCLUDE_NOT_ONBOARDED }); continue; }
-    if (EXPORT_ELIGIBLE_STATUSES.includes(S(row.status))) eligible.push(account);
-    else excluded.push({ accountId, name, reason: EXCLUDE_STATUS_PREFIX + S(row.status).toUpperCase() });
+    const row = byAccount ? byAccount.get(accountId) : null;
+    if (row) {
+      if (EXPORT_ELIGIBLE_STATUSES.includes(S(row.status))) eligible.push(account);
+      else excluded.push({ accountId, name, reason: EXCLUDE_STATUS_PREFIX + S(row.status).toUpperCase() });
+      continue;
+    }
+    // No onboarding row for this DataDoe-ready account.
+    if (established) {
+      // Reconcile ONLY an established (already-directory-known) account; a brand-new id is never exposed.
+      if (established.has(accountId)) { eligible.push(account); reconciled.push({ accountId, name }); }
+      else excluded.push({ accountId, name, reason: EXCLUDE_NOT_ONBOARDED });
+      continue;
+    }
+    // No established-set signal: an absent/empty table is readiness-only (fail-soft, pre-onboarding baseline);
+    // a populated table treats a no-row account as brand-new (route through onboarding).
+    if (!byAccount) { eligible.push(account); continue; }
+    excluded.push({ accountId, name, reason: EXCLUDE_NOT_ONBOARDED });
   }
-  return { eligible, excluded, gateMode: byAccount ? "onboarding" : "readiness-only" };
+  const gateMode = established ? "reconcile" : (byAccount ? "onboarding" : "readiness-only");
+  return { eligible, excluded, reconciled, gateMode };
 }
 
 /**
@@ -501,14 +535,26 @@ export function mergeOnboardingIntoDirectorySnapshot({ priorAccounts, detailedAc
  * fetchAccounts for every included account, so downstream payloads/hashes are unchanged.
  * `onExcluded(excluded, gateMode)` lets operators surface the typed exclusions.
  */
-export async function fetchExportEligibleAccounts(apiKey, { fetchDetailed, readOnboardingRows, onExcluded = null } = {}) {
+export async function fetchExportEligibleAccounts(apiKey, { fetchDetailed, readOnboardingRows, readEstablishedAccountIds = null, onExcluded = null } = {}) {
   if (typeof fetchDetailed !== "function" || typeof readOnboardingRows !== "function") {
     throw new Error("fetchExportEligibleAccounts requires injected fetchDetailed + readOnboardingRows (fail closed).");
   }
   const detailed = (await fetchDetailed(apiKey)) || [];
   let onboardingRows = null;
   try { onboardingRows = await readOnboardingRows(); } catch { onboardingRows = null; } // fail-soft -> readiness-only
-  const { eligible, excluded, gateMode } = filterExportEligibleAccounts({ detailedAccounts: detailed, onboardingRows });
+  // OPTIONAL established-account signal (durable account-directory snapshot). Fail-soft: on any error the
+  // established set is null and the gate falls back to readiness-only on an empty/absent table -- it NEVER
+  // hard-fails discovery, and it NEVER exposes a brand-new id (that path only reconciles established ones).
+  let establishedAccountIds = null;
+  if (typeof readEstablishedAccountIds === "function") {
+    try {
+      const ids = await readEstablishedAccountIds();
+      establishedAccountIds = Array.isArray(ids)
+        ? ids.map((x) => S(x && (x.accountId ?? x.account_id ?? x.id ?? x))).filter(Boolean)
+        : null;
+    } catch { establishedAccountIds = null; }
+  }
+  const { eligible, excluded, gateMode } = filterExportEligibleAccounts({ detailedAccounts: detailed, onboardingRows, establishedAccountIds });
   if (excluded.length && typeof onExcluded === "function") {
     try { onExcluded(excluded, gateMode); } catch { /* reporting must never fail discovery */ }
   }

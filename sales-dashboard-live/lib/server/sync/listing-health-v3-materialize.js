@@ -25,6 +25,7 @@
 import { reportSourceRequestHashes } from "./report-source-contracts.js";
 import { isolateFragmentRowsForOwner } from "./source-account-isolation.js";
 import { organizationFingerprint as orgFingerprintOf } from "../source-identity.js";
+import { MAX_ACCOUNTS_PER_BATCH } from "./source-batching.js";
 
 // The three v3 source families that need per-account materialization. Catalog + OLI are DURABLE, org/per-account
 // reads (never batched here), so they are deliberately absent.
@@ -115,10 +116,22 @@ function approxBytes(rows) { try { return Buffer.byteLength(JSON.stringify({ row
 export const LISTING_HEALTH_V3_NEW_EXPORT_KEYS = Object.freeze(["listing-health-v3:listings", "listing-health-v3:listings-raw"]);
 export const LISTING_HEALTH_V3_REUSED_EXPORT_KEYS = Object.freeze(["listing-health-v3:inventory"]);
 
-// Expected per-region ceilings = 2 x (regional batch count) at the reviewed baseline (India 2 / Europe-AU 4 / US-CA 2
-// batches -> 4 / 8 / 4 new exports). A reviewed phase raises these deliberately; account growth beyond a ceiling
-// FAILS CLOSED (no runaway create) until the ceiling is re-reviewed.
+// DEPRECATED fixed per-region baseline (India 2 / Europe-AU 4 / US-CA 2 batches -> 4 / 8 / 4). Retained ONLY as a
+// last-resort fallback when neither an explicit ceiling nor the eligible account count is available. The gate now
+// COMPUTES the ceiling from the exact frozen plan's account membership (see expectedListingHealthV3NewExports), so
+// account growth NEVER hard-fails against a stale literal -- it scales with the batch count while still catching
+// drift (a plan fanning out more creates than the membership justifies).
 export const LISTING_HEALTH_V3_REGION_EXPORT_CEILING = Object.freeze({ india: 4, "europe-au": 8, "us-ca": 4 });
+
+// The exact number of NEW v3 creates the frozen plan requires for `accountCount` eligible accounts: two creates
+// (Listings + Listings-Raw) per <=MAX_ACCOUNTS_PER_BATCH-seller batch. Returns null for an invalid count.
+export function expectedListingHealthV3NewExports(accountCount) {
+  if (accountCount == null || typeof accountCount === "boolean") return null; // unknown -> caller falls back (Number(null)===0 would be wrong)
+  const n = Number(accountCount);
+  if (!Number.isInteger(n) || n < 0) return null;
+  if (n === 0) return 0;
+  return LISTING_HEALTH_V3_NEW_EXPORT_KEYS.length * Math.ceil(n / MAX_ACCOUNTS_PER_BATCH);
+}
 
 /** Count the DISTINCT planned v3 export request_hashes, split into NEW (listings + listings-raw) vs REUSED (inventory). */
 export function listingHealthV3PlannedExports(plans) {
@@ -135,20 +148,31 @@ export function listingHealthV3PlannedExports(plans) {
 }
 
 /**
- * FAIL-CLOSED per-region export-ceiling gate. Counts ONLY the new Listings + Listings-Raw creates (inventory reuse =
- * zero incremental) and throws BEFORE any create when the planned count exceeds the region's ceiling. Returns the
- * counts + ceiling when within budget. `ceiling` overrides the region default (for a reviewed bump / a test).
+ * FAIL-CLOSED export-ceiling gate. Counts ONLY the new Listings + Listings-Raw creates (inventory reuse = zero
+ * incremental) and throws BEFORE any create when the planned count exceeds the ceiling.
+ *
+ * The ceiling is COMPUTED from the exact frozen plan's eligible account membership (`accountCount`): two creates per
+ * <=5-seller batch. This scales with account growth (no fixed 4/8/4) while still catching DRIFT -- a plan that fans
+ * out MORE creates than the membership justifies is refused. Precedence: an explicit `ceiling` (reviewed override /
+ * test) wins; else the computed value from `accountCount`; else the DEPRECATED per-region literal (only when neither
+ * is available). Returns the counts + ceiling when within budget.
  */
-export function assertListingHealthV3ExportCeiling({ region, plans, ceiling = null }) {
+export function assertListingHealthV3ExportCeiling({ region, plans, accountCount = null, ceiling = null }) {
   const counts = listingHealthV3PlannedExports(plans);
-  const cap = ceiling != null ? ceiling : LISTING_HEALTH_V3_REGION_EXPORT_CEILING[String(region)];
+  const computed = expectedListingHealthV3NewExports(accountCount);
+  let cap = ceiling != null ? Number(ceiling) : computed;
+  const computedFromAccounts = ceiling == null && computed != null;
+  if (cap == null) cap = LISTING_HEALTH_V3_REGION_EXPORT_CEILING[String(region)]; // deprecated last-resort fallback
   if (typeof cap !== "number" || !Number.isFinite(cap) || cap < 0) {
-    throw new Error(`listing-health-v3 has no reviewed export ceiling for region "${region}" (fail closed).`);
+    throw new Error(`listing-health-v3 could not determine an export ceiling for region "${region}" (no explicit ceiling, no valid accountCount, no reviewed region default) (fail closed).`);
   }
   if (counts.newExports > cap) {
-    throw new Error(`listing-health-v3 planned ${counts.newExports} new Listings/Listings-Raw exports for region "${region}" exceeds its reviewed ceiling ${cap}; refusing to create (fail closed).`);
+    const basis = computedFromAccounts
+      ? `the computed ceiling ${cap} (2 x ceil(${accountCount} eligible accounts / ${MAX_ACCOUNTS_PER_BATCH}))`
+      : `the ceiling ${cap}`;
+    throw new Error(`listing-health-v3 planned ${counts.newExports} new Listings/Listings-Raw exports for region "${region}" exceeds ${basis}; refusing to create (drift, fail closed).`);
   }
-  return { region: String(region), ceiling: cap, withinCeiling: true, ...counts };
+  return { region: String(region), ceiling: cap, computedFromAccounts, accountCount: accountCount == null ? null : Number(accountCount), withinCeiling: true, ...counts };
 }
 
 /**

@@ -18,6 +18,7 @@ import {
   listingHealthV3PerAccountReadHashes,
   listingHealthV3PlannedExports,
   assertListingHealthV3ExportCeiling,
+  expectedListingHealthV3NewExports,
   LISTING_HEALTH_V3_READ_KEYS,
   LISTING_HEALTH_V3_REGION_EXPORT_CEILING,
 } from "../lib/server/sync/listing-health-v3-materialize.js";
@@ -244,6 +245,39 @@ await (async () => {
   throwsSync("I: an unknown region (no reviewed ceiling) FAILS CLOSED", () => assertListingHealthV3ExportCeiling({ region: "atlantis", plans: p }));
   ok("I: the reviewed baseline ceilings are India 4 / Europe-AU 8 / US-CA 4 (2 x regional batch count)",
     LISTING_HEALTH_V3_REGION_EXPORT_CEILING.india === 4 && LISTING_HEALTH_V3_REGION_EXPORT_CEILING["europe-au"] === 8 && LISTING_HEALTH_V3_REGION_EXPORT_CEILING["us-ca"] === 4);
+
+  // ---- COMPUTED ceiling (the fix): scales with the frozen plan's account membership; no fixed 4/8/4. ----
+  // A v3 plan with N batches -> 2 distinct new export hashes per batch (listings + listings-raw).
+  const planBatches = (n) => Array.from({ length: n }, (_, b) => ({
+    reportKey: "listing-health-v3",
+    sources: [
+      { requestKey: "listing-health-v3:listings", requestHash: "L" + b },
+      { requestKey: "listing-health-v3:listings-raw", requestHash: "R" + b },
+      { requestKey: "listing-health-v3:inventory", requestHash: "I" + b },
+    ],
+  }));
+  ok("I(computed): expectedListingHealthV3NewExports scales as 2 x ceil(accounts/5); null/invalid -> null",
+    expectedListingHealthV3NewExports(5) === 2 && expectedListingHealthV3NewExports(12) === 6
+    && expectedListingHealthV3NewExports(35) === 14 && expectedListingHealthV3NewExports(0) === 0
+    && expectedListingHealthV3NewExports(null) === null && expectedListingHealthV3NewExports(-1) === null);
+  // Europe grew past the old fixed ceiling 8: 35 accounts -> 7 batches -> 14 exports now PASSES (was hard-fail).
+  const eu = assertListingHealthV3ExportCeiling({ region: "europe-au", plans: planBatches(7), accountCount: 35 });
+  ok("I(computed): Europe 35 accounts -> 14 exports is WITHIN the computed ceiling 14 (was fail-closed against the fixed 8)",
+    eu.withinCeiling === true && eu.newExports === 14 && eu.ceiling === 14 && eu.computedFromAccounts === true);
+  // US-CA grew past the old fixed ceiling 4: 12 accounts -> 3 batches -> 6 exports now PASSES.
+  const usca = assertListingHealthV3ExportCeiling({ region: "us-ca", plans: planBatches(3), accountCount: 12 });
+  ok("I(computed): US-CA 12 accounts -> 6 exports is WITHIN the computed ceiling 6 (was fail-closed against the fixed 4)",
+    usca.withinCeiling === true && usca.newExports === 6 && usca.ceiling === 6);
+  // DRIFT still fails closed: a plan fanning out MORE creates than the membership justifies is refused.
+  throwsSync("I(computed): a plan with 14 exports for only 5 eligible accounts (expected 2) FAILS CLOSED as drift",
+    () => assertListingHealthV3ExportCeiling({ region: "europe-au", plans: planBatches(7), accountCount: 5 }));
+  // An explicit ceiling still overrides (reviewed test path).
+  throwsSync("I(computed): an explicit ceiling override still wins and can fail closed",
+    () => assertListingHealthV3ExportCeiling({ region: "us-ca", plans: planBatches(3), accountCount: 12, ceiling: 1 }));
+  // Backward-compat: no accountCount + no ceiling falls back to the deprecated region map (never a 0-ceiling).
+  const legacy = assertListingHealthV3ExportCeiling({ region: "us-ca", plans: planBatches(1) });
+  ok("I(computed): with no accountCount and no explicit ceiling it falls back to the region map (not a 0 ceiling)",
+    legacy.ceiling === LISTING_HEALTH_V3_REGION_EXPORT_CEILING["us-ca"] && legacy.computedFromAccounts === false);
 })();
 
 /* ===================== J. safe-closed scheduler wiring (present, but nothing can dispatch v3) ===================== */
