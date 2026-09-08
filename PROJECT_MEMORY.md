@@ -15684,3 +15684,35 @@ notes, omitted-vs-blank, real dates, duplicates, atomic, diff, REAL .xlsx round-
 fba-plan-config-handler.test.js (+4: bulk note forwarded, real-date reject, atomic catalog reject, single startedDate).
 IMPLEMENTED + deployed; PRODUCTION ACCEPTANCE (authenticated browser flow + DB note persistence after migration
 20260920 is applied) is PENDING -- the migration is approval-gated and was NOT applied this session.
+
+### FBA Shipment Plan audit ROUND 2 -- UI integration defects (2026-09-08, base 9e1e0f4; pure code; zero DataDoe)
+
+Three ACTUAL UI integration defects on top of the round-1 helper fixes, reproduced + fixed together (new pure module
+src/lib/import-lifecycle.js used by BOTH App.jsx and the tests):
+1. IMPORT LIFECYCLE IDENTITY: the preview stored only {result,fileName} and Apply used the CURRENT account -> an
+   A-parsed preview could POST to B (client retarget). FIX: the whole lifecycle is bound to an immutable scope
+   (account + session token) -- file-select captures it, the async parse self-cancels via a scoped-loader guard
+   (importScopeKey), the preview stores {accountId,token,scope,isCurrent}, and applyLeadTimePreview RE-CHECKS
+   canApplyImport immediately before POST (cancels on any change; never retargets). bulkImportLeadTimes now takes the
+   PARSED accountId explicitly. A pending preview/notice/busy is invalidated the instant the account/session changes.
+2. NOTE PRESERVATION IN THE REAL UI: downloadLeadTimeTemplate hardcoded note:"" -> now uses the SAVED note
+   (lt.note). saveLeadTime (inline day edits + Start/Reset) omitted the note -> the single-row RPC's
+   coalesce(p_note,'') CLEARED it. FIX: resolveLeadTimeNote preserves the existing note on an OMITTED note (read from
+   leadTimeByAsinRef), and only an explicitly-supplied note (incl. an approved "") changes it. Blank-as-clear stays
+   intentional.
+3. ACCOUNT-KEYED CONFIG STATE: rejecting late responses left A's settings/warehouse/lead-times VISIBLE under B while
+   B loaded. FIX: config is tagged with __accountId (tagConfigAccount); loadPlanConfig drops any other-account config
+   IMMEDIATELY (before the await); planConfigReady=isConfigReady gates all config-dependent actions (settings save,
+   warehouse + lead-time edits, imports, template download) via planActionsBusy; a same-account post-save reload keeps
+   the current config (no flash). Honest read-failure behavior preserved (planConfigError, never defaults-as-saved).
+
+Kept the session-SWR invariant: no effect keyed solely on [session?.access_token] (the ref-mirror effect is keyed on
+both account + token). Tests: import-lifecycle.test.js (15), fba-import-integration.test.js (23, REAL React via
+react-test-renderer: A->B, A->B->A, delayed parse + switch, same ASIN in both accounts, failed load, delayed
+post-save reload, note through inline edit/Start-Reset/template round-trip, zero wrong-account writes). verify 173/149
+incl build:check; git diff --check clean; api/*.js=12; zero DataDoe.
+
+MIGRATION 20260920_fba_lead_time_bulk_note.sql is still UNAPPLIED (approval-gated). PRODUCTION ACCEPTANCE PENDING:
+(1) apply the migration with approval, then verify RPC note persistence on a real bulk import; (2) the authenticated
+browser flow (download -> edit -> preview -> import -> reload -> persistence + A->B switch) needs a real session.
+Do NOT claim acceptance from helper/integration tests or deploy success alone.

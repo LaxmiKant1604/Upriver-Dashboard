@@ -164,6 +164,8 @@ const SUITES = [
   "test:fba-plan-config-handler",
   "test:fba-lead-time-import",
   "test:scoped-loader",
+  "test:import-lifecycle",
+  "test:fba-import-integration",
   "test:fba-plan-operation",
   "test:fba-regional-inventory",
   "test:plan-brand",

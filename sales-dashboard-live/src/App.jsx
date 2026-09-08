@@ -37,6 +37,7 @@ import { matchesPlanBrand, UNMAPPED_BRAND } from "./lib/plan-brand.js";
 import { computeAsinWdd, resolveWddWeights, validateWddWeights, WDD_DEFAULT_WEIGHTS } from "./lib/fba-wdd.js";
 import { buildFbaLeadTimeMatrix, validateFbaLeadTimeRows, validateFbaLeadTimeText } from "./lib/fba-lead-time-import.js";
 import { makeScopedLoader } from "./lib/scoped-loader.js";
+import { importScopeKey, resolveLeadTimeNote, canApplyImport, tagConfigAccount, isConfigReady } from "./lib/import-lifecycle.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import { canonicalBrandKey, permittedBrandKeySetForAccount, filterBrandNamesToPermitted } from "./lib/brand-scope-filter.js";
 // Regional Brand View: Region -> Brand selection, using the SINGLE canonical marketplace->region mapping the
@@ -1917,12 +1918,23 @@ function DashboardApp({ session, access, onSignOut }) {
   const [leadTimePreview, setLeadTimePreview] = useState(null);
   // The LIVE selected account, mirrored into a ref so an in-flight config load resolving after an account switch can
   // detect it and refuse to write another account's data into this account's state (account-keyed guard).
+  // The LIVE account + session token mirrored into refs so an in-flight import/load can detect an account switch or a
+  // sign-out / token rotation. Kept in ONE effect keyed on both (never a token-ONLY effect: a token-only effect would
+  // re-run on every silent refresh, which the session-SWR fix deliberately avoids -- and this only updates refs).
   const selectedAccountIdRef = useRef(selectedAccountId);
-  useEffect(() => { selectedAccountIdRef.current = selectedAccountId; }, [selectedAccountId]);
+  const sessionTokenRef = useRef(session?.access_token || null);
+  useEffect(() => { selectedAccountIdRef.current = selectedAccountId; sessionTokenRef.current = session?.access_token || null; }, [selectedAccountId, session?.access_token]);
   // The account-keyed load guard for the plan config (pure, tested in scripts/scoped-loader.test.js). Reads the LIVE
   // account from the ref so a stale/failed/superseded response is discarded rather than written to another account.
   const planConfigLoader = useRef(null);
   if (!planConfigLoader.current) planConfigLoader.current = makeScopedLoader(() => selectedAccountIdRef.current);
+  // The import-lifecycle guard: its scope is the account AND the session token, so a slow parse whose account/session
+  // changed mid-flight (file-select -> arrayBuffer/text -> parse -> preview) is discarded and never becomes a preview.
+  const leadTimeImportLoader = useRef(null);
+  if (!leadTimeImportLoader.current) leadTimeImportLoader.current = makeScopedLoader(() => importScopeKey(selectedAccountIdRef.current, sessionTokenRef.current));
+  // Current lead-times keyed by ASIN, mirrored into a ref so saveLeadTime (defined before the memo) can PRESERVE an
+  // existing note when an inline day edit / Start-Reset omits it.
+  const leadTimeByAsinRef = useRef(new Map());
   // Per-user column visibility (set of HIDDEN column ids), the SKU-horizon editor target, and the bulk-import modal.
   const [planHiddenCols, setPlanHiddenCols] = useState(() => new Set());
   const [planColsBusy, setPlanColsBusy] = useState(false);
@@ -2571,10 +2583,16 @@ function DashboardApp({ session, access, onSignOut }) {
     // the ref. So a slow A load, an A->B switch, or an A->B->A round-trip can never let a stale/other-account response
     // (or a failed request, or a post-upload reload) overwrite the active account's configuration.
     const isCurrent = planConfigLoader.current.begin(acct);
+    // ACCOUNT-KEYED: drop any config that belongs to a DIFFERENT account IMMEDIATELY (before the await), so account
+    // A's settings / warehouse / lead-times are never rendered under account B while B loads. A same-account reload
+    // (post-save) keeps the current config until the fresh one arrives (no flash).
+    setPlanConfig((prev) => (prev && prev.__accountId === acct ? prev : null));
+    setPlanConfigError(null);
     try {
       const cfg = await authFetch(`/api/fba-plan-config?accountId=${encodeURIComponent(acct)}`, session.access_token);
       if (!isCurrent()) return;
-      setPlanConfig(cfg && typeof cfg === "object" ? cfg : { settings: null, overrides: [], warehouse: [] });
+      // Tag the config with its account so every config-derived value can prove which account it is showing.
+      setPlanConfig(tagConfigAccount(cfg, acct));
       setPlanConfigError(null);
     } catch (e) {
       if (!isCurrent()) return;
@@ -2585,6 +2603,13 @@ function DashboardApp({ session, access, onSignOut }) {
     }
   }, [selectedAccountId, session?.access_token]);
   useEffect(() => { if (view === "fbaplan") loadPlanConfig(); else { setPlanConfig(null); setPlanConfigError(null); } }, [view, loadPlanConfig]);
+  // Whether the CURRENT account's configuration is loaded (belongs to it). Config-dependent actions are disabled until
+  // this is true, so nothing is saved/imported against a not-yet-loaded (or another account's) configuration.
+  const planConfigReady = isConfigReady(planConfig, selectedAccountId);
+  // Config-dependent write actions (save settings, warehouse/lead-time edits, imports) are disabled while a write is in
+  // flight OR the current account's config is not yet loaded -- so nothing is ever saved against a stale/other-account
+  // (or not-yet-loaded) configuration.
+  const planActionsBusy = planConfigBusy || !planConfigReady;
 
   // The resolved ACCOUNT-DEFAULT planning settings (durable, with the system defaults when unsaved).
   const planAccountSettings = useMemo(() => {
@@ -2718,7 +2743,10 @@ function DashboardApp({ session, access, onSignOut }) {
     const body = { kind: "lead-time", accountId: selectedAccountId, childAsin, action };
     if (action === "clear") { /* identity only */ }
     else {
-      body.production = production; body.shipping = shipping; body.awd = awd; body.safety = safety; body.note = note || "";
+      body.production = production; body.shipping = shipping; body.awd = awd; body.safety = safety;
+      // PRESERVE the existing note when the caller omits it (an inline day edit / Start-Reset never touches the note);
+      // only an explicitly supplied note (incl. "" the user approved) changes it. Read from the ref (current values).
+      body.note = resolveLeadTimeNote(note, leadTimeByAsinRef.current.get(String(childAsin).toUpperCase())?.note);
       if (action === "start") body.startedDate = startedDate;
     }
     setPlanConfigBusy(true);
@@ -2728,10 +2756,13 @@ function DashboardApp({ session, access, onSignOut }) {
   }, [selectedAccountId, session?.access_token, loadPlanConfig]);
 
   // ADDITIVE: atomic bulk lead-time import (validated client rows; blank-as-clear). Returns the applied count or throws.
-  const bulkImportLeadTimes = useCallback(async (rows) => {
-    if (!selectedAccountId || !session?.access_token) throw new Error("No account selected.");
-    const res = await authFetch("/api/fba-plan-config", session.access_token, {
-      method: "POST", body: JSON.stringify({ kind: "lead-time-bulk", accountId: selectedAccountId, rows }),
+  // `accountId` is passed EXPLICITLY (the account the preview was parsed for) so the POST can never be retargeted to a
+  // different live account; the caller (applyLeadTimePreview) rechecks identity immediately before invoking this.
+  const bulkImportLeadTimes = useCallback(async (rows, accountId = selectedAccountId) => {
+    const token = session?.access_token;
+    if (!accountId || !token) throw new Error("No account selected.");
+    const res = await authFetch("/api/fba-plan-config", token, {
+      method: "POST", body: JSON.stringify({ kind: "lead-time-bulk", accountId, rows }),
     });
     await loadPlanConfig();
     return res;
@@ -3379,6 +3410,8 @@ function DashboardApp({ session, access, onSignOut }) {
     });
     return m;
   }, [planConfig?.leadTimes]);
+  // Mirror into a ref so saveLeadTime (defined earlier) can preserve an existing note on an omitted-note write.
+  useEffect(() => { leadTimeByAsinRef.current = leadTimeByAsin; }, [leadTimeByAsin]);
   // Marketplace-LOCAL current date for the account (drives Days to Inbound + a countdown start), never the browser clock.
   const planMarketToday = useMemo(() => marketplaceToday(planData?.marketCountry || "US"), [planData?.marketCountry]);
 
@@ -3407,6 +3440,9 @@ function DashboardApp({ session, access, onSignOut }) {
   const [leadTimeImportBusy, setLeadTimeImportBusy] = useState(false);
   const [leadTimeNotice, setLeadTimeNotice] = useState(null);
   const leadTimeFileRef = useRef(null);
+  // Invalidate any pending import parse / preview + its notice/busy the instant the account or session changes, so an
+  // A-parsed preview can never linger (or be applied) under B. (The parse also self-cancels via the import guard.)
+  useEffect(() => { setLeadTimePreview(null); setLeadTimeNotice(null); setLeadTimeImportBusy(false); }, [selectedAccountId, session?.access_token]);
   // ADDITIVE: download a lossless XLSX template of the visible ASINs + their current lead-time values (ASIN kept as
   // text). Editing + re-uploading applies changes; a blank cell clears that field (blank-as-clear).
   const downloadLeadTimeTemplate = useCallback(async () => {
@@ -3415,7 +3451,8 @@ function DashboardApp({ session, access, onSignOut }) {
       const a = String(r.asin || "").toUpperCase();
       if (!a || r.warehouseOnly || seen.has(a)) continue; seen.add(a);
       const lt = (r.wdd && r.wdd.leadTime) || {};
-      rows.push({ asin: a, productName: r.productName, brand: r.brand, production: lt.production, shipping: lt.shipping, awd: lt.awd, safety: lt.safety, inboundEta: r.wdd?.inboundEta, note: "" });
+      // Include the SAVED note so a template download -> unchanged re-import round-trips losslessly (was hardcoded "").
+      rows.push({ asin: a, productName: r.productName, brand: r.brand, production: lt.production, shipping: lt.shipping, awd: lt.awd, safety: lt.safety, inboundEta: r.wdd?.inboundEta, note: lt.note ?? "" });
     }
     const matrix = buildFbaLeadTimeMatrix({ accountId: selectedAccountId, rows });
     const { buildXlsx } = await import("./lib/xlsx.js");
@@ -3427,32 +3464,52 @@ function DashboardApp({ session, access, onSignOut }) {
   // confirm-before-apply PREVIEW. The import is NOT applied here -- the user confirms in the preview modal. Blank cells
   // clear (shown as "cleared" in the preview); an omitted writable column or a wrong/mixed account is rejected upfront.
   const onImportLeadTimeFile = useCallback(async (file) => {
-    if (!file) return; setLeadTimeNotice(null); setLeadTimePreview(null); setLeadTimeImportBusy(true);
+    if (!file) return;
+    // Capture the IMMUTABLE lifecycle identity at file selection. The whole parse is bound to it: a mid-flight account
+    // or session change (or a newer file selection) makes isCurrent() false, so a stale parse never becomes a preview.
+    const acct = selectedAccountId; const token = session?.access_token;
+    if (!acct || !token) { setLeadTimeNotice({ tone: "error", msg: "Select an account before importing." }); return; }
+    if (!planConfigReady) { setLeadTimeNotice({ tone: "warning", msg: "This account's configuration is still loading; try again in a moment." }); return; }
+    const scope = importScopeKey(acct, token);
+    const isCurrent = leadTimeImportLoader.current.begin(scope);
+    setLeadTimeNotice(null); setLeadTimePreview(null); setLeadTimeImportBusy(true);
     try {
-      const opts = { expectedAccountId: selectedAccountId, currentByAsin: leadTimeByAsin };
+      const opts = { expectedAccountId: acct, currentByAsin: leadTimeByAsin };
       let result;
-      if (/\.xlsx$/i.test(file.name)) { const { readXlsxFirstSheet } = await import("./lib/xlsx-read.js"); result = validateFbaLeadTimeRows(await readXlsxFirstSheet(await file.arrayBuffer()), opts); }
-      else result = validateFbaLeadTimeText(await file.text(), opts);
+      if (/\.xlsx$/i.test(file.name)) { const { readXlsxFirstSheet } = await import("./lib/xlsx-read.js"); const buf = await file.arrayBuffer(); if (!isCurrent()) return; result = validateFbaLeadTimeRows(await readXlsxFirstSheet(buf), opts); }
+      else { const text = await file.text(); if (!isCurrent()) return; result = validateFbaLeadTimeText(text, opts); }
+      if (!isCurrent()) return; // account/session changed (or a newer file) while parsing -> discard silently
       if (!result.ok) { setLeadTimeNotice({ tone: result.nothingToApply ? "warning" : "error", msg: result.message || "Import invalid; nothing was written." }); return; }
-      setLeadTimePreview({ result, fileName: file.name });
-    } catch (e) { setLeadTimeNotice({ tone: "error", msg: (e && e.message) || "Could not read the file; nothing was written." }); }
-    finally { setLeadTimeImportBusy(false); if (leadTimeFileRef.current) leadTimeFileRef.current.value = ""; }
-  }, [selectedAccountId, leadTimeByAsin]);
+      // Stamp the preview with its immutable scope + the live-scope check so Apply can re-verify identity before POST.
+      setLeadTimePreview({ result, fileName: file.name, accountId: acct, token, scope, isCurrent });
+    } catch (e) { if (isCurrent()) setLeadTimeNotice({ tone: "error", msg: (e && e.message) || "Could not read the file; nothing was written." }); }
+    finally { if (isCurrent()) setLeadTimeImportBusy(false); if (leadTimeFileRef.current) leadTimeFileRef.current.value = ""; }
+  }, [selectedAccountId, session?.access_token, planConfigReady, leadTimeByAsin]);
 
   // ADDITIVE: apply the CONFIRMED lead-time preview. Notes are carried through (childAsin + 4 days + inbound_eta + note).
-  // The bulk write is atomic server-side; a success notice reports the applied count BEFORE the reload, so a later
-  // reload failure is distinguishable from "nothing was written" (the write already returned an applied count).
+  // Identity is RE-CHECKED immediately before the POST: if the account/session changed (or a newer import superseded
+  // this one) since the preview was built, the import is CANCELLED (nothing written, nothing retargeted). The POST
+  // targets the account the preview was PARSED for. A success notice reports the applied count before the reload, so a
+  // later reload failure is distinguishable from "nothing was written".
   const applyLeadTimePreview = useCallback(async () => {
-    const rows = leadTimePreview?.result?.applyRows;
+    const pv = leadTimePreview;
+    const rows = pv?.result?.applyRows;
     if (!rows || !rows.length) { setLeadTimePreview(null); return; }
+    const guard = canApplyImport(pv.scope, selectedAccountId, session?.access_token);
+    if (!guard.ok || (typeof pv.isCurrent === "function" && !pv.isCurrent())) {
+      setLeadTimePreview(null);
+      setLeadTimeNotice({ tone: "warning", msg: "The account or session changed; the import was cancelled and nothing was written." });
+      return;
+    }
     setLeadTimeImportBusy(true); setLeadTimeNotice(null);
     try {
-      const res = await bulkImportLeadTimes(rows.map((r) => ({ childAsin: r.childAsin, production: r.production, shipping: r.shipping, awd: r.awd, safety: r.safety, inboundEta: r.inboundEta, note: r.note || "" })));
-      setLeadTimeNotice({ tone: "success", msg: `Applied ${res?.applied ?? rows.length} ASIN lead-time row(s).` });
+      const res = await bulkImportLeadTimes(rows.map((r) => ({ childAsin: r.childAsin, production: r.production, shipping: r.shipping, awd: r.awd, safety: r.safety, inboundEta: r.inboundEta, note: r.note || "" })), pv.accountId);
+      // Only surface the success notice if THIS import is still the current one (a later account switch supersedes it).
+      if (typeof pv.isCurrent !== "function" || pv.isCurrent()) setLeadTimeNotice({ tone: "success", msg: `Applied ${res?.applied ?? rows.length} ASIN lead-time row(s) to ${pv.accountId}.` });
       setLeadTimePreview(null);
-    } catch (e) { setLeadTimeNotice({ tone: "error", msg: (e && e.message) || "Could not import lead times; nothing was written." }); }
+    } catch (e) { if (typeof pv.isCurrent !== "function" || pv.isCurrent()) setLeadTimeNotice({ tone: "error", msg: (e && e.message) || "Could not import lead times; nothing was written." }); }
     finally { setLeadTimeImportBusy(false); }
-  }, [leadTimePreview, bulkImportLeadTimes]);
+  }, [leadTimePreview, bulkImportLeadTimes, selectedAccountId, session?.access_token]);
 
   // The full ordered column model (identity + sales + forecast + inventory + planning + status). Each column owns its
   // header metadata + cell + footer renderer, so the grouped column chooser and the table stay perfectly in sync. AWD
@@ -3493,7 +3550,7 @@ function DashboardApp({ session, access, onSignOut }) {
       { id: "horizonDemand", group: "Planning", label: "Horizon Demand", chooserLabel: "Horizon demand", thTitle: "Daily run rate × effective horizon days (calendar-aware from the effective-through date)", cell: (r) => td("horizonDemand", r.planning?.horizonDemand), foot: (t) => td("horizonDemand", t.horizonDemand) },
       { id: "safety", group: "Planning", label: "Safety", chooserLabel: "Safety stock", thTitle: "Daily run rate × safety days", cell: (r) => td("safety", r.planning?.safetyStockUnits), foot: (t) => td("safety", t.safetyStock) },
       { id: "targetInv", group: "Planning", label: "Target Inv", chooserLabel: "Target inventory", thTitle: "ceil(Horizon Demand + Safety Stock)", cell: (r) => td("targetInv", r.planning?.targetInventory, "mono pt-strong"), foot: (t) => td("targetInv", t.targetInventory, "mono pt-strong") },
-      { id: "sellerWh", group: "Planning", label: "Seller WH", chooserLabel: "Seller warehouse", thTitle: "Your OWN uncommitted warehouse units for this SKU (click to edit). Never Amazon inventory and never units already in inbound working.", cell: (r) => <WarehouseCell key="sellerWh" row={r} onSave={saveWarehouseQty} busy={planConfigBusy} />, foot: (t) => td("sellerWh", t.sellerWh) },
+      { id: "sellerWh", group: "Planning", label: "Seller WH", chooserLabel: "Seller warehouse", thTitle: "Your OWN uncommitted warehouse units for this SKU (click to edit). Never Amazon inventory and never units already in inbound working.", cell: (r) => <WarehouseCell key="sellerWh" row={r} onSave={saveWarehouseQty} busy={planActionsBusy} />, foot: (t) => td("sellerWh", t.sellerWh) },
       { id: "shipWh", group: "Planning", label: "Ship WH", chooserLabel: "Ship from warehouse", thTitle: "min(Seller WH, shortage after Amazon/AWD network stock)", cell: (r) => td("shipWh", r.planning?.shipFromSellerWarehouse), foot: (t) => td("shipWh", t.shipWh) },
       { id: "produce", group: "Planning", label: "Produce", chooserLabel: "Production requirement", thTitle: "max(0, shortage after Amazon/AWD network stock − Seller WH)", cell: (r) => td("produce", r.planning?.productionRequirement, "mono pt-strong"), foot: (t) => td("produce", t.production, "mono pt-strong") },
       { id: "stockout", group: "Planning", label: "Est. Stockout", chooserLabel: "Estimated stockout", thTitle: "Effective-through date + floor(Immediately Available / daily run rate)", cell: (r) => <td key="stockout" className="mono" title={r.planning?.estimatedStockoutDate ? "" : (r.planning?.stockoutReason || "")}>{r.planning?.estimatedStockoutDate ? fmtDateHuman(r.planning.estimatedStockoutDate) : <span className="dr-dash">—</span>}</td>, foot: () => <td key="stockout" className="mono">—</td> },
@@ -3508,19 +3565,19 @@ function DashboardApp({ session, access, onSignOut }) {
       { id: "avg30", group: "Demand (WDD)", label: "30D Avg", chooserLabel: "30-day daily avg", thTitle: "Covered ordered units in the trailing 30 days / covered days.", cell: (r) => <td key="avg30" className="mono">{wnum2(r.wdd?.avg30)}</td>, foot: () => <td key="avg30" className="mono">—</td> },
       { id: "avg60", group: "Demand (WDD)", label: "60D Avg", chooserLabel: "60-day daily avg", thTitle: "Covered ordered units in the trailing 60 days / covered days.", cell: (r) => <td key="avg60" className="mono">{wnum2(r.wdd?.avg60)}</td>, foot: () => <td key="avg60" className="mono">—</td> },
       { id: "wdd", group: "Demand (WDD)", label: "WDD", chooserLabel: "Weighted daily demand", thTitle: "(7D×w7 + 30D×w30 + 60D×w60)/100 using this ASIN's brand WDD weights (unmapped uses the account default). Full precision; shown to 2 decimals.", cell: (r) => <td key="wdd" className="mono pt-strong">{wnum2(r.wdd?.wdd)}</td>, foot: () => <td key="wdd" className="mono">—</td> },
-      { id: "ltProd", group: "Lead Time", label: "Production (d)", chooserLabel: "Production lead time (days)", thTitle: "Manual: your production lead time in days. Blank = Not configured.", cell: (r) => <LeadTimeDayCell key="ltProd" row={r} field="production" onSave={saveLeadTime} busy={planConfigBusy} />, foot: () => <td key="ltProd" className="mono">—</td> },
-      { id: "ltShip", group: "Lead Time", label: "Shipping (d)", chooserLabel: "Shipping lead time (days)", thTitle: "Manual: your shipping lead time in days.", cell: (r) => <LeadTimeDayCell key="ltShip" row={r} field="shipping" onSave={saveLeadTime} busy={planConfigBusy} />, foot: () => <td key="ltShip" className="mono">—</td> },
-      { id: "ltAwd", group: "Lead Time", label: "AWD Transfer (d)", chooserLabel: "AWD transfer time (days)", thTitle: "Manual: your AWD transfer time in days.", cell: (r) => <LeadTimeDayCell key="ltAwd" row={r} field="awd" onSave={saveLeadTime} busy={planConfigBusy} />, foot: () => <td key="ltAwd" className="mono">—</td> },
-      { id: "ltSafety", group: "Lead Time", label: "Safety Stock (d)", chooserLabel: "Safety stock (days)", thTitle: "Manual: your safety-stock buffer in days. Excluded from the Inbound ETA (it is a buffer), included in Total Lead Time.", cell: (r) => <LeadTimeDayCell key="ltSafety" row={r} field="safety" onSave={saveLeadTime} busy={planConfigBusy} />, foot: () => <td key="ltSafety" className="mono">—</td> },
+      { id: "ltProd", group: "Lead Time", label: "Production (d)", chooserLabel: "Production lead time (days)", thTitle: "Manual: your production lead time in days. Blank = Not configured.", cell: (r) => <LeadTimeDayCell key="ltProd" row={r} field="production" onSave={saveLeadTime} busy={planActionsBusy} />, foot: () => <td key="ltProd" className="mono">—</td> },
+      { id: "ltShip", group: "Lead Time", label: "Shipping (d)", chooserLabel: "Shipping lead time (days)", thTitle: "Manual: your shipping lead time in days.", cell: (r) => <LeadTimeDayCell key="ltShip" row={r} field="shipping" onSave={saveLeadTime} busy={planActionsBusy} />, foot: () => <td key="ltShip" className="mono">—</td> },
+      { id: "ltAwd", group: "Lead Time", label: "AWD Transfer (d)", chooserLabel: "AWD transfer time (days)", thTitle: "Manual: your AWD transfer time in days.", cell: (r) => <LeadTimeDayCell key="ltAwd" row={r} field="awd" onSave={saveLeadTime} busy={planActionsBusy} />, foot: () => <td key="ltAwd" className="mono">—</td> },
+      { id: "ltSafety", group: "Lead Time", label: "Safety Stock (d)", chooserLabel: "Safety stock (days)", thTitle: "Manual: your safety-stock buffer in days. Excluded from the Inbound ETA (it is a buffer), included in Total Lead Time.", cell: (r) => <LeadTimeDayCell key="ltSafety" row={r} field="safety" onSave={saveLeadTime} busy={planActionsBusy} />, foot: () => <td key="ltSafety" className="mono">—</td> },
       { id: "ltTotal", group: "Lead Time", label: "Total Lead (d)", chooserLabel: "Total lead time (days)", thTitle: "Production + Shipping + AWD Transfer + Safety Stock. 'Not configured' when any input is missing.", cell: (r) => <td key="ltTotal" className="mono pt-strong">{r.wdd?.totalLeadTime == null ? <span className="plan-wh-empty">Not configured</span> : nInt(r.wdd.totalLeadTime)}</td>, foot: () => <td key="ltTotal" className="mono">—</td> },
-      { id: "inboundEta", group: "Lead Time", label: "Inbound ETA", chooserLabel: "Inbound ETA + Start/Reset", align: "left", thTitle: "Set on an explicit Start/Reset: marketplace-local start date + Production + Shipping + AWD Transfer (Safety excluded).", cell: (r) => <InboundEtaCell key="inboundEta" row={r} marketToday={planMarketToday} busy={planConfigBusy} onStart={(asin) => { const lt = (r.wdd && r.wdd.leadTime) || {}; saveLeadTime({ childAsin: asin, production: lt.production, shipping: lt.shipping, awd: lt.awd, safety: lt.safety, action: "start", startedDate: planMarketToday }); }} />, foot: () => <td key="inboundEta" className="mono">—</td> },
+      { id: "inboundEta", group: "Lead Time", label: "Inbound ETA", chooserLabel: "Inbound ETA + Start/Reset", align: "left", thTitle: "Set on an explicit Start/Reset: marketplace-local start date + Production + Shipping + AWD Transfer (Safety excluded).", cell: (r) => <InboundEtaCell key="inboundEta" row={r} marketToday={planMarketToday} busy={planActionsBusy} onStart={(asin) => { const lt = (r.wdd && r.wdd.leadTime) || {}; saveLeadTime({ childAsin: asin, production: lt.production, shipping: lt.shipping, awd: lt.awd, safety: lt.safety, action: "start", startedDate: planMarketToday }); }} />, foot: () => <td key="inboundEta" className="mono">—</td> },
       { id: "daysToInbound", group: "Lead Time", label: "Days to Inbound", chooserLabel: "Days to inbound", thTitle: "max(0, Inbound ETA − marketplace-local current date). Derived live; 'Not configured' with no ETA.", cell: (r) => <td key="daysToInbound" className="mono">{r.wdd?.daysToInbound == null ? <span className="plan-wh-empty">Not configured</span> : nInt(r.wdd.daysToInbound)}</td>, foot: () => <td key="daysToInbound" className="mono">—</td> },
       { id: "idealCover", group: "Reorder", label: "Ideal Cover", chooserLabel: "Ideal cover (units)", thTitle: "WDD × Total Lead Time (whole units).", cell: (r) => <td key="idealCover" className="mono">{r.wdd?.idealCover == null ? <span className="dr-dash">—</span> : nInt(r.wdd.idealCover)}</td>, foot: () => <td key="idealCover" className="mono">—</td> },
       { id: "existingCover", group: "Reorder", label: "Existing Cover", chooserLabel: "Existing cover at inbound (units)", thTitle: "max(0, FBA Available + AWD Available + Inbound Pipeline − WDD × Days to Inbound). Total FBA Inventory is deliberately excluded (it already contains inbound).", cell: (r) => <td key="existingCover" className="mono">{r.wdd?.existingCover == null ? <span className="dr-dash">—</span> : nInt(r.wdd.existingCover)}</td>, foot: () => <td key="existingCover" className="mono">—</td> },
       { id: "reorderStatus", group: "Reorder", label: "Reorder Status", chooserLabel: "Reorder status", align: "left", thTitle: "Reorder when Existing Cover < Ideal Cover (full precision), else Sufficient. Unavailable when demand, inventory or settings are missing (never a false Sufficient).", cell: (r) => { const s = r.wdd?.reorderStatus; return <td key="reorderStatus">{s === "Reorder" ? <span className="pt-badge pt-badge-restock">Reorder</span> : s === "Sufficient" ? <span className="pt-badge pt-badge-ok">Sufficient</span> : <span className="pt-badge sku-badge-neutral" title="Demand, inventory or lead-time settings not configured">Unavailable</span>}</td>; }, foot: (t, rows) => { const n = (rows || []).filter((r) => r.wdd?.reorderStatus === "Reorder").length; return <td key="reorderStatus">{n > 0 ? `${n} reorder` : "—"}</td>; } },
       { id: "suggestedReorder", group: "Reorder", label: "Suggested Reorder", chooserLabel: "Suggested reorder (units)", thTitle: "ceil(max(0, Ideal Cover − Existing Cover)) — whole units.", cell: (r) => <td key="suggestedReorder" className="mono pt-strong">{r.wdd?.suggestedReorder == null ? <span className="dr-dash">—</span> : nInt(r.wdd.suggestedReorder)}</td>, foot: (t, rows) => { const sum = (rows || []).reduce((s, r) => s + (r.wdd?.suggestedReorder || 0), 0); return <td key="suggestedReorder" className="mono pt-strong">{sum > 0 ? nInt(sum) : "—"}</td>; } },
     ];
-  }, [planData, targetDays, saveWarehouseQty, saveLeadTime, planConfigBusy, planMarketToday]);
+  }, [planData, targetDays, saveWarehouseQty, saveLeadTime, planActionsBusy, planMarketToday]);
 
   // Visible columns = model minus the user's hidden set, minus AWD columns for non-US accounts.
   const planVisibleColumns = useMemo(
@@ -4915,11 +4972,11 @@ function DashboardApp({ session, access, onSignOut }) {
           </div>
         </div>
 
-        <PlanningSettingsBar settings={planAccountSettings} onSave={savePlanSettings} busy={planConfigBusy} />
+        <PlanningSettingsBar settings={planAccountSettings} onSave={savePlanSettings} busy={planActionsBusy} />
 
         {/* ADDITIVE: WDD blend weights for the selected brand (or the account default). Sits beside the existing
             Planning Horizon / Forecast Method controls; never alters them. */}
-        <WddSettingsBar brandLabel={wddEditKey ? selectedBrand : "All brands / unmapped"} brandKey={wddEditKey} saved={wddWeightsByKey.get(wddEditKey)} onSave={saveWddWeights} busy={planConfigBusy} />
+        <WddSettingsBar brandLabel={wddEditKey ? selectedBrand : "All brands / unmapped"} brandKey={wddEditKey} saved={wddWeightsByKey.get(wddEditKey)} onSave={saveWddWeights} busy={planActionsBusy} />
 
         <div className="plan-controls">
           <label className="plan-field plan-search">
@@ -4929,14 +4986,14 @@ function DashboardApp({ session, access, onSignOut }) {
               <input type="text" placeholder="ASIN, SKU, product, or brand" value={planSearch} onChange={(e) => setPlanSearch(e.target.value)} />
             </span>
           </label>
-          <button className="plan-tool-btn" type="button" disabled={!selectedAccountId} onClick={() => setWarehouseImportOpen(true)} title="Bulk-import your seller warehouse units (CSV / XLSX)">
+          <button className="plan-tool-btn" type="button" disabled={!selectedAccountId || !planConfigReady} onClick={() => setWarehouseImportOpen(true)} title="Bulk-import your seller warehouse units (CSV / XLSX)">
             <Upload size={15} /> Import warehouse
           </button>
           {/* ADDITIVE: per-ASIN lead-time XLSX download + upload (ASIN kept as text; atomic import; blank-as-clear). */}
-          <button className="plan-tool-btn" type="button" disabled={!planData} onClick={downloadLeadTimeTemplate} title="Download the ASIN lead-time template (XLSX, keeps ASINs exact)">
+          <button className="plan-tool-btn" type="button" disabled={!planData || !planConfigReady} onClick={downloadLeadTimeTemplate} title="Download the ASIN lead-time template (XLSX, keeps ASINs exact)">
             <Download size={15} /> Lead-time template
           </button>
-          <button className="plan-tool-btn" type="button" disabled={!selectedAccountId || leadTimeImportBusy} onClick={() => leadTimeFileRef.current && leadTimeFileRef.current.click()} title="Import ASIN lead times (CSV / XLSX). Blank cells clear that field.">
+          <button className="plan-tool-btn" type="button" disabled={!selectedAccountId || leadTimeImportBusy || !planConfigReady} onClick={() => leadTimeFileRef.current && leadTimeFileRef.current.click()} title="Import ASIN lead times (CSV / XLSX). Blank cells clear that field.">
             <Upload size={15} /> Import lead times
           </button>
           <input ref={leadTimeFileRef} type="file" accept=".csv,.tsv,.xlsx,text/csv" style={{ display: "none" }} onChange={(e) => onImportLeadTimeFile(e.target.files && e.target.files[0])} />
@@ -5058,7 +5115,7 @@ function DashboardApp({ session, access, onSignOut }) {
           {" "}<strong>Total FBA Inv.</strong> = FBA Available + Reserved (FC) + Inbound Pipeline (FBA network only — no AWD, no seller warehouse). <strong>Amazon Network Pos.</strong> = Total FBA Inv.{planData?.isUS ? " + AWD Available" : ""} and is the planning supply. <strong>Seller WH</strong> holds your OWN uncommitted warehouse units (edit inline or bulk-import); never Amazon inventory and never units already in inbound working. Target Units = the corrected daily run rate × the entered coverage days; Recommend = ceil(Target Units − Amazon Network Pos.), floored at 0. FBA Days (MTD DRR) = FBA Available ÷ MTD daily run rate (excludes reserved, inbound and AWD). Planning columns (Pipeline, Horizon Demand, Safety, Target Inv, Ship WH, Produce, Est. Stockout, Priority) come from the per-account/per-SKU planning settings. Live inventory freshness is independent of sales-report freshness; both dates are shown above. Settings, warehouse edits, the column chooser, filters, sorting, and the target-days input recompute locally without new DataDoe requests.
         </div>
         {skuHorizonEdit && (
-          <SkuHorizonEditor target={skuHorizonEdit} accountDefault={planAccountSettings.horizon} busy={planConfigBusy}
+          <SkuHorizonEditor target={skuHorizonEdit} accountDefault={planAccountSettings.horizon} busy={planActionsBusy}
             onSave={saveSkuHorizon} onClose={() => setSkuHorizonEdit(null)} />
         )}
         {warehouseImportOpen && (
