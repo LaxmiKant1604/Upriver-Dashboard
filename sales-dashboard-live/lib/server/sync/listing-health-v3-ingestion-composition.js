@@ -33,6 +33,7 @@ import { materializeListingHealthV3PerAccount, LISTING_HEALTH_V3_REGION_EXPORT_C
 import { planFbaPlanBucketBatched } from "./report-planner.js";
 import { fbaCycleBucket } from "./fba-plan-operation.js";
 import { defaultInventoryBatchesOf, overflowSellersFromTruncated, readRecentTruncatedInventoryOwnership, DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS } from "./fba-inventory-overflow.js";
+import { readRecentReadinessRejectionOwnership, readinessIsolationFrom } from "./source-readiness-isolation.js";
 
 const V3_NEW_SOURCE_KEYS = Object.freeze(["listings", "listings-raw"]);
 const V3_INVENTORY_SOURCE_KEY = "fba-inventory-health";
@@ -115,6 +116,23 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
       });
     } catch (_e) { return new Set(); }
     const { overflowSellers } = overflowSellersFromTruncated({ defaultInventoryBatches, truncatedOwnership });
+    // BATCH-POISONING SELF-HEAL: fold readiness-isolation (DATADOE_INITIAL_LOAD_INCOMPLETE) for the v3 inventory
+    // source into the SAME single-seller inventory split channel, so a readiness-poisoned inventory seller is
+    // isolated off its shared batch (healthy batch-mates never poisoned; self-clears on the next single-seller
+    // success). Fail-soft: any read error adds nothing.
+    try {
+      // v3 inventory REUSES the fba-plan:inventory-health export identity, so its durable owners carry request_key
+      // "fba-plan:inventory-health" under the <region>-fba cycle bucket (exactly what the TRUNCATED reader above
+      // matches). Read the SAME shared inventory evidence -- keying on "listing-health-v3:inventory" would match no
+      // owner and make the fold inert.
+      const { isolateScopeHashes } = await readRecentReadinessRejectionOwnership({
+        requestKey: "fba-plan:inventory-health", cycleBucket: fbaCycleBucket(region), now, maxAgeDays, connectionId: "primary", organizationFingerprint: org,
+        readRecentCycleIds: (cb, since) => getRecentCycleIds(cb, since),
+        readSourceJobs: (cid) => getSourceJobsWithMeta(cid),
+        readOwners: (cid) => getSourceJobOwners(cid),
+      });
+      for (const s of readinessIsolationFrom({ defaultBatches: defaultInventoryBatches, isolateScopeHashes }).isolateSellers) overflowSellers.add(s);
+    } catch (_e) { /* fail-soft: no readiness isolation */ }
     return overflowSellers;
   };
 

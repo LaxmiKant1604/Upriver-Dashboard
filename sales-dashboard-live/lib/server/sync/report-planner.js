@@ -433,8 +433,10 @@ export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, 
       const byId = new Map(eligible.map((m) => [m.scope.accountId, m]));
       const membership = new Map([...existingFbaMembership].filter(([id]) => byId.has(id)));
       const { batches } = assignAccountBatches(eligible.map((m) => ({ accountId: m.scope.accountId, rawSellerId: m.scope.rawSellerId })), membership, MAX_ACCOUNTS_PER_BATCH);
-      // Adaptive self-heal: isolate proven-overflow sellers into single-seller INVENTORY batches (never AWD). Empty
-      // overflow set => byte-identical to the default plan (existing hashes unchanged).
+      // Adaptive self-heal: isolate proven-overflow sellers into single-seller INVENTORY batches (never AWD). The
+      // overflowSellers set also carries readiness-isolation sellers (DATADOE_INITIAL_LOAD_INCOMPLETE) folded in by
+      // the release composition, so a readiness-poisoned inventory seller is split off the same way. Empty set =>
+      // byte-identical to the default plan (existing hashes unchanged).
       const effectiveBatches = requestKey === "fba-plan:inventory-health" ? splitOverflowBatches(batches, byId, overflowSellers) : batches;
       for (const batch of effectiveBatches) {
         const owners = batch.accounts.map((a) => byId.get(a.accountId));
@@ -514,7 +516,10 @@ export function planListingHealthV3BucketBatched({ accounts = [], connections, a
     // seller child for proven-overflow sellers -- but ONLY for inventory. Listings + Listings-Raw do NOT truncate, so
     // they stay BATCHED (splitting them would multiply the owned Listings/Raw create count past the region ceiling).
     // The overflow evidence is inventory-specific; applying it beyond inventory would be incorrect over-splitting.
-    // Empty overflow set => inventoryBatches === batches => byte-identical to the pre-split single-loop result.
+    // Empty overflow set => inventoryBatches === batches => byte-identical to the pre-split single-loop result. The
+    // overflowSellers set also carries readiness-isolation sellers (DATADOE_INITIAL_LOAD_INCOMPLETE) folded in by the
+    // v3 ingestion composition, so a readiness-poisoned inventory seller is split off the same way; Listings +
+    // Listings-Raw stay BATCHED (splitting them would multiply the create count past the region ceiling).
     const inventoryBatches = splitOverflowBatches(batches, byId, overflowSellers);
     const sourcesByAccount = new Map(members.map((m) => [m.scope.accountId, []]));
     const buildSourcesInto = (batchSet, keepRequestKeys) => {

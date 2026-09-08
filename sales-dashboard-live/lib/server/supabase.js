@@ -1672,10 +1672,14 @@ export async function getSyncCycle(cycleId, { signal = null } = {}) {
 // region-fba cycles for terminal TRUNCATED inventory jobs). Read-only; returns [cycleId] newest-first, bounded.
 export async function getRecentSyncCycleIds(bucket, sinceDate, { signal = null, limit = 60 } = {}) {
   const query = new URLSearchParams({
-    select: "id,cycle_date",
+    select: "id,cycle_date,created_at",
     bucket: `eq.${bucket}`,
     cycle_date: `gte.${sinceDate}`,
-    order: "cycle_date.desc",
+    // created_at is the intra-date tiebreak so the returned ids are STRICTLY newest-first even when a base cycle and
+    // its superseding attempt(s) share one cycle_date. The readiness-isolation reader relies on this ordering for its
+    // first-seen-wins recency (a newer rejection must never be masked by a stale same-date success); the truncated-
+    // overflow readers are order-independent, so this is a safe refinement.
+    order: "cycle_date.desc,created_at.desc",
     limit: String(limit),
   });
   const rows = await request(`/rest/v1/sync_cycles?${query}`, { signal });

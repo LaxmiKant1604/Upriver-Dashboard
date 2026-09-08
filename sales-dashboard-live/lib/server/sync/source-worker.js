@@ -38,6 +38,7 @@ import { sourceJobOwnerId } from "../source-identity.js";
 import { validateBatchSourcePayload } from "./source-account-isolation.js";
 import { isRoutingScope } from "./scheduler-scope.js";
 import { compactLatestInventorySnapshot, isLatestSnapshotSource } from "./fba-inventory-latest-snapshot.js";
+import { isInitialLoadIncompleteMessage, READINESS_INCOMPLETE_CODE } from "./source-readiness-isolation.js";
 
 const DEFAULT_RESERVE_MS = 3_000; // stop before the server cap so status/locks persist
 
@@ -99,6 +100,15 @@ export function classifyFetchError(error, stage = "create-export") {
       // 408 Request Timeout + 429 Too Many Requests + every 5xx are TRANSIENT (resumable); every OTHER 4xx is a
       // DEFINITIVE client-side request rejection (terminal -- the SAME request will be rejected again).
       const transient = status === 408 || status === 429 || status >= 500;
+      // NARROW readiness rejection: DataDoe hard-rejects a seller-batched export with HTTP 400 when even ONE
+      // selected seller's Seller Central initial data load is incomplete ("... requires Seller Central data on
+      // every selected seller, but the initial data load is not complete."). It is STILL terminal for THIS exact
+      // batch (the same request re-fails), but a DISTINCT typed code so a later fresh cycle can isolate the batch
+      // into single-seller jobs (healthy sellers stop being poisoned). Matched ONLY on the proven provider
+      // signature -- every other terminal 400 stays HTTP_400 and never triggers a split.
+      if (status === 400 && isInitialLoadIncompleteMessage(raw)) {
+        return { stage, code: READINESS_INCOMPLETE_CODE, message: "DataDoe rejected this export: a selected seller's Seller Central initial data load is not complete.", terminal: true, httpStatus: 400, transient: false, detail };
+      }
       return { stage, code: `HTTP_${status}`, message: `DataDoe returned HTTP ${status} for this source.`, terminal: !transient, httpStatus: status, transient, detail };
     }
   }

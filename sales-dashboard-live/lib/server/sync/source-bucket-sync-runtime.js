@@ -34,7 +34,7 @@ import { makeSupabaseSourceStore, makeDataDoeAdapter } from "./source-sync-drive
 import { makeShadowSnapshotSaver } from "./report-snapshot-store.js";
 import { buildSchedulerV2SourceTrancheRuntime } from "./runtime-composition.js";
 import { batchFamilyKey } from "./source-batching.js";
-import { runBucketSourceSync, SOURCE_SYNC_OWNER_REPORT_KEY, selectCatalogCarrierSeller } from "./source-bucket-sync.js";
+import { runBucketSourceSync, SOURCE_SYNC_OWNER_REPORT_KEY, selectCatalogCarrierSeller, OLI_SLICE_REQUEST_KEY } from "./source-bucket-sync.js";
 import { REPORT_SOURCE_CONTRACTS } from "./report-source-contracts.js";
 import {
   OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY, ORGANIZATION_SCOPE_KEY,
@@ -58,7 +58,9 @@ import {
   getReportSyncSettings, getSchedulerAccountRollout,
   upsertSyncReportJob, claimReportDeriveLease, reconcileReportDeriveSuccess, getReportSnapshot,
   getReportSnapshotStoragePayload, saveShadowSnapshotIfNewer,
+  getRecentSyncCycleIds, getSyncSourceJobsWithMeta, getSyncSourceJobOwnersForCycle,
 } from "../supabase.js";
+import { readRecentReadinessRejectionOwnership, readinessIsolationFrom } from "./source-readiness-isolation.js";
 import { recomputeOliSalesEstimatesWindow } from "./oli-sales-estimate-recompute.js";
 import {
   enrichOliHistoryRowsWithEstimates,
@@ -269,6 +271,12 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     readAdMetrics = getActiveAdsDailyRows,
     readBatchMembership = listSourceBatchMembership,
     assignBatchMembership = assignSourceAccountBatch,
+    // READINESS ISOLATION evidence readers (batch-poisoning self-heal) -- the SAME durable readers the FBA overflow
+    // uses. Injectable for offline tests; the resolution is fail-soft (any error => no isolation => default plan).
+    readRecentSyncCycleIds = getRecentSyncCycleIds,
+    readSyncSourceJobsWithMeta = getSyncSourceJobsWithMeta,
+    readSyncSourceJobOwnersForCycle = getSyncSourceJobOwnersForCycle,
+    readinessNow = () => Date.now(),
     readSettings = getReportSyncSettings,
     readRollout = getSchedulerAccountRollout,
     // Round-4 finding 3 + round-7 finding 1: the GENUINE, RECOVERABLE publication lineage. Every durable
@@ -439,6 +447,28 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const primary = connections.find((c) => c && c.id === "primary" && String(c.apiKey || "").trim());
     if (!primary) throw new Error("bucket source sync requires a configured primary DataDoe connection (fail closed).");
     return { connections, primary, orgFingerprint: primary.organizationFingerprint || organizationFingerprint(primary.apiKey) };
+  };
+
+  // Resolve the OLI readiness-isolation set from recent durable DATADOE_INITIAL_LOAD_INCOMPLETE evidence, scoped to
+  // this region cycle bucket + primary connection + organization (mirrors the FBA overflow's resolveOverflowSellers).
+  // The isolate set is recency-resolved (a seller whose newest readiness event is a rejection); a later single-seller
+  // success clears it. Fail-soft: any error (or a pre-migration reader) yields an empty set => byte-identical default
+  // OLI batching. Threaded into runBucketSourceSync, which applies it ONLY on a FRESH cycle (never a continuation).
+  const resolveReadinessSellers = async ({ bucket, cycleBucket, accounts, orgFingerprint }) => {
+    const empty = { readinessIsolateSellers: new Set() };
+    if (!Array.isArray(accounts) || accounts.length === 0) return empty;
+    try {
+      const defaultBatches = [{ sellerOrVendorIds: accounts.map((a) => String(a && a.rawSellerId)).filter(Boolean) }];
+      const { isolateScopeHashes } = await readRecentReadinessRejectionOwnership({
+        requestKey: OLI_SLICE_REQUEST_KEY, cycleBucket: cycleBucket || bucket, now: readinessNow,
+        connectionId: "primary", organizationFingerprint: orgFingerprint,
+        readRecentCycleIds: (cb, since) => readRecentSyncCycleIds(cb, since),
+        readSourceJobs: (cid) => readSyncSourceJobsWithMeta(cid),
+        readOwners: (cid) => readSyncSourceJobOwnersForCycle(cid),
+      });
+      const r = readinessIsolationFrom({ defaultBatches, isolateScopeHashes });
+      return { readinessIsolateSellers: r.isolateSellers };
+    } catch (_e) { return empty; }
   };
 
   const discoverBucketAccounts = async ({ connections, bucket }) => {
@@ -774,6 +804,10 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const boundedUpdateRunStatus = updateRunStatus == null ? null
       : (entry) => dl.bound("run-status-write", (signal) => updateRunStatus(entry, { signal }), { write: true });
 
+    // Batch-poisoning self-heal: resolve the OLI readiness-isolation set from durable evidence. Fail-soft to empty
+    // (default plan). runBucketSourceSync applies it ONLY on a FRESH cycle (a frozen continuation is untouched).
+    const { readinessIsolateSellers } = await resolveReadinessSellers({ bucket, cycleBucket, accounts, orgFingerprint });
+
     let rollup;
     try {
       rollup = await runBucketSourceSync({
@@ -785,6 +819,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         pausedSources,
         asOf: asOfStr, today: todayStr,
         store, dataDoe,
+        readinessIsolateSellers,
         replaceHistoryWindow: trackedReplaceHistory, persistSnapshot: trackedPersistSnapshot, updateRunStatus: boundedUpdateRunStatus,
         recordCompleteness: recordOliCompleteness,
         cycleDate: cycleDate || todayStr, cycleBucket, trigger: "manual",

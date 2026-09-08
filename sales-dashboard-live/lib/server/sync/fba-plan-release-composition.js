@@ -13,6 +13,7 @@ import { buildSchedulerV2Publisher } from "./publisher-composition.js";
 import { planFbaPlanBucketBatched } from "./report-planner.js";
 import { fbaCycleBucket } from "./fba-plan-operation.js";
 import { defaultInventoryBatchesOf, overflowSellersFromTruncated, readRecentTruncatedInventoryOwnership, DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS } from "./fba-inventory-overflow.js";
+import { readRecentReadinessRejectionOwnership, readinessIsolationFrom } from "./source-readiness-isolation.js";
 import { getRecentSyncCycleIds, getSyncSourceJobsWithMeta, getSyncSourceJobOwnersForCycle } from "../supabase.js";
 import { organizationFingerprint as orgFingerprintOf } from "../source-identity.js";
 import { runControlPackageCli, buildFbaPlanControlPackage } from "./source-priority-control-package.js";
@@ -186,7 +187,26 @@ export function buildFbaPlanRelease(overrides = {}) {
       readSourceJobs: (cid) => getSyncSourceJobsWithMeta(cid),
       readOwners: (cid) => getSyncSourceJobOwnersForCycle(cid),
     });
-    return overflowSellersFromTruncated({ defaultInventoryBatches, truncatedOwnership });
+    const base = overflowSellersFromTruncated({ defaultInventoryBatches, truncatedOwnership });
+    // BATCH-POISONING SELF-HEAL: fold readiness-isolation (DATADOE_INITIAL_LOAD_INCOMPLETE) for the FBA INVENTORY
+    // source into the SAME single-seller inventory split channel. A seller whose newest readiness event is a rejection
+    // is isolated off its shared inventory batch so the healthy batch-mates are never poisoned; it self-clears the
+    // moment its single-seller inventory export next succeeds. Fail-soft: any read error adds nothing. ONLY the
+    // inventory key is folded -- planFbaPlanBucketBatched splits inventory batches only (never AWD), so folding the
+    // AWD key would force needless single-seller INVENTORY without ever protecting AWD or self-clearing (AWD is a
+    // stable no-date hash that never runs single-seller). AWD readiness evidence is still recorded by the classifier;
+    // AWD batch-isolation is deferred to a dedicated AWD-split pass (out of scope here).
+    let readinessIsolate = new Set();
+    try {
+      const { isolateScopeHashes } = await readRecentReadinessRejectionOwnership({
+        requestKey: "fba-plan:inventory-health", cycleBucket: fbaCycleBucket(bucket), now, maxAgeDays, connectionId: "primary", organizationFingerprint: org,
+        readRecentCycleIds: (cb, since) => getRecentSyncCycleIds(cb, since),
+        readSourceJobs: (cid) => getSyncSourceJobsWithMeta(cid),
+        readOwners: (cid) => getSyncSourceJobOwnersForCycle(cid),
+      });
+      readinessIsolate = readinessIsolationFrom({ defaultBatches: defaultInventoryBatches, isolateScopeHashes }).isolateSellers;
+    } catch (_e) { readinessIsolate = new Set(); /* fail-soft: no readiness isolation */ }
+    return { overflowSellers: new Set([...base.overflowSellers, ...readinessIsolate]), singleSellerHardStops: base.singleSellerHardStops };
   };
 
   return Object.freeze({

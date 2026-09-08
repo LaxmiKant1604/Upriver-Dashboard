@@ -33,6 +33,7 @@ import { assignAccountBatches, MAX_ACCOUNTS_PER_BATCH } from "./source-batching.
 import { isRoutingScope } from "./scheduler-scope.js";
 import { plannedSourceJob, plannedBatchSourceJobs } from "./source-sync-driver.js";
 import { runSourceJobs } from "./source-worker.js";
+import { READINESS_INCOMPLETE_CODE } from "./source-readiness-isolation.js";
 import { makeSourceTranche } from "./source-tranche.js";
 import { computeFrozenTrancheBudget } from "./source-tranche-budget.js";
 import { registryIsPremiumOf, sourceRegistryEntry } from "./source-registry.js";
@@ -222,6 +223,27 @@ export function clipCoverageForRefresh(windows, refreshFrom) {
  *   asOf / today        : YYYY-MM-DD (marketplace-local latest completed day / decision day).
  * Returns { batches, membership, families:[{sourceKey, plannedJobs, units?}], skippedPaused, summary }.
  */
+// Apply readiness ISOLATION to a source's stable <=5-seller batches (pure). Each isolate member (a seller whose
+// newest readiness event is a DATADOE_INITIAL_LOAD_INCOMPLETE rejection) is PEELED OFF into its own single-seller
+// batch so it 400s ALONE (a typed waiting no-op that self-clears when it next succeeds); the HEALTHY remainder stays
+// BATCHED (never poisoned, and no wasted single-seller exports). Empty set => the input batches unchanged
+// (byte-identical). Peel-off (vs whole-batch split) is what lets a continuation reproduce the frozen plan exactly
+// from the durable owners: a single-owner OLI hash <=> a peeled seller; the batched remainder keeps its hash.
+function readinessAdjustedBatches(batches, isolateSet) {
+  if (!isolateSet || isolateSet.size === 0) return batches;
+  const raw = (a) => String((a && (a.rawSellerId ?? a.sellerId)) || "");
+  const out = [];
+  for (const batch of batches) {
+    const members = batch.accounts || [];
+    const isolated = members.filter((a) => isolateSet.has(raw(a)));
+    if (isolated.length === 0) { out.push(batch); continue; }
+    for (const a of isolated) out.push({ accounts: [a] });         // peel each unready seller to its own single-seller batch
+    const rest = members.filter((a) => !isolateSet.has(raw(a)));
+    if (rest.length) out.push({ accounts: rest });                 // the healthy remainder stays batched (efficient, unpoisoned)
+  }
+  return out;
+}
+
 export function planBucketSourceSync({
   apiKey, bucket, accounts, existingMembership = new Map(),
   coverageByAccountId = {}, catalogSnapshot = null, fbaSnapshotsByAccount = {},
@@ -235,6 +257,12 @@ export function planBucketSourceSync({
   // (globalDrained), and its lineage binds to a cycle Catalog hash; forcing the (cache-reusing, zero-token
   // when warm) Catalog job gives that path a drainable cycle without any OLI/Ads/FBA fetch.
   forceCatalogRefresh = false,
+  // READINESS ISOLATION (batch-poisoning self-heal). A Set of RAW seller ids whose newest readiness event is a
+  // DATADOE_INITIAL_LOAD_INCOMPLETE rejection (source-readiness-isolation.js), passed ONLY on a FRESH cycle (never a
+  // frozen continuation -- the frozen plan is reproduced verbatim). The OLI batch containing such a seller is split
+  // into single-seller jobs so the healthy members succeed independently and the unready one 400s alone (a typed
+  // waiting no-op that self-clears on its next success). Empty set => byte-identical to the prior plan.
+  readinessIsolateSellers = new Set(),
 } = {}) {
   if (!isRoutingScope(bucket)) throw new Error(`planBucketSourceSync requires a routing scope (india|europe-au|us-ca|us|non-us; got "${bucket}").`);
   if (!Array.isArray(accounts) || accounts.length === 0) throw new Error("planBucketSourceSync requires this bucket's non-empty account list (fail closed).");
@@ -246,7 +274,13 @@ export function planBucketSourceSync({
   }
 
   // 1) STABLE <=5-account batches; existing membership preserved, new accounts join without reshuffling.
+  // Batching is over the FULL account set so persisted membership is never disturbed by a transient readiness flip.
   const { membership, batches } = assignAccountBatches(accounts, existingMembership, MAX_ACCOUNTS_PER_BATCH);
+
+  // Normalize the readiness isolate set (accept a Set or an array). Empty => byte-identical to the prior behavior.
+  const isolateSet = readinessIsolateSellers instanceof Set ? readinessIsolateSellers : new Set(readinessIsolateSellers || []);
+  const rawOf = (a) => String((a && (a.rawSellerId ?? a.sellerId)) || "");
+  const readinessIsolated = isolateSet.size ? accounts.filter((a) => isolateSet.has(rawOf(a))).map((a) => String(a.accountId)) : [];
 
   const families = [];
   const skippedPaused = [];
@@ -269,7 +303,9 @@ export function planBucketSourceSync({
     // 7-day window (one cache-hit-stable export/batch); an initial backfill fetches the whole window in <=cap
     // chunks. An empty authorized window (asOf before the fixed start) skips OLI.
     if (backfill.from <= backfill.to) {
-      for (const batch of batches) {
+      // READINESS ISOLATION applies to OLI (a seller-batched Seller-Central source): split a batch holding an
+      // isolate member into single-seller units so the healthy members are never poisoned by the unready one.
+      for (const batch of readinessAdjustedBatches(batches, isolateSet)) {
         const members = batch.accounts;
         const clippedCoverage = Object.fromEntries(members.map((a) => [
           a.accountId, clipCoverageForRefresh(coverageByAccountId[a.accountId] || [], refresh.from),
@@ -321,6 +357,9 @@ export function planBucketSourceSync({
     accounts: accounts.length,
     batches: batches.length,
     plannedJobsByFamily: Object.fromEntries(families.map((f) => [f.sourceKey, f.plannedJobs.length])),
+    // Honest readiness accounting (req 7): sellers routed into single-seller isolation this cycle (the unready one
+    // becomes a typed "waiting"/"Setting up" no-op with LKG preserved). Empty when no readiness set was supplied.
+    readinessIsolatedAccounts: readinessIsolated,
   };
   return { batches, membership, families, skippedPaused, summary };
 }
@@ -339,7 +378,7 @@ const stat = (r) => r.fetch_status ?? r.fetchStatus ?? "pending";
 const skey = (r) => r.source_key ?? r.sourceKey ?? "";
 
 async function familyState(store, cycleId, sourceKey) {
-  const state = { total: 0, open: 0, succeeded: 0, failed: 0 };
+  const state = { total: 0, open: 0, succeeded: 0, failed: 0, readinessWaiting: 0 };
   if (!cycleId) return state;
   for (const r of await store.listSourceJobs(cycleId)) {
     if (skey(r) !== sourceKey) continue;
@@ -347,7 +386,15 @@ async function familyState(store, cycleId, sourceKey) {
     const s = stat(r);
     if (OPEN.has(s)) state.open += 1;
     else if (s === "succeeded") state.succeeded += 1;
-    else if (s === "failed") state.failed += 1;
+    else if (s === "failed") {
+      state.failed += 1;
+      // A terminal DATADOE_INITIAL_LOAD_INCOMPLETE is a typed "waiting"/"Setting up" deferral (the seller's Seller
+      // Central initial load is incomplete), NOT a required-source failure: it must NOT stop the bucket and block the
+      // HEALTHY accounts from deriving/publishing. It self-heals via the next fresh cycle's single-seller isolation
+      // (multi-member) then exclusion (single-member). The cycle still finalizes honestly PARTIAL (a failed job
+      // exists), so the region is never reported all-fresh (no false-green).
+      if ((r.terminal ?? false) === true && String(r.error_code ?? r.errorCode ?? "") === READINESS_INCOMPLETE_CODE) state.readinessWaiting += 1;
+    }
   }
   return state;
 }
@@ -408,6 +455,10 @@ export async function runBucketSourceSync({
   // FORCE-FRESH-OLI (previous-day "force latest"): a pending OLI job skips the stale-cache adoption so it makes a
   // real create-export POST (re-querying DataDoe for newly-settled D-1 rows). Threaded to runSourceJobs.
   forceFreshOli = false,
+  // READINESS ISOLATION set (raw seller ids) resolved from durable DATADOE_INITIAL_LOAD_INCOMPLETE evidence. The
+  // caller composition resolves it; it is threaded into planBucketSourceSync ONLY on a FRESH cycle (a frozen
+  // continuation must reproduce its frozen plan verbatim, so the set is dropped there). Empty => byte-identical.
+  readinessIsolateSellers = new Set(),
 } = {}) {
   if (!store || typeof store.listSourceJobs !== "function") throw new Error("runBucketSourceSync requires the injected store (fail closed).");
   if (Number(cooldownMs) > 0 && typeof wait !== "function") {
@@ -511,7 +562,29 @@ export async function runBucketSourceSync({
       if (hashes.size === 0) return deferredFrozenScope(bucket, activeCycleId, "frozen-budget-malformed", { detail: sourceKey + ": no frozen request hashes" });
       frozenByFamily.set(sourceKey, { trancheKey, planFingerprint: String(row.plan_fingerprint ?? row.planFingerprint), hashes });
     }
-    continuation = { persistedJobs, persistedHashes, frozenByFamily, orgOnly, frozenAccountIds: [...perAccountOwnerIds].sort() };
+    // Reproduce the frozen READINESS split on this continuation from the DURABLE owners (never re-resolved evidence,
+    // which could drift mid-cycle). An OLI slice request_hash owned by EXACTLY ONE account was a single-seller
+    // isolation (peel-off) at freeze; deriving the isolate set from those single-owner OLI hashes makes
+    // planBucketSourceSync reproduce the EXACT frozen single-seller plan, so a split cycle that spans multiple
+    // serverless invocations RESUMES instead of deferring (a whole batch that was NOT split keeps its multi-owner
+    // hash and is untouched). Byte-identical for a cycle that was never split (no single-owner OLI hash).
+    const oliCountByHash = new Map();
+    const oliAcctByHash = new Map();
+    for (const o of owners) {
+      if (String((o && (o.request_key ?? o.requestKey)) || "") !== OLI_SLICE_REQUEST_KEY) continue;
+      const h = String((o && (o.request_hash ?? o.requestHash)) || "");
+      if (!h) continue;
+      oliCountByHash.set(h, (oliCountByHash.get(h) || 0) + 1);
+      if (!oliAcctByHash.has(h)) oliAcctByHash.set(h, String((o && (o.account_id ?? o.accountId)) || "").trim());
+    }
+    const acctById = new Map((planningAccounts || []).map((a) => [String((a && (a.accountId ?? a.id)) || "").trim(), a]));
+    const frozenReadinessIsolateSellers = new Set();
+    for (const [h, count] of oliCountByHash) {
+      if (count !== 1) continue;
+      const a = acctById.get(oliAcctByHash.get(h));
+      if (a && a.rawSellerId) frozenReadinessIsolateSellers.add(String(a.rawSellerId));
+    }
+    continuation = { persistedJobs, persistedHashes, frozenByFamily, orgOnly, frozenAccountIds: [...perAccountOwnerIds].sort(), frozenReadinessIsolateSellers };
   }
 
   const plan = planBucketSourceSync({
@@ -519,6 +592,11 @@ export async function runBucketSourceSync({
     catalogSnapshot, fbaSnapshotsByAccount, pausedSources, asOf, today,
     catalogCarrierSeller,
     forceCatalogRefresh,
+    // Readiness isolation: a FRESH cycle uses the evidence-resolved set (shapes + freezes the plan); a CONTINUATION
+    // reproduces its frozen split from the DURABLE owners (never the re-resolved set, which could have drifted
+    // mid-cycle -> a divergent plan / PLAN_BUDGET_MISMATCH). This lets a split recovery spanning multiple invocations
+    // resume instead of deferring, while a never-split cycle stays byte-identical.
+    readinessIsolateSellers: isContinuation ? (continuation ? continuation.frozenReadinessIsolateSellers : new Set()) : readinessIsolateSellers,
   });
   if (continuation) {
     // CONTINUATION PLAN restriction, per family. ORIGINAL-WORK vs NEWLY-ENABLED-WORK is decided ONLY from the ORIGINAL
@@ -936,7 +1014,11 @@ export async function runBucketSourceSync({
 
     // REQUIRED-source policy: OLI + catalog are required by the priority dashboards; a terminal failure in a
     // completed family stops this bucket before the next family launches (LKG intact; other bucket unaffected).
-    if (state && state.failed > 0 && sourceRegistryEntry(family.sourceKey).usedByReports.length > 0
+    // EXCEPTION: a failure that is ONLY the typed readiness deferral (DATADOE_INITIAL_LOAD_INCOMPLETE) does NOT
+    // block -- the healthy sellers that succeeded still derive/publish, and the unready seller stays "waiting"
+    // (self-healing via next fresh cycle's isolation/exclusion). Any NON-readiness failure still stops the bucket.
+    const realFailed = (state ? state.failed : 0) - (state ? (state.readinessWaiting || 0) : 0);
+    if (state && realFailed > 0 && sourceRegistryEntry(family.sourceKey).usedByReports.length > 0
       && family.sourceKey !== FBA_INVENTORY_SOURCE_KEY) {
       rollup.stopped = true;
       rollup.stopReason = Object.freeze({ code: "REQUIRED_SOURCE_FAILED", family: family.sourceKey, state });
