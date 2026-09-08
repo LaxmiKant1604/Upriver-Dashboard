@@ -521,39 +521,66 @@ export async function runBucketSourceSync({
     forceCatalogRefresh,
   });
   if (continuation) {
-    // CONTINUATION PLAN = persisted job identities ∩ frozen budget hashes, per family. Nothing regenerated from current
-    // coverage/discovery is ever executed; an organization-only cycle keeps ONLY the catalog family.
+    // CONTINUATION PLAN restriction, per family. ORIGINAL-WORK vs NEWLY-ENABLED-WORK is decided ONLY from the ORIGINAL
+    // PERSISTED source jobs -- NEVER from the current plan (which reflects the CURRENT pausedSources/coverage/discovery).
+    // runSourceJobs upserts EVERY planned family's canonical rows on the first execution pass, BEFORE any tranche
+    // executes, so an originally-planned family has persisted jobs even if the run stopped before that family's budget
+    // was frozen; a family that was PAUSED at the original freeze has NONE. Three cases per family:
+    //   (a) has a frozen budget            -> reuse it; plan = persisted identities INTERSECT frozen hashes.
+    //   (b) no budget but HAS persisted jobs -> ORIGINALLY PLANNED, interrupted before its budget freeze: resume from
+    //       EXACTLY those persisted identities (the family loop freezes the budget from them); request hashes bind
+    //       dates/sellers/marketplaces/row limits/pricing, so nothing regenerated is admitted.
+    //   (c) no budget and NO persisted jobs -> NEWLY ENABLED (paused originally / unreadable): NEVER add jobs, budgets,
+    //       reservations or exports to THIS cycle -- it joins the NEXT fresh cycle.
+    // For (a) and (b), every OPEN persisted ORIGINAL job MUST be reproducible by the current plan, else defer (never a
+    // divergent plan). NOTE: source-sync has no separate per-family authorization record -- the deterministic frozen
+    // tranche budget IS the spend authorization, so resuming (b) freezes exactly the ceiling that WOULD have been frozen.
     let dropped = 0;
+    const resumedUnfrozen = [];
     for (const family of plan.families) {
       const frozen = continuation.frozenByFamily.get(family.sourceKey) || null;
       const orgExcluded = continuation.orgOnly && family.sourceKey !== CATALOG_SOURCE_KEY;
+      const persistedFamilyHashes = new Set(
+        continuation.persistedJobs.filter((r) => skey(r) === family.sourceKey).map(rowHash).filter(Boolean),
+      );
       const before = family.plannedJobs.length;
+      let requiredHashes = null; // the ORIGINAL identities this family must reproduce (frozen, or persisted-unfrozen)
       if (orgExcluded) {
         // An organization-only cycle NEVER admits per-account discovery work.
         family.plannedJobs = []; if (Array.isArray(family.units)) family.units = [];
+        if (before > 0) family.skippedContinuation = "not-in-frozen-scope";
       } else if (frozen) {
-        // FROZEN family: persisted job identities ∩ frozen budget hashes ONLY.
+        // (a) FROZEN family: persisted job identities INTERSECT frozen budget hashes ONLY.
         const keep = (h) => continuation.persistedHashes.has(h) && frozen.hashes.has(h);
         family.plannedJobs = family.plannedJobs.filter((j) => keep(j.requestHash));
         if (Array.isArray(family.units)) family.units = family.units.filter((u) => keep(u.requestHash));
-      } // else: UNFROZEN family on a per-account frozen membership -> planned from the frozen membership; frozen below.
+        requiredHashes = frozen.hashes;
+      } else if (persistedFamilyHashes.size > 0) {
+        // (b) ORIGINALLY PLANNED, interrupted before its budget freeze: restrict to EXACTLY the original persisted
+        // identities; the family loop freezes the budget from these (never from a regenerated current plan).
+        family.plannedJobs = family.plannedJobs.filter((j) => persistedFamilyHashes.has(j.requestHash));
+        if (Array.isArray(family.units)) family.units = family.units.filter((u) => persistedFamilyHashes.has(u.requestHash));
+        family.originallyPlannedUnfrozen = true;
+        requiredHashes = persistedFamilyHashes;
+        resumedUnfrozen.push(family.sourceKey);
+      } else {
+        // (c) NEWLY ENABLED: no original persisted jobs. Enabling it now must NOT add work to THIS cycle.
+        family.plannedJobs = []; if (Array.isArray(family.units)) family.units = [];
+        if (before > 0) family.skippedContinuation = "newly-enabled-deferred";
+      }
       dropped += before - family.plannedJobs.length;
-      // Honest label: a family whose current-discovery work was dropped because it is NOT in the frozen scope is
-      // reported as such (not as "nothing-to-do"), so the skip is visible in the rollup.
-      if (orgExcluded && before > 0) family.skippedContinuation = "not-in-frozen-scope";
-      const admitted = !!frozen && !orgExcluded;
-      if (admitted) {
-        // Every OPEN persisted frozen job of this family must be REPRODUCED (identical request identity) by the plan;
-        // otherwise this invocation cannot resume it faithfully -> defer rather than run a different plan.
+      if (requiredHashes) {
+        // Every OPEN persisted ORIGINAL job of this family must be REPRODUCED (identical request identity) by the
+        // current plan; otherwise this invocation cannot resume it faithfully -> defer rather than run a different plan.
         const planned = new Set(family.plannedJobs.map((j) => j.requestHash));
-        const unreproduced = continuation.persistedJobs.filter((r) => skey(r) === family.sourceKey && OPEN.has(stat(r)) && frozen.hashes.has(rowHash(r)) && !planned.has(rowHash(r)));
-        if (unreproduced.length) return deferredFrozenScope(bucket, activeCycleId, "frozen-plan-not-reproducible", { detail: `${family.sourceKey}: ${unreproduced.length} open frozen job(s) not reproduced by the current plan` });
+        const unreproduced = continuation.persistedJobs.filter((r) => skey(r) === family.sourceKey && OPEN.has(stat(r)) && requiredHashes.has(rowHash(r)) && !planned.has(rowHash(r)));
+        if (unreproduced.length) return deferredFrozenScope(bucket, activeCycleId, "frozen-plan-not-reproducible", { detail: `${family.sourceKey}: ${unreproduced.length} open ${frozen ? "frozen" : "originally-planned"} job(s) not reproduced by the current plan` });
       }
     }
     plan.summary = {
       ...plan.summary,
       plannedJobsByFamily: Object.fromEntries(plan.families.map((f) => [f.sourceKey, f.plannedJobs.length])),
-      continuation: { cycleId: activeCycleId, orgOnly: continuation.orgOnly, frozenAccounts: continuation.frozenAccountIds.length, droppedUnfrozenJobs: dropped },
+      continuation: { cycleId: activeCycleId, orgOnly: continuation.orgOnly, frozenAccounts: continuation.frozenAccountIds.length, droppedUnfrozenJobs: dropped, resumedUnfrozenFamilies: resumedUnfrozen },
     };
   }
   const allPlannedJobs = plan.families.flatMap((f) => f.plannedJobs);
@@ -603,15 +630,14 @@ export async function runBucketSourceSync({
         // POSTs) -- it joins the NEXT fresh cycle. LKG preserved either way.
         const frozen = continuation && continuation.frozenByFamily.get(family.sourceKey);
         if (frozen && frozen.trancheKey === trancheKey) {
+          // (a) already had a frozen budget: REUSE it verbatim (never recompute/re-persist from current discovery).
           rollup.cycleId = rollup.cycleId || activeCycleId;
           budget = { trancheKey: frozen.trancheKey, planFingerprint: frozen.planFingerprint };
-        } else if (continuation && continuation.orgOnly) {
-          rollup.families.push({ sourceKey: family.sourceKey, continuations: 0, state: null, skipped: "not-in-frozen-scope" });
-          continue;
-        } else {
-          // UNFROZEN required family on the FROZEN per-account membership (a bounded earlier invocation stopped before
-          // freezing it): freeze NOW from the frozen membership on the SAME active cycle (a same-plan re-persist is an
-          // idempotent "exists"); never from current discovery (planningAccounts is exactly the frozen owner set).
+        } else if (family.originallyPlannedUnfrozen) {
+          // (b) ORIGINALLY PLANNED, interrupted before its budget freeze. family.plannedJobs was already restricted
+          // (above) to EXACTLY the original persisted identities, and every open original job proven reproducible.
+          // Freeze the budget from those persisted identities ONLY -- the deterministic freeze reproduces the ceiling
+          // that WOULD have been frozen originally. A same-plan re-persist is an idempotent "exists" (replay-safe).
           const frozenNow = computeFrozenTrancheBudget({ plannedJobs: family.plannedJobs, sourceTranche: tranche, isPremiumOf: registryIsPremiumOf, trancheKey });
           if (frozenNow.maxCreates > 0) {
             rollup.cycleId = rollup.cycleId || activeCycleId;
@@ -623,6 +649,11 @@ export async function runBucketSourceSync({
             if (ack !== "created" && ack !== "exists") throw new Error(`runBucketSourceSync: malformed budget acknowledgement "${ack}" (fail closed).`);
             budget = { trancheKey: frozenNow.trancheKey, planFingerprint: frozenNow.planFingerprint };
           }
+        } else {
+          // (c) NEWLY ENABLED / org-excluded / no original evidence: NEVER fund on an active cycle. (Such families were
+          // emptied above and are caught at the top of the loop; this is a defensive skip.)
+          rollup.families.push({ sourceKey: family.sourceKey, continuations: 0, state: null, skipped: family.skippedContinuation || "not-in-frozen-scope" });
+          continue;
         }
       } else {
         // FRESH cycle: compute + persist the frozen budget from the current plan (first freeze).

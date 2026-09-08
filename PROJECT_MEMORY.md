@@ -15608,3 +15608,30 @@ zero DataDoe calls (all suites offline). NOT done here: no manual workflow dispa
 populates, no 400), europe-au 08:30Z / us-ca 16:30Z / india 03:00Z natural regional runs (preflight passes with
 authoritative counts 16/10/8, continuation frozen-plan reuse, v3 binding proceeds within the standing limits).
 A green job is NOT completeness evidence -- check per-account publication + fba_complete + v3 bindingHash.
+
+### Scheduler fixes ROUND 2b — freeze-now original-vs-new (2026-09-08, base 60f27a3; pure code, no migration, zero DataDoe)
+
+**Confirmed defect:** the round-2 "freeze-now" branch treated a MISSING family budget on an active cycle as permission
+to plan and fund that family from the CURRENT plan. G10(b) reproduced it: FBA paused at the original freeze, unpaused
+before continuation -> the continuation created a new FBA budget + exports inside the ORIGINAL cycle. Frozen account
+membership alone is not proof those exports belonged to the original authorized work.
+
+**Distinction (the fix):** ORIGINAL vs NEWLY-ENABLED is decided ONLY from the ORIGINAL PERSISTED source jobs, never
+the current plan. runSourceJobs upserts every planned family's canonical rows on the first execution pass (before any
+tranche executes), so an originally-planned family has persisted jobs even if the run stopped before its budget freeze;
+a family paused at freeze has none. Per family on continuation (source-bucket-sync.js): (a) frozen budget -> reuse,
+plan = persisted INTERSECT frozen hashes; (b) no budget but HAS persisted jobs -> originally planned, interrupted
+before its budget: restrict to EXACTLY the persisted identities and freeze the budget from those only (deterministic
+freeze reproduces the ceiling that would have been frozen); (c) no budget and NO persisted jobs -> newly enabled:
+add nothing to this cycle (skipped "newly-enabled-deferred"), joins the next fresh cycle. (a)+(b) still require every
+OPEN persisted original job to be reproducible by the current plan, else defer frozen-plan-not-reproducible. Rollup
+carries continuation.resumedUnfrozenFamilies. Source-sync has no separate per-family authorization record: the
+deterministic frozen tranche budget IS the spend authorization, so resuming (b) can never exceed or invent it. A
+failed original job/budget read still defers typed before any mutation.
+
+**Tests (source-bucket-sync.test.js):** G10(b) expectation REPLACED (paused->enabled = zero FBA jobs/budget/exports,
+zero mutations); G14 originally-planned FBA interrupted before its budget resumes with exact persisted identities;
+G15 new account + changed coverage cannot alter original jobs; G16 replay + concurrent late-budget idempotent; G17 a
+fresh subsequent cycle legitimately plans the newly-enabled family; G18 failed original-job read defers typed. Each
+deferral/skip asserts a byte-identical store snapshot. verify 169/145 incl build:check; git diff --check clean;
+api/*.js=12; zero DataDoe. Deployed 60f27a3 -> (this commit). PRODUCTION ACCEPTANCE still PENDING natural runs.

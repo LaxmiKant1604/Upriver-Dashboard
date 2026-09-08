@@ -239,7 +239,7 @@ function makeSinks() {
 }
 
 const CATALOG_CARRIER = "carrier-seller-01"; // a canonical primary seller id (org-wide catalog requires one)
-function runHarness({ accounts = FIVE, coverage = null, dd = null, store = null, pausedSources, catalogSnapshot = null, fbaSnapshotsByAccount = {}, reuseOnly = false, cooldownMs = 60_000, existingMembership, catalogCarrierSeller = CATALOG_CARRIER } = {}) {
+function runHarness({ accounts = FIVE, coverage = null, dd = null, store = null, pausedSources, catalogSnapshot = null, fbaSnapshotsByAccount = {}, reuseOnly = false, cooldownMs = 60_000, existingMembership, catalogCarrierSeller = CATALOG_CARRIER, cycleDate = CYCLE_DATE } = {}) {
   const st = store || makeStore();
   const d = dd || makeDataDoe();
   const clock = makeClock();
@@ -255,7 +255,7 @@ function runHarness({ accounts = FIVE, coverage = null, dd = null, store = null,
     asOf: ASOF, today: TODAY,
     store: st, dataDoe: d,
     ...sinks,
-    cycleDate: CYCLE_DATE, clock: clock.fn, wait, cooldownMs,
+    cycleDate, clock: clock.fn, wait, cooldownMs,
     reuseOnly, catalogCarrierSeller,
   });
   return { store: st, dd: d, clock, waits, sinks, run };
@@ -778,6 +778,15 @@ test("G5. an ORGANIZATION-ONLY cycle is recognised ONLY from POSITIVE persisted 
   }
 });
 
+// A store wrapper that THROWS at the FBA tranche budget write (simulating the process/serverless deadline dying right
+// there): the FBA canonical jobs were already upserted during the OLI pass, but the FBA budget is never persisted.
+function fbaBudgetInterrupt(store) {
+  return { ...store, persistBudget(args) { if (String(args.trancheKey) === "source-sync:fba-inventory-health") throw new Error("interrupted before FBA budget write"); return store.persistBudget(args); } };
+}
+const FBA_TRANCHE = "source-sync:fba-inventory-health";
+const fbaSellers = (dd) => [...new Set(dd.createSeq.filter((c) => c.sourceKey === "fba-inventory-health").flatMap((c) => c.ids))].sort();
+const fbaPersistedHashes = (store, cycleId) => store.listSourceJobs(cycleId).filter((j) => j.source_key === "fba-inventory-health").map((j) => j.request_hash).sort();
+
 // A mutation-free snapshot of everything a continuation could touch (cycles, jobs, owners, budgets, reservations, POSTs).
 function snapshotStore(store, cycleId, dd) {
   const tranches = ["source-sync:order-line-items", "source-sync:product-catalog", "source-sync:fba-inventory-health"];
@@ -862,26 +871,126 @@ test("G10. an UNREADABLE required budget DEFERS (budget-read-failed) BEFORE any 
     assert.equal(r3.deferred, true); assert.equal(r3.stopReason.reason, "budget-read-failed");
     assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations (hash read)");
   }
-  // (b) an UNFROZEN required family on a FROZEN per-account membership (a bounded earlier invocation stopped before
-  //     freezing FBA) is frozen NOW from the FROZEN membership only -- never silently skipped, never from current
-  //     discovery: the 4th (post-freeze) account gets no FBA export; a still-paused family is honestly nothing-to-do.
+  // (b) NEWLY ENABLED: a family PAUSED at the original freeze (no persisted jobs) that is UNPAUSED before continuation
+  //     must NOT add any jobs/budget/reservations/exports to the ORIGINAL cycle. Frozen membership alone is NOT proof
+  //     that these exports belonged to the original authorized work -> it joins the NEXT fresh cycle.
   {
     const store = makeStore();
     const h1 = runHarness({ accounts: THREE, store, pausedSources: new Set(["fba-inventory-health"]) });
     const r1 = await h1.run();
-    assert.equal(store._budget(r1.cycleId, "source-sync:fba-inventory-health"), null, "no frozen FBA budget after pass 1");
-    const stillPaused = await runHarness({ accounts: [1, 2, 3, 4].map(acct), store, dd: h1.dd, pausedSources: new Set(["fba-inventory-health"]) }).run();
-    assert.notEqual(stillPaused.deferred, true);
-    assert.ok(stillPaused.skippedPaused.includes("fba-inventory-health"), "a still-paused family plans nothing (skippedPaused), no budget is frozen for it");
-    assert.equal(store._budget(r1.cycleId, "source-sync:fba-inventory-health"), null, "still no FBA budget while paused");
-    const r2 = await runHarness({ accounts: [1, 2, 3, 4].map(acct), store, dd: h1.dd }).run(); // FBA now required
-    assert.notEqual(r2.deferred, true, "required unfrozen work is NOT deferred/skipped: " + JSON.stringify(r2.stopReason));
-    const fbaBudget = store._budget(r1.cycleId, "source-sync:fba-inventory-health");
-    assert.ok(fbaBudget && fbaBudget.maxCreates === 3, "FBA frozen NOW on the SAME cycle for exactly the 3 FROZEN accounts: " + JSON.stringify(fbaBudget));
-    const fbaSellers = h1.dd.createSeq.filter((c) => c.sourceKey === "fba-inventory-health").flatMap((c) => c.ids);
-    assert.deepEqual([...new Set(fbaSellers)].sort(), ["S01", "S02", "S03"], "FBA exported for the frozen membership only (never S04)");
-    assert.equal(store.listCycleOwners(r1.cycleId).some((o) => o.account_id === "A04"), false, "the post-freeze account never joined the frozen cycle");
+    assert.equal(store._budget(r1.cycleId, FBA_TRANCHE), null, "no frozen FBA budget after the paused original run");
+    assert.equal(fbaPersistedHashes(store, r1.cycleId).length, 0, "a PAUSED family has NO persisted jobs in the original cycle (the original-vs-new signal)");
+    const snap = snapshotStore(store, r1.cycleId, h1.dd);
+    // FBA now UNPAUSED on the continuation (+ a post-freeze 4th account, to prove neither current pausedSources nor
+    // discovery can inject the family into the old cycle).
+    const r2 = await runHarness({ accounts: [1, 2, 3, 4].map(acct), store, dd: h1.dd }).run();
+    assert.notEqual(r2.deferred, true, "the continuation still proceeds for the frozen families (only the newly-enabled family is deferred)");
+    assert.equal(store._budget(r1.cycleId, FBA_TRANCHE), null, "NEWLY-ENABLED FBA is NOT frozen on the original cycle");
+    assert.equal(fbaSellers(h1.dd).length, 0, "ZERO FBA exports on the original cycle for the newly-enabled family");
+    assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations from enabling FBA on the old cycle");
+    const fbaFam = r2.families.find((x) => x.sourceKey === "fba-inventory-health");
+    assert.equal(fbaFam && fbaFam.skipped, "newly-enabled-deferred", "FBA is honestly reported as newly-enabled-deferred (not silently nothing-to-do, never marked successful)");
+    assert.ok(!r2.plan.continuation.resumedUnfrozenFamilies.includes("fba-inventory-health"), "FBA was NOT resumed as originally-planned work");
   }
+});
+
+test("G14. ORIGINALLY-PLANNED FBA interrupted BEFORE its budget was written RESUMES using EXACTLY the original persisted identities + valid deterministic authorization (no divergent plan, no duplicate export)", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  // ORIGINAL run: FBA is planned (not paused) but the process dies at the FBA budget write. FBA canonical jobs were
+  // upserted during the OLI pass; the FBA budget is never persisted.
+  let threw = null;
+  try { await runHarness({ accounts: THREE, store: fbaBudgetInterrupt(store) }).run(); } catch (e) { threw = e; }
+  assert.match(String(threw && threw.message), /interrupted before FBA budget/, "the original run died at the FBA budget write");
+  const cycleId = store.getCycleByBucketDate(BUCKET, CYCLE_DATE).id;
+  const originalFbaHashes = fbaPersistedHashes(store, cycleId);
+  assert.equal(originalFbaHashes.length, 3, "the 3 FBA canonical jobs were persisted (upserted on the OLI pass) though the FBA budget was not: " + JSON.stringify(originalFbaHashes));
+  assert.equal(store._budget(cycleId, FBA_TRANCHE), null, "the FBA budget was NEVER written (interrupted)");
+  // CONTINUATION on a healthy store: FBA has persisted jobs but no budget -> originally-planned-unfrozen -> resume.
+  const dd2 = makeDataDoe();
+  const r2 = await runHarness({ accounts: THREE, store, dd: dd2 }).run();
+  assert.notEqual(r2.deferred, true, "the originally-planned family RESUMES (not deferred): " + JSON.stringify(r2.stopReason));
+  assert.ok(r2.plan.continuation.resumedUnfrozenFamilies.includes("fba-inventory-health"), "FBA is typed as a resumed originally-planned family");
+  const fbaBudget = store._budget(cycleId, FBA_TRANCHE);
+  assert.ok(fbaBudget && fbaBudget.maxCreates === 3, "FBA budget frozen NOW from the 3 original persisted jobs (the deterministic ceiling that would have been frozen): " + JSON.stringify(fbaBudget));
+  assert.deepEqual(fbaPersistedHashes(store, cycleId), originalFbaHashes, "EXACT original persisted FBA request identities preserved (no regenerated hash)");
+  assert.deepEqual(fbaSellers(dd2), ["S01", "S02", "S03"], "FBA exported for exactly the original sellers");
+});
+
+test("G15. resume never admits NEWLY DISCOVERED accounts or CHANGED coverage into the original FBA work", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  try { await runHarness({ accounts: THREE, store: fbaBudgetInterrupt(store) }).run(); } catch { /* interrupted */ }
+  const cycleId = store.getCycleByBucketDate(BUCKET, CYCLE_DATE).id;
+  const originalFbaHashes = fbaPersistedHashes(store, cycleId);
+  const dd2 = makeDataDoe();
+  // Continuation: a 4th (post-freeze) account + CHANGED coverage. Neither may alter the original FBA identities.
+  const r2 = await runHarness({ accounts: [1, 2, 3, 4].map(acct), store, dd: dd2, coverage: steadyCoverage([1, 2, 3, 4].map(acct), dates.addDaysStr(ASOF, -30)) }).run();
+  assert.notEqual(r2.deferred, true, "resume proceeds for the frozen membership: " + JSON.stringify(r2.stopReason));
+  assert.deepEqual(fbaPersistedHashes(store, cycleId), originalFbaHashes, "the persisted FBA identities are UNCHANGED (new account/coverage never rewrote them)");
+  assert.deepEqual(fbaSellers(dd2), ["S01", "S02", "S03"], "FBA exported for exactly the 3 original sellers; the 4th account got no FBA export");
+  assert.equal(store.listCycleOwners(cycleId).some((o) => o.account_id === "A04"), false, "the post-freeze account never joined the frozen cycle");
+});
+
+test("G16. resume is REPLAY-idempotent: a watchdog/second continuation and a concurrent late-budget attempt create nothing new (same frozen budget, no duplicate export)", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  try { await runHarness({ accounts: THREE, store: fbaBudgetInterrupt(store) }).run(); } catch { /* interrupted */ }
+  const cycleId = store.getCycleByBucketDate(BUCKET, CYCLE_DATE).id;
+  // First continuation resumes FBA.
+  const dd2 = makeDataDoe();
+  await runHarness({ accounts: THREE, store, dd: dd2 }).run();
+  const fbaBudget1 = JSON.stringify(store._budget(cycleId, FBA_TRANCHE));
+  const fbaSellers1 = fbaSellers(dd2);
+  assert.deepEqual(fbaSellers1, ["S01", "S02", "S03"], "first resume exported the 3 sellers");
+  // Watchdog/replay: a SECOND continuation now sees a frozen FBA budget -> reuse; no new creates, byte-identical budget.
+  const snapAfter = snapshotStore(store, cycleId, dd2);
+  const r3 = await runHarness({ accounts: THREE, store, dd: dd2 }).run();
+  assert.notEqual(r3.deferred, true, "replay proceeds");
+  assert.equal(JSON.stringify(store._budget(cycleId, FBA_TRANCHE)), fbaBudget1, "the frozen FBA budget is byte-identical on replay (reused, never re-persisted differently)");
+  assert.deepEqual(fbaSellers(dd2), fbaSellers1, "replay created NO new FBA export");
+  assert.equal(snapshotStore(store, cycleId, dd2), snapAfter, "ZERO mutations on the replay");
+  // Concurrent late-budget attempts: two fresh continuations from the SAME interrupted state both freeze deterministically.
+  const store2 = makeStore();
+  try { await runHarness({ accounts: THREE, store: fbaBudgetInterrupt(store2) }).run(); } catch { /* interrupted */ }
+  const cyc2 = store2.getCycleByBucketDate(BUCKET, CYCLE_DATE).id;
+  const ddA = makeDataDoe();
+  await runHarness({ accounts: THREE, store: store2, dd: ddA }).run();
+  let concurrentThrew = null;
+  try { await runHarness({ accounts: THREE, store: store2, dd: ddA }).run(); } catch (e) { concurrentThrew = e; }
+  assert.equal(concurrentThrew, null, "a same-plan late-budget re-attempt is an idempotent 'exists', never PLAN_BUDGET_MISMATCH");
+  assert.deepEqual(fbaSellers(ddA), ["S01", "S02", "S03"], "no double FBA export under the concurrent late-budget attempt");
+});
+
+test("G17. a FRESH SUBSEQUENT cycle can legitimately plan + freeze the newly-enabled family", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  // Original cycle at CYCLE_DATE with FBA paused (its jobs never planned).
+  const r1 = await runHarness({ accounts: THREE, store, pausedSources: new Set(["fba-inventory-health"]) }).run();
+  assert.equal(store._budget(r1.cycleId, FBA_TRANCHE), null, "no FBA budget on the original paused cycle");
+  // A FRESH cycle (a different cycle_date) with FBA enabled: it is NOT a continuation of the old cycle, so FBA is
+  // planned + frozen normally.
+  const nextDate = dates.addDaysStr(CYCLE_DATE, 1);
+  const dd2 = makeDataDoe();
+  const r2 = await runHarness({ accounts: THREE, store, dd: dd2, cycleDate: nextDate }).run();
+  assert.notEqual(r2.deferred, true, "the fresh cycle proceeds");
+  assert.notEqual(r2.cycleId, r1.cycleId, "a NEW cycle was opened for the new date");
+  const fbaBudget = store._budget(r2.cycleId, FBA_TRANCHE);
+  assert.ok(fbaBudget && fbaBudget.maxCreates === 3, "the fresh cycle legitimately freezes the newly-enabled FBA family: " + JSON.stringify(fbaBudget));
+  assert.deepEqual(fbaSellers(dd2), ["S01", "S02", "S03"], "the fresh cycle exports FBA for the current membership");
+});
+
+test("G18. a FAILED original-job read on a continuation DEFERS typed (job-read-failed) BEFORE any mutation", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  const h1 = runHarness({ accounts: THREE, store });
+  const r1 = await h1.run();
+  const snap = snapshotStore(store, r1.cycleId, h1.dd);
+  const brokenJobs = { ...store, listSourceJobs() { throw new Error("job read boom"); } };
+  const r2 = await runHarness({ accounts: THREE, store: brokenJobs, dd: h1.dd }).run();
+  assert.equal(r2.deferred, true); assert.equal(r2.stopReason.reason, "job-read-failed");
+  assert.equal(r2.families.length, 0, "no family launched (deferred before mutation)");
+  assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations");
 });
 
 test("G11. a store LACKING the production continuation readers on an ACTIVE cycle DEFERS (continuation-readers-unavailable) instead of taking the fresh path", async () => {
