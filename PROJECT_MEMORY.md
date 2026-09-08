@@ -15746,3 +15746,23 @@ fba-import-integration (27, real hook), fba-lead-time-import (28), fba-plan-conf
 MIGRATION 20260920 STILL UNAPPLIED (approval-gated). PRODUCTION ACCEPTANCE PENDING: apply the migration with approval
 + verify RPC note persistence; then the authenticated browser flow (download -> edit -> preview -> import -> reload ->
 persistence + A->B switch). Do NOT claim acceptance from tests or deploy success alone.
+
+### Migration 20260920 APPLIED (2026-09-08, approved) -- FBA bulk lead-time note persistence
+
+Deployed code confirmed at c4077df (Vercel Production success). Applied ONLY 20260920_fba_lead_time_bulk_note.sql
+via the ledger-guarded runner with MIGRATE_ONLY (transactional; no other pending migration touched -- ledger shows
+exactly one filename applied today; total 36->49 over the intervening releases, 20260920 at 07:16:47Z). Pre-state
+proven read-only: ledger row absent, the old bulk RPC did NOT read note, note columns already existed, execute was
+service_role/postgres only. Post-migration verified read-only: record_fba_asin_lead_time_bulk is security definer,
+reads v_row->>'note', writes note on INSERT + ON CONFLICT (note=excluded.note) + the audit row, caps at left(...,500);
+execute grants = postgres + service_role ONLY (no anon/authenticated/public). Note persistence verified with SYNTHETIC
+org/account inside a rolled-back transaction (10/10: supplied note persisted verbatim; unchanged note survives a
+re-import; explicit blank clears; an out-of-range-day batch and a duplicate-ASIN batch each RAISE and write NOTHING;
+audit trail carries the note; rollback proved zero net DB change). Real account settings were NOT touched. Zero
+DataDoe calls/exports/tokens; no workflow dispatch. DB gate: PASS.
+
+BROWSER-FLOW GATE: PENDING -- no authenticated session was available (no Playwright, no saved storageState/auth
+artifact, no e2e session), and per instruction I did not ask for credentials/tokens or mint one. The
+download->edit->preview->import->reload->persistence flow (incl. account switch during a pending request) is NOT yet
+executed against the live UI. PRODUCTION ACCEPTANCE therefore NOT fully declared: database persistence is verified;
+the authenticated browser flow remains the one open gate.
