@@ -48,6 +48,8 @@
     "test:warehouse-validation": "node scripts/warehouse-validation.test.js",
     "test:warehouse-ownership": "node scripts/warehouse-ownership.test.js",
     "test:fba-plan-config-handler": "node scripts/fba-plan-config-handler.test.js",
+    "test:fba-lead-time-import": "node scripts/fba-lead-time-import.test.js",
+    "test:scoped-loader": "node scripts/scoped-loader.test.js",
     "test:fba-plan-operation": "node scripts/fba-plan-operation.test.js",
     "test:fba-regional-inventory": "node scripts/fba-regional-inventory.test.js",
     "test:plan-brand": "node scripts/plan-brand.test.js",

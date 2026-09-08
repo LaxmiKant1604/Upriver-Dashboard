@@ -26,6 +26,15 @@ function bodyOf(req) {
   return req.body;
 }
 const S = (v) => (v == null ? "" : String(v));
+// A REAL calendar date (YYYY-MM-DD AND an actual day; 2026-02-30 / 2026-13-01 rejected). Server twin of the client
+// isRealCalendarDate (src/lib/fba-lead-time-import.js) so date validation is consistent on both sides. The DB ::date
+// cast would also reject an impossible date, but validating here returns a clear 400 instead of a raw 500.
+function isRealCalendarDate(v) {
+  const str = S(v).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return false;
+  const d = new Date(str + "T00:00:00Z");
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === str;
+}
 function orgFingerprint() {
   const primary = getDataDoeConnections().find((c) => c && c.id === "primary" && S(c.apiKey).trim());
   if (!primary) throw new DashboardAccessError("No primary DataDoe connection is configured.", 500);
@@ -311,7 +320,7 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
           let startedDate = null;
           if (action === "start") {
             startedDate = S(body.startedDate).trim();
-            if (!/^\d{4}-\d{2}-\d{2}$/.test(startedDate)) { res.status(400).json({ error: "startedDate (YYYY-MM-DD, marketplace-local) is required to start a countdown." }); return; }
+            if (!isRealCalendarDate(startedDate)) { res.status(400).json({ error: "startedDate must be a real date (YYYY-MM-DD, marketplace-local) to start a countdown." }); return; }
             if (production == null || shipping == null || awd == null) { res.status(400).json({ error: "production, shipping and AWD transit are required before starting a countdown." }); return; }
           }
           const saved = await deps.recordFbaAsinLeadTime({ organizationFingerprint: organization_fingerprint, connectionId, accountId, childAsin, production, shipping, awd, safety, note: S(body.note).slice(0, 500), action, startedDate, updatedBy: access.userId, updatedByEmail: S(access.email) });
@@ -339,9 +348,11 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
             const production = dayVal(raw.production), shipping = dayVal(raw.shipping), awd = dayVal(raw.awd), safety = dayVal(raw.safety);
             if ([production, shipping, awd, safety].some((x) => Number.isNaN(x))) { res.status(400).json({ error: `a day value for ${childAsin} is invalid; nothing was written.` }); return; }
             let inboundEta = S(raw.inboundEta).trim();
-            if (inboundEta && !/^\d{4}-\d{2}-\d{2}$/.test(inboundEta)) { res.status(400).json({ error: `inbound_eta for ${childAsin} must be YYYY-MM-DD or blank; nothing was written.` }); return; }
+            if (inboundEta && !isRealCalendarDate(inboundEta)) { res.status(400).json({ error: `inbound_eta for ${childAsin} must be a real date (YYYY-MM-DD) or blank; nothing was written.` }); return; }
             if (!inboundEta) inboundEta = null;
-            norm.push({ childAsin, production, shipping, awd, safety, inboundEta });
+            // Notes are preserved through the bulk import (parser -> API -> RPC -> reload); a blank note clears (migration 23).
+            const note = S(raw.note).slice(0, 500);
+            norm.push({ childAsin, production, shipping, awd, safety, inboundEta, note });
           }
           const result = await deps.recordFbaAsinLeadTimeBulk({ organizationFingerprint: organization_fingerprint, connectionId, accountId, rows: norm, updatedBy: access.userId, updatedByEmail: S(access.email) });
           await deps.insertAuditLog({ actorUserId: access.userId, action: "fba-plan.lead-time.bulk", target: { accountId, applied: norm.length } });

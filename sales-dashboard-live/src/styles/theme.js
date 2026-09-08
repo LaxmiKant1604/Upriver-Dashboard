@@ -501,6 +501,8 @@ body{ overflow-x:hidden; }
 .plan-modal-body{ padding:16px 18px; display:flex; flex-direction:column; gap:12px; }
 .plan-modal-note, .plan-modal-foot-note{ font-size:12px; color:var(--text-secondary); margin:0; }
 .plan-modal-foot{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 18px; border-top:1px solid var(--border-default); }
+.plan-tool-btn-primary{ background:var(--accent, #b45309); border-color:var(--accent, #b45309); color:#fff; }
+.plan-tool-btn-primary:disabled{ opacity:.6; cursor:not-allowed; }
 .plan-icon-btn{ display:inline-flex; align-items:center; justify-content:center; width:30px; height:30px; border:1px solid var(--border-default); border-radius:var(--radius-sm); background:var(--bg-elevated); color:var(--text-secondary); cursor:pointer; }
 .plan-icon-btn:hover{ border-color:var(--accent); color:var(--accent-strong); }
 .plan-reset-link{ display:inline-flex; align-items:center; gap:6px; background:none; border:0; padding:2px 0; color:var(--accent-strong); font:700 12px inherit; cursor:pointer; }

@@ -41,7 +41,11 @@ function makeDeps(over = {}) {
     recordFbaSellerWarehouse: async (a) => { calls.record.push(a); return { ...a }; },
     recordFbaSellerWarehouseBulk: async (a) => { calls.bulk.push(a); return { applied: a.rows.length }; },
     insertAuditLog: async (a) => { calls.audit.push(a); },
+    // Lead-time deps (audit 2026-09-08). No resolveUserReportScope -> capability gate open (admin/ALL_BRANDS parity).
+    recordFbaAsinLeadTime: async (a) => { calls.record.push({ leadTime: a }); return { ...a }; },
+    recordFbaAsinLeadTimeBulk: async (a) => { calls.leadBulk.push(a); return { applied: a.rows.length }; },
   };
+  calls.leadBulk = [];
   return { deps, calls };
 }
 const post = (body) => ({ method: "POST", body });
@@ -162,6 +166,55 @@ test("SAFE clear: deletes the account's own row without identity validation, 200
   assert.equal(calls.record.length, 1);
   assert.equal(calls.record[0].action, "clear");
   assert.equal(calls.record[0].qty, null);
+});
+
+/* ===== lead-time bulk import: note forwarding + real-date rejection + atomicity (audit 2026-09-08) ===== */
+test("LEAD-TIME BULK: notes are FORWARDED to the RPC (childAsin + days + eta + note)", async () => {
+  const { deps, calls } = makeDeps();
+  const res = fakeRes();
+  await handler(post({ accountId: "A", kind: "lead-time-bulk", rows: [
+    { childAsin: "ASIN1", production: 5, shipping: 10, awd: 3, safety: 7, inboundEta: "2026-01-15", note: "keep this note" },
+  ] }), res, deps);
+  assert.equal(res.statusCode, 200, `expected 200, got ${res.statusCode}: ${JSON.stringify(res.body)}`);
+  assert.equal(calls.leadBulk.length, 1, "bulk RPC called once");
+  const row = calls.leadBulk[0].rows[0];
+  assert.equal(row.childAsin, "ASIN1");
+  assert.equal(row.note, "keep this note", "the note reached the RPC row (was dropped before this fix)");
+  assert.equal(calls.audit.length, 1);
+});
+
+test("LEAD-TIME BULK: an impossible inbound_eta (2026-02-30) is rejected 400, ZERO writes/audit (atomic)", async () => {
+  const { deps, calls } = makeDeps();
+  const res = fakeRes();
+  await handler(post({ accountId: "A", kind: "lead-time-bulk", rows: [
+    { childAsin: "ASIN1", production: 5, shipping: 10, awd: 3, safety: 7, inboundEta: "2026-01-15", note: "ok" },
+    { childAsin: "ASIN3", production: 4, shipping: 8, awd: 2, safety: 5, inboundEta: "2026-02-30", note: "bad date" },
+  ] }), res, deps);
+  assert.equal(res.statusCode, 400, "impossible date rejected");
+  assert.match(res.body.error, /real date/);
+  assert.equal(calls.leadBulk.length, 0, "no bulk write");
+  assert.equal(calls.audit.length, 0, "no audit");
+});
+
+test("LEAD-TIME BULK: an ASIN not in the account catalog rejects the WHOLE import (atomic), zero writes", async () => {
+  const { deps, calls } = makeDeps();
+  const res = fakeRes();
+  await handler(post({ accountId: "A", kind: "lead-time-bulk", rows: [
+    { childAsin: "ASIN1", production: 5, shipping: 10, awd: 3, safety: 7, inboundEta: "", note: "" },
+    { childAsin: "NOTMINE", production: 1, shipping: 1, awd: 1, safety: 1, inboundEta: "", note: "" },
+  ] }), res, deps);
+  assert.equal(res.statusCode, 400);
+  assert.match(res.body.error, /not in this account's catalog/);
+  assert.equal(calls.leadBulk.length, 0, "atomic: zero writes though one row was valid");
+});
+
+test("LEAD-TIME single: startedDate must be a REAL date to start a countdown (2026-13-01 rejected, no write)", async () => {
+  const { deps, calls } = makeDeps();
+  const res = fakeRes();
+  await handler(post({ accountId: "A", kind: "lead-time", childAsin: "ASIN1", action: "start", startedDate: "2026-13-01", production: 5, shipping: 10, awd: 3 }), res, deps);
+  assert.equal(res.statusCode, 400);
+  assert.match(res.body.error, /real date/);
+  assert.equal(calls.record.length, 0);
 });
 
 let failures = 0;

@@ -762,6 +762,9 @@ export async function recordFbaAsinLeadTimeBulk({ organizationFingerprint, conne
   const p_rows = (Array.isArray(rows) ? rows : []).map((r) => ({
     child_asin: r.childAsin, production_days: n(r.production), shipping_days: n(r.shipping),
     awd_transfer_days: n(r.awd), safety_stock_days: n(r.safety), inbound_eta: r.inboundEta || null,
+    // Note is preserved through the bulk import. Forward-compatible: the pre-migration-23 RPC ignores this key
+    // (leaving note unchanged); the migration-23 RPC applies it (blank clears), matching the single-row path.
+    note: r.note == null ? "" : String(r.note),
   }));
   const body = await request("/rest/v1/rpc/record_fba_asin_lead_time_bulk", {
     method: "POST",

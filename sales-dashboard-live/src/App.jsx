@@ -36,6 +36,7 @@ import { matchesPlanBrand, UNMAPPED_BRAND } from "./lib/plan-brand.js";
 // ADDITIVE FBA WDD / lead-time / reorder model (sits BESIDE the existing planner; never replaces it).
 import { computeAsinWdd, resolveWddWeights, validateWddWeights, WDD_DEFAULT_WEIGHTS } from "./lib/fba-wdd.js";
 import { buildFbaLeadTimeMatrix, validateFbaLeadTimeRows, validateFbaLeadTimeText } from "./lib/fba-lead-time-import.js";
+import { makeScopedLoader } from "./lib/scoped-loader.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import { canonicalBrandKey, permittedBrandKeySetForAccount, filterBrandNamesToPermitted } from "./lib/brand-scope-filter.js";
 // Regional Brand View: Region -> Brand selection, using the SINGLE canonical marketplace->region mapping the
@@ -791,6 +792,61 @@ function WarehouseImportModal({ onClose, defaultMarketplace, directory, catalogA
               <button type="button" className="plan-export-btn" disabled={!canApply} onClick={doApply}>{applying ? "Importing…" : `Import ${result?.valid.length || 0} row${(result?.valid.length || 0) === 1 ? "" : "s"}`}</button>
             </>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ADDITIVE: confirm-before-apply preview for the per-ASIN lead-time import. Shows what WILL change and, prominently,
+// what will be CLEARED (a present-blank cell) before the atomic apply. The file was already validated + bound to this
+// account; this modal is the required human confirmation so a bulk import can never silently overwrite/clear values.
+function LeadTimeImportPreview({ result, fileName, busy, onConfirm, onClose }) {
+  const rows = (result && result.applyRows) || [];
+  const pv = (result && result.preview) || {};
+  const dayLabel = { production: "Production", shipping: "Shipping", awd: "AWD Transfer", safety: "Safety Stock", inboundEta: "Inbound ETA", note: "Note" };
+  const fmt = (v) => (v == null || v === "" ? "—" : String(v));
+  const changedRows = rows.filter((r) => r.diff && (r.diff.changes.length || r.diff.clears.length));
+  return (
+    <div className="plan-modal-backdrop" onClick={onClose}>
+      <div className="plan-modal plan-modal-lg" role="dialog" aria-label="Review lead-time import" onClick={(e) => e.stopPropagation()}>
+        <div className="plan-modal-head">
+          <div>
+            <div className="plan-modal-title">Review lead-time import</div>
+            <div className="plan-modal-sub">{fileName ? `${fileName} — ` : ""}review the changes below, then apply. Nothing is written until you confirm. A blank cell clears that field.</div>
+          </div>
+          <button type="button" className="plan-icon-btn" onClick={onClose} aria-label="Close"><X size={16} /></button>
+        </div>
+        <div className="plan-modal-body">
+          <div className="plan-import-summary">
+            <span className="plan-import-pill ok"><Check size={13} /> {rows.length} ASIN{rows.length === 1 ? "" : "s"}</span>
+            {pv.changed > 0 && <span className="plan-import-pill">{pv.changed} with changes</span>}
+            {pv.cleared > 0 && <span className="plan-import-pill bad"><AlertTriangle size={13} /> {pv.cleared} will clear a value</span>}
+          </div>
+          {pv.cleared > 0 && (
+            <div className="alert warning"><AlertTriangle size={15} /> {pv.cleared} ASIN{pv.cleared === 1 ? " has a" : "s have"} blank cell that will CLEAR an existing value (set it back to Not configured). Review the "clears" below before applying.</div>
+          )}
+          <div className="plan-import-table-wrap">
+            <table className="plan-import-table">
+              <thead><tr><th>Child ASIN</th><th>Changes</th><th>Clears</th><th>Note</th></tr></thead>
+              <tbody>
+                {(changedRows.length ? changedRows : rows).slice(0, 200).map((r) => (
+                  <tr key={r.childAsin}>
+                    <td className="mono">{r.childAsin}</td>
+                    <td>{r.diff && r.diff.changes.length ? r.diff.changes.filter((c) => c.field !== "note").map((c) => `${dayLabel[c.field] || c.field}: ${fmt(c.from)}→${fmt(c.to)}`).join("; ") || "—" : "(no current values to compare)"}</td>
+                    <td className="mono">{r.diff && r.diff.clears.length ? r.diff.clears.map((f) => dayLabel[f] || f).join(", ") : "—"}</td>
+                    <td>{fmt(r.note)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div className="plan-modal-foot">
+          <button type="button" className="plan-tool-btn" onClick={onClose} disabled={busy}>Cancel</button>
+          <button type="button" className="plan-tool-btn plan-tool-btn-primary" onClick={onConfirm} disabled={busy || rows.length === 0}>
+            {busy ? "Applying…" : `Apply ${rows.length} ASIN${rows.length === 1 ? "" : "s"}`}
+          </button>
         </div>
       </div>
     </div>
@@ -1854,6 +1910,19 @@ function DashboardApp({ session, access, onSignOut }) {
   // account-scoped API. A settings/warehouse change re-reads this and recomputes locally with ZERO DataDoe.
   const [planConfig, setPlanConfig] = useState(null);
   const [planConfigBusy, setPlanConfigBusy] = useState(false);
+  // A configuration-READ failure. Shown as a distinct notice so a failed load NEVER renders defaults as if they were
+  // saved settings (audit 2026-09-08). Cleared on a successful (account-current) load.
+  const [planConfigError, setPlanConfigError] = useState(null);
+  // Confirm-before-apply preview for the lead-time import: { result } (the validated parse) | null.
+  const [leadTimePreview, setLeadTimePreview] = useState(null);
+  // The LIVE selected account, mirrored into a ref so an in-flight config load resolving after an account switch can
+  // detect it and refuse to write another account's data into this account's state (account-keyed guard).
+  const selectedAccountIdRef = useRef(selectedAccountId);
+  useEffect(() => { selectedAccountIdRef.current = selectedAccountId; }, [selectedAccountId]);
+  // The account-keyed load guard for the plan config (pure, tested in scripts/scoped-loader.test.js). Reads the LIVE
+  // account from the ref so a stale/failed/superseded response is discarded rather than written to another account.
+  const planConfigLoader = useRef(null);
+  if (!planConfigLoader.current) planConfigLoader.current = makeScopedLoader(() => selectedAccountIdRef.current);
   // Per-user column visibility (set of HIDDEN column ids), the SKU-horizon editor target, and the bulk-import modal.
   const [planHiddenCols, setPlanHiddenCols] = useState(() => new Set());
   const [planColsBusy, setPlanColsBusy] = useState(false);
@@ -2495,16 +2564,27 @@ function DashboardApp({ session, access, onSignOut }) {
   // Load the durable planning config for the selected account (read-only; never DataDoe). Resets on account change so
   // one account's settings/warehouse never leak into another.
   const loadPlanConfig = useCallback(async () => {
-    if (!selectedAccountId || !session?.access_token) { setPlanConfig(null); return; }
+    if (!selectedAccountId || !session?.access_token) { setPlanConfig(null); setPlanConfigError(null); return; }
     const acct = selectedAccountId;
+    // Request-generation + account-keyed guard: a NEWER load (any account switch re-creates this callback and re-runs
+    // the effect, bumping the generation) supersedes an older one, and the LIVE account is re-checked at completion via
+    // the ref. So a slow A load, an A->B switch, or an A->B->A round-trip can never let a stale/other-account response
+    // (or a failed request, or a post-upload reload) overwrite the active account's configuration.
+    const isCurrent = planConfigLoader.current.begin(acct);
     try {
       const cfg = await authFetch(`/api/fba-plan-config?accountId=${encodeURIComponent(acct)}`, session.access_token);
-      if (selectedAccountId === acct) setPlanConfig(cfg && typeof cfg === "object" ? cfg : { settings: null, overrides: [], warehouse: [] });
-    } catch (_e) {
-      if (selectedAccountId === acct) setPlanConfig({ settings: null, overrides: [], warehouse: [] });
+      if (!isCurrent()) return;
+      setPlanConfig(cfg && typeof cfg === "object" ? cfg : { settings: null, overrides: [], warehouse: [] });
+      setPlanConfigError(null);
+    } catch (e) {
+      if (!isCurrent()) return;
+      // A READ failure must NOT render defaults as saved settings. Drop stale config and surface a typed notice so the
+      // planner shows "couldn't load" (with a retry) rather than empty defaults that look like a wiped configuration.
+      setPlanConfig(null);
+      setPlanConfigError(String(e && e.message ? e.message : e) || "Could not load this account's configuration.");
     }
   }, [selectedAccountId, session?.access_token]);
-  useEffect(() => { if (view === "fbaplan") loadPlanConfig(); else setPlanConfig(null); }, [view, loadPlanConfig]);
+  useEffect(() => { if (view === "fbaplan") loadPlanConfig(); else { setPlanConfig(null); setPlanConfigError(null); } }, [view, loadPlanConfig]);
 
   // The resolved ACCOUNT-DEFAULT planning settings (durable, with the system defaults when unsaved).
   const planAccountSettings = useMemo(() => {
@@ -3295,7 +3375,7 @@ function DashboardApp({ session, access, onSignOut }) {
     const m = new Map();
     for (const lt of planConfig?.leadTimes || []) m.set(String(lt.child_asin || "").toUpperCase(), {
       production: lt.production_days ?? null, shipping: lt.shipping_days ?? null, awd: lt.awd_transfer_days ?? null, safety: lt.safety_stock_days ?? null,
-      inboundStarted: lt.inbound_started_date || null, inboundEta: lt.inbound_eta || null, updatedByEmail: lt.updated_by_email || "",
+      inboundStarted: lt.inbound_started_date || null, inboundEta: lt.inbound_eta || null, note: lt.note || "", updatedByEmail: lt.updated_by_email || "",
     });
     return m;
   }, [planConfig?.leadTimes]);
@@ -3343,19 +3423,36 @@ function DashboardApp({ session, access, onSignOut }) {
     const url = URL.createObjectURL(new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
     const link = document.createElement("a"); link.href = url; link.download = `fba-lead-times-${String(selectedAccountId || "account").replace(/[^a-z0-9]+/gi, "-")}.xlsx`; link.click(); URL.revokeObjectURL(url);
   }, [planRowsWithWdd, selectedAccountId]);
-  // ADDITIVE: validate (shared validator) then atomically apply an ASIN lead-time import. Any invalid row -> zero writes.
+  // ADDITIVE: validate (shared validator, bound to THIS account + diffed against current values) then open a
+  // confirm-before-apply PREVIEW. The import is NOT applied here -- the user confirms in the preview modal. Blank cells
+  // clear (shown as "cleared" in the preview); an omitted writable column or a wrong/mixed account is rejected upfront.
   const onImportLeadTimeFile = useCallback(async (file) => {
-    if (!file) return; setLeadTimeNotice(null); setLeadTimeImportBusy(true);
+    if (!file) return; setLeadTimeNotice(null); setLeadTimePreview(null); setLeadTimeImportBusy(true);
     try {
+      const opts = { expectedAccountId: selectedAccountId, currentByAsin: leadTimeByAsin };
       let result;
-      if (/\.xlsx$/i.test(file.name)) { const { readXlsxFirstSheet } = await import("./lib/xlsx-read.js"); result = validateFbaLeadTimeRows(await readXlsxFirstSheet(await file.arrayBuffer())); }
-      else result = validateFbaLeadTimeText(await file.text());
+      if (/\.xlsx$/i.test(file.name)) { const { readXlsxFirstSheet } = await import("./lib/xlsx-read.js"); result = validateFbaLeadTimeRows(await readXlsxFirstSheet(await file.arrayBuffer()), opts); }
+      else result = validateFbaLeadTimeText(await file.text(), opts);
       if (!result.ok) { setLeadTimeNotice({ tone: result.nothingToApply ? "warning" : "error", msg: result.message || "Import invalid; nothing was written." }); return; }
-      const res = await bulkImportLeadTimes(result.applyRows.map((r) => ({ childAsin: r.childAsin, production: r.production, shipping: r.shipping, awd: r.awd, safety: r.safety, inboundEta: r.inboundEta })));
-      setLeadTimeNotice({ tone: "success", msg: `Applied ${res?.applied || result.applyRows.length} ASIN lead-time row(s).` });
-    } catch (e) { setLeadTimeNotice({ tone: "error", msg: (e && e.message) || "Could not import lead times; nothing was written." }); }
+      setLeadTimePreview({ result, fileName: file.name });
+    } catch (e) { setLeadTimeNotice({ tone: "error", msg: (e && e.message) || "Could not read the file; nothing was written." }); }
     finally { setLeadTimeImportBusy(false); if (leadTimeFileRef.current) leadTimeFileRef.current.value = ""; }
-  }, [bulkImportLeadTimes]);
+  }, [selectedAccountId, leadTimeByAsin]);
+
+  // ADDITIVE: apply the CONFIRMED lead-time preview. Notes are carried through (childAsin + 4 days + inbound_eta + note).
+  // The bulk write is atomic server-side; a success notice reports the applied count BEFORE the reload, so a later
+  // reload failure is distinguishable from "nothing was written" (the write already returned an applied count).
+  const applyLeadTimePreview = useCallback(async () => {
+    const rows = leadTimePreview?.result?.applyRows;
+    if (!rows || !rows.length) { setLeadTimePreview(null); return; }
+    setLeadTimeImportBusy(true); setLeadTimeNotice(null);
+    try {
+      const res = await bulkImportLeadTimes(rows.map((r) => ({ childAsin: r.childAsin, production: r.production, shipping: r.shipping, awd: r.awd, safety: r.safety, inboundEta: r.inboundEta, note: r.note || "" })));
+      setLeadTimeNotice({ tone: "success", msg: `Applied ${res?.applied ?? rows.length} ASIN lead-time row(s).` });
+      setLeadTimePreview(null);
+    } catch (e) { setLeadTimeNotice({ tone: "error", msg: (e && e.message) || "Could not import lead times; nothing was written." }); }
+    finally { setLeadTimeImportBusy(false); }
+  }, [leadTimePreview, bulkImportLeadTimes]);
 
   // The full ordered column model (identity + sales + forecast + inventory + planning + status). Each column owns its
   // header metadata + cell + footer renderer, so the grouped column chooser and the table stay perfectly in sync. AWD
@@ -4869,6 +4966,7 @@ function DashboardApp({ session, access, onSignOut }) {
         </div>
 
         {planData && planError && <DataQualityAlert tone="error" title="The last refresh failed" detail={planError} />}
+        {planConfigError && <DataQualityAlert tone="error" title="Couldn't load this account's saved configuration" detail={`${planConfigError} These are NOT your saved settings — switch accounts and back, or retry, to reload.`} />}
         {leadTimeNotice && <DataQualityAlert tone={leadTimeNotice.tone} title={leadTimeNotice.msg} />}
 
         {planData && (
@@ -4973,6 +5071,15 @@ function DashboardApp({ session, access, onSignOut }) {
             skuAsinMap={planSkuAsinMap}
             onApply={bulkImportWarehouse}
             onClose={() => setWarehouseImportOpen(false)}
+          />
+        )}
+        {leadTimePreview && (
+          <LeadTimeImportPreview
+            result={leadTimePreview.result}
+            fileName={leadTimePreview.fileName}
+            busy={leadTimeImportBusy}
+            onConfirm={applyLeadTimePreview}
+            onClose={() => setLeadTimePreview(null)}
           />
         )}
       </div>

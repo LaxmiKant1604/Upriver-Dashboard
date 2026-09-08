@@ -15635,3 +15635,52 @@ G15 new account + changed coverage cannot alter original jobs; G16 replay + conc
 fresh subsequent cycle legitimately plans the newly-enabled family; G18 failed original-job read defers typed. Each
 deferral/skip asserts a byte-identical store snapshot. verify 169/145 incl build:check; git diff --check clean;
 api/*.js=12; zero DataDoe. Deployed 60f27a3 -> (this commit). PRODUCTION ACCEPTANCE still PENDING natural runs.
+
+### FBA Shipment Plan audit -- bulk lead-time import + account-safe config (2026-09-08, base 90c68fb; pure code + 1 UNAPPLIED migration; zero DataDoe)
+
+CONFIRMED ROOT CAUSES + FIXES (all in the FBA planning/config/import surface only):
+1. UPLOAD FAILURE ("Child ASIN"): detectHeader matched only the exact key `child_asin`, so a human "Child ASIN"
+   header (normalizes to "child asin") failed -> "missing child_asin column". FIX (src/lib/fba-lead-time-import.js):
+   alias-based header resolution ("Child ASIN"/"child_asin"/"ASIN" -> child_asin; human day/eta/note labels too),
+   with AMBIGUOUS-duplicate rejection (both "ASIN" and "Child ASIN" -> reject) and PARENT-ASIN-only rejection
+   (clear message: the identity is the child ASIN). Missing-header errors now show the headers found.
+2. DATA LOSS from OMITTED COLUMNS: the parser turned an ABSENT day/eta/note column into null -> the bulk RPC's
+   full-replace CLEARED that field for every ASIN. FIX: a re-uploaded file MUST carry every WRITABLE column (4 days
+   + inbound_eta + note), else it is REJECTED with the missing list. A PRESENT-but-blank cell still explicitly
+   clears (the documented lossless round-trip). DECISION: rejecting an incomplete template was chosen over
+   omitted-preserves patch semantics (which would need per-field DB support) -- the template download always
+   provides the full column set. Recorded as the deliberate semantics, not a limitation.
+3. WRONG-ACCOUNT WRITES: the parser ignored the `account` column. FIX: when present it must match the account being
+   configured; a mismatched OR mixed-account template is rejected client-side (the server still binds the write to
+   its account + validates ASIN ownership -- this is an early friendly guard, never the only boundary).
+4. NOTES DROPPED in bulk: the client map, the API `lead-time-bulk`, the supabase wrapper AND the RPC all omitted
+   `note`. FIX: note flows parser -> client apply -> API (norm row) -> wrapper (p_rows) -> RPC. The RPC piece is
+   migration 20260920 (fba_lead_time_bulk_note.sql, CREATE OR REPLACE record_fba_asin_lead_time_bulk with
+   blank-as-clear note; signature unchanged) -- ADDED to the tree, NOT applied (approval-gated). Forward-compatible:
+   the pre-migration RPC ignores the new note key (note unchanged); post-migration it applies it.
+5. CONFIG REQUEST RACE: loadPlanConfig compared `selectedAccountId === acct` where both are the SAME captured
+   closure value (always true) -> a slow/failed/superseded response overwrote the active account, and a READ FAILURE
+   rendered empty defaults AS IF saved. FIX: new src/lib/scoped-loader.js (makeScopedLoader: monotonic generation +
+   live-scope re-read) drives loadPlanConfig; a read failure now sets a DISTINCT planConfigError notice ("these are
+   NOT your saved settings"), never defaults. Proven by scoped-loader.test.js (A->B, A->B->A, failure, reload).
+6. CONFIRM-BEFORE-APPLY: the import applied immediately. FIX: parse -> LeadTimeImportPreview modal (changed/cleared
+   diff vs current values, notes shown) -> explicit Apply. The bulk apply is atomic server-side (any invalid row =>
+   zero writes); the success notice reports the applied count BEFORE the reload, so a save+reload-failure is
+   distinguishable from "nothing was written".
+7. REAL CALENDAR DATES: client parser + server (inbound_eta bulk, startedDate single) now reject impossible dates
+   (2026-02-30 / 2026-13-01), consistently, instead of a raw 500 from the DB ::date cast.
+
+BUSINESS-RULE DECISIONS RECORDED (NOT changed unilaterally):
+* AWD-blocks-total: totalLeadTime + Inbound ETA both REQUIRE AWD Transfer days (fba-wdd.js); a blank AWD -> "Not
+  configured" rather than silently substituting 0 (which would UNDERSTATE lead time). Whether a direct-FBA route
+  (no AWD leg, AWD optional/0) should be first-class is a PRODUCT decision -- left as-is, flagged for confirmation.
+* Inventory double-counting / freshness / WDD coverage / warehouse allocation / Excel export: reviewed against the
+  existing contract; NO demonstrated defect (coverModel already excludes Total FBA Inventory; missing evidence -> null
+  never fabricated 0; the plan surfaces the published snapshot's proven as-of). No change.
+
+VERIFICATION: npm run verify 171/147 incl build:check; git diff --check clean; api/*.js = 12; zero DataDoe.
+New/changed tests: fba-lead-time-import.test.js (28: aliases, ambiguity/parent, omitted-column, account binding,
+notes, omitted-vs-blank, real dates, duplicates, atomic, diff, REAL .xlsx round-trip), scoped-loader.test.js (9),
+fba-plan-config-handler.test.js (+4: bulk note forwarded, real-date reject, atomic catalog reject, single startedDate).
+IMPLEMENTED + deployed; PRODUCTION ACCEPTANCE (authenticated browser flow + DB note persistence after migration
+20260920 is applied) is PENDING -- the migration is approval-gated and was NOT applied this session.
