@@ -116,4 +116,45 @@ const sig = (o) => Object.keys(o).sort().join(",");
     threw !== null && /Supabase request failed \(400\)/.test(String(threw.message)) && threw.status === 400);
 }
 
+/* ===== P0-D. reconcileAccountOnboardingDiscovery: RPC-present success + RPC-absent typed fallback signal ===== */
+{
+  const rows = mixedBatch();
+  // RPC PRESENT: the reconcile endpoint answers with the RPC's typed disposition.
+  const origFetch = globalThis.fetch;
+  let rpcCalls = 0; let sentBody = null;
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).includes("/rpc/reconcile_account_onboarding_discovery")) {
+      rpcCalls += 1; sentBody = opts.body ? JSON.parse(opts.body) : null;
+      return { ok: true, status: 200, json: async () => ({ disposition: "reconciled", inserted: 1, updated: 5, forward: 0, rejected_regressions: 0 }) };
+    }
+    return { ok: true, status: 200, json: async () => [] };
+  };
+  let res = null; let threw = null;
+  try { res = await sb.reconcileAccountOnboardingDiscovery(rows); } catch (e) { threw = e; }
+  globalThis.fetch = origFetch;
+  ok("P0D-R1: reconcileAccountOnboardingDiscovery calls the RPC once and returns its typed disposition", rpcCalls === 1 && threw === null && res && res.disposition === "reconciled");
+  ok("P0D-R2: the RPC receives the discovery rows under p_rows (single atomic call, not one-POST-per-group)", sentBody && Array.isArray(sentBody.p_rows) && sentBody.p_rows.length === rows.length);
+
+  // RPC ABSENT (migration pending): PostgREST answers 404 PGRST202 -> a typed ONBOARDING_RECONCILE_RPC_ABSENT so the
+  // caller can fall back to the grouped merge-upsert (safe to deploy the code BEFORE the migration).
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/rpc/reconcile_account_onboarding_discovery")) {
+      return { ok: false, status: 404, json: async () => ({ message: "Could not find the function public.reconcile_account_onboarding_discovery(p_rows)", code: "PGRST202" }) };
+    }
+    return { ok: true, status: 200, json: async () => [] };
+  };
+  let absentErr = null;
+  try { await sb.reconcileAccountOnboardingDiscovery(rows); } catch (e) { absentErr = e; }
+  globalThis.fetch = origFetch;
+  ok("P0D-R3: an ABSENT RPC (404 PGRST202) throws the typed ONBOARDING_RECONCILE_RPC_ABSENT (caller falls back to the merge-upsert)",
+    absentErr && absentErr.code === "ONBOARDING_RECONCILE_RPC_ABSENT");
+
+  // An empty batch is a no-op (never touches the network).
+  let netCalls = 0;
+  globalThis.fetch = async () => { netCalls += 1; return { ok: true, status: 200, json: async () => [] }; };
+  const empty = await sb.reconcileAccountOnboardingDiscovery([]);
+  globalThis.fetch = origFetch;
+  ok("P0D-R4: an empty batch is a zero-network no-op", netCalls === 0 && empty && empty.inserted === 0 && empty.updated === 0);
+}
+
 writeSync(1, `\naccount-onboarding-upsert: ${passed} checks passed\n`);

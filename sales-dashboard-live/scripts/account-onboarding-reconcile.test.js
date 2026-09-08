@@ -8,6 +8,7 @@ import path from "node:path";
 import {
   filterExportEligibleAccounts, fetchExportEligibleAccounts, classifyOnboardingAccount,
   ONBOARDING_STATUS, EXPORT_ELIGIBLE_STATUSES, EXCLUDE_NOT_ONBOARDED, EXCLUDE_DATADOE_NOT_READY,
+  resolveOnboardingForwardStatus,
 } from "../lib/server/sync/account-onboarding.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -155,6 +156,48 @@ const exReasons = (r) => r.excluded.map((e) => e.accountId + ":" + e.reason);
     pgStore.includes("readEstablishedAccountIds: getAccountDirectorySnapshotAccounts")
     && runtime.includes("readEstablishedAccountIds")
     && runtime.includes("getAccountDirectorySnapshotAccounts"));
+}
+
+/* ===== P0-D. concurrency-safe forward-only discovery reconciliation (resolveOnboardingForwardStatus) ===== */
+{
+  const S = ONBOARDING_STATUS;
+  // THE RACE: discovery read the row as ready_for_bootstrap; a concurrent claim advanced it to bootstrapping. The
+  // reconciliation runs against the LOCKED current (bootstrapping) and must NOT regress to ready_for_bootstrap.
+  ok("P0D-1: a stale ready_for_bootstrap proposal against a claimed (bootstrapping) row is REJECTED (keeps bootstrapping)",
+    resolveOnboardingForwardStatus(S.BOOTSTRAPPING, S.READY_FOR_BOOTSTRAP) === S.BOOTSTRAPPING);
+  ok("P0D-2: a stale waiting_for_datadoe proposal against a claimed row is REJECTED (keeps bootstrapping)",
+    resolveOnboardingForwardStatus(S.BOOTSTRAPPING, S.WAITING_FOR_DATADOE) === S.BOOTSTRAPPING);
+  // FORWARD grading of a claim-owned row is allowed (bootstrapping -> partially_ready -> ready).
+  ok("P0D-3: bootstrapping -> partially_ready is a valid FORWARD transition", resolveOnboardingForwardStatus(S.BOOTSTRAPPING, S.PARTIALLY_READY) === S.PARTIALLY_READY);
+  ok("P0D-4: partially_ready -> ready is a valid FORWARD transition", resolveOnboardingForwardStatus(S.PARTIALLY_READY, S.READY) === S.READY);
+  ok("P0D-5: ready NEVER regresses (even to partially_ready)", resolveOnboardingForwardStatus(S.READY, S.PARTIALLY_READY) === S.READY);
+  ok("P0D-6: partially_ready does NOT regress to bootstrapping", resolveOnboardingForwardStatus(S.PARTIALLY_READY, S.BOOTSTRAPPING) === S.PARTIALLY_READY);
+  // PRE-CLAIM current: discovery decides (readiness flaps legitimately move ready_for_bootstrap <-> waiting).
+  ok("P0D-7: pre-claim ready_for_bootstrap -> waiting_for_datadoe is allowed (readiness flap before the claim)",
+    resolveOnboardingForwardStatus(S.READY_FOR_BOOTSTRAP, S.WAITING_FOR_DATADOE) === S.WAITING_FOR_DATADOE);
+  ok("P0D-8: pre-claim waiting_for_datadoe -> ready_for_bootstrap is allowed", resolveOnboardingForwardStatus(S.WAITING_FOR_DATADOE, S.READY_FOR_BOOTSTRAP) === S.READY_FOR_BOOTSTRAP);
+  // A brand-new row (no current) adopts the proposed status verbatim (INSERT path).
+  ok("P0D-9: a brand-new row adopts the proposed status verbatim", resolveOnboardingForwardStatus("", S.READY_FOR_BOOTSTRAP) === S.READY_FOR_BOOTSTRAP);
+  ok("P0D-10: an empty proposal keeps the current status", resolveOnboardingForwardStatus(S.BOOTSTRAPPING, "") === S.BOOTSTRAPPING);
+}
+
+/* ===== P0-D SQL parity: the migration is additive + forward-only + never touches claim-owned/constraint ===== */
+{
+  const sql = readFileSync(path.join(ROOT, "supabase/migrations/20260922_account_onboarding_reconcile.sql"), "utf8");
+  ok("P0D-SQL-1: adds a SECURITY DEFINER RPC", /create or replace function public\.reconcile_account_onboarding_discovery/.test(sql) && /security definer/.test(sql));
+  ok("P0D-SQL-2: locks each row (FOR UPDATE) + advisory lock", /for update/i.test(sql) && /pg_advisory_xact_lock/.test(sql));
+  ok("P0D-SQL-3: NEVER writes claim-owned columns (operation_id / bootstrap_started_at / first_discovered_at) in the UPDATE",
+    !/update public\.account_onboarding set[\s\S]*?(operation_id|bootstrap_started_at)\s*=/i.test(sql));
+  ok("P0D-SQL-4: forward-only guard keeps the current claim-owned status on a regression (v_new_status := v_row.status)",
+    /v_new_status\s*:=\s*v_row\.status/.test(sql));
+  ok("P0D-SQL-5: refuses to INSERT/keep a bootstrapping row without a claim (never violates claim_coherent)",
+    /refusing to INSERT a bootstrapping row/i.test(sql));
+  ok("P0D-SQL-6: does NOT ALTER the table or the claim_coherent CONSTRAINT (additive only)",
+    !/alter table[\s\S]*account_onboarding/i.test(sql) && !/drop constraint[\s\S]*claim_coherent/i.test(sql));
+  ok("P0D-SQL-7: service-role only (revoked from public/anon/authenticated)",
+    /revoke all on function public\.reconcile_account_onboarding_discovery/.test(sql) && /grant execute on function public\.reconcile_account_onboarding_discovery\(jsonb\) to service_role/.test(sql));
+  ok("P0D-SQL-8: validates input (jsonb array; primary account id; valid status)",
+    /jsonb_typeof\(p_rows\) <> 'array'/.test(sql) && /position\(':' in v_account\) > 0/.test(sql) && /invalid proposed status/.test(sql));
 }
 
 writeSync(1, `\naccount-onboarding-reconcile: ${passed} checks passed\n`);

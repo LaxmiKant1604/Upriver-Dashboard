@@ -69,6 +69,31 @@ export const SERVING_STATUSES = Object.freeze([
   ONBOARDING_STATUS.READY,
 ]);
 
+// P0-D concurrency-safe reconciliation core. A discovery pass computes the proposed status from a read of the durable
+// row that may be STALE (a concurrent claim_account_bootstrap can advance ready_for_bootstrap -> bootstrapping AFTER
+// discovery read it). At WRITE time (under a row lock inside reconcile_account_onboarding_discovery) the proposed
+// status is reconciled against the CURRENT locked status so it NEVER regresses a status a claim/bootstrap advanced.
+// CLAIM-OWNED statuses (bootstrapping/partially_ready/ready) move ONLY forward (bootstrapping -> partially_ready ->
+// ready); a proposed pre-claim status against a claim-owned current is a stale-read regression and is REJECTED (the
+// current status is kept). A pre-claim current accepts the proposed status verbatim (readiness flaps legitimately move
+// ready_for_bootstrap <-> waiting_for_datadoe before the claim). This mirrors classifyOnboardingAccount's in-memory
+// forward-grading, enforced against the durable locked status -- the SQL RPC applies the identical rule.
+const ONBOARDING_STATUS_RANK = Object.freeze({
+  discovered: 0, waiting_for_datadoe: 1, blocked: 1, ready_for_bootstrap: 2, bootstrapping: 3, partially_ready: 4, ready: 5,
+});
+export const CLAIM_OWNED_ONBOARDING_STATUSES = Object.freeze([
+  ONBOARDING_STATUS.BOOTSTRAPPING, ONBOARDING_STATUS.PARTIALLY_READY, ONBOARDING_STATUS.READY,
+]);
+export function resolveOnboardingForwardStatus(currentStatus, proposedStatus) {
+  const cur = S(currentStatus); const prop = S(proposedStatus);
+  if (!prop) return cur; // nothing proposed -> keep current
+  if (!cur) return prop; // brand-new row -> the proposed status verbatim (INSERT path)
+  if (!CLAIM_OWNED_ONBOARDING_STATUSES.includes(cur)) return prop; // pre-claim current -> discovery decides
+  // claim-owned current: accept ONLY a forward claim-owned progression; otherwise keep the current (reject regression).
+  if (CLAIM_OWNED_ONBOARDING_STATUSES.includes(prop) && (ONBOARDING_STATUS_RANK[prop] ?? -1) >= (ONBOARDING_STATUS_RANK[cur] ?? 0)) return prop;
+  return cur;
+}
+
 // SAFE typed failure/exclusion codes (never a raw upstream body).
 export const UNSUPPORTED_MARKETPLACE = "UNSUPPORTED_MARKETPLACE";
 export const EXCLUDE_DATADOE_NOT_READY = "DATADOE_NOT_READY";

@@ -583,7 +583,16 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     };
   };
 
-  const run = async ({ bucket, asOf = null, today = null, cycleDate = null, cycleBucket = null, reuseOnly = false, onlySourceKey = null, deadline = null, preflight = null, forceFreshOli = false } = {}) => {
+  const run = async ({ bucket, asOf = null, today = null, cycleDate = null, cycleBucket = null, reuseOnly = false, onlySourceKey = null, deadline = null, preflight = null, forceFreshOli = false,
+    // P0-A COMPLETE-DAILY-PLAN (scheduled full-region cycle): plan+freeze a SET of families but execute only a
+    // subset. `planSourceKeys` (a Set-generalization of onlySourceKey) INCLUDES exactly these families in the plan
+    // (every other registered source is paused); `executeSourceKeys` restricts which planned families this step
+    // CREATES/DRAINS -- the rest are frozen into the SAME cycle (budget + canonical jobs/owners) but left open for a
+    // later step. The scheduled OLI step passes planSourceKeys=[OLI,CATALOG] + executeSourceKeys=[OLI] + forceCatalog
+    // so the Product Catalog family is durably frozen up front and the priority step drains it as a case-(a)
+    // continuation (never the case-(c) newly-enabled deferral that produced not-drained). All three are BUILD/OPERATOR
+    // arguments (the trusted scheduled OLI operator), never ordinary reads; null/false => byte-identical prior behavior.
+    planSourceKeys = null, executeSourceKeys = null, forceCatalog = false } = {}) => {
     if (!isRoutingScope(bucket)) {
       throw new Error(`buildBucketSourceSyncRuntime.run requires a routing scope (region india|europe-au|us-ca or legacy us|non-us; got "${bucket}").`);
     }
@@ -627,6 +636,23 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       }
       for (const entry of SOURCE_REGISTRY) {
         if (entry.sourceKey !== onlySourceKey) pausedSources.add(entry.sourceKey);
+      }
+    }
+    // P0-A: plan-scope a SET of families (every OTHER registered source is paused, exactly as onlySourceKey does for
+    // one). Each key is validated (typed UNREGISTERED_SOURCE, fail closed) and must not be paused by controls. This is
+    // orthogonal to executeSourceKeys (below): planSourceKeys shapes the FROZEN plan; executeSourceKeys narrows which
+    // planned family this step drains. onlySourceKey (admin/manual) is untouched.
+    if (planSourceKeys != null) {
+      const planSet = new Set(planSourceKeys);
+      for (const sk of planSet) {
+        sourceRegistryEntry(sk); // typed UNREGISTERED_SOURCE (fail closed)
+        if (pausedSources.has(sk)) {
+          const err = new Error(`SOURCE_PAUSED: "${sk}" is paused; resume it before the scheduled full-region cycle can freeze it (fail closed).`);
+          err.code = "SOURCE_PAUSED"; err.status = 409; throw err;
+        }
+      }
+      for (const entry of SOURCE_REGISTRY) {
+        if (!planSet.has(entry.sourceKey)) pausedSources.add(entry.sourceKey);
       }
     }
     // PRIORITY DASHBOARDS PATH (Daily Reporting + Brand View): derive ONLY from the PROVEN durable OLI history
@@ -827,7 +853,10 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         deadlineMs: dl.deadlineMs, reserveMs: dl.reserveMs,
         reuseOnly,
         catalogCarrierSeller,
-        forceCatalogRefresh: priority,
+        // Force a Catalog job when the priority derive needs it OR the scheduled OLI step must freeze it into the cycle.
+        forceCatalogRefresh: priority || forceCatalog === true,
+        // P0-A: freeze every planned family but CREATE/DRAIN only these (null => execute all, byte-identical).
+        executeSourceKeys: executeSourceKeys != null ? new Set(executeSourceKeys) : null,
         forceFreshOli: forceFreshOli === true,
       });
     } catch (e) { return catchDeadline(e); }
@@ -1531,7 +1560,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     };
   };
 
-  const runSourceCardAction = async ({ bucket, sourceKey, reuseOnly = false, deadline = null, preflight = null, forceFreshOli = false } = {}) => {
+  const runSourceCardAction = async ({ bucket, sourceKey, reuseOnly = false, deadline = null, preflight = null, forceFreshOli = false, scheduledDaily = false } = {}) => {
     const entry = sourceRegistryEntry(sourceKey); // typed UNREGISTERED_SOURCE (fail closed)
     // FORCE-FRESH-OLI is authorized ONLY for the order-line-items family (the D-1 "force latest" re-fetch). It is a
     // trusted operator/composition argument (the admin DSC + the GitHub force-latest job), never an ordinary read.
@@ -1557,6 +1586,14 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     const dl = resolveDeadline(deadline);
     const pf = preflight && preflight.bucket === bucket ? preflight : await preflightEvidence({ bucket, sourceKey, deadline: dl });
     if (entry.storage === "durable-history" || entry.storage === "durable-snapshot") {
+      // P0-A SCHEDULED FULL-REGION DAILY OLI: freeze BOTH order-line-items AND the organization Product Catalog into
+      // ONE cycle before OLI's first create, but EXECUTE only OLI here (the priority step drains the frozen Catalog on
+      // the SAME cycle). Authorized ONLY for the scheduled OLI operator (scheduledDaily) on the order-line-items family;
+      // any other family, or an ordinary/admin/manual source-card action (scheduledDaily=false), keeps the byte-
+      // identical onlySourceKey path (Catalog paused). This never widens execution -- OLI still creates ONLY OLI.
+      if (scheduledDaily === true && sourceKey === OLI_SOURCE_KEY) {
+        return run({ bucket, planSourceKeys: [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY], executeSourceKeys: [OLI_SOURCE_KEY], forceCatalog: true, reuseOnly, deadline: dl, preflight: pf, forceFreshOli: freshOli });
+      }
       return run({ bucket, onlySourceKey: sourceKey, reuseOnly, deadline: dl, preflight: pf, forceFreshOli: freshOli });
     }
     // FINDING 1: a cycle-cache family executes ONLY its own canonical source family -- the trusted

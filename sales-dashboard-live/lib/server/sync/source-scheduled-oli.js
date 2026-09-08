@@ -47,6 +47,33 @@ export function oliBucketPlan(accounts, existingMembership = new Map()) {
 }
 
 /**
+ * P0-C: resolve the EFFECTIVE OLI create/token ceiling for one refresh attempt. PURE + offline-testable.
+ *   - A FRESH cycle (no active head, or a freshly-opened superseding cycle) uses the newly-computed + authorized
+ *     `recomputedCreates` (the steady batch count + one create per account behind D-1).
+ *   - A CONTINUATION of an existing frozen cycle uses the DURABLE frozen source_tranche_budget VERBATIM
+ *     (max_creates/max_tokens) -- NEVER a recomputed live ceiling. Comparing the frozen cycle's historical durable
+ *     spend against a smaller recomputed ceiling is the exact defect that falsely tripped TOKEN_CEILING_EXCEEDED
+ *     (16 spent > 14 recomputed) once coverage advanced.
+ *   - A continuation whose frozen budget is UNREADABLE (`frozenBudgetReadError`) or MALFORMED (non-positive /
+ *     non-integer max_creates/max_tokens) DEFERS -- the caller must make ZERO mutations (no create).
+ *   - A continuation with NO frozen OLI budget yet (`frozenBudget == null`; the family had not frozen before an
+ *     interrupt) keeps the recomputed ceiling; the runtime freezes it on the first create this run.
+ * Returns { ok:true, source, creates, tokens } OR { ok:false, defer:true, reason, detail }.
+ */
+export function resolveOliCeiling({ isContinuation = false, frozenBudget = null, frozenBudgetReadError = false, recomputedCreates = 0, tokensPerCreate = OLI_TOKENS_PER_CREATE } = {}) {
+  const recomputed = { creates: recomputedCreates, tokens: recomputedCreates * tokensPerCreate };
+  if (!isContinuation) return { ok: true, source: "fresh", ...recomputed };
+  if (frozenBudgetReadError) return { ok: false, defer: true, reason: "FROZEN_BUDGET_UNREADABLE", detail: "continuation frozen OLI budget could not be read" };
+  if (frozenBudget == null) return { ok: true, source: "continuation-unfrozen", ...recomputed };
+  const fc = Number(frozenBudget.max_creates);
+  const ft = Number(frozenBudget.max_tokens);
+  if (!Number.isSafeInteger(fc) || fc <= 0 || !Number.isSafeInteger(ft) || ft <= 0) {
+    return { ok: false, defer: true, reason: "FROZEN_BUDGET_MALFORMED", detail: `max_creates=${frozenBudget.max_creates} max_tokens=${frozenBudget.max_tokens}` };
+  }
+  return { ok: true, source: "continuation-frozen", creates: fc, tokens: ft };
+}
+
+/**
  * STRICT post-drain assessment of a scheduled OLI cycle. Given the discovered primary accounts, the cycle's OLI
  * source jobs + owners, and the OLI family's remaining open-job count, prove EVERY invariant and return
  * { ok, problems, creates, tokens, batches, ceilingCreates, ceilingTokens }:
@@ -186,4 +213,25 @@ export function classifyScheduledOliCycle({ bucket, cycle, discoveredAccounts, s
   if (durableCoverage == null) return { disposition: "terminal-refuse", reason: "terminal-cycle-coverage-unreadable", assessment, cycleStatus: status };
   if (durableCoverage.complete === true) return { disposition: "idempotent-complete", assessment, cycleStatus: status, reason: "durable-coverage-complete" };
   return { disposition: "supersede", reason: "stale-terminal-below-d1", assessment, cycleStatus: status, missingAccounts: durableCoverage.missingAccounts || [] };
+}
+
+/**
+ * P0-B: classify a RUNNING (bucket, today) head, distinguishing a COMPLETE-DAILY-PLAN cycle (OLI + a frozen Product
+ * Catalog budget/job) from a LEGACY OLI-only cycle (OLI frozen budget/jobs but NO Catalog budget AND NO Catalog job
+ * -- created before the complete-daily-plan fix). A frozen continuation can NEVER inject the newly-required Catalog
+ * family (case-c newly-enabled-deferred), so the priority step would fail not-drained FOREVER on a legacy cycle.
+ * Recovery (caller): finalize the legacy cycle HONESTLY from its own source work, then open a SUPERSEDING full-plan
+ * cycle; runtime.run(priority) drains a fresh Catalog on the superseding cycle (FRESH-ON-ACTIVE) and derives off the
+ * DURABLE OLI evidence -- no OLI re-fetch. Returns:
+ *   - { disposition: "run" }             -- a complete-daily-plan cycle (Catalog budget or job present), or no OLI
+ *                                           evidence: derive normally (the priority step drains the frozen Catalog).
+ *   - { disposition: "recover-legacy" }  -- a legacy OLI-only cycle: finalize + supersede (the caller stops typed if
+ *                                           finalize reports the OLI is still open, and a later retry recovers it).
+ * hasCatalogBudget MUST come from a SUCCESSFUL budget read (a read failure defers upstream, never "false").
+ */
+export function classifyLegacyOliOnlyCycle({ status, hasCatalogBudget, hasCatalogJob, hasOliJob } = {}) {
+  if (S(status) !== "running") return { disposition: "run", reason: "not-running" };
+  if (hasCatalogBudget === true || hasCatalogJob === true) return { disposition: "run", reason: "complete-daily-plan" };
+  if (hasOliJob !== true) return { disposition: "run", reason: "no-oli-evidence" };
+  return { disposition: "recover-legacy", reason: "legacy-oli-only" };
 }

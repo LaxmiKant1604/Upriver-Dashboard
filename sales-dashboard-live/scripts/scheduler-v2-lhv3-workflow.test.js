@@ -43,9 +43,13 @@ const ackIdx = wf.indexOf("\n  bootstrap-ack:");
 const matInvEnd = ackCommentIdx > matInvIdx ? ackCommentIdx : (ackIdx > matInvIdx ? ackIdx : wf.length);
 const matInvJob = matInvIdx > 0 ? wf.slice(matInvIdx, matInvEnd) : "";
 
-/* ===================== A. dependency order + gate ===================== */
+/* ===================== A. dependency order + gate (P1 FBA-completeness contract) ===================== */
 ok("A: the v3 job needs BOTH run and fba", /needs:\s*\[run,\s*fba\]/.test(v3Job));
-ok("A: it is gated on a resolved region AND fba success", /needs\.run\.outputs\.region\s*!=\s*''/.test(v3Job) && /needs\.fba\.result\s*==\s*'success'/.test(v3Job));
+ok("A: P1 -- the v3 job is gated on a resolved region, fba success, AND fba_complete=='true' (not merely success)",
+  /needs\.run\.outputs\.region\s*!=\s*''/.test(v3Job) && /needs\.fba\.result\s*==\s*'success'/.test(v3Job) && /needs\.fba\.outputs\.fba_complete\s*==\s*'true'/.test(v3Job));
+ok("A: P1 -- the fba job EXPOSES fba_complete as a job output mapped from the id'd golive step",
+  /\n  fba:\n[\s\S]*?outputs:\s*\n\s*fba_complete:\s*\$\{\{\s*steps\.fba\.outputs\.fba_complete\s*\}\}/.test(beforeV3) && /id:\s*fba\b/.test(beforeV3));
+ok("A: P1 -- a PARTIAL region (fba exits success but fba_complete!='true') therefore SKIPS v3 (zero creates)", /needs\.fba\.outputs\.fba_complete\s*==\s*'true'/.test(v3Job));
 ok("A: the fba job itself only needs run (v3 runs strictly after fba)", /^\s{2}fba:\s*$/m.test(wf) && /\n  fba:\n[\s\S]*?needs:\s*run\b/.test(wf));
 
 /* ===================== B. ONE shared inventory_asof (D-1, = asof), computed once, consumed by BOTH ===================== */

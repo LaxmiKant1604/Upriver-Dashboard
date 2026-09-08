@@ -71,9 +71,9 @@ const fetchAccounts = accountScope === "bootstrap"
     onExcluded: (excluded, gateMode) => console.log(`onboarding gate (${gateMode}): excluded ${excluded.length} account(s): ${excluded.map((x) => `${x.accountId.slice(0, 8)}:${x.reason}`).join(", ")}`),
   });
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
-const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, openSupersedingSyncCycle, reserveOliFreshnessCreate, recordOliFreshnessExport, getOliCompleteness } = await import("../../lib/server/supabase.js");
+const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, openSupersedingSyncCycle, reserveOliFreshnessCreate, recordOliFreshnessExport, getOliCompleteness, getSourceTrancheBudget } = await import("../../lib/server/supabase.js");
 const { OLI_SOURCE_KEY, windowsProve } = await import("../../lib/server/sync/source-durable-model.js");
-const { classifyScheduledOliCycle, assessScheduledOliCycle, assessDurableOliCoverageComplete, oliBucketPlan, OLI_TOKENS_PER_CREATE } = await import("../../lib/server/sync/source-scheduled-oli.js");
+const { classifyScheduledOliCycle, assessScheduledOliCycle, assessDurableOliCoverageComplete, oliBucketPlan, OLI_TOKENS_PER_CREATE, resolveOliCeiling } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 const { freshnessOperationKey, attemptKindForMode } = await import("../../lib/server/sync/source-oli-freshness.js");
@@ -203,6 +203,27 @@ if (head && head.id) {
 }
 // else: no head -> a fresh base cycle is created by the runtime's head-aware openCycle on the first fetch.
 
+// P0-C: pick the EFFECTIVE ceiling. A CONTINUATION (an existing running/pending head we did NOT supersede) uses the
+// DURABLE frozen OLI tranche budget VERBATIM -- never a freshly-recomputed live ceiling compared against the frozen
+// cycle's historical durable spend (which falsely tripped TOKEN_CEILING_EXCEEDED once coverage advanced). A FRESH or
+// superseding cycle keeps the recomputed + authorized ceiling. Bootstrap scope keeps its wave-gated ceiling (above).
+// An unreadable/malformed frozen budget DEFERS here -- BEFORE the drain -- so zero creates are issued.
+const isContinuationCycle = accountScope !== "bootstrap" && head && head.id && workingCycleId === String(head.id);
+if (isContinuationCycle) {
+  let frozenBudget = null; let frozenBudgetReadError = false;
+  try { frozenBudget = await getSourceTrancheBudget({ cycleId: workingCycleId, trancheKey: "source-sync:" + OLI }); }
+  catch { frozenBudgetReadError = true; }
+  const eff = resolveOliCeiling({ isContinuation: true, frozenBudget, frozenBudgetReadError, recomputedCreates: ceilingCreates, tokensPerCreate: OLI_TOKENS_PER_CREATE });
+  if (!eff.ok) { console.error("STOP " + eff.reason + " (continuation" + (eff.detail ? ": " + eff.detail : "") + ") -- deferring before any create (ZERO mutation)."); process.exit(1); }
+  if (eff.source === "continuation-frozen") { ceilingCreates = eff.creates; ceilingTokens = eff.tokens; log("continuation: using DURABLE frozen OLI budget verbatim (creates=" + eff.creates + ", tokens=" + eff.tokens + "); live recompute is NOT the ceiling."); }
+}
+
+// P0-A: on the SCHEDULED FULL-REGION daily cycle, freeze the organization Product Catalog into the SAME cycle as OLI
+// (executing only OLI here) so the later priority step drains that frozen Catalog as a case-(a) continuation instead
+// of hitting the case-(c) newly-enabled deferral that produced not-drained. The bootstrap onboarding path (its own
+// dedicated cycle bucket + publication flow) is left byte-identical (scheduledDaily stays false there).
+const scheduledDaily = accountScope === "full";
+
 // FRESH FETCH: run the OLI family (forceFreshOli bypasses the stale cache) on the ACTIVE head (the superseding
 // attempt when we just created one, else the running/fresh base). Bounded resume until drained.
 let iter = 0; let prevOpen = Infinity; let stall = 0;
@@ -210,7 +231,7 @@ const blockedCodes = {}; // account-block reasons: OLI_D1_PENDING_ITEMIZATION (A
 const itemz = { resolved: 0, pending: 0, notItemized: 0, presale: 0, defect: 0, pctByAccount: [] }; // itemization diagnostics across held/blocked accounts
 while (iter < MAX_ITERS) {
   iter += 1;
-  const res = await runtime.runSourceCardAction({ bucket, sourceKey: OLI, forceFreshOli: true, deadline, preflight });
+  const res = await runtime.runSourceCardAction({ bucket, sourceKey: OLI, forceFreshOli: true, deadline, preflight, scheduledDaily });
   if (res && res.refused === true) { console.error("STOP runSourceCardAction refused: " + (res.code || "unknown")); process.exit(1); }
   for (const b of (res && Array.isArray(res.blockedAccounts) ? res.blockedAccounts : [])) {
     const code = String(b.code || "unknown"); blockedCodes[code] = (blockedCodes[code] || 0) + 1;
@@ -252,7 +273,7 @@ if (cov1.missing.length && !cov1.anyUnreadable) {
     const deps = {
       reserve: async (hash) => reserveOliFreshnessCreate(operationKey, hash),
       reopenJob: async (hash) => { const r = await pgc.query(`update public.sync_source_jobs j set fetch_status='pending', export_id=null, create_export_count=0, cache_object_path=null, terminal=false, error_stage=null, error_code=null, updated_at=now() from public.sync_cycles c where j.cycle_id=c.id and c.id=$1 and c.status in ('running','pending') and j.request_hash=$2 and j.source_key='order-line-items' and j.fetch_status in ('succeeded','failed') and coalesce(j.terminal,false)=false`, [workingCycleId, hash]); return { reopened: r.rowCount === 1, reason: r.rowCount === 1 ? null : "not-reopenable" }; },
-      runFreshOli: async () => { let it = 0; while (it < 20) { it += 1; const r = await runtime.runSourceCardAction({ bucket, sourceKey: OLI, forceFreshOli: true, deadline, preflight }); if (r && r.refused === true) throw new Error("refused:" + (r.code || "?")); if (await oliOpen(workingCycleId) === 0) break; if (deadline.outOfTime && deadline.outOfTime()) break; } },
+      runFreshOli: async () => { let it = 0; while (it < 20) { it += 1; const r = await runtime.runSourceCardAction({ bucket, sourceKey: OLI, forceFreshOli: true, deadline, preflight, scheduledDaily }); if (r && r.refused === true) throw new Error("refused:" + (r.code || "?")); if (await oliOpen(workingCycleId) === 0) break; if (deadline.outOfTime && deadline.outOfTime()) break; } },
       readJobExport: async (hash) => { const r = await pgc.query("select fetch_status, export_id from public.sync_source_jobs where cycle_id=$1 and request_hash=$2 and source_key='order-line-items' limit 1", [workingCycleId, hash]); return r.rows.length ? { status: String(r.rows[0].fetch_status), exportId: r.rows[0].export_id || null } : { status: "missing", exportId: null }; },
       record: async (hash, exportId, tokens) => recordOliFreshnessExport(operationKey, hash, exportId, tokens),
       log,

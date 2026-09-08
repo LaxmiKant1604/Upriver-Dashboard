@@ -1255,6 +1255,32 @@ export async function upsertAccountOnboardingRows(rows) {
   }
 }
 
+// P0-D: the CONCURRENCY-SAFE discovery reconciliation (SECURITY DEFINER RPC reconcile_account_onboarding_discovery,
+// migration 20260922). Per row, under a row lock: refresh discovery-owned fields, apply the proposed status ONLY as a
+// valid FORWARD transition (claim-owned bootstrapping/partially_ready/ready never regress), preserve claim-owned
+// evidence (operation_id / bootstrap_started_at / first_discovered_at) and set-once timestamps. Atomic + idempotent.
+// Throws a typed ONBOARDING_RECONCILE_RPC_ABSENT when the function is not applied yet (migration pending) so the
+// caller can fall back to the grouped merge-upsert -- the code is therefore safe to deploy BEFORE the migration.
+export async function reconcileAccountOnboardingDiscovery(rows) {
+  if (!rows || !rows.length) return { disposition: "reconciled", inserted: 0, updated: 0 };
+  try {
+    const res = await request("/rest/v1/rpc/reconcile_account_onboarding_discovery", {
+      method: "POST",
+      body: { p_rows: rows },
+    });
+    return res || null;
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    // PostgREST answers 404 / PGRST202 when the function is absent (migration pending). Signal typed for fallback.
+    if (/PGRST202|Could not find the function|does not exist|not\s+found|\b404\b/i.test(msg)) {
+      const err = new Error("ONBOARDING_RECONCILE_RPC_ABSENT: reconcile_account_onboarding_discovery is not applied yet");
+      err.code = "ONBOARDING_RECONCILE_RPC_ABSENT";
+      throw err;
+    }
+    throw e;
+  }
+}
+
 // The ATOMIC bootstrap claim (SECURITY DEFINER RPC): transitions ready_for_bootstrap -> bootstrapping
 // exactly once per account; the same operation id is idempotent ('already-claimed'), a different one is
 // refused ('held'). Returns the RPC's typed jsonb disposition.

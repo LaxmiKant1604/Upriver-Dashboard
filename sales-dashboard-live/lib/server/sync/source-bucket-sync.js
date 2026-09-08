@@ -459,6 +459,12 @@ export async function runBucketSourceSync({
   // caller composition resolves it; it is threaded into planBucketSourceSync ONLY on a FRESH cycle (a frozen
   // continuation must reproduce its frozen plan verbatim, so the set is dropped there). Empty => byte-identical.
   readinessIsolateSellers = new Set(),
+  // P0-A COMPLETE-DAILY-PLAN: when set (a Set of source keys), FREEZE every planned family's tranche budget + upsert
+  // its canonical jobs/owners, but CREATE/DRAIN only the families in this set THIS step. Freeze-only families are
+  // reordered BEFORE the executed ones so their budgets are committed BEFORE the first paid create ("one complete
+  // daily-cycle plan before the first paid create"), and left OPEN on the cycle for a later step (the priority step
+  // drains the frozen Catalog as a case-(a) continuation). null => execute every planned family (byte-identical).
+  executeSourceKeys = null,
 } = {}) {
   if (!store || typeof store.listSourceJobs !== "function") throw new Error("runBucketSourceSync requires the injected store (fail closed).");
   if (Number(cooldownMs) > 0 && typeof wait !== "function") {
@@ -523,68 +529,87 @@ export async function runBucketSourceSync({
   let isContinuation = false;
   let continuation = null;
   if (budgets && activeCycleId) {
-    isContinuation = true;
     const readersMissing = ["listCycleOwners", "getBudget", "getBudgetHashes", "listSourceJobs"].filter((k) => typeof store[k] !== "function");
     if (readersMissing.length) return deferredFrozenScope(bucket, activeCycleId, "continuation-readers-unavailable", { detail: readersMissing.join(",") });
     let owners = null;
     try { owners = await store.listCycleOwners(activeCycleId); } catch (e) { return deferredFrozenScope(bucket, activeCycleId, "owner-read-failed", { detail: safeMessage(e) }); }
     if (!Array.isArray(owners)) return deferredFrozenScope(bucket, activeCycleId, "owner-read-failed", { detail: "non-array owner read" });
-    if (owners.length === 0) return deferredFrozenScope(bucket, activeCycleId, "frozen-owners-empty");
-    const ownerIdsRaw = owners.map((o) => String((o && (o.account_id ?? o.accountId)) ?? "").trim());
-    const blank = ownerIdsRaw.filter((id) => !id).length;
-    if (blank > 0) return deferredFrozenScope(bucket, activeCycleId, "owner-identities-malformed", { detail: `${blank} of ${ownerIdsRaw.length} owner identities blank` });
-    const perAccountOwnerIds = new Set(ownerIdsRaw.filter((id) => id !== ORGANIZATION_SCOPE_KEY));
-    let persistedJobs = null;
-    try { persistedJobs = await store.listSourceJobs(activeCycleId); } catch (e) { return deferredFrozenScope(bucket, activeCycleId, "job-read-failed", { detail: safeMessage(e) }); }
-    if (!Array.isArray(persistedJobs)) return deferredFrozenScope(bucket, activeCycleId, "job-read-failed", { detail: "non-array job read" });
-    const persistedHashes = new Set(persistedJobs.map(rowHash).filter(Boolean));
-    let orgOnly = false;
-    if (perAccountOwnerIds.size === 0) {
-      const orgEvidence = persistedJobs.length > 0 && persistedJobs.every((r) => skey(r) === CATALOG_SOURCE_KEY);
-      if (!orgEvidence) return deferredFrozenScope(bucket, activeCycleId, "frozen-scope-indeterminate", { detail: "organization-only owners without positive persisted catalog job evidence" });
-      orgOnly = true;
+    if (owners.length === 0) {
+      // FRESH-ON-ACTIVE (P0-B enabler): a freshly-opened active head with NO owners is EITHER a base/superseding
+      // attempt an operator just opened (open_superseding_sync_cycle inserts an empty 'pending' row) OR an earlier
+      // invocation that opened the cycle + froze a budget but crashed BEFORE upserting any canonical job/owner. It has
+      // NO reproducible frozen plan (owners ARE the frozen membership), so it is NOT a continuation. When it ALSO has
+      // zero persisted CANONICAL JOBS it is genuinely UNPOPULATED (nothing was executed or reserved): take the FRESH
+      // plan on THIS cycle (writes target activeCycleId). Re-planning duplicates NOTHING -- openCycle is idempotent,
+      // persist_source_tranche_budget is idempotent for the same deterministic same-day plan ('exists') and raises
+      // PLAN_BUDGET_MISMATCH (fail closed, no mutation) for a drifted one, and the create-reservation is atomic. This
+      // is what lets a freshly-SUPERSEDED cycle actually get planned + fetched instead of deferring forever, and also
+      // recovers the (astronomically rare) freeze-then-crash-before-upsert window. Any PERSISTED CANONICAL JOB without
+      // owners is indeterminate (a job could already be succeeded/spent, and a fresh re-plan under drifted discovery
+      // might orphan it and double-fetch) -> defer typed (fail closed; LKG preserved).
+      let jobs0 = null;
+      try { jobs0 = await store.listSourceJobs(activeCycleId); } catch (e) { return deferredFrozenScope(bucket, activeCycleId, "job-read-failed", { detail: safeMessage(e) }); }
+      if (!Array.isArray(jobs0)) return deferredFrozenScope(bucket, activeCycleId, "job-read-failed", { detail: "non-array job read" });
+      if (jobs0.length !== 0) return deferredFrozenScope(bucket, activeCycleId, "frozen-owners-empty");
+      // else: genuinely unpopulated -> fall through as a FRESH cycle (isContinuation stays false; writes -> activeCycleId).
     } else {
-      const byId = new Map((accounts || []).map((a) => [String((a && (a.accountId ?? a.id)) || "").trim(), a]));
-      const missing = [...perAccountOwnerIds].filter((id) => !byId.has(id));
-      if (missing.length) return deferredFrozenScope(bucket, activeCycleId, "frozen-accounts-missing", { detail: `${missing.length} of ${perAccountOwnerIds.size} frozen account(s) absent from current discovery` });
-      planningAccounts = [...perAccountOwnerIds].map((id) => byId.get(id));
+      isContinuation = true;
+      const ownerIdsRaw = owners.map((o) => String((o && (o.account_id ?? o.accountId)) ?? "").trim());
+      const blank = ownerIdsRaw.filter((id) => !id).length;
+      if (blank > 0) return deferredFrozenScope(bucket, activeCycleId, "owner-identities-malformed", { detail: `${blank} of ${ownerIdsRaw.length} owner identities blank` });
+      const perAccountOwnerIds = new Set(ownerIdsRaw.filter((id) => id !== ORGANIZATION_SCOPE_KEY));
+      let persistedJobs = null;
+      try { persistedJobs = await store.listSourceJobs(activeCycleId); } catch (e) { return deferredFrozenScope(bucket, activeCycleId, "job-read-failed", { detail: safeMessage(e) }); }
+      if (!Array.isArray(persistedJobs)) return deferredFrozenScope(bucket, activeCycleId, "job-read-failed", { detail: "non-array job read" });
+      const persistedHashes = new Set(persistedJobs.map(rowHash).filter(Boolean));
+      let orgOnly = false;
+      if (perAccountOwnerIds.size === 0) {
+        const orgEvidence = persistedJobs.length > 0 && persistedJobs.every((r) => skey(r) === CATALOG_SOURCE_KEY);
+        if (!orgEvidence) return deferredFrozenScope(bucket, activeCycleId, "frozen-scope-indeterminate", { detail: "organization-only owners without positive persisted catalog job evidence" });
+        orgOnly = true;
+      } else {
+        const byId = new Map((accounts || []).map((a) => [String((a && (a.accountId ?? a.id)) || "").trim(), a]));
+        const missing = [...perAccountOwnerIds].filter((id) => !byId.has(id));
+        if (missing.length) return deferredFrozenScope(bucket, activeCycleId, "frozen-accounts-missing", { detail: `${missing.length} of ${perAccountOwnerIds.size} frozen account(s) absent from current discovery` });
+        planningAccounts = [...perAccountOwnerIds].map((id) => byId.get(id));
+      }
+      const frozenByFamily = new Map();
+      for (const sourceKey of CONTINUATION_FAMILIES) {
+        const trancheKey = `source-sync:${sourceKey}`;
+        let row = null;
+        try { row = await store.getBudget({ cycleId: activeCycleId, trancheKey }); } catch (e) { return deferredFrozenScope(bucket, activeCycleId, "budget-read-failed", { detail: sourceKey + ": " + safeMessage(e) }); }
+        if (!row) { frozenByFamily.set(sourceKey, null); continue; } // genuinely unplanned family (successful read)
+        if (!String(row.plan_fingerprint ?? row.planFingerprint ?? "").trim()) return deferredFrozenScope(bucket, activeCycleId, "frozen-budget-malformed", { detail: sourceKey + ": blank plan fingerprint" });
+        let hashRows = null;
+        try { hashRows = await store.getBudgetHashes({ cycleId: activeCycleId, trancheKey }); } catch (e) { return deferredFrozenScope(bucket, activeCycleId, "budget-read-failed", { detail: sourceKey + " hashes: " + safeMessage(e) }); }
+        const hashes = new Set((Array.isArray(hashRows) ? hashRows : []).map(rowHash).filter(Boolean));
+        if (hashes.size === 0) return deferredFrozenScope(bucket, activeCycleId, "frozen-budget-malformed", { detail: sourceKey + ": no frozen request hashes" });
+        frozenByFamily.set(sourceKey, { trancheKey, planFingerprint: String(row.plan_fingerprint ?? row.planFingerprint), hashes });
+      }
+      // Reproduce the frozen READINESS split on this continuation from the DURABLE owners (never re-resolved evidence,
+      // which could drift mid-cycle). An OLI slice request_hash owned by EXACTLY ONE account was a single-seller
+      // isolation (peel-off) at freeze; deriving the isolate set from those single-owner OLI hashes makes
+      // planBucketSourceSync reproduce the EXACT frozen single-seller plan, so a split cycle that spans multiple
+      // serverless invocations RESUMES instead of deferring (a whole batch that was NOT split keeps its multi-owner
+      // hash and is untouched). Byte-identical for a cycle that was never split (no single-owner OLI hash).
+      const oliCountByHash = new Map();
+      const oliAcctByHash = new Map();
+      for (const o of owners) {
+        if (String((o && (o.request_key ?? o.requestKey)) || "") !== OLI_SLICE_REQUEST_KEY) continue;
+        const h = String((o && (o.request_hash ?? o.requestHash)) || "");
+        if (!h) continue;
+        oliCountByHash.set(h, (oliCountByHash.get(h) || 0) + 1);
+        if (!oliAcctByHash.has(h)) oliAcctByHash.set(h, String((o && (o.account_id ?? o.accountId)) || "").trim());
+      }
+      const acctById = new Map((planningAccounts || []).map((a) => [String((a && (a.accountId ?? a.id)) || "").trim(), a]));
+      const frozenReadinessIsolateSellers = new Set();
+      for (const [h, count] of oliCountByHash) {
+        if (count !== 1) continue;
+        const a = acctById.get(oliAcctByHash.get(h));
+        if (a && a.rawSellerId) frozenReadinessIsolateSellers.add(String(a.rawSellerId));
+      }
+      continuation = { persistedJobs, persistedHashes, frozenByFamily, orgOnly, frozenAccountIds: [...perAccountOwnerIds].sort(), frozenReadinessIsolateSellers };
     }
-    const frozenByFamily = new Map();
-    for (const sourceKey of CONTINUATION_FAMILIES) {
-      const trancheKey = `source-sync:${sourceKey}`;
-      let row = null;
-      try { row = await store.getBudget({ cycleId: activeCycleId, trancheKey }); } catch (e) { return deferredFrozenScope(bucket, activeCycleId, "budget-read-failed", { detail: sourceKey + ": " + safeMessage(e) }); }
-      if (!row) { frozenByFamily.set(sourceKey, null); continue; } // genuinely unplanned family (successful read)
-      if (!String(row.plan_fingerprint ?? row.planFingerprint ?? "").trim()) return deferredFrozenScope(bucket, activeCycleId, "frozen-budget-malformed", { detail: sourceKey + ": blank plan fingerprint" });
-      let hashRows = null;
-      try { hashRows = await store.getBudgetHashes({ cycleId: activeCycleId, trancheKey }); } catch (e) { return deferredFrozenScope(bucket, activeCycleId, "budget-read-failed", { detail: sourceKey + " hashes: " + safeMessage(e) }); }
-      const hashes = new Set((Array.isArray(hashRows) ? hashRows : []).map(rowHash).filter(Boolean));
-      if (hashes.size === 0) return deferredFrozenScope(bucket, activeCycleId, "frozen-budget-malformed", { detail: sourceKey + ": no frozen request hashes" });
-      frozenByFamily.set(sourceKey, { trancheKey, planFingerprint: String(row.plan_fingerprint ?? row.planFingerprint), hashes });
-    }
-    // Reproduce the frozen READINESS split on this continuation from the DURABLE owners (never re-resolved evidence,
-    // which could drift mid-cycle). An OLI slice request_hash owned by EXACTLY ONE account was a single-seller
-    // isolation (peel-off) at freeze; deriving the isolate set from those single-owner OLI hashes makes
-    // planBucketSourceSync reproduce the EXACT frozen single-seller plan, so a split cycle that spans multiple
-    // serverless invocations RESUMES instead of deferring (a whole batch that was NOT split keeps its multi-owner
-    // hash and is untouched). Byte-identical for a cycle that was never split (no single-owner OLI hash).
-    const oliCountByHash = new Map();
-    const oliAcctByHash = new Map();
-    for (const o of owners) {
-      if (String((o && (o.request_key ?? o.requestKey)) || "") !== OLI_SLICE_REQUEST_KEY) continue;
-      const h = String((o && (o.request_hash ?? o.requestHash)) || "");
-      if (!h) continue;
-      oliCountByHash.set(h, (oliCountByHash.get(h) || 0) + 1);
-      if (!oliAcctByHash.has(h)) oliAcctByHash.set(h, String((o && (o.account_id ?? o.accountId)) || "").trim());
-    }
-    const acctById = new Map((planningAccounts || []).map((a) => [String((a && (a.accountId ?? a.id)) || "").trim(), a]));
-    const frozenReadinessIsolateSellers = new Set();
-    for (const [h, count] of oliCountByHash) {
-      if (count !== 1) continue;
-      const a = acctById.get(oliAcctByHash.get(h));
-      if (a && a.rawSellerId) frozenReadinessIsolateSellers.add(String(a.rawSellerId));
-    }
-    continuation = { persistedJobs, persistedHashes, frozenByFamily, orgOnly, frozenAccountIds: [...perAccountOwnerIds].sort(), frozenReadinessIsolateSellers };
   }
 
   const plan = planBucketSourceSync({
@@ -660,6 +685,19 @@ export async function runBucketSourceSync({
       plannedJobsByFamily: Object.fromEntries(plan.families.map((f) => [f.sourceKey, f.plannedJobs.length])),
       continuation: { cycleId: activeCycleId, orgOnly: continuation.orgOnly, frozenAccounts: continuation.frozenAccountIds.length, droppedUnfrozenJobs: dropped, resumedUnfrozenFamilies: resumedUnfrozen },
     };
+  }
+  // P0-A COMPLETE-DAILY-PLAN: when executeSourceKeys is set, EXECUTE (create/drain) only those families this step;
+  // every OTHER planned family is FREEZE-ONLY (its budget + canonical jobs/owners are committed, but it is left OPEN
+  // for a later step -- the priority step drains the frozen Catalog). Reorder so freeze-only families run FIRST: this
+  // guarantees their tranche budgets are persisted BEFORE the executed family makes its first paid create ("one
+  // complete daily-cycle plan before the first paid create"). runSourceJobs (called on the first EXECUTED family)
+  // upserts the FULL planned set's canonical jobs + owners, so a freeze-only family's job/owner are durably persisted
+  // even though it creates nothing here. null => execute every family (byte-identical; no reorder).
+  const executeSet = executeSourceKeys instanceof Set ? executeSourceKeys : (executeSourceKeys != null ? new Set(executeSourceKeys) : null);
+  if (executeSet) {
+    const freezeOnly = plan.families.filter((f) => !executeSet.has(f.sourceKey));
+    const executed = plan.families.filter((f) => executeSet.has(f.sourceKey));
+    plan.families = [...freezeOnly, ...executed];
   }
   const allPlannedJobs = plan.families.flatMap((f) => f.plannedJobs);
   const ownerIds = [...new Set(allPlannedJobs.map((j) => j.owner.ownerId))];
@@ -753,6 +791,18 @@ export async function runBucketSourceSync({
           budget = { trancheKey: frozen.trancheKey, planFingerprint: frozen.planFingerprint };
         }
       }
+    }
+
+    // P0-A FREEZE-ONLY: this family's tranche budget is now committed (above) and its canonical job/owner will be
+    // upserted by the EXECUTED family's runSourceJobs upsert-all pass. It is NOT created/drained THIS step -- it stays
+    // OPEN on the cycle so the later step (the priority Product Catalog step) drains it as a case-(a) continuation.
+    // globalDrained therefore stays false for THIS step (the open family), which is correct: the OLI step must not
+    // derive; the priority step derives after Catalog drains. Reordering put freeze-only families FIRST, so the budget
+    // is frozen BEFORE the executed family's first paid create.
+    if (executeSet && !executeSet.has(family.sourceKey)) {
+      rollup.cycleId = rollup.cycleId || activeCycleId;
+      rollup.families.push({ sourceKey: family.sourceKey, continuations: 0, state: null, skipped: "frozen-not-executed-this-step" });
+      continue;
     }
 
     let continuations = 0;

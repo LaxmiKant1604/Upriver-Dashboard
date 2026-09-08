@@ -239,7 +239,7 @@ function makeSinks() {
 }
 
 const CATALOG_CARRIER = "carrier-seller-01"; // a canonical primary seller id (org-wide catalog requires one)
-function runHarness({ accounts = FIVE, coverage = null, dd = null, store = null, pausedSources, catalogSnapshot = null, fbaSnapshotsByAccount = {}, reuseOnly = false, cooldownMs = 60_000, existingMembership, catalogCarrierSeller = CATALOG_CARRIER, cycleDate = CYCLE_DATE } = {}) {
+function runHarness({ accounts = FIVE, coverage = null, dd = null, store = null, pausedSources, catalogSnapshot = null, fbaSnapshotsByAccount = {}, reuseOnly = false, cooldownMs = 60_000, existingMembership, catalogCarrierSeller = CATALOG_CARRIER, cycleDate = CYCLE_DATE, executeSourceKeys = null, forceCatalogRefresh = false, bucket = BUCKET } = {}) {
   const st = store || makeStore();
   const d = dd || makeDataDoe();
   const clock = makeClock();
@@ -247,7 +247,7 @@ function runHarness({ accounts = FIVE, coverage = null, dd = null, store = null,
   const wait = async (ms) => { waits.push(ms); clock.advance(ms); };
   const sinks = makeSinks();
   const run = () => bucketSync.runBucketSourceSync({
-    apiKey: API_KEY, bucket: BUCKET, accounts,
+    apiKey: API_KEY, bucket, accounts,
     existingMembership: existingMembership || new Map(),
     coverageByAccountId: coverage || steadyCoverage(accounts, dates.addDaysStr(ASOF, -7)),
     catalogSnapshot, fbaSnapshotsByAccount,
@@ -257,6 +257,9 @@ function runHarness({ accounts = FIVE, coverage = null, dd = null, store = null,
     ...sinks,
     cycleDate, clock: clock.fn, wait, cooldownMs,
     reuseOnly, catalogCarrierSeller,
+    // P0-A: freeze every planned family but CREATE/DRAIN only these (null => execute all, byte-identical);
+    // forceCatalogRefresh plans the org Catalog job even when its snapshot is fresh-today.
+    executeSourceKeys, forceCatalogRefresh,
   });
   return { store: st, dd: d, clock, waits, sinks, run };
 }
@@ -1040,6 +1043,119 @@ test("G13. a VALID continuation resumes EXACTLY the persisted frozen identities:
   assert.equal(h1.dd.totalCreates(), creates1, "no duplicate export");
   assert.equal(r2.plan.continuation.frozenAccounts, 3, "membership = exactly the 3 frozen accounts");
   assert.ok(r2.plan.continuation.droppedUnfrozenJobs >= 0);
+});
+
+/* ============ H. P0-A/P0-B: one complete daily-cycle plan; freeze OLI+Catalog; execute OLI only ============ */
+group("H. P0-A complete daily plan + P0-B fresh-on-active recovery");
+
+const FBA_K = () => model.FBA_INVENTORY_SOURCE_KEY;
+const OLI_K = () => model.OLI_SOURCE_KEY;
+const CAT_K = () => model.CATALOG_SOURCE_KEY;
+const catJobOf = (store, cid) => store.listSourceJobs(cid).find((j) => j.source_key === CAT_K());
+const oliCreates = (store, cid) => store.listSourceJobs(cid).filter((j) => j.source_key === OLI_K()).reduce((a, j) => a + Number(j.create_export_count || 0), 0);
+// The scheduled OLI step: plan [OLI, CATALOG] (FBA paused), freeze BOTH, execute ONLY OLI.
+const oliStep = (opts) => runHarness({ accounts: FIVE, pausedSources: new Set([FBA_K()]), executeSourceKeys: [OLI_K()], forceCatalogRefresh: true, ...opts });
+// The priority step: pause OLI+FBA, force the Catalog (a catalog-only continuation that drains the frozen Catalog).
+const priorityStep = (opts) => runHarness({ accounts: FIVE, pausedSources: new Set([OLI_K(), FBA_K()]), forceCatalogRefresh: true, ...opts });
+
+test("H1. the scheduled OLI step FREEZES OLI+Catalog into ONE cycle but CREATES only OLI (Catalog frozen-not-executed, cycle NOT drained here)", async () => {
+  const h = oliStep({});
+  const r = await h.run();
+  assert.notEqual(r.deferred, true, "not deferred");
+  const cid = r.cycleId; assert.ok(cid, "a cycle was opened");
+  assert.ok(h.store._budget(cid, "source-sync:order-line-items"), "OLI tranche budget frozen");
+  assert.ok(h.store._budget(cid, "source-sync:product-catalog"), "Catalog tranche budget frozen UP FRONT (before OLI's create)");
+  const cat = catJobOf(h.store, cid);
+  assert.ok(cat, "exactly one org Catalog job upserted into the cycle");
+  assert.equal(cat.fetch_status, "pending", "Catalog is OPEN (frozen-not-executed)");
+  assert.equal(cat.create_export_count, 0, "Catalog made ZERO creates in the OLI step");
+  assert.equal(h.dd.createCount(cat.request_hash), 0, "no Catalog export POSTed in the OLI step");
+  const oli = h.store.listSourceJobs(cid).filter((j) => j.source_key === OLI_K());
+  assert.ok(oli.length >= 1 && oli.every((j) => j.fetch_status === "succeeded"), "OLI executed + succeeded");
+  assert.equal(r.globalDrained, false, "the OLI step does NOT drain the cycle (Catalog still open) -> it must not derive");
+  const catFam = r.families.find((f) => f.sourceKey === CAT_K());
+  assert.equal(catFam && catFam.skipped, "frozen-not-executed-this-step", "Catalog reported frozen-not-executed-this-step");
+  assert.ok(h.store._owners(cid).some((o) => o.account_id === "__organization" && o.request_hash === cat.request_hash), "Catalog org owner persisted (so the priority step resolves it as case-a)");
+});
+
+test("H2. the priority step CONTINUES the same cycle and drains the FROZEN Catalog (case a) -> globalDrained; ONE Catalog export; NO OLI re-fetch (not-drained is GONE)", async () => {
+  const store = makeStore(); const dd = makeDataDoe();
+  const r1 = await oliStep({ store, dd }).run();
+  const cid = r1.cycleId;
+  const catHash = catJobOf(store, cid).request_hash;
+  const oliBefore = oliCreates(store, cid);
+  const r2 = await priorityStep({ store, dd }).run();
+  assert.notEqual(r2.deferred, true, "priority continuation NOT deferred (Catalog is case-a frozen): " + JSON.stringify(r2.stopReason));
+  assert.equal(r2.cycleId, cid, "the SAME cycle is continued (no second cycle)");
+  assert.equal(catJobOf(store, cid).fetch_status, "succeeded", "Catalog drained by the priority step");
+  assert.equal(dd.createCount(catHash), 1, "exactly ONE Catalog export created across the whole cycle");
+  assert.equal(r2.globalDrained, true, "the cycle is now DRAINED -> the durable-evidence derive/save runs");
+  assert.equal(oliCreates(store, cid), oliBefore, "OLI was NOT re-fetched by the priority step");
+});
+
+test("H3. LEGACY OLI-only cycle: the priority continuation CANNOT inject Catalog (case-c newly-enabled-deferred) -> not drained (the exact defect P0-B recovers by superseding)", async () => {
+  const store = makeStore(); const dd = makeDataDoe();
+  // Legacy OLD behavior: Catalog paused in the OLI step -> an OLI-only cycle.
+  const r1 = await runHarness({ accounts: FIVE, store, dd, pausedSources: new Set([CAT_K(), FBA_K()]) }).run();
+  const cid = r1.cycleId;
+  assert.equal(store.listSourceJobs(cid).filter((j) => j.source_key === CAT_K()).length, 0, "legacy cycle has NO Catalog job");
+  const r2 = await priorityStep({ store, dd }).run();
+  const catFam = r2.families.find((f) => f.sourceKey === CAT_K());
+  assert.equal(catFam && catFam.skipped, "newly-enabled-deferred", "Catalog is case-c newly-enabled-deferred on the legacy cycle");
+  assert.notEqual(r2.globalDrained, true, "the legacy OLI-only cycle can NOT be drained by the priority step (why P0-B must supersede + fresh-plan)");
+  assert.equal(dd.totalCreates(), r1.plan ? dd.totalCreates() : 0); // (no catalog export was created on the legacy cycle)
+  assert.equal(store.listSourceJobs(cid).filter((j) => j.source_key === CAT_K()).length, 0, "still no Catalog job -- case-c never injects into a frozen legacy cycle");
+});
+
+test("H4. FRESH-ON-ACTIVE (P0-B): a freshly-opened EMPTY active cycle (a superseding attempt) takes the FRESH path (populates + drains) -- never a frozen-owners-empty defer, never a duplicate cycle", async () => {
+  const store = makeStore();
+  const cid = store.openCycle({ bucket: BUCKET, cycleDate: CYCLE_DATE });
+  store.claimCycle(cid); // pending -> running head, but genuinely empty (no owners/jobs/budgets)
+  assert.equal(store.listSourceJobs(cid).length, 0, "cycle is genuinely empty (no jobs)");
+  assert.equal(store._owners(cid).length, 0, "no owners");
+  const h = runHarness({ accounts: FIVE, store, pausedSources: new Set([FBA_K()]), forceCatalogRefresh: true });
+  const r = await h.run();
+  assert.notEqual(r.deferred, true, "empty freshly-opened active cycle is NOT deferred (fresh path): " + JSON.stringify(r.stopReason));
+  assert.equal(r.cycleId, cid, "the fresh plan targets the EXISTING empty cycle");
+  assert.equal(store._cycleCount(), 1, "no duplicate cycle opened");
+  assert.ok(r.globalDrained, "the empty cycle populated + drained via the fresh path (this is what a freshly-SUPERSEDED cycle needs)");
+});
+
+test("H4b. FRESH-ON-ACTIVE only applies to a genuinely EMPTY cycle: a cycle with owners artificially emptied but JOBS present still DEFERS (corruption, fail closed)", async () => {
+  const store = makeStore();
+  const r1 = await runHarness({ accounts: [1, 2, 3].map(acct), store }).run();
+  const emptyOwners = { ...store, listCycleOwners() { return []; } }; // owners gone, but jobs remain
+  const r2 = await runHarness({ accounts: [1, 2, 3].map(acct), store: emptyOwners }).run();
+  assert.equal(r2.deferred, true, "owners-empty WITH persisted jobs is indeterminate -> defer");
+  assert.equal(r2.stopReason.reason, "frozen-owners-empty");
+});
+
+test("H5. watchdog replay of the scheduled OLI step is idempotent: no duplicate creates, budgets byte-identical, Catalog still frozen-not-executed", async () => {
+  const store = makeStore(); const dd = makeDataDoe();
+  const r1 = await oliStep({ store, dd }).run();
+  const cid = r1.cycleId;
+  const b1 = JSON.stringify(["order-line-items", "product-catalog"].map((k) => store._budget(cid, "source-sync:" + k)));
+  const creates1 = dd.totalCreates();
+  const r2 = await oliStep({ store, dd }).run();
+  assert.equal(r2.cycleId, cid, "same cycle on replay");
+  assert.equal(dd.totalCreates(), creates1, "no duplicate creates on replay");
+  assert.equal(JSON.stringify(["order-line-items", "product-catalog"].map((k) => store._budget(cid, "source-sync:" + k))), b1, "frozen budgets byte-identical (never widened/re-persisted)");
+  assert.equal(catJobOf(store, cid).fetch_status, "pending", "Catalog still frozen-not-executed after replay");
+});
+
+test("H6. India, Europe-AU and US-CA run the IDENTICAL freeze-OLI+Catalog / drain-via-priority lifecycle", async () => {
+  for (const bucket of ["india", "europe-au", "us-ca"]) {
+    const store = makeStore(); const dd = makeDataDoe();
+    const r1 = await oliStep({ store, dd, bucket }).run();
+    const cid = r1.cycleId;
+    assert.ok(store._budget(cid, "source-sync:product-catalog"), bucket + ": Catalog frozen in the OLI step");
+    assert.equal(catJobOf(store, cid).fetch_status, "pending", bucket + ": Catalog frozen-not-executed in the OLI step");
+    assert.equal(r1.globalDrained, false, bucket + ": OLI step not drained");
+    const r2 = await priorityStep({ store, dd, bucket }).run();
+    assert.equal(r2.cycleId, cid, bucket + ": priority continues the same cycle");
+    assert.equal(r2.globalDrained, true, bucket + ": priority drains the cycle (not-drained gone)");
+    assert.equal(catJobOf(store, cid).fetch_status, "succeeded", bucket + ": Catalog drained");
+  }
 });
 
 async function main() {

@@ -271,6 +271,7 @@ function makeRelease(over = {}) {
     getCycleByBucketDate: over.getCycleByBucketDate || (async () => over.cycle || null),
     asOfOverride: over.asOfOverride,
     operationKey: over.operationKey,
+    ...(over.openSuperseding ? { openSuperseding: over.openSuperseding } : {}),
   });
 }
 
@@ -310,6 +311,72 @@ test("P4a2. deriveBucket is RESUMABLE: an ALREADY-terminal cycle SKIPS the re-de
     buildRuntime: () => ({ makeDeadline: () => ({}), preflightEvidence: async () => ({ bucket: "us", accounts: [], today: TODAY }), run: async () => { ran2 += 1; return { derived: { skipped: null } }; } }),
   }).deriveBucket("us");
   assert.equal(ran2, 1, "a running cycle derives normally");
+});
+
+test("P0B-1. LEGACY OLI-only running cycle: deriveBucket FINALIZES it + opens a SUPERSEDING full-plan cycle, then derives on the fresh cycle (never not-drained forever)", async () => {
+  const legacy = { id: "legacyCyc", bucket: "us", status: "running", trigger: "manual" };
+  const oliOnlyJobs = [{ source_key: "order-line-items", request_hash: "oli1", fetch_status: "succeeded" }]; // NO catalog job
+  let finalized = 0; let superseded = null; let ran = 0;
+  const store = {
+    getBudget: async ({ trancheKey }) => (trancheKey === "source-sync:product-catalog" ? null : { plan_fingerprint: "f", max_creates: 1, max_tokens: 2 }), // NO catalog budget (legacy)
+    listSourceJobs: async () => oliOnlyJobs,
+    listCycleOwners: async () => [],
+    finalizeCycle: async ({ cycleId }) => { finalized += 1; assert.equal(cycleId, "legacyCyc"); return { disposition: "finalized", cycle: { status: "succeeded" } }; },
+  };
+  const rel = makeRelease({
+    cycle: legacy,
+    makeStore: () => store,
+    openSuperseding: async (args) => { superseded = args; return "supersedeCyc"; },
+    buildRuntime: () => ({ makeDeadline: () => ({}), preflightEvidence: async () => ({ bucket: "us", accounts: [{ accountId: "A01" }], today: TODAY }), run: async () => { ran += 1; return { cycleId: "supersedeCyc", globalDrained: true, derived: { skipped: null } }; } }),
+  });
+  const { rollup } = await rel.deriveBucket("us");
+  assert.equal(finalized, 1, "the legacy OLI-only cycle was finalized honestly (its own source work)");
+  assert.ok(superseded, "a superseding full-plan cycle was opened");
+  assert.equal(superseded.supersedesCycleId, "legacyCyc", "supersedes the exact legacy cycle");
+  assert.equal(superseded.attemptKind, "scheduled-fresh");
+  assert.match(String(superseded.operationKey), /^priority-legacy-recovery\/us\//, "a DEDICATED recovery operation key (idempotent by op-key on watchdog replay)");
+  assert.equal(ran, 1, "runtime.run(priority) then derives on the fresh superseding cycle (off durable OLI)");
+  assert.equal(rollup.derived.skipped, null, "the derive completes (not-drained is GONE)");
+});
+
+test("P0B-2. does NOT touch a COMPLETE-daily-plan running cycle (Catalog budget present) -- it derives normally, no finalize/supersede", async () => {
+  let finalized = 0; let superseded = 0; let ran = 0;
+  const store = {
+    getBudget: async () => ({ plan_fingerprint: "f", max_creates: 1, max_tokens: 2 }), // Catalog budget PRESENT (complete-daily-plan)
+    listSourceJobs: async () => [{ source_key: "order-line-items", request_hash: "oli1", fetch_status: "succeeded" }, { source_key: "product-catalog", request_hash: "cat1", fetch_status: "pending" }],
+    listCycleOwners: async () => [],
+    finalizeCycle: async () => { finalized += 1; return { disposition: "finalized", cycle: { status: "succeeded" } }; },
+  };
+  const rel = makeRelease({
+    cycle: { id: "goodCyc", bucket: "us", status: "running", trigger: "manual" },
+    makeStore: () => store,
+    openSuperseding: async () => { superseded += 1; return "x"; },
+    buildRuntime: () => ({ makeDeadline: () => ({}), preflightEvidence: async () => ({ bucket: "us", accounts: [{ accountId: "A01" }], today: TODAY }), run: async () => { ran += 1; return { cycleId: "goodCyc", globalDrained: true, derived: { skipped: null } }; } }),
+  });
+  await rel.deriveBucket("us");
+  assert.equal(finalized, 0, "a complete-daily-plan cycle is NEVER finalized by the recovery path");
+  assert.equal(superseded, 0, "and NEVER superseded");
+  assert.equal(ran, 1, "it derives normally (priority drains the frozen Catalog as a continuation)");
+});
+
+test("P0B-3. legacy recovery with OLI STILL OPEN: finalize returns open-work -> typed stop (LKG intact), NO supersede, NO publish", async () => {
+  let superseded = 0;
+  const store = {
+    getBudget: async () => null, // no catalog budget (legacy)
+    listSourceJobs: async () => [{ source_key: "order-line-items", request_hash: "oli1", fetch_status: "pending" }],
+    listCycleOwners: async () => [],
+    finalizeCycle: async () => ({ disposition: "open-work", cycle: { status: "running" } }),
+  };
+  const rel = makeRelease({
+    cycle: { id: "openCyc", bucket: "us", status: "running", trigger: "manual" },
+    makeStore: () => store,
+    openSuperseding: async () => { superseded += 1; return "x"; },
+    buildRuntime: () => ({ makeDeadline: () => ({}), preflightEvidence: async () => ({ bucket: "us", accounts: [{ accountId: "A01" }], today: TODAY }), run: async () => ({ globalDrained: true, derived: { skipped: null } }) }),
+  });
+  const { rollup } = await rel.deriveBucket("us");
+  assert.equal(superseded, 0, "OLI not drained -> NOT superseded (a retry finalizes once it drains)");
+  assert.equal(rollup.stopped, true, "typed stop -- nothing published");
+  assert.equal(rollup.stopReason.code, "LEGACY_OLI_STILL_OPEN");
 });
 
 const finBase = { accounts: [{ accountId: "A01" }], today: TODAY, cycle: { id: "cyc", bucket: "us", status: "running", trigger: "manual" }, owners: CAT_OWNERS_OK, repJobs: repJobsFor(["A01"]), finalizeResp: { disposition: "finalized", cycle: { status: "succeeded" } } };

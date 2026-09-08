@@ -359,7 +359,16 @@ export async function buildProductionOnboardingDeps() {
     getConnections: getDataDoeConnections,
     fetchDetailed: fetchAccountsDetailed,
     readOnboardingRows: sb.getAccountOnboardingRows,
-    upsertRows: sb.upsertAccountOnboardingRows,
+    // P0-D: prefer the CONCURRENCY-SAFE forward-only reconciliation RPC; FALL BACK to the grouped merge-upsert when the
+    // RPC is not applied yet (migration 20260922 pending) so the code is safe to deploy BEFORE that migration. Once the
+    // migration lands, discovery writes go through the atomic, row-locked, never-regress path.
+    upsertRows: async (rows) => {
+      try { return await sb.reconcileAccountOnboardingDiscovery(rows); }
+      catch (e) {
+        if (e && e.code === "ONBOARDING_RECONCILE_RPC_ABSENT") return sb.upsertAccountOnboardingRows(rows);
+        throw e;
+      }
+    },
     claimBootstrap: sb.claimAccountBootstrap,
     readOliCoverage: (accountId) => sb.getSourceCoverageWindows({
       organizationFingerprint: orgFingerprintOf(), connectionId: "primary", accountId, sourceKey: OLI_SOURCE_KEY,

@@ -314,6 +314,13 @@ jobs:
     if: always() && needs.run.outputs.region != '' && (needs.run.outputs.already_published == 'true' || needs.run.outputs.token_proceed == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # P1: the machine-readable FBA-completeness contract. fba-plan-golive.mjs writes fba_complete (true ONLY when every
+    # eligible account for the region published live -- a natural partial like 10/11 is fba_complete=false) and
+    # fba_published to $GITHUB_OUTPUT; expose them as JOB outputs so Listing Health v3 gates on completeness, not the
+    # exit code. A hard FBA failure leaves fba_complete empty -> also != 'true'.
+    outputs:
+      fba_complete: ${{ steps.fba.outputs.fba_complete }}
+      fba_published: ${{ steps.fba.outputs.fba_published }}
     defaults:
       run:
         working-directory: sales-dashboard-live
@@ -352,6 +359,7 @@ jobs:
       # fetch (EXACTLY [D-1 .. D-1]) and the downstream Listing Health v3 job adopt ONE inventory identity (v3
       # reuses this exact cache).
       - name: FBA go-live for this region (batched fetch -> derive -> publish -> ownership -> ALWAYS safe-close)
+        id: fba
         run: node scripts/release/fba-plan-golive.mjs --mode=go-live --region=${{ needs.run.outputs.region }} --max-tokens=${{ steps.fcfg.outputs.maxtok }} --inventory-as-of=${{ needs.run.outputs.inventory_asof }} --account-scope=${{ needs.run.outputs.scope }} --dispatch-id=${{ inputs.dispatch_id }} --run-token=${{ github.run_id }}-${{ github.run_attempt }}
 
   # Listing Health v3 SHADOW ingestion -- runs ONLY after THIS region's FBA inventory job SUCCEEDED, so v3's reuse-only
@@ -366,7 +374,12 @@ jobs:
     needs: [run, fba]
     # A BOOTSTRAP-scoped run never ingests v3 (its per-region export ceiling belongs to the natural daily
     # run; the new accounts' shadow snapshots land on the next full run instead).
-    if: always() && needs.run.outputs.region != '' && needs.fba.result == 'success' && needs.run.outputs.scope != 'bootstrap'
+    # P1: v3 runs ONLY when the region's FBA is COMPLETE (fba_complete == 'true'), not merely when the fba job exited
+    # success -- a natural PARTIAL region (e.g. 10/11, Canada LATEST_SNAPSHOT_INCOMPLETE) exits success but is
+    # fba_complete=false, so v3 is SKIPPED (zero creates/tokens; the typed reason -- which accounts blocked
+    # completeness -- is in the fba job's own log/output). A hard FBA failure leaves fba_complete empty (also != 'true').
+    # materialize + materialize-inventory stay INDEPENDENT of this gate (they run LKG-preserving regardless).
+    if: always() && needs.run.outputs.region != '' && needs.fba.result == 'success' && needs.fba.outputs.fba_complete == 'true' && needs.run.outputs.scope != 'bootstrap'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     defaults:

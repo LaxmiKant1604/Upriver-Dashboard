@@ -23,7 +23,9 @@ import { makeDataDoeAdapter, makeSupabaseSourceStore } from "./source-sync-drive
 import { buildSchedulerV2Publisher } from "./publisher-composition.js";
 import { ORGANIZATION_SCOPE_KEY, OLI_SOURCE_KEY } from "./source-durable-model.js";
 import { MAX_ACCOUNTS_PER_BATCH } from "./source-batching.js";
-import { getSyncReportJobs, getSyncCycleByBucketDate, reservePriorityCatalogCreate, recordPriorityCatalogExport, getPriorityCatalogReservation } from "../supabase.js";
+import { getSyncReportJobs, getSyncCycleByBucketDate, reservePriorityCatalogCreate, recordPriorityCatalogExport, getPriorityCatalogReservation, openSupersedingSyncCycle as openSupersedingSyncCycleDefault } from "../supabase.js";
+import { CATALOG_SOURCE_KEY } from "./source-durable-model.js";
+import { classifyLegacyOliOnlyCycle } from "./source-scheduled-oli.js";
 
 // FROZEN scope. Never overridable from an HTTP body / card action / scheduler.
 export const PRIORITY_DASHBOARDS = Object.freeze({
@@ -213,6 +215,11 @@ export function buildPriorityDashboardsRelease({
   // the report_snapshots CAS and FAILS CLOSED (lease-lost) when no live fence exists. null => unfenced (the
   // natural non-bootstrap path is byte-identical).
   getControlFence = null,
+  // P0-B LEGACY-CYCLE RECOVERY: openSuperseding opens a durable full-plan attempt superseding a terminal cycle
+  // (open_superseding_sync_cycle), injectable for tests. Terminalization reuses store.finalizeCycle (the SAME
+  // finalize_sync_cycle RPC finalizeBucket uses). Used ONLY to recover a LEGACY OLI-only running cycle (see
+  // deriveBucket); the natural complete-daily-plan path never invokes it.
+  openSuperseding = openSupersedingSyncCycleDefault,
 } = {}) {
   if (typeof buildRuntime !== "function") throw new Error("buildPriorityDashboardsRelease requires buildRuntime (fail closed).");
   if (asOfOverride != null && !/^\d{4}-\d{2}-\d{2}$/.test(String(asOfOverride))) throw new Error("buildPriorityDashboardsRelease asOfOverride must be a YYYY-MM-DD date (fail closed).");
@@ -260,6 +267,50 @@ export function buildPriorityDashboardsRelease({
     const existingStatus = existingCycle ? S(existingCycle.status) : null;
     if (existingStatus === "succeeded" || existingStatus === "partial") {
       return { rollup: { stopped: false, continuationRequired: false, globalDrained: true, alreadyComplete: true, cycleId: S(existingCycle.id), cycleStatus: existingStatus, derived: { skipped: null, lineage: [] } } };
+    }
+    // P0-B LEGACY OLI-only RECOVERY: a RUNNING head created before the complete-daily-plan fix has an OLI frozen
+    // budget/jobs but NO Product Catalog budget or job. A frozen continuation can NEVER inject the newly-required
+    // Catalog family (case-c newly-enabled-deferred), so runtime.run would return not-drained here FOREVER. Recover
+    // by finalizing the legacy cycle HONESTLY (from its OWN drained source work) and opening a SUPERSEDING full-plan
+    // cycle; runtime.run(priority) below then drains a FRESH Catalog on the (empty) superseding cycle via FRESH-ON-
+    // ACTIVE and derives off the DURABLE OLI evidence -- no OLI re-fetch, no duplicate exports, LKG preserved. A
+    // complete-daily-plan running cycle (Catalog budget present) is NOT legacy and is left untouched.
+    if (existingStatus === "running" && typeof store.getBudget === "function" && typeof store.listSourceJobs === "function" && typeof store.finalizeCycle === "function" && typeof openSuperseding === "function") {
+      const legacyCid = S(existingCycle.id);
+      const catTrancheKey = "source-sync:" + CATALOG_SOURCE_KEY;
+      let catBudget = null;
+      try { catBudget = await store.getBudget({ cycleId: legacyCid, trancheKey: catTrancheKey }); }
+      catch (e) { return { rollup: { stopped: true, stopReason: { code: "CATALOG_BUDGET_UNREADABLE", detail: S(e && e.message) }, globalDrained: false, continuationRequired: true, cycleId: legacyCid, derived: { skipped: "catalog-budget-unreadable" } } }; }
+      let srcJobs = null;
+      try { srcJobs = await store.listSourceJobs(legacyCid); }
+      catch (e) { return { rollup: { stopped: true, stopReason: { code: "LEGACY_JOBS_UNREADABLE", detail: S(e && e.message) }, globalDrained: false, continuationRequired: true, cycleId: legacyCid, derived: { skipped: "legacy-jobs-unreadable" } } }; }
+      const skOf = (j) => S(j && (j.source_key ?? j.sourceKey));
+      const jobs = Array.isArray(srcJobs) ? srcJobs : [];
+      const legacy = classifyLegacyOliOnlyCycle({
+        status: existingStatus,
+        hasCatalogBudget: !!catBudget,
+        hasCatalogJob: jobs.some((j) => skOf(j) === CATALOG_SOURCE_KEY),
+        hasOliJob: jobs.some((j) => skOf(j) === OLI_SOURCE_KEY),
+      });
+      if (legacy.disposition === "recover-legacy") {
+        // Finalize the legacy cycle from its own work (idempotent: 'already-terminal' on replay). 'open-work' means
+        // its OLI is not yet drained -> a retry finalizes once it is; nothing is published, the LKG is intact.
+        let fin = null;
+        try { fin = await store.finalizeCycle({ cycleId: legacyCid }); }
+        catch (e) { return { rollup: { stopped: true, stopReason: { code: "LEGACY_FINALIZE_FAILED", detail: S(e && e.message) }, globalDrained: false, continuationRequired: true, cycleId: legacyCid, derived: { skipped: "legacy-finalize-failed" } } }; }
+        const disp = S(fin && fin.disposition);
+        if (disp !== "finalized" && disp !== "already-terminal") {
+          return { rollup: { stopped: true, stopReason: { code: "LEGACY_OLI_STILL_OPEN", detail: disp }, globalDrained: false, continuationRequired: true, cycleId: legacyCid, derived: { skipped: "legacy-oli-open" } } };
+        }
+        // Open (or idempotently resume) the superseding full-plan attempt. A DEDICATED operation key keeps it distinct
+        // from the OLI operator's freshness attempt; idempotent by operation_key so a watchdog replay reuses it.
+        const recoveryOpKey = "priority-legacy-recovery/" + cycleBucketFor(bucket) + "/" + S(preflight.today);
+        try { await openSuperseding({ bucket: cycleBucketFor(bucket), cycleDate: S(preflight.today), operationKey: recoveryOpKey, supersedesCycleId: legacyCid, attemptKind: "scheduled-fresh" }, sig); }
+        catch (e) { return { rollup: { stopped: true, stopReason: { code: "LEGACY_SUPERSEDE_FAILED", detail: S(e && e.message) }, globalDrained: false, continuationRequired: true, cycleId: legacyCid, derived: { skipped: "legacy-supersede-failed" } } }; }
+        // Fall through to runtime.run(priority): the superseding cycle is the fresh (empty) active head -> FRESH-ON-
+        // ACTIVE plans a catalog-only cycle, drains it, and derives off the durable OLI. finalizeBucket independently
+        // re-proves the superseding cycle's scope before any publish.
+      }
     }
     const rollup = await runtime.run({ bucket, deadline, preflight, ...(cycleBucket != null ? { cycleBucket } : {}) });
     return { rollup };
