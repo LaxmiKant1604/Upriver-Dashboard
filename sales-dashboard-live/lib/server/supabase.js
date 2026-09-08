@@ -934,6 +934,45 @@ export async function setFbaPlanColumnPrefs({ userId, reportKey = "fba-plan", hi
   };
 }
 
+// ACCOUNT-scoped FBA Shipment Plan column visibility. SHARED display layout keyed by the COMPLETE trusted identity
+// (organization_fingerprint, connection_id, account_id, report_key) -- NOT the user, and NEVER account_id alone. Any
+// authorized dashboard user opening that account sees the same saved hidden set; each account keeps its own layout.
+// The api/ layer authenticates + authorizes account access + validates the column ids BEFORE calling these; identity
+// is server-bound (org/connection never trusted from the browser). Distinct table from the per-user fba_plan_column_prefs
+// (which stays user-scoped and is shared with SKU Movement); this never reads or writes that table.
+export async function getFbaPlanAccountColumnPrefs({ organizationFingerprint, connectionId = "primary", accountId, reportKey = "fba-plan", signal = null } = {}) {
+  if (!organizationFingerprint || !accountId) throw new Error("getFbaPlanAccountColumnPrefs requires organizationFingerprint + accountId (fail closed).");
+  const q = new URLSearchParams({
+    organization_fingerprint: `eq.${organizationFingerprint}`, connection_id: `eq.${connectionId}`,
+    account_id: `eq.${accountId}`, report_key: `eq.${reportKey}`, select: "hidden_columns,updated_at",
+  });
+  try {
+    const rows = await request(`/rest/v1/fba_plan_account_column_prefs?${q}`, { signal });
+    const row = Array.isArray(rows) ? rows[0] : null;
+    // updatedAt present === a saved account layout exists (even an empty hidden set = the user chose "Select all").
+    // Absent row => null updatedAt => the caller falls back to PLAN_DEFAULT_HIDDEN_COLS. Never another account's set.
+    return { hiddenColumns: Array.isArray(row?.hidden_columns) ? row.hidden_columns.map(String) : [], updatedAt: row?.updated_at || null };
+  } catch (e) { if (isSchemaMissingError(e)) return { hiddenColumns: [], updatedAt: null }; throw e; }
+}
+
+export async function setFbaPlanAccountColumnPrefs({ organizationFingerprint, connectionId = "primary", accountId, reportKey = "fba-plan", hiddenColumns, updatedBy = null, updatedByEmail = "" }) {
+  if (!organizationFingerprint || !accountId) throw new Error("setFbaPlanAccountColumnPrefs requires organizationFingerprint + accountId (fail closed).");
+  const hidden = Array.from(new Set((Array.isArray(hiddenColumns) ? hiddenColumns : []).map(String)));
+  const body = {
+    organization_fingerprint: organizationFingerprint, connection_id: connectionId, account_id: accountId, report_key: reportKey,
+    hidden_columns: hidden, updated_by: updatedBy || null, updated_by_email: updatedByEmail || "", updated_at: new Date().toISOString(),
+  };
+  // Atomic, idempotent upsert on the natural key; last successful save wins for simultaneous edits. return=representation
+  // gives the canonical stored row back to the caller.
+  const rows = await request("/rest/v1/fba_plan_account_column_prefs?on_conflict=organization_fingerprint,connection_id,account_id,report_key", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body,
+  });
+  const row = Array.isArray(rows) ? rows[0] : rows;
+  return { hiddenColumns: Array.isArray(row?.hidden_columns) ? row.hidden_columns.map(String) : hidden, updatedAt: row?.updated_at || body.updated_at };
+}
+
 // ---- SKU MOVEMENT identifier (manual per-(org, account, marketplace, ASIN) metadata) --------------------------
 // Read the account's saved identifiers -> a map { CHILD_ASIN(upper): identifier }. Account-scoped (the caller
 // authorizes account access). Fail-soft: schema-missing / read error => {} (the report renders without identifiers).

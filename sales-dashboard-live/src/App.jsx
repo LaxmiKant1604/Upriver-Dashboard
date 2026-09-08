@@ -37,6 +37,7 @@ import { matchesPlanBrand, UNMAPPED_BRAND } from "./lib/plan-brand.js";
 import { computeAsinWdd, resolveWddWeights, validateWddWeights, WDD_DEFAULT_WEIGHTS } from "./lib/fba-wdd.js";
 import { buildFbaLeadTimeMatrix, validateFbaLeadTimeRows, validateFbaLeadTimeText } from "./lib/fba-lead-time-import.js";
 import { useFbaPlanConfig } from "./lib/use-fba-plan-config.js";
+import { useFbaPlanColumns } from "./lib/use-fba-plan-columns.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import { canonicalBrandKey, permittedBrandKeySetForAccount, filterBrandNamesToPermitted } from "./lib/brand-scope-filter.js";
 // Regional Brand View: Region -> Brand selection, using the SINGLE canonical marketplace->region mapping the
@@ -1924,9 +1925,19 @@ function DashboardApp({ session, access, onSignOut }) {
     leadTimePreview, leadTimeNotice, leadTimeImportBusy,
     beginImport: onImportLeadTimeFile, applyImport: applyLeadTimePreview, dismissPreview: dismissLeadTimePreview,
   } = planCfg;
-  // Per-user column visibility (set of HIDDEN column ids), the SKU-horizon editor target, and the bulk-import modal.
-  const [planHiddenCols, setPlanHiddenCols] = useState(() => new Set());
-  const [planColsBusy, setPlanColsBusy] = useState(false);
+  // ACCOUNT-scoped column visibility (set of HIDDEN column ids) -- a SHARED layout per selected account, not per user.
+  // The whole lifecycle (account-keyed load, obsolete-response rejection, optimistic save + rollback, and the render
+  // gate so account A's columns never flash under B) lives in the shared, tested hook (src/lib/use-fba-plan-columns.js).
+  const planColsApi = useFbaPlanColumns({
+    accountId: selectedAccountId,
+    token: session?.access_token || null,
+    active: view === "fbaplan",
+    apiFetch: authFetch,
+    onWriteError: (msg) => setPlanError(msg),
+    userId: session?.user?.id || null,
+  });
+  const planHiddenCols = planColsApi.hiddenCols;
+  const planColsBusy = planColsApi.busy;
   const [skuHorizonEdit, setSkuHorizonEdit] = useState(null); // { sku, asin, effective, source } | null
   const [warehouseImportOpen, setWarehouseImportOpen] = useState(false);
   // SKU Movement (v2): per-USER window N + hidden columns, persisted via /api/sku-movement-prefs (never DataDoe).
@@ -2676,33 +2687,9 @@ function DashboardApp({ session, access, onSignOut }) {
 
   // Per-USER column-visibility prefs: localStorage for an instant first paint, then the durable server copy (which
   // wins). Saving writes both. A guest (no session) keeps localStorage only.
-  const columnPrefsKey = useMemo(() => `fbaplan.cols.${session?.user?.id || "anon"}`, [session?.user?.id]);
-  const loadPlanColumns = useCallback(async () => {
-    let local = null;
-    try { const raw = localStorage.getItem(columnPrefsKey); if (raw) local = JSON.parse(raw); } catch { /* ignore */ }
-    // No saved preference anywhere yet -> the default view (raw component columns hidden).
-    if (Array.isArray(local)) setPlanHiddenCols(new Set(local.map(String)));
-    else setPlanHiddenCols(new Set(PLAN_DEFAULT_HIDDEN_COLS));
-    if (!session?.access_token) return;
-    try {
-      const r = await authFetch("/api/fba-plan-columns", session.access_token);
-      // A SAVED preference (updatedAt present) wins -- even an empty set (the user chose "Select all"). Only when the
-      // user has never saved AND there is no local copy do we fall back to the default view.
-      if (r && r.updatedAt) setPlanHiddenCols(new Set((r.hiddenColumns || []).map(String)));
-      else if (!Array.isArray(local)) setPlanHiddenCols(new Set(PLAN_DEFAULT_HIDDEN_COLS));
-    } catch { /* keep local */ }
-  }, [columnPrefsKey, session?.access_token]);
-  useEffect(() => { if (view === "fbaplan") loadPlanColumns(); }, [view, loadPlanColumns]);
-  const savePlanColumns = useCallback(async (nextHidden) => {
-    const arr = Array.from(nextHidden);
-    setPlanHiddenCols(new Set(arr));
-    try { localStorage.setItem(columnPrefsKey, JSON.stringify(arr)); } catch { /* ignore */ }
-    if (!session?.access_token) return;
-    setPlanColsBusy(true);
-    try { await authFetch("/api/fba-plan-columns", session.access_token, { method: "POST", body: JSON.stringify({ hiddenColumns: arr }) }); }
-    catch { /* localStorage already holds it */ }
-    finally { setPlanColsBusy(false); }
-  }, [columnPrefsKey, session?.access_token]);
+  // FBA Shipment Plan column visibility is now ACCOUNT-scoped + fully managed by the useFbaPlanColumns hook above
+  // (load on account change, obsolete-response rejection, optimistic save + rollback). The old per-user localStorage
+  // path + endpoint call were removed; the hook is the single source.
 
   // SKU Movement per-USER prefs (window N + hidden columns). localStorage gives an instant first paint; the durable
   // server copy (user-scoped) wins. Kept SEPARATE from the report snapshot so a zero-export re-derive never erases it.
@@ -3425,6 +3412,12 @@ function DashboardApp({ session, access, onSignOut }) {
   // Visible columns = model minus the user's hidden set, minus AWD columns for non-US accounts.
   const planVisibleColumns = useMemo(
     () => planColumns.filter((c) => (c.locked || !planHiddenCols.has(c.id)) && (planAwdEligible || !c.awd)),
+    [planColumns, planHiddenCols, planAwdEligible]
+  );
+  // "N hidden" uses the EFFECTIVE hidden set: only columns that are actually AVAILABLE (AWD columns excluded for
+  // non-AWD marketplaces) and hideable (not the locked Product / ASIN). A saved-but-unavailable AWD id never counts.
+  const planHiddenEffectiveCount = useMemo(
+    () => planColumns.filter((c) => !c.locked && (planAwdEligible || !c.awd) && planHiddenCols.has(c.id)).length,
     [planColumns, planHiddenCols, planAwdEligible]
   );
   // Presentation-only: consecutive same-group runs of the visible columns, for a
@@ -4842,14 +4835,14 @@ function DashboardApp({ session, access, onSignOut }) {
           <input ref={leadTimeFileRef} type="file" accept=".csv,.tsv,.xlsx,text/csv" style={{ display: "none" }} onChange={(e) => { const f = e.target.files && e.target.files[0]; onImportLeadTimeFile(f); e.target.value = ""; }} />
           <div className="plan-cols-wrap">
             <button className="plan-tool-btn" type="button" disabled={!planData} onClick={() => setPlanColsOpen((v) => !v)} aria-expanded={planColsOpen} title="Show or hide columns">
-              <SlidersHorizontal size={15} /> Columns{planHiddenCols.size > 0 ? ` (${planHiddenCols.size} hidden)` : ""}
+              <SlidersHorizontal size={15} /> Columns{planHiddenEffectiveCount > 0 ? ` (${planHiddenEffectiveCount} hidden)` : ""}
             </button>
             {planColsOpen && planData && (
               <PlanColumnChooser
                 groups={planColumnGroups} hidden={planHiddenCols} isUS={planAwdEligible} busy={planColsBusy}
-                onToggle={(id) => { const next = new Set(planHiddenCols); if (next.has(id)) next.delete(id); else next.add(id); savePlanColumns(next); }}
-                onSelectAll={() => savePlanColumns(new Set())}
-                onReset={() => savePlanColumns(new Set(PLAN_DEFAULT_HIDDEN_COLS))}
+                onToggle={(id) => planColsApi.toggle(id)}
+                onSelectAll={() => planColsApi.selectAll()}
+                onReset={() => planColsApi.reset()}
                 onClose={() => setPlanColsOpen(false)}
               />
             )}
