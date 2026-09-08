@@ -708,6 +708,55 @@ test("G2. a continuation with the SAME membership reuses the frozen budget idemp
   assert.equal(h1.dd.totalCreates(), creates1, "an idempotent same-membership continuation creates NO new exports");
 });
 
+test("G3. P0-2 strict: an owner-read FAILURE on a continuation DEFERS (typed deferred-frozen-scope-unavailable; zero jobs/creates; never falls back to current discovery)", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  const h1 = runHarness({ accounts: THREE, store });
+  await h1.run();
+  const creates1 = h1.dd.totalCreates();
+  const throwingStore = { ...store, listCycleOwners() { throw new Error("owner read boom"); } };
+  const h2 = runHarness({ accounts: [1, 2, 3, 4].map(acct), store: throwingStore, dd: h1.dd });
+  const r2 = await h2.run();
+  assert.equal(r2.deferred, true, "deferred");
+  assert.equal(r2.deferredReason, "deferred-frozen-scope-unavailable", "typed deferral reason");
+  assert.equal(r2.stopped, true, "the run stopped (no work)");
+  assert.equal(r2.families.length, 0, "zero families processed");
+  assert.equal(h1.dd.totalCreates(), creates1, "ZERO new DataDoe creates on the deferred continuation");
+});
+
+test("G4. P0-2 strict: MALFORMED frozen owners (all blank identities) DEFER; zero jobs/creates", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  const h1 = runHarness({ accounts: THREE, store });
+  await h1.run();
+  const creates1 = h1.dd.totalCreates();
+  const malformedStore = { ...store, listCycleOwners() { return [{ account_id: "" }, { account_id: "   " }]; } };
+  const h2 = runHarness({ accounts: THREE, store: malformedStore, dd: h1.dd });
+  const r2 = await h2.run();
+  assert.equal(r2.deferred, true, "deferred on malformed owner identities");
+  assert.equal(r2.deferredReason, "deferred-frozen-scope-unavailable");
+  assert.equal(h1.dd.totalCreates(), creates1, "zero new creates");
+});
+
+test("G5. P0-2 strict: a NON-BLANK org-scope owner ('__organization', the catalog sentinel) is NOT malformed -- the continuation PROCEEDS (never a false defer) and reuses frozen budgets (zero new creates)", async () => {
+  // The catalog job's owner account_id is the org sentinel, not a real account. A continuation whose owners include
+  // only such non-account ids must NOT be misread as "malformed" (that would wrongly stall a catalog-only cycle). It
+  // proceeds: the frozen intersection is empty, so it plans from current accounts but the family loop reuses ONLY
+  // frozen budgets (no recompute -> no mismatch), and an idempotent replay creates nothing.
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  const h1 = runHarness({ accounts: THREE, store });
+  const r1 = await h1.run();
+  const creates1 = h1.dd.totalCreates();
+  const orgOwnerStore = { ...store, listCycleOwners() { return [{ account_id: "__organization" }]; } };
+  const h2 = runHarness({ accounts: THREE, store: orgOwnerStore, dd: h1.dd });
+  const r2 = await h2.run();
+  assert.notEqual(r2.deferred, true, "a non-blank org sentinel owner is NOT a malformed defer");
+  assert.notEqual(r2.deferredReason, "deferred-frozen-scope-unavailable", "no false frozen-scope-unavailable");
+  assert.ok(r1.cycleId && r2.cycleId === r1.cycleId, "the same active cycle is continued");
+  assert.equal(h1.dd.totalCreates(), creates1, "ZERO new creates -- frozen budgets reused, never recomputed");
+});
+
 async function main() {
   out("source-bucket-sync + durable-dashboards proof suite");
   bucketSync = await import("../lib/server/sync/source-bucket-sync.js");

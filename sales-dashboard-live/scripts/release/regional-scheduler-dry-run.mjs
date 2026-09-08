@@ -20,7 +20,7 @@ if (regionArg !== "all" && !REGION_SCOPES.includes(regionArg)) { console.error("
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
-const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
+const { fetchExportEligibleAccounts, classifyDiscoveryOutcome } = await import("../../lib/server/sync/account-onboarding.js");
 const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
 // EXPORT-ELIGIBILITY GATE (dry-run parity with the live scheduler): show exactly the gated account set
 // plus the typed exclusions, so the dry-run rehearses the real scope.
@@ -51,7 +51,12 @@ for (const a of active) {
   seen.add(accountId);
   accounts.push({ accountId, marketplace: String((a && a.country) || "").toUpperCase() });
 }
-if (!accounts.length) { console.error("STOP no primary accounts discovered"); process.exit(1); }
+if (!accounts.length) {
+  // P1-4: surface the TYPED discovery disposition (no-authoritative-scope / all-awaiting-onboarding / empty
+  // directory) instead of a generic "no accounts discovered" -- the dry-run rehearses the exact live deferral.
+  const disp = classifyDiscoveryOutcome(rows);
+  console.error("STOP " + (disp.deferred ? disp.message : "no primary accounts discovered after classification")); process.exit(1);
+}
 log("discovered " + accounts.length + " primary accounts (max sellers/batch = " + MAX_SELLERS_PER_BATCH + ")");
 
 const { byRegion, unassigned } = routeAccounts(accounts);

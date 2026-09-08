@@ -35,7 +35,7 @@ if (accountScope === "bootstrap") {
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
-const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
+const { fetchExportEligibleAccounts, classifyDiscoveryOutcome } = await import("../../lib/server/sync/account-onboarding.js");
 const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
 // EXPORT-ELIGIBILITY GATE: the duplicate guard proves the SAME export-eligible account set the
 // publish pipeline uses, so a still-loading/unclaimed account can never keep a region "unpublished".
@@ -60,7 +60,11 @@ for (const account of active) {
   if (!accountId || accountId.includes(":") || seen.has(accountId) || !accountInScope(bucket, country)) continue;
   seen.add(accountId); accountIds.push(accountId);
 }
-if (!accountIds.length) { console.error("STOP no primary " + bucket + " accounts discovered."); process.exit(1); }
+if (!accountIds.length) {
+  // P1-4: typed discovery disposition instead of a generic "no accounts discovered".
+  const disp = classifyDiscoveryOutcome(directory);
+  console.error("STOP " + (disp.deferred ? disp.message + " [bucket=" + bucket + "]" : "no export-eligible " + bucket + " primary accounts (discovery had eligible accounts in other regions)")); process.exit(1);
+}
 
 const client = new pg.Client({ connectionString: String(process.env.POSTGRES_URL).split("?")[0], ssl: { rejectUnauthorized: false } });
 let rows;

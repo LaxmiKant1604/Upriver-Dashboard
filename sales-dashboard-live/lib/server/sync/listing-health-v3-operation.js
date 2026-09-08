@@ -33,6 +33,11 @@ import {
   assertListingHealthV3ExportCeiling,
   assertNoDuplicatePerAccountReadIdentities,
 } from "./listing-health-v3-materialize.js";
+import {
+  LISTING_HEALTH_V3_PRICING_REVISION,
+  readListingHealthV3Authorization,
+  decideListingHealthV3Authorization,
+} from "./listing-health-v3-authorization.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(S(v));
@@ -121,6 +126,12 @@ export async function runListingHealthV3Ingestion({
   discoverAccounts, buildPlan = buildListingHealthV3Plan, resolveCost, checkBalance,
   runSources, materialize, runReports, finalizeCycle,
   ceiling = null, emergencyReserveTokens = V3_DEFAULT_EMERGENCY_RESERVE_TOKENS,
+  // P1-3: EXPLICIT DURABLE AUTHORIZATION -- read from the durable control system (default: the reviewed region
+  // config), bound to the region + pricing revision. INJECTABLE so a future migration-backed operator-runtime
+  // authorization table can replace it without touching this operation's logic. `readAuthorization` returns a typed
+  // decision (never throws for missing/stale/malformed authz -> those become awaiting-budget, not a crash).
+  readAuthorization = readListingHealthV3Authorization,
+  pricingRevision = LISTING_HEALTH_V3_PRICING_REVISION,
   reservationSupported = true, pricingKnown = true,
   now = () => Date.now(), log = () => {},
 } = {}) {
@@ -197,28 +208,54 @@ export async function runListingHealthV3Ingestion({
   if (!dryRun) {
     if (pricingKnown !== true) return fail("budget", "DataDoe pricing state is unknown; refusing to create (fail closed)");
     if (reservationSupported !== true) return fail("budget", "atomic pre-POST create reservation is unavailable; refusing to create (fail closed)");
+    // The three spend concepts are enforced as THREE SEPARATE gates, in order:
+    //   (1) STRUCTURAL required  -- 2 creates per <=5-seller batch (ceilingCheck.newExports); tokens = the
+    //       freshness-aware estimate. This is what the run NEEDS and scales with account growth.
+    const requiredCreates = Number(ceilingCheck.newExports || 0);
+    const requiredTokens = Number(cost.estimatedTokens || 0);
+    ev.requiredCreates = requiredCreates; ev.requiredTokens = requiredTokens;
+
+    //   (2) EXPLICIT DURABLE AUTHORIZATION -- what an operator has reviewed and authorized for the region (bound to
+    //       the pricing revision), read from the durable control system. NOT derived from the token balance and it
+    //       does NOT auto-increase when accounts are added: growth beyond the authorized ceiling defers here. A
+    //       missing / stale (pricing) / malformed / below-required authorization returns a TYPED awaiting-budget
+    //       BEFORE any cycle/reservation/POST (zero creates, LKG preserved) -- an operator must review/raise it.
+    if (typeof readAuthorization !== "function") return fail("authorization", "readAuthorization collaborator is required for a live run (fail closed)");
+    let authz;
+    try { authz = await readAuthorization({ region: S(region), pricingRevision: S(pricingRevision) }); }
+    catch (e) { authz = { authorized: false, reason: "authorization-unreadable", detail: safe(e) }; }
+    const authDecision = decideListingHealthV3Authorization({ region: S(region), accountCount: regionAccounts.length, requiredCreates, requiredTokens, authorization: authz });
+    ev.authorization = authDecision.authorization && authDecision.authorization.authorized
+      ? { maxAccounts: authDecision.authorization.maxAccounts, maxCreates: authDecision.authorization.maxCreates, maxTokens: authDecision.authorization.maxTokens, pricingRevision: authDecision.authorization.pricingRevision }
+      : null;
+    ev.authorizedCreates = authDecision.authorization && authDecision.authorization.authorized ? authDecision.authorization.maxCreates : null;
+    ev.authorizedTokens = authDecision.authorization && authDecision.authorization.authorized ? authDecision.authorization.maxTokens : null;
+    if (!authDecision.ok) {
+      return {
+        ...ev, phase: "awaiting-budget", ok: false, deferred: true, awaitingBudget: true,
+        authorizationReason: authDecision.reason, creates: 0, tokens: 0, snapshots: 0,
+        note: `NOT authorized (${authDecision.reason}${authDecision.detail ? ": " + authDecision.detail : ""}) for ${S(region)} -- deferred BEFORE any cycle/reservation/POST (zero creates); last-known-good preserved. An operator must review/raise the durable Listing Health v3 authorization (this is SEPARATE from funding the token balance).`,
+      };
+    }
+
+    //   (3) LIVE AFFORDABILITY -- even WITH authorization, the usable DataDoe balance minus the emergency reserve
+    //       must cover the required tokens. Authorization does NOT imply affordability. estimatedTokens is an
+    //       OBSERVED estimate (rowCountBilling=true), so requiring headroom above the reserve also stops a
+    //       heavier-than-expected bill from exhausting the account. The atomic pre-POST reservation + frozen tranche
+    //       budget remain the true runtime ceiling on top of this.
     if (typeof checkBalance !== "function") return fail("balance", "checkBalance collaborator is required for a live run (fail closed)");
     let bal;
     try { bal = await checkBalance(); } catch (e) { return fail("balance", "balance check failed (fail closed): " + safe(e)); }
     if (!bal || typeof bal.usable !== "number" || !Number.isFinite(bal.usable)) return fail("balance", "usable DataDoe balance is unknown (fail closed)");
     const reserve = typeof bal.reserve === "number" ? bal.reserve : Number(emergencyReserveTokens);
     ev.usableBalance = bal.usable; ev.emergencyReserve = reserve;
-    // AUTHORIZED BUDGET (P1): the STRUCTURAL required spend (creates = 2 per <=5-seller batch; tokens = the
-    // freshness-aware estimate) is compared to the AUTHORIZED maximum from the durable DataDoe token budget
-    // (usable MINUS the emergency reserve that protects other reports' spend). Account growth scales the required
-    // spend but can NEVER silently authorize unlimited exports: when required > authorized this returns a TYPED
-    // awaiting-budget deferral BEFORE any cycle/reservation/POST (zero creates, LKG preserved) -- an operator must
-    // fund/review to raise the authorized budget. estimatedTokens is an OBSERVED estimate (rowCountBilling=true),
-    // so requiring headroom above the reserve also stops a heavier-than-expected bill from exhausting the account.
-    const requiredCreates = Number(ceilingCheck.newExports || 0);
-    const requiredTokens = Number(cost.estimatedTokens || 0);
-    const authorizedTokens = bal.usable - reserve;
-    ev.requiredCreates = requiredCreates; ev.requiredTokens = requiredTokens; ev.authorizedTokens = authorizedTokens;
-    if (requiredTokens > authorizedTokens) {
+    const affordableTokens = bal.usable - reserve;
+    ev.affordableTokens = affordableTokens;
+    if (requiredTokens > affordableTokens) {
       return {
         ...ev, phase: "awaiting-budget", ok: false, deferred: true, awaitingBudget: true,
-        creates: 0, tokens: 0, snapshots: 0,
-        note: `required ${requiredCreates} create(s) / ${requiredTokens} token(s) exceed the authorized DataDoe budget (usable ${bal.usable} - reserve ${reserve} = ${authorizedTokens}); deferred BEFORE any cycle/reservation/POST (zero creates); last-known-good preserved. Fund/review to authorize.`,
+        authorizationReason: "insufficient-balance", creates: 0, tokens: 0, snapshots: 0,
+        note: `required ${requiredCreates} create(s) / ${requiredTokens} token(s) exceed the usable DataDoe balance minus the emergency reserve (usable ${bal.usable} - reserve ${reserve} = ${affordableTokens}); deferred BEFORE any cycle/reservation/POST (zero creates); last-known-good preserved. Fund to proceed (authorization is already in place).`,
       };
     }
   }

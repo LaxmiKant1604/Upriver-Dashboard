@@ -45,6 +45,16 @@ export async function discoverPrimaryAccountIds(bucket = null) {
     if (bucket && !accountInScope(bucket, String((a && a.country) || ""))) continue;
     ids.push(id);
   }
+  // P1-4: PROPAGATE the typed discovery disposition onto the returned id array (non-enumerable, so every existing
+  // caller that iterates/.length/.includes is byte-identical). A caller can read ids.discoveryState / ids.deferred to
+  // distinguish a genuine deferral (no-authoritative-scope / all-awaiting-onboarding / empty directory) from an
+  // empty-after-routing result, instead of collapsing both into "no accounts".
+  Object.defineProperties(ids, {
+    discoveryState: { value: rows && rows.discoveryState ? rows.discoveryState : (ids.length ? "eligible" : "no-accounts-discovered"), enumerable: false },
+    deferred: { value: !!(rows && rows.deferred), enumerable: false },
+    discoveredCount: { value: rows && Number.isFinite(rows.discoveredCount) ? rows.discoveredCount : ids.length, enumerable: false },
+    eligibleCount: { value: rows && Number.isFinite(rows.eligibleCount) ? rows.eligibleCount : ids.length, enumerable: false },
+  });
   return ids;
 }
 

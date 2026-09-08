@@ -37,7 +37,7 @@ if (accountScope !== "bootstrap" && (!requestedAsOf || !/^\d{4}-\d{2}-\d{2}$/.te
 
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
-const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
+const { fetchExportEligibleAccounts, classifyDiscoveryOutcome } = await import("../../lib/server/sync/account-onboarding.js");
 const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
 const { resolveBootstrapScopeByDispatch, gateOnboardingBudget, recordOnboardingActualSpend, findApprovedStepEntry, bootstrapStepRef, assertBootstrapStepPlan } = await import("../../lib/server/sync/account-onboarding-bootstrap.js");
 // ACCOUNT SCOPE:
@@ -105,7 +105,14 @@ if (!discovered.length && accountScope === "bootstrap") {
   console.log("RESULT " + JSON.stringify({ ok: true, bucket, requestedAsOf, accountScope, classification: "BOOTSTRAP_SCOPE_EMPTY", creates: 0, tokens: 0 }));
   process.exit(0);
 }
-if (!discovered.length) { console.error("STOP no discovered " + bucket + " primary accounts"); process.exit(1); }
+if (!discovered.length) {
+  // P1-4: DISTINGUISH a genuine discovery deferral (no-authoritative-scope / all-awaiting-onboarding / empty
+  // directory) from a per-region-empty (discovery HAD export-eligible accounts, just none routed into this bucket).
+  // Either way we STOP before any cycle/export -- but with a CLEAR typed reason, never a generic "no accounts".
+  const disp = classifyDiscoveryOutcome(rows);
+  if (disp.deferred) { console.error("STOP " + disp.message + " [bucket=" + bucket + "]"); process.exit(1); }
+  console.error("STOP no export-eligible " + bucket + " primary accounts (discovery had " + (rows.eligibleCount ?? rows.length) + " eligible in other regions -- nothing to refresh in this bucket)"); process.exit(1);
+}
 const ids = discovered.map((a) => a.accountId);
 const oliStart = sourceRegistryEntry(OLI).initialBackfill.start;
 const orgFp = primaryConn.organizationFingerprint || organizationFingerprint(primaryConn.apiKey);

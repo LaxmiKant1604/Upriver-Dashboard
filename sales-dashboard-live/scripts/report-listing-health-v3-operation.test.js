@@ -99,19 +99,22 @@ await (async () => {
   const sCeil = spies({ cost: { newExports: 2, reusedExports: 1, creates: 99, estimatedTokens: 198, inventoryAdoptable: true } });
   const rCeil = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...sCeil }));
   ok("E: a freshness-aware create count above the region ceiling fails closed BEFORE any source run", rCeil.ok === false && rCeil.phase === "ceiling" && sCeil.calls.runSources === 0);
-  // P1: required tokens exceed the AUTHORIZED budget (usable - reserve) => TYPED awaiting-budget, ZERO creates,
-  // BEFORE any source run/reservation/POST (not a generic failure).
+  // P1-3: the THREE spend concepts are SEPARATE. authorizedTokens is the durable AUTHORIZATION ceiling (reviewed
+  // region config, NOT the balance); affordableTokens is the live balance minus the emergency reserve. Even WITH
+  // authorization (us-ca is authorized for up to 20 accounts here), an unaffordable balance => TYPED awaiting-budget
+  // (reason insufficient-balance), ZERO creates, BEFORE any source run/reservation/POST.
   const sBal = spies({ balance: { usable: 10, reserve: 50 } });
   const rBal = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...sBal }));
-  ok("E(P1): required spend above the authorized DataDoe budget returns TYPED awaiting-budget (deferred, zero creates) before any source run",
+  ok("E(P1-3): required tokens above the usable balance minus reserve returns TYPED awaiting-budget (insufficient-balance, deferred, zero creates) before any source run",
     rBal.ok === false && rBal.phase === "awaiting-budget" && rBal.awaitingBudget === true && rBal.deferred === true
     && rBal.creates === 0 && rBal.tokens === 0 && sBal.calls.runSources === 0
-    && rBal.requiredTokens === 4 && rBal.authorizedTokens === -40);
-  // P1: required WITHIN the authorized budget proceeds using the exact frozen plan (control -- runs sources).
+    && rBal.authorizationReason === "insufficient-balance"
+    && rBal.requiredTokens === 4 && rBal.affordableTokens === -40 && rBal.authorizedTokens === 16);
+  // P1-3: required WITHIN both the authorization AND the affordability balance proceeds using the exact frozen plan.
   const sOk = spies({ balance: { usable: 500, reserve: 50 } });
   const rOk = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...sOk }));
-  ok("E(P1): required spend WITHIN the authorized budget proceeds (runs sources; not deferred)",
-    rOk.awaitingBudget !== true && sOk.calls.runSources >= 1 && rOk.authorizedTokens === 450);
+  ok("E(P1-3): required spend WITHIN authorization AND affordability proceeds (runs sources; not deferred)",
+    rOk.awaitingBudget !== true && sOk.calls.runSources >= 1 && rOk.affordableTokens === 450 && rOk.authorizedTokens === 16);
   // unknown pricing
   const sPrice = spies();
   const rPrice = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, pricingKnown: false, ...sPrice }));

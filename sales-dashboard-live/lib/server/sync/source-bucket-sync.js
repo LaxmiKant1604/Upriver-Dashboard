@@ -352,6 +352,19 @@ async function familyState(store, cycleId, sourceKey) {
   return state;
 }
 
+// P0-2: the typed fail-closed result when a continuation's durable frozen scope cannot be established (owners
+// unreadable / malformed). ZERO jobs, budgets, reservations, and DataDoe POSTs; LKG preserved; the cycle is left
+// resumable (continuationRequired) so a later pass can retry once the frozen scope is readable again.
+function deferredFrozenScope(bucket, cycleId, reason) {
+  return {
+    bucket, cycleId: cycleId || null, plan: null, skippedPaused: [], families: [],
+    stopped: true, stopReason: Object.freeze({ code: "FROZEN_SCOPE_UNAVAILABLE", reason }),
+    globalDrained: false, deadlineReached: false, continuationRequired: true,
+    deferred: true, deferredReason: "deferred-frozen-scope-unavailable",
+    history: { rowsPersisted: 0, accountsCovered: 0 }, snapshots: { recorded: [], rejected: [] },
+  };
+}
+
 /**
  * RUN one bucket's source sync end to end (the ONE operator action). Collaborators are all injected --
  * store + dataDoe (the proven worker backends), durable-model sinks (persistHistory / recordCoverage /
@@ -411,29 +424,39 @@ export async function runBucketSourceSync({
     try { const h = await store.getCycleByBucketDate(cycleKeyBucket, cycleDate); if (h && h.id && ["running", "pending"].includes(String(h.status))) activeCycleId = h.id; } catch (_e) { activeCycleId = null; }
   }
 
-  // P0-B FROZEN-CYCLE CONTINUATION: on a continuation, RE-PLAN from the cycle's ALREADY-FROZEN membership (the
-  // accounts whose source-job OWNERS were persisted when the cycle opened) -- NEVER from current discovery. Because
-  // assignAccountBatches is deterministic, the frozen accounts reproduce the EXACT frozen batches + request hashes,
-  // so the persisted tranche budget matches and is reused verbatim (never recomputed/overwritten) -- this is what
-  // eliminates the mid-cycle PLAN_BUDGET_MISMATCH. An account CONNECTED AFTER the freeze is absent from the frozen
-  // membership, so it is excluded from THIS cycle's plan (never upserted/reserved/created) and joins the NEXT new
-  // cycle. Falls back to current discovery when no frozen owners are readable (a fresh cycle, or a test double).
+  // P0-2 STRICT FROZEN-CYCLE CONTINUATION: an active running/pending cycle is ALWAYS a continuation, and its
+  // membership + budget come ONLY from the durable frozen owners/budgets -- NEVER from current discovery. On a
+  // continuation this code:
+  //   (a) scopes the plan to the frozen per-account membership (the accounts whose owners were persisted at freeze)
+  //       when it intersects discovery, so post-freeze accounts are excluded and existing batches never rehash;
+  //   (b) in the family loop below, REUSES each family's persisted frozen budget verbatim (never recompute/persist
+  //       from current discovery -> no PLAN_BUDGET_MISMATCH) and SKIPS any family without a frozen budget (that is
+  //       new/unfrozen work -> it joins the NEXT fresh cycle);
+  //   (c) if the frozen owners cannot be READ, or are present but all malformed, FAILS CLOSED with a typed
+  //       `deferred-frozen-scope-unavailable` result: zero jobs, zero budgets, zero reservations, zero DataDoe POSTs,
+  //       LKG preserved, the cycle left resumable.
+  // A continuation requires BOTH durable readers (listCycleOwners + getBudget); a store lacking them (offline test
+  // double) is not strict-continuation-capable and takes the fresh idempotent path (a same-membership re-persist is a
+  // no-op "exists"). A fresh cycle (no active head) always plans from discovery.
   let planningAccounts = accounts;
   let isContinuation = false;
-  if (budgets && activeCycleId && typeof store.listCycleOwners === "function") {
-    let frozenAccountIds = null;
-    try {
-      const owners = (await store.listCycleOwners(activeCycleId)) || [];
-      const ids = new Set(owners.map((o) => String((o && (o.account_id ?? o.accountId)) || "")).filter(Boolean));
-      if (ids.size > 0) frozenAccountIds = ids;
-    } catch (_e) { frozenAccountIds = null; }
-    if (frozenAccountIds) {
-      const scoped = (accounts || []).filter((a) => frozenAccountIds.has(String((a && (a.accountId ?? a.id)) || "")));
-      // Only apply the frozen-membership scope when it yields a NON-EMPTY intersection. An empty intersection means
-      // the frozen owners cannot be matched to the current accounts (or every frozen account disconnected); in that
-      // case fall back to the pre-continuation behavior rather than planning from an empty set (fail closed upstream).
-      if (scoped.length > 0) { planningAccounts = scoped; isContinuation = true; }
+  if (budgets && activeCycleId && typeof store.listCycleOwners === "function" && typeof store.getBudget === "function") {
+    isContinuation = true;
+    let owners = null;
+    try { owners = await store.listCycleOwners(activeCycleId); } catch (_e) { owners = "read-failed"; }
+    if (!Array.isArray(owners)) {
+      return deferredFrozenScope(bucket, activeCycleId, "owner-read-failed");
     }
+    const ownerAccountIds = new Set(owners.map((o) => String((o && (o.account_id ?? o.accountId)) || "").trim()).filter(Boolean));
+    if (owners.length > 0 && ownerAccountIds.size === 0) {
+      // Owners exist but every identity is blank/malformed -> cannot establish the frozen membership -> fail closed.
+      return deferredFrozenScope(bucket, activeCycleId, "owner-identities-malformed");
+    }
+    const scoped = (accounts || []).filter((a) => ownerAccountIds.has(String((a && (a.accountId ?? a.id)) || "")));
+    // Scope to the frozen per-account membership when it intersects discovery. A cycle whose only frozen work is the
+    // org-wide catalog (no per-account owner matches discovery) plans from current accounts but executes ONLY frozen
+    // tranche budgets below (per-account families without a frozen budget are skipped -- never fresh discovery work).
+    if (scoped.length > 0) planningAccounts = scoped;
   }
 
   const plan = planBucketSourceSync({
@@ -482,18 +505,22 @@ export async function runBucketSourceSync({
     const trancheKey = `source-sync:${family.sourceKey}`;
     let budget = null;
     if (budgets && typeof store.persistBudget === "function") {
-      // CONTINUATION: LOAD + REUSE the already-persisted frozen budget verbatim (never recompute/re-persist from
-      // current discovery). The plan was re-derived from the frozen membership above, so the frozen hashes are the
-      // exact ones this pass will reserve against; a genuine structural/pricing drift still fails closed at reserve.
-      let frozenRow = null;
-      if (isContinuation && typeof store.getBudget === "function") {
+      if (isContinuation) {
+        // STRICT CONTINUATION (P0-2): REUSE the already-persisted frozen budget verbatim -- NEVER recompute or
+        // re-persist from current discovery (that recompute is exactly what raised PLAN_BUDGET_MISMATCH). A family
+        // with NO valid frozen budget is new/unfrozen work on an active cycle: SKIP it (zero jobs/reservations/POSTs)
+        // -- it joins the NEXT fresh cycle. LKG preserved either way.
+        let frozenRow = null;
         try { frozenRow = await store.getBudget({ cycleId: activeCycleId, trancheKey }); } catch (_e) { frozenRow = null; }
-      }
-      if (frozenRow && frozenRow.plan_fingerprint) {
-        rollup.cycleId = rollup.cycleId || activeCycleId;
-        budget = { trancheKey, planFingerprint: String(frozenRow.plan_fingerprint) };
+        if (frozenRow && frozenRow.plan_fingerprint) {
+          rollup.cycleId = rollup.cycleId || activeCycleId;
+          budget = { trancheKey, planFingerprint: String(frozenRow.plan_fingerprint) };
+        } else {
+          rollup.families.push({ sourceKey: family.sourceKey, continuations: 0, state: null, skipped: "not-in-frozen-scope" });
+          continue;
+        }
       } else {
-        // NEW cycle OR first freeze of this family this cycle: compute + persist from the current plan.
+        // FRESH cycle: compute + persist the frozen budget from the current plan (first freeze).
         const frozen = computeFrozenTrancheBudget({
           plannedJobs: family.plannedJobs, sourceTranche: tranche,
           isPremiumOf: registryIsPremiumOf, trancheKey,

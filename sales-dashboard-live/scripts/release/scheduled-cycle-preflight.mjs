@@ -28,7 +28,7 @@ if (accountScope === "bootstrap") {
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
-const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
+const { fetchExportEligibleAccounts, classifyDiscoveryOutcome } = await import("../../lib/server/sync/account-onboarding.js");
 const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
 // EXPORT-ELIGIBILITY GATE: the cycle preflight scopes to the SAME export-eligible set the run will use.
 const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows });
@@ -46,7 +46,11 @@ const { active } = classifyDirectoryAccounts(rows, connections);
 const seen = new Set();
 const discovered = [];
 for (const a of active) { const id = String((a && (a.accountId ?? a.id)) || "").trim(); const country = String((a && a.country) || "").toUpperCase(); if (!id || id.includes(":") || seen.has(id)) continue; if (!accountInScope(bucket, country)) continue; seen.add(id); discovered.push({ accountId: id }); }
-if (!discovered.length) { console.error("STOP no discovered " + bucket + " primary accounts"); process.exit(1); }
+if (!discovered.length) {
+  // P1-4: typed discovery disposition instead of a generic "no accounts".
+  const disp = classifyDiscoveryOutcome(rows);
+  console.error("STOP " + (disp.deferred ? disp.message + " [bucket=" + bucket + "]" : "no export-eligible " + bucket + " primary accounts (discovery had eligible accounts in other regions)")); process.exit(1);
+}
 
 let cycle = null;
 try { cycle = await getSyncCycleByBucketDate(bucket, today); }

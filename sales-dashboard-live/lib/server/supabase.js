@@ -1187,17 +1187,30 @@ export async function getAccountOnboardingRows() {
 // Idempotent upsert of onboarding rows (merge-duplicates on account_id). `first_discovered_at` is
 // intentionally NOT in the payload so a conflict update preserves the original discovery time, and
 // `operation_id`/`bootstrap_started_at` are NEVER written here -- only the claim RPC owns them.
+//
+// PostgREST rejects a bulk-upsert array whose objects have DIFFERENT key sets with HTTP 400 "All object keys must
+// match". Discovery rows legitimately OMIT optional columns per status (e.g. ready_at, bootstrap_completed_at), and
+// omission is load-bearing: a merge-duplicates upsert that OMITS a column preserves its durable value, whereas
+// sending it as null would ERASE it. So we GROUP rows by their exact key signature and send ONE upsert per group --
+// every object in a request has identical keys (no 400), and omitted columns stay untouched. Any group failure
+// throws (the caller must treat the whole pass as failed, never partially succeeded); each row is idempotent, so a
+// retry re-applies cleanly and never erases ready_at / bootstrap_completed_at / operation_id / failure evidence.
 export async function upsertAccountOnboardingRows(rows) {
   if (!rows || !rows.length) return;
-  const body = rows.map((r) => {
+  const groups = new Map(); // sorted-key signature -> [owned rows]
+  for (const r of rows) {
     const { first_discovered_at: _fd, operation_id: _op, bootstrap_started_at: _bs, ...owned } = r;
-    return owned;
-  });
-  await request("/rest/v1/account_onboarding?on_conflict=account_id", {
-    method: "POST",
-    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-    body,
-  });
+    const signature = Object.keys(owned).sort().join(","); // comma-separated so distinct key sets can never collide
+    if (!groups.has(signature)) groups.set(signature, []);
+    groups.get(signature).push(owned);
+  }
+  for (const body of groups.values()) {
+    await request("/rest/v1/account_onboarding?on_conflict=account_id", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body,
+    });
+  }
 }
 
 // The ATOMIC bootstrap claim (SECURITY DEFINER RPC): transitions ready_for_bootstrap -> bootstrapping

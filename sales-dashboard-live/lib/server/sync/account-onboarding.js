@@ -575,9 +575,64 @@ export async function fetchExportEligibleAccounts(apiKey, { fetchDetailed, readO
         : null;
     } catch { establishedAccountIds = null; }
   }
-  const { eligible, excluded, gateMode } = filterExportEligibleAccounts({ detailedAccounts: detailed, onboardingRows, establishedAccountIds, requireAuthoritativeScope });
+  const { eligible, excluded, gateMode, hasAuthoritativeScope } = filterExportEligibleAccounts({ detailedAccounts: detailed, onboardingRows, establishedAccountIds, requireAuthoritativeScope });
   if (excluded.length && typeof onExcluded === "function") {
-    try { onExcluded(excluded, gateMode); } catch { /* reporting must never fail discovery */ }
+    try { onExcluded(excluded, gateMode, { hasAuthoritativeScope }); } catch { /* reporting must never fail discovery */ }
   }
-  return eligible.map(toLegacyAccountShape);
+  // P1-4: PROPAGATE the typed discovery result through the array-returning drop-in. The return value is still a
+  // plain Array<legacyAccount> (every caller that does .length / iterate / .map / JSON.stringify is byte-identical),
+  // but it carries NON-ENUMERABLE typed metadata so a paid/scheduled caller can DISTINGUISH a genuine deferral from
+  // an empty directory instead of collapsing both into a generic "no accounts discovered". `discoveryState`:
+  //   - "eligible"                 -> >=1 export-eligible account (normal path)
+  //   - "no-authoritative-scope"   -> accounts EXIST in the directory but NONE carry authoritative onboarding/
+  //                                   established scope: DEFER before any cycle/export (never a brand-new bypass)
+  //   - "all-awaiting-onboarding"  -> accounts exist WITH authoritative scope but none are export-ready yet
+  //                                   (waiting/bootstrapping/blocked): DEFER, established accounts unaffected
+  //   - "no-accounts-discovered"   -> the directory itself returned zero accounts (empty/still-loading region)
+  const result = eligible.map(toLegacyAccountShape);
+  // An EMPTY directory is the most specific signal (there is nothing to have scope for), so it wins over the
+  // scope-derived gateMode; otherwise eligibility, then no-authoritative-scope, then awaiting-onboarding.
+  const discoveryState = detailed.length === 0 ? "no-accounts-discovered"
+    : result.length > 0 ? "eligible"
+      : gateMode === "no-authoritative-scope" ? "no-authoritative-scope"
+        : "all-awaiting-onboarding";
+  Object.defineProperties(result, {
+    gateMode: { value: gateMode, enumerable: false },
+    hasAuthoritativeScope: { value: hasAuthoritativeScope, enumerable: false },
+    discoveredCount: { value: detailed.length, enumerable: false },
+    eligibleCount: { value: result.length, enumerable: false },
+    excludedCount: { value: excluded.length, enumerable: false },
+    excluded: { value: excluded, enumerable: false },
+    discoveryState: { value: discoveryState, enumerable: false },
+    deferred: { value: discoveryState !== "eligible", enumerable: false },
+  });
+  return result;
+}
+
+/**
+ * P1-4: classify a discovery outcome for a PAID/scheduled operator into a typed, honest disposition. Accepts either
+ * the metadata-carrying array from fetchExportEligibleAccounts OR an explicit descriptor. Returns:
+ *   { deferred, code, ok, message } -- `deferred` true means STOP before any cycle/export with a CLEAR typed reason
+ * (never a false success, never a generic "no accounts" error). `code` is the machine-readable disposition.
+ */
+export function classifyDiscoveryOutcome(rowsOrMeta) {
+  const meta = rowsOrMeta || {};
+  const state = meta.discoveryState
+    || (Array.isArray(rowsOrMeta) && rowsOrMeta.length ? "eligible" : "no-accounts-discovered");
+  const discovered = Number.isFinite(meta.discoveredCount) ? meta.discoveredCount : (Array.isArray(rowsOrMeta) ? rowsOrMeta.length : 0);
+  const eligible = Number.isFinite(meta.eligibleCount) ? meta.eligibleCount : (Array.isArray(rowsOrMeta) ? rowsOrMeta.length : 0);
+  switch (state) {
+    case "eligible":
+      return { deferred: false, code: "eligible", ok: true, message: `${eligible} export-eligible account(s)` };
+    case "no-authoritative-scope":
+      return { deferred: true, code: "no-authoritative-scope", ok: false,
+        message: `DEFERRED (no-authoritative-scope): ${discovered} account(s) discovered but NONE carry authoritative onboarding/established scope -- deferring before any cycle/export (fail closed, LKG preserved; run account onboarding first)` };
+    case "all-awaiting-onboarding":
+      return { deferred: true, code: "all-awaiting-onboarding", ok: false,
+        message: `DEFERRED (all-awaiting-onboarding): ${discovered} account(s) discovered with authoritative scope but NONE are export-ready yet (waiting/bootstrapping/blocked) -- deferring before any cycle/export (LKG preserved)` };
+    case "no-accounts-discovered":
+    default:
+      return { deferred: true, code: "no-accounts-discovered", ok: false,
+        message: `DEFERRED (no-accounts-discovered): the primary directory returned ZERO accounts for this scope (empty or still-loading) -- deferring before any cycle/export (no false success)` };
+  }
 }
