@@ -15716,3 +15716,33 @@ MIGRATION 20260920_fba_lead_time_bulk_note.sql is still UNAPPLIED (approval-gate
 (1) apply the migration with approval, then verify RPC note persistence on a real bulk import; (2) the authenticated
 browser flow (download -> edit -> preview -> import -> reload -> persistence + A->B switch) needs a real session.
 Do NOT claim acceptance from helper/integration tests or deploy success alone.
+
+### FBA Shipment Plan audit ROUND 3 -- lifecycle extraction + 4 residual defects (2026-09-08, base bafea22; pure code; zero DataDoe)
+
+Extracted the ENTIRE FBA config lifecycle into ONE tested production hook src/lib/use-fba-plan-config.js (used by
+App.jsx AND the integration test -- no more copied test component), and fixed four residual lifecycle defects:
+1. OBSOLETE RELOAD REJECTION: reload() now returns BEFORE loader.begin()/state-clear/error when the live account or
+   token no longer matches the account this reload is bound to. A delayed POST for A resolving after a switch to B no
+   longer starts an A reload, bumps the generation (which had invalidated B's in-flight GET), or clears B's config.
+   ALL saves route through a single guarded write() so this covers settings/warehouse/sku-horizon/warehouse-bulk/
+   wdd/lead-time uniformly.
+2. IMPORT COMPLETION GUARDED BY OP IDENTITY: applyImport guards EVERY side effect (preview clear, busy reset, notice,
+   reload) on current() = pv.isCurrent() (generation) && canApplyImport(scope, live). Preview clears use a functional
+   update keyed on the exact preview object, so an OLD apply can never clear a NEWER preview or release its busy.
+   Account equality alone is insufficient; this handles A->B->A and newer same-account imports.
+3. ACCOUNT-FILTERED RENDER VALUES: scopedConfig = configForAccount(planConfig, accountId); settings, warehouse,
+   overrides, WDD weights, lead times and the template/preview data all derive from scopedConfig, so A's values are
+   never derived under B at RENDER time (not relying on an effect clearing raw state after render).
+4. DEFERRED-POST TESTS against the REAL hook (react-test-renderer mounts useFbaPlanConfig): A POST pending -> switch
+   B -> B GET pending -> A POST resolves (B GET survives, B config intact) both before AND after B loaded; a new
+   preview opened before A's apply completes (old apply never clears it); A->B->A with a newer import (stale
+   isCurrent()=false, fresh=true, POST targets A). Asserts zero wrong-account writes across every scenario.
+
+App.jsx shrank ~230 lines (lifecycle now in the hook). Kept note/header fixes, session-SWR invariant (the hook's
+ref-mirror effect is keyed on account+token, never token-only), formulas, permissions, schedulers. verify 173/149
+incl build:check; git diff --check clean; api/*.js=12; zero DataDoe. Tests: import-lifecycle (15), scoped-loader (9),
+fba-import-integration (27, real hook), fba-lead-time-import (28), fba-plan-config-handler (16).
+
+MIGRATION 20260920 STILL UNAPPLIED (approval-gated). PRODUCTION ACCEPTANCE PENDING: apply the migration with approval
++ verify RPC note persistence; then the authenticated browser flow (download -> edit -> preview -> import -> reload ->
+persistence + A->B switch). Do NOT claim acceptance from tests or deploy success alone.

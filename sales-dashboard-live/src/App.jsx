@@ -36,8 +36,7 @@ import { matchesPlanBrand, UNMAPPED_BRAND } from "./lib/plan-brand.js";
 // ADDITIVE FBA WDD / lead-time / reorder model (sits BESIDE the existing planner; never replaces it).
 import { computeAsinWdd, resolveWddWeights, validateWddWeights, WDD_DEFAULT_WEIGHTS } from "./lib/fba-wdd.js";
 import { buildFbaLeadTimeMatrix, validateFbaLeadTimeRows, validateFbaLeadTimeText } from "./lib/fba-lead-time-import.js";
-import { makeScopedLoader } from "./lib/scoped-loader.js";
-import { importScopeKey, resolveLeadTimeNote, canApplyImport, tagConfigAccount, isConfigReady } from "./lib/import-lifecycle.js";
+import { useFbaPlanConfig } from "./lib/use-fba-plan-config.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import { canonicalBrandKey, permittedBrandKeySetForAccount, filterBrandNamesToPermitted } from "./lib/brand-scope-filter.js";
 // Regional Brand View: Region -> Brand selection, using the SINGLE canonical marketplace->region mapping the
@@ -1907,34 +1906,24 @@ function DashboardApp({ session, access, onSignOut }) {
   const [targetDays, setTargetDays] = useState(30);
   const [planSearch, setPlanSearch] = useState("");
   const [planSort, setPlanSort] = useState({ key: "recommended", dir: "desc" });
-  // Durable, per-seller planning config (settings + SKU horizon overrides + seller warehouse), loaded from the
-  // account-scoped API. A settings/warehouse change re-reads this and recomputes locally with ZERO DataDoe.
-  const [planConfig, setPlanConfig] = useState(null);
-  const [planConfigBusy, setPlanConfigBusy] = useState(false);
-  // A configuration-READ failure. Shown as a distinct notice so a failed load NEVER renders defaults as if they were
-  // saved settings (audit 2026-09-08). Cleared on a successful (account-current) load.
-  const [planConfigError, setPlanConfigError] = useState(null);
-  // Confirm-before-apply preview for the lead-time import: { result } (the validated parse) | null.
-  const [leadTimePreview, setLeadTimePreview] = useState(null);
-  // The LIVE selected account, mirrored into a ref so an in-flight config load resolving after an account switch can
-  // detect it and refuse to write another account's data into this account's state (account-keyed guard).
-  // The LIVE account + session token mirrored into refs so an in-flight import/load can detect an account switch or a
-  // sign-out / token rotation. Kept in ONE effect keyed on both (never a token-ONLY effect: a token-only effect would
-  // re-run on every silent refresh, which the session-SWR fix deliberately avoids -- and this only updates refs).
-  const selectedAccountIdRef = useRef(selectedAccountId);
-  const sessionTokenRef = useRef(session?.access_token || null);
-  useEffect(() => { selectedAccountIdRef.current = selectedAccountId; sessionTokenRef.current = session?.access_token || null; }, [selectedAccountId, session?.access_token]);
-  // The account-keyed load guard for the plan config (pure, tested in scripts/scoped-loader.test.js). Reads the LIVE
-  // account from the ref so a stale/failed/superseded response is discarded rather than written to another account.
-  const planConfigLoader = useRef(null);
-  if (!planConfigLoader.current) planConfigLoader.current = makeScopedLoader(() => selectedAccountIdRef.current);
-  // The import-lifecycle guard: its scope is the account AND the session token, so a slow parse whose account/session
-  // changed mid-flight (file-select -> arrayBuffer/text -> parse -> preview) is discarded and never becomes a preview.
-  const leadTimeImportLoader = useRef(null);
-  if (!leadTimeImportLoader.current) leadTimeImportLoader.current = makeScopedLoader(() => importScopeKey(selectedAccountIdRef.current, sessionTokenRef.current));
-  // Current lead-times keyed by ASIN, mirrored into a ref so saveLeadTime (defined before the memo) can PRESERVE an
-  // existing note when an inline day edit / Start-Reset omits it.
-  const leadTimeByAsinRef = useRef(new Map());
+  // Durable, per-seller planning config (settings + SKU horizon overrides + seller warehouse + WDD + lead times),
+  // loaded from the account-scoped API. The ENTIRE lifecycle -- account-keyed load, obsolete-reload rejection,
+  // account-filtered config, and the lead-time import (file -> parse -> preview -> confirm -> POST -> reload) with
+  // per-operation-identity guards -- lives in the shared, tested hook (src/lib/use-fba-plan-config.js). A settings /
+  // warehouse / lead-time change re-reads this and recomputes locally with ZERO DataDoe.
+  const planCfg = useFbaPlanConfig({
+    accountId: selectedAccountId,
+    token: session?.access_token || null,
+    active: view === "fbaplan",
+    apiFetch: authFetch,
+    onWriteError: (msg) => setPlanError(msg),
+  });
+  const {
+    scopedConfig, planConfigError, planConfigReady, planActionsBusy, leadTimeByAsin,
+    write: writePlanConfig, saveLeadTime,
+    leadTimePreview, leadTimeNotice, leadTimeImportBusy,
+    beginImport: onImportLeadTimeFile, applyImport: applyLeadTimePreview, dismissPreview: dismissLeadTimePreview,
+  } = planCfg;
   // Per-user column visibility (set of HIDDEN column ids), the SKU-horizon editor target, and the bulk-import modal.
   const [planHiddenCols, setPlanHiddenCols] = useState(() => new Set());
   const [planColsBusy, setPlanColsBusy] = useState(false);
@@ -2573,47 +2562,13 @@ function DashboardApp({ session, access, onSignOut }) {
   }, [view, loadCachedPlan]);
   useAutoRevalidate(loadCachedPlan, { active: view === "fbaplan" });
 
-  // Load the durable planning config for the selected account (read-only; never DataDoe). Resets on account change so
-  // one account's settings/warehouse never leak into another.
-  const loadPlanConfig = useCallback(async () => {
-    if (!selectedAccountId || !session?.access_token) { setPlanConfig(null); setPlanConfigError(null); return; }
-    const acct = selectedAccountId;
-    // Request-generation + account-keyed guard: a NEWER load (any account switch re-creates this callback and re-runs
-    // the effect, bumping the generation) supersedes an older one, and the LIVE account is re-checked at completion via
-    // the ref. So a slow A load, an A->B switch, or an A->B->A round-trip can never let a stale/other-account response
-    // (or a failed request, or a post-upload reload) overwrite the active account's configuration.
-    const isCurrent = planConfigLoader.current.begin(acct);
-    // ACCOUNT-KEYED: drop any config that belongs to a DIFFERENT account IMMEDIATELY (before the await), so account
-    // A's settings / warehouse / lead-times are never rendered under account B while B loads. A same-account reload
-    // (post-save) keeps the current config until the fresh one arrives (no flash).
-    setPlanConfig((prev) => (prev && prev.__accountId === acct ? prev : null));
-    setPlanConfigError(null);
-    try {
-      const cfg = await authFetch(`/api/fba-plan-config?accountId=${encodeURIComponent(acct)}`, session.access_token);
-      if (!isCurrent()) return;
-      // Tag the config with its account so every config-derived value can prove which account it is showing.
-      setPlanConfig(tagConfigAccount(cfg, acct));
-      setPlanConfigError(null);
-    } catch (e) {
-      if (!isCurrent()) return;
-      // A READ failure must NOT render defaults as saved settings. Drop stale config and surface a typed notice so the
-      // planner shows "couldn't load" (with a retry) rather than empty defaults that look like a wiped configuration.
-      setPlanConfig(null);
-      setPlanConfigError(String(e && e.message ? e.message : e) || "Could not load this account's configuration.");
-    }
-  }, [selectedAccountId, session?.access_token]);
-  useEffect(() => { if (view === "fbaplan") loadPlanConfig(); else { setPlanConfig(null); setPlanConfigError(null); } }, [view, loadPlanConfig]);
-  // Whether the CURRENT account's configuration is loaded (belongs to it). Config-dependent actions are disabled until
-  // this is true, so nothing is saved/imported against a not-yet-loaded (or another account's) configuration.
-  const planConfigReady = isConfigReady(planConfig, selectedAccountId);
-  // Config-dependent write actions (save settings, warehouse/lead-time edits, imports) are disabled while a write is in
-  // flight OR the current account's config is not yet loaded -- so nothing is ever saved against a stale/other-account
-  // (or not-yet-loaded) configuration.
-  const planActionsBusy = planConfigBusy || !planConfigReady;
+  // (The plan-config load, obsolete-reload rejection, account filtering, readiness/busy flags and the import lifecycle
+  // are all provided by useFbaPlanConfig above -- loadPlanConfig/planConfigReady/planActionsBusy/scopedConfig etc.)
 
-  // The resolved ACCOUNT-DEFAULT planning settings (durable, with the system defaults when unsaved).
+  // The resolved ACCOUNT-DEFAULT planning settings (durable, with the system defaults when unsaved). Derived from the
+  // ACCOUNT-FILTERED scopedConfig so account A's saved settings are never shown under B (defect 3).
   const planAccountSettings = useMemo(() => {
-    const s = planConfig?.settings || null;
+    const s = scopedConfig?.settings || null;
     const horizon = normalizeHorizon(
       s ? (s.horizon_kind === "days" ? { kind: "days", days: s.horizon_days } : { kind: "months", months: s.horizon_months }) : null
     ) || { ...SYSTEM_DEFAULT_HORIZON };
@@ -2624,19 +2579,20 @@ function DashboardApp({ session, access, onSignOut }) {
       safetyDays: Number.isFinite(Number(s?.safety_days)) ? Number(s.safety_days) : DEFAULT_SAFETY_DAYS,
       isSaved: !!s,
     };
-  }, [planConfig]);
+  }, [scopedConfig]);
 
-  // SKU horizon overrides + seller warehouse qty, keyed for O(1) lookup during the per-row planning compute.
+  // SKU horizon overrides + seller warehouse qty, keyed for O(1) lookup during the per-row planning compute. Both are
+  // derived from the ACCOUNT-FILTERED scopedConfig (defect 3).
   const planSkuOverrides = useMemo(() => {
     const m = new Map();
-    for (const o of planConfig?.overrides || []) m.set(String(o.sku), o.horizon_kind === "days" ? { kind: "days", days: o.horizon_days } : { kind: "months", months: o.horizon_months });
+    for (const o of scopedConfig?.overrides || []) m.set(String(o.sku), o.horizon_kind === "days" ? { kind: "days", days: o.horizon_days } : { kind: "months", months: o.horizon_months });
     return m;
-  }, [planConfig]);
+  }, [scopedConfig]);
   const planWarehouseBySku = useMemo(() => {
     const m = new Map();
-    for (const w of planConfig?.warehouse || []) m.set(String(w.sku), { qty: Number(w.qty), marketplace: w.marketplace, childAsin: w.child_asin || "", note: w.note || "", updatedByEmail: w.updated_by_email || "" });
+    for (const w of scopedConfig?.warehouse || []) m.set(String(w.sku), { qty: Number(w.qty), marketplace: w.marketplace, childAsin: w.child_asin || "", note: w.note || "", updatedByEmail: w.updated_by_email || "" });
     return m;
-  }, [planConfig]);
+  }, [scopedConfig]);
 
   // Org-wide Product Catalog ASIN -> { brand, productName }, for enriching manual/warehouse SKUs + proving an ASIN
   // exists during import. Present on v2d-5+ snapshots.
@@ -2669,104 +2625,54 @@ function DashboardApp({ session, access, onSignOut }) {
   const planKnownSkus = useMemo(() => new Set(planSkuDirectory.keys()), [planSkuDirectory]);
 
   // Persist the account planning settings, then reload the config (recomputes the plan locally, zero DataDoe).
+  // Every save routes through the hook's guarded `write` (POST then the obsolete-reload-rejecting reload), so a save
+  // whose account switched mid-flight can never clear/replace the new account's config (defect 1).
   const savePlanSettings = useCallback(async (patch) => {
-    if (!selectedAccountId || !session?.access_token) return;
+    if (!selectedAccountId) return;
     const cur = planAccountSettings;
     const horizon = patch.horizon || cur.horizon;
-    const body = {
+    await writePlanConfig({
       kind: "settings", accountId: selectedAccountId,
       horizonKind: horizon.kind, horizonMonths: horizon.kind === "months" ? horizon.months : undefined, horizonDays: horizon.kind === "days" ? horizon.days : undefined,
       forecastMethod: patch.forecastMethod || cur.forecastMethod,
       forecastWeights: (patch.forecastMethod || cur.forecastMethod) === "weighted" ? (patch.forecastWeights || cur.forecastWeights) : undefined,
       safetyDays: patch.safetyDays != null ? patch.safetyDays : cur.safetyDays,
-    };
-    setPlanConfigBusy(true);
-    try { await authFetch("/api/fba-plan-config", session.access_token, { method: "POST", body: JSON.stringify(body) }); await loadPlanConfig(); }
-    catch (e) { setPlanError(String(e && e.message ? e.message : e)); }
-    finally { setPlanConfigBusy(false); }
-  }, [selectedAccountId, session?.access_token, planAccountSettings, loadPlanConfig]);
+    });
+  }, [selectedAccountId, planAccountSettings, writePlanConfig]);
 
   // Persist one seller-warehouse quantity (qty=null clears it), then reload + recompute.
   const saveWarehouseQty = useCallback(async ({ sku, marketplace, childAsin, qty, note }) => {
-    if (!selectedAccountId || !session?.access_token || !sku || !marketplace) return;
-    setPlanConfigBusy(true);
-    try {
-      await authFetch("/api/fba-plan-config", session.access_token, {
-        method: "POST",
-        body: JSON.stringify({ kind: "warehouse", accountId: selectedAccountId, sku, marketplace, childAsin: childAsin || "", qty: qty == null ? undefined : qty, clear: qty == null, note: note || "" }),
-      });
-      await loadPlanConfig();
-    } catch (e) { setPlanError(String(e && e.message ? e.message : e)); }
-    finally { setPlanConfigBusy(false); }
-  }, [selectedAccountId, session?.access_token, loadPlanConfig]);
+    if (!selectedAccountId || !sku || !marketplace) return;
+    await writePlanConfig({ kind: "warehouse", accountId: selectedAccountId, sku, marketplace, childAsin: childAsin || "", qty: qty == null ? undefined : qty, clear: qty == null, note: note || "" });
+  }, [selectedAccountId, writePlanConfig]);
 
   // Persist (or clear) ONE SKU's horizon override, then reload + recompute. clear=true reverts the SKU to the
   // account default ("inherit").
   const saveSkuHorizon = useCallback(async ({ sku, horizon, clear }) => {
-    if (!selectedAccountId || !session?.access_token || !sku) return;
+    if (!selectedAccountId || !sku) return;
     const body = clear
       ? { kind: "sku-horizon", accountId: selectedAccountId, sku, clear: true }
       : { kind: "sku-horizon", accountId: selectedAccountId, sku, horizonKind: horizon.kind, horizonMonths: horizon.kind === "months" ? horizon.months : undefined, horizonDays: horizon.kind === "days" ? horizon.days : undefined };
-    setPlanConfigBusy(true);
-    try { await authFetch("/api/fba-plan-config", session.access_token, { method: "POST", body: JSON.stringify(body) }); await loadPlanConfig(); setSkuHorizonEdit(null); }
-    catch (e) { setPlanError(String(e && e.message ? e.message : e)); }
-    finally { setPlanConfigBusy(false); }
-  }, [selectedAccountId, session?.access_token, loadPlanConfig]);
+    await writePlanConfig(body);
+    setSkuHorizonEdit(null);
+  }, [selectedAccountId, writePlanConfig]);
 
   // Atomic bulk seller-warehouse apply (validated + de-duplicated client rows). Returns the applied count or throws.
+  // busy:false -- the warehouse modal owns its own "applying" state; rethrow so the modal can surface the error.
   const bulkImportWarehouse = useCallback(async (rows) => {
-    if (!selectedAccountId || !session?.access_token) throw new Error("No account selected.");
-    const res = await authFetch("/api/fba-plan-config", session.access_token, {
-      method: "POST", body: JSON.stringify({ kind: "warehouse-bulk", accountId: selectedAccountId, rows }),
-    });
-    await loadPlanConfig();
-    return res;
-  }, [selectedAccountId, session?.access_token, loadPlanConfig]);
+    if (!selectedAccountId) throw new Error("No account selected.");
+    return writePlanConfig({ kind: "warehouse-bulk", accountId: selectedAccountId, rows }, { busy: false, rethrow: true });
+  }, [selectedAccountId, writePlanConfig]);
 
   // ADDITIVE: persist one brand's WDD blend weights (brandKey "" == the account default for unmapped ASINs), then
   // reload + recompute locally (ZERO DataDoe). clear=true removes the record. The server re-validates 0..100 + total-100.
   const saveWddWeights = useCallback(async ({ brandKey: bk = "", w7, w30, w60, clear } = {}) => {
-    if (!selectedAccountId || !session?.access_token) return;
+    if (!selectedAccountId) return;
     const body = clear
       ? { kind: "wdd-weights", accountId: selectedAccountId, brandKey: bk, clear: true }
       : { kind: "wdd-weights", accountId: selectedAccountId, brandKey: bk, w7, w30, w60 };
-    setPlanConfigBusy(true);
-    try { await authFetch("/api/fba-plan-config", session.access_token, { method: "POST", body: JSON.stringify(body) }); await loadPlanConfig(); }
-    catch (e) { setPlanError(String(e && e.message ? e.message : e)); throw e; }
-    finally { setPlanConfigBusy(false); }
-  }, [selectedAccountId, session?.access_token, loadPlanConfig]);
-
-  // ADDITIVE: persist one ASIN's lead-time inputs. action "set" preserves any running countdown; "start" (with a
-  // marketplace-local start date) recomputes + stores the Inbound ETA; "clear" removes the row. Reload + recompute.
-  const saveLeadTime = useCallback(async ({ childAsin, production, shipping, awd, safety, note, action = "set", startedDate } = {}) => {
-    if (!selectedAccountId || !session?.access_token || !childAsin) return;
-    const body = { kind: "lead-time", accountId: selectedAccountId, childAsin, action };
-    if (action === "clear") { /* identity only */ }
-    else {
-      body.production = production; body.shipping = shipping; body.awd = awd; body.safety = safety;
-      // PRESERVE the existing note when the caller omits it (an inline day edit / Start-Reset never touches the note);
-      // only an explicitly supplied note (incl. "" the user approved) changes it. Read from the ref (current values).
-      body.note = resolveLeadTimeNote(note, leadTimeByAsinRef.current.get(String(childAsin).toUpperCase())?.note);
-      if (action === "start") body.startedDate = startedDate;
-    }
-    setPlanConfigBusy(true);
-    try { await authFetch("/api/fba-plan-config", session.access_token, { method: "POST", body: JSON.stringify(body) }); await loadPlanConfig(); }
-    catch (e) { setPlanError(String(e && e.message ? e.message : e)); throw e; }
-    finally { setPlanConfigBusy(false); }
-  }, [selectedAccountId, session?.access_token, loadPlanConfig]);
-
-  // ADDITIVE: atomic bulk lead-time import (validated client rows; blank-as-clear). Returns the applied count or throws.
-  // `accountId` is passed EXPLICITLY (the account the preview was parsed for) so the POST can never be retargeted to a
-  // different live account; the caller (applyLeadTimePreview) rechecks identity immediately before invoking this.
-  const bulkImportLeadTimes = useCallback(async (rows, accountId = selectedAccountId) => {
-    const token = session?.access_token;
-    if (!accountId || !token) throw new Error("No account selected.");
-    const res = await authFetch("/api/fba-plan-config", token, {
-      method: "POST", body: JSON.stringify({ kind: "lead-time-bulk", accountId, rows }),
-    });
-    await loadPlanConfig();
-    return res;
-  }, [selectedAccountId, session?.access_token, loadPlanConfig]);
+    await writePlanConfig(body, { rethrow: true });
+  }, [selectedAccountId, writePlanConfig]);
 
   // Per-USER column-visibility prefs: localStorage for an instant first paint, then the durable server copy (which
   // wins). Saving writes both. A guest (no session) keeps localStorage only.
@@ -3399,19 +3305,10 @@ function DashboardApp({ session, access, onSignOut }) {
   // Saved per-brand WDD weights ('' key = the explicit account default used by unmapped ASINs) + per-ASIN lead-times.
   const wddWeightsByKey = useMemo(() => {
     const m = new Map();
-    for (const w of planConfig?.wddWeights || []) m.set(String(w.brand_key || ""), { w7: Number(w.weight_7d), w30: Number(w.weight_30d), w60: Number(w.weight_60d) });
+    for (const w of scopedConfig?.wddWeights || []) m.set(String(w.brand_key || ""), { w7: Number(w.weight_7d), w30: Number(w.weight_30d), w60: Number(w.weight_60d) });
     return m;
-  }, [planConfig?.wddWeights]);
-  const leadTimeByAsin = useMemo(() => {
-    const m = new Map();
-    for (const lt of planConfig?.leadTimes || []) m.set(String(lt.child_asin || "").toUpperCase(), {
-      production: lt.production_days ?? null, shipping: lt.shipping_days ?? null, awd: lt.awd_transfer_days ?? null, safety: lt.safety_stock_days ?? null,
-      inboundStarted: lt.inbound_started_date || null, inboundEta: lt.inbound_eta || null, note: lt.note || "", updatedByEmail: lt.updated_by_email || "",
-    });
-    return m;
-  }, [planConfig?.leadTimes]);
-  // Mirror into a ref so saveLeadTime (defined earlier) can preserve an existing note on an omitted-note write.
-  useEffect(() => { leadTimeByAsinRef.current = leadTimeByAsin; }, [leadTimeByAsin]);
+  }, [scopedConfig?.wddWeights]);
+  // (leadTimeByAsin is derived from the ACCOUNT-FILTERED scopedConfig inside useFbaPlanConfig and destructured above.)
   // Marketplace-LOCAL current date for the account (drives Days to Inbound + a countdown start), never the browser clock.
   const planMarketToday = useMemo(() => marketplaceToday(planData?.marketCountry || "US"), [planData?.marketCountry]);
 
@@ -3437,12 +3334,7 @@ function DashboardApp({ session, access, onSignOut }) {
   // The WDD-weight editor targets the SELECTED brand's canonical key, or '' (the account default) for All Brands /
   // Unmapped -- never inferring one brand's weights from another.
   const wddEditKey = useMemo(() => ((selectedBrand && selectedBrand !== "ALL" && selectedBrand !== UNMAPPED_BRAND) ? (canonicalBrandKey(selectedBrand) || "") : ""), [selectedBrand]);
-  const [leadTimeImportBusy, setLeadTimeImportBusy] = useState(false);
-  const [leadTimeNotice, setLeadTimeNotice] = useState(null);
   const leadTimeFileRef = useRef(null);
-  // Invalidate any pending import parse / preview + its notice/busy the instant the account or session changes, so an
-  // A-parsed preview can never linger (or be applied) under B. (The parse also self-cancels via the import guard.)
-  useEffect(() => { setLeadTimePreview(null); setLeadTimeNotice(null); setLeadTimeImportBusy(false); }, [selectedAccountId, session?.access_token]);
   // ADDITIVE: download a lossless XLSX template of the visible ASINs + their current lead-time values (ASIN kept as
   // text). Editing + re-uploading applies changes; a blank cell clears that field (blank-as-clear).
   const downloadLeadTimeTemplate = useCallback(async () => {
@@ -3460,56 +3352,7 @@ function DashboardApp({ session, access, onSignOut }) {
     const url = URL.createObjectURL(new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
     const link = document.createElement("a"); link.href = url; link.download = `fba-lead-times-${String(selectedAccountId || "account").replace(/[^a-z0-9]+/gi, "-")}.xlsx`; link.click(); URL.revokeObjectURL(url);
   }, [planRowsWithWdd, selectedAccountId]);
-  // ADDITIVE: validate (shared validator, bound to THIS account + diffed against current values) then open a
-  // confirm-before-apply PREVIEW. The import is NOT applied here -- the user confirms in the preview modal. Blank cells
-  // clear (shown as "cleared" in the preview); an omitted writable column or a wrong/mixed account is rejected upfront.
-  const onImportLeadTimeFile = useCallback(async (file) => {
-    if (!file) return;
-    // Capture the IMMUTABLE lifecycle identity at file selection. The whole parse is bound to it: a mid-flight account
-    // or session change (or a newer file selection) makes isCurrent() false, so a stale parse never becomes a preview.
-    const acct = selectedAccountId; const token = session?.access_token;
-    if (!acct || !token) { setLeadTimeNotice({ tone: "error", msg: "Select an account before importing." }); return; }
-    if (!planConfigReady) { setLeadTimeNotice({ tone: "warning", msg: "This account's configuration is still loading; try again in a moment." }); return; }
-    const scope = importScopeKey(acct, token);
-    const isCurrent = leadTimeImportLoader.current.begin(scope);
-    setLeadTimeNotice(null); setLeadTimePreview(null); setLeadTimeImportBusy(true);
-    try {
-      const opts = { expectedAccountId: acct, currentByAsin: leadTimeByAsin };
-      let result;
-      if (/\.xlsx$/i.test(file.name)) { const { readXlsxFirstSheet } = await import("./lib/xlsx-read.js"); const buf = await file.arrayBuffer(); if (!isCurrent()) return; result = validateFbaLeadTimeRows(await readXlsxFirstSheet(buf), opts); }
-      else { const text = await file.text(); if (!isCurrent()) return; result = validateFbaLeadTimeText(text, opts); }
-      if (!isCurrent()) return; // account/session changed (or a newer file) while parsing -> discard silently
-      if (!result.ok) { setLeadTimeNotice({ tone: result.nothingToApply ? "warning" : "error", msg: result.message || "Import invalid; nothing was written." }); return; }
-      // Stamp the preview with its immutable scope + the live-scope check so Apply can re-verify identity before POST.
-      setLeadTimePreview({ result, fileName: file.name, accountId: acct, token, scope, isCurrent });
-    } catch (e) { if (isCurrent()) setLeadTimeNotice({ tone: "error", msg: (e && e.message) || "Could not read the file; nothing was written." }); }
-    finally { if (isCurrent()) setLeadTimeImportBusy(false); if (leadTimeFileRef.current) leadTimeFileRef.current.value = ""; }
-  }, [selectedAccountId, session?.access_token, planConfigReady, leadTimeByAsin]);
-
-  // ADDITIVE: apply the CONFIRMED lead-time preview. Notes are carried through (childAsin + 4 days + inbound_eta + note).
-  // Identity is RE-CHECKED immediately before the POST: if the account/session changed (or a newer import superseded
-  // this one) since the preview was built, the import is CANCELLED (nothing written, nothing retargeted). The POST
-  // targets the account the preview was PARSED for. A success notice reports the applied count before the reload, so a
-  // later reload failure is distinguishable from "nothing was written".
-  const applyLeadTimePreview = useCallback(async () => {
-    const pv = leadTimePreview;
-    const rows = pv?.result?.applyRows;
-    if (!rows || !rows.length) { setLeadTimePreview(null); return; }
-    const guard = canApplyImport(pv.scope, selectedAccountId, session?.access_token);
-    if (!guard.ok || (typeof pv.isCurrent === "function" && !pv.isCurrent())) {
-      setLeadTimePreview(null);
-      setLeadTimeNotice({ tone: "warning", msg: "The account or session changed; the import was cancelled and nothing was written." });
-      return;
-    }
-    setLeadTimeImportBusy(true); setLeadTimeNotice(null);
-    try {
-      const res = await bulkImportLeadTimes(rows.map((r) => ({ childAsin: r.childAsin, production: r.production, shipping: r.shipping, awd: r.awd, safety: r.safety, inboundEta: r.inboundEta, note: r.note || "" })), pv.accountId);
-      // Only surface the success notice if THIS import is still the current one (a later account switch supersedes it).
-      if (typeof pv.isCurrent !== "function" || pv.isCurrent()) setLeadTimeNotice({ tone: "success", msg: `Applied ${res?.applied ?? rows.length} ASIN lead-time row(s) to ${pv.accountId}.` });
-      setLeadTimePreview(null);
-    } catch (e) { if (typeof pv.isCurrent !== "function" || pv.isCurrent()) setLeadTimeNotice({ tone: "error", msg: (e && e.message) || "Could not import lead times; nothing was written." }); }
-    finally { setLeadTimeImportBusy(false); }
-  }, [leadTimePreview, bulkImportLeadTimes, selectedAccountId, session?.access_token]);
+  // (onImportLeadTimeFile/applyLeadTimePreview are the hook's beginImport/applyImport, destructured above.)
 
   // The full ordered column model (identity + sales + forecast + inventory + planning + status). Each column owns its
   // header metadata + cell + footer renderer, so the grouped column chooser and the table stay perfectly in sync. AWD
@@ -4996,7 +4839,7 @@ function DashboardApp({ session, access, onSignOut }) {
           <button className="plan-tool-btn" type="button" disabled={!selectedAccountId || leadTimeImportBusy || !planConfigReady} onClick={() => leadTimeFileRef.current && leadTimeFileRef.current.click()} title="Import ASIN lead times (CSV / XLSX). Blank cells clear that field.">
             <Upload size={15} /> Import lead times
           </button>
-          <input ref={leadTimeFileRef} type="file" accept=".csv,.tsv,.xlsx,text/csv" style={{ display: "none" }} onChange={(e) => onImportLeadTimeFile(e.target.files && e.target.files[0])} />
+          <input ref={leadTimeFileRef} type="file" accept=".csv,.tsv,.xlsx,text/csv" style={{ display: "none" }} onChange={(e) => { const f = e.target.files && e.target.files[0]; onImportLeadTimeFile(f); e.target.value = ""; }} />
           <div className="plan-cols-wrap">
             <button className="plan-tool-btn" type="button" disabled={!planData} onClick={() => setPlanColsOpen((v) => !v)} aria-expanded={planColsOpen} title="Show or hide columns">
               <SlidersHorizontal size={15} /> Columns{planHiddenCols.size > 0 ? ` (${planHiddenCols.size} hidden)` : ""}
@@ -5136,7 +4979,7 @@ function DashboardApp({ session, access, onSignOut }) {
             fileName={leadTimePreview.fileName}
             busy={leadTimeImportBusy}
             onConfirm={applyLeadTimePreview}
-            onClose={() => setLeadTimePreview(null)}
+            onClose={dismissLeadTimePreview}
           />
         )}
       </div>
