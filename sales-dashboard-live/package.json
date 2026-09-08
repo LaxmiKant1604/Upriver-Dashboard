@@ -153,6 +153,7 @@
     "test:fba-d1-guard": "node scripts/fba-d1-source-guard.test.js",
     "test:account-onboarding-bootstrap": "node scripts/account-onboarding-bootstrap.test.js",
     "test:round11-publication-fence": "node scripts/round11-publication-fence.test.js",
+    "test:release-env-ordering": "node scripts/release-env-ordering.test.js",
     "test:account-onboarding-reconcile": "node scripts/account-onboarding-reconcile.test.js",
     "test:account-onboarding-upsert": "node scripts/account-onboarding-upsert.test.js",
     "test:discovery-deferral": "node scripts/discovery-deferral.test.js",

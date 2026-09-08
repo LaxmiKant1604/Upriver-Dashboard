@@ -57,3 +57,28 @@ export function loadReleaseEnv() {
   const info = applyEnv({ envFilePath: resolve(REPO_ROOT, ".env.local") });
   return { ...info, appRoot: APP_ROOT, repoRoot: REPO_ROOT };
 }
+
+// TYPED fail-closed config gate. Call this AFTER loadReleaseEnv() and BEFORE importing any lib/server module that
+// reads Supabase creds at module-evaluation time (supabase.js captures SUPABASE_URL + SUPABASE_SECRET_KEY into
+// module-level constants the instant it is imported). If the URL or the service/secret key is unavailable, this
+// throws a typed RELEASE_CONFIG_UNAVAILABLE error so the operator STOPS on an honest configuration failure --
+// it must NEVER be silently degraded into "zero accounts" / "no accounts discovered". Never prints a secret
+// value (only which variable name is missing). Returns true when configured. Pure w.r.t. the injected env map.
+export function assertSupabaseReleaseConfig(env = process.env) {
+  const url = String(env.SUPABASE_URL || env.VITE_SUPABASE_URL || "").trim();
+  const key = String(env.SUPABASE_SERVICE_ROLE_KEY || env.SUPABASE_SECRET_KEY || "").trim();
+  if (!url || !key) {
+    const missing = [
+      !url && "SUPABASE_URL (or VITE_SUPABASE_URL)",
+      !key && "SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY)",
+    ].filter(Boolean).join(" + ");
+    const err = new Error(
+      "RELEASE_CONFIG_UNAVAILABLE: " + missing + " is not configured. This is a CONFIGURATION failure -- it is NOT "
+      + "'zero accounts' / 'no accounts discovered'. Populate the release environment (load .env.local, or inject "
+      + "the CI secrets) BEFORE importing any lib/server module that captures Supabase credentials at import time."
+    );
+    err.code = "RELEASE_CONFIG_UNAVAILABLE";
+    throw err;
+  }
+  return true;
+}

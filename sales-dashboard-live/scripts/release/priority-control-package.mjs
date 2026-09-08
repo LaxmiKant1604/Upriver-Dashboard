@@ -10,15 +10,32 @@
 // advisory-locked transaction with exact PRE and POST assertions -- any failure ROLLS BACK the whole package.
 // The default (no flag) is a DRY RUN that writes nothing.
 
-import { loadReleaseEnv } from "./env-bootstrap.mjs";
-import { runControlPackageCli, PRIORITY_DISPATCH_ENABLED, PRIORITY_PROMOTED_ENABLED } from "../../lib/server/sync/source-priority-control-package.js";
-import { CONTROLLED_REPORT_KEYS } from "../../lib/server/sync/report-controls.js";
+import { loadReleaseEnv, assertSupabaseReleaseConfig } from "./env-bootstrap.mjs";
+
+// CRITICAL IMPORT ORDERING -- do NOT convert the dynamic imports below back into static imports.
+// lib/server/supabase.js captures SUPABASE_URL + SUPABASE_SECRET_KEY into MODULE-LEVEL constants the instant it
+// is imported, and priority-control-pg-store.js imports it. Static ESM imports are HOISTED and fully evaluated
+// BEFORE this file's top-level code runs, so a static import of the pg store would evaluate supabase.js while
+// process.env is still empty -- capturing BLANK credentials. Every discovery read would then fail and (this was
+// the observed production defect) surface as "0 primary accounts" -> "buildPriorityControlPackage requires >=1
+// primary account (fail closed)". The fix: keep ONLY env-bootstrap + safe Node built-ins as static imports,
+// call loadReleaseEnv() first, then DYNAMICALLY import every env-dependent lib AFTER the env is populated.
+loadReleaseEnv(); // portable: loads <repoRoot>/.env.local when present, maps SUPABASE_URL, never overrides CI env
+try {
+  // TYPED fail-closed gate BEFORE any DataDoe call, DB write, lease, control mutation, or publication. A missing
+  // URL/key is an HONEST configuration failure -- never degraded into "zero accounts" / "no accounts discovered".
+  assertSupabaseReleaseConfig();
+} catch (e) {
+  console.error("STOP " + (e && e.message));
+  process.exit(1);
+}
+
+const { runControlPackageCli, PRIORITY_DISPATCH_ENABLED, PRIORITY_PROMOTED_ENABLED } = await import("../../lib/server/sync/source-priority-control-package.js");
+const { CONTROLLED_REPORT_KEYS } = await import("../../lib/server/sync/report-controls.js");
 // The reviewed pg store + primary discovery moved VERBATIM into the shared lib (one implementation for the CLI,
 // the manual source-sync operator, and any other trusted caller -- no drift).
-import { connectPriorityControlStore, discoverPrimaryAccountIds } from "../../lib/server/sync/priority-control-pg-store.js";
-import { isRoutingScope } from "../../lib/server/sync/scheduler-scope.js";
-
-loadReleaseEnv(); // portable: loads <repoRoot>/.env.local when present, maps SUPABASE_URL, never overrides CI env
+const { connectPriorityControlStore, discoverPrimaryAccountIds } = await import("../../lib/server/sync/priority-control-pg-store.js");
+const { isRoutingScope } = await import("../../lib/server/sync/scheduler-scope.js");
 
 const MODE = process.argv.includes("--apply") ? "apply"
   : process.argv.includes("--rollback") ? "rollback"

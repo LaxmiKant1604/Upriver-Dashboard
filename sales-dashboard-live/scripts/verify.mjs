@@ -63,6 +63,7 @@ const SUITES = [
   "test:account-onboarding-worker",
   "test:account-onboarding-bootstrap",
   "test:round11-publication-fence",
+  "test:release-env-ordering",
   "test:lhv3-cycle-bucket-migration",
   "test:report-materialization-registry",
   "test:report-materialization-operation",
