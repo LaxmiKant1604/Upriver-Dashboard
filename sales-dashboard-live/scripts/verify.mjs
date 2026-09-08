@@ -59,6 +59,7 @@ const SUITES = [
   "test:account-onboarding-reconcile",
   "test:account-onboarding-upsert",
   "test:discovery-deferral",
+  "test:discovery-scope-recovery",
   "test:account-onboarding-worker",
   "test:account-onboarding-bootstrap",
   "test:round11-publication-fence",

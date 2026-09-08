@@ -57,6 +57,7 @@ await (async () => {
     buildPlan: () => ({ reportRequests: [req("acct-DE-9a1", "PANEU-SELLER-1", "DE"), req("acct-FR-7b2", "PANEU-SELLER-1", "FR")] }),
     resolveCost: async () => ({ newExports: 4, reusedExports: 2, creates: 4, estimatedTokens: 8, inventoryAdoptable: true }),
     checkBalance: async () => ({ usable: 1000 }),
+    freezeBudget: async () => ({ planFingerprint: "fp-test", maxCreates: 2, maxTokens: 4, hashes: [{ requestHash: "h1", tokenCost: 2 }, { requestHash: "h2", tokenCost: 2 }] }), readFrozenBudget: async () => null,
     runSources: async () => { calls.runSources += 1; return { drained: true, creates: 4, inventoryCreated: false }; },
     materialize: async () => { calls.materialize += 1; return { rejected: 0 }; },
     runReports: async () => { calls.runReports += 1; return { succeeded: 2, blocked: 0, failed: 0, drained: true }; },

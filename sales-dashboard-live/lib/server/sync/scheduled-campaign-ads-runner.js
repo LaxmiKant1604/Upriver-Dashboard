@@ -17,7 +17,7 @@ import { runAdsSyncWithDeps, PRODUCTION_ADS_SYNC_DEPS } from "../ads-sync.js";
 import { getDataDoeConnections, classifyDirectoryAccounts } from "../datadoe-connections.js";
 import { fetchAccountsDetailed, fetchCompatibleSourceNames } from "../datadoe.js";
 import { fetchExportEligibleAccounts } from "./account-onboarding.js";
-import { getDailyAdsCoverage, getAccountOnboardingRows } from "../supabase.js";
+import { getDailyAdsCoverage, getAccountOnboardingRows, getAccountDirectorySnapshotAccounts } from "../supabase.js";
 import { evaluateSourceCoverage } from "./ppc-ads-loader.js";
 import { getDataDoeTokenBalance } from "../datadoe-usage.js";
 import {
@@ -67,7 +67,7 @@ export async function discoverRoutedAccounts({ deps = {} } = {}) {
   // DataDoe still-loading account never enters a Campaign Ads batch (its export would 400 and poison
   // the whole <=5-seller batch). Tests may inject deps.fetchAccounts to bypass the gate.
   const fetchAccts = deps.fetchAccounts
-    || ((apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows: getAccountOnboardingRows }));
+    || ((apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows: getAccountOnboardingRows, readEstablishedAccountIds: getAccountDirectorySnapshotAccounts }));
   const connections = getConnections();
   const primaryConn = connections.find((c) => c && c.id === "primary");
   if (!primaryConn || !primaryConn.apiKey) { const e = new Error("CAMPAIGN_ADS_NO_PRIMARY_CONNECTION: no primary DataDoe connection / api key (fail closed)."); e.code = "CAMPAIGN_ADS_NO_PRIMARY"; throw e; }

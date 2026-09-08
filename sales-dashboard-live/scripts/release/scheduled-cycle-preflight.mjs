@@ -29,9 +29,10 @@ const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../..
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
 const { fetchExportEligibleAccounts, classifyDiscoveryOutcome } = await import("../../lib/server/sync/account-onboarding.js");
-const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
-// EXPORT-ELIGIBILITY GATE: the cycle preflight scopes to the SAME export-eligible set the run will use.
-const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows });
+const { getAccountOnboardingRows: readOnboardingRows, getAccountDirectorySnapshotAccounts: readEstablishedAccountIds } = await import("../../lib/server/supabase.js");
+// EXPORT-ELIGIBILITY GATE: the cycle preflight scopes to the SAME export-eligible set the run will use
+// (onboarding rows + the durable established-directory reader; source-guarded).
+const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows, readEstablishedAccountIds });
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows } = await import("../../lib/server/supabase.js");
 const { classifyScheduledOliCycle, assessDurableOliCoverageComplete } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");

@@ -560,20 +560,36 @@ export async function fetchExportEligibleAccounts(apiKey, { fetchDetailed, readO
     throw new Error("fetchExportEligibleAccounts requires injected fetchDetailed + readOnboardingRows (fail closed).");
   }
   const detailed = (await fetchDetailed(apiKey)) || [];
+  // READER STATES (scope recovery): a READ FAILURE must stay distinguishable from a SUCCESSFUL EMPTY response.
+  //   onboardingRead  : "rows" (>=1 row) | "empty" (table read OK, zero rows: the onboarding worker has not
+  //                     populated it yet) | "unavailable" (reader threw or returned a non-array -- the supabase
+  //                     wrapper returns null on any request failure).
+  //   establishedRead : "ids" (>=1 established account) | "empty" (directory read OK, zero established) |
+  //                     "unavailable" (reader threw / non-array) | "not-supplied" (the CALLER did not wire the
+  //                     established-directory reader -- a composition defect on a paid path, reported as such).
   let onboardingRows = null;
-  try { onboardingRows = await readOnboardingRows(); } catch { onboardingRows = null; } // fail-soft (no rows read)
-  // OPTIONAL established-account signal (durable account-directory snapshot). Fail-soft: on any error the
-  // established set is null. This helper is a PAID path, so requireAuthoritativeScope defaults TRUE: with NEITHER
-  // onboarding rows NOR established evidence, ZERO accounts are eligible (typed no-authoritative-scope) -- a
+  let onboardingRead = "unavailable";
+  let onboardingReadError = null;
+  try {
+    const rows = await readOnboardingRows();
+    if (Array.isArray(rows)) { onboardingRows = rows; onboardingRead = rows.length > 0 ? "rows" : "empty"; }
+  } catch (e) { onboardingRows = null; onboardingReadError = safeErr(e); } // fail-soft (no rows read) but TYPED
+  // Established-account signal (durable account-directory snapshot). Fail-soft on error (the established set is
+  // null) but TYPED. This helper is a PAID path, so requireAuthoritativeScope defaults TRUE: with NEITHER onboarding
+  // rows NOR established evidence, ZERO accounts are eligible (typed no-authoritative-scope / scope-unreadable) -- a
   // brand-new id is NEVER exposed and the scheduler defers before any cycle/export.
   let establishedAccountIds = null;
+  let establishedRead = "not-supplied";
+  let establishedReadError = null;
   if (typeof readEstablishedAccountIds === "function") {
+    establishedRead = "unavailable";
     try {
       const ids = await readEstablishedAccountIds();
-      establishedAccountIds = Array.isArray(ids)
-        ? ids.map((x) => S(x && (x.accountId ?? x.account_id ?? x.id ?? x))).filter(Boolean)
-        : null;
-    } catch { establishedAccountIds = null; }
+      if (Array.isArray(ids)) {
+        establishedAccountIds = ids.map((x) => S(x && (x.accountId ?? x.account_id ?? x.id ?? x))).filter(Boolean);
+        establishedRead = establishedAccountIds.length > 0 ? "ids" : "empty";
+      }
+    } catch (e) { establishedAccountIds = null; establishedReadError = safeErr(e); }
   }
   const { eligible, excluded, gateMode, hasAuthoritativeScope } = filterExportEligibleAccounts({ detailedAccounts: detailed, onboardingRows, establishedAccountIds, requireAuthoritativeScope });
   if (excluded.length && typeof onExcluded === "function") {
@@ -592,13 +608,24 @@ export async function fetchExportEligibleAccounts(apiKey, { fetchDetailed, readO
   const result = eligible.map(toLegacyAccountShape);
   // An EMPTY directory is the most specific signal (there is nothing to have scope for), so it wins over the
   // scope-derived gateMode; otherwise eligibility, then no-authoritative-scope, then awaiting-onboarding.
+  //   - "scope-unreadable"         -> accounts exist, NO authoritative scope was established, AND at least one scope
+  //                                   reader FAILED (onboarding table unreadable / established directory unreadable):
+  //                                   a READ FAILURE, never evidence that onboarding has not run. DEFER (fail closed).
+  const readFailure = onboardingRead === "unavailable" || establishedRead === "unavailable";
   const discoveryState = detailed.length === 0 ? "no-accounts-discovered"
     : result.length > 0 ? "eligible"
-      : gateMode === "no-authoritative-scope" ? "no-authoritative-scope"
+      : gateMode === "no-authoritative-scope" ? (readFailure ? "scope-unreadable" : "no-authoritative-scope")
         : "all-awaiting-onboarding";
+  const readers = Object.freeze({
+    onboarding: onboardingRead, onboardingError: onboardingReadError,
+    onboardingRowCount: Array.isArray(onboardingRows) ? onboardingRows.length : null,
+    established: establishedRead, establishedError: establishedReadError,
+    establishedCount: Array.isArray(establishedAccountIds) ? establishedAccountIds.length : null,
+  });
   Object.defineProperties(result, {
     gateMode: { value: gateMode, enumerable: false },
     hasAuthoritativeScope: { value: hasAuthoritativeScope, enumerable: false },
+    readers: { value: readers, enumerable: false },
     discoveredCount: { value: detailed.length, enumerable: false },
     eligibleCount: { value: result.length, enumerable: false },
     excludedCount: { value: excluded.length, enumerable: false },
@@ -607,6 +634,22 @@ export async function fetchExportEligibleAccounts(apiKey, { fetchDetailed, readO
     deferred: { value: discoveryState !== "eligible", enumerable: false },
   });
   return result;
+}
+
+// A safe, secret-free error description (message only; never a payload or header).
+function safeErr(e) { return S(e && e.message ? e.message : e).slice(0, 200) || "unknown error"; }
+
+// Human-readable reader summary for typed deferral messages (which reader failed vs. read empty vs. not supplied).
+export function describeScopeReaders(readers) {
+  const r = readers || {};
+  const onb = r.onboarding === "unavailable" ? `onboarding table UNREADABLE${r.onboardingError ? ": " + r.onboardingError : ""}`
+    : r.onboarding === "empty" ? "onboarding table read OK but EMPTY (onboarding worker has not populated it yet)"
+      : r.onboarding === "rows" ? `onboarding rows: ${r.onboardingRowCount}` : "onboarding: " + S(r.onboarding);
+  const est = r.established === "unavailable" ? `established directory UNREADABLE${r.establishedError ? ": " + r.establishedError : ""}`
+    : r.established === "empty" ? "established directory read OK but EMPTY"
+      : r.established === "ids" ? `established accounts: ${r.establishedCount}`
+        : r.established === "not-supplied" ? "established-directory reader NOT SUPPLIED by the caller" : "established: " + S(r.established);
+  return onb + "; " + est;
 }
 
 /**
@@ -621,12 +664,17 @@ export function classifyDiscoveryOutcome(rowsOrMeta) {
     || (Array.isArray(rowsOrMeta) && rowsOrMeta.length ? "eligible" : "no-accounts-discovered");
   const discovered = Number.isFinite(meta.discoveredCount) ? meta.discoveredCount : (Array.isArray(rowsOrMeta) ? rowsOrMeta.length : 0);
   const eligible = Number.isFinite(meta.eligibleCount) ? meta.eligibleCount : (Array.isArray(rowsOrMeta) ? rowsOrMeta.length : 0);
+  const readers = meta.readers && typeof meta.readers === "object" ? meta.readers : null;
+  const readerDetail = readers ? describeScopeReaders(readers) : "";
   switch (state) {
+    case "scope-unreadable":
+      return { deferred: true, code: "scope-unreadable", ok: false, readers,
+        message: `DEFERRED (scope-unreadable): ${discovered} account(s) discovered but the authoritative scope could NOT be READ (${readerDetail}) -- this is a READ FAILURE (infrastructure/composition), NOT evidence that onboarding has not run; deferring before any cycle/export (fail closed, LKG preserved; inspect the readers and retry)` };
     case "eligible":
       return { deferred: false, code: "eligible", ok: true, message: `${eligible} export-eligible account(s)` };
     case "no-authoritative-scope":
-      return { deferred: true, code: "no-authoritative-scope", ok: false,
-        message: `DEFERRED (no-authoritative-scope): ${discovered} account(s) discovered but NONE carry authoritative onboarding/established scope -- deferring before any cycle/export (fail closed, LKG preserved; run account onboarding first)` };
+      return { deferred: true, code: "no-authoritative-scope", ok: false, readers,
+        message: `DEFERRED (no-authoritative-scope): ${discovered} account(s) discovered but NONE carry authoritative onboarding/established scope${readerDetail ? " (" + readerDetail + ")" : ""} -- deferring before any cycle/export (fail closed, LKG preserved; ${readers && readers.established === "not-supplied" ? "COMPOSITION DEFECT: the caller did not supply the established-directory reader; " : ""}run account onboarding first)` };
     case "all-awaiting-onboarding":
       return { deferred: true, code: "all-awaiting-onboarding", ok: false,
         message: `DEFERRED (all-awaiting-onboarding): ${discovered} account(s) discovered with authoritative scope but NONE are export-ready yet (waiting/bootstrapping/blocked) -- deferring before any cycle/export (LKG preserved)` };

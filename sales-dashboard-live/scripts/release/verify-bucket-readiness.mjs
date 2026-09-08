@@ -35,7 +35,7 @@ const adsFrom = addDays(requestedAsOf, -20); const adsTo = requestedAsOf;
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccountsDetailed, fetchCompatibleSourceNames } = await import("../../lib/server/datadoe.js");
 const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
-const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
+const { getAccountOnboardingRows: readOnboardingRows, getAccountDirectorySnapshotAccounts: readEstablishedAccountIds } = await import("../../lib/server/supabase.js");
 const { resolveBootstrapScope } = await import("../../lib/server/sync/account-onboarding-bootstrap.js");
 // ACCOUNT SCOPE:
 //   full      -> EXPORT-ELIGIBILITY GATE: the readiness proof covers EXACTLY the export-eligible
@@ -48,7 +48,7 @@ const { resolveBootstrapScope } = await import("../../lib/server/sync/account-on
 //                fails closed (typed, LKG untouched) while they do not.
 const fetchAccounts = accountScope === "bootstrap"
   ? async (apiKey) => (await resolveBootstrapScope(apiKey, { region: bucket })).accounts
-  : (apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows });
+  : (apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows, readEstablishedAccountIds });
 const { ASIN_ADS_SOURCE_NAME } = await import("../../lib/server/sync/scheduled-asin-ads-runner.js");
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, getOliCompleteness } = await import("../../lib/server/supabase.js");
 const { assessScheduledOliCycle } = await import("../../lib/server/sync/source-scheduled-oli.js");

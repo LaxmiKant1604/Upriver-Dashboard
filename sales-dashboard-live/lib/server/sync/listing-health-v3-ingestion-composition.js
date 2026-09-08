@@ -133,13 +133,48 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     readAliasMeta: async (h) => { const e = await getExportCacheMeta(h); return e && e.request_meta ? { batchFetchedAt: e.request_meta.batchFetchedAt } : null; },
   });
 
-  const runSources = async ({ plan, region, cycleDate }) => {
+  // The frozen NEW-tranche budget (listings + listings-raw ONLY; inventory is never in it), computed WITHOUT persisting.
+  // The operation binds the standing authorization to exactly this (fingerprint + hashes + ceilings) BEFORE paid work.
+  const newTranche = (region) => makeSourceTranche({ sourceKeys: [...V3_NEW_SOURCE_KEYS], name: `lhv3-new#${region}` });
+  const freezeBudget = ({ plan, region }) => {
+    const plannedJobs = resolveFromGenericPlan(plan)().sourceJobs;
+    return computeFrozenTrancheBudget({ plannedJobs, sourceTranche: newTranche(region), isPremiumOf: budgetPlanner.isPremiumOf, trancheKey: `lhv3-new#${region}` });
+  };
+  // The DURABLE frozen budget already on this region's v3 cycle for the tranche (null = no cycle/budget yet = a NEW
+  // frozen cycle). Read-only; a read failure propagates so the operation defers typed (frozen-budget-unreadable).
+  const readFrozenBudget = async ({ region, cycleDate, trancheKey }) => {
+    const cyc = await runtime.store.getCycleByBucketDate(listingHealthV3CycleBucket(region), cycleDate);
+    if (!cyc || !cyc.id) return null;
+    if (typeof runtime.store.getBudget !== "function" || typeof runtime.store.getBudgetHashes !== "function") throw new Error("frozen-budget readers unavailable on the store");
+    const row = await runtime.store.getBudget({ cycleId: cyc.id, trancheKey });
+    if (!row) return null;
+    const hashes = await runtime.store.getBudgetHashes({ cycleId: cyc.id, trancheKey });
+    return { cycleId: cyc.id, row, hashes: Array.isArray(hashes) ? hashes : [] };
+  };
+
+  const runSources = async ({ plan, region, cycleDate, authorizationBinding = null }) => {
     const cycleBucket = listingHealthV3CycleBucket(region);
-    const NEW = makeSourceTranche({ sourceKeys: [...V3_NEW_SOURCE_KEYS], name: `lhv3-new#${region}` });
+    const NEW = newTranche(region);
     const INV = makeSourceTranche({ sourceKeys: [V3_INVENTORY_SOURCE_KEY], name: `lhv3-inv#${region}` });
     // Freeze the create budget for the NEW tranche ONLY (listings + listings-raw). Inventory is never in it.
     const plannedJobs = resolveFromGenericPlan(plan)().sourceJobs;
-    const frozen = computeFrozenTrancheBudget({ plannedJobs, sourceTranche: NEW, isPremiumOf: budgetPlanner.isPremiumOf, trancheKey: `lhv3-new#${region}` });
+    const frozen = freezeBudget({ plan, region });
+    // EXACT BINDING ENFORCEMENT (fail closed BEFORE openCycle/persistBudget/reservation/POST): the operation's bound
+    // authorization must describe EXACTLY this region, cycle, tranche, plan fingerprint, ceilings and request hashes.
+    if (!authorizationBinding || !authorizationBinding.bindingHash) {
+      throw new Error("listing-health-v3 ingestion: AUTHORIZATION_BINDING_MISSING -- runSources requires the operation's exact authorization binding; refusing before any cycle/reservation/POST (fail closed).");
+    }
+    const b = authorizationBinding;
+    const mismatches = [];
+    if (String(b.region) !== String(region)) mismatches.push("region");
+    if (String(b.cycleDate) !== String(cycleDate)) mismatches.push("cycleDate");
+    if (String(b.trancheKey) !== String(frozen.trancheKey)) mismatches.push("trancheKey");
+    if (String(b.planFingerprint) !== String(frozen.planFingerprint)) mismatches.push("planFingerprint");
+    if (Number(b.maxCreates) !== frozen.maxCreates || Number(b.maxTokens) !== frozen.maxTokens) mismatches.push("ceilings");
+    if (JSON.stringify([...(b.requestHashes || [])]) !== JSON.stringify(frozen.hashes.map((h) => h.requestHash).sort())) mismatches.push("requestHashes");
+    if (mismatches.length) {
+      throw new Error(`listing-health-v3 ingestion: AUTHORIZATION_BINDING_MISMATCH (${mismatches.join(", ")}) -- refusing before any cycle/reservation/POST (fail closed).`);
+    }
     // STRUCTURAL DRIFT GUARD (P1): the frozen NEW-create count must equal the exact expected 2-per-<=5-seller-batch
     // count for the plan's distinct accounts. A plan fanning out MORE creates than the membership justifies is drift
     // and fails closed. This is NOT the obsolete fixed 4/8/4 assumption (removed): the AUTHORIZED spending limit is
@@ -230,6 +265,7 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     discoverAccounts,
     buildPlan,
     resolveCost, checkBalance, materialize, runSources, runReports, finalizeCycle,
+    freezeBudget, readFrozenBudget,
     getSourceExportCache: getExportCache,
     reservationSupported: typeof runtime.store.reserveExportCreate === "function",
     pricingKnown: true,

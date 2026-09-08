@@ -15536,3 +15536,75 @@ materialize job was already observed on the Increment-1 europe-au watchdog, but 
 observed); and an AUTHENTICATED page check (needs a user session token, not available in-session) proving the portfolio
 current with no Refresh + no GET write. Increment-2 items (authenticated audit, fx-rates provider-cache) still stand;
 Reelleo/dd-secondary + 11 unowned reports remain the separate approval-gated recovery.
+
+
+### Scheduler fixes ROUND 2 (2026-09-08, base 90d981e -- pure code, no migration, zero DataDoe spend)
+
+**Trigger (live evidence):** india watchdog run 34183173600 (on 90d981e) failed at the preflight
+`verify-us-d1-published.mjs` with "DEFERRED (no-authoritative-scope): 51 account(s) discovered but NONE carry
+authoritative onboarding/established scope" (51 = the directory-wide count). The last account-onboarding run
+(34174818720, 00:53Z) was still on 8cd59a4 and crashed on the upsert 400; NO onboarding run on 90d981e has
+happened (the */30 cron fires irregularly). The same materialize jobs in that run found "8 primary account(s)"
+for india -- the durable account-directory snapshot DID prove the established accounts.
+
+**1. Authoritative discovery restored (ROOT CAUSE = composition defect, not an onboarding gap).** Seven
+scheduled/operator call sites composed `fetchExportEligibleAccounts` WITHOUT `readEstablishedAccountIds`
+(verify-us-d1-published, scheduled-cycle-preflight, oli-refresh-d1, verify-bucket-readiness,
+regional-scheduler-dry-run, oli-escalation-report, returns-leakage-golive, + scheduled-campaign-ads-runner.js),
+so an EMPTY onboarding table collapsed into no-authoritative-scope even though the directory snapshot proved
+the 8 india accounts. Every call site now supplies `getAccountDirectorySnapshotAccounts` (the SAME durable
+established-directory reader discoverPrimaryAccountIds / makeProductionDiscoverAccounts already used).
+Gate semantics (account-onboarding.js): reader states are TYPED -- onboarding rows|empty|unavailable,
+established ids|empty|unavailable|not-supplied -- and a READ FAILURE is a DISTINCT `scope-unreadable`
+deferral ("NOT evidence that onboarding has not run"), while both readers succeeding empty stays
+`no-authoritative-scope` ("onboarding worker has not populated it yet"); a caller that omits the established
+reader is named as a COMPOSITION DEFECT in the message. The gate itself is NOT weakened: brand-new
+DataDoe-ready ids stay NOT_ONBOARDED, "Setting up" directory entries are not established evidence, loading
+established accounts stay DATADOE_NOT_READY. New suite `discovery-scope-recovery.test.js` (20) drives the REAL
+supabase readers (fetch stub) through the real gate: the india reproduction (empty table + established
+directory => eligible), both readers unavailable, ready-new account, mixed ready/loading, and a SOURCE GUARD
+over every production call site (10) + the scheduler-v2 preflight scripts. discovery-deferral A2b added.
+
+**2. Frozen OLI continuation fallbacks closed (source-bucket-sync.js).** (a) a `getCycleByBucketDate` THROW
+is now a typed `deferred-cycle-unreadable` (never "fresh"); (b) an active cycle REQUIRES the production readers
+(listCycleOwners + getBudget + getBudgetHashes + listSourceJobs) else `continuation-readers-unavailable`;
+(c) EMPTY owners (`frozen-owners-empty`), ANY blank owner id (`owner-identities-malformed`, mixed included), a
+frozen per-account owner ABSENT from discovery (`frozen-accounts-missing`, partial AND empty intersection),
+an org-only cycle without POSITIVE persisted catalog-only job evidence (`frozen-scope-indeterminate`), an
+UNREADABLE budget/hash read (`budget-read-failed`), a blank fingerprint / empty hash set
+(`frozen-budget-malformed`) all DEFER before ANY mutation (budgets read UP FRONT); (d) membership is EXACTLY
+the frozen owner set; the continuation plan is persisted job identities INTERSECT frozen budget hashes per
+family (matching ids alone freeze nothing), and an OPEN frozen job the current plan cannot REPRODUCE defers
+(`frozen-plan-not-reproducible`) instead of running a different plan; (e) an organization-only cycle keeps
+ONLY the catalog family and never admits per-account discovery; (f) an UNFROZEN required family on a known
+per-account frozen membership (a bounded earlier invocation stopped before freezing it -- the real F3a
+deadline-resume path) is frozen NOW from the FROZEN membership on the same cycle (never skipped, never from
+current discovery; the post-freeze account waits for the next fresh cycle); a null budget row (successful
+read) is distinguished from a failed read. Tests G5-G13 rewritten/added (32 total), each deferral asserting a
+byte-identical store snapshot + zero creates; G13 asserts exact persisted hashes/owners/budgets on a valid
+replay. source-production-hardening's store double gained the two production readers (119 green).
+
+**3. Listing Health v3 authorization binding (listing-health-v3-authorization/operation/composition).**
+Provenance VERIFIED from git: the 20/35/20 maxAccounts limits were introduced in 90d981e (2026-09-08) and are
+recorded as a STANDING regional policy (`LISTING_HEALTH_V3_AUTHORIZATION_PROVENANCE`, kind
+standing-regional-limit) -- NOT raised, NOT an exact-plan approval; a standing policy authorizes a NEW frozen
+cycle within its limits (no daily manual approval). New pure `computeListingHealthV3AuthorizationBinding`
+binds region + cycleDate + operationId + tranche + sorted membership hash + sorted frozen request hashes +
+frozen plan fingerprint + pricing revision + frozen ceilings (bindingHash, deterministic); strict numerics
+(a numeric string/float/NaN limit = authorization-malformed; string request counts = request-malformed);
+region/pricing compared with the ACTUAL request (authorization-region-mismatch / pricing-revision-stale).
+`verifyListingHealthV3ReplayBinding` requires an EXACT match with the durable frozen budget row + hash set on
+replay (`replay-binding-mismatch` => awaiting-budget). The operation runs the binding gate AFTER authorization
+and BEFORE affordability (binding-unavailable / frozen-budget-unreadable are typed awaiting-budget), hands the
+binding to runSources; the composition's runSources REFUSES a missing/mismatched binding
+(AUTHORIZATION_BINDING_MISSING/MISMATCH) before openCycle/persistBudget/reservation/POST; the CLI wires
+`freezeBudget` + `readFrozenBudget` (reusing the existing source_tranche_budget store readers). Affordability
+stays a separate gate; 2 tokens/create remains an ESTIMATE (rowCountBilling) -- an internal reservation never
+guarantees the provider's final charge. Tests: authorization D0-D10 + E1-E8 (37), ingestion B(binding) x2.
+
+**Verification:** `npm run verify` 169/145 incl. build:check (192s); `git diff --check` clean; api/*.js = 12;
+zero DataDoe calls (all suites offline). NOT done here: no manual workflow dispatch, no migration.
+**PRODUCTION ACCEPTANCE STILL PENDING** (unobserved): one natural account-onboarding run on the new SHA (table
+populates, no 400), europe-au 08:30Z / us-ca 16:30Z / india 03:00Z natural regional runs (preflight passes with
+authoritative counts 16/10/8, continuation frozen-plan reuse, v3 binding proceeds within the standing limits).
+A green job is NOT completeness evidence -- check per-account publication + fba_complete + v3 bindingHash.

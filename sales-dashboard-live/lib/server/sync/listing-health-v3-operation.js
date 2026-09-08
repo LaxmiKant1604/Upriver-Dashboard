@@ -37,6 +37,8 @@ import {
   LISTING_HEALTH_V3_PRICING_REVISION,
   readListingHealthV3Authorization,
   decideListingHealthV3Authorization,
+  computeListingHealthV3AuthorizationBinding,
+  verifyListingHealthV3ReplayBinding,
 } from "./listing-health-v3-authorization.js";
 
 const S = (v) => (v == null ? "" : String(v));
@@ -125,6 +127,11 @@ export async function runListingHealthV3Ingestion({
   authorized = false, gate = null, connections = [],
   discoverAccounts, buildPlan = buildListingHealthV3Plan, resolveCost, checkBalance,
   runSources, materialize, runReports, finalizeCycle,
+  // EXACT AUTHORIZATION BINDING collaborators (live): freezeBudget({plan,region,cycleDate}) computes the frozen NEW-tranche
+  // budget (fingerprint + request hashes + ceilings) WITHOUT persisting; readFrozenBudget({region,cycleDate,trancheKey})
+  // returns the durable frozen budget already on this region's v3 cycle (or null for a NEW cycle). Both are REQUIRED for
+  // a live run: a missing collaborator returns typed awaiting-budget (binding-unavailable) before any paid work.
+  freezeBudget = null, readFrozenBudget = null,
   ceiling = null, emergencyReserveTokens = V3_DEFAULT_EMERGENCY_RESERVE_TOKENS,
   // P1-3: EXPLICIT DURABLE AUTHORIZATION -- read from the durable control system (default: the reviewed region
   // config), bound to the region + pricing revision. INJECTABLE so a future migration-backed operator-runtime
@@ -174,6 +181,7 @@ export async function runListingHealthV3Ingestion({
 
   // 7) validate ceiling + cost + pricing/reservation + balance BEFORE any POST.
   let ceilingCheck;
+  let authorizationBinding = null; // set by the live binding gate; handed to runSources
   // The ceiling is COMPUTED from the frozen plan's eligible account membership (2 creates per <=5-seller batch), so
   // account growth scales the ceiling instead of hard-failing against a fixed 4/8/4 literal (an explicit `ceiling`
   // still overrides for a reviewed test). A plan fanning out more creates than the membership justifies is drift.
@@ -224,7 +232,7 @@ export async function runListingHealthV3Ingestion({
     let authz;
     try { authz = await readAuthorization({ region: S(region), pricingRevision: S(pricingRevision) }); }
     catch (e) { authz = { authorized: false, reason: "authorization-unreadable", detail: safe(e) }; }
-    const authDecision = decideListingHealthV3Authorization({ region: S(region), accountCount: regionAccounts.length, requiredCreates, requiredTokens, authorization: authz });
+    const authDecision = decideListingHealthV3Authorization({ region: S(region), accountCount: regionAccounts.length, requiredCreates, requiredTokens, authorization: authz, pricingRevision: S(pricingRevision) });
     ev.authorization = authDecision.authorization && authDecision.authorization.authorized
       ? { maxAccounts: authDecision.authorization.maxAccounts, maxCreates: authDecision.authorization.maxCreates, maxTokens: authDecision.authorization.maxTokens, pricingRevision: authDecision.authorization.pricingRevision }
       : null;
@@ -238,6 +246,37 @@ export async function runListingHealthV3Ingestion({
       };
     }
 
+    //   (2b) EXACT BINDING -- the standing regional authorization is bound to THIS run's actual frozen work: region +
+    //        cycleDate + operationId + tranche + sorted membership + sorted frozen request hashes + frozen plan fingerprint
+    //        + pricing revision + frozen ceilings. A standing policy authorizes a NEW frozen cycle within its limits (no
+    //        daily manual approval); on REPLAY (a frozen budget already persisted on this region's v3 cycle) every bound
+    //        element must match EXACTLY, else typed awaiting-budget BEFORE any cycle/reservation/POST. The binding is
+    //        handed to runSources, which refuses to persist/POST anything that differs from it (fail closed).
+    const trancheKey = `lhv3-new#${S(region)}`;
+    const awaitingBinding = (reason, detail) => ({
+      ...ev, phase: "awaiting-budget", ok: false, deferred: true, awaitingBudget: true,
+      authorizationReason: reason, creates: 0, tokens: 0, snapshots: 0,
+      note: `authorization NOT bound (${reason}${detail ? ": " + detail : ""}) for ${S(region)} -- deferred BEFORE any cycle/reservation/POST (zero creates); last-known-good preserved.`,
+    });
+    if (typeof freezeBudget !== "function") return awaitingBinding("binding-unavailable", "freezeBudget collaborator is required for a live run");
+    if (typeof readFrozenBudget !== "function") return awaitingBinding("binding-unavailable", "readFrozenBudget collaborator is required for a live run");
+    let frozen = null;
+    try { frozen = await freezeBudget({ plan, region: S(region), cycleDate: S(cycleDate) }); } catch (e) { return awaitingBinding("binding-unavailable", safe(e)); }
+    const bound = computeListingHealthV3AuthorizationBinding({
+      region: S(region), cycleDate: S(cycleDate), operationId: ev.operationId, trancheKey,
+      accountIds: regionAccounts.map((a) => a.accountId), frozen, pricingRevision: S(pricingRevision), authorization: authDecision.authorization,
+    });
+    if (!bound.ok) return awaitingBinding(bound.reason, bound.detail);
+    let persisted = null;
+    try { persisted = await readFrozenBudget({ region: S(region), cycleDate: S(cycleDate), trancheKey }); } catch (e) { return awaitingBinding("frozen-budget-unreadable", safe(e)); }
+    const replay = verifyListingHealthV3ReplayBinding({ binding: bound.binding, persisted });
+    if (!replay.ok) return awaitingBinding(replay.reason, replay.detail);
+    authorizationBinding = bound.binding;
+    ev.authorizationBinding = {
+      bindingHash: bound.binding.bindingHash, membershipHash: bound.binding.membershipHash, requestHashesHash: bound.binding.requestHashesHash,
+      planFingerprint: bound.binding.planFingerprint, trancheKey, maxCreates: bound.binding.maxCreates,
+      estimatedTokens: bound.binding.estimatedTokens, pricingRevision: S(pricingRevision), replay: replay.replay,
+    };
     //   (3) LIVE AFFORDABILITY -- even WITH authorization, the usable DataDoe balance minus the emergency reserve
     //       must cover the required tokens. Authorization does NOT imply affordability. estimatedTokens is an
     //       OBSERVED estimate (rowCountBilling=true), so requiring headroom above the reserve also stops a
@@ -270,7 +309,7 @@ export async function runListingHealthV3Ingestion({
 
   // 8) run source jobs (listings + listings-raw CREATE within the frozen budget; inventory REUSE-ONLY). LKG preserved.
   let sourceRes;
-  try { sourceRes = await runSources({ plan, region: S(region), cycleDate: S(cycleDate), operationId: ev.operationId, budget: cost }); }
+  try { sourceRes = await runSources({ plan, region: S(region), cycleDate: S(cycleDate), operationId: ev.operationId, budget: cost, authorizationBinding }); }
   catch (e) { return fail("source", "source run failed (last-known-good preserved): " + safe(e)); }
   ev.creates = Number(sourceRes && sourceRes.creates || 0);
   ev.tokens = Number(sourceRes && sourceRes.tokens || 0);

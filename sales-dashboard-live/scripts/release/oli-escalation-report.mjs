@@ -20,10 +20,10 @@ if (!/^\d{4}-\d{2}-\d{2}$/.test(requestedAsOf)) { console.error("STOP --requeste
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
 const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
-const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
+const { getAccountOnboardingRows: readOnboardingRows, getAccountDirectorySnapshotAccounts: readEstablishedAccountIds } = await import("../../lib/server/supabase.js");
 // EXPORT-ELIGIBILITY GATE: escalation reporting covers the export-eligible set only (a still-loading
 // account is expected to be behind D-1 and must not be flagged as an escalation).
-const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows });
+const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows, readEstablishedAccountIds });
 const { bucketForCountry } = await import("../../lib/server/sync/registry.js");
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 const { OLI_SOURCE_ID } = await import("../../lib/server/sync/registry.js").catch(() => ({ OLI_SOURCE_ID: "89b27535d2" }));

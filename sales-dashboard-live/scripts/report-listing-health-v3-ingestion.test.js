@@ -1,4 +1,5 @@
 // Phase 4B2 -- Listing Health v3 ingestion COMPOSITION (production wiring) integration test.
+import { computeListingHealthV3AuthorizationBinding, readListingHealthV3Authorization, LISTING_HEALTH_V3_PRICING_REVISION } from "../lib/server/sync/listing-health-v3-authorization.js";
 //
 // De-risks the paid two-pass source wiring OFFLINE (fake store/adapter/runners; ZERO DataDoe/network): the frozen
 // per-region create budget over listings + listings-raw ONLY, the ceiling fail-closed gate, the two runStagedSourceCycle
@@ -70,7 +71,7 @@ await (async () => {
     ...invHashes.map((h) => ({ request_hash: h, source_key: "fba-inventory-health", create_export_count: 0 })),
   ];
   const { release, calls } = makeFakeRelease({ ceiling: 4, jobsAfter });
-  const res = await release.runSources({ plan, region: "india", cycleDate });
+  const res = await release.runSources({ plan, region: "india", cycleDate, authorizationBinding: bindFor(release, plan, "india") });
   ok("A: runSources opened the DEDICATED namespaced cycle (listing-health-v3-india)", calls.lastCycleBucket === listingHealthV3CycleBucket("india"));
   ok("A: it froze + persisted the create budget once, with maxCreates=4 (listings+raw only)", calls.persistBudget.length === 1 && calls.persistBudget[0].maxCreates === 4);
   ok("A: it ran TWO source passes", calls.sourceCycle.length === 2);
@@ -88,7 +89,11 @@ await (async () => {
   // The authorization is the frozen tranche budget's maxCreates (= the exact structural count) + the atomic
   // pre-POST reservation (never a fixed 4/8/4 assumption). An 8-account plan freezes maxCreates=4 and proceeds.
   const { release, calls } = makeFakeRelease({ ceiling: 1 }); // legacy ceiling param is now ignored
-  await release.runSources({ plan, region: "india", cycleDate });
+  await release.runSources({ plan, region: "india", cycleDate, authorizationBinding: bindFor(release, plan, "india") });
+  let missingBinding = null; try { await release.runSources({ plan, region: "india", cycleDate }); } catch (e) { missingBinding = e; }
+  ok("B(binding): runSources REFUSES without the exact authorization binding (AUTHORIZATION_BINDING_MISSING); nothing new persisted", /AUTHORIZATION_BINDING_MISSING/.test(String(missingBinding && missingBinding.message)) && calls.persistBudget.length === 1);
+  let wrongBinding = null; try { await release.runSources({ plan, region: "india", cycleDate, authorizationBinding: { ...bindFor(release, plan, "india"), planFingerprint: "tampered" } }); } catch (e) { wrongBinding = e; }
+  ok("B(binding): a binding whose plan fingerprint differs from the frozen plan is refused (AUTHORIZATION_BINDING_MISMATCH) before any persist/POST", /AUTHORIZATION_BINDING_MISMATCH.*planFingerprint/.test(String(wrongBinding && wrongBinding.message)) && calls.persistBudget.length === 1);
   ok("B(P1): the obsolete fixed regional ceiling is gone -- a valid 8-account plan proceeds and freezes the exact structural maxCreates=4 (authorization = frozen budget + reservation), both source passes ran",
     calls.persistBudget.length === 1 && calls.persistBudget[0].maxCreates === 4 && calls.sourceCycle.length === 2);
   // The composition keeps a STRUCTURAL DRIFT guard (frozen.maxCreates > 2 x ceil(accounts/5) => fail closed).
@@ -146,3 +151,8 @@ await (async () => {
 })();
 
 writeSync(1, `\nreport-listing-health-v3-ingestion: ${passed} assertions passed\n`);
+
+// EXACT authorization binding for a test plan (mirrors the operation: standing authz bound to the frozen NEW tranche).
+function bindFor(rel, plan, region) {
+  return computeListingHealthV3AuthorizationBinding({ region, cycleDate, operationId: "op-test", trancheKey: `lhv3-new#${region}`, accountIds: IN8.map((a) => a.accountId), frozen: rel.freezeBudget({ plan, region }), pricingRevision: LISTING_HEALTH_V3_PRICING_REVISION, authorization: readListingHealthV3Authorization({ region }) }).binding;
+}

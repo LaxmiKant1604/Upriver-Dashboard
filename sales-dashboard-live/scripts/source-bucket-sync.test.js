@@ -738,23 +738,199 @@ test("G4. P0-2 strict: MALFORMED frozen owners (all blank identities) DEFER; zer
   assert.equal(h1.dd.totalCreates(), creates1, "zero new creates");
 });
 
-test("G5. P0-2 strict: a NON-BLANK org-scope owner ('__organization', the catalog sentinel) is NOT malformed -- the continuation PROCEEDS (never a false defer) and reuses frozen budgets (zero new creates)", async () => {
-  // The catalog job's owner account_id is the org sentinel, not a real account. A continuation whose owners include
-  // only such non-account ids must NOT be misread as "malformed" (that would wrongly stall a catalog-only cycle). It
-  // proceeds: the frozen intersection is empty, so it plans from current accounts but the family loop reuses ONLY
-  // frozen budgets (no recompute -> no mismatch), and an idempotent replay creates nothing.
+test("G5. an ORGANIZATION-ONLY cycle is recognised ONLY from POSITIVE persisted catalog evidence: org owners + per-account persisted jobs is INDETERMINATE (defer); org owners + catalog-only jobs continues catalog ONLY and never admits per-account discovery", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  // (a) INDETERMINATE: owners claim organization-only but the persisted jobs include per-account OLI/FBA work.
+  {
+    const store = makeStore();
+    const h1 = runHarness({ accounts: THREE, store });
+    const r1 = await h1.run();
+    const snap = snapshotStore(store, r1.cycleId, h1.dd);
+    const orgOwnerStore = { ...store, listCycleOwners() { return [{ account_id: "__organization" }]; } };
+    const h2 = runHarness({ accounts: THREE, store: orgOwnerStore, dd: h1.dd });
+    const r2 = await h2.run();
+    assert.equal(r2.deferred, true, "org-only owners WITHOUT positive catalog-only job evidence defer");
+    assert.equal(r2.stopReason.reason, "frozen-scope-indeterminate");
+    assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations on the deferral");
+  }
+  // (b) POSITIVE evidence: a catalog-only cycle (OLI + FBA paused at freeze) continues catalog-only; unpausing OLI/FBA
+  //     mid-cycle with a NEW account admits NO per-account work (it joins the next fresh cycle).
+  {
+    const store = makeStore();
+    const paused = new Set(["order-line-items", "fba-inventory-health"]);
+    const h1 = runHarness({ accounts: THREE, store, pausedSources: paused });
+    const r1 = await h1.run();
+    assert.ok(r1.cycleId, "catalog-only cycle opened");
+    const jobsBefore = store.listSourceJobs(r1.cycleId).map((j) => j.request_hash).sort();
+    assert.ok(jobsBefore.length > 0 && store.listSourceJobs(r1.cycleId).every((j) => j.source_key === "product-catalog"), "POSITIVE persisted evidence: every persisted job is the catalog family: " + JSON.stringify(store.listSourceJobs(r1.cycleId).map((j) => [j.source_key, j.fetch_status])));
+    const creates1 = h1.dd.totalCreates();
+    // The durable owner rows carry ONLY the organization sentinel (the catalog job's owner scope).
+    const orgOnlyStore = { ...store, listCycleOwners() { return [{ account_id: "__organization" }]; } };
+    const h2 = runHarness({ accounts: [1, 2, 3, 4].map(acct), store: orgOnlyStore, dd: h1.dd }); // OLI/FBA UNPAUSED + a new account
+    const r2 = await h2.run();
+    assert.notEqual(r2.deferred, true, "positive catalog-only evidence continues (no false defer): " + JSON.stringify(r2.stopReason));
+    assert.equal(r2.cycleId, r1.cycleId, "the same active cycle is continued");
+    assert.equal(r2.plan.continuation.orgOnly, true, "typed as an organization-only continuation");
+    assert.deepEqual(store.listSourceJobs(r1.cycleId).map((j) => j.request_hash).sort(), jobsBefore, "NO per-account job was admitted into the frozen cycle (persisted identities unchanged)");
+    assert.equal(h1.dd.totalCreates(), creates1, "ZERO new creates");
+    assert.equal(h1.dd.createSeq.some((c) => (c.ids || []).includes("S04")), false, "the new account was never exported");
+    for (const fam of r2.families.filter((x) => x.sourceKey !== "product-catalog")) assert.ok(["nothing-to-do", "not-in-frozen-scope"].includes(fam.skipped), fam.sourceKey + " skipped: " + fam.skipped);
+  }
+});
+
+// A mutation-free snapshot of everything a continuation could touch (cycles, jobs, owners, budgets, reservations, POSTs).
+function snapshotStore(store, cycleId, dd) {
+  const tranches = ["source-sync:order-line-items", "source-sync:product-catalog", "source-sync:fba-inventory-health"];
+  return JSON.stringify({
+    cycles: store._cycleCount(), jobs: store.listSourceJobs(cycleId), owners: store._owners(cycleId),
+    budgets: tranches.map((t) => store._budget(cycleId, t)), reserves: store._counters.reserves, claims: store._counters.claims,
+    creates: dd.totalCreates(),
+  });
+}
+
+test("G6. a CYCLE-READ ERROR is never treated as a fresh cycle: typed deferred-cycle-unreadable, ZERO mutations (no second cycle, no creates)", async () => {
   const THREE = [1, 2, 3].map(acct);
   const store = makeStore();
   const h1 = runHarness({ accounts: THREE, store });
   const r1 = await h1.run();
-  const creates1 = h1.dd.totalCreates();
-  const orgOwnerStore = { ...store, listCycleOwners() { return [{ account_id: "__organization" }]; } };
-  const h2 = runHarness({ accounts: THREE, store: orgOwnerStore, dd: h1.dd });
+  const snap = snapshotStore(store, r1.cycleId, h1.dd);
+  const throwing = { ...store, getCycleByBucketDate() { throw new Error("cycle read boom"); } };
+  const h2 = runHarness({ accounts: THREE, store: throwing, dd: h1.dd });
   const r2 = await h2.run();
-  assert.notEqual(r2.deferred, true, "a non-blank org sentinel owner is NOT a malformed defer");
-  assert.notEqual(r2.deferredReason, "deferred-frozen-scope-unavailable", "no false frozen-scope-unavailable");
-  assert.ok(r1.cycleId && r2.cycleId === r1.cycleId, "the same active cycle is continued");
-  assert.equal(h1.dd.totalCreates(), creates1, "ZERO new creates -- frozen budgets reused, never recomputed");
+  assert.equal(r2.deferred, true);
+  assert.equal(r2.deferredReason, "deferred-cycle-unreadable");
+  assert.equal(r2.stopReason.reason, "cycle-read-failed");
+  assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations");
+  assert.equal(store._cycleCount(), 1, "no duplicate cycle was opened");
+});
+
+test("G7. EMPTY frozen owners on an active cycle DEFER (frozen-owners-empty); zero mutations", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  const h1 = runHarness({ accounts: THREE, store });
+  const r1 = await h1.run();
+  const snap = snapshotStore(store, r1.cycleId, h1.dd);
+  const emptyOwners = { ...store, listCycleOwners() { return []; } };
+  const r2 = await runHarness({ accounts: THREE, store: emptyOwners, dd: h1.dd }).run();
+  assert.equal(r2.deferred, true); assert.equal(r2.stopReason.reason, "frozen-owners-empty");
+  assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations");
+});
+
+test("G8. MIXED malformed owners (one valid + one blank) DEFER (owner-identities-malformed); zero mutations", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  const h1 = runHarness({ accounts: THREE, store });
+  const r1 = await h1.run();
+  const snap = snapshotStore(store, r1.cycleId, h1.dd);
+  const mixed = { ...store, listCycleOwners() { return [{ account_id: "A01" }, { account_id: "" }, { account_id: "A02" }]; } };
+  const r2 = await runHarness({ accounts: THREE, store: mixed, dd: h1.dd }).run();
+  assert.equal(r2.deferred, true); assert.equal(r2.stopReason.reason, "owner-identities-malformed");
+  assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations");
+});
+
+test("G9. a frozen account ABSENT from current discovery (partial intersection) DEFERS (frozen-accounts-missing): membership is never narrowed to a different plan", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  const h1 = runHarness({ accounts: THREE, store });
+  const r1 = await h1.run();
+  const snap = snapshotStore(store, r1.cycleId, h1.dd);
+  const r2 = await runHarness({ accounts: [1, 2].map(acct), store, dd: h1.dd }).run();
+  assert.equal(r2.deferred, true); assert.equal(r2.stopReason.reason, "frozen-accounts-missing");
+  assert.match(r2.stopReason.detail, /1 of 3/);
+  assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations");
+  // EMPTY intersection (all frozen accounts gone) is the same typed deferral, never a fresh plan from discovery.
+  const r3 = await runHarness({ accounts: [7, 8].map(acct), store, dd: h1.dd }).run();
+  assert.equal(r3.deferred, true); assert.equal(r3.stopReason.reason, "frozen-accounts-missing");
+  assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations on the empty intersection");
+});
+
+test("G10. an UNREADABLE required budget DEFERS (budget-read-failed) BEFORE any mutation -- distinct from a genuinely unplanned family (skipped)", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  // (a) failed read => defer, zero mutations
+  {
+    const store = makeStore();
+    const h1 = runHarness({ accounts: THREE, store });
+    const r1 = await h1.run();
+    const snap = snapshotStore(store, r1.cycleId, h1.dd);
+    const broken = { ...store, getBudget() { throw new Error("budget read boom"); } };
+    const r2 = await runHarness({ accounts: THREE, store: broken, dd: h1.dd }).run();
+    assert.equal(r2.deferred, true); assert.equal(r2.stopReason.reason, "budget-read-failed");
+    assert.equal(r2.families.length, 0, "no family was launched (not silently skipped)");
+    assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations");
+    const brokenHashes = { ...store, getBudgetHashes() { throw new Error("hash read boom"); } };
+    const r3 = await runHarness({ accounts: THREE, store: brokenHashes, dd: h1.dd }).run();
+    assert.equal(r3.deferred, true); assert.equal(r3.stopReason.reason, "budget-read-failed");
+    assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations (hash read)");
+  }
+  // (b) an UNFROZEN required family on a FROZEN per-account membership (a bounded earlier invocation stopped before
+  //     freezing FBA) is frozen NOW from the FROZEN membership only -- never silently skipped, never from current
+  //     discovery: the 4th (post-freeze) account gets no FBA export; a still-paused family is honestly nothing-to-do.
+  {
+    const store = makeStore();
+    const h1 = runHarness({ accounts: THREE, store, pausedSources: new Set(["fba-inventory-health"]) });
+    const r1 = await h1.run();
+    assert.equal(store._budget(r1.cycleId, "source-sync:fba-inventory-health"), null, "no frozen FBA budget after pass 1");
+    const stillPaused = await runHarness({ accounts: [1, 2, 3, 4].map(acct), store, dd: h1.dd, pausedSources: new Set(["fba-inventory-health"]) }).run();
+    assert.notEqual(stillPaused.deferred, true);
+    assert.ok(stillPaused.skippedPaused.includes("fba-inventory-health"), "a still-paused family plans nothing (skippedPaused), no budget is frozen for it");
+    assert.equal(store._budget(r1.cycleId, "source-sync:fba-inventory-health"), null, "still no FBA budget while paused");
+    const r2 = await runHarness({ accounts: [1, 2, 3, 4].map(acct), store, dd: h1.dd }).run(); // FBA now required
+    assert.notEqual(r2.deferred, true, "required unfrozen work is NOT deferred/skipped: " + JSON.stringify(r2.stopReason));
+    const fbaBudget = store._budget(r1.cycleId, "source-sync:fba-inventory-health");
+    assert.ok(fbaBudget && fbaBudget.maxCreates === 3, "FBA frozen NOW on the SAME cycle for exactly the 3 FROZEN accounts: " + JSON.stringify(fbaBudget));
+    const fbaSellers = h1.dd.createSeq.filter((c) => c.sourceKey === "fba-inventory-health").flatMap((c) => c.ids);
+    assert.deepEqual([...new Set(fbaSellers)].sort(), ["S01", "S02", "S03"], "FBA exported for the frozen membership only (never S04)");
+    assert.equal(store.listCycleOwners(r1.cycleId).some((o) => o.account_id === "A04"), false, "the post-freeze account never joined the frozen cycle");
+  }
+});
+
+test("G11. a store LACKING the production continuation readers on an ACTIVE cycle DEFERS (continuation-readers-unavailable) instead of taking the fresh path", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  const h1 = runHarness({ accounts: THREE, store });
+  const r1 = await h1.run();
+  const snap = snapshotStore(store, r1.cycleId, h1.dd);
+  const { getBudgetHashes: _omit, ...noHashes } = store;
+  const r2 = await runHarness({ accounts: THREE, store: noHashes, dd: h1.dd }).run();
+  assert.equal(r2.deferred, true); assert.equal(r2.stopReason.reason, "continuation-readers-unavailable");
+  assert.match(r2.stopReason.detail, /getBudgetHashes/);
+  assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations");
+});
+
+test("G12. a continuation that cannot REPRODUCE an OPEN frozen job's identity DEFERS (frozen-plan-not-reproducible): never a different plan from current coverage", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  const h1 = runHarness({ accounts: THREE, store });
+  const r1 = await h1.run();
+  // Re-open the frozen OLI job durably (as if its poll deferred), then present coverage that makes the current plan
+  // emit a DIFFERENT OLI window (a regenerated plan): the open frozen identity is not reproduced => defer.
+  const oliHash = store.listSourceJobs(r1.cycleId).find((j) => j.source_key === "order-line-items").request_hash;
+  const reopened = { ...store, listSourceJobs(id) { return store.listSourceJobs(id).map((j) => (j.request_hash === oliHash ? { ...j, fetch_status: "pending" } : j)); } };
+  const snap = snapshotStore(reopened, r1.cycleId, h1.dd);
+  const r2 = await runHarness({ accounts: THREE, store: reopened, dd: h1.dd, coverage: steadyCoverage(THREE, dates.addDaysStr(ASOF, -30)) }).run();
+  assert.equal(r2.deferred, true, "deferred: " + JSON.stringify(r2.stopReason));
+  assert.equal(r2.stopReason.reason, "frozen-plan-not-reproducible");
+  assert.equal(snapshotStore(reopened, r1.cycleId, h1.dd), snap, "ZERO mutations");
+});
+
+test("G13. a VALID continuation resumes EXACTLY the persisted frozen identities: job hash set, owners and budgets byte-identical after replay; no duplicate export; a NEW account waits for the next fresh cycle", async () => {
+  const THREE = [1, 2, 3].map(acct);
+  const store = makeStore();
+  const h1 = runHarness({ accounts: THREE, store });
+  const r1 = await h1.run();
+  const hashes1 = store.listSourceJobs(r1.cycleId).map((j) => j.request_hash).sort();
+  const owners1 = JSON.stringify(store._owners(r1.cycleId));
+  const budgets1 = JSON.stringify(["order-line-items", "product-catalog", "fba-inventory-health"].map((k) => store._budget(r1.cycleId, "source-sync:" + k)));
+  const creates1 = h1.dd.totalCreates();
+  const r2 = await runHarness({ accounts: [1, 2, 3, 4].map(acct), store, dd: h1.dd }).run();
+  assert.notEqual(r2.deferred, true, "a valid continuation proceeds: " + JSON.stringify(r2.stopReason));
+  assert.equal(r2.cycleId, r1.cycleId);
+  assert.deepEqual(store.listSourceJobs(r1.cycleId).map((j) => j.request_hash).sort(), hashes1, "EXACT persisted request identities (no regenerated hash)");
+  assert.equal(JSON.stringify(store._owners(r1.cycleId)), owners1, "owner memberships byte-identical (A04 never added)");
+  assert.equal(JSON.stringify(["order-line-items", "product-catalog", "fba-inventory-health"].map((k) => store._budget(r1.cycleId, "source-sync:" + k))), budgets1, "frozen budgets byte-identical (never re-persisted)");
+  assert.equal(h1.dd.totalCreates(), creates1, "no duplicate export");
+  assert.equal(r2.plan.continuation.frozenAccounts, 3, "membership = exactly the 3 frozen accounts");
+  assert.ok(r2.plan.continuation.droppedUnfrozenJobs >= 0);
 });
 
 async function main() {

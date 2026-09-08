@@ -29,6 +29,7 @@ function scenario({ inventoryAdoptable = false, finalize = { disposition: "final
     buildPlan: (args) => buildListingHealthV3Plan(args),
     resolveCost: async () => ({ newExports: 2, reusedExports: 1, creates: 2, estimatedTokens: 4, inventoryAdoptable }),
     checkBalance: async () => { calls.checkBalance += 1; return { usable: 1000 }; },
+    freezeBudget: async () => ({ planFingerprint: "fp-test", maxCreates: 2, maxTokens: 4, hashes: [{ requestHash: "h1", tokenCost: 2 }, { requestHash: "h2", tokenCost: 2 }] }), readFrozenBudget: async () => null,
     runSources: async () => { calls.runSources += 1; store.openCycle += 1; store.persistBudget += 1; store.reserveExportCreate += 1; store.create += 1; return { drained: true, creates: sourceCreates, tokens: sourceCreates * 2, inventoryCreated: false }; },
     materialize: async () => { calls.materialize += 1; return { rejected: 0, aliasesWritten: 6 }; },
     runReports: async () => { calls.runReports += 1; return { succeeded: 2, blocked: 0, failed: 0, drained: true }; },

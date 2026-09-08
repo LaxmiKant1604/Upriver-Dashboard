@@ -29,7 +29,9 @@ const discover = ({ detailed = [], onboardingRows = null, established = null } =
   const eligible = await discover({ detailed: [detAcct("A1")], onboardingRows: [{ account_id: "A1", status: "ready" }] });
   ok("A1: an export-ready account => discoveryState 'eligible', not deferred", eligible.discoveryState === "eligible" && eligible.deferred === false && eligible.length === 1);
 
-  const noScope = await discover({ detailed: [detAcct("A1"), detAcct("A2")], onboardingRows: null, established: null });
+  const noScope = await discover({ detailed: [detAcct("A1"), detAcct("A2")], onboardingRows: [], established: [] });
+  const unreadable = await discover({ detailed: [detAcct("A1"), detAcct("A2")], onboardingRows: null, established: null });
+  ok("A2b: a FAILED/null scope read is a DISTINCT typed state (scope-unreadable), never mistaken for no-authoritative-scope", unreadable.discoveryState === "scope-unreadable" && unreadable.deferred === true && unreadable.length === 0 && classifyDiscoveryOutcome(unreadable).code === "scope-unreadable");
   ok("A2: accounts EXIST but NO authoritative scope => 'no-authoritative-scope', deferred, ZERO eligible",
     noScope.discoveryState === "no-authoritative-scope" && noScope.deferred === true && noScope.length === 0 && noScope.discoveredCount === 2);
 
@@ -57,7 +59,7 @@ const discover = ({ detailed = [], onboardingRows = null, established = null } =
   const outEligible = classifyDiscoveryOutcome(await discover({ detailed: [detAcct("A1")], onboardingRows: [{ account_id: "A1", status: "ready" }] }));
   ok("C1: eligible => not deferred, ok=true, code 'eligible'", outEligible.deferred === false && outEligible.ok === true && outEligible.code === "eligible");
 
-  const outNoScope = classifyDiscoveryOutcome(await discover({ detailed: [detAcct("A1")], onboardingRows: null }));
+  const outNoScope = classifyDiscoveryOutcome(await discover({ detailed: [detAcct("A1")], onboardingRows: [], established: [] }));
   ok("C2: no-authoritative-scope => deferred, ok=false, typed message names the reason + LKG + fail-closed",
     outNoScope.deferred === true && outNoScope.ok === false && outNoScope.code === "no-authoritative-scope"
     && /no-authoritative-scope/.test(outNoScope.message) && /fail closed/.test(outNoScope.message) && !/^no accounts discovered$/.test(outNoScope.message));
@@ -66,7 +68,7 @@ const discover = ({ detailed = [], onboardingRows = null, established = null } =
   // 'bootstrapping' IS export-eligible -> this one is actually eligible, proving the classifier tracks real eligibility.
   ok("C3: a bootstrapping account is export-eligible (not falsely deferred)", outAwaiting.deferred === false && outAwaiting.code === "eligible");
 
-  const outEmpty = classifyDiscoveryOutcome(await discover({ detailed: [], onboardingRows: null }));
+  const outEmpty = classifyDiscoveryOutcome(await discover({ detailed: [], onboardingRows: [] }));
   ok("C4: empty directory => deferred, code 'no-accounts-discovered', never a false success", outEmpty.deferred === true && outEmpty.ok === false && outEmpty.code === "no-accounts-discovered");
 }
 

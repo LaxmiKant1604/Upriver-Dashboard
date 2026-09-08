@@ -45,8 +45,8 @@ const { fetchAccountsDetailed, fetchExportRows } = await import("../../lib/serve
 const { fetchExportEligibleAccounts } = await import("../../lib/server/sync/account-onboarding.js");
 // EXPORT-ELIGIBILITY GATE: returns/settlement exports run only for export-eligible primary accounts.
 const fetchAccounts = async (key) => {
-  const { getAccountOnboardingRows } = await import("../../lib/server/supabase.js");
-  return fetchExportEligibleAccounts(key, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows: getAccountOnboardingRows });
+  const { getAccountOnboardingRows, getAccountDirectorySnapshotAccounts } = await import("../../lib/server/supabase.js");
+  return fetchExportEligibleAccounts(key, { fetchDetailed: fetchAccountsDetailed, readOnboardingRows: getAccountOnboardingRows, readEstablishedAccountIds: getAccountDirectorySnapshotAccounts });
 };
 const { sourceRequestIdentity, organizationFingerprint } = await import("../../lib/server/source-identity.js");
 const { bucketForCountry } = await import("../../lib/server/sync/registry.js");

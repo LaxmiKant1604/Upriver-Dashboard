@@ -38,7 +38,7 @@ if (accountScope !== "bootstrap" && (!requestedAsOf || !/^\d{4}-\d{2}-\d{2}$/.te
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
 const { fetchExportEligibleAccounts, classifyDiscoveryOutcome } = await import("../../lib/server/sync/account-onboarding.js");
-const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
+const { getAccountOnboardingRows: readOnboardingRows, getAccountDirectorySnapshotAccounts: readEstablishedAccountIds } = await import("../../lib/server/supabase.js");
 const { resolveBootstrapScopeByDispatch, gateOnboardingBudget, recordOnboardingActualSpend, findApprovedStepEntry, bootstrapStepRef, assertBootstrapStepPlan } = await import("../../lib/server/sync/account-onboarding-bootstrap.js");
 // ACCOUNT SCOPE:
 //   full      -> EXPORT-ELIGIBILITY GATE: only export-eligible primary accounts are refreshed -- a
@@ -67,7 +67,7 @@ const fetchAccounts = accountScope === "bootstrap"
     return bootstrapScope.accounts;
   }
   : (apiKey) => fetchExportEligibleAccounts(apiKey, {
-    fetchDetailed: fetchAccountsDetailed, readOnboardingRows,
+    fetchDetailed: fetchAccountsDetailed, readOnboardingRows, readEstablishedAccountIds,
     onExcluded: (excluded, gateMode) => console.log(`onboarding gate (${gateMode}): excluded ${excluded.length} account(s): ${excluded.map((x) => `${x.accountId.slice(0, 8)}:${x.reason}`).join(", ")}`),
   });
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");

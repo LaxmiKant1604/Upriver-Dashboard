@@ -65,6 +65,8 @@ const evidence = await runListingHealthV3Ingestion({
   resolveCost: release.resolveCost,
   checkBalance: release.checkBalance,
   runSources: release.runSources,
+  freezeBudget: release.freezeBudget,
+  readFrozenBudget: release.readFrozenBudget,
   materialize: release.materialize,
   runReports: release.runReports,
   finalizeCycle: release.finalizeCycle,

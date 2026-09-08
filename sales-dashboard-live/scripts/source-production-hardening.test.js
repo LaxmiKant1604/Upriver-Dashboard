@@ -196,6 +196,10 @@ function makeStore() {
       b.spentCreates += 1; b.spentTokens += cost;
       return "reserved";
     },
+    // Production continuation readers (mirror supabase getSourceTrancheBudget / getSourceTrancheBudgetHashes): a strict
+    // continuation on an active cycle REQUIRES them (source-bucket-sync round 2), exactly like the real driver store.
+    getBudget({ cycleId, trancheKey }) { const b = budgets.get(bkey(cycleId, trancheKey)); return b ? { cycle_id: cycleId, tranche_key: trancheKey, plan_fingerprint: b.planFingerprint, max_creates: b.maxCreates, max_tokens: b.maxTokens, spent_creates: b.spentCreates, spent_tokens: b.spentTokens } : null; },
+    getBudgetHashes({ cycleId, trancheKey }) { const b = budgets.get(bkey(cycleId, trancheKey)); return b ? [...b.cost.entries()].map(([request_hash, token_cost]) => ({ request_hash, token_cost })) : []; },
     /* round-5: the sync_report_jobs model (insert-ignore upsert, pending->running one-attempt claim,
        validated success) + the reviewed finalize_sync_cycle terminal lifecycle. */
     _reportJobs: reportJobs,

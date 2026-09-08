@@ -21,11 +21,11 @@ if (regionArg !== "all" && !REGION_SCOPES.includes(regionArg)) { console.error("
 const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
 const { fetchExportEligibleAccounts, classifyDiscoveryOutcome } = await import("../../lib/server/sync/account-onboarding.js");
-const { getAccountOnboardingRows: readOnboardingRows } = await import("../../lib/server/supabase.js");
+const { getAccountOnboardingRows: readOnboardingRows, getAccountDirectorySnapshotAccounts: readEstablishedAccountIds } = await import("../../lib/server/supabase.js");
 // EXPORT-ELIGIBILITY GATE (dry-run parity with the live scheduler): show exactly the gated account set
 // plus the typed exclusions, so the dry-run rehearses the real scope.
 const fetchAccounts = (apiKey) => fetchExportEligibleAccounts(apiKey, {
-  fetchDetailed: fetchAccountsDetailed, readOnboardingRows,
+  fetchDetailed: fetchAccountsDetailed, readOnboardingRows, readEstablishedAccountIds,
   onExcluded: (excluded, gateMode) => console.log(`onboarding gate (${gateMode}): excluded ${excluded.length} account(s): ${excluded.map((x) => `${x.accountId.slice(0, 8)}:${x.reason}`).join(", ")}`),
 });
 const { routeAccounts, batchAccounts, REGION_SCHEDULE, MAX_SELLERS_PER_BATCH } = await import("../../lib/server/sync/campaign-region-routing.js");

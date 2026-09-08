@@ -152,6 +152,7 @@
     "test:account-onboarding-reconcile": "node scripts/account-onboarding-reconcile.test.js",
     "test:account-onboarding-upsert": "node scripts/account-onboarding-upsert.test.js",
     "test:discovery-deferral": "node scripts/discovery-deferral.test.js",
+    "test:discovery-scope-recovery": "node scripts/discovery-scope-recovery.test.js",
     "test:listing-health-v3-authorization": "node scripts/listing-health-v3-authorization.test.js"
   },
   "dependencies": {

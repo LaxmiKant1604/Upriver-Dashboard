@@ -34,6 +34,7 @@ function live({
     buildPlan: (args) => buildListingHealthV3Plan(args),
     resolveCost: async () => ({ newExports: 2, reusedExports: 1, creates: 2, estimatedTokens: 4, inventoryAdoptable }),
     checkBalance: async () => ({ usable: 1000 }),
+    freezeBudget: async () => ({ planFingerprint: "fp-test", maxCreates: 2, maxTokens: 4, hashes: [{ requestHash: "h1", tokenCost: 2 }, { requestHash: "h2", tokenCost: 2 }] }), readFrozenBudget: async () => null,
     runSources: async () => { calls.runSources += 1; return sourceOut; },
     materialize: async () => { calls.materialize += 1; return matOut; },
     runReports: async () => { calls.runReports += 1; return reportOut; },
