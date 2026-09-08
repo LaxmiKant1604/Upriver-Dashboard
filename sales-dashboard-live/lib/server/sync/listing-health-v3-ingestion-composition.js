@@ -24,14 +24,15 @@ import { makeSourceTranche } from "./source-tranche.js";
 import { computeFrozenTrancheBudget } from "./source-tranche-budget.js";
 import { registryBudgetPlanner } from "./source-fixpoint.js";
 import { getDataDoeConnections } from "../datadoe-connections.js";
-import { getSourceExportCache, saveSourceExportCache, getSourceExportCacheMeta, getRecentSyncCycleIds, getSyncSourceJobsWithMeta } from "../supabase.js";
+import { getSourceExportCache, saveSourceExportCache, getSourceExportCacheMeta, getRecentSyncCycleIds, getSyncSourceJobsWithMeta, getSyncSourceJobOwnersForCycle } from "../supabase.js";
+import { organizationFingerprint as orgFingerprintOf } from "../source-identity.js";
 import { getDataDoeTokenBalance } from "../datadoe-usage.js";
 import { discoverPrimaryAccountIds } from "./priority-control-pg-store.js";
 import { buildListingHealthV3Plan, planListingHealthV3IngestionCost } from "./listing-health-v3-operation.js";
 import { materializeListingHealthV3PerAccount, LISTING_HEALTH_V3_REGION_EXPORT_CEILING, expectedListingHealthV3NewExports } from "./listing-health-v3-materialize.js";
 import { planFbaPlanBucketBatched } from "./report-planner.js";
 import { fbaCycleBucket } from "./fba-plan-operation.js";
-import { defaultInventoryBatchesOf, overflowSellersFromTruncated, readRecentTruncatedInventoryHashes, DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS } from "./fba-inventory-overflow.js";
+import { defaultInventoryBatchesOf, overflowSellersFromTruncated, readRecentTruncatedInventoryOwnership, DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS } from "./fba-inventory-overflow.js";
 
 const V3_NEW_SOURCE_KEYS = Object.freeze(["listings", "listings-raw"]);
 const V3_INVENTORY_SOURCE_KEY = "fba-inventory-health";
@@ -64,6 +65,7 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     // readers). A build-time test seam ONLY -- kept injectable so the composition stays offline-testable.
     getRecentCycleIds = getRecentSyncCycleIds,
     getSourceJobsWithMeta = getSyncSourceJobsWithMeta,
+    getSourceJobOwners = getSyncSourceJobOwnersForCycle,
   } = overrides;
 
   const runtime = makeRuntime({}); // store + dataDoe + saveSnapshot + loadDerivedContext (shadow namespace)
@@ -101,15 +103,18 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
       const fbaPlan = planFbaPlanBucketBatched({ accounts, connections, asOfFor: () => cycleDate, inventoryAsOf: cycleDate });
       defaultInventoryBatches = defaultInventoryBatchesOf(fbaPlan);
     } catch (_e) { return new Set(); }
-    let recentTruncatedHashes = new Set();
+    const primary = (connections || []).find((c) => c && c.id === "primary");
+    const org = primary ? (primary.organizationFingerprint || orgFingerprintOf(primary.apiKey)) : null;
+    let truncatedOwnership = [];
     try {
-      recentTruncatedHashes = await readRecentTruncatedInventoryHashes({
-        cycleBucket: fbaCycleBucket(region), now, maxAgeDays,
+      truncatedOwnership = await readRecentTruncatedInventoryOwnership({
+        cycleBucket: fbaCycleBucket(region), now, maxAgeDays, connectionId: "primary", organizationFingerprint: org,
         readRecentCycleIds: (cb, since) => getRecentCycleIds(cb, since),
         readSourceJobs: (cid) => getSourceJobsWithMeta(cid),
+        readOwners: (cid) => getSourceJobOwners(cid),
       });
     } catch (_e) { return new Set(); }
-    const { overflowSellers } = overflowSellersFromTruncated({ defaultInventoryBatches, recentTruncatedHashes });
+    const { overflowSellers } = overflowSellersFromTruncated({ defaultInventoryBatches, truncatedOwnership });
     return overflowSellers;
   };
 

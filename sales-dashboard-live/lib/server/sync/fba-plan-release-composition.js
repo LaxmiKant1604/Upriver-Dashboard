@@ -12,8 +12,9 @@ import { buildSchedulerV2Runtime, makeProductionDiscoverAccounts } from "./runti
 import { buildSchedulerV2Publisher } from "./publisher-composition.js";
 import { planFbaPlanBucketBatched } from "./report-planner.js";
 import { fbaCycleBucket } from "./fba-plan-operation.js";
-import { defaultInventoryBatchesOf, overflowSellersFromTruncated, readRecentTruncatedInventoryHashes, DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS } from "./fba-inventory-overflow.js";
-import { getRecentSyncCycleIds, getSyncSourceJobsWithMeta } from "../supabase.js";
+import { defaultInventoryBatchesOf, overflowSellersFromTruncated, readRecentTruncatedInventoryOwnership, DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS } from "./fba-inventory-overflow.js";
+import { getRecentSyncCycleIds, getSyncSourceJobsWithMeta, getSyncSourceJobOwnersForCycle } from "../supabase.js";
+import { organizationFingerprint as orgFingerprintOf } from "../source-identity.js";
 import { runControlPackageCli, buildFbaPlanControlPackage } from "./source-priority-control-package.js";
 import { CONTROLLED_REPORT_KEYS } from "./report-controls.js";
 import { buildLiveReadback } from "./source-priority-release-runner.js";
@@ -164,23 +165,28 @@ export function buildFbaPlanRelease(overrides = {}) {
   };
 
   // Adaptive FBA-inventory self-heal: derive the proven-overflow raw seller ids for a bucket from recent terminal
-  // TRUNCATED inventory evidence (scoped to the region-fba cycle bucket + a recency window). The default plan maps a
-  // recent TRUNCATED batch hash deterministically back to its sellers. Fail-soft: any read error yields an empty set
+  // TRUNCATED inventory evidence (scoped to the region-fba cycle bucket + a recency window). Ownership of each TRUNCATED
+  // export is resolved from the DURABLE owner memberships (date-independent account_scope_hash), NOT the date-dependent
+  // request hash, so the overflow set survives the daily date rollover. Fail-soft: any read error yields an empty set
   // (byte-identical default batching). Also returns single-seller HARD STOPS (a lone seller still at the 50000 cap
   // that cannot split further -- the caller escalates, never auto-raises the limit).
   const resolveOverflowSellers = async ({ bucket, bucketAccounts, asOf, inventoryAsOf, maxAgeDays = DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS, now = () => Date.now() }) => {
     if (!bucketAccounts || !bucketAccounts.length) return { overflowSellers: new Set(), singleSellerHardStops: [] };
+    const conns = getConnections();
     let defaultInventoryBatches = [];
     try {
-      const plan = planFbaPlanBucketBatched({ accounts: bucketAccounts, connections: getConnections(), asOfFor: () => asOf, inventoryAsOf });
+      const plan = planFbaPlanBucketBatched({ accounts: bucketAccounts, connections: conns, asOfFor: () => asOf, inventoryAsOf });
       defaultInventoryBatches = defaultInventoryBatchesOf(plan);
     } catch (_e) { return { overflowSellers: new Set(), singleSellerHardStops: [] }; }
-    const recentTruncatedHashes = await readRecentTruncatedInventoryHashes({
-      cycleBucket: fbaCycleBucket(bucket), now, maxAgeDays,
+    const primary = (conns || []).find((c) => c && c.id === "primary");
+    const org = primary ? (primary.organizationFingerprint || orgFingerprintOf(primary.apiKey)) : null;
+    const truncatedOwnership = await readRecentTruncatedInventoryOwnership({
+      cycleBucket: fbaCycleBucket(bucket), now, maxAgeDays, connectionId: "primary", organizationFingerprint: org,
       readRecentCycleIds: (cb, since) => getRecentSyncCycleIds(cb, since),
       readSourceJobs: (cid) => getSyncSourceJobsWithMeta(cid),
+      readOwners: (cid) => getSyncSourceJobOwnersForCycle(cid),
     });
-    return overflowSellersFromTruncated({ defaultInventoryBatches, recentTruncatedHashes });
+    return overflowSellersFromTruncated({ defaultInventoryBatches, truncatedOwnership });
   };
 
   return Object.freeze({

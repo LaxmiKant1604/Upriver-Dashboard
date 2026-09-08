@@ -15766,3 +15766,56 @@ artifact, no e2e session), and per instruction I did not ask for credentials/tok
 download->edit->preview->import->reload->persistence flow (incl. account switch during a pending request) is NOT yet
 executed against the live UI. PRODUCTION ACCEPTANCE therefore NOT fully declared: database persistence is verified;
 the authenticated browser flow remains the one open gate.
+
+### FBA scheduler/report repair -- overflow date-rollover + provider-detail preservation (2026-09-08, base 11c8891; pure code; zero DataDoe)
+
+Codex owns GitHub/Cloudflare; this is CODE only. Two proven defects fixed + a full diagnosis (read-only DB evidence).
+
+DEFECT 1 -- OVERFLOW RECOVERY (fixed). fba-inventory-overflow.js mapped a historical terminal-TRUNCATED inventory
+batch back to its sellers by request_hash. The inventory request_hash ENCODES the inventory date (request_meta shows
+from/to = D, no sellers). So on D+1 the current plan's batch hash (date D+1) never equals the day-D truncated hash ->
+overflowSellers went EMPTY every day after the truncation (the whale re-batches + truncates forever). FIX: resolve
+ownership from the DURABLE owner memberships (sync_source_job_owners.account_scope_hash = accountScopeHash([rawSellerId]),
+a pure DATE-INDEPENDENT hash -- confirmed in prod: e5d5d2c9 -> 3 owner accounts, 613e5b7c -> 5). overflowSellersFromTruncated
+now takes truncatedOwnership:[{scopeHashes}] and matches each current seller's accountScopeHash([sid]); new reader
+readRecentTruncatedInventoryOwnership reads jobs+owners per region-fba cycle and filters source(request_key
+fba-plan:inventory-health)/connection/org/active + recency. Both compositions inject the owners reader + org/connection.
+Date kept in export/cache identity; no stale reuse; 50000 cap unchanged; single-seller = HARD STOP; unaffected batches
++ frozen budgets byte-identical; membership changes followed. Test report-fba-inventory-overflow.test.js rewritten to
+the ownership API + a DATE-ROLLOVER REPRODUCTION (F): same sellers, hash changes D->D+1, overflow still resolves the 3.
+
+DEFECT 2 -- PROVIDER DETAIL (fixed). source-worker.js classifyFetchError computed sanitizeErrorDetail(raw) (a bounded,
+secret-free provider snippet) but fail() dropped it -- every failure stored only the generic "DataDoe returned HTTP
+400 for this source." FIX: fail() appends the sanitized detail to error_message (":: provider: <detail>"). No retry/
+classification change; a definitive 400 stays terminal. New test sync-source-jobs.test.js: a 400 body preserves the
+actionable reason, redacts a secret token; the existing no-leak test updated (startsWith + no-leak, not exact-equality).
+
+DIAGNOSIS (read-only, no paid probes):
+- HTTP_400 create-export failures (30 OLI + 4 inventory + 3 listings, all Sep 07 on OLD SHAs) = readiness-blind era,
+  now gated by the deployed onboarding/export-eligibility filter; NOT a current-main request defect. 1 BATCH_CROSS_
+  MARKETPLACE (validator working). Catalog 69c1badc EXPORT_ERROR (Sep 08) = a TRANSIENT provider error (non-terminal,
+  retryable) that correctly fail-closed the US-CA derive (REQUIRED_SOURCE_FAILED, LKG preserved) -- provider-side, not
+  a request defect. Never blindly retry terminal 400s / recreate ambiguous exports. The only provider CODE fix is the
+  detail preservation above (so the NEXT failure is diagnosable).
+- Europe-AU coverage: EVERY europe-au account's durable OLI coverage tops at 2026-09-06, one day short of the D-1
+  target 2026-09-07. Blockers split into (i) onboarding-new (0 windows; SETTING_UP bootstrapping/waiting/partially_ready)
+  and (ii) established-but-D-1-lagged (covered_to 2026-09-06; the KNOWN Amazon per-line itemization lag, not a defect,
+  not zero sales). resolveFbaPlanScope blocks an account when covered_to < target -- MISSING coverage, distinct from
+  zero sales / successful publication; correctly deferred, LKG preserved, independent reports continue. NO code change.
+
+Verify 173/149 incl build:check; git diff --check clean; api/*.js=12; zero DataDoe. Recovery scope + spend estimate:
+re-running the FBA plan for the truncated India whale accounts (e5ce6ade/fd7653e8/d658442d) as SINGLE-seller inventory
+= 3 create-exports x 5 premium tokens = 15 tokens HARD max (2/create is the STANDARD estimate; inventory is premium 5);
+the US-CA catalog recovers with ONE standard catalog create (2 tokens) on the next scheduled run once the provider
+transient clears. NOT executed here (Codex runs GitHub/Cloudflare after authorization).
+
+**Adversarial review (6-agent workflow) confirmed one MUST-FIX defect in the DEFECT-2 change + it is now fixed:** the
+newly-PRESERVED provider detail could leak Amazon ids because sanitizeErrorDetail only redacted 16+ char id tokens,
+but real Amazon seller/vendor/marketplace tokens are 13-14 chars ("A"+digits) and ASINs are 10 ("B0"+8) -- all under
+16. FIX (source-worker.js sanitizeErrorDetail): added `A[A-Z0-9]{12,13}` (redacted only when it contains a digit, so
+plain uppercase reason words like AUTHORIZATION survive) + `B0[A-Z0-9]{8}` redaction. Regression test added to
+sync-signals.test.js using REAL-length tokens (A21TJRUUN4KGV/A2EUQ1WTGCTBG2/ATVPDKIKX0DER/B08N5WRWNW). Review's other
+findings were minor/nits: the overflow self-heal is intentionally primary-connection-scoped (the FBA plan is
+primary-only; the task mandates keeping the connection check) -- no change. The org filter is robust: the connection
+object carries no organizationFingerprint field so it resolves to orgFingerprintOf(apiKey), exactly what the owner
+rows store. verify 173/149 green after the fix.

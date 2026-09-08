@@ -514,6 +514,19 @@ test("classifyFetchError.detail + sanitizeErrorDetail: a bounded body is capture
   // the fixed `message` NEVER carries the raw body (no secret can leak through it either).
   for (const secret of ["A1B2C3D4E5F6G7H8", "sk_live_ABCDEFGHIJKLMNOP", "sellerOrVendorIds"]) assert.ok(!c.message.includes(secret), `message stays fixed: ${secret}`);
 });
+test("sanitizeErrorDetail: REAL-length Amazon ids (13-14 char seller/marketplace tokens, 10-char ASINs) are redacted, but useful reason words survive", () => {
+  // These fall UNDER the generic 16-char id rule; a create-export 400 body that echoes them must not leak them into
+  // the now-preserved provider detail.
+  const body = 'DataDoe export creation failed (400): {"error":"sellerOrVendorIds is required","seller":"A21TJRUUN4KGV","merchant":"A2EUQ1WTGCTBG2","marketplace":"ATVPDKIKX0DER","asin":"B08N5WRWNW"}';
+  const d = sanitizeErrorDetail(body);
+  for (const id of ["A21TJRUUN4KGV", "A2EUQ1WTGCTBG2", "ATVPDKIKX0DER", "B08N5WRWNW"]) assert.ok(!d.includes(id), `redacted Amazon id: ${id}`);
+  assert.ok(d.includes("sellerOrVendorIds is required"), "the human-useful reason survives (mixed-case, no leak)");
+  // A plain uppercase word with NO digit is NOT an id and must survive (e.g. an AUTHORIZATION reason).
+  assert.ok(sanitizeErrorDetail("AUTHORIZATION header missing").includes("AUTHORIZATION"), "a digitless uppercase word is not an id");
+  // The full classify path also stores none of them (defense in depth for the fail()-preserved detail).
+  const c = classifyFetchError(new Error(body), "create-export");
+  for (const id of ["A21TJRUUN4KGV", "A2EUQ1WTGCTBG2", "ATVPDKIKX0DER", "B08N5WRWNW"]) assert.ok(!c.detail.includes(id), `classify detail redacts: ${id}`);
+});
 
 /* ============================================================================================
    Production Supabase durable-write guards  (async; formerly scheduler-v2-supabase-wrapper.test.mjs)

@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { writeSync, readFileSync } from "node:fs";
 import { buildListingHealthV3IngestionRelease, listingHealthV3CycleBucket } from "../lib/server/sync/listing-health-v3-ingestion-composition.js";
 import { runListingHealthV3Ingestion } from "../lib/server/sync/listing-health-v3-operation.js";
+import { organizationFingerprint as orgFingerprintOf, accountScopeHash } from "../lib/server/source-identity.js";
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -24,7 +25,7 @@ const IN8 = Array.from({ length: 8 }, (_, i) => ({ accountId: `in-${String(i).pa
 
 // A fake runtime whose store records the budget + returns fabricated post-run job rows so runSources can count
 // "actual creates" without any real I/O. runSourceCycle / runReportsFn / materializeFn are spies.
-function makeFakeRelease({ ceiling = 4, jobsAfter = null, recentCycleIds = [], truncatedJobs = [] } = {}) {
+function makeFakeRelease({ ceiling = 4, jobsAfter = null, recentCycleIds = [], truncatedJobs = [], owners = [] } = {}) {
   const calls = { openCycle: 0, persistBudget: [], sourceCycle: [], reports: 0, materialize: 0, saveSnapshot: 0 };
   const store = {
     openCycle: async ({ bucket }) => { calls.openCycle += 1; calls.lastCycleBucket = bucket; return "cyc-1"; },
@@ -49,8 +50,10 @@ function makeFakeRelease({ ceiling = 4, jobsAfter = null, recentCycleIds = [], t
     materializeFn: async (a) => { calls.materialize += 1; calls.materializePlans = (a.plans || []).length; return { accounts: 8, aliasesWritten: 16, emptyAliases: 0, rejected: 0, batchMissing: 0, skippedStale: 0 }; },
     regionCeilings: { india: ceiling, "europe-au": 8, "us-ca": 4 },
     // Injected offline evidence readers for the inventory-only overflow derivation (default: no evidence => no split).
+    // Ownership is resolved from the durable owner memberships (date-independent account_scope_hash), NOT the hash.
     getRecentCycleIds: async () => recentCycleIds,
     getSourceJobsWithMeta: async () => truncatedJobs,
+    getSourceJobOwners: async () => owners,
   });
   return { release, calls };
 }
@@ -140,9 +143,12 @@ await (async () => {
   const threeBatch = baseInv.find((s) => s.sellerOrVendorIds.length === 3);
   const fiveBatchHash = baseInv.find((s) => s.sellerOrVendorIds.length === 5).requestHash;
 
-  // Terminal TRUNCATED evidence for that 3-seller inventory batch => its 3 sellers become proven overflow.
+  // Terminal TRUNCATED evidence for that 3-seller inventory batch + its DURABLE owner memberships (the 3 sellers'
+  // date-independent account_scope_hash). Ownership -- not the date-dependent hash -- drives the overflow set.
+  const org = orgFingerprintOf(API_KEY);
   const truncatedJobs = [{ request_hash: threeBatch.requestHash, source_key: "fba-inventory-health", fetch_status: "failed", error_code: "TRUNCATED", terminal: true }];
-  const splitPlan = await makeFakeRelease({ recentCycleIds: ["cyc-x"], truncatedJobs }).release.buildPlan({ accounts: IN8, connections, cycleDate, region: "india" });
+  const owners = threeBatch.sellerOrVendorIds.map((sid) => ({ request_hash: threeBatch.requestHash, request_key: "fba-plan:inventory-health", account_scope_hash: accountScopeHash([String(sid)]), connection_id: "primary", organization_fingerprint: org, owner_status: "active" }));
+  const splitPlan = await makeFakeRelease({ recentCycleIds: ["cyc-x"], truncatedJobs, owners }).release.buildPlan({ accounts: IN8, connections, cycleDate, region: "india" });
   const inv = invOf(splitPlan);
   ok("E: with overflow evidence, INVENTORY splits to [5,1,1,1] (the whale batch isolated to single sellers)", inv.map((s) => s.sellerOrVendorIds.length).sort().join(",") === "1,1,1,5");
   ok("E: the 5-seller inventory batch hash is unchanged (byte-identical to default)", inv.some((s) => s.requestHash === fiveBatchHash));

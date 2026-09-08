@@ -223,6 +223,20 @@ test("repeated invocations never repeat create; completed jobs skipped on resume
   assert.equal(dd.createCount("h2"), 1);
 });
 
+test("provider-detail: a create-export HTTP 400 preserves the SANITIZED provider reason in error_message (not just the generic string)", async () => {
+  const store = makeMemoryStore();
+  // DataDoe rejects the create with a 400 whose body carries the actionable reason + a secret-ish token to redact.
+  const err = new Error("DataDoe request failed (400): sellerOrVendorIds must contain at most 5 ids token=abcdef0123456789xyz");
+  const dd = makeDataDoe((job, stage) => (stage === "create" ? { throw: err } : null));
+  const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [synthJob("h1")] }));
+  const row = store._rawJob(res.cycleId, "h1");
+  assert.equal(row.error_code, "HTTP_400");
+  assert.ok(/DataDoe returned HTTP 400 for this source\./.test(row.error_message), "keeps the fixed operator message");
+  assert.ok(/provider:/.test(row.error_message) && /sellerOrVendorIds must contain at most 5 ids/.test(row.error_message), "appends the sanitized actionable provider reason");
+  assert.ok(!/abcdef0123456789xyz/.test(row.error_message), "redacts the secret-ish token (never a raw key/id)");
+  assert.equal(row.terminal, true, "a definitive 400 is terminal (never blindly retried)");
+});
+
 test("checkpoint: maxJobs then a later invocation drains the rest; each created once", async () => {
   const store = makeMemoryStore();
   const dd = makeDataDoe(() => ({ rows: [{ a: 1 }] }));
@@ -337,8 +351,10 @@ test("no secret value appears in a recorded error or the progress output", async
   const dd = makeDataDoe(() => ({ throw: leaky }));
   const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [synthJob("h1")] }));
   const j = store._rawJob(res.cycleId, "h1");
+  // No secret ever leaks -- even into the newly-preserved sanitized provider detail.
   assert.ok(!leakPattern.test(j.error_message));
-  assert.equal(j.error_message, "DataDoe returned HTTP 403 for this source.");
+  // The fixed operator message is preserved; a SANITIZED (secret-free) provider detail may follow it.
+  assert.ok(j.error_message.startsWith("DataDoe returned HTTP 403 for this source."));
   assert.ok(!leakPattern.test(JSON.stringify(res)));
 });
 

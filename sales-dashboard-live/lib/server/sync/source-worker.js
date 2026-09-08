@@ -59,6 +59,12 @@ export function sanitizeErrorDetail(raw, max = 200) {
   // long id/key/export tokens (16+ chars) but ONLY those that look like an identifier -- containing a digit,
   // underscore, or hyphen -- so a plain long word (e.g. "sellerOrVendorIds") survives as useful evidence.
   s = s.replace(/\b[A-Za-z0-9_-]{16,}\b/g, (m) => (/[0-9_-]/.test(m) ? "[redacted-id]" : m));
+  // Amazon identifier shapes fall UNDER the 16+ rule: seller/vendor/marketplace tokens (start "A", 13-14 chars) and
+  // ASINs (start "B0", 10 chars). Redact the id-shaped ones. The "A..." rule requires a DIGIT so a plain uppercase
+  // reason word (e.g. AUTHORIZATION) is NOT redacted, while a real seller/marketplace id (which always carries digits)
+  // is; ASINs are B0 + 8 (always a digit). Keeps useful provider reasons intact but never lets an Amazon id survive.
+  s = s.replace(/\bA[A-Z0-9]{12,13}\b/g, (m) => (/[0-9]/.test(m) ? "[redacted-id]" : m));
+  s = s.replace(/\bB0[A-Z0-9]{8}\b/g, "[redacted-id]");
   s = s.replace(/\s+/g, " ").trim();
   if (s.length > max) s = s.slice(0, max) + "...";
   return s;
@@ -165,8 +171,14 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   const status = job.fetch_status;
   let exportId = job.export_id || null;
 
-  const fail = async (stage, code, message, terminal, rowCount) => {
-    await store.recordSourceFailure({ cycleId, requestHash, exportId, stage, code, message, terminal, durationMs: clock() - started, rowCount });
+  const fail = async (stage, code, message, terminal, rowCount, detail) => {
+    // PRESERVE the sanitized, secret-free provider detail (from classifyFetchError) alongside the fixed operator
+    // message, so an operator can see WHY DataDoe rejected a create/poll/download (e.g. the provider's own reason)
+    // instead of only "DataDoe returned HTTP 400 for this source." No schema change: the detail is appended to the
+    // stored error_message (already bounded + sanitized upstream). Never a URL, id, key, or raw body.
+    const d = detail == null ? "" : String(detail).trim();
+    const stored = d && d !== String(message).trim() ? `${message} :: provider: ${d}` : message;
+    await store.recordSourceFailure({ cycleId, requestHash, exportId, stage, code, message: stored, terminal, durationMs: clock() - started, rowCount });
     progress.failed += 1;
     return { requestKey, requestHash, status: terminal ? "terminal" : "failed", validated: false, code };
   };
@@ -300,7 +312,7 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
       exportId = created && created.exportId ? created.exportId : null;
     } catch (error) {
       const cls = classifyFetchError(error, "create-export");
-      return fail(cls.stage, cls.code, cls.message, cls.terminal);
+      return fail(cls.stage, cls.code, cls.message, cls.terminal, undefined, cls.detail);
     }
     if (!exportId) {
       // The POST returned no export id: an explicit safe failure, never silently skipped.
@@ -326,7 +338,7 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
     const deferral = deferIfResumable(error, "poll");
     if (deferral) return deferral; // resumable: job stays attempted + export_id
     const cls = classifyFetchError(error, "poll");
-    return fail(cls.stage, cls.code, cls.message, cls.terminal);
+    return fail(cls.stage, cls.code, cls.message, cls.terminal, undefined, cls.detail);
   }
 
   // ---- STEP 5: download ----
@@ -337,7 +349,7 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
     const deferral = deferIfResumable(error, "download");
     if (deferral) return deferral; // resumable: job stays attempted + export_id
     const cls = classifyFetchError(error, "download");
-    return fail(cls.stage, cls.code, cls.message, cls.terminal);
+    return fail(cls.stage, cls.code, cls.message, cls.terminal, undefined, cls.detail);
   }
 
   // ---- STEP 6: validate. A non-array payload is a failure (never coerced to []); a
