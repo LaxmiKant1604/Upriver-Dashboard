@@ -1,5 +1,27 @@
 # Project Memory
 
+## Scheduler per-account publication — TWO confirmed-finding fixes (2026-09-10, commit 139ede5 on main, NOT pushed; code verification only, NOT production acceptance)
+
+Follow-up to the 2 release-safety corrections (efd0d64, preserved). **verify 188/188; no push; migrations
+20260923/20260924 NOT applied; zero DataDoe spend. Adversarial review: 0 substantiated defects.**
+
+- **Finding 1 — resolve open_sync_cycle by EXACT OID, not textual identity-args.** `priority-partial-capability.js` now
+  uses `to_regprocedure('public.open_sync_cycle(text, date, timestamptz, text)')` — schema-qualified (search_path-
+  independent), matches by argument TYPES only (NAME-agnostic; canonicalises timestamptz), returns present(bool)+def via
+  a CASE that never calls `pg_get_functiondef(NULL)`. Both the function-guard AND `sync_cycles_bucket_check` checks stay
+  fail-closed (exactly-one + exact regex in BOTH). Now DISTINGUISHES "function missing" (to_regprocedure NULL) from
+  "function found, capability absent" (present but guard lacks the regex → migration not applied). **VERIFIED READ-ONLY
+  against the live prod DB** (BEGIN…READ ONLY+ROLLBACK; zero writes/tokens): resolved the real NAMED-arg function, guard
+  currently lacks the regex, evaluator → permitted:false / "function found, capability absent". Regression covers named
+  args + found-vs-missing + unreadable/comment-only/ambiguous.
+- **Finding 2 — failed/skipped Campaign notice no longer over-claims zero.** Reworded to "the sales publication did NOT
+  complete or could not be verified; some snapshots may already have been published" (never "NO dashboards were
+  published"); a zero-write claim now appears ONLY on explicit-evidence paths (capability preflight / region guard /
+  token skip, which fail BEFORE any publication write). New runner regressions P9v (writes→readback failure), P9w
+  (mid-publish lease loss via verifyLease), P9x (lease-lost disposition) — all → code 1, honest reporting.
+
+Production acceptance PENDING a natural partial cycle + migration 20260924 approval.
+
 ## Scheduler per-account publication — TWO release-safety corrections (2026-09-10, commit efd0d64 on main, NOT pushed; code verification only, NOT production acceptance)
 
 Follow-up to the 3-blocker fixes (227d685, preserved). **verify 188/188 (164 suites); no budget/dispatch/paid-export;
