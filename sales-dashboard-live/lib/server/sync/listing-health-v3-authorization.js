@@ -19,6 +19,12 @@
 // This module NEVER touches the network, DataDoe, or the token balance. 7-bit ASCII, LF.
 
 import { sha256 } from "../source-identity.js";
+// ONE canonical DataDoe pricing definition (the SAME constants the estimator + the frozen tranche budget use), so the
+// authorization ceiling is priced by the real registry token classes rather than a flat per-create guess. A v3 batched
+// plan is, per <=5-seller batch, one Listings export (source-registry class PREMIUM = 5) + one Listings-Raw export
+// (STANDARD = 2) = 7 tokens. Importing these keeps a SINGLE source of truth: if the pricing ever changes, the drift
+// guard below fails closed (awaiting-budget) until the reviewed ceiling is updated. This module still performs NO I/O.
+import { PREMIUM_SOURCE_TOKENS, STANDARD_SOURCE_TOKENS, MAX_SELLER_IDS_PER_EXPORT } from "./source-tranche-budget.js";
 
 const S = (v) => (v == null ? "" : String(v));
 // STRICT numeric validation: a real JS number that is a finite integer (a numeric STRING, NaN, Infinity, a float or a
@@ -28,46 +34,72 @@ export const isStrictNonNegativeInt = (v) => typeof v === "number" && Number.isI
 
 export const V3_INGESTION_REGIONS = Object.freeze(["india", "europe-au", "us-ca"]);
 
-// STANDARD per-create token estimate for a Listings / Listings-Raw export. rowCountBilling=true means the real bill
-// can EXCEED this -- it is an ESTIMATE, never a guaranteed maximum. The authorization caps the STRUCTURAL plan; the
-// frozen tranche budget's atomic pre-POST reservation + the live balance gate are the true runtime enforcers.
-export const V3_AUTHORIZED_TOKENS_PER_CREATE = 2;
+// REAL per-batch pricing (NOT a flat per-create guess). The v3 batched plan is, per <=5-seller batch, ONE Listings
+// export (registry class PREMIUM = 5 tokens) + ONE Listings-Raw export (STANDARD = 2 tokens) = 2 creates / 7 tokens.
+// These mirror the source-registry token classes (listings=premium, listings-raw=standard) through the ONE pricing
+// definition in source-tranche-budget.js, so the authorization ceiling, the estimator (planListingHealthV3IngestionCost)
+// and the frozen tranche budget (computeFrozenTrancheBudget) all agree. The OBSOLETE flat V3_AUTHORIZED_TOKENS_PER_CREATE
+// (=2, a "std2" guess) priced a PREMIUM Listings export as standard, making the token ceiling 16/28/16 -- below the real
+// 14/42/21 a full new plan needs -- so a healthy run FALSELY deferred (US natural run 34394580474: 21 real tokens > 16
+// authorized, zero creates). rowCountBilling=true means the real bill can EXCEED this -- it is an ESTIMATE, never a
+// guaranteed maximum. The authorization caps the STRUCTURAL plan; the frozen tranche budget's atomic pre-POST reservation
+// + the live balance gate remain the true runtime enforcers.
+export const V3_CREATES_PER_BATCH = 2; // one Listings + one Listings-Raw export per <=5-seller batch
+export const V3_TOKENS_PER_BATCH = PREMIUM_SOURCE_TOKENS + STANDARD_SOURCE_TOKENS; // premium listings (5) + standard listings-raw (2) = 7
 
 // The pricing revision the current authorization was reviewed against. Authorization is bound to it: if the live
-// pricing revision differs, the authorization is STALE and the run defers (awaiting-budget) until re-reviewed.
-export const LISTING_HEALTH_V3_PRICING_REVISION = "2026-09-lhv3-std2";
+// pricing revision differs, the authorization is STALE and the run defers (awaiting-budget) until re-reviewed. The
+// label is HONEST about the real pricing (premium Listings + standard Listings-Raw), replacing the wrong "std2" label.
+export const LISTING_HEALTH_V3_PRICING_REVISION = "2026-09-10-lhv3-premium5-raw-std2";
 
 // REVIEWED DURABLE per-region authorization. `maxAccounts` is the operator-authorized ceiling on export-eligible
 // accounts for the region (chosen with deliberate headroom over the current membership so ordinary growth does not
-// trip awaiting-budget, while a large unexpected jump does -- forcing a reviewed decision). maxCreates / maxTokens are
-// DERIVED from it via the SAME structural formula the run uses (2 * ceil(N / 5) creates), so the authorization is a
-// true ceiling on structural spend rather than an independent magic number. These are EXPLICIT authorizations, NOT the
-// obsolete fixed 4/8/4 batch-count assumption: they are membership CEILINGS with headroom, not the current batch count.
-// APPROVAL PROVENANCE of the standing limits below (verified from git history: the limits were introduced in commit
-// 90d981e, 2026-09-08, reviewed release "Onboarding/scheduler P0+P1: ... durable LH authorization"). They are STANDING
-// REGIONAL LIMITS -- a reviewed policy that authorizes any NEW frozen cycle whose structural spend fits within them --
-// NOT an exact-plan approval of a specific day's plan and NOT a daily manual approval. They never raise themselves;
-// raising one is a reviewed PR. Exact per-cycle binding (region + cycle/operation + tranche + membership + request
-// hashes + plan fingerprint + pricing revision) is computed at run time by computeListingHealthV3AuthorizationBinding
-// and verified EXACTLY on replay by verifyListingHealthV3ReplayBinding.
+// trip awaiting-budget, while a large unexpected jump does -- forcing a reviewed decision). `approvedPlanTokens` is the
+// EXPLICIT user-approved token ceiling for the region (india 28 / europe-au 49 / us-ca 28, approved 2026-09-10) -- the
+// REVIEWED authoritative value. maxCreates is DERIVED from maxAccounts via the SAME structural formula the run uses
+// (2 * batches). A DRIFT GUARD in readListingHealthV3Authorization requires approvedPlanTokens to EQUAL the real-priced
+// structural composition (ceil(maxAccounts/5) * 7 = premium Listings + standard Listings-Raw per batch); a mismatch is
+// authorization-malformed (fail closed) so a stale ceiling (e.g. the old flat std2 16) can never silently under- or
+// over-authorize. These are EXPLICIT authorizations, NOT the obsolete fixed 4/8/4 batch-count assumption: they are
+// membership CEILINGS with headroom priced at the real registry token classes. APPROVAL PROVENANCE (git-verified): the
+// standing limits were introduced in commit 90d981e (2026-09-08, "Onboarding/scheduler P0+P1: ... durable LH
+// authorization"); the TOKEN ceilings were RAISED from the flat-std2 16/28/16 to the real premium-priced 28/49/28 under
+// explicit user approval on 2026-09-10 (a reviewed limit-raise -- maxAccounts/maxCreates are UNCHANGED). They are
+// STANDING REGIONAL LIMITS -- a reviewed policy that authorizes any NEW frozen cycle whose structural spend fits within
+// them -- NOT an exact-plan approval of a specific day's plan and NOT a daily manual approval. They never raise
+// themselves; raising one is a reviewed PR. Exact per-cycle binding (region + cycle/operation + tranche + membership +
+// request hashes + plan fingerprint + pricing revision) is computed at run time by
+// computeListingHealthV3AuthorizationBinding and verified EXACTLY on replay by verifyListingHealthV3ReplayBinding.
 export const LISTING_HEALTH_V3_AUTHORIZATION_PROVENANCE = Object.freeze({
   kind: "standing-regional-limit",
-  approvedIn: "commit 90d981e (2026-09-08) reviewed release; unchanged since",
+  approvedIn: "commit 90d981e (2026-09-08) introduced the standing limits; the token ceilings were RAISED to real premium pricing (india 28 / europe-au 49 / us-ca 28) under user approval 2026-09-10 (reviewed limit-raise)",
   approvedBy: "release-owner review (git-audited; changed only through a reviewed PR)",
-  tokensPerCreate: "ESTIMATE (rowCountBilling=true): the provider's final charge may differ; not a guaranteed maximum",
+  tokensPerBatch: "one PREMIUM Listings export (5) + one STANDARD Listings-Raw export (2) = 7 tokens per <=5-seller batch",
+  tokensNote: "ESTIMATE (rowCountBilling=true): the provider's final charge may differ; not a guaranteed maximum",
 });
 
 export const LISTING_HEALTH_V3_REGION_AUTHORIZATION = Object.freeze({
-  "india": { maxAccounts: 20, pricingRevision: LISTING_HEALTH_V3_PRICING_REVISION },
-  "europe-au": { maxAccounts: 35, pricingRevision: LISTING_HEALTH_V3_PRICING_REVISION },
-  "us-ca": { maxAccounts: 20, pricingRevision: LISTING_HEALTH_V3_PRICING_REVISION },
+  "india": { maxAccounts: 20, approvedPlanTokens: 28, pricingRevision: LISTING_HEALTH_V3_PRICING_REVISION },
+  "europe-au": { maxAccounts: 35, approvedPlanTokens: 49, pricingRevision: LISTING_HEALTH_V3_PRICING_REVISION },
+  "us-ca": { maxAccounts: 20, approvedPlanTokens: 28, pricingRevision: LISTING_HEALTH_V3_PRICING_REVISION },
 });
+
+/** Number of <=5-seller export batches for N export-eligible accounts (batching drives creates AND tokens). */
+export function structuralBatches(accountCount) {
+  const n = Number(accountCount);
+  if (!Number.isInteger(n) || n <= 0) return 0;
+  return Math.ceil(n / MAX_SELLER_IDS_PER_EXPORT);
+}
 
 /** STRUCTURAL required creates for N export-eligible accounts: 2 creates per <=5-seller batch. */
 export function structuralRequiredCreates(accountCount) {
-  const n = Number(accountCount);
-  if (!Number.isInteger(n) || n <= 0) return 0;
-  return 2 * Math.ceil(n / 5);
+  return structuralBatches(accountCount) * V3_CREATES_PER_BATCH;
+}
+
+/** STRUCTURAL required tokens for N export-eligible accounts: one PREMIUM Listings (5) + one STANDARD Listings-Raw (2)
+ * per <=5-seller batch = 7 tokens/batch (the REAL registry-priced plan, not a flat per-create guess). */
+export function structuralRequiredTokens(accountCount) {
+  return structuralBatches(accountCount) * V3_TOKENS_PER_BATCH;
 }
 
 /**
@@ -85,8 +117,19 @@ export function readListingHealthV3Authorization({ region, pricingRevision = LIS
   }
   const maxAccounts = cfg.maxAccounts;
   if (!isStrictPositiveInt(maxAccounts)) return { authorized: false, reason: "authorization-malformed", region: r, detail: "maxAccounts must be a strict positive integer" };
+  const approvedPlanTokens = cfg.approvedPlanTokens;
+  if (!isStrictPositiveInt(approvedPlanTokens)) return { authorized: false, reason: "authorization-malformed", region: r, detail: "approvedPlanTokens must be a strict positive integer" };
   const maxCreates = structuralRequiredCreates(maxAccounts);
-  const maxTokens = maxCreates * V3_AUTHORIZED_TOKENS_PER_CREATE;
+  const structuralTokens = structuralRequiredTokens(maxAccounts);
+  // DRIFT GUARD: the EXPLICIT reviewed token ceiling must EQUAL the real-priced structural composition (premium
+  // Listings + standard Listings-Raw per <=5-seller batch). This catches a stale/mismatched approval -- e.g. the old
+  // flat std2 16-token ceiling left standing against a 20-account cap -- as authorization-malformed (fail closed ->
+  // awaiting-budget) rather than silently under- or over-authorizing. The reviewed value stays authoritative; the guard
+  // only proves it is internally consistent with the real pricing (and re-fires if the source pricing ever changes).
+  if (structuralTokens !== approvedPlanTokens) {
+    return { authorized: false, reason: "authorization-malformed", region: r, detail: `approvedPlanTokens ${approvedPlanTokens} != real-priced structural tokens ${structuralTokens} for maxAccounts ${maxAccounts}` };
+  }
+  const maxTokens = approvedPlanTokens;
   return { authorized: true, region: r, maxAccounts, maxCreates, maxTokens, pricingRevision: S(cfg.pricingRevision), provenance: LISTING_HEALTH_V3_AUTHORIZATION_PROVENANCE };
 }
 

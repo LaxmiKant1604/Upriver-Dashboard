@@ -501,7 +501,12 @@ const REGISTRY = {
       // durable coverage proves through asOf. Missing/short/absent => block (last-known-good preserved).
       const durableOli = context.fbaPlanDurableOli;
       if (!durableOli || durableOli.available !== true || !Array.isArray(durableOli.fragments)) {
-        throw new Error("fba-plan requires durable Order Line Items evidence (source_oli_daily_history) proving coverage through asOf; it is missing or short, so the snapshot is blocked (previous data preserved).");
+        // A MISSING/short durable Order Line Items input is an EXPECTED transient dependency-unavailability (the durable
+        // OLI has not yet materialized for this cycle -- a delayed dependency), NOT a data-integrity error. Type it
+        // `unavailable` (deriveError) so the worker records a NON-terminal SOURCE_UNAVAILABLE that RETRIES (this cycle
+        // once OLI materializes, and the next cycle) with last-known-good preserved -- never a permanent, indistinguishable
+        // DERIVE_INVALID. Genuine integrity problems below (malformed/cross-account/wrong-window rows) stay plain-invalid.
+        throw deriveError("fba-plan requires durable Order Line Items evidence (source_oli_daily_history) proving coverage through asOf; it is missing or short, so the snapshot is deferred (previous data preserved; a later cycle retries once it materializes).", "unavailable");
       }
       const oliSalesRows = slicedFragmentRows(durableOli, expectedOliSlices, rawSellerId, "fba-plan:oli-sales");
       const { completedUnitRows, mtdUnitRows, dailyDateRows } = foldOliSalesToFbaInputs(oliSalesRows, completed, current);
@@ -511,7 +516,10 @@ const REGISTRY = {
       //    .. current.to]; absence blocks (last-known-good preserved).
       const durableCatalog = context.fbaPlanDurableCatalog;
       if (!durableCatalog || durableCatalog.available !== true || !Array.isArray(durableCatalog.fragments)) {
-        throw new Error("fba-plan requires the durable Product Catalog snapshot; it is missing, so the snapshot is blocked (previous data preserved).");
+        // A MISSING durable Product Catalog snapshot is likewise an EXPECTED transient dependency-unavailability (a
+        // delayed dependency), NOT integrity-invalidity: type it `unavailable` so the worker records a NON-terminal
+        // SOURCE_UNAVAILABLE that retries with last-known-good preserved, instead of a permanent DERIVE_INVALID.
+        throw deriveError("fba-plan requires the durable Product Catalog snapshot; it is missing, so the snapshot is deferred (previous data preserved; a later cycle retries once it materializes).", "unavailable");
       }
       const catalogRows = singleAccountFragmentRows(durableCatalog, "fba-plan:catalog", rawSellerId, completed[0].from, current.to);
       // Inventory window is EXACTLY the single snapshot day [inventoryAsOf .. inventoryAsOf] (D-1). Pin

@@ -200,6 +200,61 @@ test("FBA latest-snapshot COMPACTION: a cap-sized single-seller inventory payloa
   assert.equal(res.failed, 0);
 });
 
+group("source worker: FBA latest-snapshot EMPTY = valid-empty inventory-unavailable (single/multi-seller parity, defect 2)");
+
+// A single-seller EXACT D-1 (from===to) inventory job. BEFORE the fix an empty response was a terminal
+// LATEST_SNAPSHOT_INCOMPLETE hard stop (blocking the whole report); AFTER the fix it is a valid-empty SUCCESS
+// (rowCount 0) typed inventory-unavailable -- CONSISTENT with a multi-seller batch's zero-row valid-empty, so
+// splitting a seller no longer flips a successful empty inventory export from valid-empty to blocked.
+function invJobD1(ids, marketplace, day) {
+  const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids, windowsByRequestKey: { "fba-plan:inventory-health": [{ from: day, to: day }] }, marketplaceCountry: marketplace });
+  const src = resolved.find((r) => r.requestKey === "fba-plan:inventory-health");
+  return { src, job: plannedSourceJob("fba-plan", src, "us", "primary", "acct-" + ids[0], ids[0], marketplace) };
+}
+
+test("EMPTY single-seller D-1 inventory export is a valid-empty SUCCESS (rowCount 0), NOT a LATEST_SNAPSHOT_INCOMPLETE hard stop (defect 2 reproduction)", async () => {
+  const store = makeStore();
+  const { src, job } = invJobD1(["A1"], "CA", "2026-09-08");
+  assert.deepEqual(job.fetchParams.sellerOrVendorIds, ["A1"], "single-seller job (drives the latest-snapshot compaction path)");
+  const dd = makeDataDoe(() => []); // a successfully-completed export that returned zero rows
+  const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [job] }));
+  const j = store._rawJob(res.cycleId, src.requestHash);
+  assert.equal(j.fetch_status, "succeeded", "an empty bounded D-1 export SUCCEEDS (valid-empty), not a terminal hard stop");
+  assert.equal(j.error_code, null, "no LATEST_SNAPSHOT_INCOMPLETE failure recorded");
+  assert.equal(j.row_count, 0, "zero rows persisted (inventory-unavailable for the day, never a fabricated zero)");
+  const cached = store.loadSourceRows(src.requestHash);
+  assert.ok(cached && Array.isArray(cached.rows) && cached.rows.length === 0, "the empty payload is persisted as valid-empty (so the report derives inventoryAvailable=false)");
+  assert.equal(res.succeeded, 1);
+  assert.equal(res.failed, 0);
+});
+
+test("EMPTY multi-seller D-1 inventory batch is ALSO a valid-empty SUCCESS -> single/multi-seller PARITY (defect 2)", async () => {
+  const store = makeStore();
+  const { src, job } = invJobD1(["A1", "A2"], "CA", "2026-09-08"); // 2-seller batch -> generic path (NOT compaction)
+  assert.equal(job.fetchParams.sellerOrVendorIds.length, 2, "a >1-seller batch exercises the generic (non-compaction) empty path");
+  const dd = makeDataDoe(() => []);
+  const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [job] }));
+  const j = store._rawJob(res.cycleId, src.requestHash);
+  assert.equal(j.fetch_status, "succeeded", "a multi-seller empty batch is valid-empty (unchanged) -> AGREES with the single-seller outcome");
+  assert.equal(j.row_count, 0);
+  assert.equal(res.succeeded, 1);
+  assert.equal(res.failed, 0);
+});
+
+test("an UNBOUNDED (multi-day) single-seller EMPTY inventory export is STILL a terminal hard stop (unbounded empty proves nothing)", async () => {
+  const store = makeStore();
+  const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "fba-plan:inventory-health": [{ from: "2026-08-30", to: "2026-09-08" }] }, marketplaceCountry: "CA" });
+  const src = resolved.find((r) => r.requestKey === "fba-plan:inventory-health");
+  const job = plannedSourceJob("fba-plan", src, "us", "primary", "acct-A1", "A1", "CA");
+  const dd = makeDataDoe(() => []);
+  const res = await runSourceJobs(runOpts({ store, dataDoe: dd, plannedJobs: [job] }));
+  const j = store._rawJob(res.cycleId, src.requestHash);
+  assert.equal(j.error_code, "LATEST_SNAPSHOT_INCOMPLETE", "an unbounded (multi-day) empty lookback is never inferred unavailable");
+  assert.equal(j.terminal, true);
+  assert.equal(store._cache.has(src.requestHash), false, "nothing persisted for the unprovable empty lookback");
+  assert.equal(res.failed, 1);
+});
+
 async function main() {
   mark("main(): loading source-worker modules");
   ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));

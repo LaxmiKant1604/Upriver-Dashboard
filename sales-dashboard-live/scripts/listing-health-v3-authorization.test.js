@@ -9,9 +9,10 @@ import {
   readListingHealthV3Authorization,
   decideListingHealthV3Authorization,
   structuralRequiredCreates,
+  structuralRequiredTokens,
+  V3_TOKENS_PER_BATCH,
   LISTING_HEALTH_V3_PRICING_REVISION,
   LISTING_HEALTH_V3_REGION_AUTHORIZATION,
-  V3_AUTHORIZED_TOKENS_PER_CREATE,
   LISTING_HEALTH_V3_AUTHORIZATION_PROVENANCE,
   computeListingHealthV3AuthorizationBinding,
   verifyListingHealthV3ReplayBinding,
@@ -33,9 +34,18 @@ writeSync(1, "listing-health-v3-authorization\n");
     structuralRequiredCreates(8) === 4 && structuralRequiredCreates(6) === 4 && structuralRequiredCreates(5) === 2 && structuralRequiredCreates(11) === 6);
   ok("A2: zero/negative account count -> zero required (no spend)", structuralRequiredCreates(0) === 0 && structuralRequiredCreates(-3) === 0);
 
+  ok("A2b: structural TOKENS = 7 per <=5-seller batch (premium listings 5 + standard listings-raw 2): 20 accts -> 28, 35 -> 49, 11 -> 21, 8 -> 14",
+    V3_TOKENS_PER_BATCH === 7 && structuralRequiredTokens(20) === 28 && structuralRequiredTokens(35) === 49 && structuralRequiredTokens(11) === 21 && structuralRequiredTokens(8) === 14);
+
   const au = readListingHealthV3Authorization({ region: "us-ca" });
-  ok("A3: a known region reads AUTHORIZED with maxCreates/maxTokens DERIVED from maxAccounts (not a magic number)",
-    au.authorized === true && au.maxAccounts === 20 && au.maxCreates === structuralRequiredCreates(20) && au.maxTokens === au.maxCreates * V3_AUTHORIZED_TOKENS_PER_CREATE && au.pricingRevision === LISTING_HEALTH_V3_PRICING_REVISION);
+  ok("A3: a known region reads AUTHORIZED with maxCreates + real-priced maxTokens DERIVED from maxAccounts (not a flat per-create magic number)",
+    au.authorized === true && au.maxAccounts === 20 && au.maxCreates === structuralRequiredCreates(20) && au.maxTokens === structuralRequiredTokens(20) && au.maxTokens === 28 && au.pricingRevision === LISTING_HEALTH_V3_PRICING_REVISION);
+
+  // The user-approved standing token ceilings (2026-09-10): india 28 / europe-au 49 / us-ca 28 -- real premium pricing.
+  ok("A3b: all three regions read the APPROVED real-priced token ceilings (india 28 / europe-au 49 / us-ca 28); maxCreates unchanged (8/14/8)",
+    readListingHealthV3Authorization({ region: "india" }).maxTokens === 28 && readListingHealthV3Authorization({ region: "india" }).maxCreates === 8
+    && readListingHealthV3Authorization({ region: "europe-au" }).maxTokens === 49 && readListingHealthV3Authorization({ region: "europe-au" }).maxCreates === 14
+    && readListingHealthV3Authorization({ region: "us-ca" }).maxTokens === 28 && readListingHealthV3Authorization({ region: "us-ca" }).maxCreates === 8);
 
   const authorizedCreates = Object.keys(LISTING_HEALTH_V3_REGION_AUTHORIZATION).map((r) => readListingHealthV3Authorization({ region: r }).maxCreates).sort((a, b) => a - b);
   ok("A4: the authorization is NOT the obsolete fixed 4/8/4 (it is a membership CEILING with headroom)",
@@ -44,20 +54,45 @@ writeSync(1, "listing-health-v3-authorization\n");
   ok("A5: an UNKNOWN region reads no-authorization (never a silent default)", readListingHealthV3Authorization({ region: "atlantis" }).authorized === false && readListingHealthV3Authorization({ region: "atlantis" }).reason === "no-authorization");
   const stale = readListingHealthV3Authorization({ region: "us-ca", pricingRevision: "OTHER-REV" });
   ok("A6: a pricing-revision mismatch reads pricing-revision-stale (authorization is bound to pricing)", stale.authorized === false && stale.reason === "pricing-revision-stale");
-  const malformed = readListingHealthV3Authorization({ region: "x", config: { x: { maxAccounts: 0, pricingRevision: LISTING_HEALTH_V3_PRICING_REVISION } } });
+  const malformed = readListingHealthV3Authorization({ region: "x", config: { x: { maxAccounts: 0, approvedPlanTokens: 0, pricingRevision: LISTING_HEALTH_V3_PRICING_REVISION } } });
   ok("A7: a malformed authorization (maxAccounts<=0) reads authorization-malformed", malformed.authorized === false && malformed.reason === "authorization-malformed");
+  // DRIFT GUARD: a stale/mismatched explicit ceiling (e.g. the OLD flat-std2 16 left against a 20-account cap whose
+  // real-priced structural is 28) is authorization-malformed -- fail closed, never a silent under-authorization.
+  const drift = readListingHealthV3Authorization({ region: "us-ca", config: { "us-ca": { maxAccounts: 20, approvedPlanTokens: 16, pricingRevision: LISTING_HEALTH_V3_PRICING_REVISION } } });
+  ok("A7b: DRIFT GUARD -- an approvedPlanTokens that != the real-priced structural (16 vs 28) is authorization-malformed (the old flat-std2 defect is now caught)",
+    drift.authorized === false && drift.reason === "authorization-malformed" && /16/.test(drift.detail) && /28/.test(drift.detail));
+  // A missing approvedPlanTokens is malformed (the explicit reviewed ceiling is required).
+  const noTokens = readListingHealthV3Authorization({ region: "x", config: { x: { maxAccounts: 20, pricingRevision: LISTING_HEALTH_V3_PRICING_REVISION } } });
+  ok("A7c: a config missing approvedPlanTokens is authorization-malformed (the explicit reviewed ceiling is required)", noTokens.authorized === false && noTokens.reason === "authorization-malformed");
 }
 
 /* ===================== B. pure decision: NOT derived from balance; growth defers ===================== */
 {
-  const authz = readListingHealthV3Authorization({ region: "us-ca" }); // maxAccounts 20, maxCreates 8, maxTokens 16
+  const authz = readListingHealthV3Authorization({ region: "us-ca" }); // maxAccounts 20, maxCreates 8, maxTokens 28
   ok("B1: within authorization -> ok", decideListingHealthV3Authorization({ region: "us-ca", accountCount: 8, requiredCreates: 4, requiredTokens: 8, authorization: authz }).ok === true);
+  // The DEFECT-FIX case: us-ca 11 accounts / 6 creates / 21 real tokens now FITS (21 <= 28) -- the exact shape that
+  // failed US natural run 34394580474 under the old flat-std2 16 ceiling.
+  ok("B1b: us-ca 11 accounts / 6 creates / 21 real tokens is now WITHIN authorization (21 <= 28) -- the defect fix",
+    decideListingHealthV3Authorization({ region: "us-ca", accountCount: 11, requiredCreates: 6, requiredTokens: 21, authorization: authz }).ok === true);
   ok("B2: MEMBERSHIP beyond the authorized maxAccounts defers (growth never self-authorizes)",
     decideListingHealthV3Authorization({ region: "us-ca", accountCount: 21, requiredCreates: 8, requiredTokens: 16, authorization: authz }).reason === "membership-exceeds-authorization");
   ok("B3: CREATES beyond authorized maxCreates defers", decideListingHealthV3Authorization({ region: "us-ca", accountCount: 5, requiredCreates: 9, requiredTokens: 10, authorization: authz }).reason === "creates-exceed-authorization");
-  ok("B4: TOKENS beyond authorized maxTokens defers", decideListingHealthV3Authorization({ region: "us-ca", accountCount: 5, requiredCreates: 2, requiredTokens: 17, authorization: authz }).reason === "tokens-exceed-authorization");
+  ok("B4: TOKENS beyond authorized maxTokens defers (29 > 28)", decideListingHealthV3Authorization({ region: "us-ca", accountCount: 5, requiredCreates: 2, requiredTokens: 29, authorization: authz }).reason === "tokens-exceed-authorization");
   ok("B5: an unauthorized authorization object defers with its own typed reason", decideListingHealthV3Authorization({ region: "us-ca", accountCount: 1, requiredCreates: 1, requiredTokens: 1, authorization: { authorized: false, reason: "no-authorization" } }).reason === "no-authorization");
   ok("B6: a missing authorization object defers authorization-unreadable (never a crash, never a pass)", decideListingHealthV3Authorization({ region: "us-ca", accountCount: 1, requiredCreates: 1, requiredTokens: 1, authorization: null }).reason === "authorization-unreadable");
+
+  // ALL REGIONS at CURRENT membership (india 8->14 tok, europe-au 30->42, us-ca 11->21) are authorized under 28/49/28.
+  const cur = [["india", 8, 4, 14], ["europe-au", 30, 12, 42], ["us-ca", 11, 6, 21]];
+  ok("B7: every region at CURRENT membership is authorized under the approved ceilings (india 14<=28, europe-au 42<=49, us-ca 21<=28)",
+    cur.every(([r, n, c, t]) => decideListingHealthV3Authorization({ region: r, accountCount: n, requiredCreates: c, requiredTokens: t, authorization: readListingHealthV3Authorization({ region: r }) }).ok === true));
+  // ALL REGIONS at the APPROVED account CAP (20/35/20) fit EXACTLY (28/49/28).
+  const caps = [["india", 20, 8, 28], ["europe-au", 35, 14, 49], ["us-ca", 20, 8, 28]];
+  ok("B8: every region at the APPROVED account cap fits its ceiling EXACTLY (india 28, europe-au 49, us-ca 28)",
+    caps.every(([r, n, c, t]) => decideListingHealthV3Authorization({ region: r, accountCount: n, requiredCreates: c, requiredTokens: t, authorization: readListingHealthV3Authorization({ region: r }) }).ok === true));
+  // cap+1 accounts defers (membership-exceeds) for every region -- growth beyond the reviewed cap never self-authorizes.
+  const capPlus = [["india", 21], ["europe-au", 36], ["us-ca", 21]];
+  ok("B9: every region at cap+1 accounts defers membership-exceeds-authorization (growth never self-raises the ceiling)",
+    capPlus.every(([r, n]) => decideListingHealthV3Authorization({ region: r, accountCount: n, requiredCreates: 2, requiredTokens: 2, authorization: readListingHealthV3Authorization({ region: r }) }).reason === "membership-exceeds-authorization"));
 }
 
 /* ===================== C. operation: authorization is a SEPARATE gate BEFORE affordability ===================== */
@@ -105,16 +140,17 @@ await (async () => {
   const s4 = spies({ balance: { usable: 500, reserve: 50 } });
   const r4 = await runListingHealthV3Ingestion(base({ ...s4 }));
   ok("C5: the real durable authorization (us-ca) with an affordable balance proceeds (both gates pass; runs sources)",
-    r4.awaitingBudget !== true && s4.calls.checkBalance === 1 && s4.calls.runSources === 1 && r4.authorizedTokens === 16 && r4.affordableTokens === 450);
+    r4.awaitingBudget !== true && s4.calls.checkBalance === 1 && s4.calls.runSources === 1 && r4.authorizedTokens === 28 && r4.affordableTokens === 450);
 })();
 
 
 /* ===================== D. EXACT per-cycle BINDING of the STANDING regional authorization (round 2) ===================== */
 {
-  ok("D0: the limits are a STANDING regional policy with recorded provenance (commit 90d981e), NOT an exact-plan approval, and were NOT raised (20/35/20)",
-    LISTING_HEALTH_V3_AUTHORIZATION_PROVENANCE.kind === "standing-regional-limit" && /90d981e/.test(LISTING_HEALTH_V3_AUTHORIZATION_PROVENANCE.approvedIn)
+  ok("D0: the limits are a STANDING regional policy with recorded provenance (origin 90d981e + the 2026-09-10 reviewed token-ceiling raise); account caps UNCHANGED (20/35/20); approved token ceilings 28/49/28",
+    LISTING_HEALTH_V3_AUTHORIZATION_PROVENANCE.kind === "standing-regional-limit" && /90d981e/.test(LISTING_HEALTH_V3_AUTHORIZATION_PROVENANCE.approvedIn) && /2026-09-10/.test(LISTING_HEALTH_V3_AUTHORIZATION_PROVENANCE.approvedIn)
     && LISTING_HEALTH_V3_REGION_AUTHORIZATION.india.maxAccounts === 20 && LISTING_HEALTH_V3_REGION_AUTHORIZATION["europe-au"].maxAccounts === 35 && LISTING_HEALTH_V3_REGION_AUTHORIZATION["us-ca"].maxAccounts === 20
-    && /ESTIMATE/.test(LISTING_HEALTH_V3_AUTHORIZATION_PROVENANCE.tokensPerCreate));
+    && LISTING_HEALTH_V3_REGION_AUTHORIZATION.india.approvedPlanTokens === 28 && LISTING_HEALTH_V3_REGION_AUTHORIZATION["europe-au"].approvedPlanTokens === 49 && LISTING_HEALTH_V3_REGION_AUTHORIZATION["us-ca"].approvedPlanTokens === 28
+    && /ESTIMATE/.test(LISTING_HEALTH_V3_AUTHORIZATION_PROVENANCE.tokensNote));
 
   const authz = readListingHealthV3Authorization({ region: "us-ca" });
   const frozen = { trancheKey: "lhv3-new#us-ca", planFingerprint: "fp-A", maxCreates: 4, maxTokens: 8, hashes: [{ requestHash: "h-b" }, { requestHash: "h-a" }, { requestHash: "h-d" }, { requestHash: "h-c" }] };
@@ -160,6 +196,21 @@ await (async () => {
   ok("D10: REPLAY mismatch on fingerprint / hash set / ceilings is a typed replay-binding-mismatch (awaiting-budget, never paid work)",
     fpDrift.ok === false && fpDrift.reason === "replay-binding-mismatch" && /plan-fingerprint/.test(fpDrift.detail)
     && hashDrift.ok === false && /request-hashes/.test(hashDrift.detail) && ceilDrift.ok === false && /max-tokens/.test(ceilDrift.detail));
+
+  // OLD-CYCLE COMPATIBLE REPLAY (defect 1 old-cycle handling): a prior terminal cycle's REAL-priced frozen budget
+  // (computeFrozenTrancheBudget is UNCHANGED -- premium listings 5 + standard raw 2) still BINDS and REPLAYS under the
+  // RAISED ceiling. Raising the ceiling only WIDENS the band (14 <= 28), never shrinks a frozen reservation; and the
+  // pricing-revision string is NOT part of the persisted replay comparison (fingerprint/creates/tokens/hashes only),
+  // so no old frozen cycle is refused, rewritten, or re-authorized.
+  const canaryAuthz = readListingHealthV3Authorization({ region: "us-ca" }); // now 28 tokens / 8 creates
+  const canaryFrozen = { trancheKey: "lhv3-new#us-ca", planFingerprint: "fp-canary", maxCreates: 4, maxTokens: 14, hashes: [{ requestHash: "c1" }, { requestHash: "c2" }, { requestHash: "c3" }, { requestHash: "c4" }] };
+  const canaryBind = computeListingHealthV3AuthorizationBinding({ region: "us-ca", cycleDate: "2026-09-06", operationId: "listing-health-v3/us-ca/2026-09-06", trancheKey: "lhv3-new#us-ca", accountIds: Array.from({ length: 10 }, (_, i) => "u" + i), frozen: canaryFrozen, pricingRevision: LISTING_HEALTH_V3_PRICING_REVISION, authorization: canaryAuthz });
+  ok("D11: an OLD real-priced canary frozen budget (4 creates / 14 tokens) STILL binds under the RAISED 28 ceiling (a widened band never shrinks a frozen reservation)",
+    canaryBind.ok === true && canaryBind.binding.maxTokens === 14 && canaryBind.binding.maxCreates === 4);
+  const canaryPersisted = { row: { plan_fingerprint: "fp-canary", max_creates: 4, max_tokens: 14 }, hashes: [{ request_hash: "c4" }, { request_hash: "c3" }, { request_hash: "c2" }, { request_hash: "c1" }] };
+  const canaryReplay = verifyListingHealthV3ReplayBinding({ binding: canaryBind.binding, persisted: canaryPersisted });
+  ok("D11: the OLD canary's persisted frozen budget replays EXACTLY (replay:true) -- the pricing-revision change is not part of the persisted comparison; no old cycle is rewritten",
+    canaryReplay.ok === true && canaryReplay.replay === true);
 }
 
 /* ===================== E. the OPERATION enforces the binding BEFORE affordability and hands it to runSources ===================== */

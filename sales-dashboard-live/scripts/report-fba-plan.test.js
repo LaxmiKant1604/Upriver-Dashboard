@@ -31,7 +31,7 @@ const mark = (m) => { try { writeSync(2, "[+" + (Date.now() - START) + "ms] " + 
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
 // Assigned in main() after the dummy env is set.
-let assembleSources, deriveReportSnapshot, runReportJobs;
+let assembleSources, deriveReportSnapshot, runReportJobs, sanitizeReportDiagnostic;
 let fbaPlanPayload, foldPlanAsinUnits;
 let planMonthWindows, addDaysStr, planFbaPlan, canonicalOliSlices;
 let slicedOliSourceFromHistory;
@@ -452,21 +452,38 @@ test("fba-plan: an unavailable required source preserves last-known-good (no sna
   assert.equal(res.payload, null);
 });
 
-test("fba-plan: a MISSING durable OLI context fails closed (invalid -> last-known-good preserved)", () => {
+test("fba-plan: a MISSING durable OLI context is UNAVAILABLE (retryable defer), NOT terminal invalid; LKG preserved (defect 3)", () => {
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const sources = buildSources(planned, rows);
-  // Durable OLI absent (loader returned {} for short/missing coverage) -> derive blocks, never fabricates.
+  // Durable OLI absent (loader returned {} for short/missing coverage) = an EXPECTED delayed dependency, not a data-
+  // integrity error. It must type `unavailable` (retryable, distinguishable) -- never an indistinguishable permanent
+  // DERIVE_INVALID -- and carry the real deferred reason (not the generic "derivation threw"). Zero writes, LKG kept.
   const res = deriveReportSnapshot({ reportKey: "fba-plan", sources, context: { ...usContext(), fbaPlanDurableCatalog: sources["fba-plan:catalog"] } });
-  assert.equal(res.status, "invalid");
+  assert.equal(res.status, "unavailable");
   assert.equal(res.payload, null);
+  assert.notEqual(res.reason, "derivation threw", "an unavailable defer carries its real reason, not the generic invalid label");
+  assert.match(res.reason, /Order Line Items/, "the reason names the delayed durable dependency");
 });
 
-test("fba-plan: a MISSING durable Catalog context fails closed (invalid -> last-known-good preserved)", () => {
+test("fba-plan: a MISSING durable Catalog context is UNAVAILABLE (retryable defer), NOT terminal invalid; LKG preserved (defect 3)", () => {
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const sources = buildSources(planned, rows);
   const res = deriveReportSnapshot({ reportKey: "fba-plan", sources, context: { ...usContext(), fbaPlanDurableOli: sources["fba-plan:oli-sales"] } });
-  assert.equal(res.status, "invalid");
+  assert.equal(res.status, "unavailable");
   assert.equal(res.payload, null);
+  assert.match(res.reason, /Product Catalog/, "the reason names the delayed durable dependency");
+});
+
+test("fba-plan: a delayed durable OLI that LATER becomes available RECOVERS (same account, dep materializes) (defect 3)", () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const sources = buildSources(planned, rows);
+  // Pass 1: durable OLI not yet materialized -> unavailable (retryable), no snapshot.
+  const before = deriveReportSnapshot({ reportKey: "fba-plan", sources, context: { ...usContext(), fbaPlanDurableCatalog: sources["fba-plan:catalog"] } });
+  assert.equal(before.status, "unavailable", "delayed dependency defers, retryable");
+  // Pass 2: the SAME inputs once the durable OLI materializes -> derives cleanly (natural next-cycle recovery, no framework).
+  const after = deriveReportSnapshot({ reportKey: "fba-plan", sources, context: { ...usContext(), fbaPlanDurableOli: sources["fba-plan:oli-sales"], fbaPlanDurableCatalog: sources["fba-plan:catalog"] } });
+  assert.equal(after.status, "derived", "once the delayed durable dependency is present the derive succeeds");
+  assert.ok(after.payload && Array.isArray(after.payload.rows), "a real payload is produced on recovery");
 });
 
 test("fba-plan: derivation is idempotent (same inputs -> identical payload)", () => {
@@ -656,11 +673,72 @@ test("loader: OLI present but catalog missing -> OLI supplied, catalog omitted (
   assert.equal(ctx.fbaPlanDurableCatalog, undefined);
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const out = deriveReportSnapshot({ reportKey: "fba-plan", sources: buildSources(planned, rows), context: { ...usContext(), ...ctx } });
-  assert.equal(out.status, "invalid", "missing durable catalog blocks the derive (last-known-good preserved)");
+  assert.equal(out.status, "unavailable", "missing durable catalog DEFERS the derive (retryable; last-known-good preserved)");
 });
 
 test("loader: a non-calendar asOf yields {} (derive fails closed)", async () => {
   assert.deepEqual(await makeLoader()({ reportKey: "fba-plan", accountId: ID, planned: { context: usContext({ to: "not-a-date" }) } }), {});
+});
+
+/* ===================== defect 3: delayed durable dependency = honest retryable defer + diagnostics ============= */
+
+group("fba-plan: delayed durable dependency (SOURCE_UNAVAILABLE) vs genuine integrity (DERIVE_INVALID) + diagnostics");
+
+// Wrap fbaReportPlan's store to CAPTURE the full recordReportFailure args (the shared double records error_code but
+// not the message/terminal flag). Proves what is PERSISTED for an operator/Codex to diagnose.
+function capturingReportPlan(planned, rows) {
+  const base = fbaReportPlan(planned, rows);
+  const failures = [];
+  const orig = base.store.recordReportFailure.bind(base.store);
+  base.store.recordReportFailure = async (a) => { failures.push(a); return orig(a); };
+  return { ...base, failures };
+}
+
+test("fba-plan worker: a missing durable OLI records SOURCE_UNAVAILABLE (retryable), the real reason, no snapshot, LKG preserved (defect 3)", async () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const base = capturingReportPlan(planned, rows);
+  base.store.seedSnapshot("scheduler-v2/fba-plan", ID, { asOf: "2025-07-01", rows: [{ asin: "PRIOR" }] });
+  let saveCalls = 0; const saveSnapshot = async () => { saveCalls += 1; return { paramsHash: "ph" }; };
+  // The durable OLI never materializes this cycle (loadDerivedContext supplies only the catalog) = a delayed dependency.
+  const loadDerivedContext = async ({ reportKey }) => (reportKey === "fba-plan" ? { fbaPlanDurableCatalog: buildSources(planned, rows)["fba-plan:catalog"] } : {});
+  await runReportJobs({ store: base.store, cycleId: "cycU", sourceRows: base.sourceRows, saveSnapshot, plannedReports: [base.plannedReport], loadDerivedContext });
+  assert.equal(saveCalls, 0, "no snapshot saved for the deferred derive");
+  assert.deepEqual(base.store._snapshots.get("scheduler-v2/fba-plan|" + ID).payload.rows[0].asin, "PRIOR", "last-known-good snapshot unchanged");
+  assert.equal(base.failures.length, 1);
+  assert.equal(base.failures[0].code, "SOURCE_UNAVAILABLE", "a delayed durable dependency is a retryable SOURCE_UNAVAILABLE, NOT terminal DERIVE_INVALID");
+  assert.equal(base.failures[0].terminal, false, "non-terminal (retryable next cycle / once it materializes)");
+  assert.match(base.failures[0].message, /Order Line Items/, "the persisted reason names the delayed durable dependency (diagnosable)");
+});
+
+test("fba-plan worker: a GENUINE integrity error records DERIVE_INVALID with the REAL sanitized detail, not the generic 'derivation threw' (defect 3 diagnostics)", async () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
+  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -9) }; // wrong inventory window => genuine integrity invalid
+  const base = capturingReportPlan(planned, rows);
+  let saveCalls = 0; const saveSnapshot = async () => { saveCalls += 1; return { paramsHash: "ph" }; };
+  await runReportJobs({ store: base.store, cycleId: "cycI", sourceRows: base.sourceRows, saveSnapshot, plannedReports: [base.plannedReport], loadDerivedContext: base.loadDerivedContext });
+  assert.equal(saveCalls, 0, "no snapshot saved for the invalid derive");
+  assert.equal(base.failures.length, 1);
+  assert.equal(base.failures[0].code, "DERIVE_INVALID", "a genuine integrity error stays terminal DERIVE_INVALID");
+  assert.equal(base.failures[0].terminal, true);
+  assert.notEqual(base.failures[0].message, "derivation threw", "the persisted message is the REAL sanitized detail, not the generic label");
+  assert.ok(base.failures[0].message.length > 0 && base.failures[0].message.length <= 300, "the diagnostic is bounded (secret-free, capped)");
+});
+
+test("sanitizeReportDiagnostic: TRUNCATES to 300 chars and COLLAPSES whitespace/newlines (bounded, secret-free) (defect 3)", () => {
+  // Directly exercise the sanitizer's two distinctive behaviors (the worker's real derive messages are short + clean,
+  // so integration tests never hit these): a >300-char message with tabs/newlines/repeated spaces must come out
+  // single-spaced, trimmed, and EXACTLY 300 chars -- so removing .slice(0,300) or the \\s+ collapse is regression-caught.
+  const long = "  x" + "\t\n  y   z\n".repeat(200) + "  "; // >300 chars, many whitespace runs + newlines/tabs
+  const s = sanitizeReportDiagnostic(long);
+  assert.equal(s.length, 300, "truncated to exactly the 300-char cap");
+  assert.ok(!/\s\s/.test(s), "no double-spaces (whitespace runs collapsed)");
+  assert.ok(!/[\n\t]/.test(s), "no newlines or tabs (collapsed to single spaces)");
+  assert.equal(s[0], "x", "leading whitespace trimmed");
+  // A short clean message passes through unchanged; a blank/nullish input falls back to a stable label.
+  assert.equal(sanitizeReportDiagnostic("snapshot blocked."), "snapshot blocked.");
+  assert.equal(sanitizeReportDiagnostic("   "), "derivation failed");
+  assert.equal(sanitizeReportDiagnostic(null), "derivation failed");
 });
 
 /* ===================== BATCHED marketplace-safe planning + isolation (go-live) ===================== */
@@ -831,7 +909,7 @@ test("fbaGoLiveTokenCost: 16 batched exports = 80 premium tokens; adoptable jobs
 
 async function main() {
   mark("main(): loading fba-plan modules");
-  ({ assembleSources, runReportJobs } = await import("../lib/server/sync/report-worker.js"));
+  ({ assembleSources, runReportJobs, sanitizeReportDiagnostic } = await import("../lib/server/sync/report-worker.js"));
   ({ deriveReportSnapshot } = await import("../lib/server/sync/report-derivation.js"));
   ({ fbaPlanPayload, foldPlanAsinUnits } = await import("../lib/server/reports/derivation-core.js"));
   ({ planMonthWindows, addDaysStr, canonicalOliSlices } = await import("../lib/server/date-windows.js"));

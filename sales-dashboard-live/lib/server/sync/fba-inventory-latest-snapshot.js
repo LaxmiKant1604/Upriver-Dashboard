@@ -32,6 +32,11 @@ const bytesOf = (rows) => { try { return Buffer.byteLength(JSON.stringify({ rows
  * Reduce a SINGLE-SELLER FBA inventory payload to its latest provably-complete date. PURE (no I/O; rows never mutated).
  * `rows` are the downloaded inventory rows (DataDoe returns them ordered by date DESC). Returns:
  *   { complete:true, snapshotDate, rows:block, metadata:{...}, proof:{...} }  when the latest date is provably complete,
+ *   { complete:true, empty:true, inventoryAvailable:false, snapshotDate:null, rows:[], metadata:{...} }
+ *                                                                              when a BOUNDED exact single-day (D-1)
+ *                                                                              export legitimately returned zero rows
+ *                                                                              (typed inventory-unavailable, NOT zero
+ *                                                                              stock, NOT a proven snapshot date),
  *   { complete:false, reason, proof:{...} }                                    otherwise (never infer completeness).
  * `metadata` carries the durable provenance the cache row should record (raw/compacted row counts + bytes, the snapshot
  * date, the completeness proof, and the caller-supplied source export reference).
@@ -42,7 +47,47 @@ export function compactLatestInventorySnapshot({ rows, seller, marketplace, rowC
   const mkt = S(marketplace).trim().toUpperCase();
   const rawRowCount = rows.length;
   const capSized = rawRowCount >= rowCap;
-  if (rawRowCount === 0) return { complete: false, reason: "EMPTY_PAYLOAD", proof: { rawRowCount } };
+  if (rawRowCount === 0) {
+    // A SUCCESSFULLY-completed export that returned ZERO rows is honest inventory-UNAVAILABLE -- but ONLY when it was a
+    // BOUNDED, exact single-day (D-1) request (requestedFrom === requestedTo, both a real calendar date). Such an empty
+    // result is typed inventory-unavailable FOR THAT DAY: NOT measured zero stock, NOT a proven snapshot date, and NOT a
+    // truncation. This makes a single-seller latest-snapshot empty response CONSISTENT with a multi-seller batch's
+    // zero-row valid-empty (which the generic path already accepts) instead of a terminal hard stop -- so splitting a
+    // seller can no longer flip a successful empty inventory export from valid-empty to blocked. An UNBOUNDED / multi-day
+    // / missing-window empty proves NOTHING (an empty lookback could hide an incomplete or wrong window), so it stays
+    // EMPTY_PAYLOAD (rejected -> the source worker records LATEST_SNAPSHOT_INCOMPLETE; previous data preserved). The
+    // downstream derive reads the empty rows and resolves inventoryAvailable=false (no fabricated zero, no fresh date).
+    const reqFrom = S(requestedFrom);
+    const reqTo = S(requestedTo);
+    const boundedSingleDay = /^\d{4}-\d{2}-\d{2}$/.test(reqFrom) && reqFrom === reqTo;
+    if (!boundedSingleDay) {
+      return { complete: false, reason: "EMPTY_PAYLOAD", proof: { rawRowCount: 0, requestedFrom: reqFrom || null, requestedTo: reqTo || null, boundedSingleDay: false } };
+    }
+    return {
+      complete: true,
+      empty: true,
+      inventoryAvailable: false,
+      snapshotDate: null,
+      rows: [],
+      proof: { rawRowCount: 0, boundedSingleDayEmpty: true, requestedFrom: reqFrom, requestedTo: reqTo },
+      metadata: {
+        requestedFrom: reqFrom,
+        requestedTo: reqTo,
+        inventorySnapshotDate: null,
+        inventoryAvailable: false,
+        inventoryUnavailable: true,
+        emptyInventorySnapshot: true,
+        rawRowCount: 0,
+        compactedRowCount: 0,
+        rawPayloadBytes: bytesOf([]),
+        compactedPayloadBytes: bytesOf([]),
+        latestDateCompletenessProof: { boundedSingleDayEmpty: true },
+        normalizedLatestSnapshot: true,
+        normalizationVersion: LATEST_SNAPSHOT_NORMALIZATION_VERSION,
+        sourceExportRef: exportRef || null,
+      },
+    };
+  }
 
   const dateOf = (r) => S(r && r.date);
   const latestDate = rows.reduce((m, r) => { const d = dateOf(r); return d > m ? d : m; }, "");

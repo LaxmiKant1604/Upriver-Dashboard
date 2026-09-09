@@ -46,6 +46,16 @@ function reportFinished(jobRow) {
   return false;
 }
 
+// A bounded, secret-free operator diagnostic for a persisted report-job reason. deriveReportSnapshot exposes the real
+// exception message on `result.detail`, but for a plain (invalid) throw its `result.reason` is the GENERIC "derivation
+// threw" -- which drops the actual stage/cause and makes a delayed-dependency defer indistinguishable from a real
+// integrity error. Persist a sanitized, whitespace-collapsed, length-capped form so the failure is DIAGNOSABLE without
+// leaking raw payloads or credentials (the derive messages are code-authored operator strings; the cap bounds any
+// unexpected throw). Mirrors the source worker's safe() truncation discipline.
+export function sanitizeReportDiagnostic(value) {
+  return String(value == null ? "" : value).replace(/\s+/g, " ").trim().slice(0, 300) || "derivation failed";
+}
+
 // Normalize any date/timestamp to a STRICT YYYY-MM-DD (or null). Beyond the shape, the sliced
 // date must be a real calendar date (UTC round-trip via isValidCalendarDate), so an impossible
 // date (2026-02-30, 2026-99-99, non-leap 2023-02-29) is rejected rather than written to the
@@ -185,11 +195,15 @@ async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned,
     }
     if (result.status === "unavailable" || result.status === "not-implemented") {
       // Dependencies not (yet) derivable: record derive-pending as a non-terminal skip so the
-      // previous snapshot survives and a later cycle can retry. Not a hard failure.
-      await store.recordReportFailure({ cycleId, reportKey, accountId, stage: result.errorStage || "derive", code: result.status === "not-implemented" ? "DERIVE_NOT_IMPLEMENTED" : "SOURCE_UNAVAILABLE", message: result.reason, terminal: false, durationMs: clock() - started });
+      // previous snapshot survives and a later cycle can retry. Not a hard failure. The reason is the
+      // real typed message (e.g. a deferred delayed dependency), sanitized + bounded for the durable row.
+      await store.recordReportFailure({ cycleId, reportKey, accountId, stage: result.errorStage || "derive", code: result.status === "not-implemented" ? "DERIVE_NOT_IMPLEMENTED" : "SOURCE_UNAVAILABLE", message: sanitizeReportDiagnostic(result.reason), terminal: false, durationMs: clock() - started });
       return { reportKey, accountId, status: result.status };
     }
-    return fail(result.errorStage || "derive", "DERIVE_INVALID", result.reason || "derivation failed", true);
+    // A genuine integrity error (invalid): persist the SANITIZED underlying detail + stage, not the generic
+    // "derivation threw" reason -- so an operator can distinguish the real cause (and a delayed dependency, now typed
+    // unavailable above, never lands here as an indistinguishable permanent DERIVE_INVALID). LKG is preserved.
+    return fail(result.errorStage || "derive", "DERIVE_INVALID", sanitizeReportDiagnostic(result.detail || result.reason), true);
   }
 
   // 5) VALIDATE the derived latest data date BEFORE saving. sync_report_jobs.latest_data_date

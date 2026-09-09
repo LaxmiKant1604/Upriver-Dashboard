@@ -111,12 +111,12 @@ await (async () => {
     rBal.ok === false && rBal.phase === "awaiting-budget" && rBal.awaitingBudget === true && rBal.deferred === true
     && rBal.creates === 0 && rBal.tokens === 0 && sBal.calls.runSources === 0
     && rBal.authorizationReason === "insufficient-balance"
-    && rBal.requiredTokens === 4 && rBal.affordableTokens === -40 && rBal.authorizedTokens === 16);
+    && rBal.requiredTokens === 4 && rBal.affordableTokens === -40 && rBal.authorizedTokens === 28);
   // P1-3: required WITHIN both the authorization AND the affordability balance proceeds using the exact frozen plan.
   const sOk = spies({ balance: { usable: 500, reserve: 50 } });
   const rOk = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...sOk }));
   ok("E(P1-3): required spend WITHIN authorization AND affordability proceeds (runs sources; not deferred)",
-    rOk.awaitingBudget !== true && sOk.calls.runSources >= 1 && rOk.affordableTokens === 450 && rOk.authorizedTokens === 16);
+    rOk.awaitingBudget !== true && sOk.calls.runSources >= 1 && rOk.affordableTokens === 450 && rOk.authorizedTokens === 28);
   // unknown pricing
   const sPrice = spies();
   const rPrice = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, pricingKnown: false, ...sPrice }));
@@ -176,12 +176,12 @@ await (async () => {
     costStale.creates === 2 && costStale.estimatedTokens === 7);
 })();
 
-/* ===================== H2. US-CA 11 accounts: full new plan 21 tokens > authorized 16 -> awaiting-budget; reuse lowers it ===== */
+/* ===================== H2. US-CA 11 accounts: full new plan 21 real tokens now FITS the approved 28 ceiling (defect fix) ===== */
 await (async () => {
-  // Codex verified: US-CA with 11 export-eligible accounts needs a FULL new Listings/Raw plan of 21 tokens against 16
-  // authorized. 11 accounts -> ceil(11/5)=3 <=5-seller batches -> 3 listings (PREMIUM 5) + 3 listings-raw (STANDARD 2)
-  // = 6 creates, 3*5 + 3*2 = 21 tokens. The real-priced estimate MUST equal the frozen budget, and 21 > the authorized
-  // maxTokens (16) MUST defer (awaiting-budget) -- never auto-raise the authorization, never understate to fit.
+  // US-CA with 11 export-eligible accounts needs a FULL new Listings/Raw plan of 21 tokens. 11 accounts -> ceil(11/5)=3
+  // <=5-seller batches -> 3 listings (PREMIUM 5) + 3 listings-raw (STANDARD 2) = 6 creates, 3*5 + 3*2 = 21 tokens. The
+  // real-priced estimate equals the frozen budget. This is EXACTLY the shape that FAILED US natural run 34394580474
+  // under the old flat-std2 16 ceiling; under the APPROVED real-priced 28 ceiling it now PROCEEDS (never auto-raised).
   const eleven = Array.from({ length: 11 }, (_, i) => ({ accountId: `uc-${String(i).padStart(2, "0")}`, country: "US", currency: "USD", name: `UC${i}` }));
   const plan = buildListingHealthV3Plan({ accounts: eleven, connections, cycleDate });
   const stale = "2026-09-03T12:00:00.000Z"; // < freshnessNotBefore => nothing adoptable => FULL new plan
@@ -189,26 +189,31 @@ await (async () => {
   ok("H2: 11 US accounts => 3 <=5-seller batches => 6 new Listings/Raw creates", cost.newExports === 6 && cost.creates === 6);
   ok("H2: the FULL new plan is 21 real tokens (3 premium listings @5 + 3 standard listings-raw @2), NOT 6*flat2=12", cost.estimatedTokens === 21);
 
-  // Authorization: US-CA maxAccounts=20 => structuralRequiredCreates(20)=8 creates => maxTokens = 8*2 = 16. The CREATE
-  // count fits (6 <= 8) but the TOKEN cost does not (21 > 16) -> tokens-exceed-authorization -> awaiting-budget.
+  // Authorization: US-CA maxAccounts=20 => structuralRequiredCreates(20)=8 creates; the APPROVED real-priced ceiling is
+  // structuralRequiredTokens(20) = ceil(20/5)*7 = 28 tokens. Both the CREATE count (6 <= 8) AND the TOKEN cost
+  // (21 <= 28) now fit -> the decision PROCEEDS (the defect fix; the run is authorized).
   const authz = readListingHealthV3Authorization({ region: "us-ca" });
-  ok("H2: the authorized token ceiling is UNCHANGED (16 for us-ca) -- limits preserved", authz.authorized === true && authz.maxTokens === 16 && authz.maxCreates === 8);
+  ok("H2: the authorized token ceiling is the APPROVED real-priced 28 for us-ca (raised from the flat-std2 16)", authz.authorized === true && authz.maxTokens === 28 && authz.maxCreates === 8);
   const decision = decideListingHealthV3Authorization({ region: "us-ca", accountCount: 11, requiredCreates: cost.creates, requiredTokens: cost.estimatedTokens, authorization: authz });
-  ok("H2: 21 real tokens > 16 authorized => tokens-exceed-authorization (awaiting-budget), even though 6 creates <= 8 authorized",
-    decision.ok === false && decision.reason === "tokens-exceed-authorization");
+  ok("H2: 21 real tokens <= 28 authorized AND 6 creates <= 8 authorized => the decision PROCEEDS (ok) -- the exact defect-fix case",
+    decision.ok === true);
+
+  // REFUSAL COVERAGE RETAINED: under the OLD flat-std2 16-token lower policy (an explicit fixture), the same 21-token
+  // plan STILL defers (tokens-exceed), proving the gate refuses honestly whenever a plan exceeds the reviewed ceiling.
+  const oldLowerAuthz = { authorized: true, region: "us-ca", maxAccounts: 20, maxCreates: 8, maxTokens: 16, pricingRevision: authz.pricingRevision };
+  const oldDecision = decideListingHealthV3Authorization({ region: "us-ca", accountCount: 11, requiredCreates: cost.creates, requiredTokens: cost.estimatedTokens, authorization: oldLowerAuthz });
+  ok("H2 (lower-policy fixture): under the OLD 16-token ceiling the same 21-token plan STILL defers (tokens-exceed-authorization) -- refusal coverage retained",
+    oldDecision.ok === false && oldDecision.reason === "tokens-exceed-authorization");
 
   // EXACT REUSE lowers the freshness-aware ESTIMATE truthfully: with a CURRENT-cycle cache every Listings/Raw export
-  // is adoptable -> zero creates, zero estimated tokens (a same-cycle replay). Hypothetical reuse is never deducted;
-  // this is measured adoptability.
+  // is adoptable -> zero creates, zero estimated tokens (a same-cycle replay). Hypothetical reuse is never deducted.
   const fresh = "2026-09-04T06:00:00.000Z"; // >= freshnessNotBefore
   const reused = await planListingHealthV3IngestionCost({ plan, getSourceExportCache: async () => ({ fetched_at: fresh, rows: [] }) });
-  ok("H2 (exact reuse): a fully-adoptable cache => zero creates, zero estimated tokens (this lowers the FIRST gate's estimate only)",
+  ok("H2 (exact reuse): a fully-adoptable cache => zero creates, zero estimated tokens (measured adoptability, not a hypothetical deduction)",
     reused.creates === 0 && reused.estimatedTokens === 0);
-  // IMPORTANT (Codex req 1): this estimator result does NOT by itself prove the run proceeds/defers -- reuse zeroing
-  // the estimate would let the FIRST authorization gate pass. The AUTHORITATIVE proof that a 21-token FROZEN plan is
-  // STILL refused under 16 authorized EVEN under full reuse (the binding gate binds the frozen reservation ceiling,
-  // which does NOT shrink with reuse) is in report-listing-health-v3-authorization-binding.test.js, which drives the
-  // FULL composition (freezeBudget + computeListingHealthV3AuthorizationBinding + runListingHealthV3Ingestion live).
+  // The AUTHORITATIVE proof that reuse can NEVER smuggle an over-ceiling FROZEN plan past the binding (the frozen
+  // reservation ceiling does not shrink with reuse) is in report-listing-health-v3-authorization-binding.test.js,
+  // which drives the FULL composition (freezeBudget + computeListingHealthV3AuthorizationBinding + live operation).
 })();
 
 /* ===================== I. an UNDRAINED source pass is NOT a false success -- finalize reports open-work (ok:false) === */

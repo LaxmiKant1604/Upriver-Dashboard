@@ -137,6 +137,27 @@ const latestDateRows = (rows) => { const max = rows.reduce((m, r) => (String(r.d
   ok("K: rows with no valid date are NO_VALID_LATEST_DATE", compactLatestInventorySnapshot({ rows: [{ seller_or_vendor_id: SELLER, marketplace_country_code: MKT }], seller: SELLER, marketplace: MKT }).reason === "NO_VALID_LATEST_DATE");
 })();
 
+/* ===================== K2. bounded exact-single-day EMPTY -> typed inventory-UNAVAILABLE (defect 2) ============ */
+(() => {
+  // A validated, successfully-completed export for the EXACT single D-1 day that returned ZERO rows is honest
+  // inventory-UNAVAILABLE: complete:true + empty + inventoryAvailable:false + snapshotDate null + rows [] -- NOT a
+  // measured zero, NOT a proven snapshot date, NOT a truncation. This makes a single-seller latest-snapshot empty
+  // response CONSISTENT with a multi-seller batch's zero-row valid-empty (which the generic path already accepts),
+  // so splitting a seller can no longer flip a successful empty inventory export from valid-empty to blocked.
+  const c = compactLatestInventorySnapshot({ rows: [], seller: SELLER, marketplace: MKT, requestedFrom: "2026-09-08", requestedTo: "2026-09-08", exportRef: "exp-empty" });
+  ok("K2: a bounded exact-single-day (D-1) EMPTY export is complete + typed unavailable (valid-empty, not blocked)", c.complete === true && c.empty === true && c.inventoryAvailable === false);
+  ok("K2: an empty D-1 export has NO snapshot date and NO rows (never a proven date, never a fabricated zero)", c.snapshotDate === null && Array.isArray(c.rows) && c.rows.length === 0);
+  ok("K2: the metadata records the unavailable/empty provenance (distinguishable from a nonempty snapshot)",
+    c.metadata.inventoryUnavailable === true && c.metadata.emptyInventorySnapshot === true && c.metadata.inventorySnapshotDate === null
+    && c.metadata.normalizedLatestSnapshot === true && c.metadata.normalizationVersion === LATEST_SNAPSHOT_NORMALIZATION_VERSION && c.metadata.sourceExportRef === "exp-empty");
+  // An UNBOUNDED / multi-day / missing-window empty proves NOTHING -> still EMPTY_PAYLOAD (rejected), never inferred
+  // unavailable (section K already covers the no-window case; here prove a MULTI-DAY empty lookback stays rejected).
+  const multi = compactLatestInventorySnapshot({ rows: [], seller: SELLER, marketplace: MKT, requestedFrom: "2026-08-30", requestedTo: "2026-09-08" });
+  ok("K2: a MULTI-day empty lookback is STILL EMPTY_PAYLOAD (unbounded empty proves nothing; not relabeled unavailable)", multi.complete === false && multi.reason === "EMPTY_PAYLOAD");
+  const halfBound = compactLatestInventorySnapshot({ rows: [], seller: SELLER, marketplace: MKT, requestedFrom: "2026-09-08", requestedTo: "" });
+  ok("K2: a half-bounded (from only) empty is STILL EMPTY_PAYLOAD (requires from===to, both real dates)", halfBound.complete === false && halfBound.reason === "EMPTY_PAYLOAD");
+})();
+
 /* ===================== L. the exception is scoped to fba-inventory-health ONLY ===================== */
 (() => {
   ok("L: fba-inventory-health IS a latest-snapshot source", isLatestSnapshotSource("fba-inventory-health") === true);
