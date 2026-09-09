@@ -459,6 +459,25 @@ export async function runBucketSourceSync({
   // caller composition resolves it; it is threaded into planBucketSourceSync ONLY on a FRESH cycle (a frozen
   // continuation must reproduce its frozen plan verbatim, so the set is dropped there). Empty => byte-identical.
   readinessIsolateSellers = new Set(),
+  // EXECUTION-READINESS DEFER (all-region scheduler repair): primary account ids proven DataDoe-NOT-READY by the
+  // export-eligibility gate (initialLoadComplete=false / not onboarded). On a FRESH cycle they are DEFERRED from the
+  // plan ENTIRELY (no create -- a multi-seller OLI export containing an unloaded seller is 400'd by the provider,
+  // poisoning healthy batch-mates), so the plan equals the gated eligible set. Discovery still LISTS them (the
+  // frozen-owner safety check compares frozen owners against full discovery -- gating discovery would omit a
+  // now-unready frozen owner and defer the whole continuation). A CONTINUATION is UNTOUCHED: it reproduces its frozen
+  // membership from durable owners verbatim (a frozen owner that went unready post-freeze is handled by the reactive
+  // readiness isolation / retry, never dropped here). Empty => byte-identical to the prior behavior.
+  preemptiveUnreadyAccountIds = new Set(),
+  // AUTHORIZED FRESH-PLAN ACCOUNT SET (all-region scheduler repair, req 2): the EXPLICIT, POSITIVELY-authorized set of
+  // primary account ids a FRESH cycle may plan -- the export-eligibility gate's `eligible` accounts (full mode) or the
+  // immutable approved dispatch wave (bootstrap mode). When supplied (non-null), the FRESH plan is the INTERSECTION
+  // discovery INTER allowlist, so an account present in current discovery but ABSENT from the authorized set (a
+  // brand-new account that appeared between the gate read and discovery, or a bootstrap account outside the approved
+  // wave) can NEVER enter the plan or issue a create -- it joins a LATER wave only after it is itself gated/authorized.
+  // This is the POSITIVE control the exclusion list alone cannot provide (Codex req 2). Discovery (`accounts`) is still
+  // FULL, so the frozen-owner safety check sees every owner. A CONTINUATION is untouched (frozen membership). null =>
+  // no allowlist (byte-identical; the non-gated FBA/materialize/priority callers pass none). Accepts a Set or array.
+  freshPlanAccountIds = null,
   // P0-A COMPLETE-DAILY-PLAN: when set (a Set of source keys), FREEZE every planned family's tranche budget + upsert
   // its canonical jobs/owners, but CREATE/DRAIN only the families in this set THIS step. Freeze-only families are
   // reordered BEFORE the executed ones so their budgets are committed BEFORE the first paid create ("one complete
@@ -612,6 +631,34 @@ export async function runBucketSourceSync({
     }
   }
 
+  // AUTHORIZED FRESH-PLAN SET (req 2) + EXECUTION-READINESS DEFER (FRESH cycle only). On a FRESH cycle the plan is
+  // restricted to the POSITIVELY-authorized account set when one is supplied (discovery INTER allowlist); otherwise it
+  // falls back to removing only the known-unready exclusion set. Either way, NO create is attempted for a deferred
+  // account (it waits as "Setting up"; LKG preserved). A CONTINUATION's planningAccounts is the frozen owner set and
+  // is left UNTOUCHED (membership/budget immutable). Discovery (`accounts`) is never filtered, so the frozen-owner
+  // safety check above still sees every owner.
+  const idOf = (a) => String((a && (a.accountId ?? a.id)) || "").trim();
+  const allowlist = freshPlanAccountIds == null ? null
+    : (freshPlanAccountIds instanceof Set ? freshPlanAccountIds : new Set([...(freshPlanAccountIds || [])].map((x) => String(x).trim()).filter(Boolean)));
+  const preemptiveUnreadySet = preemptiveUnreadyAccountIds instanceof Set ? preemptiveUnreadyAccountIds : new Set(preemptiveUnreadyAccountIds || []);
+  let preemptiveDeferredAccounts = [];
+  // Accounts in discovery but NOT authorized for THIS fresh wave that are ALSO not known-unready -- i.e. new/unknown
+  // accounts that appeared after gating. Reported honestly; they never enter the plan (they cannot bypass onboarding).
+  let unauthorizedFreshAccounts = [];
+  if (!isContinuation) {
+    if (allowlist) {
+      const notAllowed = planningAccounts.filter((a) => !allowlist.has(idOf(a))).map(idOf);
+      planningAccounts = planningAccounts.filter((a) => allowlist.has(idOf(a)));
+      // Split the disallowed set for honest accounting: known-unready (the gate flagged them) vs. not-authorized-this-
+      // wave (new/unknown accounts -> a later gated wave only). Both are excluded from the plan; neither creates.
+      preemptiveDeferredAccounts = notAllowed.filter((id) => preemptiveUnreadySet.has(id));
+      unauthorizedFreshAccounts = notAllowed.filter((id) => !preemptiveUnreadySet.has(id));
+    } else if (preemptiveUnreadySet.size) {
+      // No positive allowlist (a non-gated caller): defense-in-depth exclusion of the known-unready set only.
+      preemptiveDeferredAccounts = planningAccounts.filter((a) => preemptiveUnreadySet.has(idOf(a))).map(idOf);
+      if (preemptiveDeferredAccounts.length) planningAccounts = planningAccounts.filter((a) => !preemptiveUnreadySet.has(idOf(a)));
+    }
+  }
   const plan = planBucketSourceSync({
     apiKey, bucket, accounts: planningAccounts, existingMembership, coverageByAccountId,
     catalogSnapshot, fbaSnapshotsByAccount, pausedSources, asOf, today,
@@ -623,6 +670,11 @@ export async function runBucketSourceSync({
     // resume instead of deferring, while a never-split cycle stays byte-identical.
     readinessIsolateSellers: isContinuation ? (continuation ? continuation.frozenReadinessIsolateSellers : new Set()) : readinessIsolateSellers,
   });
+  // Honest accounting (req 7): accounts DEFERRED from the fresh plan for execution-readiness (known-unready; no
+  // create, they wait as "Setting up", LKG preserved) and accounts EXCLUDED because they are not in the authorized
+  // fresh-plan wave (new/unknown accounts that appeared after gating -> a later gated wave only). Both empty on a
+  // continuation (frozen membership is immutable) or when no gate set/allowlist was supplied.
+  plan.summary = { ...plan.summary, preemptiveDeferredAccounts, unauthorizedFreshAccounts };
   if (continuation) {
     // CONTINUATION PLAN restriction, per family. ORIGINAL-WORK vs NEWLY-ENABLED-WORK is decided ONLY from the ORIGINAL
     // PERSISTED source jobs -- NEVER from the current plan (which reflects the CURRENT pausedSources/coverage/discovery).

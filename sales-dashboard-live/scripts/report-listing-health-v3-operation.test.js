@@ -13,6 +13,7 @@ import {
   listingHealthV3OperationId,
   V3_INGESTION_REGIONS,
 } from "../lib/server/sync/listing-health-v3-operation.js";
+import { readListingHealthV3Authorization, decideListingHealthV3Authorization } from "../lib/server/sync/listing-health-v3-authorization.js";
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -168,8 +169,46 @@ await (async () => {
   const costNext = await planListingHealthV3IngestionCost({ plan: nextPlan, getSourceExportCache: mkCache("2026-09-04T06:00:00.000Z") });
   ok("H: the NEXT cycle treats the prior cache as stale -> refreshes exactly the new exports (once)", costNext.creates === costNext.newExports && costNext.newExports === 2);
 
-  // token estimate is described as an estimate (observed 2/export), never a guaranteed maximum.
-  ok("H: estimated tokens = creates x observed per-export price (an estimate, not a guaranteed max)", costStale.estimatedTokens === 2 * costStale.creates && costStale.tokenPerExport === 2);
+  // The token estimate is priced by the REAL per-source registry token class (the ONE definition the frozen tranche
+  // budget uses), NOT a flat 2/export: the 2 stale creates are listings (PREMIUM=5) + listings-raw (STANDARD=2) = 7,
+  // never 2*2=4. This makes the first authorization gate agree with the frozen binding (repair Work 2).
+  ok("H: estimated tokens = SUM of each create's real registry token class (listings 5 + listings-raw 2 = 7, not flat 2x2=4)",
+    costStale.creates === 2 && costStale.estimatedTokens === 7);
+})();
+
+/* ===================== H2. US-CA 11 accounts: full new plan 21 tokens > authorized 16 -> awaiting-budget; reuse lowers it ===== */
+await (async () => {
+  // Codex verified: US-CA with 11 export-eligible accounts needs a FULL new Listings/Raw plan of 21 tokens against 16
+  // authorized. 11 accounts -> ceil(11/5)=3 <=5-seller batches -> 3 listings (PREMIUM 5) + 3 listings-raw (STANDARD 2)
+  // = 6 creates, 3*5 + 3*2 = 21 tokens. The real-priced estimate MUST equal the frozen budget, and 21 > the authorized
+  // maxTokens (16) MUST defer (awaiting-budget) -- never auto-raise the authorization, never understate to fit.
+  const eleven = Array.from({ length: 11 }, (_, i) => ({ accountId: `uc-${String(i).padStart(2, "0")}`, country: "US", currency: "USD", name: `UC${i}` }));
+  const plan = buildListingHealthV3Plan({ accounts: eleven, connections, cycleDate });
+  const stale = "2026-09-03T12:00:00.000Z"; // < freshnessNotBefore => nothing adoptable => FULL new plan
+  const cost = await planListingHealthV3IngestionCost({ plan, getSourceExportCache: async () => ({ fetched_at: stale, rows: [] }) });
+  ok("H2: 11 US accounts => 3 <=5-seller batches => 6 new Listings/Raw creates", cost.newExports === 6 && cost.creates === 6);
+  ok("H2: the FULL new plan is 21 real tokens (3 premium listings @5 + 3 standard listings-raw @2), NOT 6*flat2=12", cost.estimatedTokens === 21);
+
+  // Authorization: US-CA maxAccounts=20 => structuralRequiredCreates(20)=8 creates => maxTokens = 8*2 = 16. The CREATE
+  // count fits (6 <= 8) but the TOKEN cost does not (21 > 16) -> tokens-exceed-authorization -> awaiting-budget.
+  const authz = readListingHealthV3Authorization({ region: "us-ca" });
+  ok("H2: the authorized token ceiling is UNCHANGED (16 for us-ca) -- limits preserved", authz.authorized === true && authz.maxTokens === 16 && authz.maxCreates === 8);
+  const decision = decideListingHealthV3Authorization({ region: "us-ca", accountCount: 11, requiredCreates: cost.creates, requiredTokens: cost.estimatedTokens, authorization: authz });
+  ok("H2: 21 real tokens > 16 authorized => tokens-exceed-authorization (awaiting-budget), even though 6 creates <= 8 authorized",
+    decision.ok === false && decision.reason === "tokens-exceed-authorization");
+
+  // EXACT REUSE lowers the freshness-aware ESTIMATE truthfully: with a CURRENT-cycle cache every Listings/Raw export
+  // is adoptable -> zero creates, zero estimated tokens (a same-cycle replay). Hypothetical reuse is never deducted;
+  // this is measured adoptability.
+  const fresh = "2026-09-04T06:00:00.000Z"; // >= freshnessNotBefore
+  const reused = await planListingHealthV3IngestionCost({ plan, getSourceExportCache: async () => ({ fetched_at: fresh, rows: [] }) });
+  ok("H2 (exact reuse): a fully-adoptable cache => zero creates, zero estimated tokens (this lowers the FIRST gate's estimate only)",
+    reused.creates === 0 && reused.estimatedTokens === 0);
+  // IMPORTANT (Codex req 1): this estimator result does NOT by itself prove the run proceeds/defers -- reuse zeroing
+  // the estimate would let the FIRST authorization gate pass. The AUTHORITATIVE proof that a 21-token FROZEN plan is
+  // STILL refused under 16 authorized EVEN under full reuse (the binding gate binds the frozen reservation ceiling,
+  // which does NOT shrink with reuse) is in report-listing-health-v3-authorization-binding.test.js, which drives the
+  // FULL composition (freezeBudget + computeListingHealthV3AuthorizationBinding + runListingHealthV3Ingestion live).
 })();
 
 /* ===================== I. an UNDRAINED source pass is NOT a false success -- finalize reports open-work (ok:false) === */

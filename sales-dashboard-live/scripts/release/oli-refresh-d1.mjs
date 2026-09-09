@@ -49,6 +49,12 @@ const { resolveBootstrapScopeByDispatch, gateOnboardingBudget, recordOnboardingA
 //                approved plan (so a next-day retry uses the SAME dates + SAME reservation).
 let bootstrapScope = null;   // resolveBootstrapScopeByDispatch result (bootstrap mode only)
 let bootstrapEntry = null;   // the approved plan entry for (oli, region)
+// Round-4/scheduler-repair: the PRIMARY seller account ids the export-eligibility gate EXCLUDED (DataDoe not
+// loaded / not onboarded / not export-eligible). The runtime discovers the FULL directory (so the frozen-owner
+// safety check still sees every frozen owner), and DEFERS exactly these from the FRESH OLI plan (no create), so an
+// unready seller can never be grouped into a multi-seller export and reject the whole batch. Empty in bootstrap
+// mode (the frozen wave is already all-ready or the whole wave defers). Populated by the gate's onExcluded below.
+const preemptiveUnreadyIds = new Set();
 const fetchAccounts = accountScope === "bootstrap"
   ? async (apiKey) => {
     bootstrapScope = await resolveBootstrapScopeByDispatch({ apiKey, region: bucket, dispatchId });
@@ -68,7 +74,12 @@ const fetchAccounts = accountScope === "bootstrap"
   }
   : (apiKey) => fetchExportEligibleAccounts(apiKey, {
     fetchDetailed: fetchAccountsDetailed, readOnboardingRows, readEstablishedAccountIds,
-    onExcluded: (excluded, gateMode) => console.log(`onboarding gate (${gateMode}): excluded ${excluded.length} account(s): ${excluded.map((x) => `${x.accountId.slice(0, 8)}:${x.reason}`).join(", ")}`),
+    onExcluded: (excluded, gateMode) => {
+      // Capture EVERY excluded primary account id so the runtime defers it from the FRESH OLI plan (execution
+      // readiness), while the FULL directory discovery still lists it for the frozen-owner safety check.
+      for (const x of excluded) { const id = String((x && x.accountId) || "").trim(); if (id) preemptiveUnreadyIds.add(id); }
+      console.log(`onboarding gate (${gateMode}): excluded ${excluded.length} account(s): ${excluded.map((x) => `${x.accountId.slice(0, 8)}:${x.reason}`).join(", ")}`);
+    },
   });
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, openSupersedingSyncCycle, reserveOliFreshnessCreate, recordOliFreshnessExport, getOliCompleteness, getSourceTrancheBudget } = await import("../../lib/server/supabase.js");
@@ -177,7 +188,35 @@ try { head = await getSyncCycleByBucketDate(bucket, cycleDate); }
 catch (e) { console.error("STOP AMBIGUOUS_CYCLE_HEAD: " + (e && e.message)); process.exit(1); }
 let workingCycleId = head && head.id ? String(head.id) : null;
 
-const runtime = buildBucketSourceSyncRuntime({ budgetMs: BUDGET_MS, asOfOverride: requestedAsOf });
+// READINESS-GATED EXECUTION (all-region scheduler repair Work 1). Root cause of the Europe-AU
+// DATADOE_INITIAL_LOAD_INCOMPLETE: the OLI export plan was built by the runtime over the UNFILTERED directory, so a
+// seller whose sellerCentralConnection.initialLoadComplete=false -- one the operator's gate already excluded from
+// `discovered`/the ceiling/the assessment -- was still grouped into a <=5-seller OLI export, and the provider
+// rejected the WHOLE batch, poisoning healthy batch-mates.
+//
+// The runtime DISCOVERY stays the default (FULL directory) so the frozen-owner safety check (frozen-accounts-missing)
+// still sees every frozen owner on a continuation (gating discovery would omit a now-unready frozen owner and defer
+// the whole continuation -- Codex finding 2). Instead we SEPARATE execution readiness from membership: the set of
+// DataDoe-NOT-READY primary seller account ids (from the same gate the operator already ran) is passed as
+// `preemptiveUnreadyAccountIds`, and runBucketSourceSync DEFERS exactly those from the FRESH OLI plan (no create,
+// typed "Setting up"/waiting, LKG preserved) while healthy accounts derive/publish -- a frozen CONTINUATION is
+// untouched (it reproduces its frozen split from durable owners). Preserves 5-seller batching (it removes unready
+// sellers from the fresh plan, it does NOT force single-seller exports for the healthy remainder).
+// AUTHORIZED FRESH-PLAN ALLOWLIST (all-region scheduler repair, req 2): the POSITIVELY-authorized account set for
+// THIS run -- the export-eligibility gate's `eligible` accounts (full mode) or the immutable approved dispatch wave
+// (bootstrap mode). `ids` is exactly that set (built above from `discovered`, which in full mode IS the gate output
+// and in bootstrap mode IS bootstrapScope.accounts). The runtime discovers the FULL directory independently (so the
+// frozen-owner safety check still sees every owner), and builds the FRESH plan as discovery INTER this allowlist --
+// so a brand-new account that appears in the runtime's directory read but was NOT gated/authorized here (it showed up
+// between the gate read and discovery), or any bootstrap account outside the approved wave, CANNOT enter the fresh
+// plan or issue a create. It joins a later wave only after it is itself gated + authorized (never bypassing onboarding).
+// This is the POSITIVE control an exclusion list alone cannot provide (preemptiveUnreadyIds stays as defense-in-depth).
+const freshPlanAllowlistIds = new Set(ids);
+const runtime = buildBucketSourceSyncRuntime({
+  budgetMs: BUDGET_MS, asOfOverride: requestedAsOf,
+  preemptiveUnreadyAccountIds: preemptiveUnreadyIds,
+  freshPlanAccountIds: freshPlanAllowlistIds,
+});
 const deadline = runtime.makeDeadline();
 const preflight = await runtime.preflightEvidence({ bucket, sourceKey: OLI, deadline });
 const isOpen = (j) => { const st = j.fetch_status ?? j.fetchStatus; return st === "pending" || st === "attempted"; };

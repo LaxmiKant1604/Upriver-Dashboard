@@ -28,6 +28,12 @@
 
 import { buildShadowReportPlan } from "./report-planner.js";
 import { accountInScope, isRoutingScope } from "./scheduler-scope.js";
+// ONE pricing definition (all-region scheduler repair Work 2): the estimate MUST price each create by its real
+// registry token class -- the SAME sourceTokenCost(registryIsPremiumOf(job)) the frozen tranche budget uses -- so
+// the displayed estimate + the first authorization gate + the frozen binding agree. A flat per-export price
+// understates a premium listings export (5) as standard (2) and lets the first gate pass deceptively.
+import { sourceTokenCost } from "./source-tranche-budget.js";
+import { registryIsPremiumOf } from "./source-registry.js";
 import {
   listingHealthV3PlannedExports,
   assertListingHealthV3ExportCeiling,
@@ -45,10 +51,10 @@ const S = (v) => (v == null ? "" : String(v));
 const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(S(v));
 const safe = (e) => S(e && e.message ? e.message : e).slice(0, 200);
 export const V3_INGESTION_REGIONS = Object.freeze(["india", "europe-au", "us-ca"]);
-// OBSERVED per-export token price (standard export). rowCountBilling=true means this is an ESTIMATE, never a
-// guaranteed maximum -- the balance gate keeps an emergency reserve on top, and the frozen tranche budget's atomic
-// pre-POST reservation is the true ceiling at execution time.
-export const V3_OBSERVED_TOKENS_PER_EXPORT = 2;
+// PER-EXPORT token price is NO LONGER a flat constant: it is the source's real registry token class (standard=2 /
+// premium=5) via sourceTokenCost(registryIsPremiumOf(job)) -- the SAME definition the frozen tranche budget uses.
+// rowCountBilling=true means every per-source price is an ESTIMATE, never a guaranteed maximum -- the balance gate
+// keeps an emergency reserve on top, and the frozen tranche budget's atomic pre-POST reservation is the true ceiling.
 export const V3_DEFAULT_EMERGENCY_RESERVE_TOKENS = 50;
 
 /** The durable, replay-stable operation identity for one regional cycle. */
@@ -80,11 +86,14 @@ export function buildListingHealthV3Plan({ accounts, connections, cycleDate, ove
  * refreshed. Inventory is REUSE-ONLY: it is never counted as a create, and `inventoryAdoptable` reports whether the
  * current FBA Plan inventory cache is fresh (the precondition to derive/publish).
  */
-export async function planListingHealthV3IngestionCost({ plan, getSourceExportCache, tokenPerExport = V3_OBSERVED_TOKENS_PER_EXPORT }) {
+export async function planListingHealthV3IngestionCost({ plan, getSourceExportCache }) {
   if (typeof getSourceExportCache !== "function") throw new Error("planListingHealthV3IngestionCost requires getSourceExportCache (fail closed).");
   const v3Requests = (plan.reportRequests || []).filter((r) => r && r.reportKey === "listing-health-v3");
   const { newExports, reusedExports, newExportHashes, reusedExportHashes } = listingHealthV3PlannedExports(v3Requests);
   const plannedByHash = new Map(v3Requests.flatMap((r) => (r.sources || []).map((s) => [s.requestHash, s])));
+  // ONE pricing definition: the real per-source token class (standard=2 / premium=5), identical to the frozen
+  // tranche budget. An unregistered source throws (fail closed -> awaiting-budget), never a silent default price.
+  const tokenCostOfHash = (h) => sourceTokenCost(registryIsPremiumOf({ sourceKey: plannedByHash.get(h)?.sourceKey ?? plannedByHash.get(h)?.source_key }));
   const adoptable = new Set();
   for (const h of [...newExportHashes, ...reusedExportHashes]) {
     try {
@@ -100,11 +109,13 @@ export async function planListingHealthV3IngestionCost({ plan, getSourceExportCa
   const inventoryAdoptableByHash = Object.fromEntries(reusedExportHashes.map((h) => [h, adoptable.has(h)]));
   const inventoryAdoptableCount = reusedExportHashes.filter((h) => adoptable.has(h)).length;
   const anyInventoryAdoptable = inventoryAdoptableCount > 0;
+  // Real per-source estimate (sum of each create's registry token class) -- equals the frozen tranche budget for
+  // the same create set, so the first authorization gate no longer passes deceptively while the binding gate defers.
+  const estimatedTokens = createHashes.reduce((sum, h) => sum + tokenCostOfHash(h), 0);
   return {
     newExports, reusedExports,
     creates: createHashes.length,
-    estimatedTokens: createHashes.length * Number(tokenPerExport),
-    tokenPerExport: Number(tokenPerExport),
+    estimatedTokens,
     createHashes, adoptedNewHashes: newExportHashes.filter((h) => adoptable.has(h)),
     inventoryHashes: reusedExportHashes,
     // Back-compat field kept, but it is NO LONGER a region-wide gate: it now reports whether ANY account's inventory

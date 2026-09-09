@@ -260,6 +260,18 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
   const {
     getConnections = getDataDoeConnections,
     fetchAccounts = fetchDataDoeAccounts,
+    // EXECUTION-READINESS DEFER (all-region scheduler repair): primary account ids the caller's export-eligibility
+    // gate proved DataDoe-NOT-READY. Threaded into runBucketSourceSync, which DEFERS them from the FRESH OLI plan
+    // (no create) while DISCOVERY still lists them (the frozen-owner safety check needs the full set). A CONTINUATION
+    // is untouched. Empty => byte-identical default planning. Accepts a Set or array.
+    preemptiveUnreadyAccountIds = new Set(),
+    // AUTHORIZED FRESH-PLAN ACCOUNT SET (all-region scheduler repair, req 2): the caller's export-eligibility gate's
+    // POSITIVELY-authorized `eligible` account ids (full mode) or the immutable approved dispatch wave (bootstrap).
+    // Threaded into runBucketSourceSync, which builds the FRESH plan as discovery INTER this allowlist, so an account
+    // in discovery but ABSENT from the authorized set (a new account that appeared after gating, or a bootstrap
+    // account outside the approved wave) can never enter the fresh plan. null => no allowlist (byte-identical; the
+    // non-gated callers pass none). Discovery stays FULL (the frozen-owner check needs it). Accepts a Set or array.
+    freshPlanAccountIds = null,
     makeSourceStore = makeSupabaseSourceStore,
     makeAdapter = makeDataDoeAdapter,
     readSourceControls = getSourceControls,
@@ -846,6 +858,8 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         asOf: asOfStr, today: todayStr,
         store, dataDoe,
         readinessIsolateSellers,
+        preemptiveUnreadyAccountIds,
+        freshPlanAccountIds,
         replaceHistoryWindow: trackedReplaceHistory, persistSnapshot: trackedPersistSnapshot, updateRunStatus: boundedUpdateRunStatus,
         recordCompleteness: recordOliCompleteness,
         cycleDate: cycleDate || todayStr, cycleBucket, trigger: "manual",

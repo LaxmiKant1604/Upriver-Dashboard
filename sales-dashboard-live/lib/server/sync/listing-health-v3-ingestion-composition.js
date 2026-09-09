@@ -247,12 +247,19 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     const jobs = await runtime.store.listSourceJobs(p1.cycleId || cycleId);
     const newHashes = new Set(frozen.hashes.map((h) => h.requestHash));
     const invSourceKey = V3_INVENTORY_SOURCE_KEY;
-    const creates = jobs.filter((j) => newHashes.has(j.request_hash ?? j.requestHash) && Number(j.create_export_count ?? j.createExportCount ?? 0) > 0).length;
+    const createdNewJobs = jobs.filter((j) => newHashes.has(j.request_hash ?? j.requestHash) && Number(j.create_export_count ?? j.createExportCount ?? 0) > 0);
+    const creates = createdNewJobs.length;
+    // Observed tokens priced by the SAME per-source token class the frozen budget froze (frozen.hashes[].tokenCost:
+    // premium listings=5 / standard listings-raw=2), NOT a flat creates*2 -- so the reported spend cannot understate a
+    // premium create. rowCountBilling=true means each per-source price is still an estimate; the true charge is the
+    // reserved frozen budget.
+    const tokenCostByHash = new Map(frozen.hashes.map((h) => [h.requestHash, Number(h.tokenCost) || 0]));
+    const tokens = createdNewJobs.reduce((sum, j) => sum + (tokenCostByHash.get(j.request_hash ?? j.requestHash) || 0), 0);
     const inventoryCreated = jobs.some((j) => (j.source_key ?? j.sourceKey) === invSourceKey && Number(j.create_export_count ?? j.createExportCount ?? 0) > 0);
     return {
       cycleId: p1.cycleId || cycleId,
       drained: !!(p1.drained && p2.drained),
-      creates, maxCreates: frozen.maxCreates, tokens: creates * 2, // observed estimate (rowCountBilling=true)
+      creates, maxCreates: frozen.maxCreates, tokens, // observed estimate (rowCountBilling=true), real per-source pricing
       inventoryCreated, inventoryPass: { succeeded: p2.succeeded, skipped: p2.skipped }, newPass: { succeeded: p1.succeeded, failed: p1.failed },
     };
   };

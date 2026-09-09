@@ -193,6 +193,14 @@ function makeDataDoe(opts = {}) {
     createSeq,
     async create(job) {
       if (opts.failKey && (job.requestKey || "").includes(opts.failKey)) throw new Error("DataDoe create-export failed (500) here.");
+      // PROVIDER READINESS REJECTION (DATADOE_INITIAL_LOAD_INCOMPLETE): DataDoe hard-rejects a seller-batched export
+      // with HTTP 400 when even ONE selected seller's Seller Central initial data load is incomplete. Simulated for a
+      // create whose batch includes any raw seller id in `readinessRejectSellers` -- the message matches the exact
+      // provider signature source-worker classifies as READINESS_INCOMPLETE_CODE (terminal for THIS batch, not poison).
+      if (opts.readinessRejectSellers && Array.isArray(job.fetchParams && job.fetchParams.sellerOrVendorIds)
+        && job.fetchParams.sellerOrVendorIds.some((sid) => opts.readinessRejectSellers.has(String(sid)))) {
+        throw new Error("DataDoe rejected this export (400): this source requires Seller Central data on every selected seller, but the initial data load is not complete.");
+      }
       bump(create, job.requestHash);
       createSeq.push({ sourceKey: job.sourceKey || "", requestKey: job.requestKey || "", ids: [...(job.fetchParams.sellerOrVendorIds || [])], from: job.fetchParams.from ?? null, to: job.fetchParams.to ?? null });
       return { exportId: "e_" + job.requestHash };
@@ -239,7 +247,7 @@ function makeSinks() {
 }
 
 const CATALOG_CARRIER = "carrier-seller-01"; // a canonical primary seller id (org-wide catalog requires one)
-function runHarness({ accounts = FIVE, coverage = null, dd = null, store = null, pausedSources, catalogSnapshot = null, fbaSnapshotsByAccount = {}, reuseOnly = false, cooldownMs = 60_000, existingMembership, catalogCarrierSeller = CATALOG_CARRIER, cycleDate = CYCLE_DATE, executeSourceKeys = null, forceCatalogRefresh = false, bucket = BUCKET } = {}) {
+function runHarness({ accounts = FIVE, coverage = null, dd = null, store = null, pausedSources, catalogSnapshot = null, fbaSnapshotsByAccount = {}, reuseOnly = false, cooldownMs = 60_000, existingMembership, catalogCarrierSeller = CATALOG_CARRIER, cycleDate = CYCLE_DATE, executeSourceKeys = null, forceCatalogRefresh = false, bucket = BUCKET, preemptiveUnreadyAccountIds = new Set(), freshPlanAccountIds = null } = {}) {
   const st = store || makeStore();
   const d = dd || makeDataDoe();
   const clock = makeClock();
@@ -260,6 +268,8 @@ function runHarness({ accounts = FIVE, coverage = null, dd = null, store = null,
     // P0-A: freeze every planned family but CREATE/DRAIN only these (null => execute all, byte-identical);
     // forceCatalogRefresh plans the org Catalog job even when its snapshot is fresh-today.
     executeSourceKeys, forceCatalogRefresh,
+    preemptiveUnreadyAccountIds,
+    freshPlanAccountIds,
   });
   return { store: st, dd: d, clock, waits, sinks, run };
 }
@@ -693,6 +703,131 @@ test("G1. a fresh cycle then a continuation with a NEW account: no PLAN_BUDGET_M
   // The frozen accounts' owners remain exactly the 3 originals (no A04 owner was added to the frozen cycle).
   const ownerAccts = new Set(store.listCycleOwners(cycleId).map((o) => o.account_id));
   assert.equal(ownerAccts.has("A04"), false, "A04 was never added as an owner of the frozen cycle");
+});
+
+test("G1b. FRESH cycle: a preemptively-unready account is DEFERRED from the plan (no create); the healthy remainder stays in ONE <=5-seller batch (no batch poisoning)", async () => {
+  // FIVE accounts A01..A05 (sellers S01..S05); A05 is DataDoe-NOT-READY this cycle. Without the defer all five share
+  // ONE <=5-seller OLI export and the provider 400s the WHOLE batch (the Europe-AU DATADOE_INITIAL_LOAD_INCOMPLETE).
+  // The execution-readiness defer removes A05 from the FRESH plan (no create; it waits, LKG preserved) so S01..S04
+  // export together and S05 is never sent. Preserves 5-seller batching (the healthy remainder is NOT forced singles).
+  const store = makeStore();
+  const h = runHarness({ accounts: FIVE, store, preemptiveUnreadyAccountIds: new Set(["A05"]) });
+  const r = await h.run();
+  assert.equal(h.dd.createSeq.some((c) => (c.ids || []).includes("S05")), false, "the unready seller S05 was NEVER exported (deferred; no doomed create)");
+  const healthyBatch = h.dd.createSeq.find((c) => (c.ids || []).includes("S01"));
+  assert.ok(healthyBatch && ["S01", "S02", "S03", "S04"].every((id) => (healthyBatch.ids || []).includes(id)) && !(healthyBatch.ids || []).includes("S05"),
+    "the four healthy sellers stayed in ONE <=5-seller batch with the unready one absent (not poisoned, not forced singles)");
+  assert.deepEqual((r.plan && r.plan.preemptiveDeferredAccounts) || [], ["A05"], "the deferred account is reported honestly (waits; LKG preserved)");
+});
+
+test("G1c. CONTINUATION: a frozen owner that went preemptively-unready AFTER the freeze is NOT dropped -- frozen membership/budget reused, the whole region is NOT deferred (frozen-owner safety check preserved; Codex finding 2)", async () => {
+  const oliTranche = "source-sync:order-line-items";
+  const store = makeStore();
+  // Pass 1 (FRESH): freeze the OLI budget over the five ready accounts.
+  const h1 = runHarness({ accounts: FIVE, store });
+  const r1 = await h1.run();
+  const cycleId = r1.cycleId;
+  const fp1 = store._budget(cycleId, oliTranche).planFingerprint;
+  assert.ok(fp1, "pass 1 froze the OLI budget");
+  // Pass 2 (CONTINUATION): A03 flipped to DataDoe-NOT-READY after the freeze. The preemptive defer MUST NOT gate the
+  // continuation -- discovery still LISTS A03 (we defer from the plan, never omit from discovery), so the frozen-owner
+  // check passes and the frozen membership/budget is reproduced verbatim; a post-freeze readiness change is handled by
+  // the reactive isolation/retry, NEVER a whole-region defer. (Gating discovery, the naive fix, WOULD have deferred.)
+  const h2 = runHarness({ accounts: FIVE, store, dd: h1.dd, preemptiveUnreadyAccountIds: new Set(["A03"]) });
+  let threw = null; let r2 = null;
+  try { r2 = await h2.run(); } catch (e) { threw = e; }
+  assert.equal(threw, null, "the continuation did not throw");
+  assert.notEqual(r2 && r2.deferred, true, "the continuation was NOT deferred despite A03 going unready");
+  assert.ok(!(r2 && r2.stopReason && r2.stopReason.code === "FROZEN_SCOPE_UNAVAILABLE"), "no FROZEN_SCOPE_UNAVAILABLE (frozen-accounts-missing) defer");
+  assert.equal(store._budget(cycleId, oliTranche).planFingerprint, fp1, "the frozen OLI budget is reused verbatim (A03 stays a frozen owner; membership immutable)");
+  assert.deepEqual((r2.plan && r2.plan.preemptiveDeferredAccounts) || [], [], "a continuation defers NOTHING preemptively (frozen membership is immutable; execution readiness applies to FRESH cycles only)");
+});
+
+test("G1d. FRESH cycle: an EXPLICIT authorized fresh-plan allowlist (not an exclusion list) is the ONLY thing planned -- a NEW account present in discovery but NOT gated/authorized CANNOT enter the plan or issue a create (Codex req 2)", async () => {
+  // Discovery lists A01..A05, but ONLY A01..A04 were gated + authorized this run (the positive allowlist). A05 is a
+  // brand-new account that appeared in the directory read AFTER the gate ran -- it is in NEITHER the allowlist NOR the
+  // known-unready set. An exclusion-list-only design would MISS it (it was never flagged) and let it into the batch,
+  // bypassing onboarding. The positive allowlist excludes it: S05 is NEVER exported, and it is reported honestly as
+  // NOT-authorized-this-wave (it joins a later wave only after it is itself gated). Preserves 5-seller batching.
+  const store = makeStore();
+  const h = runHarness({ accounts: FIVE, store, freshPlanAccountIds: new Set(["A01", "A02", "A03", "A04"]) });
+  const r = await h.run();
+  assert.equal(h.dd.createSeq.some((c) => (c.ids || []).includes("S05")), false, "the un-authorized NEW account's seller S05 was NEVER exported (it cannot bypass onboarding)");
+  const healthyBatch = h.dd.createSeq.find((c) => (c.ids || []).includes("S01"));
+  assert.ok(healthyBatch && ["S01", "S02", "S03", "S04"].every((id) => (healthyBatch.ids || []).includes(id)) && !(healthyBatch.ids || []).includes("S05"),
+    "the four authorized accounts stayed in ONE <=5-seller batch (allowlist restricts membership, it does NOT force singles)");
+  assert.deepEqual((r.plan && r.plan.unauthorizedFreshAccounts) || [], ["A05"], "the new/unauthorized account is reported as not-in-authorized-wave (never planned; a later gated wave only)");
+  assert.deepEqual((r.plan && r.plan.preemptiveDeferredAccounts) || [], [], "A05 is NOT labeled known-unready (it was never gated) -- the allowlist, not the exclusion list, is what excluded it");
+});
+
+test("G1e. CONTINUATION with a PROVIDER READINESS REJECTION on a frozen batch: safe deferral, frozen budget UNCHANGED, NO duplicate create, and healthy-account publication where dependencies allow (Codex req 3)", async () => {
+  // SIX accounts A01..A06 => two OLI export batches: [S01..S05] (healthy) and [S06] (its Seller Central initial load is
+  // NOT complete, so DataDoe 400s that batch with DATADOE_INITIAL_LOAD_INCOMPLETE). Pass 1 freezes the OLI budget over
+  // all six and runs both batches: the healthy batch SUCCEEDS + PUBLISHES, the S06 batch is terminally readiness-
+  // rejected (typed "waiting", NOT a REQUIRED_SOURCE_FAILED stop -- so healthy accounts are not blocked). Pass 2 re-
+  // enters the SAME running cycle as a CONTINUATION with the SAME rejection and must: reuse the frozen budget verbatim,
+  // never re-create the healthy batch (already succeeded -> adopted) NOR the rejected batch (the durable reservation was
+  // consumed -> it can never POST twice), keep the S06 batch a terminal readiness-waiting deferral, and never crash.
+  const SIX = [1, 2, 3, 4, 5, 6].map(acct);
+  const oliTranche = "source-sync:order-line-items";
+  const store = makeStore();
+  const dd = makeDataDoe({ readinessRejectSellers: new Set(["S06"]) });
+  // Pass 1 (FRESH): freeze + run both batches; S06 readiness-rejected, the healthy batch publishes.
+  const h1 = runHarness({ accounts: SIX, store, dd });
+  const r1 = await h1.run();
+  assert.equal(r1.stopped, false, "a single readiness-rejected batch does NOT stop the bucket (typed waiting, not REQUIRED_SOURCE_FAILED) -- healthy accounts still publish");
+  const cycleId = r1.cycleId;
+  const b1 = store._budget(cycleId, oliTranche);
+  assert.ok(b1 && b1.planFingerprint, "pass 1 froze the OLI tranche budget over all six accounts");
+  const fp1 = b1.planFingerprint, mc1 = b1.maxCreates, mt1 = b1.maxTokens;
+  const healthyCreate = dd.createSeq.find((c) => (c.ids || []).includes("S01"));
+  assert.ok(healthyCreate && !(healthyCreate.ids || []).includes("S06"), "the healthy batch [S01..S05] created ONCE, without the unready seller");
+  // Healthy publication: A01..A05 got their OLI rollup written; A06 (the readiness-rejected seller) did NOT.
+  const publishedAccts = new Set(h1.sinks.replaceCalls.map((c) => c.accountId));
+  assert.ok(["A01", "A02", "A03", "A04", "A05"].every((id) => publishedAccts.has(id)), "the five healthy accounts published their OLI history (dependencies allowed it)");
+  assert.equal(publishedAccts.has("A06"), false, "the readiness-rejected account A06 did NOT publish (no fabricated success; LKG preserved)");
+  // The S06 batch is a TERMINAL readiness-waiting failure (honest partial; never a false-green success).
+  const s06Job = store.listSourceJobs(cycleId).find((j) => (j.source_key === "order-line-items") && j.error_code === "DATADOE_INITIAL_LOAD_INCOMPLETE");
+  assert.ok(s06Job && s06Job.terminal === true && s06Job.fetch_status === "failed", "the S06 batch is terminally readiness-rejected (DATADOE_INITIAL_LOAD_INCOMPLETE), preserved as a waiting deferral");
+  const createsAfterPass1 = dd.totalCreates();
+
+  // Pass 2 (CONTINUATION): SAME rejection. The cycle head is still running/pending (pass 1 did not finalize).
+  const head = store.getCycleByBucketDate(BUCKET, CYCLE_DATE);
+  assert.ok(head && ["running", "pending"].includes(head.status), "the cycle head is a continuation head after pass 1");
+  const h2 = runHarness({ accounts: SIX, store, dd });
+  let threw = null; let r2 = null;
+  try { r2 = await h2.run(); } catch (e) { threw = e; }
+  assert.equal(threw, null, "the continuation did NOT crash on the frozen readiness-rejected batch: " + (threw ? String((threw && threw.message) || threw) : ""));
+  const b2 = store._budget(cycleId, oliTranche);
+  assert.equal(b2.planFingerprint, fp1, "the frozen OLI budget fingerprint is UNCHANGED across the continuation (never recomputed/widened by the rejection)");
+  assert.ok(b2.maxCreates === mc1 && b2.maxTokens === mt1, "the frozen OLI create/token ceilings are UNCHANGED");
+  assert.equal(dd.totalCreates(), createsAfterPass1, "NO duplicate create on the continuation: the healthy batch was adopted (already succeeded) and the rejected batch's durable reservation was already consumed (it can never POST twice)");
+  const s06Job2 = store.listSourceJobs(cycleId).find((j) => (j.source_key === "order-line-items") && j.error_code === "DATADOE_INITIAL_LOAD_INCOMPLETE");
+  assert.ok(s06Job2 && s06Job2.create_export_count === 1, "the readiness-rejected batch was attempted exactly ONCE across both passes (no double-charge)");
+  assert.ok(!(r2 && r2.stopReason && r2.stopReason.code === "FROZEN_SCOPE_UNAVAILABLE"), "the continuation did not defer the whole frozen scope");
+});
+
+test("G1f. CONTINUATION ignores the fresh-plan allowlist entirely: a frozen owner EXCLUDED from freshPlanAccountIds is NOT dropped (frozen membership is immutable; the allowlist applies to FRESH cycles only)", async () => {
+  // The positive allowlist (Codex req 2) governs which accounts a FRESH cycle may plan. It must NEVER narrow a frozen
+  // continuation: doing so would drop a frozen owner and either drift the frozen budget or falsely shrink membership.
+  // Pass 1 freezes over five owners; pass 2 (continuation) passes an allowlist that OMITS A03 -- A03 must stay a frozen
+  // owner, the budget is reused verbatim, and nothing is deferred/unauthorized on the continuation.
+  const oliTranche = "source-sync:order-line-items";
+  const store = makeStore();
+  const h1 = runHarness({ accounts: FIVE, store });
+  const r1 = await h1.run();
+  const cycleId = r1.cycleId;
+  const fp1 = store._budget(cycleId, oliTranche).planFingerprint;
+  assert.ok(fp1, "pass 1 froze the OLI budget over five owners");
+  const h2 = runHarness({ accounts: FIVE, store, dd: h1.dd, freshPlanAccountIds: new Set(["A01", "A02", "A04", "A05"]) }); // A03 omitted
+  let threw = null; let r2 = null;
+  try { r2 = await h2.run(); } catch (e) { threw = e; }
+  assert.equal(threw, null, "the continuation did not throw when the allowlist omits a frozen owner");
+  assert.equal(store._budget(cycleId, oliTranche).planFingerprint, fp1, "the frozen OLI budget is reused verbatim (A03 stays a frozen owner; the allowlist never narrows a continuation)");
+  assert.deepEqual((r2.plan && r2.plan.unauthorizedFreshAccounts) || [], [], "a continuation reports NO unauthorized-fresh accounts (the allowlist is a FRESH-only control)");
+  assert.deepEqual((r2.plan && r2.plan.preemptiveDeferredAccounts) || [], [], "a continuation defers nothing preemptively");
+  const ownerAccts = new Set(store.listCycleOwners(cycleId).map((o) => o.account_id));
+  assert.ok(["A01", "A02", "A03", "A04", "A05"].every((id) => ownerAccts.has(id)), "all five frozen owners (incl. the allowlist-omitted A03) remain owners of the frozen cycle");
 });
 
 test("G2. a continuation with the SAME membership reuses the frozen budget idempotently (no new creates, no throw)", async () => {
