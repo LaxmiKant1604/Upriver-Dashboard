@@ -1,10 +1,32 @@
-# Handoff — Website report repair (rounds 1+2) + scheduler permanent repair (DEPLOYED) + open gates
+# Handoff — Website report repair (rounds 1+2+3) + scheduler permanent repair (DEPLOYED) + open gates
 
-**Branch:** `main`   **HEAD:** round-2 commit (below)   **origin/main:** push PENDING for round 2
-**Latest deploy:** Vercel Production **Ready** at `45f14e8` (round 1, Codex-confirmed). Round 2 deploys on push.
+**Branch:** `main`   **HEAD:** round-3 commit `7c8afc3`   **origin/main:** push PENDING for round 3
+**Latest deploy:** Vercel Production **Ready** at `842f9ca` (round 2, Codex-confirmed). Round 3 deploys on push.
 **Date:** 2026-09-09
 **DataDoe this session:** 0 exports / 0 tokens   **api/*.js:** 12 (unchanged)
 
+## Round 3 (5 deeper integration defects on `842f9ca`) — code-complete, `npm run verify` 184/184 (commit `7c8afc3`)
+
+Closes gaps the round-3 adversarial review found deeper in the sync -> store -> fingerprint -> materializer -> serve
+chain (the review confirmed 2 findings — one HIGH I introduced — both fixed before commit): **(1)** an equal-timestamp
+and a LAGGING inventoryAvailable:false->true now WRITE through the real `materializeSnapshot` via a CONTENT fingerprint
+(`compactInventoryContentFingerprint`), with the CYCLE folded in for a lagging compact so the fresh unavailable
+placeholder can't shadow it across cycles; a same-content/same-cycle replay stays a zero-write no-op. **(2)** rebuild
+authorization is CYCLE-BOUND (`live.params.to === inventory_asof`, threaded via `--inventory-as-of`), not mere row
+existence — an old-cycle row / revoked account / missing asof all fail closed. **(3)** the Ads content revision now
+describes COMMITTED durable data (`committedContentRev` re-reads the store over a canonical 60-day window —
+window-independent + delete-aware; a THROWN read preserves the previous rev, never a spurious flip). **(4)** the Ads
+notice distinguishes verified delay vs verified zero vs UNKNOWN (`verifiedThrough` + `provisionalState:unknown-unverified`);
+delay is no longer inferred from latestMetricDate alone. **(5)** Listing Health v3 runs when FBA publishes ZERO accounts
+— the v3 job gate dropped `fba_published` and now keys on `needs.run.result=='success'` (FBA is ordering-only), so
+Listings/OLI publish and inventory stays unavailable per-account.
+
+**Next: push `main` (Vercel deploy) + keep migration `20260923_ads_content_rev.sql` approval-gated until the revision
+design is reviewed** (the content-rev fold is inert until it lands). Then observe natural regional runs (do NOT
+dispatch). Detail: `PROJECT_MEMORY.md` (2026-09-09 round-3 entry) +
+`sales-dashboard-live/scratchpad/REPAIR-STATUS-MATRIX-20260909.md` (recalculated paid-source plan — NOT a flat 34/day).
+
+---
 ## Round 2 (5 integration follow-ups) — code-complete, `npm run verify` 184/184
 
 Fixes real gaps in round 1 + completes v3: **(1)** brand-inventory rebuild was INERT in prod (gated on a
