@@ -1,5 +1,52 @@
 # Project Memory
 
+## Scheduler per-account DASHBOARD publication isolation — PARTIAL (2026-09-09, commit f3a7d9d on main, NOT pushed; code verification only, NOT production acceptance)
+
+Continuation of the all-region scheduler repair (builds on e4e3ff2/7d99d00, preserved). Codex reproduced the deeper
+gap: **saving OLI history is NOT dashboard publication.** `assessScheduledOliCycle` is a FULL-REGION completeness
+check, so 5 succeeded owners + 1 DATADOE_INITIAL_LOAD_INCOMPLETE owner returned ok:false (job-not-succeeded +
+owner-coverage-missing); `oli-refresh-d1.mjs` then `exit 1`, and scheduler-v2's OLI/Campaign success gates
+(`steps.oli.outcome=='success'`, honesty step) skipped the WHOLE region's readiness + controls + publish — so the
+HEALTHY accounts' Brand View / Daily / Brand-Inventory snapshots never published. FIXED + tested. **verify 186/186
+(162 suites); git diff --check clean; api/*.js=12; zero DataDoe spend; no budget/dispatch/migration/paid-export/
+frozen-batch change. Existing commits kept; NOT pushed.**
+
+**Three-way separation (pure, tested).** New `classifyOliPublicationOutcome` (source-scheduled-oli.js) ON TOP of the
+UNCHANGED `assessScheduledOliCycle`: (1) **full-region completeness** (every account eligible — the ONLY "complete");
+(2) **safe publication eligibility** = accounts with a SUCCEEDED, in-scope, owner-covered OLI job AND proven D-1
+coverage (`eligibleAccountIds`); (3) **fatal integrity/authorization** = over-ceiling / owner-unexpected /
+batch-oversized / bad-create-count / org-scope / non-oli-source → publish NOTHING. Only job-not-succeeded /
+owner-coverage-missing / family-not-drained are non-fatal. Tests C4a–C4f.
+
+**Release entrypoint + workflow outputs.** `oli-refresh-d1.mjs` (FULL scope) emits `publication_outcome / full_complete
+/ publishable / eligible_ids / deferred_ids / counts` to `$GITHUB_OUTPUT` and exits THREE-way: FATAL → exit 1 (publish
+nothing); all-deferred → exit 1 (LKG, never false-green); COMPLETE or PARTIAL-publishable → exit 0. NEVER labels a
+partial "complete". Bootstrap UNCHANGED (strict a.ok). The ALREADY_PUBLISHED_D1 / idempotent-complete early exits ALSO
+emit full_complete=true (via `emitFullCompleteOutputs`) so the complete-publish recovery step still runs (watchdog
+recovery preserved — this was adversarial-review DEFECT 1, fixed).
+
+**Healthy-subset publication (reuses the proven bootstrap `fetchAccounts`+`cycleBucket` seam; NO migration).** On a
+PARTIAL the workflow publishes EXACTLY `eligible_ids` via `priority-dashboards-release.mjs --eligible-accounts`, scoped
+into a deterministic dedicated cycle bucket `priority-partial-<region>-<membershipHash>`, so the natural daily cycle is
+NEVER finalized with a partial set and deferred accounts' dated LKG is untouched. `verify-bucket-readiness.mjs
+--eligible-accounts` proves EXACTLY the subset (deferred never fail-closes the region; an eligible id absent from
+discovery fails closed). The COMPLETE path is BYTE-IDENTICAL (blank sentinel → whole-region, natural cycle). Controls/
+fence region-wide (one lease/generation, renewed by both paths); Catalog org-wide, one create/day (SAME per-day
+operation key `priority-dashboards/scheduled/<asof>` for both, adopted — a distinct `scheduled-partial` key is REJECTED
+by `assertPriorityOperationKey`; using it was adversarial-review DEFECT 2, fixed).
+
+**Tests.** scheduler-v2-automation C4a–f + D5 (complete/partial/fatal workflow branches + valid op key + report gated
+on publish success) + D6 (entrypoint source guards incl. the early-exit full_complete emission). source-priority-
+dashboards PP1a–e: END-TO-END through the REAL publisher (`buildSchedulerV2Publisher`) — healthy accounts publish fresh
+D-1 while the deferred account's DATED LKG stays BYTE-IDENTICAL (not-successful, zero writes); Campaign failure with
+usable OLI sales still publishes (ads unavailable, sales never suppressed); hard sibling failure identical
+(independent deps); per-account gate; the `scheduled-partial` op key proven rejected. Two adversarial-review rounds
+(2 HIGH defects found + fixed, re-review clean).
+
+**Production acceptance PENDING a natural PARTIAL cycle** (observe; never dispatch): a region with a mix of ready +
+unready sellers publishes the healthy subset fresh D-1, the unready sellers keep dated LKG, and the run is honestly
+reported PARTIAL. Still a PARTIAL repair — NOT the complete all-region fix.
+
 ## All-region scheduler repair — PARTIAL (2026-09-09, commit e4e3ff2 on main, NOT yet pushed; code verification only, NOT production acceptance)
 
 Continuation of the all-region scheduler repair (separate from the website report rounds 1-4 at 8285b7a, preserved).

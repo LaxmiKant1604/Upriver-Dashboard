@@ -1,8 +1,9 @@
 # Handoff — Website report repair (rounds 1-4) + all-region scheduler repair (PARTIAL) + open gates
 
-**Branch:** `main`   **HEAD:** all-region scheduler-repair (partial) commit `e4e3ff2` (report rounds 1-4 at `8285b7a`).
-**e4e3ff2 is committed locally on `main`, NOT yet pushed** — the scheduler effect lands only on the NEXT natural cron
-off origin/main, so it needs a push (normal path, no dispatch) to take effect. Awaiting go-ahead to push.
+**Branch:** `main`   **HEAD:** scheduler per-account publication (partial) commit `f3a7d9d` (prior scheduler-repair
+`e4e3ff2`/`7d99d00`; report rounds 1-4 at `8285b7a`).
+**f3a7d9d + e4e3ff2 are committed locally on `main`, NOT yet pushed** — the scheduler effect lands only on the NEXT
+natural cron off origin/main, so they need a push (normal path, no dispatch) to take effect. Awaiting go-ahead to push.
 **Latest deploy:** Vercel Production **Ready** at `c0d92cd` (round 3, Codex-confirmed); round 4 (`8285b7a`) deployed.
 **Date:** 2026-09-09
 **DataDoe this session:** 0 exports / 0 tokens   **api/*.js:** 12 (unchanged)   **verify:** 186/186 (162 suites).
@@ -33,10 +34,17 @@ spending limits, manually dispatch a scheduler/DataDoe/workflow run, or apply a 
      is the POSITIVELY-authorized eligible set (`freshPlanAccountIds` allowlist), not discovery-minus-exclusions, so an
      unready seller never poisons a batch and a new/un-gated account (or a bootstrap account outside the approved wave)
      cannot bypass onboarding. A continuation reuses frozen membership/budget verbatim.
-   - **Per-account publication:** eligibility is already expressible from EXISTING durable records (owners→job status +
-     coverage + OLI provenance + report_snapshots); the readiness case is already per-account isolated. **No migration
-     required.** Remaining reviewed items (named, NOT a blanket blocker): hard-failure per-account isolation at the
-     derive entry gate = a reviewed CODE change; an explicit durable per-account outcome ledger = OPTIONAL migration.
+   - **Per-account DASHBOARD publication — NOW IMPLEMENTED (`f3a7d9d`), not just designed.** Root cause: saving OLI
+     history ≠ dashboard publication; `oli-refresh-d1` exited 1 on a partial → the whole region's readiness/controls/
+     publish were skipped. Fix: three-way outcome (`classifyOliPublicationOutcome`: complete / partial-publishable /
+     fatal) emitted as workflow outputs; on a PARTIAL the workflow publishes EXACTLY the healthy OLI-eligible subset
+     (`priority-dashboards-release --eligible-accounts`) into a dedicated cycle bucket (`priority-partial-<region>-
+     <hash>`, reusing the bootstrap seam), leaving deferred accounts' dated LKG untouched; COMPLETE path byte-identical;
+     fatal/all-deferred exits nonzero (never false-green). NO migration. END-TO-END regression through the REAL
+     publisher (PP1a–e) + workflow/source guards (D5/D6) + classifier (C4). Two adversarial-review rounds (2 HIGH
+     defects found + fixed). OBSERVE a natural PARTIAL cycle (never dispatch): healthy subset fresh D-1, deferred keep
+     LKG, run honestly reported PARTIAL. The remaining OPTIONAL durable per-account outcome ledger (a migration) is
+     still deferred; eligibility remains fully inferable without it.
    - **Observe (do NOT dispatch)** the next natural india/europe-au/us-ca cycles: OLI excludes unready sellers (logged
      "onboarding gate … excluded N"), NOT a DATADOE_INITIAL_LOAD_INCOMPLETE batch rejection; LH v3 logged
      estimatedTokens == frozen maxTokens; no region spends beyond its UNCHANGED authorization. NOT yet reproduced:
