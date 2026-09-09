@@ -1,9 +1,62 @@
-# Handoff — Website report repair (rounds 1+2+3) + scheduler permanent repair (DEPLOYED) + open gates
+# Handoff — Website report repair (rounds 1-4) + scheduler permanent repair (DEPLOYED) + open gates
 
-**Branch:** `main`   **HEAD:** round-3 commit `7c8afc3`   **origin/main:** push PENDING for round 3
-**Latest deploy:** Vercel Production **Ready** at `842f9ca` (round 2, Codex-confirmed). Round 3 deploys on push.
+**Branch:** `main`   **HEAD:** round-4 commit `8285b7a` (pushed to origin/main)
+**Latest deploy:** Vercel Production **Ready** at `c0d92cd` (round 3, Codex-confirmed). Round 4 deploys on this push.
 **Date:** 2026-09-09
 **DataDoe this session:** 0 exports / 0 tokens   **api/*.js:** 12 (unchanged)
+
+## → CODEX HANDOFF (what to do next — Upriver owns GitHub/Cloudflare/migrations/natural-run observation)
+
+Round 4 is pushed (`8285b7a`) and deploys on this push. **Everything below is observe/approve only — do NOT raise
+spending limits, manually dispatch a scheduler/DataDoe/workflow run, or apply a migration without explicit approval.**
+
+1. **Confirm the Vercel Production deploy** of `8285b7a` is Ready (rounds 1-3 were Codex-confirmed the same way).
+2. **Natural-run acceptance (do NOT dispatch)** — observe the next natural india (03:00 UTC) / europe-au (08:30) /
+   us-ca (16:30) cycles and confirm on a real page: (a) a lagging **available** Brand View LKG keeps showing with its
+   real (older) inventory date and is NOT shadowed by the same-cycle unavailable placeholder republish; (b) a
+   same-window Ads correction/delete flips `content_rev` and rebuilds Brand View; (c) the Daily ads band shows the
+   recorded-extent wording and unrecorded covered days as unavailable (—), never a measured zero.
+3. **Migration `20260923_ads_content_rev.sql` — STILL approval-gated.** The Ads content-rev fold is fail-soft/inert
+   until it lands. Decide on the revision design, then (only if approved) apply via
+   `MIGRATE_ONLY=20260923_ads_content_rev.sql npm run db:migrate`. No other migration is touched.
+4. **Scheduler investigation — tracked, NOT fixed here** (`sales-dashboard-live/scratchpad/SCHEDULER-INVESTIGATION-20260909.md`):
+   (a) Europe OLI readiness blocking regional priority publication (provider itemization lag vs the strict D-1 gate —
+   observe the next natural europe-au cycle; do NOT relax the gate without review); (b) Listing Health v3 token
+   conflict — a 24-token estimate vs a 42-token frozen plan vs a 28-token authorization; reconcile the ESTIMATE and
+   PLAN to the AUTHORIZED ceiling (make the plan fit the authorization), **never raise the authorization to fit**.
+   Each needs its own reviewed change.
+
+## Round 4 (4 reproduced defects on `c0d92cd` + 3 Codex follow-up findings) — code-complete, `npm run verify` 184/184 (commit `8285b7a`)
+
+Two adversarial-review rounds drove revisions of the first round-4 attempt (Codex rejected: the ads "2-day settled"
+assumption, "non-empty = authoritative replacement", and the "latest-12" inventory cutoff); a final focused review of
+the two remaining confirmed fixes returned **zero** findings. Net fixes:
+- **(1) Cycle-bound inventory authorization** decoupled from the latest displayed snapshot: authorize on the EXACT
+  current-cycle publication (`getReportSnapshot` at `paramsHashFor({to: cycleAsOf})`), so a lagging rebuild can't
+  invalidate a later fresh update in the same cycle; revoked/missing-cycle fail closed.
+- **(2) Serve SELECTS the authoritative available compact** (`selectAuthoritativeInventorySnapshot`) so a same-cycle
+  unavailable placeholder republish can't shadow a lagging available LKG. The LKG is found WITHOUT a recent-N cutoff
+  via a direct payload query (`payload->>inventoryAvailable=eq.true`) + the newest overall — works for any writer, no
+  marker. Round-3 cycle-fold stays removed (pure content idempotency; real older date kept). Writer + serve select
+  identically; the dependency fingerprint keys on the SELECTED compact.
+- **(3) Empty-Ads revision + deletion completeness:** a successfully-read empty window gets a stable non-null
+  `EMPTY_ADS_CONTENT_REV` (distinct from a thrown read = preserve previous), so nonempty→empty invalidates dependents;
+  the aggregated clean-replace runs only on a proven-complete window (fetchAllPages complete-by-construction +
+  validateExportPage fail-closed) and now CHECKS the per-account delete ack (a failed delete excludes the account —
+  no double-count, no data loss). (Deletion path dormant: asin-only, create-retired; campaign is upsert-only.)
+- **(4) Honest Ads completeness:** `resolveDailyAdsAvailability` makes NO completeness claim without explicit
+  evidence — no reporting-lag constant, no "later metric proves earlier days", invariant to `requestedTo`. It reports
+  the factual recorded-data extent; a covered day with no recorded row is unavailable, never a measured zero.
+
+**Migration `20260923` unchanged (approval-gated). No paid exports, no dispatch, no limit changes. Detail:**
+`PROJECT_MEMORY.md` (2026-09-09 round-4 entry) + `sales-dashboard-live/scratchpad/SCHEDULER-INVESTIGATION-20260909.md`.
+
+---
+## Round 3 (5 deeper integration defects on `842f9ca`) — code-complete, `npm run verify` 184/184 (commit `7c8afc3`)
+
+Closes gaps the round-3 adversarial review found deeper in the sync -> store -> fingerprint -> materializer -> serve
+chain (the review confirmed 2 findings — one HIGH I introduced — both fixed before commit): **(1)** an equal-timestamp
+and a LAGGING inventoryAvailable:false->true now WRITE through the real `materializeSnapshot` via a CONTENT fingerprint
 
 ## Round 3 (5 deeper integration defects on `842f9ca`) — code-complete, `npm run verify` 184/184 (commit `7c8afc3`)
 
