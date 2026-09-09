@@ -915,6 +915,125 @@ test("P10b. a mutated-after-save row fails provenance; a dangling storage payloa
   assert.equal((await readbackFor(badPayload)({ reportKey: RK, liveReportKey: "brand-sales", accountId: "A01", paramsHash: PH })).reason, "payload-contract");
 });
 
+/* ===================== P12. END-TO-END partial publication: healthy subset publishes; deferred keeps dated LKG ===================== */
+// Codex per-account publication isolation. Through the REAL publisher (buildSchedulerV2Publisher), a PARTIAL OLI
+// cycle -- healthy accounts (terminal 'succeeded' cycle + fresh D-1 shadow) plus a deferred account (a non-terminal
+// 'running' cycle, e.g. a readiness/hard-failed batch) -- publishes EXACTLY the healthy accounts' fresh D-1 live
+// dashboards while the deferred account's DATED last-known-good live snapshot is left BYTE-IDENTICAL. Also proves a
+// Campaign-Ads failure never suppresses an account with usable OLI sales (ads shown unavailable), and that a HARD
+// (non-readiness) sibling failure is treated identically (independent dependencies). Offline; zero network.
+group("PP1. END-TO-END: a partial cycle publishes the HEALTHY subset; the deferred account keeps its dated LKG");
+
+// A per-account SHADOW spec (accountId substituted). The shadow reportVersion == REPORT_DERIVATIONS[rk].snapshotVersion
+// (what the publisher asserts). `dailyPayload` lets a variant inject usable sales with ads unavailable.
+function shadowSpecFor(rk, accountId, dailyPayload) {
+  if (rk === "daily-reporting") return { version: "daily-reporting/v2f-campaign", params: { reportVersion: "daily-reporting/v2f-campaign", accountId, from: "2026-03-19", to: ASOF, brand: "ALL" }, payload: dailyPayload || { rows: [], brandFiltered: false, adsAvailability: { status: "unavailable" } } };
+  if (rk === "brand-sales") return { version: "brand-sales/v2d-2", params: { reportVersion: "brand-sales/v2d-2", accountId, from: "2025-01-01", to: ASOF }, payload: { rows: [], catalogBrands: [], asinBrand: { B0A: "Acme" } } };
+  return { version: "brand-inventory-shared-v1", params: { reportVersion: "brand-inventory-shared-v1", accountId, to: ASOF }, payload: { inventoryByBrandCountry: [], inventoryDate: null, inventoryAvailable: false } };
+}
+const shadowHashFor = (rk, a, dp) => reportStore.paramsHashFor(shadowSpecFor(rk, a, dp).version, shadowSpecFor(rk, a, dp).params);
+// The LIVE identity (report_key + account_id + params_hash) the publisher's fenced write targets.
+function liveKeyFor(rk, accountId) {
+  const c = publisherCore.SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[rk];
+  const lp = c.liveParams(shadowSpecFor(rk, accountId).params);
+  return c.liveReportKey + "|" + accountId + "|" + reportStore.paramsHashFor(c.liveReportVersion, lp);
+}
+// A real publisher over a live-snapshot STORE (a Map). publishLiveFenced WRITES the live row so we can observe exactly
+// which accounts were (re)published. `cycleStatusByAccount` steers each account terminal (succeeded -> published) or
+// non-terminal (running -> not-successful -> NO write). `dailyPayloadByAccount` injects a variant daily payload.
+function partialPublisherRelease({ scope, cycleStatusByAccount, liveStore, dailyPayloadByAccount = {} }) {
+  const scopeAccounts = scope.map((id) => ({ id, name: id, country: "US", currency: "USD", status: "active" }));
+  const pub = pubComposition.buildSchedulerV2Publisher({
+    connections: [{ id: "primary", apiKey: "k", accountPrefix: "" }],
+    fetchAccounts: async () => scopeAccounts,
+    getAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: [...scope] }),
+    getSettings: async () => [{ report_key: "daily-reporting", schedule_enabled: true }, { report_key: "brand-sales", schedule_enabled: true }],
+    getPromotedSettings: async () => [{ report_key: "brand-inventory", publish_enabled: true }],
+    getApproval: async () => ({ read: "ok", approved: true }),
+    getJob: async (rk, acct) => ({ cycle_id: "cyc-" + acct, validated: true, snapshot_params_hash: shadowHashFor(rk, acct, dailyPayloadByAccount[acct]), derive_status: "succeeded", save_status: "succeeded", cycle_status: cycleStatusByAccount[acct] || "running" }),
+    getSnapshot: async ({ reportKey, accountId }) => { const rk = reportKey.replace("scheduler-v2/", ""); const s = shadowSpecFor(rk, accountId, dailyPayloadByAccount[accountId]); return { params_hash: shadowHashFor(rk, accountId, dailyPayloadByAccount[accountId]), params: s.params, payload: s.payload, payload_storage_path: null, source_refreshed_at: TS }; },
+    getControlFence: () => ({ ownerToken: "test-owner", generation: 1 }),
+    publishLiveFenced: async (args) => { liveStore.set(args.reportKey + "|" + args.accountId + "|" + args.paramsHash, { report_key: args.reportKey, account_id: args.accountId, params_hash: args.paramsHash, params: args.params, payload: args.payload }); return { outcome: "inserted" }; },
+  });
+  return priorityMod.buildPriorityDashboardsRelease({ buildRuntime: () => ({ makeDeadline: () => ({}), preflightEvidence: async () => ({}), run: async () => ({}) }), makeInnerAdapter: () => makeInner([]), buildPublisher: () => pub, reservation: makeFakeReservation(), makeStore: () => ({ listSourceJobs: async () => [], listCycleOwners: async () => [], finalizeCycle: async () => ({}) }), listReportJobs: async () => [], getCycleByBucketDate: async () => null });
+}
+
+test("PP1a. the healthy OLI-eligible accounts publish fresh D-1 dashboards; the readiness-deferred account keeps its DATED last-known-good BYTE-IDENTICAL", async () => {
+  // Scope [A01,A02] healthy (terminal succeeded) + A03 deferred (running: its OLI batch was readiness/hard-deferred).
+  const liveStore = new Map();
+  // Seed A03's DATED last-known-good live rows (an OLDER cycle: to = 2026-08-10, before ASOF 2026-08-19).
+  const A03_LKG = new Map();
+  for (const rk of ["daily-reporting", "brand-sales", "brand-inventory"]) {
+    const c = publisherCore.SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[rk];
+    const oldParams = rk === "brand-inventory" ? { to: "2026-08-10" } : (rk === "daily-reporting" ? { from: "2026-03-19", to: "2026-08-10", brand: "ALL" } : { from: "2025-01-01", to: "2026-08-10" });
+    const ph = reportStore.paramsHashFor(c.liveReportVersion, oldParams);
+    const key = c.liveReportKey + "|A03|" + ph;
+    const row = { report_key: c.liveReportKey, account_id: "A03", params_hash: ph, params: { reportVersion: c.liveReportVersion, ...oldParams }, payload: { dated: "lkg-2026-08-10" } };
+    liveStore.set(key, row); A03_LKG.set(key, JSON.stringify(row));
+  }
+  const beforeSize = liveStore.size;
+  const rel = partialPublisherRelease({ scope: ["A01", "A02", "A03"], cycleStatusByAccount: { A01: "succeeded", A02: "succeeded", A03: "running" }, liveStore });
+
+  // The healthy accounts (the OLI-eligible subset) publish all three fresh D-1 dashboards.
+  for (const acct of ["A01", "A02"]) {
+    const outp = await rel.publishAccount(acct);
+    assert.deepEqual(outp.results.map((r) => r.reportKey), ["daily-reporting", "brand-sales", "brand-inventory"], acct + " publishes the 3 priority reports");
+    for (const r of outp.results) assert.equal(r.disposition, "published", acct + "/" + r.reportKey + " published fresh");
+    for (const rk of ["daily-reporting", "brand-sales", "brand-inventory"]) assert.ok(liveStore.has(liveKeyFor(rk, acct)), acct + "/" + rk + " wrote a fresh D-1 live row");
+  }
+  // The deferred account: a direct publish attempt is NOT-SUCCESSFUL (non-terminal cycle) -> ZERO writes.
+  const a3 = await rel.publishAccount("A03");
+  for (const r of a3.results) assert.equal(r.disposition, "not-successful", "A03/" + r.reportKey + " is not-successful (deferred; never published)");
+  // A03's DATED last-known-good rows are BYTE-IDENTICAL (untouched) -- and no fresh D-1 A03 row was created.
+  for (const [key, json] of A03_LKG) assert.equal(JSON.stringify(liveStore.get(key)), json, "A03 LKG row " + key.slice(0, 24) + " untouched (byte-identical)");
+  for (const rk of ["daily-reporting", "brand-sales", "brand-inventory"]) assert.equal(liveStore.has(liveKeyFor(rk, "A03")), false, "A03 got NO fresh D-1 " + rk + " row");
+  assert.equal(liveStore.size, beforeSize + 2 * 3, "exactly the 2 healthy accounts x 3 reports were written; A03 unchanged");
+});
+
+test("PP1b. CAMPAIGN Ads failure with usable OLI sales: a healthy account STILL publishes daily + brand-sales (ads shown unavailable, sales never suppressed)", async () => {
+  const liveStore = new Map();
+  // A01's daily payload carries USABLE sales rows but adsAvailability unavailable (Campaign Ads failed this cycle).
+  const dailyWithSalesAdsDown = { rows: [{ date: "2026-08-18", marketplace_country_code: "US", currency: "USD", product_brand: "Acme", total_sales: 210, total_units_sold: 21 }], brandFiltered: false, adsAvailability: { status: "unavailable" } };
+  const rel = partialPublisherRelease({ scope: ["A01"], cycleStatusByAccount: { A01: "succeeded" }, liveStore, dailyPayloadByAccount: { A01: dailyWithSalesAdsDown } });
+  const outp = await rel.publishAccount("A01");
+  for (const r of outp.results) assert.equal(r.disposition, "published", "A01/" + r.reportKey + " published despite the Campaign Ads failure");
+  const daily = liveStore.get(liveKeyFor("daily-reporting", "A01"));
+  assert.ok(daily && daily.payload && Array.isArray(daily.payload.rows) && daily.payload.rows.length === 1, "the published daily row carries the usable OLI sales");
+  assert.equal(daily.payload.adsAvailability.status, "unavailable", "ads are honestly UNAVAILABLE (never a fabricated zero), but sales published");
+});
+
+test("PP1c. a HARD sibling failure (independent deps) is identical: the healthy accounts publish, the hard-failed account keeps dated LKG (a non-terminal cycle -> not-successful -> untouched)", async () => {
+  // The deferred account's batch failed HARD (non-readiness). At the publication layer the shape is the same: its
+  // cycle is non-terminal -> not-successful -> zero writes -> LKG preserved. Healthy siblings are unaffected.
+  const liveStore = new Map();
+  const rel = partialPublisherRelease({ scope: ["A01", "A02", "A03"], cycleStatusByAccount: { A01: "succeeded", A02: "succeeded", A03: "failed" }, liveStore });
+  for (const acct of ["A01", "A02"]) { const outp = await rel.publishAccount(acct); for (const r of outp.results) assert.equal(r.disposition, "published", acct + " publishes despite the hard sibling failure"); }
+  const a3 = await rel.publishAccount("A03");
+  for (const r of a3.results) assert.equal(r.disposition, "not-successful", "the hard-failed account is not-successful -> keeps LKG (no write)");
+  assert.equal(liveStore.size, 2 * 3, "only the 2 healthy accounts x 3 reports were written; the hard-failed account wrote nothing");
+});
+
+test("PP1e. the PARTIAL publish reuses the VALID per-day catalog operation key (scheduled/YYYY-MM-DD); the once-proposed scheduled-partial/ key is REJECTED (would hard-fail the partial step)", () => {
+  // Regression guard for the partial-publish operation key: buildPriorityDashboardsRelease validates it via
+  // assertPriorityOperationKey, which accepts ONLY priority-dashboards/v2 | priority-dashboards/scheduled/<date>.
+  // The partial workflow step MUST therefore reuse the per-day scheduled key (the org-wide Catalog is one create/day,
+  // shared complete-or-partial); the cycle isolation comes from the dedicated cycle bucket, not the operation key.
+  assert.equal(priorityMod.assertPriorityOperationKey("priority-dashboards/scheduled/2026-09-08"), "priority-dashboards/scheduled/2026-09-08");
+  assert.throws(() => priorityMod.assertPriorityOperationKey("priority-dashboards/scheduled-partial/2026-09-08"), /PRIORITY_OPERATION_KEY_INVALID/, "a scheduled-partial/ key is rejected -> the partial step would exit 2 (dead on arrival)");
+});
+
+test("PP1d. terminal-succeeded is REQUIRED for a fresh write: with the SAME fresh shadow evidence, a 'running' cycle writes nothing but a 'succeeded' cycle publishes (the publication gate is per-account, not per-region)", async () => {
+  const liveStore = new Map();
+  const relRunning = partialPublisherRelease({ scope: ["A01"], cycleStatusByAccount: { A01: "running" }, liveStore });
+  const running = await relRunning.publishAccount("A01");
+  for (const r of running.results) assert.equal(r.disposition, "not-successful", "a non-terminal cycle never publishes");
+  assert.equal(liveStore.size, 0, "no live row written while the cycle is non-terminal (LKG preserved)");
+  const relOk = partialPublisherRelease({ scope: ["A01"], cycleStatusByAccount: { A01: "succeeded" }, liveStore });
+  const okp = await relOk.publishAccount("A01");
+  for (const r of okp.results) assert.equal(r.disposition, "published", "the same account publishes once its own cycle is terminal");
+  assert.equal(liveStore.size, 3, "exactly 3 fresh live rows once terminal");
+});
+
 /* ===================== P11. the exact publication control package builder (prepared) ===================== */
 group("P11. control package builder: exact global target sets; safe-close rollback; fails closed");
 test("P11a. buildPriorityControlPackage: exact rollout, ONLY 2 dispatch enabled (others paused), promoted enabled, 3xN approvals", () => {

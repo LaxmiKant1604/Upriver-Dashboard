@@ -15,7 +15,33 @@
 // work. It NEVER reopens/resets/mutates a terminal cycle, NEVER retries an ambiguous create, and preserves the LKG.
 
 import pg from "pg";
+import { appendFileSync } from "node:fs";
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
+
+// Emit a GitHub Actions step output (key=value) so the workflow can gate + scope downstream steps on the OLI
+// publication outcome. A no-op locally (GITHUB_OUTPUT unset). Values are single-line; account-id lists are csv.
+function ghOut(key, value) {
+  const f = process.env.GITHUB_OUTPUT;
+  if (!f) return;
+  try { appendFileSync(f, `${key}=${String(value == null ? "" : value).replace(/\r?\n/g, " ")}\n`); } catch { /* non-fatal */ }
+}
+
+// An ALREADY-COMPLETE / idempotent-D-1 outcome (durable coverage already spans D-1 for every account, or the head is a
+// terminal complete cycle) IS a full-region publishable outcome. It MUST emit the whole-region three-way scope so the
+// COMPLETE-region publish step (gated on full_complete=='true') still runs and IDEMPOTENTLY recovers any not-yet-
+// published live snapshot -- exactly the watchdog recovery guarantee (OLI coverage complete but the live dashboards
+// were not published on the interrupted primary run). Omitting these outputs skipped both publish steps -> a green run
+// that published nothing. These early exits happen BEFORE the drain/classifier, so emit the full-complete scope here.
+function emitFullCompleteOutputs(idList) {
+  const all = [...new Set((idList || []).map((x) => String(x).trim()).filter(Boolean))].sort();
+  ghOut("publication_outcome", "complete");
+  ghOut("full_complete", "true");
+  ghOut("publishable", "true");
+  ghOut("eligible_ids", all.join(","));
+  ghOut("deferred_ids", "");
+  ghOut("eligible_count", String(all.length));
+  ghOut("deferred_count", "0");
+}
 import { accountInScope, isRoutingScope } from "../../lib/server/sync/scheduler-scope.js";
 
 loadReleaseEnv();
@@ -84,7 +110,7 @@ const fetchAccounts = accountScope === "bootstrap"
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, openSupersedingSyncCycle, reserveOliFreshnessCreate, recordOliFreshnessExport, getOliCompleteness, getSourceTrancheBudget } = await import("../../lib/server/supabase.js");
 const { OLI_SOURCE_KEY, windowsProve } = await import("../../lib/server/sync/source-durable-model.js");
-const { classifyScheduledOliCycle, assessScheduledOliCycle, assessDurableOliCoverageComplete, oliBucketPlan, OLI_TOKENS_PER_CREATE, resolveOliCeiling } = await import("../../lib/server/sync/source-scheduled-oli.js");
+const { classifyScheduledOliCycle, assessScheduledOliCycle, classifyOliPublicationOutcome, assessDurableOliCoverageComplete, oliBucketPlan, OLI_TOKENS_PER_CREATE, resolveOliCeiling } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 const { freshnessOperationKey, attemptKindForMode } = await import("../../lib/server/sync/source-oli-freshness.js");
@@ -148,7 +174,7 @@ let cov0 = await coverageState();
 const ceilingCreates = plan.maxCreates + cov0.missing.length;
 const ceilingTokens = ceilingCreates * OLI_TOKENS_PER_CREATE;
 log(cov0.missing.length + "/" + ids.length + " account(s) behind D-1 (unreadable=" + cov0.anyUnreadable + "); create ceiling=" + ceilingCreates + " (" + plan.maxCreates + " batches + " + cov0.missing.length + " behind)");
-if (cov0.durableComplete) { log("ALREADY_PUBLISHED_D1: durable coverage complete through D-1 -- ZERO creates, ZERO tokens (idempotent primary/fallback no-op)."); console.log("RESULT " + JSON.stringify({ ok: true, bucket, requestedAsOf, classification: "ALREADY_PUBLISHED_D1", creates: 0, tokens: 0, d1Complete: true, alreadyComplete: true })); process.exit(0); }
+if (cov0.durableComplete) { log("ALREADY_PUBLISHED_D1: durable coverage complete through D-1 -- ZERO creates, ZERO tokens (idempotent primary/fallback no-op)."); console.log("RESULT " + JSON.stringify({ ok: true, bucket, requestedAsOf, classification: "ALREADY_PUBLISHED_D1", creates: 0, tokens: 0, d1Complete: true, alreadyComplete: true, publicationOutcome: "complete", fullComplete: true, publishable: true })); if (accountScope === "full") emitFullCompleteOutputs(ids); process.exit(0); }
 if (cov0.anyUnreadable) { console.error("STOP OLI coverage unreadable -- fail closed (never classify freshness without evidence)."); process.exit(1); }
 
 // BOOTSTRAP BUDGET GATE (before ANY DataDoe work): reserve THIS attempt's coverage-derived spend
@@ -230,7 +256,7 @@ if (head && head.id) {
   const cls = classifyScheduledOliCycle({ bucket, cycle: head, discoveredAccounts: discovered, sourceJobs: jobs, owners, durableCoverage });
   log("head " + workingCycleId.slice(0, 8) + " status=" + head.status + " -> classification=" + cls.disposition + (cls.reason ? " (" + cls.reason + ")" : ""));
   if (cls.disposition === "refuse" || cls.disposition === "terminal-refuse") { console.error("STOP CYCLE_REFUSED (" + cls.reason + ") -- fail closed."); process.exit(1); }
-  if (cls.disposition === "idempotent-complete") { log("ALREADY_PUBLISHED_D1: idempotent D-1 complete; ZERO creates, ZERO tokens."); console.log("RESULT " + JSON.stringify({ ok: true, bucket, requestedAsOf, classification: "ALREADY_PUBLISHED_D1", creates: 0, tokens: 0, d1Complete: true })); process.exit(0); }
+  if (cls.disposition === "idempotent-complete") { log("ALREADY_PUBLISHED_D1: idempotent D-1 complete; ZERO creates, ZERO tokens."); console.log("RESULT " + JSON.stringify({ ok: true, bucket, requestedAsOf, classification: "ALREADY_PUBLISHED_D1", creates: 0, tokens: 0, d1Complete: true, publicationOutcome: "complete", fullComplete: true, publishable: true })); if (accountScope === "full") emitFullCompleteOutputs(ids); process.exit(0); }
   if (cls.disposition === "supersede") {
     // Open a durable SUPERSEDING running attempt on the same slot; the terminal cycle stays IMMUTABLE.
     let newId;
@@ -374,7 +400,41 @@ if (accountScope === "bootstrap") {
       + " creates EXCEEDED reservation " + rec.reserved_tokens + " tok/" + rec.reserved_creates + " -- investigate before the next wave step.");
   }
 }
-console.log("RESULT " + JSON.stringify({ ok: a.ok, bucket, requestedAsOf, accountScope, operationKey, workingCycle: workingCycleId.slice(0, 8), creates: a.creates, tokens: a.tokens, ceilingTokens, classification, d1Complete, coverageBehindD1: cov1.missing.length, completeness: { provisional, final, sourceDefect: sourceDefect || realDefect, itemizedOrders, pendingOrders, pendingUnits, overallItemizedPct: overallPct }, blockedCodes, realDefect: realDefect > 0 }));
-if (!a.ok) { console.error("STOP OLI assessment FAILED: " + a.problems.join(", ")); process.exit(1); }
-// GREEN exit for provisional: expected pending itemization is a SUCCESS (D1_PROVISIONAL publishes now), never a red run.
+// THREE-WAY PUBLICATION OUTCOME (Codex: separate full-region completeness / safe healthy-subset publication / fatal
+// integrity+authorization failure). Full-region completeness stays EXACTLY assessScheduledOliCycle (a.ok); this only
+// SEPARATES a per-batch deferral (some healthy owners succeeded) from a run-integrity/authorization breach, so the
+// workflow can publish the HEALTHY accounts while a deferred account keeps dated LKG -- WITHOUT turning a partial into
+// a complete run, and WITHOUT ignoring the exit code (a fatal breach still exits nonzero, publishing nothing). Bootstrap
+// scope is UNCHANGED (its dedicated wave publication is all-or-nothing per the frozen wave; keep the strict a.ok exit).
+const pub = classifyOliPublicationOutcome({ bucket, discoveredAccounts: discovered, sourceJobs: jobsF, owners: ownersF, open: await oliOpen(workingCycleId), extraCreatesHeadroom: cov0.missing.length, coverageMissingAccountIds: cov1.missing });
+console.log("RESULT " + JSON.stringify({ ok: a.ok, publicationOutcome: pub.outcome, fullComplete: pub.fullComplete, publishable: pub.publishable, fatal: pub.fatal, eligibleCount: pub.eligibleCount, deferredCount: pub.deferredCount, bucket, requestedAsOf, accountScope, operationKey, workingCycle: workingCycleId.slice(0, 8), creates: a.creates, tokens: a.tokens, ceilingTokens, classification, d1Complete, coverageBehindD1: cov1.missing.length, completeness: { provisional, final, sourceDefect: sourceDefect || realDefect, itemizedOrders, pendingOrders, pendingUnits, overallItemizedPct: overallPct }, blockedCodes, realDefect: realDefect > 0 }));
+
+if (accountScope === "bootstrap") {
+  // Bootstrap: strict all-or-nothing over the frozen wave (unchanged). Its scoped publication proves readiness per
+  // account inside its own derive/finalize; a partial wave is not a green run here.
+  if (!a.ok) { console.error("STOP OLI assessment FAILED (bootstrap): " + a.problems.join(", ")); process.exit(1); }
+  process.exit(0);
+}
+
+// FULL scope: emit the three-way outcome + the exact eligible/deferred account scopes for the workflow to publish the
+// healthy subset (never taken from an input -- computed here from the durable succeeded owners + proven D-1 coverage).
+ghOut("publication_outcome", pub.outcome);
+ghOut("full_complete", pub.fullComplete ? "true" : "false");
+ghOut("publishable", pub.publishable ? "true" : "false");
+ghOut("eligible_ids", pub.eligibleAccountIds.join(","));
+ghOut("deferred_ids", pub.deferredAccountIds.join(","));
+ghOut("eligible_count", String(pub.eligibleCount));
+ghOut("deferred_count", String(pub.deferredCount));
+log("publication outcome=" + pub.outcome + " full_complete=" + pub.fullComplete + " publishable=" + pub.publishable
+  + " eligible=" + pub.eligibleCount + " deferred=" + pub.deferredCount
+  + (pub.deferredCount ? " (deferred accounts keep dated LKG: " + pub.deferredAccountIds.map((x) => x.slice(0, 8)).join(",") + ")" : "")
+  + (pub.fatal ? " FATAL=" + pub.fatalProblems.join(",") : ""));
+
+// FATAL integrity/authorization breach -> publish NOTHING (exit nonzero; the workflow's publish steps stay gated off).
+if (pub.fatal) { console.error("STOP OLI FATAL integrity/authorization failure: " + pub.fatalProblems.join(", ") + " -- publishing NOTHING (fail closed)."); process.exit(1); }
+// Nothing publishable this run (every batch deferred; no healthy account) -> honest non-success (LKG preserved). Not a
+// fatal breach, but not a publication either: exit nonzero so the run is not falsely green with zero fresh dashboards.
+if (!pub.publishable) { console.error("STOP OLI produced NO publishable account (all deferred; e.g. readiness lag) -- ZERO fresh publication, LKG preserved."); process.exit(1); }
+// COMPLETE or PARTIAL-PUBLISHABLE: green exit. The workflow publishes the eligible scope; deferred accounts keep dated
+// LKG. A PARTIAL is honestly labelled full_complete=false -- it is NEVER reported as a complete region.
 process.exit(0);

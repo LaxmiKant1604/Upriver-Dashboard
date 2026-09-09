@@ -7,7 +7,7 @@ import { writeSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { parseEnvFile, applyEnv } from "./release/env-bootstrap.mjs";
-import { oliBucketPlan, assessScheduledOliCycle, classifyScheduledOliCycle, assessDurableOliCoverageComplete, OLI_TOKENS_PER_CREATE, scheduledSourceControlPlan, SCHEDULED_ENABLED_SOURCE_KEYS } from "../lib/server/sync/source-scheduled-oli.js";
+import { oliBucketPlan, assessScheduledOliCycle, classifyOliPublicationOutcome, NON_FATAL_OLI_PROBLEM_PREFIXES, classifyScheduledOliCycle, assessDurableOliCoverageComplete, OLI_TOKENS_PER_CREATE, scheduledSourceControlPlan, SCHEDULED_ENABLED_SOURCE_KEYS } from "../lib/server/sync/source-scheduled-oli.js";
 import { getDataDoeTokenBalance, confirmUsableTokens, COMBINED_DAILY_TOKEN_CEILING, tokenGateDecision, NON_US_RUN_TOKEN_CEILING, US_RUN_TOKEN_CEILING, LOW_BALANCE_WARN_TOKENS } from "../lib/server/datadoe-usage.js";
 import { asinAdsBucketPlan, asinAdsRefreshWindow, assessScheduledAsinAdsCycle, ASIN_ADS_TOKENS_PER_CREATE, ASIN_ADS_ROLLING_WINDOW_DAYS } from "../lib/server/sync/source-scheduled-asin-ads.js";
 import { fetchCompatibleSourceNames } from "../lib/server/datadoe.js";
@@ -171,6 +171,91 @@ test("C3. rejects every violation: not-drained, non-OLI source, failed job, batc
   }
 });
 
+group("C4. THREE-WAY publication outcome separation (classifyOliPublicationOutcome)");
+
+test("C4a. full-region completeness: every discovered account eligible -> outcome=complete, publishable, ZERO deferred, NOT fatal", () => {
+  const c = classifyOliPublicationOutcome({ bucket: "us", ...oliCycle(8) });
+  assert.equal(c.outcome, "complete");
+  assert.equal(c.fullComplete, true);
+  assert.equal(c.fatal, false);
+  assert.equal(c.publishable, true);
+  assert.equal(c.partialPublishable, false);
+  assert.equal(c.deferredAccountIds.length, 0);
+  assert.equal(c.eligibleAccountIds.length, 8);
+});
+
+test("C4b. one READINESS-deferred batch (5 healthy owners + 1 failed batch): outcome=partial-publishable, healthy accounts eligible, failed account deferred (keeps LKG), NOT fatal, NOT complete", () => {
+  // 6 accounts => batches [A01..A05] (succeeded) + [A06] (readiness-deferred: its OLI job did NOT succeed).
+  const c0 = oliCycle(6);
+  const failHash = c0.sourceJobs.find((j) => (c0.owners.filter((o) => o.request_hash === j.request_hash).map((o) => o.account_id)).includes("A06")).request_hash;
+  for (const j of c0.sourceJobs) if (j.request_hash === failHash) { j.fetch_status = "failed"; j.error_code = "DATADOE_INITIAL_LOAD_INCOMPLETE"; j.terminal = true; j.create_export_count = 1; }
+  const c = classifyOliPublicationOutcome({ bucket: "us", ...c0 });
+  assert.equal(c.outcome, "partial-publishable");
+  assert.equal(c.fatal, false, JSON.stringify(c.fatalProblems));
+  assert.equal(c.fullComplete, false);
+  assert.equal(c.partialPublishable, true);
+  assert.deepEqual(c.eligibleAccountIds, ["A01", "A02", "A03", "A04", "A05"]);
+  assert.deepEqual(c.deferredAccountIds, ["A06"], "the readiness-deferred account is deferred (keeps dated LKG), not eligible");
+  // The only problems are the non-fatal deferral consequences.
+  assert.ok(c.problems.every((p) => NON_FATAL_OLI_PROBLEM_PREFIXES.some((pre) => p === pre || p.startsWith(pre + ":"))), "only non-fatal problems: " + JSON.stringify(c.problems));
+});
+
+test("C4c. a HARD sibling failure (independent batch fails non-readiness): STILL partial-publishable -- the healthy batch publishes, the failed batch's accounts keep LKG (dependencies are independent)", () => {
+  const c0 = oliCycle(6); // [A01..A05] + [A06]
+  const failHash = c0.sourceJobs.find((j) => (c0.owners.filter((o) => o.request_hash === j.request_hash).map((o) => o.account_id)).includes("A06")).request_hash;
+  for (const j of c0.sourceJobs) if (j.request_hash === failHash) { j.fetch_status = "failed"; j.error_code = "HTTP_400"; j.terminal = true; j.create_export_count = 1; }
+  const c = classifyOliPublicationOutcome({ bucket: "us", ...c0 });
+  assert.equal(c.outcome, "partial-publishable", "a hard sibling failure is a per-batch defer, not a run-integrity breach");
+  assert.equal(c.fatal, false);
+  assert.deepEqual(c.eligibleAccountIds, ["A01", "A02", "A03", "A04", "A05"]);
+  assert.deepEqual(c.deferredAccountIds, ["A06"]);
+});
+
+test("C4d. FATAL integrity/authorization breaches publish NOTHING: over-ceiling, unexpected owner, oversized batch, bad create count, org-scope owner -> fatal, NOT publishable", () => {
+  const fatals = [
+    ["creates over the spend ceiling", (() => {
+      const ids = accountsN(8).map((a) => a.accountId);
+      const groups = [ids.slice(0, 3), ids.slice(3, 6), ids.slice(6, 8)];
+      const sourceJobs = []; const owners = [];
+      groups.forEach((g, b) => { const h = "oli-x-" + b; sourceJobs.push({ source_key: "order-line-items", request_hash: h, fetch_status: "succeeded", create_export_count: 1 }); g.forEach((m) => owners.push({ request_hash: h, account_id: m })); });
+      return { bucket: "us", discoveredAccounts: ids.map((accountId) => ({ accountId })), sourceJobs, owners, open: 0 };
+    })()],
+    ["an owner outside the discovered set (isolation breach)", (() => { const c = oliCycle(3); c.owners.push({ request_hash: "oli-0", account_id: "A99" }); return { bucket: "us", ...c }; })()],
+    ["a batch of 6 sellers (batching breach)", (() => { const c = oliCycle(5); c.discoveredAccounts.push({ accountId: "A06" }); c.owners.push({ request_hash: "oli-0", account_id: "A06" }); return { bucket: "us", ...c }; })()],
+    ["a multi-create OLI job (reservation breach)", (() => { const c = oliCycle(3); c.sourceJobs[0].create_export_count = 2; return { bucket: "us", ...c }; })()],
+    ["an org-scoped OLI owner", (() => { const c = oliCycle(3); c.owners.push({ request_hash: "oli-0", account_id: "__organization" }); return { bucket: "us", ...c }; })()],
+  ];
+  for (const [name, input] of fatals) {
+    const c = classifyOliPublicationOutcome(input);
+    assert.equal(c.fatal, true, name + " must be fatal");
+    assert.equal(c.publishable, false, name + " must publish NOTHING");
+    assert.equal(c.outcome, "fatal", name);
+    assert.ok(c.fatalProblems.length > 0, name + " must record the fatal problem(s)");
+  }
+});
+
+test("C4e. coverage that did NOT advance to D-1 excludes an account from eligibility even if its OLI job succeeded (no fresh D-1 -> keep LKG)", () => {
+  const c = classifyOliPublicationOutcome({ bucket: "us", ...oliCycle(8), coverageMissingAccountIds: ["A07", "A08"] });
+  // Not fatal, but two accounts lack proven D-1 coverage -> deferred; the other six publish.
+  assert.equal(c.fatal, false);
+  assert.deepEqual(c.deferredAccountIds, ["A07", "A08"]);
+  assert.equal(c.eligibleAccountIds.length, 6);
+  assert.equal(c.fullComplete, false, "a coverage gap is never full completeness");
+  assert.equal(c.outcome, "partial-publishable");
+});
+
+test("C4f. all batches deferred (no healthy account): NOT fatal but NOT publishable -> outcome=deferred-empty (publish nothing, keep LKG; never a false-green complete)", () => {
+  const c0 = oliCycle(5);
+  for (const j of c0.sourceJobs) { j.fetch_status = "failed"; j.error_code = "DATADOE_INITIAL_LOAD_INCOMPLETE"; j.terminal = true; }
+  const c = classifyOliPublicationOutcome({ bucket: "us", ...c0 });
+  assert.equal(c.fatal, false);
+  assert.equal(c.publishable, false);
+  assert.equal(c.fullComplete, false);
+  assert.equal(c.outcome, "deferred-empty");
+  assert.equal(c.eligibleAccountIds.length, 0);
+  assert.equal(c.deferredAccountIds.length, 5);
+});
+
 group("D. GitHub Actions workflow: INDEPENDENT per-bucket publish + always-safe-close shape");
 
 test("D1. scheduler-v2.yml: the THREE regional crons (0 3 india / 30 8 europe-au / 30 16 us-ca), region resolved FROM the fired cron, dispatch kept, concurrency, Node 24, >=90-min timeout", () => {
@@ -322,6 +407,69 @@ test("D4. previous-day (D-1) freshness shape: refresh_mode input, scheduled-alwa
   // schedules: the three regional primaries; the +20-min Cloudflare watchdog dispatches the same workflow per region.
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
   assert.deepEqual(crons, ["0 3 * * *", "30 16 * * *", "30 8 * * *"].sort(), "india 03:00 + europe-au 08:30 + us-ca 16:30");
+});
+
+test("D5. PER-ACCOUNT publication: the workflow separates COMPLETE (whole-region, natural cycle) from PARTIAL-publishable (healthy OLI-eligible subset into a dedicated cycle; deferred accounts keep dated LKG); a fatal/all-deferred OLI exits nonzero and publishes nothing", () => {
+  const yml = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-v2.yml"), "utf8");
+  // The readiness proof scopes to the OLI-eligible subset on a partial (blank -> whole-region on complete).
+  assert.match(yml, /verify-bucket-readiness\.mjs[^\n]*--eligible-accounts=\$\{\{ steps\.oli\.outputs\.full_complete == 'true' && ' ' \|\| steps\.oli\.outputs\.eligible_ids \}\}/,
+    "readiness proves EXACTLY the OLI-eligible subset on a partial (whole-region on complete)");
+  // A COMPLETE-region publish runs ONLY when full_complete=='true' and carries NO --eligible-accounts (natural cycle).
+  const completeStep = yml.slice(yml.indexOf("(COMPLETE region)"), yml.indexOf("(PARTIAL region)"));
+  assert.match(completeStep, /steps\.oli\.outputs\.full_complete == 'true'/, "the complete-region publish is gated on full_complete");
+  // Isolate JUST the complete step's run command (the partial step's preamble comment also mentions --eligible-accounts).
+  const completeRunAt = yml.indexOf("run: node scripts/release/priority-dashboards-release.mjs", yml.indexOf("(COMPLETE region)"));
+  const completeRun = yml.slice(completeRunAt, yml.indexOf("\n", completeRunAt));
+  assert.doesNotMatch(completeRun, /--eligible-accounts/, "the complete-region publish never scopes to a subset (whole region, natural cycle)");
+  // A PARTIAL publish runs ONLY when publishable && NOT full_complete, passes the eligible ids, and uses a DISTINCT
+  // catalog operation key (scheduled-partial) so its dedicated cycle never collides with the complete run's reservation.
+  const partialStart = yml.indexOf("(PARTIAL region)");
+  const partialStep = yml.slice(partialStart, yml.indexOf("Report a PARTIAL publication"));
+  assert.match(partialStep, /steps\.oli\.outputs\.full_complete != 'true'/, "the partial publish runs only when NOT full_complete");
+  assert.match(partialStep, /steps\.oli\.outputs\.publishable == 'true'/, "the partial publish runs only when publishable");
+  assert.match(partialStep, /priority-dashboards-release\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.region \}\} --eligible-accounts=\$\{\{ steps\.oli\.outputs\.eligible_ids \}\}/, "the partial publish scopes to EXACTLY the eligible ids");
+  // The catalog operation key MUST be a VALID scheduled key (assertPriorityOperationKey accepts only v2 |
+  // scheduled/YYYY-MM-DD). A "scheduled-partial/..." key is rejected and would hard-fail the partial step (dead on
+  // arrival). Cycle isolation comes from the entrypoint-derived dedicated cycle bucket, not the operation key.
+  assert.match(partialStep, /--operation-key=priority-dashboards\/scheduled\/\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "the partial publish uses the VALID per-day catalog operation key (not a rejected scheduled-partial/ key)");
+  assert.doesNotMatch(partialStep, /scheduled-partial/, "no rejected scheduled-partial operation key");
+  assert.match(partialStep, /--strict-d1/, "the partial publish still fails closed below D-1 per account");
+  // The partial-publication REPORT runs only when the subset publish actually SUCCEEDED (never claims a publication
+  // on a failed/skipped step -- a red partial must not print 'healthy accounts published').
+  assert.match(yml, /Report a PARTIAL publication[\s\S]{0,200}steps\.partial_publish\.outcome == 'success'/, "the partial report is gated on the subset publish succeeding");
+  // Both publish paths renew the SAME control fence opened by the one full_controls --apply (per-account isolation is
+  // scoped inside a region-wide fence -- leases preserved).
+  assert.match(partialStep, /--owner-generation=\$\{\{ steps\.full_controls\.outputs\.generation \}\}/, "the partial publish renews the full_controls fence");
+  // The partial outcome is reported honestly (never a false 'complete') and the deferred count is surfaced.
+  assert.match(yml, /PARTIAL_PUBLICATION region=[^\n]*deferred=\$\{\{ steps\.oli\.outputs\.deferred_count \}\}/, "a partial publication is reported honestly with the deferred count");
+  // The final honesty gate is UNCHANGED: a non-success OLI (fatal / all-deferred exits nonzero) keeps the run red.
+  assert.match(yml, /SOURCE_REFRESH_FAILED[^\n]*OLI outcome=\$\{\{ steps\.oli\.outcome \}\}/, "a fatal/all-deferred OLI (nonzero exit) still reddens the run (no false green)");
+});
+
+test("D6. the release entrypoints implement the three-way outcome + healthy-subset scope (source guards)", () => {
+  const oli = readFileSync(resolve(HERE, "release", "oli-refresh-d1.mjs"), "utf8");
+  // oli-refresh-d1 classifies the three-way outcome and emits the eligible/deferred scope + a three-way exit.
+  assert.match(oli, /classifyOliPublicationOutcome\(/, "oli-refresh-d1 uses the pure three-way classifier");
+  for (const k of ["publication_outcome", "full_complete", "publishable", "eligible_ids", "deferred_ids"]) {
+    assert.match(oli, new RegExp('ghOut\\("' + k + '"'), "oli-refresh-d1 emits the workflow output " + k);
+  }
+  assert.match(oli, /if \(pub\.fatal\) \{[^}]*process\.exit\(1\)/, "a FATAL integrity/authorization outcome exits nonzero (publish nothing)");
+  assert.match(oli, /if \(!pub\.publishable\) \{[^}]*process\.exit\(1\)/, "an all-deferred (nothing publishable) outcome exits nonzero (LKG preserved, never false-green)");
+  // Defect-1 regression guard: the ALREADY_PUBLISHED_D1 / idempotent-complete EARLY exits (exit 0 BEFORE the drain)
+  // MUST emit the full-complete outputs, else the complete-publish step (gated on full_complete=='true') is skipped and
+  // a watchdog recovery run goes green publishing nothing.
+  assert.match(oli, /function emitFullCompleteOutputs\(/, "an already-complete/idempotent outcome emits the full-region publishable scope");
+  assert.match(oli, /ALREADY_PUBLISHED_D1[\s\S]{0,400}emitFullCompleteOutputs\(ids\)/, "the durable-complete early exit emits full_complete (so the complete-publish recovery step still runs)");
+  assert.match(oli, /idempotent D-1 complete[\s\S]{0,400}emitFullCompleteOutputs\(ids\)/, "the idempotent-complete head disposition emits full_complete (watchdog recovery publishes)");
+  // verify-bucket-readiness proves EXACTLY the eligible subset when given --eligible-accounts (whole-region otherwise).
+  const rd = readFileSync(resolve(HERE, "release", "verify-bucket-readiness.mjs"), "utf8");
+  assert.match(rd, /argOf\("eligible-accounts"\)/, "verify-bucket-readiness accepts --eligible-accounts");
+  assert.match(rd, /scope inconsistency/, "an eligible id absent from discovery fails closed (never prove an undiscovered account)");
+  // priority-dashboards-release scopes to the subset via a fetchAccounts filter + a DEDICATED derived cycle bucket.
+  const rel = readFileSync(resolve(HERE, "release", "priority-dashboards-release.mjs"), "utf8");
+  assert.match(rel, /--eligible-accounts=/, "priority-dashboards-release accepts --eligible-accounts");
+  assert.match(rel, /priority-partial-/, "the subset publishes into a dedicated derived cycle bucket (natural daily cycle untouched)");
+  assert.match(rel, /fetchAccounts: subsetFetchAccounts, cycleBucket: subsetCycleBucket/, "the subset is threaded via the fetchAccounts + cycleBucket seams (the bootstrap precedent)");
 });
 
 group("E. DataDoe token-confirmation gate (read-only balance from usage-logs; fail-closed)");

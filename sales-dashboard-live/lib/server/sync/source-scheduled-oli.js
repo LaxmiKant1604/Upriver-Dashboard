@@ -153,6 +153,70 @@ export function assessScheduledOliCycle({ bucket, discoveredAccounts, sourceJobs
   };
 }
 
+// The assessScheduledOliCycle problems that are NON-FATAL -- i.e. a per-batch DEFERRAL (a batch did not succeed, so
+// its accounts keep dated LKG) rather than a breach of the RUN's integrity/authorization. A publishable partial is
+// built ONLY from these. EVERYTHING ELSE assessScheduledOliCycle can report (over-ceiling spend, an out-of-scope /
+// org-scope / unexpected owner, an oversized batch, a bad create count, a blank hash, a missing-owner succeeded job,
+// a non-OLI job, no jobs, a bad bucket, no discovered accounts) is a FATAL integrity/authorization failure that must
+// publish NOTHING. Matched by exact string OR "<prefix>:<detail>".
+export const NON_FATAL_OLI_PROBLEM_PREFIXES = Object.freeze(["job-not-succeeded", "owner-coverage-missing", "family-not-drained"]);
+const isNonFatalOliProblem = (p) => NON_FATAL_OLI_PROBLEM_PREFIXES.some((pre) => p === pre || p.startsWith(pre + ":"));
+
+/**
+ * SEPARATE the three publication outcomes of a scheduled OLI cycle (pure; no I/O), so the release entrypoint can
+ * publish the HEALTHY accounts while a deferred one keeps dated LKG -- WITHOUT ever turning a partial into a
+ * "complete" run or a fatal integrity/authorization breach into a publish.
+ *
+ * Built ON TOP of assessScheduledOliCycle (unchanged) so full-region completeness stays exactly as strict as before:
+ *   - fullComplete      : assessScheduledOliCycle passed AND every discovered account is eligible (the ONLY "complete").
+ *   - fatal             : ANY integrity/authorization problem is present (see NON_FATAL_OLI_PROBLEM_PREFIXES) -> the
+ *                         run's isolation/spend guarantees are broken -> publish NOTHING (the entrypoint exits nonzero).
+ *   - partialPublishable: NOT fatal, NOT complete, and >=1 eligible account -> publish EXACTLY the eligible subset;
+ *                         the deferred accounts keep dated LKG (they are simply out of the published scope).
+ * eligibleAccountIds = accounts with a SUCCEEDED, in-scope, owner-covered OLI job AND proven D-1 coverage (a caller-
+ * supplied coverageMissingAccountIds excludes an account whose durable coverage did not advance to D-1). deferred =
+ * discovered - eligible. A fatal outcome yields publishable:false regardless of the eligible set.
+ */
+export function classifyOliPublicationOutcome({ bucket, discoveredAccounts, sourceJobs, owners, open, extraCreatesHeadroom = 0, coverageMissingAccountIds = [] } = {}) {
+  const assessment = assessScheduledOliCycle({ bucket, discoveredAccounts, sourceJobs, owners, open, extraCreatesHeadroom });
+  const discovered = [...new Set((discoveredAccounts || []).map((a) => S(a && (a.accountId ?? a)).trim()).filter(Boolean))].sort();
+  const discoveredSet = new Set(discovered);
+  const coverageMissing = new Set((coverageMissingAccountIds || []).map((x) => S(x).trim()).filter(Boolean));
+
+  // ownerUnion of SUCCEEDED OLI jobs = the accounts whose fresh OLI export landed this cycle (per-account eligibility).
+  const ownersByHash = new Map();
+  for (const o of Array.isArray(owners) ? owners : []) {
+    const h = S(o.request_hash ?? o.requestHash);
+    if (!ownersByHash.has(h)) ownersByHash.set(h, []);
+    ownersByHash.get(h).push(S(o.account_id ?? o.accountId).trim());
+  }
+  const succeededOwned = new Set();
+  for (const j of Array.isArray(sourceJobs) ? sourceJobs : []) {
+    if (S(j.source_key ?? j.sourceKey) !== OLI_SOURCE_KEY) continue;
+    if (S(j.fetch_status ?? j.fetchStatus) !== "succeeded") continue;
+    const h = S(j.request_hash ?? j.requestHash);
+    for (const a of ownersByHash.get(h) || []) if (a && a !== ORGANIZATION_SCOPE_KEY) succeededOwned.add(a);
+  }
+  // Eligible = succeeded-owned AND in-scope AND proven D-1 coverage. deferred = discovered - eligible (keep dated LKG).
+  const eligibleAccountIds = [...succeededOwned].filter((a) => discoveredSet.has(a) && !coverageMissing.has(a)).sort();
+  const eligibleSet = new Set(eligibleAccountIds);
+  const deferredAccountIds = discovered.filter((a) => !eligibleSet.has(a));
+
+  const fatalProblems = assessment.problems.filter((p) => !isNonFatalOliProblem(p));
+  const fatal = fatalProblems.length > 0;
+  const fullComplete = assessment.ok && deferredAccountIds.length === 0; // ok => no problems + full owner coverage
+  const publishable = !fatal && eligibleAccountIds.length > 0;
+  const partialPublishable = publishable && !fullComplete;
+  // outcome is the single honest label the entrypoint emits: never "complete" for a partial, never green for fatal.
+  const outcome = fatal ? "fatal" : (fullComplete ? "complete" : (publishable ? "partial-publishable" : "deferred-empty"));
+  return {
+    ...assessment,
+    outcome, fatal, fatalProblems, fullComplete, publishable, partialPublishable,
+    eligibleAccountIds, deferredAccountIds,
+    eligibleCount: eligibleAccountIds.length, deferredCount: deferredAccountIds.length,
+  };
+}
+
 /**
  * Classify the EXISTING (bucket, today) cycle BEFORE a scheduled OLI run touches it, so the run never assesses an
  * unrelated cycle as its own, never appends work to a terminal cycle, and never fabricates owner coverage. Given

@@ -66,8 +66,24 @@ const primaryConn = connections.find((c) => c.id === "primary");
 const rows = (await fetchAccounts(primaryConn.apiKey)) || [];
 const { active } = classifyDirectoryAccounts(rows, connections);
 const seen = new Set();
-const discovered = [];
+let discovered = [];
 for (const a of active) { const id = String((a && (a.accountId ?? a.id)) || "").trim(); const country = String((a && a.country) || "").toUpperCase(); if (!id || id.includes(":") || seen.has(id)) continue; if (!accountInScope(bucket, country)) continue; seen.add(id); discovered.push({ accountId: id }); }
+
+// HEALTHY-SUBSET readiness (full scope only): when the OLI publication outcome is a PARTIAL, the release entrypoint
+// passes the EXACT eligible (healthy, OLI-succeeded + D-1-covered) account ids here, so the strict D-1 gate proves
+// EXACTLY that subset instead of failing the whole region on a deferred account. The deferred accounts are simply not
+// in scope -> never assessed -> their dated LKG is untouched. Every eligible id MUST be in discovery (a scope
+// inconsistency fails closed). Omitted/empty => whole-region (byte-identical). Ignored in bootstrap scope.
+const eligibleArg = argOf("eligible-accounts");
+if (eligibleArg != null && String(eligibleArg).trim() !== "" && accountScope !== "bootstrap") {
+  const wanted = new Set(String(eligibleArg).split(",").map((s) => s.trim()).filter(Boolean));
+  if (wanted.size === 0) { console.error("STOP --eligible-accounts was provided but parsed empty (fail closed)."); process.exit(2); }
+  const discoveredSet = new Set(discovered.map((a) => a.accountId));
+  const missing = [...wanted].filter((id) => !discoveredSet.has(id));
+  if (missing.length) { console.error("STOP eligible-accounts scope inconsistency: " + missing.length + " requested id(s) are not in current discovery -- fail closed (never prove readiness for an undiscovered account)."); process.exit(1); }
+  discovered = discovered.filter((a) => wanted.has(a.accountId));
+  log("eligible-subset readiness: proving EXACTLY " + discovered.length + " healthy account(s); deferred accounts are out of scope and keep dated LKG.");
+}
 if (!discovered.length && accountScope === "bootstrap") {
   // NOTHING claimed in this region: a valid green no-op -- no publish steps run, LKG untouched.
   ghOut("proceed", "false"); ghOut("status", "BOOTSTRAP_SCOPE_EMPTY"); ghOut("effective_asof", ""); ghOut("requested_asof", requestedAsOf);

@@ -38,6 +38,33 @@ const bucketArg = (process.argv.find((a) => a.startsWith("--bucket=")) || "").sp
 if (bucketArg != null && !isRoutingScope(bucketArg)) { console.error("STOP --bucket must be a routing scope (india|europe-au|us-ca|us|non-us; got: " + bucketArg + ")"); process.exit(2); }
 if (bucketArg) console.log("priority-release: scope = " + bucketArg + " ONLY (every other scope's snapshots are preserved untouched).");
 
+// HEALTHY-SUBSET publication (Codex per-account isolation): when the OLI outcome is a PARTIAL, the workflow passes the
+// EXACT eligible (healthy) account ids here. The release then discovers EXACTLY that subset (a fetchAccounts override
+// that filters the real directory to those ids -- the account objects keep full marketplace metadata for routing) and
+// derives/finalizes/publishes into a DEDICATED cycle bucket derived from the region + the sorted eligible membership
+// (mirrors bootstrap's dedicated cycle) so the natural daily (region, today) cycle is NEVER finalized with a partial
+// set. Deferred accounts are simply out of scope: their dated LKG snapshots are untouched. Omitted => whole-region
+// natural-cycle publication (byte-identical). Requires --bucket (the region the subset belongs to).
+const eligibleArg = ((process.argv.find((a) => a.startsWith("--eligible-accounts=")) || "").split("=").slice(1).join("=") || "").trim();
+let subsetFetchAccounts = null; let subsetCycleBucket = null;
+if (eligibleArg !== "") {
+  if (!bucketArg) { console.error("STOP --eligible-accounts REQUIRES --bucket (the region the healthy subset belongs to)."); process.exit(2); }
+  const wanted = [...new Set(eligibleArg.split(",").map((s) => s.trim()).filter(Boolean))].sort();
+  if (wanted.length === 0) { console.error("STOP --eligible-accounts was provided but parsed empty (fail closed)."); process.exit(2); }
+  const wantedSet = new Set(wanted);
+  const { sha256 } = await import("../../lib/server/source-identity.js");
+  const { fetchAccounts: fetchDirectory } = await import("../../lib/server/datadoe.js");
+  // Deterministic dedicated cycle bucket: the SAME eligible set (a watchdog replay) resolves the SAME cycle (idempotent);
+  // a DIFFERENT eligible set (readiness advanced) gets its own cycle -- neither ever touches the natural daily cycle.
+  subsetCycleBucket = "priority-partial-" + bucketArg + "-" + sha256(JSON.stringify(wanted)).slice(0, 12);
+  subsetFetchAccounts = async (apiKey) => {
+    const rows = (await fetchDirectory(apiKey)) || [];
+    return rows.filter((r) => wantedSet.has(String((r && (r.accountId ?? r.account_id ?? r.id)) || "").trim()));
+  };
+  console.log("priority-release: HEALTHY-SUBSET publication of " + wanted.length + " eligible account(s) in " + bucketArg
+    + " into dedicated cycle bucket '" + subsetCycleBucket + "' (deferred accounts keep dated LKG, out of scope; natural daily cycle untouched).");
+}
+
 // --strict-d1: FAIL CLOSED (DATADOE_D1_NOT_READY, never publish) if the derive clamps effectivePublishAsOf below the
 // requested D-1 (--as-of). The scheduler passes it so a lagged/regressed bucket keeps its LKG instead of publishing D-2.
 const strictD1 = process.argv.includes("--strict-d1");
@@ -62,7 +89,7 @@ let release;
 try {
   // Resolve the BASE cycle (the one that owns the shared Product Catalog job), not the OLI-only superseding HEAD --
   // so the release's Catalog reservation + finalize verification target the cycle that actually carries the catalog.
-  release = buildPriorityDashboardsRelease({ asOfOverride: asOfArg, ...(opKeyArg ? { operationKey: opKeyArg } : {}), getCycleByBucketDate: sb.getBaseSyncCycleByBucketDate, getControlFence: () => leaseFence });
+  release = buildPriorityDashboardsRelease({ asOfOverride: asOfArg, ...(opKeyArg ? { operationKey: opKeyArg } : {}), getCycleByBucketDate: sb.getBaseSyncCycleByBucketDate, getControlFence: () => leaseFence, ...(subsetFetchAccounts ? { fetchAccounts: subsetFetchAccounts, cycleBucket: subsetCycleBucket } : {}) });
 } catch (e) { console.error("STOP " + (e && e.message ? e.message : e)); process.exit(2); }
 
 // A dedicated read-only pg client for the cron proof (never mutates).
@@ -129,5 +156,5 @@ const result = await runPriorityDashboardsRelease({
   ...(verifyLease ? { verifyLease } : {}),
   log: (m) => console.log("priority-release: " + m),
 });
-console.log("RESULT " + JSON.stringify({ ok: result.ok, stage: result.stage, status: result.status || null, bucket: bucketArg || "both", evidence: result.evidence || null, problems: result.problems || null, reports: [...PRIORITY_DASHBOARDS.publishOrder] }));
+console.log("RESULT " + JSON.stringify({ ok: result.ok, stage: result.stage, status: result.status || null, bucket: bucketArg || "both", publicationScope: subsetFetchAccounts ? "healthy-subset" : "full-region", subsetCycleBucket: subsetCycleBucket || null, evidence: result.evidence || null, problems: result.problems || null, reports: [...PRIORITY_DASHBOARDS.publishOrder] }));
 process.exit(result.code);
