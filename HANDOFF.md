@@ -1,10 +1,13 @@
 # Handoff — Website report repair (rounds 1-4) + all-region scheduler repair (PARTIAL) + open gates
 
-**Branch:** `main`   **HEAD:** scheduler per-account publication — 3 release-blocker fixes commit `227d685` (prior:
-`f3a7d9d` per-account publication, `e4e3ff2`/`7d99d00` scheduler-repair; report rounds 1-4 at `8285b7a`).
-**227d685 + f3a7d9d + e4e3ff2 are committed locally on `main`, NOT yet pushed** — the scheduler effect lands only on
-the NEXT natural cron off origin/main, so they need a push (normal path, no dispatch) to take effect. Awaiting go-ahead
-to push. The healthy-subset PARTIAL publication is additionally INERT until migration `20260924` is applied (see item 3).
+**Branch:** `main`   **HEAD:** scheduler per-account publication — 2 release-safety corrections commit `efd0d64`
+(prior: `227d685` 3-blocker fixes, `f3a7d9d` per-account publication, `e4e3ff2`/`7d99d00` scheduler-repair; report
+rounds 1-4 at `8285b7a`).
+**efd0d64 + 227d685 + f3a7d9d + e4e3ff2 are committed locally on `main`, NOT yet pushed** — the scheduler effect lands
+only on the NEXT natural cron off origin/main, so they need a push (normal path, no dispatch) to take effect. Awaiting
+go-ahead to push. The healthy-subset PARTIAL publication additionally runs a READ-ONLY schema-capability preflight
+BEFORE opening controls and is INERT (zero publication writes, fail-closed) until migration `20260924` is applied
+(see item 3); a COMPLETE region is unaffected.
 **Latest deploy:** Vercel Production **Ready** at `c0d92cd` (round 3, Codex-confirmed); round 4 (`8285b7a`) deployed.
 **Date:** 2026-09-09
 **DataDoe this session:** 0 exports / 0 tokens   **api/*.js:** 12 (unchanged)   **verify:** 186/186 (162 suites).

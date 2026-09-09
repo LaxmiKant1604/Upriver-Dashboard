@@ -1,5 +1,34 @@
 # Project Memory
 
+## Scheduler per-account publication — TWO release-safety corrections (2026-09-10, commit efd0d64 on main, NOT pushed; code verification only, NOT production acceptance)
+
+Follow-up to the 3-blocker fixes (227d685, preserved). **verify 188/188 (164 suites); no budget/dispatch/paid-export;
+migrations 20260923/20260924 NOT applied. Multi-dimension adversarial review (9 agents): 6 findings, 0 confirmed.**
+
+**Correction 1 — capability preflight BEFORE controls (was: inside the publish step, after full_controls opened a
+lease/write).** New READ-ONLY workflow step `partial_preflight` (`scripts/release/priority-partial-preflight.mjs`) runs
+after readiness + BEFORE `full_controls` on a PARTIAL run; `full_controls` is gated on
+`(full_complete=='true' || partial_preflight.outcome=='success')` and `partial_publish` additionally requires it — so a
+missing/unreadable capability opens ZERO publication-control/lease/cycle/reservation/publication writes (the earlier
+OLI/Campaign SOURCE refresh already ran independently — no bare "zero writes" claim remains). New SHARED
+`lib/server/sync/priority-partial-capability.js` verifies the EXACT `public.open_sync_cycle(text,date,timestamptz,text)`
+signature (`pg_get_function_identity_arguments`) AND the named `sync_cycles_bucket_check` constraint BOTH contain the
+exact 20260924 regex, requiring exactly one matching object each — NOT "any pg_proc whose text contains
+priority-partial" (comment-only / overload / function-only / constraint-only all fail closed). Reused by the workflow
+preflight AND the publisher's internal preflight (defense in depth; publisher check precedes any lease renew/write).
+Missing OR unreadable → permitted:false (fail closed).
+
+**Correction 2 — explicit publish IDs + accurate Campaign notice.** Both publish steps carry ids (`complete_publish`,
+`partial_publish`). The "sales PUBLISHED" Campaign notice fires ONLY when the APPLICABLE publish step — INCLUDING its
+live read-back — succeeded (each entrypoint exits nonzero on readback failure, so outcome=='success' proves
+publish+readback); a SECOND notice fires on the exact negation and accurately states sales publication FAILED/SKIPPED
+(never claims published; the run is already RED via the failed step).
+
+**Tests (executable, evaluate ACTUAL conditions):** `priority-partial-capability.test.js` (13: migration-absent /
+unreadable-throw / comment-only / ambiguous / exact-signature query / permitted); `scheduler-partial-publication-
+ordering.test.js` (24: parses each step's `if:`, a faithful GitHub-Actions `if`-evaluator, asserts ordering + the
+S1..S8 outcome matrix). Production acceptance PENDING a natural partial cycle + migration 20260924 approval.
+
 ## Scheduler per-account publication — THREE verified release blockers fixed (2026-09-09, commit 227d685 on main, NOT pushed; code verification only, NOT production acceptance)
 
 Codex verified three release blockers on the per-account DASHBOARD publication feature (builds on f3a7d9d, preserved).
