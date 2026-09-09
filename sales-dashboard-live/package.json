@@ -166,6 +166,8 @@
     "test:release-env-ordering": "node scripts/release-env-ordering.test.js",
     "test:source-readiness-isolation": "node scripts/source-readiness-isolation.test.js",
     "test:scheduler-oli-readiness-plan": "node scripts/scheduler-oli-readiness-plan.test.js",
+    "test:priority-partial-capability": "node scripts/priority-partial-capability.test.js",
+    "test:scheduler-partial-publication-ordering": "node scripts/scheduler-partial-publication-ordering.test.js",
     "test:account-onboarding-reconcile": "node scripts/account-onboarding-reconcile.test.js",
     "test:account-onboarding-upsert": "node scripts/account-onboarding-upsert.test.js",
     "test:discovery-deferral": "node scripts/discovery-deferral.test.js",

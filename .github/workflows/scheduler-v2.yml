@@ -255,6 +255,18 @@ jobs:
         if: always() && steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outcome == 'success' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success'
         run: node scripts/release/verify-bucket-readiness.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }} --account-scope=full --eligible-accounts=${{ steps.oli.outputs.full_complete == 'true' && ' ' || steps.oli.outputs.eligible_ids }}
 
+      # PARTIAL-CYCLE SCHEMA CAPABILITY PREFLIGHT (READ-ONLY) -- runs BEFORE any publication control on a PARTIAL run.
+      # A partial publishes the healthy subset into a dedicated priority-partial-<region>-<16hex> cycle, which the
+      # production schema permits ONLY once migration 20260924 has widened the EXACT open_sync_cycle(text,date,
+      # timestamptz,text) guard + the sync_cycles_bucket_check constraint. If that capability is missing OR unreadable,
+      # this step exits nonzero BEFORE full_controls opens, so ZERO publication-control / lease / cycle / reservation /
+      # publication writes occur (the earlier OLI/Campaign source refresh already ran independently; LKG preserved).
+      # A COMPLETE region publishes into the natural cycle and does NOT need this (the step is skipped there).
+      - name: Partial-cycle schema capability preflight (read-only; before controls; PARTIAL region only)
+        id: partial_preflight
+        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.oli.outputs.full_complete != 'true' && steps.oli.outputs.publishable == 'true' && steps.readiness.outputs.proceed == 'true'
+        run: node scripts/release/priority-partial-preflight.mjs --bucket=${{ steps.cfg.outputs.region }}
+
       # INDEPENDENT SALES PUBLICATION (Codex blocker 2): controls + BOTH publish paths are NO LONGER gated on
       # steps.campaign.outcome. Campaign Ads is an INDEPENDENT best-effort source (like the FBA job) with its own
       # compatibility preflight, <=5-seller recovery split and LKG isolation; its failure degrades the Daily ads band
@@ -263,15 +275,19 @@ jobs:
       # brand-inventory). A Campaign failure is surfaced by the non-failing notice below; the final honesty gate reddens
       # ONLY on the REQUIRED sales source (OLI). Safe-close fencing is unchanged.
       # (step 7, FULL scope) Open publication controls for this region x 3 keys (all_primary stays false).
+      # Controls open when OLI + strict D-1 pass. On a PARTIAL run they ALSO require the partial-cycle capability
+      # preflight to have SUCCEEDED (so a missing/unreadable capability opens NO controls); a COMPLETE run skips the
+      # preflight and opens controls as before (byte-identical).
       - name: Open publication controls (this region only)
         id: full_controls
-        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
+        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.readiness.outputs.proceed == 'true' && (steps.oli.outputs.full_complete == 'true' || steps.partial_preflight.outcome == 'success')
         run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.region }} --account-scope=full --owner-token=${{ github.run_id }}-${{ github.run_attempt }}
 
       # (steps 6/8/9/10, FULL scope, COMPLETE region) Catalog reuse/refresh + derive + preflight EVERY account in this
       # region + publish this region x3 + live read-back into the NATURAL daily cycle. Runs ONLY when OLI covered the
       # WHOLE region (full_complete). Byte-identical to before. Reached ONLY after the strict D-1 proof.
       - name: Refresh Catalog + derive/preflight/publish this region at D-1 + live read-back (COMPLETE region)
+        id: complete_publish
         if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.oli.outputs.full_complete == 'true' && steps.readiness.outputs.proceed == 'true'
         run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.region }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }} --run-token=${{ github.run_id }}-${{ github.run_attempt }} --owner-generation=${{ steps.full_controls.outputs.generation }} --strict-d1
 
@@ -288,7 +304,7 @@ jobs:
       # (from --eligible-accounts), NOT from the operation key.
       - name: Publish the HEALTHY OLI-eligible subset at D-1 into a dedicated cycle + live read-back (PARTIAL region)
         id: partial_publish
-        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.oli.outputs.full_complete != 'true' && steps.oli.outputs.publishable == 'true' && steps.readiness.outputs.proceed == 'true'
+        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.oli.outputs.full_complete != 'true' && steps.oli.outputs.publishable == 'true' && steps.readiness.outputs.proceed == 'true' && steps.partial_preflight.outcome == 'success'
         run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.region }} --eligible-accounts=${{ steps.oli.outputs.eligible_ids }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }} --run-token=${{ github.run_id }}-${{ github.run_attempt }} --owner-generation=${{ steps.full_controls.outputs.generation }} --strict-d1
 
       # Report the partial ONLY when the subset publish actually SUCCEEDED (never claim a publication on a failed step).
@@ -341,14 +357,24 @@ jobs:
         if: always() && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed != 'true' && steps.tokengate.outcome == 'success'
         run: echo "SKIPPED_INSUFFICIENT_TOKENS -- no creates, no controls, LKG unchanged (region=${{ steps.cfg.outputs.region }} requestedAsOf=${{ steps.cfg.outputs.asof }})."
 
-      # Campaign Ads UNAVAILABLE notice (non-failing): surfaced when the independent Campaign source failed but the
-      # OLI-driven SALES dashboards still published (ads shown honestly unavailable/stale, never a fabricated zero).
-      # This makes the degraded-ads state VISIBLE without reddening a run whose required sales source (OLI) succeeded.
-      - name: Report Campaign Ads unavailable (sales published independently)
-        if: always() && steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome != 'success'
+      # Campaign Ads unavailable -- TWO accurate, mutually-exclusive notices (non-failing). "sales published" is claimed
+      # ONLY when the APPLICABLE publication step -- INCLUDING its live read-back -- actually SUCCEEDED: the COMPLETE
+      # step on a full_complete run, or the PARTIAL step otherwise (each publish entrypoint exits nonzero if its
+      # read-back fails, so outcome=='success' proves publish+readback). Otherwise the second notice reports the
+      # Campaign failure separately AND accurately states sales publication FAILED or was SKIPPED (never claims it
+      # published). Ads stay honestly unavailable/stale (never a fabricated zero) either way; the run is already RED
+      # (via the failed publish/readiness step) in the failed/skipped case.
+      - name: Report Campaign Ads unavailable (sales PUBLISHED independently -- ads honestly unavailable)
+        if: always() && steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome != 'success' && ((steps.oli.outputs.full_complete == 'true' && steps.complete_publish.outcome == 'success') || (steps.oli.outputs.full_complete != 'true' && steps.partial_publish.outcome == 'success'))
         run: |
-          echo "CAMPAIGN_ADS_UNAVAILABLE region=${{ steps.cfg.outputs.region }} campaign=${{ steps.campaign.outcome }} -- the OLI sales dashboards published independently; the Ads band is HONESTLY UNAVAILABLE/stale (never a fabricated zero). Ads self-heal on the next natural cycle."
-          echo "### Campaign Ads unavailable (${{ steps.cfg.outputs.region }}) -- sales published; ads band honestly unavailable/stale" >> "$GITHUB_STEP_SUMMARY"
+          echo "CAMPAIGN_ADS_UNAVAILABLE region=${{ steps.cfg.outputs.region }} campaign=${{ steps.campaign.outcome }} sales=published -- the OLI sales dashboards published independently (publish + read-back succeeded); the Ads band is HONESTLY UNAVAILABLE/stale (never a fabricated zero). Ads self-heal on the next natural cycle."
+          echo "### Campaign Ads unavailable (${{ steps.cfg.outputs.region }}) -- sales PUBLISHED; ads band honestly unavailable/stale" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report Campaign Ads failure WITHOUT a sales publication (sales publication failed or skipped)
+        if: always() && steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome != 'success' && !((steps.oli.outputs.full_complete == 'true' && steps.complete_publish.outcome == 'success') || (steps.oli.outputs.full_complete != 'true' && steps.partial_publish.outcome == 'success'))
+        run: |
+          echo "CAMPAIGN_ADS_FAILED_NO_PUBLICATION region=${{ steps.cfg.outputs.region }} campaign=${{ steps.campaign.outcome }} complete_publish=${{ steps.complete_publish.outcome }} partial_publish=${{ steps.partial_publish.outcome }} -- Campaign Ads failed AND the SALES publication did NOT complete (failed or skipped: readiness/controls/capability/publish). NO dashboards were published this run; LKG preserved. This is NOT a sales publication." >&2
+          echo "### Campaign Ads failed AND sales publication FAILED/SKIPPED (${{ steps.cfg.outputs.region }}) -- no dashboards published; LKG preserved" >> "$GITHUB_STEP_SUMMARY"
 
       # Keep the workflow honest after every source has had its chance and controls are safe-closed. The REQUIRED sales
       # source is OLI: an OLI failure (fatal / all-deferred exits nonzero, or a genuine source failure) keeps the run

@@ -67,6 +67,8 @@ const SUITES = [
   "test:release-env-ordering",
   "test:source-readiness-isolation",
   "test:scheduler-oli-readiness-plan",
+  "test:priority-partial-capability",
+  "test:scheduler-partial-publication-ordering",
   "test:lhv3-cycle-bucket-migration",
   "test:report-materialization-registry",
   "test:scheduled-family-registry",

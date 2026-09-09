@@ -54,7 +54,7 @@ if (eligibleArg !== "") {
   // regex does NOT, so reject them HERE (before building the bucket or any write) rather than passing the general-
   // namespace preflight and then hard-crashing on openCycle after a lease write. Fail closed, ZERO writes.
   if (!["india", "europe-au", "us-ca"].includes(bucketArg)) {
-    console.error("STOP PRIORITY_PARTIAL_REGION_UNSUPPORTED: healthy-subset publication is region-scoped (india|europe-au|us-ca); got --bucket=" + bucketArg + " -- fail closed (ZERO writes).");
+    console.error("STOP PRIORITY_PARTIAL_REGION_UNSUPPORTED: healthy-subset publication is region-scoped (india|europe-au|us-ca); got --bucket=" + bucketArg + " -- fail closed (ZERO publication-control/lease/cycle/reservation/publication writes; source refresh already ran independently).");
     process.exit(2);
   }
   const wanted = [...new Set(eligibleArg.split(",").map((s) => s.trim()).filter(Boolean))].sort();
@@ -71,24 +71,28 @@ if (eligibleArg !== "") {
     const rows = (await fetchDirectory(apiKey)) || [];
     return rows.filter((r) => wantedSet.has(String((r && (r.accountId ?? r.account_id ?? r.id)) || "").trim()));
   };
-  // PRODUCTION-SCHEMA PREFLIGHT (read-only, fail-closed): the priority-partial namespace is permitted ONLY once the
-  // approval-gated migration 20260924 is applied (it widens open_sync_cycle's guard + the sync_cycles bucket CHECK).
-  // Until then openCycle would raise 'Invalid bucket ...'. Probe open_sync_cycle's definition READ-ONLY: if it does
-  // not yet permit priority-partial, STOP with a clear typed PRIORITY_PARTIAL_MIGRATION_PENDING (ZERO control/lease/
-  // publish work; LKG preserved) instead of a raw SQL error -- and NEVER fall back to a bootstrap-shaped bucket.
+  // PRODUCTION-SCHEMA PREFLIGHT (read-only, fail-closed; DEFENSE IN DEPTH -- the workflow ALSO runs this exact check
+  // BEFORE opening publication controls). The priority-partial namespace is permitted ONLY once the approval-gated
+  // migration 20260924 widens BOTH open_sync_cycle's EXACT-signature guard AND the sync_cycles_bucket_check constraint
+  // to contain the exact priority-partial regex -- verified by the SHARED readPartialCycleCapability (never "any
+  // pg_proc whose text mentions priority-partial"). Missing OR unreadable => STOP before ANY publication-control /
+  // lease / cycle / reservation / publication write (those have not happened yet at this point; the earlier OLI/
+  // Campaign SOURCE refreshes already ran independently and are unaffected -- this is NOT an overall zero-write claim).
   {
+    const { readPartialCycleCapability } = await import("../../lib/server/sync/priority-partial-capability.js");
     const probe = new pg.Client({ connectionString: String(process.env.POSTGRES_URL).split("?")[0], ssl: { rejectUnauthorized: false } });
-    let permitted = false;
+    let cap = { permitted: false, reason: "capability-unreadable: connect failed" };
     try {
       await probe.connect();
-      const r = await probe.query("select 1 from pg_proc where proname = 'open_sync_cycle' and pg_get_functiondef(oid) ~ 'priority-partial' limit 1");
-      permitted = r.rowCount === 1;
-    } catch (e) { console.error("STOP PRIORITY_PARTIAL_PREFLIGHT_UNREADABLE: " + (e && e.message ? e.message : e) + " -- fail closed (LKG preserved; ZERO writes)."); try { await probe.end(); } catch { /* ignore */ } process.exit(1); }
+      cap = await readPartialCycleCapability((sql) => probe.query(sql).then((r) => r.rows));
+    } catch (e) { cap = { permitted: false, reason: "capability-unreadable: " + (e && e.message ? e.message : e) }; }
     finally { try { await probe.end(); } catch { /* ignore */ } }
-    if (!permitted) {
-      console.error("STOP PRIORITY_PARTIAL_MIGRATION_PENDING: open_sync_cycle does not yet permit the '" + subsetCycleBucket
-        + "' namespace. Apply the approval-gated migration 20260924_priority_partial_cycle_bucket.sql (MIGRATE_ONLY) first."
-        + " Healthy-subset publication is DEFERRED; the deferred + healthy accounts keep their dated last-known-good; ZERO writes.");
+    if (!cap.permitted) {
+      console.error("STOP PRIORITY_PARTIAL_MIGRATION_PENDING: the priority-partial cycle namespace ('" + subsetCycleBucket
+        + "') is NOT yet permitted by the production schema (" + cap.reason + "). Apply the approval-gated migration"
+        + " 20260924_priority_partial_cycle_bucket.sql (MIGRATE_ONLY) first. Healthy-subset publication is DEFERRED (the"
+        + " healthy + deferred accounts keep their dated last-known-good); ZERO publication-control/lease/cycle/reservation/"
+        + "publication writes (the earlier source refresh already ran independently).");
       process.exit(1);
     }
   }
