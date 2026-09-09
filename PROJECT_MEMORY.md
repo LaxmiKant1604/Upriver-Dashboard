@@ -1,5 +1,37 @@
 # Project Memory
 
+## Scheduler per-account publication — THREE verified release blockers fixed (2026-09-09, commit 227d685 on main, NOT pushed; code verification only, NOT production acceptance)
+
+Codex verified three release blockers on the per-account DASHBOARD publication feature (builds on f3a7d9d, preserved).
+**verify 186/186; no budget/dispatch/paid-export/frozen-batch change; migration 20260924 PREPARED but UNAPPLIED
+(approval-gated). Two adversarial-review rounds: Blockers 2 & 3 no defects; Blocker 1 one LOW gap found + closed.**
+
+1. **Prod REJECTED the partial cycle bucket.** The live `sync_cycles` bucket CHECK + `open_sync_cycle` guard (applied
+   migration 20260919) permit the 13 fixed regional buckets + regex `^bootstrap(-fba)?-(india|europe-au|us-ca)-
+   [0-9a-f]{16}$` ONLY. Fix: bucket is now `priority-partial-<region>-<16hex>` (DISTINCT namespace; 16-hex =
+   sha256(sorted eligible ids)[:16], lowercase); **prepared UNAPPLIED migration `20260924_priority_partial_cycle_
+   bucket.sql`** adds ONLY that regex to `sync_cycles_bucket_check` + `open_sync_cycle` (preserves all values + the
+   bootstrap regex + on-conflict/grants; never touches `record_onboarding_publication` — no bootstrap disguise).
+   `priority-dashboards-release.mjs` (subset mode) has a READ-ONLY preflight (`PRIORITY_PARTIAL_MIGRATION_PENDING`,
+   fails closed, ZERO writes) + a region guard (`PRIORITY_PARTIAL_REGION_UNSUPPORTED`, rejects the legacy us|non-us
+   buckets that isRoutingScope also accepts, before any write). Apply only when approved:
+   `MIGRATE_ONLY=20260924_priority_partial_cycle_bucket.sql npm run db:migrate`.
+2. **Campaign failure blocked publication.** Fix: controls + both publish paths + membership are NO LONGER gated on
+   `steps.campaign.outcome`; the honesty gate reddens ONLY on the required sales source (OLI); a Campaign failure is a
+   NON-failing `CAMPAIGN_ADS_UNAVAILABLE` notice. Sales publish independently, Ads band honestly unavailable/stale (the
+   derive treats ads as an optional derived source, never fabricates a zero, never throws on missing ads). Safe-close
+   fencing unchanged; bootstrap gates left.
+3. **Partial-publication safety validates ALL source jobs (failed/pending included).** `assessScheduledOliCycle`
+   validates create-count + owner scope/size for EVERY job + counts ATTEMPTED creates independently of successful data;
+   eligibility (owner coverage) still succeeded-only. FAILED job with `create_export_count=100` (spend breach) or an
+   out-of-scope owner (isolation breach) → `classifyOliPublicationOutcome` `fatal=true, publishable=false` (no publish).
+   A clean readiness defer stays partial-publishable.
+
+Tests (Codex's two named categories included): scheduler-v2-automation C4g/C4h/C4i + D2/D5/D6; source-priority-
+dashboards **PP2a/PP2b (REAL eligible-subset flow through cycle CREATION identity + finalize scope + EXACT dashboard
+readback)** + **PP3a/PP3b (production-schema compatibility + migration)**; scheduler-regional-workflow C1b updated to
+independent-sales semantics. Production acceptance PENDING a natural PARTIAL cycle + migration 20260924 approval.
+
 ## Scheduler per-account DASHBOARD publication isolation — PARTIAL (2026-09-09, commit f3a7d9d on main, NOT pushed; code verification only, NOT production acceptance)
 
 Continuation of the all-region scheduler repair (builds on e4e3ff2/7d99d00, preserved). Codex reproduced the deeper

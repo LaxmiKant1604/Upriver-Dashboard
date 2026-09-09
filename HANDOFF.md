@@ -1,9 +1,10 @@
 # Handoff — Website report repair (rounds 1-4) + all-region scheduler repair (PARTIAL) + open gates
 
-**Branch:** `main`   **HEAD:** scheduler per-account publication (partial) commit `f3a7d9d` (prior scheduler-repair
-`e4e3ff2`/`7d99d00`; report rounds 1-4 at `8285b7a`).
-**f3a7d9d + e4e3ff2 are committed locally on `main`, NOT yet pushed** — the scheduler effect lands only on the NEXT
-natural cron off origin/main, so they need a push (normal path, no dispatch) to take effect. Awaiting go-ahead to push.
+**Branch:** `main`   **HEAD:** scheduler per-account publication — 3 release-blocker fixes commit `227d685` (prior:
+`f3a7d9d` per-account publication, `e4e3ff2`/`7d99d00` scheduler-repair; report rounds 1-4 at `8285b7a`).
+**227d685 + f3a7d9d + e4e3ff2 are committed locally on `main`, NOT yet pushed** — the scheduler effect lands only on
+the NEXT natural cron off origin/main, so they need a push (normal path, no dispatch) to take effect. Awaiting go-ahead
+to push. The healthy-subset PARTIAL publication is additionally INERT until migration `20260924` is applied (see item 3).
 **Latest deploy:** Vercel Production **Ready** at `c0d92cd` (round 3, Codex-confirmed); round 4 (`8285b7a`) deployed.
 **Date:** 2026-09-09
 **DataDoe this session:** 0 exports / 0 tokens   **api/*.js:** 12 (unchanged)   **verify:** 186/186 (162 suites).
@@ -19,9 +20,15 @@ spending limits, manually dispatch a scheduler/DataDoe/workflow run, or apply a 
    real (older) inventory date and is NOT shadowed by the same-cycle unavailable placeholder republish; (b) a
    same-window Ads correction/delete flips `content_rev` and rebuilds Brand View; (c) the Daily ads band shows the
    recorded-extent wording and unrecorded covered days as unavailable (—), never a measured zero.
-3. **Migration `20260923_ads_content_rev.sql` — STILL approval-gated.** The Ads content-rev fold is fail-soft/inert
-   until it lands. Decide on the revision design, then (only if approved) apply via
-   `MIGRATE_ONLY=20260923_ads_content_rev.sql npm run db:migrate`. No other migration is touched.
+3. **Migrations approval-gated (two PENDING, NEITHER applied):**
+   - `20260923_ads_content_rev.sql` — the Ads content-rev fold (fail-soft/inert until it lands).
+   - `20260924_priority_partial_cycle_bucket.sql` — adds the `priority-partial-<region>-<16hex>` regex to the
+     `sync_cycles` bucket CHECK + `open_sync_cycle` guard so the healthy-subset partial publication can open its
+     dedicated cycle. Until applied, the partial path fails closed (`PRIORITY_PARTIAL_MIGRATION_PENDING`, zero writes,
+     LKG preserved) — so the per-account partial feature is INERT (a partial region keeps all-LKG, as before this work)
+     until BOTH this migration is applied AND a natural partial cycle occurs. Preserves all existing buckets + the
+     bootstrap regex; touches nothing else. Apply (only if approved): `MIGRATE_ONLY=20260924_priority_partial_cycle_
+     bucket.sql npm run db:migrate`. No other migration is touched.
 4. **All-region scheduler repair — PARTIAL, code-complete + tested at `e4e3ff2`** (deliverable:
    `sales-dashboard-live/scratchpad/ALL-REGION-SCHEDULER-REPAIR-DELIVERABLE-20260909.md`; evidence matrix:
    `SCHEDULER-INVESTIGATION-20260909.md`). Fixed + tested (code verification only, NOT production acceptance):
