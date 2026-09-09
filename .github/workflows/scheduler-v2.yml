@@ -374,15 +374,19 @@ jobs:
     needs: [run, fba]
     # A BOOTSTRAP-scoped run never ingests v3 (its per-region export ceiling belongs to the natural daily
     # run; the new accounts' shadow snapshots land on the next full run instead).
-    # OPTIONAL-INVENTORY (per-account partial publication): v3 now runs whenever the FBA job PUBLISHED at least one
-    # account's inventory (fba_published == 'true'), NOT only when the whole region is complete. A natural PARTIAL
-    # region (e.g. 10/11, Canada LATEST_SNAPSHOT_INCOMPLETE) still ingests v3: each account ADOPTS its FBA inventory
-    # where the reuse-only cache is fresh and publishes listings/OLI regardless, while inventory-dependent fields stay
-    # unavailable for the FBA-failed accounts (the operator's per-account adoptability + the inventory Pass-2
-    # complete-as-unavailable contract). A HARD FBA failure (zero accounts published) leaves fba_published != 'true',
-    # so v3 is still SKIPPED when the FBA inventory cache is entirely absent. inventory stays REUSE-ONLY (zero v3
-    # creates); the shared inventory_asof threading is unchanged. materialize + materialize-inventory stay INDEPENDENT.
-    if: always() && needs.run.outputs.region != '' && needs.fba.result == 'success' && needs.fba.outputs.fba_published == 'true' && needs.run.outputs.scope != 'bootstrap'
+    # OPTIONAL-INVENTORY (per-account partial publication): v3 ingests whenever the PRIORITY run succeeded (OLI is
+    # ready + the shared inventory_asof is resolved) -- it is NO LONGER gated on the FBA publish outcome. Listings +
+    # durable OLI are v3's own required evidence (independent of FBA), so v3 must publish them regardless of how many
+    # accounts FBA published: each account ADOPTS its FBA inventory where the reuse-only cache is fresh and leaves
+    # inventory-dependent fields unavailable otherwise (operator per-account adoptability + the inventory Pass-2
+    # complete-as-unavailable contract). This resolves the "FBA publishes ZERO accounts" case against the requested
+    # optional-inventory behavior: v3 STILL runs (listings/OLI publish; inventory unavailable for all), rather than
+    # being skipped by a whole-region FBA prerequisite. `needs: [run, fba]` is kept only for ORDERING (v3 runs AFTER
+    # fba so it reuses whatever fresh FBA cache exists); `always()` means fba's result never skips v3. A failed
+    # priority run (OLI not ready) or a bootstrap scope still skips v3. Inventory stays REUSE-ONLY (zero v3 inventory
+    # creates); v3's own balance/authorization gate still bounds its Listings creates. The fba job still exports
+    # fba_published (observability). materialize + materialize-inventory stay INDEPENDENT.
+    if: always() && needs.run.result == 'success' && needs.run.outputs.region != '' && needs.run.outputs.scope != 'bootstrap'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     defaults:
@@ -511,9 +515,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
       # Brand View asOf is derived per the serve (single: marketplaceToday(account.country); portfolio:
-      # marketplaceToday("IN")); no --as-of override. Zero export; converges brand-view + brand-view-portfolio.
+      # marketplaceToday("IN")); no --as-of override. --inventory-as-of is the shared cycle D-1 (needs.run.outputs.
+      # inventory_asof): the compact brand-inventory rebuild binds its per-account authorization to it, so it only
+      # refreshes a compact the priority run published for THIS cycle (never a stale/old-cycle row). Zero export.
       - name: Materialize Brand View + Portfolio for this region (zero export; idempotent upsert)
-        run: node scripts/release/report-materialization-brandview.mjs --region=${{ needs.run.outputs.region }} --mode=live
+        run: node scripts/release/report-materialization-brandview.mjs --region=${{ needs.run.outputs.region }} --mode=live --inventory-as-of=${{ needs.run.outputs.inventory_asof }}
 
   # BOOTSTRAP ack (completed | failed) -- the dispatched run's durable FINISH receipt, keyed by the exact
   # dispatch identity. 'completed' is acked ONLY when: the `run` job is green (its honesty step fails it on

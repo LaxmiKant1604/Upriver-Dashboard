@@ -31,8 +31,13 @@ const log = (m) => process.stdout.write(`${m}\n`);
 async function main() {
   const region = String(argOf("region", "") || "").trim();
   const mode = String(argOf("mode", "dry-run") || "dry-run").trim();
+  // The shared cycle D-1 (needs.run.outputs.inventory_asof). The compact brand-inventory rebuild binds its
+  // PER-ACCOUNT authorization to it (a live compact only authorizes a refresh when it was published for THIS cycle
+  // -- live.params.to === inventoryAsOf). Absent -> the rebuild authorizes NOTHING (fail closed).
+  const inventoryAsOf = String(argOf("inventory-as-of", "") || "").trim() || null;
   if (!REGION_SCOPES.includes(region)) { log(`report-materialization-brandview: --region must be one of ${REGION_SCOPES.join(", ")} (got "${region}"). Refusing.`); process.exit(2); }
   if (mode !== "dry-run" && mode !== "live") { log(`report-materialization-brandview: --mode must be dry-run|live (got "${mode}"). Refusing.`); process.exit(2); }
+  if (inventoryAsOf && !/^\d{4}-\d{2}-\d{2}$/.test(inventoryAsOf)) { log(`report-materialization-brandview: --inventory-as-of must be YYYY-MM-DD (got "${inventoryAsOf}"). Refusing.`); process.exit(2); }
   const dryRun = mode !== "live";
 
   const release = buildBrandViewMaterializationRelease({ operator: process.env.PRIORITY_OPERATOR || "laxmikant@superboring.in" });
@@ -45,7 +50,7 @@ async function main() {
   // Defect A: FIRST rebuild the compact brand-inventory from each account's FRESH fba-plan snapshot (this job runs
   // AFTER the fba job), so Brand View's exclusive-compact consumer reads CURRENT inventory below. Gated on the
   // source-promoted publish control; zero-export. A tokens>0 here is impossible (no adapter) but re-checked below.
-  const invResult = await runBrandInventoryRebuild({ region, accounts, dryRun }, { ...release, log });
+  const invResult = await runBrandInventoryRebuild({ region, accounts, inventoryAsOf, dryRun }, { ...release, log });
   if (invResult && invResult.summary && invResult.summary.tokens !== 0) {
     log("report-materialization-brandview: NON-ZERO token count in brand-inventory rebuild -- this path must never spend a token. Failing.");
     process.exit(1);

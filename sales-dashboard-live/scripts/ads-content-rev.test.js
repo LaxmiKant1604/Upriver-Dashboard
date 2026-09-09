@@ -4,7 +4,7 @@
 // zero-write replay holds). Pure; ZERO I/O. 7-bit ASCII, LF.
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
-import { adsWindowContentRev } from "../lib/server/ads-sync.js";
+import { adsWindowContentRev, committedContentRev } from "../lib/server/ads-sync.js";
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -41,5 +41,34 @@ ok("C: a SAME-WINDOW value correction (spend 100 -> 123, dates/grain unchanged) 
 // A clicks-only correction also flips it (all persisted metrics participate).
 const clicksCorrected = [row({ metrics: { ad_spend: 100, ad_sales: 400, ad_clicks: 21 } }), base[1]];
 ok("C: a clicks-only correction also changes the rev", adsWindowContentRev(clicksCorrected) !== revBase);
+
+// ---- committedContentRev: describes COMMITTED durable data (window-independent, delete-aware, fail-soft) --------
+// Item 3: the sync computes the rev by RE-READING the committed durable store over a CANONICAL window, so it
+// describes committed data (not the fetch batch). A store double serves the committed rows for any [from..to].
+const store = base.slice();
+const reader = async ({ from, to }) => store.filter((r) => r.metric_date >= from && r.metric_date <= to);
+const revW1 = await committedContentRev({ readDurableRows: reader, accountId: "a", sourceKey: "campaign-performance-v1", from: "2026-08-01", to: "2026-09-30", batchRowsFallback: [] });
+const revW2 = await committedContentRev({ readDurableRows: reader, accountId: "a", sourceKey: "campaign-performance-v1", from: "2026-07-01", to: "2026-09-30", batchRowsFallback: [] });
+ok("D (window-independent): the same COMMITTED rows read over two DIFFERENT windows that both contain them -> SAME rev",
+  revW1 === revW2 && revW1 === revBase);
+
+// A correction in the committed store flips the committed rev (even though the window is unchanged).
+store[0] = row({ metrics: { ad_spend: 123, ad_sales: 400, ad_clicks: 20 } });
+const revCorrected = await committedContentRev({ readDurableRows: reader, accountId: "a", sourceKey: "campaign-performance-v1", from: "2026-08-01", to: "2026-09-30", batchRowsFallback: [] });
+ok("D (correction): a committed-store correction changes the committed rev", revCorrected !== revW1);
+
+// A delete (fewer committed rows) changes the rev (delete-aware) -- the fetch-batch approach could not see this.
+store.pop();
+const revAfterDelete = await committedContentRev({ readDurableRows: reader, accountId: "a", sourceKey: "campaign-performance-v1", from: "2026-08-01", to: "2026-09-30", batchRowsFallback: [] });
+ok("D (delete-aware): removing a committed row changes the rev", revAfterDelete !== revCorrected);
+
+// Fail-soft: an ABSENT reader (pre-migration / unit path) falls back to the batch rows (never breaks the sync).
+const revNoReader = await committedContentRev({ readDurableRows: null, accountId: "a", sourceKey: "s", from: "x", to: "y", batchRowsFallback: base });
+ok("D (fail-soft): absent reader falls back to the batch-rows rev", revNoReader === revBase);
+// A THROWN durable read is a transient failure, NOT a data change: it returns null so the caller PRESERVES the
+// previous rev (contentRev || previous?.content_rev). Falling back to the narrower batch window here would compute
+// a different rev over the SAME committed data -> a spurious content_rev flip -> an unwarranted Brand View rebuild.
+const revThrows = await committedContentRev({ readDurableRows: async () => { throw new Error("read fail"); }, accountId: "a", sourceKey: "s", from: "x", to: "y", batchRowsFallback: base });
+ok("D (fail-soft): a THROWN durable read returns null (preserve previous rev; no spurious flip over unchanged data)", revThrows === null);
 
 writeSync(1, `\nads-content-rev: ${passed} assertions passed\n`);

@@ -9,6 +9,7 @@ import {
   upsertAdsSyncStates,
   recordAdsCoverageWindows,
   getDailyAdsCoverage,
+  getAdsDailySourceRows,
 } from "./supabase.js";
 import { getDataDoeConnections, publicAccountId } from "./datadoe-connections.js";
 // PURE durable-coverage proof (server-only; no transport import) -- used to skip an already-covered
@@ -483,6 +484,40 @@ export function adsWindowContentRev(rowsForAccount) {
   return createHash("sha256").update(lines.join("")).digest("hex").slice(0, 40);
 }
 
+// Local UTC date - N days (YYYY-MM-DD). Pure; no timezone ambiguity.
+function subUtcDaysStr(dateStr, days) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ""));
+  if (!m) return String(dateStr || "");
+  const t = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) - days * 86400000;
+  const d = new Date(t);
+  const p2 = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())}`;
+}
+
+// Item 3: compute the COMMITTED-durable content revision for one account+source over the canonical window by
+// RE-READING the durable store after the write commits. Window-independent (both daily and monthly syncs read the
+// SAME [from..to]), delete-aware (reflects post-delete state), failure-safe (only called after a successful commit;
+// a failed batch preserves the previous rev). Fail-soft: if the reader is absent or throws, fall back to the
+// just-persisted batch rows (a best-effort content signal that still catches same-window corrections). Returns the
+// 40-hex rev or null.
+export async function committedContentRev({ readDurableRows, accountId, sourceKey, from, to, batchRowsFallback }) {
+  if (typeof readDurableRows === "function") {
+    try {
+      const rows = await readDurableRows({ accountId, sourceKeys: [sourceKey], from, to });
+      return adsWindowContentRev(Array.isArray(rows) ? rows : []);
+    } catch {
+      // A THROWN durable read is a TRANSIENT failure, NOT evidence the committed data changed. Falling back to the
+      // narrower fetch-batch rows here would compute a DIFFERENT rev over the same committed data (the batch window
+      // is [contentRevFrom..to], the durable read is the canonical committed set) -> a spurious content_rev flip ->
+      // an unwarranted Brand View rebuild. Return null so the caller PRESERVES the previous rev (contentRev ||
+      // previous?.content_rev). The batch fallback below is only for a genuinely ABSENT reader (pre-migration /
+      // unit path), where there is no committed store to describe.
+      return null;
+    }
+  }
+  return adsWindowContentRev(batchRowsFallback || []);
+}
+
 function stateRecord(accountId, sourceKey, previous, mode, latestMetricDate, now, contentRev) {
   return {
     account_id: accountId,
@@ -749,6 +784,10 @@ export const PRODUCTION_ADS_SYNC_DEPS = Object.freeze({
   upsertAdDailyMetrics,
   upsertAdsSyncStates,
   recordAdsCoverageWindows,
+  // Item 3: re-read the COMMITTED durable rows over the canonical revision window to compute a window-independent
+  // content revision (describes committed durable data, not the fetch batch). Fail-soft: absent/error -> fall back
+  // to the batch-rows rev.
+  readDurableRows: getAdsDailySourceRows,
   now: () => new Date().toISOString(),
   clock: () => Date.now(), // monotonic ms for the work-budget deadline (injectable so the deferral is testable)
 });
@@ -768,9 +807,17 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
   } = deps;
   const clock = typeof deps.clock === "function" ? deps.clock : () => Date.now();
   const deleteRows = typeof deps.deleteAdsDailyRows === "function" ? deps.deleteAdsDailyRows : async () => ({ write: "ok" });
+  // Item 3: durable-rows reader for the committed-state revision. Absent (older deps/tests) -> the rev falls back to
+  // the just-persisted batch rows (byte-identical to the pre-item-3 behavior).
+  const readDurableRows = typeof deps.readDurableRows === "function" ? deps.readDurableRows : null;
 
   const now = nowFn();
   const to = now.slice(0, 10);
+  // The CANONICAL revision window: a FIXED span (the widest sync/correction window) ending at the run's asOf, so a
+  // daily (21d) and a monthly (49d)/initial (60d) sync compute the rev over the SAME committed window -> a
+  // window-independent content identity. A correction anywhere a sync can re-fetch (well within this span) flips it;
+  // older data is immutable. This is what makes the rev describe COMMITTED DURABLE DATA rather than one fetch batch.
+  const contentRevFrom = subUtcDaysStr(to, MAX_REQUIRED_COVERAGE_DAYS - 1);
   const scope = countries === "OTHER" ? "OTHER" : [...countries].sort().join(",");
   const selectedSources = ADS_SOURCES.filter((source) => sourceKeys.includes(source.key));
   if (!selectedSources.length) throw new Error("No supported Ads source was requested.");
@@ -934,9 +981,18 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
               if (!rowsByAccount.has(row.account_id)) rowsByAccount.set(row.account_id, []);
               rowsByAccount.get(row.account_id).push(row);
             }
-            // Item 2: per-account CONTENT revision over the rows just persisted (canonical hash; zero extra I/O).
+            // Item 3: per-account CONTENT revision from the COMMITTED durable rows over the CANONICAL window (this
+            // runs AFTER upsertRows + any window delete, so it reflects the true committed state -- window-
+            // independent, delete-aware). Each account is read once per batch. An account with NO rows in the batch
+            // still gets a re-read (it may have committed rows from earlier batches/windows). Fail-soft to the batch
+            // rows. NOTE: every account in workingBatch is covered (not only those with rows in `normalized`).
             const contentRevByAccount = new Map();
-            for (const [accId, accRows] of rowsByAccount) contentRevByAccount.set(accId, adsWindowContentRev(accRows));
+            for (const { account } of workingBatch) {
+              contentRevByAccount.set(account.id, await committedContentRev({
+                readDurableRows, accountId: account.id, sourceKey: source.key, from: contentRevFrom, to,
+                batchRowsFallback: rowsByAccount.get(account.id) || [],
+              }));
+            }
             if (coverageMode) {
               // Record the EXACT successful window, then REQUIRE a positive persistence acknowledgement (write ok
               // AND one recorded row per account) BEFORE marking the sync succeeded -- fail closed otherwise.

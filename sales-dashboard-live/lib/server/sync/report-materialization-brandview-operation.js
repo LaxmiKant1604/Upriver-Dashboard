@@ -27,6 +27,25 @@ import {
 import { buildBrandAccountMembership } from "../reports/brand-membership.js";
 import { materializeSnapshot, runUnit, summarize } from "./report-materialization-core.js";
 import { paramsHashFor } from "../report-store.js";
+import { brandViewDependencyFingerprint } from "../reports/brand-view-dependency-fingerprint.js";
+
+// CONTENT fingerprint of a compact brand-inventory payload (Item 1): a stable sha256 over the CONTENT that decides
+// what Brand View shows -- inventoryAvailable + inventoryDate + the per-(country,brand) fold. It changes when the
+// content changes (e.g. inventoryAvailable false -> true, or a fold value changes) EVEN when the fba-plan provenance
+// timestamp is unchanged/equal, and is byte-stable on a replay of the same content (so a re-run is a zero-write
+// no-op). Reuses the same canonical-JSON sha256 as every other dependency fingerprint (no new hashing framework).
+export function compactInventoryContentFingerprint(payload) {
+  const rows = Array.isArray(payload && payload.inventoryByBrandCountry) ? payload.inventoryByBrandCountry : [];
+  const canonRows = rows
+    .map((r) => `${String((r && r.country) ?? "")}|${String((r && r.brand) ?? "")}|${Number((r && r.fbaAvailable) || 0)}|${Number((r && r.skuCount) || 0)}`)
+    .sort();
+  return brandViewDependencyFingerprint({
+    v: BRAND_INVENTORY_REPORT_VERSION,
+    available: !!(payload && payload.inventoryAvailable),
+    date: String((payload && payload.inventoryDate) || ""),
+    rows: canonRows,
+  });
+}
 
 // The compact brand-inventory family this operator REBUILDS from fresh fba-plan evidence (declared as data so the
 // registry/family guards can assert the exact set without importing the run loop).
@@ -41,33 +60,38 @@ export const BRAND_INVENTORY_MATERIALIZATION_REPORT = Object.freeze({
  * as inventoryAvailable:false; this makes it available the SAME day). ZERO DataDoe -- it reuses the already-validated
  * fba-plan fold via the pure compactInventoryFromFbaPlanPayload adapter (one inventory definition, no second export).
  *
- * AUTHORIZATION (lifecycle-coherent -- the fix for the promoted-control window bug): this job runs AFTER the
- * priority run's safe-close AND the FBA job's safe-close, both of which DISABLE the source-promoted publish
- * control (source_promoted_publish_settings.publish_enabled). publish_enabled is the priority publisher's per-run
- * WINDOW toggle (opened by --apply, always closed by --rollback), NOT a durable "brand-inventory is live" flag, so
- * gating the rebuild on it made the rebuild dead in production (Defect A stayed inert). Instead this rebuild is a
- * PER-ACCOUNT REFRESH of an ALREADY-PUBLISHED live compact: it proceeds for an account ONLY when a LIVE
- * brand-inventory snapshot already exists for it -- i.e. the priority run published one this cycle under its
- * fenced + approved scoped window. The materializer therefore never FIRST-authorizes a report; it only replaces an
- * authorized live identity with fresher, zero-export inventory. No global control is opened or left enabled, the
- * scoped publication authority still flows from the priority run's fenced CAS publish, and an account the priority
- * run did NOT publish (not authorized) keeps the legacy fba-plan fallback (skip, never a fabricated write).
+ * AUTHORIZATION (CYCLE-BOUND -- the fix for the promoted-control window bug AND the historical-row bug): this job
+ * runs AFTER the priority run's safe-close AND the FBA job's safe-close, both of which DISABLE the source-promoted
+ * publish_enabled toggle -- a per-run WINDOW flag, not a durable "brand-inventory is live" flag -- so gating on it
+ * made the rebuild dead in production. But mere ROW EXISTENCE is ALSO not current authorization: a compact left over
+ * from a PREVIOUS cycle (or from an account whose scope was later revoked) would wrongly authorize a fresh write.
+ * So authorization is bound to the CURRENT CYCLE: an account is authorized ONLY when its LIVE brand-inventory row
+ * was published for THIS cycle's D-1 -- i.e. live.params.to === inventoryAsOf (the run's requested D-1, threaded in).
+ * The priority run publishes the compact with params.to = the requested D-1 for exactly the accounts in its
+ * fenced + approved scope this cycle, so this precisely means "the priority run authorized + published this account
+ * this cycle." An OLD-cycle row (params.to = an earlier D-1), a revoked account (not in this run's scope, so no
+ * current-cycle row), and a missing inventoryAsOf all FAIL CLOSED -> skip (legacy fba-plan fallback). The
+ * materializer never FIRST-authorizes; it only REFRESHES an already-authorized, current-cycle identity with fresher,
+ * zero-export inventory. No global control is opened or left enabled.
  *
- * Per-account zero-vs-missing is preserved: an account whose fba-plan has no available inventory (the source
- * omitted it, or a validator failure left only an old snapshot without inventory) leaves the existing compact
- * untouched (honest unavailable, never a fabricated zero). Newer-only: a genuinely newer AVAILABLE compact (e.g. a
- * later admin refresh) is preserved -- but an inventoryAvailable:false priority PLACEHOLDER never suppresses a fresh
- * inventoryAvailable:true fold, even if the placeholder's provenance timestamp is numerically newer.
+ * Per-account zero-vs-missing is preserved: an account whose fba-plan has no available inventory leaves the existing
+ * compact untouched (honest unavailable, never a fabricated zero). CONTENT-AWARE idempotency (Item 1): the write
+ * carries a CONTENT fingerprint of the compact, so an inventoryAvailable:false -> true change is written EVEN when
+ * the fba-plan provenance timestamp equals the placeholder's (the equal-timestamp collision), while a same-content
+ * replay is a zero-write no-op. Newer-only: a genuinely newer AVAILABLE compact (e.g. a later admin refresh) is
+ * preserved; an inventoryAvailable:false placeholder never suppresses a fresh inventoryAvailable:true fold.
  *
- * @param {object} args { region, accounts:[{accountId,country,...}], dryRun, now }
+ * @param {object} args { region, accounts:[{accountId,country,...}], inventoryAsOf, dryRun, now }
+ *   inventoryAsOf -- the current cycle's requested D-1 (the shared inventory_asof). REQUIRED for authorization; when
+ *     absent NO account is authorized (fail closed).
  * @param {object} collaborators (all zero-export):
  *   readFbaPlan({ accountId }) -> the account's latest fba-plan snapshot { payload, source_refreshed_at } | null
- *   readLiveBrandInventory({ accountId }) -> the account's latest LIVE brand-inventory snapshot | null (the
- *       per-account authorization signal the priority run's fenced publish produced; the safe-close does not erase it)
+ *   readLiveBrandInventory({ accountId }) -> the account's latest LIVE brand-inventory snapshot { params, payload,
+ *       source_refreshed_at } | null (its params.to binds it to the cycle the priority run published it for)
  *   readSnapshot / persistSnapshot / claimLock / releaseLock (shared-core store contract)
  *   log?(msg)
  */
-export async function runBrandInventoryRebuild({ region, accounts, dryRun = false, now = () => new Date() }, collaborators = {}) {
+export async function runBrandInventoryRebuild({ region, accounts, inventoryAsOf = null, dryRun = false, now = () => new Date() }, collaborators = {}) {
   const {
     readFbaPlan, readLiveBrandInventory,
     readSnapshot, persistSnapshot, claimLock = async () => true, releaseLock = async () => {},
@@ -78,6 +102,7 @@ export async function runBrandInventoryRebuild({ region, accounts, dryRun = fals
   if (typeof readFbaPlan !== "function" || typeof readLiveBrandInventory !== "function") {
     return { region: region || null, dryRun, events, summary: summarize(events), skipped: "not-wired" };
   }
+  const cycleAsOf = inventoryAsOf != null ? String(inventoryAsOf).trim() : "";
 
   for (const a of accounts || []) {
     const accountId = String((a && (a.accountId || a.id)) || "").trim();
@@ -87,12 +112,17 @@ export async function runBrandInventoryRebuild({ region, accounts, dryRun = fals
     }
     // eslint-disable-next-line no-loop-func
     await runUnit(events, async () => {
-      // PER-ACCOUNT AUTHORIZATION: refresh ONLY an account the priority run already published a live compact for
-      // (its fenced + approved scoped window authorized it this cycle). No live row -> not authorized -> skip this
-      // ONE account (legacy fba-plan fallback serves), never a global skip and never a first-time publish here.
+      // CYCLE-BOUND PER-ACCOUNT AUTHORIZATION: refresh ONLY an account whose LIVE compact was published for THIS
+      // cycle's D-1 (live.params.to === cycleAsOf). Row existence alone is NOT authorization -- an old-cycle row or a
+      // revoked account (no current-cycle row) fails closed to a skip. A missing cycleAsOf also fails closed.
       const live = await readLiveBrandInventory({ accountId });
+      const liveTo = live && live.params ? String(live.params.to || "") : "";
       if (!live || !live.payload) {
         return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "skipped", reason: "unauthorized-no-live-compact", preservedLkg: true, tokens: 0 };
+      }
+      if (!cycleAsOf || liveTo !== cycleAsOf) {
+        // The live compact is from a DIFFERENT (earlier) cycle, or no cycle was supplied -> not authorized this run.
+        return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "skipped", reason: "unauthorized-stale-cycle", preservedLkg: true, tokens: 0 };
       }
       const plan = await readFbaPlan({ accountId });
       const payload = compactInventoryFromFbaPlanPayload(plan && plan.payload, accountId);
@@ -114,10 +144,27 @@ export async function runBrandInventoryRebuild({ region, accounts, dryRun = fals
           return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "unchanged", reason: "existing-newer-available", tokens: 0 };
         }
       }
+      // CONTENT-AWARE idempotency (Item 1): pass a CONTENT fingerprint so materializeSnapshot compares the compact's
+      // actual content, not just the fba-plan timestamp. This writes an inventoryAvailable:false -> true change even
+      // when the fba-plan provenance equals the placeholder's (equal-timestamp collision), while a same-content
+      // replay stays a zero-write no-op.
+      let depFingerprint = compactInventoryContentFingerprint(payload);
+      if (String(payload.inventoryDate) !== cycleAsOf) {
+        // LAGGING-INVENTORY case (LKG / LATEST_SNAPSHOT_INCOMPLETE): this compact lives at a DIFFERENT paramsHash
+        // ({to: inventoryDate}, e.g. D-2) than the priority placeholder ({to: cycleAsOf} = D-1), which the priority
+        // run REPUBLISHES fresh (inventoryAvailable:false, newest updated_at) EVERY cycle. The serve reads latest-by-
+        // updated_at across all paramsHash, so a content-ONLY fingerprint would skip the re-persist on unchanged
+        // stock and let that fresh unavailable placeholder SHADOW this available compact (Brand View regresses to
+        // unavailable). Fold the cycle in so the available row is re-persisted (newest) each cycle -- materialize-
+        // inventory runs AFTER the priority republish, so its write wins. A same-cycle replay is still a no-op
+        // (cycleAsOf is stable within a cycle). The normal path (inventoryDate == cycleAsOf) shares the placeholder's
+        // paramsHash and overwrites it directly, so it needs no cycle fold.
+        depFingerprint = brandViewDependencyFingerprint({ fp: depFingerprint, cycle: cycleAsOf });
+      }
       return materializeSnapshot({
         reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, reportVersion: BRAND_INVENTORY_REPORT_VERSION,
         accountId, params: { to: payload.inventoryDate }, scopeLabel: "brand-inventory",
-        derived: { payload, sourceRefreshedAt },
+        derived: { payload, sourceRefreshedAt, depFingerprint },
         dryRun, now, readSnapshot, persistSnapshot, claimLock, releaseLock,
       });
     }, { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, scope: "brand-inventory" });

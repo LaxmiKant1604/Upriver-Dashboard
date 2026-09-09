@@ -60,8 +60,8 @@ writeSync(1, "scheduled-family-registry (release guard)\n");
 {
   const wf = readFileSync(path.join(ROOT, "../.github/workflows/scheduler-v2.yml"), "utf8");
   ok("G7 (P1 wiring): the fba job EXPORTS fba_complete as a job output", /outputs:\s*[\s\S]*?fba_complete:\s*\$\{\{\s*steps\.fba\.outputs\.fba_complete/.test(wf));
-  ok("G8 (optional-inventory wiring): the listing-health-v3 job GATES on needs.fba.outputs.fba_published == 'true' (runs on a partial FBA region; still blocks a hard FBA crash)",
-    /needs\.fba\.outputs\.fba_published\s*==\s*'true'/.test(wf) && /fba_published:\s*\$\{\{\s*steps\.fba\.outputs\.fba_published/.test(wf));
+  ok("G8 (optional-inventory wiring): the listing-health-v3 job GATES on needs.run.result == 'success' (OLI ready), NOT on the FBA publish outcome, so it runs on a partial OR zero-FBA region",
+    /listing-health-v3:[\s\S]*?if:\s*always\(\)\s*&&\s*needs\.run\.result\s*==\s*'success'/.test(wf) && !/listing-health-v3:[\s\S]*?needs\.fba\.outputs\.fba_published\s*==\s*'true'/.test(wf.slice(wf.indexOf("\n  listing-health-v3:"), wf.indexOf("\n  materialize:"))));
   ok("G9: materialize + materialize-inventory jobs exist (zero-export owners)", /\bmaterialize:\s*\n/.test(wf) && /materialize-inventory:\s*\n/.test(wf));
   ok("G9b (Campaign Ads parity): the declared scheduled Campaign Ads family has a real refresh step in the run job",
     !!SCHEDULED_FAMILY_REGISTRY["campaign-performance"] && /Refresh Campaign Ads/.test(wf) && /scheduled-campaign-ads-refresh\.mjs/.test(wf));

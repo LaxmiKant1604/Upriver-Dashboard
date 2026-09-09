@@ -93,19 +93,21 @@ export default function DailyReporting({
       )}
       {completeness && completeness.unitBreakdown && <ObservedUnitsBreakdown completeness={completeness} />}
 
-      {/* ADS PROVISIONAL TAIL (Item 3): the durable Ads coverage can be acknowledged through a date the provider has
-          not yet ITEMIZED (a known ~1-2 day item-level lag), so ad spend/TACoS are VERIFIED only through
-          latestMetricDate. The trailing covered days are PENDING -- shown as unavailable, NOT a measured zero. This
-          distinguishes a verified quiet day (a real 0 inside the verified window) from unverified missing data. */}
+      {/* ADS DATA-STATE HONESTY (Items 3 + 4): distinguish the VERIFIED advertising window from the UNVERIFIED tail.
+          verifiedThrough is the last day with actual metric evidence -- WITHIN [start .. verifiedThrough] a day with
+          no spend is a VERIFIED zero. The trailing covered days are covered but carry no itemization evidence: this
+          may be provider lag OR genuinely no activity -- a missing row alone proves NEITHER -- so they are shown as
+          UNKNOWN (unavailable), never a measured zero and never asserted to be provider delay. */}
       {report && report.adsAvailability && report.adsAvailability.provisionalFrom && (
         <div className="dr-band" role="status">
           <span className="dr-band-icon" aria-hidden="true"><Info size={16} /></span>
           <div>
-            <div className="dr-band-title">Advertising verified through {fmtDateHuman(report.adsAvailability.latestMetricDate)}</div>
+            <div className="dr-band-title">Advertising verified through {fmtDateHuman(report.adsAvailability.verifiedThrough || report.adsAvailability.latestMetricDate)}</div>
             <div className="dr-band-text">
+              Days up to then are confirmed (a day with no spend there is a real zero).{" "}
               {fmtDateHuman(report.adsAvailability.provisionalFrom)}
               {report.adsAvailability.provisionalTo && report.adsAvailability.provisionalTo !== report.adsAvailability.provisionalFrom ? ` – ${fmtDateHuman(report.adsAvailability.provisionalTo)}` : ""}
-              {" "}is covered but not yet itemized by the advertising provider, so ad spend and TACoS for those day(s) are shown as unavailable (&mdash;), never a measured zero. They fill in automatically as the provider itemizes them &mdash; no export is created.
+              {" "}is covered but not yet confirmed by the advertising provider &mdash; this could be provider lag or genuinely no activity, so ad spend and TACoS for those day(s) are shown as unavailable (&mdash;), never a measured zero. No export is created; they resolve on their own as the provider confirms them.
             </div>
           </div>
         </div>

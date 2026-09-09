@@ -44,15 +44,17 @@ const ackIdx = wf.indexOf("\n  bootstrap-ack:");
 const matInvEnd = ackCommentIdx > matInvIdx ? ackCommentIdx : (ackIdx > matInvIdx ? ackIdx : wf.length);
 const matInvJob = matInvIdx > 0 ? wf.slice(matInvIdx, matInvEnd) : "";
 
-/* ===================== A. dependency order + gate (P1 FBA-completeness contract) ===================== */
-ok("A: the v3 job needs BOTH run and fba", /needs:\s*\[run,\s*fba\]/.test(v3Job));
-ok("A: optional-inventory -- the v3 job is gated on a resolved region, fba success, AND fba_published=='true' (runs on a partial FBA region)",
-  /needs\.run\.outputs\.region\s*!=\s*''/.test(v3Job) && /needs\.fba\.result\s*==\s*'success'/.test(v3Job) && /needs\.fba\.outputs\.fba_published\s*==\s*'true'/.test(v3Job));
-ok("A: the fba job EXPOSES fba_published as a job output mapped from the id'd golive step",
+/* ===================== A. dependency order + gate (optional-inventory: run regardless of FBA outcome) =========== */
+ok("A: the v3 job needs BOTH run and fba (ordering only)", /needs:\s*\[run,\s*fba\]/.test(v3Job));
+ok("A: optional-inventory -- the v3 gate depends on the PRIORITY RUN succeeding (OLI + inventory_asof), NOT on the FBA publish outcome",
+  /needs\.run\.result\s*==\s*'success'/.test(v3Job) && /needs\.run\.outputs\.region\s*!=\s*''/.test(v3Job) && /needs\.run\.outputs\.scope\s*!=\s*'bootstrap'/.test(v3Job));
+ok("A: optional-inventory -- the v3 gate no longer requires fba success or a published-count/threshold (FBA=0 still runs v3)",
+  !/needs\.fba\.result\s*==\s*'success'/.test(v3Job) && !/needs\.fba\.outputs\.fba_published/.test(v3Job));
+ok("A: `always()` so fba's result (partial / crash / zero-published) never SKIPS v3", /if:\s*always\(\)/.test(v3Job));
+ok("A: the fba job still EXPOSES fba_published as a job output (observability) mapped from the id'd golive step",
   /\n  fba:\n[\s\S]*?outputs:\s*\n[\s\S]*?fba_published:\s*\$\{\{\s*steps\.fba\.outputs\.fba_published\s*\}\}/.test(beforeV3) && /id:\s*fba\b/.test(beforeV3));
-ok("A: optional-inventory -- a HARD FBA crash (zero accounts published, fba_published!='true') SKIPS v3; a PARTIAL region (some published) RUNS it", /needs\.fba\.outputs\.fba_published\s*==\s*'true'/.test(v3Job));
-// GATE/WRITER CONTRACT: fba-plan-golive MUST emit fba_published as a BOOLEAN string ("true"/"false"), never the
-// numeric account count -- otherwise the `== 'true'` string gate is unsatisfiable and v3 silently never runs.
+// The fba golive writer emits fba_published as a BOOLEAN string (hygiene; it is an observability output now, but a
+// count would be misleading). Kept as a guard against silent drift back to String(anyPublished).
 ok("A: the fba golive writer emits fba_published as a BOOLEAN (anyPublished > 0), not the numeric count",
   /ghOut\("fba_published",\s*anyPublished\s*>\s*0\s*\?\s*"true"\s*:\s*"false"\)/.test(fbaGolive) && !/ghOut\("fba_published",\s*String\(anyPublished\)\)/.test(fbaGolive));
 ok("A: the fba job itself only needs run (v3 runs strictly after fba)", /^\s{2}fba:\s*$/m.test(wf) && /\n  fba:\n[\s\S]*?needs:\s*run\b/.test(wf));

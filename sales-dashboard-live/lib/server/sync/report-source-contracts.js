@@ -1331,24 +1331,29 @@ export function resolveDailyAdsAvailability(coverage, planned) {
     : (covered.to < requestedTo ? "stale" : "partial");
   // Merge ONLY rows inside the proven covered window; uncovered dates stay unavailable (never zero).
   const coveredRows = adRows.filter((row) => row.date >= covered.from && row.date <= covered.to);
-  // PROVISIONAL METRIC TAIL (Defect C, read-side honesty). The coverage store may mark a window successfully
-  // synced through covered.to while the provider has not yet itemized the most recent day(s) (a known ~1-2d
-  // item-level lag) -- so the durable latestMetricDate trails covered.to. Those trailing days are NOT proven-zero:
-  // exposing (latestMetricDate+1 .. covered.to) as PROVISIONAL lets the consumer show "ads through <latestMetricDate>,
-  // later days pending" instead of a completed zero-ad assessment through covered.to. It does NOT drop covered-empty
-  // semantics for a genuinely quiet day (a covered day with no row inside [covered.from..latestMetricDate] stays a
-  // real 0), never invents a zero, and never changes which rows merge. Only set when we HAVE metrics (a valid
-  // latestMetricDate) that stop strictly before the covered end; a fully-empty covered window (no latestMetricDate)
-  // is left to the existing status (a legitimately zero-ad account is not relabelled provisional).
-  const provisionalFrom = (isValidCalendarDate(latestMetricDate)
-    && latestMetricDate >= covered.from && latestMetricDate < covered.to)
-    ? addUtcDaysStr(latestMetricDate, 1) : null;
+  // THREE HONEST DATA STATES for a covered window (Item 4 -- do NOT infer provider delay from latestMetricDate):
+  //   - VERIFIED window = [covered.from .. latestMetricDate]. latestMetricDate is the last day with ACTUAL metric
+  //     evidence, which PROVES the provider itemized through it. So a covered day here with no ad row is a VERIFIED
+  //     ZERO (genuine no-spend day), never "unavailable".
+  //   - UNVERIFIED tail = (latestMetricDate .. covered.to]. These days are COVERED (successfully synced) but carry no
+  //     itemization evidence yet. We do NOT know whether they are a provider-lag gap OR genuinely zero-activity days
+  //     -- a missing metric row ALONE proves neither. So they are UNKNOWN: shown as unavailable, NEVER a measured
+  //     zero, and NEVER asserted to be "not yet itemized"/"provider delay" (that would claim knowledge we lack).
+  // `verifiedThrough` names the itemization horizon; `provisionalFrom/To` demarcate the UNKNOWN tail (kept field
+  // names for wiring compatibility -- "provisional" here means UNVERIFIED/unknown, not "provider is lagging").
+  // Only set when we HAVE metrics (a valid latestMetricDate) that stop strictly before the covered end; a fully-empty
+  // covered window (no latestMetricDate) has NO verified horizon, so the whole window is unknown and is left to the
+  // existing status (a legitimately zero-ad account is not relabelled).
+  const hasVerifiedHorizon = isValidCalendarDate(latestMetricDate) && latestMetricDate >= covered.from && latestMetricDate < covered.to;
+  const provisionalFrom = hasVerifiedHorizon ? addUtcDaysStr(latestMetricDate, 1) : null;
   return {
     availability: {
       status, coveredFrom: covered.from, coveredTo: covered.to, requestedFrom, requestedTo,
       currency: accountCurrency, latestMetricDate, reason: null,
-      // Additive, optional: null unless a provider-lag tail is detected. Consumers that ignore it behave identically.
-      provisionalFrom, provisionalTo: provisionalFrom ? covered.to : null,
+      // The itemization horizon: within [covered.from..verifiedThrough] a no-row day is a VERIFIED zero.
+      verifiedThrough: hasVerifiedHorizon ? latestMetricDate : (isValidCalendarDate(latestMetricDate) ? latestMetricDate : null),
+      // The UNKNOWN (unverified) tail: covered but no itemization evidence -- lag OR zero, we cannot tell. null unless present.
+      provisionalFrom, provisionalTo: provisionalFrom ? covered.to : null, provisionalState: provisionalFrom ? "unknown-unverified" : null,
     },
     adRows: coveredRows,
   };

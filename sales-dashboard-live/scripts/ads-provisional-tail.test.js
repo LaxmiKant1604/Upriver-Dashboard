@@ -23,7 +23,9 @@ const coverage = (over = {}) => ({
   const { availability } = resolveDailyAdsAvailability(coverage(), planned);
   ok("A: coverage past the requested start is partial (Jul 8 start != Apr 1)", availability.status === "partial");
   ok("A: latestMetricDate is carried honestly (Sep 6)", availability.latestMetricDate === "2026-09-06");
-  ok("A: the trailing covered tail (Sep 7..Sep 8) is marked PROVISIONAL (not a completed zero)", availability.provisionalFrom === "2026-09-07" && availability.provisionalTo === "2026-09-08");
+  ok("A: the VERIFIED window ends at latestMetricDate (Sep 6) -- a no-spend day inside it is a real zero", availability.verifiedThrough === "2026-09-06");
+  ok("A: the trailing covered tail (Sep 7..Sep 8) is the UNKNOWN/unverified window (not a completed zero, not asserted delay)",
+    availability.provisionalFrom === "2026-09-07" && availability.provisionalTo === "2026-09-08" && availability.provisionalState === "unknown-unverified");
 }
 
 // Fully itemized through the covered end => NO provisional tail.
