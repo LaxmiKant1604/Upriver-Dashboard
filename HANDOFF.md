@@ -1,9 +1,11 @@
-# Handoff — Website report repair (rounds 1-4) + scheduler permanent repair (DEPLOYED) + open gates
+# Handoff — Website report repair (rounds 1-4) + all-region scheduler repair (PARTIAL) + open gates
 
-**Branch:** `main`   **HEAD:** round-4 commit `8285b7a` (pushed to origin/main)
-**Latest deploy:** Vercel Production **Ready** at `c0d92cd` (round 3, Codex-confirmed). Round 4 deploys on this push.
+**Branch:** `main`   **HEAD:** all-region scheduler-repair (partial) commit `e4e3ff2` (report rounds 1-4 at `8285b7a`).
+**e4e3ff2 is committed locally on `main`, NOT yet pushed** — the scheduler effect lands only on the NEXT natural cron
+off origin/main, so it needs a push (normal path, no dispatch) to take effect. Awaiting go-ahead to push.
+**Latest deploy:** Vercel Production **Ready** at `c0d92cd` (round 3, Codex-confirmed); round 4 (`8285b7a`) deployed.
 **Date:** 2026-09-09
-**DataDoe this session:** 0 exports / 0 tokens   **api/*.js:** 12 (unchanged)
+**DataDoe this session:** 0 exports / 0 tokens   **api/*.js:** 12 (unchanged)   **verify:** 186/186 (162 suites).
 
 ## → CODEX HANDOFF (what to do next — Upriver owns GitHub/Cloudflare/migrations/natural-run observation)
 
@@ -19,12 +21,26 @@ spending limits, manually dispatch a scheduler/DataDoe/workflow run, or apply a 
 3. **Migration `20260923_ads_content_rev.sql` — STILL approval-gated.** The Ads content-rev fold is fail-soft/inert
    until it lands. Decide on the revision design, then (only if approved) apply via
    `MIGRATE_ONLY=20260923_ads_content_rev.sql npm run db:migrate`. No other migration is touched.
-4. **Scheduler investigation — tracked, NOT fixed here** (`sales-dashboard-live/scratchpad/SCHEDULER-INVESTIGATION-20260909.md`):
-   (a) Europe OLI readiness blocking regional priority publication (provider itemization lag vs the strict D-1 gate —
-   observe the next natural europe-au cycle; do NOT relax the gate without review); (b) Listing Health v3 token
-   conflict — a 24-token estimate vs a 42-token frozen plan vs a 28-token authorization; reconcile the ESTIMATE and
-   PLAN to the AUTHORIZED ceiling (make the plan fit the authorization), **never raise the authorization to fit**.
-   Each needs its own reviewed change.
+4. **All-region scheduler repair — PARTIAL, code-complete + tested at `e4e3ff2`** (deliverable:
+   `sales-dashboard-live/scratchpad/ALL-REGION-SCHEDULER-REPAIR-DELIVERABLE-20260909.md`; evidence matrix:
+   `SCHEDULER-INVESTIGATION-20260909.md`). Fixed + tested (code verification only, NOT production acceptance):
+   - **LH v3 pricing coherence:** estimate + first gate + frozen binding now use ONE real-registry price (listings
+     PREMIUM 5 / listings-raw STANDARD 2). Authorized ceilings UNCHANGED. Honest awaiting-budget: **US-CA 11 accts =
+     21 > 16**, **Europe-AU 30 accts = 42 > 28** (zero creates); India 8 = 14 ≤ 16 proceeds. Proven through the FULL
+     live composition (a 21-token FROZEN plan is refused under 16 EVEN under full exact reuse — the binding gate binds
+     the frozen reservation ceiling, which never shrinks with reuse). **Do NOT raise a limit to fit — reviewed PR only.**
+   - **OLI readiness + authorized-wave isolation:** discovery stays FULL (frozen-owner check preserved); the FRESH plan
+     is the POSITIVELY-authorized eligible set (`freshPlanAccountIds` allowlist), not discovery-minus-exclusions, so an
+     unready seller never poisons a batch and a new/un-gated account (or a bootstrap account outside the approved wave)
+     cannot bypass onboarding. A continuation reuses frozen membership/budget verbatim.
+   - **Per-account publication:** eligibility is already expressible from EXISTING durable records (owners→job status +
+     coverage + OLI provenance + report_snapshots); the readiness case is already per-account isolated. **No migration
+     required.** Remaining reviewed items (named, NOT a blanket blocker): hard-failure per-account isolation at the
+     derive entry gate = a reviewed CODE change; an explicit durable per-account outcome ledger = OPTIONAL migration.
+   - **Observe (do NOT dispatch)** the next natural india/europe-au/us-ca cycles: OLI excludes unready sellers (logged
+     "onboarding gate … excluded N"), NOT a DATADOE_INITIAL_LOAD_INCOMPLETE batch rejection; LH v3 logged
+     estimatedTokens == frozen maxTokens; no region spends beyond its UNCHANGED authorization. NOT yet reproduced:
+     REELLEO Express IT (Europe FBA 21/22) needs the run's evidence; US-CA not-drained predates `583923d`.
 
 ## Round 4 (4 reproduced defects on `c0d92cd` + 3 Codex follow-up findings) — code-complete, `npm run verify` 184/184 (commit `8285b7a`)
 

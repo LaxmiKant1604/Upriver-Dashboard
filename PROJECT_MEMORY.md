@@ -1,5 +1,59 @@
 # Project Memory
 
+## All-region scheduler repair — PARTIAL (2026-09-09, commit e4e3ff2 on main, NOT yet pushed; code verification only, NOT production acceptance)
+
+Continuation of the all-region scheduler repair (separate from the website report rounds 1-4 at 8285b7a, preserved).
+Code + tests only. **verify 186/186 (162 suites, incl. build:check); git diff --check clean; api/*.js=12. Zero
+DataDoe spend. No budget increase, no manual dispatch, no paid export, no migration, no in-place frozen-batch change.**
+
+**LH v3 pricing coherence (Work 2).** The estimate + first authorization gate under-priced the premium Listings
+export as standard, so a 24-token estimate could pass while the frozen plan was 42. Unified to ONE definition:
+`sourceTokenCost(registryIsPremiumOf(job))` (listings PREMIUM=5 / listings-raw STANDARD=2) across estimate + plan +
+frozen tranche budget + authorization; observed spend priced per-source (not flat creates*2). Authorized ceilings
+UNCHANGED. Honest awaiting-budget (zero creates): **US-CA 11 accts = 3 batches = 3*5+3*2 = 21 > 16 authorized;
+Europe-AU 30 accts = 6 batches = 42 > 28; India 8 = 14 <= 16 proceeds.** The `maxTokens = structuralCreates*2`
+authorization derivation treats every create as standard, so the token ceiling is the (conservative) binding
+constraint under premium pricing — awaiting-budget is genuine; raising a limit is a reviewed PR only.
+
+**Full-composition binding proof (Codex round-3 item 1).** New suite
+`report-listing-health-v3-authorization-binding.test.js` (19 assertions) drives the LIVE composition
+(`buildListingHealthV3IngestionRelease` + `runListingHealthV3Ingestion`, real premium pricing) and proves a 21-token
+FROZEN plan is refused under 16 authorized EVEN under FULL EXACT REUSE: `computeFrozenTrancheBudget` counts every
+unique planned hash and NEVER shrinks with reuse, so reuse only zeroes gate 1's freshness-aware estimate while the
+BINDING gate (`computeListingHealthV3AuthorizationBinding` on `frozen.maxTokens`) still refuses — `runSources` never
+invoked, zero creates. India (14) proceeds. (The estimator-only H2 test alone did NOT prove this — it is cross-linked.)
+
+**OLI readiness + AUTHORIZED-WAVE isolation.** Root cause of the Europe-AU DATADOE_INITIAL_LOAD_INCOMPLETE: the OLI
+D-1 plan was built over the UNFILTERED directory, so an unready seller entered a <=5-seller batch and the provider
+400'd the whole batch. Fix keeps DISCOVERY FULL (the frozen-owner safety check needs every owner) and (a) defers the
+gate's unready ids from the FRESH plan (`preemptiveUnreadyAccountIds`); (b) **Codex round-3 item 2**: builds the FRESH
+plan from a POSITIVE authorized allowlist (`freshPlanAccountIds` = the gate's eligible set / the immutable approved
+bootstrap wave) as `discovery ∩ allowlist`, NOT discovery-minus-exclusions — so a new account appearing in discovery
+after gating (`unauthorizedFreshAccounts`) or a bootstrap account outside the approved wave can NEVER bypass onboarding.
+Threaded `runBucketSourceSync` <- `source-bucket-sync-runtime.js` <- `oli-refresh-d1.mjs`. A CONTINUATION ignores both
+(frozen membership immutable). The naive fetchAccounts discovery-gating (which omitted a now-unready frozen owner and
+deferred the whole continuation) stays REVERTED.
+
+**Tests.** `source-bucket-sync.test.js`: G1b/G1c (preemptive defer + continuation preservation), G1d (allowlist
+excludes a new account), **G1e (Codex round-3 item 3: continuation with a simulated provider readiness rejection —
+healthy accounts publish, frozen budget unchanged, no duplicate create [reservation consumed once], terminal
+readiness-waiting deferral, no crash)**, G1f (continuation ignores the allowlist). `scheduler-oli-readiness-plan.test.js`
+wiring guard E. Full suite passes; a focused adversarial review found zero substantiated defects.
+
+**Per-account publication eligibility (Codex round-3 item 4).** Already EXPRESSIBLE from EXISTING durable records
+(`sync_source_job_owners` account→hash + `sync_source_jobs.fetch_status` + `source_coverage` through-D-1 + durable OLI
+`source_request_hash` provenance + `report_snapshots`); the per-account publish path (`saveWithLineage`) already
+isolates healthy accounts from a readiness-waiting sibling. **NO migration required to express eligibility.** The two
+remaining items are named explicitly (not a blanket blocker): (1) hard-failure per-account isolation at the derive
+ENTRY gate (`runtime.js:887`, deliberately fail-closed today) = a REVIEWED CODE change; (2) an explicit durable
+per-account outcome ledger = OPTIONAL migration (inference already suffices). Migration 20260923 (`ads_sync_state.
+content_rev`) is UNRELATED (Brand View ads-correction fingerprint), still pending approval.
+
+**NOT done / needs evidence:** REELLEO Express IT (Europe FBA 21/22) needs the run's evidence; US-CA not-drained
+predates 583923d — reproduce on current code. Production acceptance PENDING natural india/europe-au/us-ca cycles
+(observe; never dispatch). This is NOT the complete all-region fix. Deliverable + evidence matrix in
+`sales-dashboard-live/scratchpad/ALL-REGION-SCHEDULER-REPAIR-DELIVERABLE-20260909.md` + `SCHEDULER-INVESTIGATION-20260909.md`.
+
 ## Primary DataDoe automatic onboarding + FBA exact-D-1 inventory (2026-09-07, commit 56b92e9 -- UNAPPLIED migration, UNDEPLOYED, approval-gated)
 
 Mission: fully automatic Primary-DataDoe account onboarding + correct FBA Inventory to EXACTLY the latest D-1
