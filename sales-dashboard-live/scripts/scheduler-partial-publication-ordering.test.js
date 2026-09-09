@@ -36,13 +36,19 @@ const steps = [];
 const byId = (id) => steps.find((s) => s.id === id);
 const idxOf = (id) => { const s = byId(id); return s ? s.index : -1; };
 const noticeSalesPublished = steps.find((s) => /sales PUBLISHED independently/.test(s.name));
-const noticeNoPublication = steps.find((s) => /WITHOUT a sales publication/.test(s.name));
+const noticeNoPublication = steps.find((s) => /incomplete\/unverified sales publication/.test(s.name));
 
 /* ---------------- ORDER ---------------- */
 ok("partial_preflight runs BEFORE full_controls (capability checked before any control write)", idxOf("partial_preflight") > 0 && idxOf("partial_preflight") < idxOf("full_controls"));
 ok("full_controls runs BEFORE both publish steps", idxOf("full_controls") < idxOf("complete_publish") && idxOf("full_controls") < idxOf("partial_publish"));
 ok("both publish steps run BEFORE the Campaign notices", idxOf("complete_publish") < noticeSalesPublished.index && idxOf("partial_publish") < noticeSalesPublished.index && idxOf("complete_publish") < noticeNoPublication.index);
 ok("both explicit publish IDs exist", !!byId("complete_publish") && !!byId("partial_publish") && !!byId("partial_preflight"));
+
+/* ---------------- notice WORDING: the failed/unverified notice makes NO zero-publication claim ---------------- */
+ok("the failed/unverified Campaign notice uses the cautious wording (did not complete or could not be verified; some snapshots may already have been published)",
+  /did NOT complete or could not be verified; some snapshots may already have been published/i.test(yml));
+ok("the failed/unverified Campaign notice NEVER claims zero publication (no 'NO dashboards were published' / 'no dashboards published' anywhere in the workflow)",
+  !/NO dashboards were published/i.test(yml) && !/no dashboards published/i.test(yml));
 
 /* ---------------- a small GitHub-Actions `if:` expression evaluator ---------------- */
 // Supports: always(), &&, ||, !, ==, !=, parentheses, string literals '...', and dotted lookups (steps.*.outcome /

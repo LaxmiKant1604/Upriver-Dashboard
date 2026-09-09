@@ -704,6 +704,7 @@ function runnerDeps(over = {}) {
     reconcile: over.reconcile || (async () => ({ ok: true })),
     readbackLive: over.readbackLive || (async () => ({ ok: true })),
     assertNoCron: over.assertNoCron || (async () => ({ ok: true })),
+    ...(over.verifyLease ? { verifyLease: over.verifyLease } : {}),
   };
 }
 
@@ -863,6 +864,37 @@ test("P9u. success REQUIRES published.length === provenAccountCount * 3 (a short
       : ({ accountId: a, results: idResults(a, "published") }),
   } }));
   assert.equal(r.code, 1); assert.equal(r.stage, "publish");
+});
+
+/* ---- P9 (cont). SUCCESSFUL WRITES then readback failure, and MID-PUBLISH lease loss (Finding 2) ---- */
+test("P9v. SUCCESSFUL WRITES followed by a READBACK FAILURE => code 1 (readback): the publishes (writes) DID occur before the readback failed, so 'some snapshots may already have been published' is the honest state (never a zero-publication claim)", async () => {
+  let publishCalls = 0;
+  const r = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({
+    releaseOver: { publishAccount: async (a) => { publishCalls += 1; return { accountId: a, results: idResults(a, "published") }; } },
+    readbackLive: async () => ({ ok: false, reason: "payload-contract" }),
+  }));
+  assert.equal(r.code, 1); assert.equal(r.stage, "readback");
+  assert.ok(publishCalls >= 1, "the publish (writes) ran for every proven account BEFORE the readback failed -- so this is 'writes then unverifiable', not a zero-write run");
+  // The runner reports the readback failure as its stage; it makes NO zero-publication claim (the writes already landed).
+  assert.ok(Array.isArray(r.problems) && /read-back failed/.test(r.problems.join(" ")), "the failure is reported as a readback failure, not a zero-write claim");
+});
+
+test("P9w. MID-PUBLISH LEASE LOSS (verifyLease turns not-ok after the first account published) => code 1, CONTROL_LEASE_LOST, leaseLost, reporting the publications already made (never zero)", async () => {
+  let leaseCalls = 0; const publishedAccts = [];
+  const r = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({
+    verifyLease: async () => { leaseCalls += 1; return { ok: leaseCalls === 1, reason: leaseCalls === 1 ? null : "reclaimed" }; },
+    releaseOver: { publishAccount: async (a) => { publishedAccts.push(a); return { accountId: a, results: idResults(a, "published") }; } },
+  }));
+  assert.equal(r.code, 1); assert.equal(r.stage, "contention"); assert.equal(r.status, "CONTROL_LEASE_LOST"); assert.equal(r.leaseLost, true);
+  assert.equal(publishedAccts.length, 1, "the FIRST account published (writes landed) BEFORE the lease was lost -- a genuine MID-publish loss");
+  assert.ok(r.problems.join(" ").includes("after 3 publications"), "the report states how many publications already occurred (never a zero claim): " + r.problems.join(" "));
+});
+
+test("P9x. a 'lease-lost' DISPOSITION at the write boundary (the CAS wrote zero rows for this account) => code 1, CONTROL_LEASE_LOST (retryable; LKG preserved)", async () => {
+  const r = await releaseRunner.runPriorityDashboardsRelease(runnerDeps({
+    releaseOver: { publishAccount: async (a) => ({ accountId: a, results: THREE.map((rk) => ({ reportKey: rk, disposition: "lease-lost", liveReportKey: rk, paramsHash: "ph" })) }) },
+  }));
+  assert.equal(r.code, 1); assert.equal(r.stage, "contention"); assert.equal(r.status, "CONTROL_LEASE_LOST"); assert.equal(r.leaseLost, true);
 });
 
 /* ===================== P10. the EXACT-identity live read-back (buildLiveReadback) ===================== */
