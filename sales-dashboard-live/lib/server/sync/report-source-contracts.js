@@ -1331,32 +1331,51 @@ export function resolveDailyAdsAvailability(coverage, planned) {
     : (covered.to < requestedTo ? "stale" : "partial");
   // Merge ONLY rows inside the proven covered window; uncovered dates stay unavailable (never zero).
   const coveredRows = adRows.filter((row) => row.date >= covered.from && row.date <= covered.to);
-  // THREE HONEST DATA STATES for a covered window (Item 4 -- do NOT infer provider delay from latestMetricDate):
-  //   - VERIFIED window = [covered.from .. latestMetricDate]. latestMetricDate is the last day with ACTUAL metric
-  //     evidence, which PROVES the provider itemized through it. So a covered day here with no ad row is a VERIFIED
-  //     ZERO (genuine no-spend day), never "unavailable".
-  //   - UNVERIFIED tail = (latestMetricDate .. covered.to]. These days are COVERED (successfully synced) but carry no
-  //     itemization evidence yet. We do NOT know whether they are a provider-lag gap OR genuinely zero-activity days
-  //     -- a missing metric row ALONE proves neither. So they are UNKNOWN: shown as unavailable, NEVER a measured
-  //     zero, and NEVER asserted to be "not yet itemized"/"provider delay" (that would claim knowledge we lack).
-  // `verifiedThrough` names the itemization horizon; `provisionalFrom/To` demarcate the UNKNOWN tail (kept field
-  // names for wiring compatibility -- "provisional" here means UNVERIFIED/unknown, not "provider is lagging").
-  // Only set when we HAVE metrics (a valid latestMetricDate) that stop strictly before the covered end; a fully-empty
-  // covered window (no latestMetricDate) has NO verified horizon, so the whole window is unknown and is left to the
-  // existing status (a legitimately zero-ad account is not relabelled).
-  const hasVerifiedHorizon = isValidCalendarDate(latestMetricDate) && latestMetricDate >= covered.from && latestMetricDate < covered.to;
-  const provisionalFrom = hasVerifiedHorizon ? addUtcDaysStr(latestMetricDate, 1) : null;
+  // EXPLICIT-EVIDENCE-ONLY completeness (Round-4, Codex finding 1). There is NO durable per-date validated-
+  // completeness signal: ads_sync_coverage records the REQUESTED synced range (covered_from..covered_to), NOT a
+  // validated data extent, and the ad provider itemizes with an unknown lag. So a covered day with no recorded ad
+  // row is NEVER asserted to be a measured zero -- it is UNKNOWN. We reject BOTH discarded assumptions: (a) "N days
+  // means final" (no reporting-lag constant, nothing keyed on requestedTo, so identical durable evidence can never
+  // flip to verified-zero just because requestedTo advances), and (b) "a later metric proves earlier days complete".
+  // We report ONLY the FACTUAL recorded-data extent from the actual covered rows -- pure DURABLE evidence (the
+  // coverage window + the recorded rows), invariant to requestedTo. A covered day is CONFIRMED iff it actually
+  // carries a recorded ad row; every covered day without one is provisional/unknown (shown unavailable, never zero).
+  const coveredMetricDates = [...new Set(coveredRows
+    .map((row) => row && row.date)
+    .filter((d) => isValidCalendarDate(d) && d >= covered.from && d <= covered.to))].sort();
+  const recordedFrom = coveredMetricDates.length ? coveredMetricDates[0] : null;
+  const recordedThrough = coveredMetricDates.length ? coveredMetricDates[coveredMetricDates.length - 1] : null;
+  const coveredDayCount = inclusiveDayCount(covered.from, covered.to);
+  const recordedDayCount = coveredMetricDates.length;
+  // Any covered day without a recorded ad row is UNCONFIRMED. Because no signal classifies which no-row day is a
+  // genuine zero vs not-yet-reported, the honest provisional scope is the covered window itself whenever ANY covered
+  // day lacks a recorded row; when every covered day has one there is nothing unconfirmed.
+  const hasUnconfirmed = recordedDayCount < coveredDayCount;
   return {
     availability: {
       status, coveredFrom: covered.from, coveredTo: covered.to, requestedFrom, requestedTo,
       currency: accountCurrency, latestMetricDate, reason: null,
-      // The itemization horizon: within [covered.from..verifiedThrough] a no-row day is a VERIFIED zero.
-      verifiedThrough: hasVerifiedHorizon ? latestMetricDate : (isValidCalendarDate(latestMetricDate) ? latestMetricDate : null),
-      // The UNKNOWN (unverified) tail: covered but no itemization evidence -- lag OR zero, we cannot tell. null unless present.
-      provisionalFrom, provisionalTo: provisionalFrom ? covered.to : null, provisionalState: provisionalFrom ? "unknown-unverified" : null,
+      // No per-date validated-completeness evidence exists in durable state -> completeness is UNVALIDATED. Only the
+      // FACTUAL recorded-data extent is reported; a covered day with no recorded row is provisional, never a zero.
+      completenessValidated: false,
+      recordedFrom, recordedThrough, recordedDayCount, coveredDayCount,
+      // The UNKNOWN (unconfirmed) scope: the whole covered window when ANY covered day lacks a recorded row; null
+      // when every covered day is recorded. Kept field names for wiring compatibility.
+      provisionalFrom: hasUnconfirmed ? covered.from : null,
+      provisionalTo: hasUnconfirmed ? covered.to : null,
+      provisionalState: hasUnconfirmed ? "unknown-unverified" : null,
     },
     adRows: coveredRows,
   };
+}
+
+// Inclusive day count between two strict YYYY-MM-DD dates (>=1 when from<=to; 0 on malformed/reversed). Pure UTC.
+function inclusiveDayCount(from, to) {
+  const a = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(from || ""));
+  const b = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(to || ""));
+  if (!a || !b) return 0;
+  const ms = Date.UTC(Number(b[1]), Number(b[2]) - 1, Number(b[3])) - Date.UTC(Number(a[1]), Number(a[2]) - 1, Number(a[3]));
+  return ms < 0 ? 0 : Math.round(ms / 86400000) + 1;
 }
 
 // Local UTC date +N days (YYYY-MM-DD). Pure; no timezone ambiguity. Kept local so this contract module stays leaf.

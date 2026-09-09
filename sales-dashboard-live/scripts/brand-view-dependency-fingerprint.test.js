@@ -13,6 +13,8 @@ import {
 import { materializeSnapshot } from "../lib/server/sync/report-materialization-core.js";
 import { serveSharedReport } from "../lib/server/report-store.js";
 import { buildBrandViewMaterializationRelease } from "../lib/server/sync/report-materialization-brandview-composition.js";
+import { paramsHashFor } from "../lib/server/report-store.js";
+import { BRAND_INVENTORY_REPORT_VERSION } from "../lib/server/reports/brand-view.js";
 
 let passed = 0;
 const ok = (name, cond) => { assert.ok(cond, name); passed += 1; writeSync(1, `  ok ${name}\n`); };
@@ -197,6 +199,56 @@ const serveWith = async ({ stored, contributingDepFingerprint }) => {
   order.length = 0;
   const rPort = await release.deriveBrandViewPortfolio({ accountIds: ["a1"], brand: "Acme", asOf: "2026-09-09", region: "india", accountsById: {} });
   ok("E: portfolio derive captures the fingerprint BEFORE building the payload (TOCTOU-safe)", order.indexOf("fp") < order.indexOf("build") && typeof rPort.depFingerprint === "string");
+}
+
+// ---- (6) Round-4 Defect 1: the composition's readLiveBrandInventory authorizes on the EXACT current-cycle -------
+// publication (paramsHash of {to: cycleAsOf}) via getExactSnapshot, NOT the latest-by-updated_at row. A lagging
+// available rebuild (a DIFFERENT identity, even if it is the newest row) never changes this reader's answer, so it
+// cannot invalidate authorization for a later fresh update in the same cycle. A missing cycleAsOf -> null.
+{
+  const CYCLE = "2026-09-08";
+  const cyclePh = paramsHashFor(BRAND_INVENTORY_REPORT_VERSION, { to: CYCLE });
+  const laggingPh = paramsHashFor(BRAND_INVENTORY_REPORT_VERSION, { to: "2026-09-02" });
+  // A store keyed by paramsHash: the {to: CYCLE} placeholder AND a NEWER lagging available compact both exist.
+  const store = {
+    [`brand-inventory|acct1|${cyclePh}`]: { params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: CYCLE }, payload: { inventoryAvailable: false, inventoryByBrandCountry: [] }, source_refreshed_at: "2026-09-08T03:00:00Z" },
+    [`brand-inventory|acct1|${laggingPh}`]: { params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-09-02" }, payload: { inventoryAvailable: true, inventoryByBrandCountry: [] }, source_refreshed_at: "2026-09-08T17:00:00Z" }, // NEWER (latest-by-updated_at)
+  };
+  const calls = [];
+  const release = buildBrandViewMaterializationRelease({
+    getConnections: () => [{ id: "primary", apiKey: "k", organizationFingerprint: "org" }],
+    getExactSnapshot: async ({ reportKey, accountId, paramsHash }) => { calls.push(paramsHash); return store[`${reportKey}|${accountId}|${paramsHash}`] || null; },
+  });
+  const authorized = await release.readLiveBrandInventory({ accountId: "acct1", cycleAsOf: CYCLE });
+  ok("F: readLiveBrandInventory reads the EXACT {to: cycleAsOf} paramsHash (not latest) -> returns the cycle placeholder, not the newer lagging row",
+    calls[0] === cyclePh && !!authorized && authorized.params.to === CYCLE && authorized.payload.inventoryAvailable === false);
+  const noCycle = await release.readLiveBrandInventory({ accountId: "acct1", cycleAsOf: null });
+  ok("F: a missing cycleAsOf -> null (fail closed, no exact-read attempted)", noCycle === null);
+  const revoked = await release.readLiveBrandInventory({ accountId: "acctRevoked", cycleAsOf: CYCLE });
+  ok("F: an account with no current-cycle publication -> null (revoked / only earlier-cycle rows)", revoked === null);
+}
+
+// ---- (7) Round-4 Defect 2 / Codex finding 3: fingerprint the SELECTED inventory dependency, not the latest row ----
+{
+  const base = { scope: "account", brand: "Acme", accountIds: ["a1"], reportVersion: "brand-view-account-scoped-v2" };
+  const withSelected = (selectedRow, latestBi = null) => collectBrandViewDependencyFingerprint({
+    ...base,
+    readers: {
+      // getSnapshotMeta backs bs/fp/lh; a brand-inventory read here would be the LATEST row -- but with
+      // getInventorySelected present, the collector reads the SELECTED compact instead, so latestBi is never consulted.
+      getSnapshotMeta: async ({ reportKey }) => (reportKey === "brand-sales" ? { params_hash: "BS", source_refreshed_at: "S" } : (reportKey === "brand-inventory" ? latestBi : null)),
+      getInventorySelected: async () => selectedRow,
+      getAdsCoverage: async () => null, getMappingRev: async () => "", getCatalogValidatedAt: async () => null,
+    },
+  });
+  const availA = { params_hash: "HA", source_refreshed_at: "2026-09-02T00:00:00Z" }; // selected available LKG (Sep 2)
+  const availB = { params_hash: "HB", source_refreshed_at: "2026-09-05T00:00:00Z" }; // a NEWER available compact (Sep 5)
+  const fpA = await withSelected(availA);
+  const fpB = await withSelected(availB);
+  ok("G: a SELECTED-row change (a fresh available compact) flips the fingerprint", fpA !== fpB);
+  // Same SELECTED compact, but the LATEST brand-inventory row (a republished unavailable placeholder) differs.
+  const fpA2 = await withSelected(availA, { params_hash: "PLACEHOLDER_NEW", source_refreshed_at: "2026-09-09T00:00:00Z" });
+  ok("G: the fingerprint is INVARIANT to a latest-placeholder change when the SELECTED compact is unchanged (no needless rebuild)", fpA === fpA2);
 }
 
 writeSync(1, `\nbrand-view-dependency-fingerprint: ${passed} assertions passed\n`);

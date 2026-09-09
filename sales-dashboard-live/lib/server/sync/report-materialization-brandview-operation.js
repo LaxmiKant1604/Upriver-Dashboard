@@ -112,17 +112,22 @@ export async function runBrandInventoryRebuild({ region, accounts, inventoryAsOf
     }
     // eslint-disable-next-line no-loop-func
     await runUnit(events, async () => {
-      // CYCLE-BOUND PER-ACCOUNT AUTHORIZATION: refresh ONLY an account whose LIVE compact was published for THIS
-      // cycle's D-1 (live.params.to === cycleAsOf). Row existence alone is NOT authorization -- an old-cycle row or a
-      // revoked account (no current-cycle row) fails closed to a skip. A missing cycleAsOf also fails closed.
-      const live = await readLiveBrandInventory({ accountId });
-      const liveTo = live && live.params ? String(live.params.to || "") : "";
-      if (!live || !live.payload) {
-        return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "skipped", reason: "unauthorized-no-live-compact", preservedLkg: true, tokens: 0 };
+      // CYCLE-BOUND AUTHORIZATION via EXACT durable cycle evidence (Round-4 Defect 1): the authorization signal is
+      // the priority run's placeholder published for THIS cycle at the EXACT identity params {to: cycleAsOf}. Read
+      // that EXACT row -- NOT the latest-by-updated_at brand-inventory row. This DECOUPLES publication authorization
+      // from the latest DISPLAYED inventory snapshot: a lagging available rebuild lives at a DIFFERENT identity
+      // ({to: its real, earlier inventory date}), so it can NEVER invalidate authorization for a later fresh update
+      // in the SAME cycle (the exact-read still finds the {to: cycleAsOf} placeholder). A revoked account (the priority
+      // run published no current-cycle row for it) fails closed, and a missing cycleAsOf fails closed. The materializer
+      // only REFRESHES an already-authorized, current-cycle identity -- it never first-authorizes.
+      if (!cycleAsOf) {
+        return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "skipped", reason: "unauthorized-no-cycle", preservedLkg: true, tokens: 0 };
       }
-      if (!cycleAsOf || liveTo !== cycleAsOf) {
-        // The live compact is from a DIFFERENT (earlier) cycle, or no cycle was supplied -> not authorized this run.
-        return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "skipped", reason: "unauthorized-stale-cycle", preservedLkg: true, tokens: 0 };
+      const live = await readLiveBrandInventory({ accountId, cycleAsOf });
+      if (!live || !live.payload) {
+        // No brand-inventory row was published for THIS cycle's exact identity {to: cycleAsOf} -> not authorized this
+        // run (covers both a never-published account and one whose only rows are from an EARLIER cycle). Fail closed.
+        return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "skipped", reason: "unauthorized-no-current-cycle-publication", preservedLkg: true, tokens: 0 };
       }
       const plan = await readFbaPlan({ accountId });
       const payload = compactInventoryFromFbaPlanPayload(plan && plan.payload, accountId);
@@ -148,19 +153,14 @@ export async function runBrandInventoryRebuild({ region, accounts, inventoryAsOf
       // actual content, not just the fba-plan timestamp. This writes an inventoryAvailable:false -> true change even
       // when the fba-plan provenance equals the placeholder's (equal-timestamp collision), while a same-content
       // replay stays a zero-write no-op.
-      let depFingerprint = compactInventoryContentFingerprint(payload);
-      if (String(payload.inventoryDate) !== cycleAsOf) {
-        // LAGGING-INVENTORY case (LKG / LATEST_SNAPSHOT_INCOMPLETE): this compact lives at a DIFFERENT paramsHash
-        // ({to: inventoryDate}, e.g. D-2) than the priority placeholder ({to: cycleAsOf} = D-1), which the priority
-        // run REPUBLISHES fresh (inventoryAvailable:false, newest updated_at) EVERY cycle. The serve reads latest-by-
-        // updated_at across all paramsHash, so a content-ONLY fingerprint would skip the re-persist on unchanged
-        // stock and let that fresh unavailable placeholder SHADOW this available compact (Brand View regresses to
-        // unavailable). Fold the cycle in so the available row is re-persisted (newest) each cycle -- materialize-
-        // inventory runs AFTER the priority republish, so its write wins. A same-cycle replay is still a no-op
-        // (cycleAsOf is stable within a cycle). The normal path (inventoryDate == cycleAsOf) shares the placeholder's
-        // paramsHash and overwrites it directly, so it needs no cycle fold.
-        depFingerprint = brandViewDependencyFingerprint({ fp: depFingerprint, cycle: cycleAsOf });
-      }
+      //
+      // Round-4 Defect 2: the Round-3 CYCLE-FOLD (re-persisting a lagging compact "newest each cycle" so it would win
+      // a latest-by-updated_at race) is REMOVED. That was an unconditional per-cycle rewrite and it still lost to a
+      // SAME-CYCLE priority placeholder republish. The placeholder-shadowing problem is now solved correctly in SERVE
+      // SELECTION (selectAuthoritativeInventorySnapshot prefers an available compact over a fresh unavailable
+      // placeholder), so idempotency here stays purely CONTENT-based: an unchanged lagging compact is a zero-write
+      // no-op every cycle, and its real (older) inventory date is preserved -- no fabricated freshness.
+      const depFingerprint = compactInventoryContentFingerprint(payload);
       return materializeSnapshot({
         reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, reportVersion: BRAND_INVENTORY_REPORT_VERSION,
         accountId, params: { to: payload.inventoryDate }, scopeLabel: "brand-inventory",

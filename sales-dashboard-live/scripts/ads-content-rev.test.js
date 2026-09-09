@@ -4,7 +4,7 @@
 // zero-write replay holds). Pure; ZERO I/O. 7-bit ASCII, LF.
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
-import { adsWindowContentRev, committedContentRev } from "../lib/server/ads-sync.js";
+import { adsWindowContentRev, committedContentRev, EMPTY_ADS_CONTENT_REV } from "../lib/server/ads-sync.js";
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -16,7 +16,11 @@ const row = (over = {}) => ({
 });
 const base = [row(), row({ dimension_key: "camp-2|SB", metrics: { ad_spend: 50, ad_sales: 150, ad_clicks: 8 } })];
 
-ok("A: empty rows -> null (no content identity)", adsWindowContentRev([]) === null && adsWindowContentRev(undefined) === null);
+// Round-4 Defect 3: a SUCCESSFULLY-read EMPTY window gets a STABLE, NON-NULL revision (empty-success), distinct from
+// any non-empty window and byte-stable across replays -- so a nonempty->empty transition flips the stored rev.
+ok("A (empty-success): empty rows -> a stable non-null EMPTY revision (not null)",
+  adsWindowContentRev([]) === EMPTY_ADS_CONTENT_REV && adsWindowContentRev(undefined) === EMPTY_ADS_CONTENT_REV
+  && typeof EMPTY_ADS_CONTENT_REV === "string" && /^[0-9a-f]{40}$/.test(EMPTY_ADS_CONTENT_REV));
 
 const revBase = adsWindowContentRev(base);
 ok("A: a non-empty window -> a 40-hex content revision", typeof revBase === "string" && /^[0-9a-f]{40}$/.test(revBase));
@@ -70,5 +74,20 @@ ok("D (fail-soft): absent reader falls back to the batch-rows rev", revNoReader 
 // a different rev over the SAME committed data -> a spurious content_rev flip -> an unwarranted Brand View rebuild.
 const revThrows = await committedContentRev({ readDurableRows: async () => { throw new Error("read fail"); }, accountId: "a", sourceKey: "s", from: "x", to: "y", batchRowsFallback: base });
 ok("D (fail-soft): a THROWN durable read returns null (preserve previous rev; no spurious flip over unchanged data)", revThrows === null);
+
+// ---- Round-4 Defect 3: empty-SUCCESS vs read FAILURE through committedContentRev (nonempty -> empty invalidates) ----
+// A store that starts with rows, then has them all removed (a complete authoritative empty), then replays empty.
+const store2 = base.slice();
+const reader2 = async ({ from, to }) => store2.filter((r) => r.metric_date >= from && r.metric_date <= to);
+const revFull = await committedContentRev({ readDurableRows: reader2, accountId: "a", sourceKey: "s", from: "2026-08-01", to: "2026-09-30", batchRowsFallback: [] });
+store2.length = 0; // all committed rows removed
+const revEmptied = await committedContentRev({ readDurableRows: reader2, accountId: "a", sourceKey: "s", from: "2026-08-01", to: "2026-09-30", batchRowsFallback: [] });
+ok("E (nonempty->empty): a committed store emptied of all rows FLIPS the rev to the stable EMPTY rev (invalidates dependents)",
+  revFull !== revEmptied && revEmptied === EMPTY_ADS_CONTENT_REV);
+const revEmptyReplay = await committedContentRev({ readDurableRows: reader2, accountId: "a", sourceKey: "s", from: "2026-08-01", to: "2026-09-30", batchRowsFallback: [] });
+ok("E (empty replay): an unchanged empty re-read yields the SAME empty rev (replay-stable -> zero-write)", revEmptyReplay === revEmptied);
+// Empty-SUCCESS (a real empty read) is DISTINCT from a read FAILURE (null): they must never be conflated.
+ok("E (empty-success != failure): an empty successful read is the non-null EMPTY rev, a thrown read is null -- distinct",
+  revEmptied === EMPTY_ADS_CONTENT_REV && revThrows === null && revEmptied !== revThrows);
 
 writeSync(1, `\nads-content-rev: ${passed} assertions passed\n`);

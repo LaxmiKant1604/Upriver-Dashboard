@@ -93,22 +93,30 @@ export default function DailyReporting({
       )}
       {completeness && completeness.unitBreakdown && <ObservedUnitsBreakdown completeness={completeness} />}
 
-      {/* ADS DATA-STATE HONESTY (Items 3 + 4): distinguish the VERIFIED advertising window from the UNVERIFIED tail.
-          verifiedThrough is the last day with actual metric evidence -- WITHIN [start .. verifiedThrough] a day with
-          no spend is a VERIFIED zero. The trailing covered days are covered but carry no itemization evidence: this
-          may be provider lag OR genuinely no activity -- a missing row alone proves NEITHER -- so they are shown as
-          UNKNOWN (unavailable), never a measured zero and never asserted to be provider delay. */}
+      {/* ADS DATA-STATE HONESTY (Items 3 + 4): there is NO durable per-date validated-completeness signal, so a
+          covered day with no recorded ad row is NEVER claimed as a measured zero -- it is UNKNOWN. We report only the
+          FACTUAL recorded-data extent (recordedFrom..recordedThrough, recorded of covered day counts). A day without a
+          recorded row is shown as unavailable, not a confirmed zero. This makes no reporting-lag assumption and does
+          not infer that a later metric completes earlier days. */}
       {report && report.adsAvailability && report.adsAvailability.provisionalFrom && (
         <div className="dr-band" role="status">
           <span className="dr-band-icon" aria-hidden="true"><Info size={16} /></span>
           <div>
-            <div className="dr-band-title">Advertising verified through {fmtDateHuman(report.adsAvailability.verifiedThrough || report.adsAvailability.latestMetricDate)}</div>
-            <div className="dr-band-text">
-              Days up to then are confirmed (a day with no spend there is a real zero).{" "}
-              {fmtDateHuman(report.adsAvailability.provisionalFrom)}
-              {report.adsAvailability.provisionalTo && report.adsAvailability.provisionalTo !== report.adsAvailability.provisionalFrom ? ` – ${fmtDateHuman(report.adsAvailability.provisionalTo)}` : ""}
-              {" "}is covered but not yet confirmed by the advertising provider &mdash; this could be provider lag or genuinely no activity, so ad spend and TACoS for those day(s) are shown as unavailable (&mdash;), never a measured zero. No export is created; they resolve on their own as the provider confirms them.
-            </div>
+            {report.adsAvailability.recordedThrough ? (
+              <>
+                <div className="dr-band-title">Advertising recorded for {typeof report.adsAvailability.recordedDayCount === "number" && typeof report.adsAvailability.coveredDayCount === "number" ? `${report.adsAvailability.recordedDayCount} of ${report.adsAvailability.coveredDayCount} covered days` : "part of the covered window"}</div>
+                <div className="dr-band-text">
+                  Recorded ad data spans {fmtDateHuman(report.adsAvailability.recordedFrom)} &ndash; {fmtDateHuman(report.adsAvailability.recordedThrough)}. The other covered days have no recorded ad activity &mdash; the provider has not validated their completeness, so we cannot tell a genuine zero from data not yet reported. Ad spend and TACoS for those days are shown as unavailable (&mdash;), never a measured zero. No export is created; they resolve on their own as the provider reports them.
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="dr-band-title">Advertising not yet recorded for the covered window</div>
+                <div className="dr-band-text">
+                  This window was covered by a successful sync but carries no recorded advertising data yet, and its completeness is not validated by the provider &mdash; we cannot tell genuine zero activity from data not yet reported, so ad spend and TACoS are shown as unavailable (&mdash;), never a measured zero. No export is created; they resolve on their own as the provider reports them.
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

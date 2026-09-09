@@ -666,6 +666,10 @@ test("SKIP-PAGINATION fails closed when a page's rowCount disagrees with its raw
   const res = await runAdsSyncWithDeps(deps, ["US"], [CAMPAIGN], { accountIds: [G6_US], requiredCoverage: REQ });
   assert.equal(calls.upsertRows.length, 0, "a torn page persists NOTHING");
   assert.equal(calls.coverage.length, 0, "no coverage recorded for a torn page");
+  // Round-4 Defect 3 (deletion completeness): an uncertain (torn/incomplete) response reaches NO delete -- old
+  // durable rows are preserved. The clean-replace delete only ever follows a COMPLETE authoritative window
+  // (validateExportPage throws on a torn page before the delete; evidence.ok gates it further).
+  assert.equal(calls.deletes.length, 0, "an uncertain response never deletes -- prior durable rows are preserved");
   assert.deepEqual(res.sources[CAMPAIGN].failedAccounts, [G6_US], "the account is marked failed");
   assert.notEqual(res.status, "completed");
 });

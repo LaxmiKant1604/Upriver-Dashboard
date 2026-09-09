@@ -32,6 +32,7 @@ const {
   buildBrandInventorySnapshot,
   asinBrandFromSalesPayload,
   isCompactInventorySnapshot,
+  selectAuthoritativeInventorySnapshot,
   isStrictCalendarDate,
   addDays,
   monthBack,
@@ -587,6 +588,59 @@ await asyncTest("10. with NO compact snapshot the temporary legacy fba-plan fall
   const wrongVersion = { [`${BRAND_INVENTORY_SNAPSHOT_KEY}|${ACCOUNT_A}`]: { params: { reportVersion: "brand-inventory-OLD" }, payload: { inventoryByBrandCountry: [{ country: "IT", brand: "Bebi Born", fbaAvailable: 1 }] } } };
   const slice2 = await sliceFor(getSnapshotWithInventory(wrongVersion));
   assert.equal(slice2.inventory.byCountry.get("IT"), 883, "a wrong-version compact snapshot is not authoritative; legacy fallback applies");
+});
+
+/* ---- ROUND-4 Defect 2: SERVE SELECTION prefers a genuinely-available compact over a fresh unavailable placeholder ---- */
+
+test("selectAuthoritativeInventorySnapshot prefers an available compact over a NEWER unavailable placeholder", () => {
+  const ph = (to, refreshed, over = {}) => ({ params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to }, source_refreshed_at: refreshed, payload: { inventoryAvailable: false, inventoryByBrandCountry: [], ...over } });
+  const avail = (to, refreshed, rows) => ({ params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to }, source_refreshed_at: refreshed, payload: { inventoryDate: to, inventoryAvailable: true, inventoryByBrandCountry: rows } });
+  // A fresh (newest) unavailable placeholder must NOT shadow a lagging AVAILABLE compact.
+  const placeholderNewest = ph("2026-09-08", "2026-09-08T18:00:00Z");
+  const laggingAvail = avail("2026-09-02", "2026-09-02T17:00:00Z", [{ country: "IN", brand: "Acme", fbaAvailable: 40 }]);
+  const chosen = selectAuthoritativeInventorySnapshot([placeholderNewest, laggingAvail]);
+  assert.equal(chosen.payload.inventoryAvailable, true, "the available compact is selected, not the newer unavailable placeholder");
+  assert.equal(chosen.payload.inventoryDate, "2026-09-02");
+  // Among multiple AVAILABLE compacts the newest real inventory date wins (updated_at breaks a tie).
+  const olderAvail = avail("2026-08-20", "2026-09-09T00:00:00Z", [{ country: "IN", brand: "Acme", fbaAvailable: 5 }]);
+  const newerAvail = avail("2026-09-05", "2026-09-06T00:00:00Z", [{ country: "IN", brand: "Acme", fbaAvailable: 9 }]);
+  assert.equal(selectAuthoritativeInventorySnapshot([olderAvail, newerAvail]).payload.inventoryDate, "2026-09-05", "newest inventory date wins even if its updated_at is older");
+  // With NO available compact, the newest placeholder is returned (honest unavailable).
+  const onlyPlaceholders = selectAuthoritativeInventorySnapshot([ph("2026-09-01", "2026-09-01T00:00:00Z"), ph("2026-09-08", "2026-09-08T00:00:00Z")]);
+  assert.equal(onlyPlaceholders.params.to, "2026-09-08", "no available compact -> newest placeholder (unavailable)");
+  // Non-compacts are ignored; an empty/absent set -> null (caller uses the legacy fallback).
+  assert.equal(selectAuthoritativeInventorySnapshot([{ params: { reportVersion: "old" }, payload: {} }, null]), null);
+  assert.equal(selectAuthoritativeInventorySnapshot([]), null);
+  assert.equal(selectAuthoritativeInventorySnapshot(undefined), null);
+  // Codex finding 3: MANY (>12) newer unavailable placeholders must NOT bury the authoritative available LKG. The
+  // selection prefers the available compact regardless of how many newer placeholders precede it (no recent-N cutoff).
+  const manyPlaceholders = Array.from({ length: 15 }, (_, i) => ph(`2026-09-${String(9 + i).padStart(2, "0")}`, `2026-09-${String(9 + i).padStart(2, "0")}T00:00:00Z`));
+  const buriedLkg = avail("2026-08-25", "2026-08-25T00:00:00Z", [{ country: "IN", brand: "Acme", fbaAvailable: 12 }]);
+  const picked = selectAuthoritativeInventorySnapshot([...manyPlaceholders, buriedLkg]);
+  assert.equal(picked.payload.inventoryAvailable, true, "the available LKG is selected even behind 15 newer placeholders (no latest-N cutoff)");
+  assert.equal(picked.payload.inventoryDate, "2026-08-25", "the LKG keeps its REAL (older) inventory date");
+});
+
+await asyncTest("13(serve). buildAccountBrandSlice serves the AVAILABLE compact over a newest unavailable placeholder (the placeholder-shadowing fix)", async () => {
+  // getInventorySnapshots yields BOTH a NEWEST unavailable placeholder (params.to = the cycle) AND a lagging AVAILABLE
+  // compact (params.to = an earlier date). A latest-by-updated_at read would serve the placeholder (unavailable); the
+  // authoritative selection serves the available compact with its REAL (older) inventory date -- Brand View does NOT
+  // regress to unavailable when the priority republishes the placeholder in the same cycle.
+  const placeholderNewest = { params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-07-28" }, source_refreshed_at: "2026-07-30T00:00:00.000Z", payload: { inventoryAvailable: false, inventoryByBrandCountry: [] } };
+  const laggingAvail = { params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-07-20" }, source_refreshed_at: "2026-07-25T00:00:00.000Z", payload: { inventoryDate: "2026-07-20", inventoryAvailable: true, inventoryByBrandCountry: [{ country: "IT", brand: "Bebi Born", fbaAvailable: 777, skuCount: 3 }] } };
+  const slice = await buildAccountBrandSlice({
+    accountId: ACCOUNT_A, brand: "Bebi Born", asOf: "2026-07-28", account: { name: "Bebi EU", country: "IT" },
+    getSnapshot: fakeGetSnapshot, getAdsRows: fakeGetAdsRows, getCampaignMappings: getCampaignMappingsFake,
+    getInventorySnapshots: async () => [placeholderNewest, laggingAvail],
+  });
+  assert.equal(slice.inventory.byCountry.get("IT"), 777, "the available compact wins over the newest unavailable placeholder");
+  assert.equal(slice.inventoryDate, "2026-07-20", "the served inventory keeps its REAL (older) inventory date");
+  assert.notEqual(slice.inventory.byCountry.get("IT"), 883, "not the legacy fba-plan value, and not the unavailable placeholder");
+});
+
+await asyncTest("13(serve-fallback). with NO multi-row reader buildAccountBrandSlice is byte-identical (legacy single read)", async () => {
+  const slice = await sliceFor(fakeGetSnapshot); // no getInventorySnapshots -> single latest read -> legacy fba-plan
+  assert.equal(slice.inventory.byCountry.get("IT"), 883, "no getInventorySnapshots reader -> unchanged legacy behavior");
 });
 
 await asyncTest("Campaign->brand mapping drives Brand View ad attribution (not the catalog); brand isolation holds", async () => {

@@ -37,6 +37,7 @@ import {
   getLatestReportSnapshotForScope,
   getLatestReportSnapshotHydrated,
   getLatestReportSnapshotMeta,
+  getInventorySnapshotCandidates,
   getLatestSourceProvenance,
   getReportSnapshot,
   getReportSnapshotsOlderThan,
@@ -163,6 +164,11 @@ function brandViewDepFingerprintReaders() {
       const ptr = read && typeof read === "object" && "snapshot" in read ? read.snapshot : read;
       return (ptr && (ptr.validated_at || ptr.payload_sha)) || null;
     },
+    // Round-4 Defect 2: fingerprint the SELECTED authoritative compact (available LKG the builder serves), NOT the
+    // latest brand-inventory row -- so a selected-row change flips the serve fingerprint even when the latest
+    // placeholder is unchanged. Identical selection to the materializer => writer + serve agree.
+    getInventorySelected: (accountId) => getInventorySnapshotCandidates({ reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, accountId, reportVersion: BRAND_INVENTORY_REPORT_VERSION })
+      .then((rows) => selectAuthoritativeInventorySnapshot(rows)).catch(() => null),
   };
 }
 import { makeRouteDeadline } from "../lib/server/sync/source-bucket-sync-runtime.js";
@@ -198,6 +204,7 @@ import {
   buildBrandViewPortfolioSnapshot,
   buildBrandViewSnapshot,
   buildBrandInventorySnapshot,
+  selectAuthoritativeInventorySnapshot,
 } from "../lib/server/reports/brand-view.js";
 import {
   selectorBrandsForAccount, buildBrandAccountMembership, brandKey, brandDisplay,
@@ -2891,6 +2898,11 @@ async function handleDataDoe(req, res) {
           getSnapshot: getLatestReportSnapshotHydrated,
           getAdsRows: getAdsDailySourceRows,
           getCampaignMappings: campaignMappingsReader(),
+          // Round-4 Defect 2: SELECT the authoritative compact inventory from two indexed reads (newest AVAILABLE
+          // compact + newest overall; NO recent-N cutoff) so a fresh unavailable placeholder cannot shadow a lagging
+          // available LKG and a long run of placeholders can never bury it. The SAME reader backs the materializer,
+          // so writer + serve select identically.
+          getInventorySnapshots: ({ reportKey, accountId: id }) => getInventorySnapshotCandidates({ reportKey, accountId: id, reportVersion: BRAND_INVENTORY_REPORT_VERSION }),
         }),
       });
       return;
@@ -2995,6 +3007,8 @@ async function handleDataDoe(req, res) {
         getCatalogRows: getBrandViewCatalogRows,
         deadline: portfolioDeadline,
         getCampaignMappings: campaignMappingsReader(),
+        // Round-4 Defect 2: same authoritative-compact selection for every account in the portfolio rollup.
+        getInventorySnapshots: ({ reportKey, accountId: id }) => getInventorySnapshotCandidates({ reportKey, accountId: id, reportVersion: BRAND_INVENTORY_REPORT_VERSION }),
       });
       await serveSharedReport({
         res,

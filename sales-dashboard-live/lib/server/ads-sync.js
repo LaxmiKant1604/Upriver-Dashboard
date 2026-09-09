@@ -461,14 +461,24 @@ function campaignMetricRecords(rows) {
   }));
 }
 
+// The stable revision of a SUCCESSFULLY-READ EMPTY Ads window (Round-4 Defect 3). A successful read that returns
+// zero rows is a REAL data state ("no ad activity / all rows removed") that must be DISTINGUISHABLE from a read
+// FAILURE: it gets this stable, non-null revision (so a nonempty->empty transition FLIPS the stored content_rev and
+// invalidates every dependent report, and an unchanged-empty replay holds the SAME rev), whereas a read failure
+// yields null (preserve the previous rev -- see committedContentRev). It is the natural sha256 of the empty row set,
+// so it can never collide with a non-empty window's revision.
+export const EMPTY_ADS_CONTENT_REV = createHash("sha256").update("").digest("hex").slice(0, 40);
+
 // CONTENT REVISION (Item 2): a deterministic sha256 over the VALUES of one account's persisted rows in the fetched
 // window, canonicalized so key order / row order never affect it. It changes IFF the content changes (a same-window
 // spend/sales/clicks correction) and is byte-stable on an unchanged re-sync (so a Brand View zero-write replay
 // holds), unlike updated_at / source_refreshed_at / last_daily_sync_at which advance on every run. Hashed over the
-// rows already fetched + persisted -> ZERO extra DataDoe/token. Returns null for an empty account (no rows).
+// rows already fetched + persisted -> ZERO extra DataDoe/token. A SUCCESSFULLY-READ empty window returns the stable
+// EMPTY_ADS_CONTENT_REV (NOT null): empty-success is a real content state that must flip a prior non-empty rev, and
+// is kept distinct from a read FAILURE (which committedContentRev maps to null = preserve previous).
 export function adsWindowContentRev(rowsForAccount) {
   const rows = Array.isArray(rowsForAccount) ? rowsForAccount : [];
-  if (!rows.length) return null;
+  if (!rows.length) return EMPTY_ADS_CONTENT_REV;
   const sortedKeysJson = (obj) => {
     const o = obj && typeof obj === "object" ? obj : {};
     const out = {};
@@ -497,9 +507,12 @@ function subUtcDaysStr(dateStr, days) {
 // Item 3: compute the COMMITTED-durable content revision for one account+source over the canonical window by
 // RE-READING the durable store after the write commits. Window-independent (both daily and monthly syncs read the
 // SAME [from..to]), delete-aware (reflects post-delete state), failure-safe (only called after a successful commit;
-// a failed batch preserves the previous rev). Fail-soft: if the reader is absent or throws, fall back to the
+// a failed batch preserves the previous rev). EMPTY-SUCCESS vs FAILURE (Round-4 Defect 3): a successful read that
+// returns ZERO committed rows yields the stable EMPTY_ADS_CONTENT_REV (non-null) so a nonempty->empty transition
+// FLIPS the stored rev and invalidates dependents; a THROWN read yields null so the caller PRESERVES the previous
+// rev (a transient failure is never mistaken for an emptied window). Fail-soft: an ABSENT reader falls back to the
 // just-persisted batch rows (a best-effort content signal that still catches same-window corrections). Returns the
-// 40-hex rev or null.
+// 40-hex rev (incl. the empty rev) on success, or null ONLY on a thrown read.
 export async function committedContentRev({ readDurableRows, accountId, sourceKey, from, to, batchRowsFallback }) {
   if (typeof readDurableRows === "function") {
     try {
@@ -956,15 +969,50 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
               summary.sources[source.key].failedAccounts.push(...workingBatch.map((entry) => entry.account.id));
               continue; // zero row/metric/coverage/success writes for this batch
             }
-            const normalized = rows.map((row) => rowRecord(source, row, now, connection));
+            let normalized = rows.map((row) => rowRecord(source, row, now, connection));
             // A reduced-grain (aggregated) source must cleanly REPLACE the window per account: any stale rows of a
             // different natural grain (e.g. the old campaign-grain ASIN rows) have different dimension_keys, so an
             // upsert alone would leave them in place and the per-date fold would DOUBLE COUNT. Delete this exact
-            // window for each account being persisted, then insert -- only for a source that declares aggregations,
-            // so the Campaign/PPC contract (no aggregations) keeps its unchanged upsert-only behavior.
+            // window for each account in the batch, then insert -- only for a source that declares aggregations, so
+            // the Campaign/PPC contract (no aggregations) keeps its unchanged upsert-only behavior (it never deletes).
+            //
+            // Round-4 Defect 3 (deletion completeness contract). The clean-replace reconciles removed rows ONLY when
+            // completeness is PROVEN -- and it is, by construction, for EVERY export that reaches this point:
+            //   * fetchAllPages returns a COMPLETE window: it skip-paginates until a short/empty page proves the end,
+            //     and validateExportPage FAILS CLOSED (throws) on any non-COMPLETED status or rowCount/length
+            //     mismatch. A truncated / partial-page / failed response therefore THROWS before this line (caught ->
+            //     failedStateRecord -> NO delete, NO write; the prior durable rows are preserved on an uncertain
+            //     response). A full page never ends the loop, so a cap-truncated window can never masquerade as short.
+            //   * validateExportBatchRows already proved evidence.ok (in-scope, right marketplace/currency) above;
+            //     evidence.ok is false -> failedStateRecord -> NO delete.
+            // So a delete here always accompanies a COMPLETE authoritative window. This includes a proven-complete
+            // EMPTY window (rowCount 0 with a COMPLETED status = the provider validated the window as genuinely empty):
+            // it reconciles the genuine emptiness (delete the stale grain, insert nothing), and the committed content
+            // revision then re-reads the now-empty durable store and returns the stable EMPTY rev, invalidating
+            // dependents. We do NOT gate the delete on non-emptiness -- a non-empty response is not "more
+            // authoritative" than a complete-empty one, and gating on rows would strand stale rows on a genuine
+            // emptying. Completeness (not row count) is the authority.
+            //
+            // The delete is a PERSISTENCE step whose acknowledgement MUST be checked (mirrors the recordCoverage
+            // fail-closed contract): deleteAdsDailySourceRows CATCHES its own errors and RETURNS a typed failure
+            // ({write:'write-failed'|'schema-missing'}) rather than throwing, so an unchecked failed delete followed
+            // by the upsert would leave the surviving stale-grain rows ALONGSIDE the fresh rows (double-count) and
+            // still mark the account succeeded. So a failed delete EXCLUDES that account from this batch: its window
+            // is NOT re-inserted (its prior durable rows stay intact -> no double-count), it is marked failed, and it
+            // retries next cadence. Accounts whose delete was acknowledged proceed normally.
             if (Array.isArray(source.aggregations) && source.aggregations.length) {
+              const deleteFailedIds = new Set();
               for (const { account } of workingBatch) {
-                await deleteRows({ accountId: account.id, sourceKey: source.key, from: range.from, to: range.to });
+                const ack = await deleteRows({ accountId: account.id, sourceKey: source.key, from: range.from, to: range.to });
+                if (!ack || ack.write !== "ok") deleteFailedIds.add(account.id);
+              }
+              if (deleteFailedIds.size) {
+                const failedEntries = workingBatch.filter(({ account }) => deleteFailedIds.has(account.id));
+                await upsertStates(failedEntries.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, new Error("ADS_ROWS_DELETE_FAILED"), now)));
+                summary.sources[source.key].failedAccounts.push(...failedEntries.map((e) => e.account.id));
+                workingBatch = workingBatch.filter(({ account }) => !deleteFailedIds.has(account.id));
+                normalized = normalized.filter((r) => !deleteFailedIds.has(r.account_id));
+                if (!workingBatch.length) continue; // every account's delete failed -> nothing authoritative to persist
               }
             }
             // DURABLE Ads-row persistence FIRST -- latest_metric_date + successful state are written only after.

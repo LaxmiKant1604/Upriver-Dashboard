@@ -10,7 +10,6 @@ import {
   compactInventoryFromFbaPlanPayload, isCompactInventorySnapshot, brandInventory, BRAND_INVENTORY_REPORT_VERSION,
 } from "../lib/server/reports/brand-view.js";
 import { runBrandInventoryRebuild, compactInventoryContentFingerprint } from "../lib/server/sync/report-materialization-brandview-operation.js";
-import { brandViewDependencyFingerprint } from "../lib/server/reports/brand-view-dependency-fingerprint.js";
 import { paramsHashFor } from "../lib/server/report-store.js";
 
 let passed = 0;
@@ -51,18 +50,25 @@ const plans = {
   acctOldCycle: { payload: freshPlan, source_refreshed_at: "2026-09-08T16:40:00Z" },
 };
 // The priority run published a live compact (placeholder) THIS cycle for the authorized accounts -- params.to = the
-// cycle's D-1. acctUnauth has NO row; acctOldCycle's row is from a PREVIOUS cycle (params.to = an earlier D-1).
+// cycle's D-1. acctUnauth has NO row; acctOldCycle's ONLY row is from a PREVIOUS cycle (params.to = an earlier D-1).
 const liveCompacts = {
   acctFresh: { params: { to: CYCLE }, payload: { inventoryAvailable: false }, source_refreshed_at: "2026-09-08T03:15:00Z" },
   acctNoInv: { params: { to: CYCLE }, payload: { inventoryAvailable: false }, source_refreshed_at: "2026-09-08T03:15:00Z" },
   acctOld: { params: { to: CYCLE }, payload: { inventoryAvailable: false }, source_refreshed_at: "2026-09-08T03:15:00Z" },
   acctOldCycle: { params: { to: "2026-09-05" }, payload: { inventoryAvailable: true, inventoryByBrandCountry: [] }, source_refreshed_at: "2026-09-05T03:15:00Z" },
 };
+// Round-4 Defect 1: authorization is the EXACT current-cycle publication -- the operator reads the brand-inventory
+// row whose params.to === cycleAsOf. This harness models that exact read: it returns the account's live row ONLY
+// when it was published for the requested cycle (so an old-cycle-only row is invisible to authorization -> null).
+const exactLive = async ({ accountId, cycleAsOf }) => {
+  const row = liveCompacts[accountId];
+  return (row && String((row.params && row.params.to) || "") === String(cycleAsOf || "")) ? row : null;
+};
 const runRebuild = async ({ liveReader, existingReader, inventoryAsOf = CYCLE } = {}) => {
   const writes = [];
   const r = await runBrandInventoryRebuild({ region: "india", accounts, inventoryAsOf, dryRun: false }, {
     readFbaPlan: async ({ accountId }) => plans[accountId] || null,
-    readLiveBrandInventory: liveReader || (async ({ accountId }) => liveCompacts[accountId] || null),
+    readLiveBrandInventory: liveReader || exactLive,
     readSnapshot: existingReader || (async () => null),
     persistSnapshot: async (u) => { writes.push(u); return { savedAt: u.sourceRefreshedAt }; },
   });
@@ -76,9 +82,9 @@ const runRebuild = async ({ liveReader, existingReader, inventoryAsOf = CYCLE } 
     JSON.stringify(byAcct("materialized")) === JSON.stringify(["acctFresh", "acctOld"])
     && JSON.stringify(byAcct("unavailable")) === JSON.stringify(["acctNoInv"])
     && JSON.stringify(byAcct("skipped")) === JSON.stringify(["acctOldCycle", "acctUnauth"]));
-  ok("B (item 2): a live compact from a PREVIOUS cycle (params.to != inventory_asof) is NOT authorized -> skip, 0 writes",
-    r.events.find((e) => e.account === "acctOldCycle").reason === "unauthorized-stale-cycle" && !writes.find((w) => w.accountId === "acctOldCycle"));
-  ok("B: the no-row account is skipped 'unauthorized-no-live-compact'", r.events.find((e) => e.account === "acctUnauth").reason === "unauthorized-no-live-compact");
+  ok("B (item 2): a live compact from a PREVIOUS cycle (params.to != inventory_asof) is NOT authorized via the exact-read -> skip, 0 writes",
+    r.events.find((e) => e.account === "acctOldCycle").reason === "unauthorized-no-current-cycle-publication" && !writes.find((w) => w.accountId === "acctOldCycle"));
+  ok("B: the no-row account is skipped 'unauthorized-no-current-cycle-publication'", r.events.find((e) => e.account === "acctUnauth").reason === "unauthorized-no-current-cycle-publication");
   ok("B: exactly two live compact writes; none for missing-inventory, no-row, or old-cycle", writes.length === 2);
   const fresh = writes.find((w) => w.accountId === "acctFresh");
   ok("B: the fresh compact carries the fba-plan provenance + the compact report version + a content depFingerprint",
@@ -91,8 +97,9 @@ const runRebuild = async ({ liveReader, existingReader, inventoryAsOf = CYCLE } 
 {
   // ITEM 2 fail-closed: a MISSING inventory_asof authorizes NO account (never a stale-row write).
   const { r, writes } = await runRebuild({ inventoryAsOf: null });
-  ok("B (item 2): a missing inventory_asof fails closed -> every account skipped 'unauthorized-stale-cycle', 0 writes",
-    writes.length === 0 && r.events.filter((e) => e.status === "materialized").length === 0 && r.events.some((e) => e.reason === "unauthorized-stale-cycle"));
+  ok("B (item 2): a missing inventory_asof fails closed -> every account skipped 'unauthorized-no-cycle', 0 writes",
+    writes.length === 0 && r.events.filter((e) => e.status === "materialized").length === 0
+    && r.events.every((e) => e.reason === "unauthorized-no-cycle" || e.reason === "non-primary-or-blank"));
 }
 
 {
@@ -110,7 +117,7 @@ const runRebuild = async ({ liveReader, existingReader, inventoryAsOf = CYCLE } 
 
 {
   // ITEM 1 replay: the existing row is the ALREADY-WRITTEN fresh compact (same content + stored content fingerprint)
-  // at an EQUAL timestamp -> a same-content replay is a ZERO-WRITE no-op.
+  // at an EQUAL timestamp -> a same-content replay is a ZERO-WRITE no-op (pure content idempotency; no marker/backfill).
   const freshCompact = compactInventoryFromFbaPlanPayload(freshPlan, "acctFresh");
   const freshFp = compactInventoryContentFingerprint(freshCompact);
   const alreadyWritten = async ({ reportKey, accountId }) => (reportKey === "brand-inventory" && accountId === "acctFresh"
@@ -142,54 +149,69 @@ const runRebuild = async ({ liveReader, existingReader, inventoryAsOf = CYCLE } 
 }
 
 {
-  // ITEM 1 CROSS-CYCLE (LAGGING inventory -- the review-confirmed HIGH): acctOld's fba-plan date (Sep 2) LAGS the
-  // cycle D-1 (Sep 8). Its compact lives at paramsHash {to: Sep 2} -- a DIFFERENT row than the priority's Sep-8
-  // placeholder, which the priority REPUBLISHES fresh (inventoryAvailable:false, newest updated_at) EVERY cycle. The
-  // serve reads latest-by-updated_at ACROSS paramsHash, so a content-ONLY fingerprint would skip the re-persist on
-  // unchanged stock and let the fresh unavailable placeholder SHADOW this available compact (Brand View regresses to
-  // unavailable). The fix folds the CYCLE into the stored fingerprint of a lagging compact so it is re-persisted
-  // (newest) each cycle, while a SAME-cycle replay stays a zero-write no-op.
+  // ROUND-4 Defect 2 -- LAGGING inventory idempotency is PURE CONTENT (the Round-3 cycle-fold rewrite is REMOVED).
+  // acctOld's fba-plan date (Sep 2) LAGS the cycle D-1 (Sep 8), so its compact lives at paramsHash {to: Sep 2} -- a
+  // DIFFERENT row than the priority's Sep-8 placeholder. The placeholder-shadowing problem is now solved in SERVE
+  // SELECTION (selectAuthoritativeInventorySnapshot, see brand-view-inventory-selection.test.js), so here the write
+  // must be a PURE content fingerprint at the REAL date, and an unchanged lagging compact must NEVER be rewritten --
+  // in the same cycle OR a later cycle (no unconditional per-cycle rewrite / no fabricated freshness).
   const onlyOld = [{ accountId: "acctOld", country: "IN" }];
+  const laggingCompact = compactInventoryFromFbaPlanPayload(plans.acctOld.payload, "acctOld");
+  const laggingContentFp = compactInventoryContentFingerprint(laggingCompact);
   const runOld = async ({ inventoryAsOf, existingReader }) => {
     const writes = [];
     const r = await runBrandInventoryRebuild({ region: "india", accounts: onlyOld, inventoryAsOf, dryRun: false }, {
       readFbaPlan: async ({ accountId }) => plans[accountId] || null,
-      // The priority run republishes acctOld's LIVE placeholder for THIS cycle (params.to = inventoryAsOf) -> authorized.
-      readLiveBrandInventory: async ({ accountId }) => (accountId === "acctOld"
-        ? { params: { to: inventoryAsOf }, payload: { inventoryAvailable: false }, source_refreshed_at: "2026-09-08T03:15:00Z" } : null),
+      // Exact-read authorization: the priority republishes acctOld's placeholder at params.to = the requested cycle.
+      readLiveBrandInventory: async ({ accountId, cycleAsOf }) => (accountId === "acctOld"
+        ? { params: { to: cycleAsOf }, payload: { inventoryAvailable: false }, source_refreshed_at: "2026-09-08T03:15:00Z" } : null),
       readSnapshot: existingReader || (async () => null),
       persistSnapshot: async (u) => { writes.push(u); return { savedAt: u.sourceRefreshedAt }; },
     });
     return { r, writes };
   };
-  const laggingCompact = compactInventoryFromFbaPlanPayload(plans.acctOld.payload, "acctOld");
-  const laggingContentFp = compactInventoryContentFingerprint(laggingCompact);
-  const thisCycleFp = brandViewDependencyFingerprint({ fp: laggingContentFp, cycle: CYCLE });
 
-  // (a) the WRITTEN fingerprint for a lagging compact FOLDS the cycle (it is NOT the pure content fp), so a fresh
-  //     unavailable Sep-8 placeholder cannot shadow it -- it is re-persisted newest each cycle.
+  // (a) a lagging compact writes at its REAL date (Sep 2) with the PURE content fingerprint -- no cycle fold.
   const first = await runOld({ inventoryAsOf: CYCLE });
   const w = first.writes.find((x) => x.accountId === "acctOld");
-  ok("E (item 1 lagging): a lagging (date != cycle) compact stores a CYCLE-FOLDED fingerprint (not the pure content fp)",
-    !!w && w.params.depFingerprint === thisCycleFp && thisCycleFp !== laggingContentFp);
+  ok("E (item 2): a lagging compact writes at its REAL date with the PURE content fingerprint (no cycle fold / rewrite hack)",
+    !!w && w.params.to === "2026-09-02" && w.payload.inventoryAvailable === true && w.params.depFingerprint === laggingContentFp);
 
-  // (b) a SAME-cycle replay (existing row already carries this cycle's folded fp) is a zero-write no-op.
-  const sameCycleExisting = async ({ accountId }) => (accountId === "acctOld"
-    ? { params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-09-02", depFingerprint: thisCycleFp }, payload: laggingCompact, source_refreshed_at: "2026-09-02T16:40:00Z" } : null);
-  const replay = await runOld({ inventoryAsOf: CYCLE, existingReader: sameCycleExisting });
-  ok("E (item 1 lagging): a SAME-cycle replay of the unchanged lagging compact is a zero-write no-op",
-    !replay.writes.find((x) => x.accountId === "acctOld") && replay.r.events.find((e) => e.account === "acctOld").status === "unchanged");
+  // (b) an unchanged lagging compact is a ZERO-WRITE no-op in the SAME cycle AND the next cycle (pure content idempotency).
+  const alreadyWritten = async ({ accountId }) => (accountId === "acctOld"
+    ? { params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-09-02", depFingerprint: laggingContentFp }, payload: laggingCompact, source_refreshed_at: "2026-09-02T16:40:00Z" } : null);
+  const replaySame = await runOld({ inventoryAsOf: CYCLE, existingReader: alreadyWritten });
+  const replayNext = await runOld({ inventoryAsOf: "2026-09-09", existingReader: alreadyWritten });
+  ok("E (item 2): an unchanged lagging compact is a zero-write no-op in the SAME cycle AND the next cycle (no rewrite)",
+    !replaySame.writes.length && replaySame.r.events.find((e) => e.account === "acctOld").status === "unchanged"
+    && !replayNext.writes.length && replayNext.r.events.find((e) => e.account === "acctOld").status === "unchanged");
+}
 
-  // (c) the NEXT cycle, with UNCHANGED lagging stock, RE-PERSISTS (the fingerprint folds the new cycle) so the
-  //     compact stays the newest live row and the fresh Sep-9 unavailable placeholder never shadows it. A content-
-  //     ONLY fingerprint would have been a no-op here -> the exact regression the fix closes.
-  const nextCycle = "2026-09-09";
-  const next = await runOld({ inventoryAsOf: nextCycle, existingReader: sameCycleExisting });
-  const nw = next.writes.find((x) => x.accountId === "acctOld");
-  ok("E (item 1 lagging): the NEXT cycle re-persists the unchanged lagging compact (new cycle fold) -> stays newest",
-    !!nw && nw.payload.inventoryAvailable === true
-    && nw.params.depFingerprint === brandViewDependencyFingerprint({ fp: laggingContentFp, cycle: nextCycle })
-    && nw.params.depFingerprint !== thisCycleFp);
+{
+  // ROUND-4 Defect 1 -- authorization is DECOUPLED from the latest displayed snapshot. The operator passes cycleAsOf
+  // to readLiveBrandInventory and authorizes SOLELY on the exact current-cycle publication. A reader that returns the
+  // {to: cycleAsOf} placeholder authorizes; a reader that returns null (the priority did not publish this account for
+  // THIS cycle -- revoked, or only earlier-cycle rows exist) fails closed. Publishing lagging inventory (a different
+  // identity) never changes this reader's answer for the fresh cycle.
+  const onlyFresh = [{ accountId: "acctFresh", country: "IN" }];
+  const run = async (reader) => {
+    const writes = [];
+    const r = await runBrandInventoryRebuild({ region: "india", accounts: onlyFresh, inventoryAsOf: CYCLE, dryRun: false }, {
+      readFbaPlan: async ({ accountId }) => plans[accountId] || null,
+      readLiveBrandInventory: reader,
+      readSnapshot: async () => null,
+      persistSnapshot: async (u) => { writes.push(u); return { savedAt: u.sourceRefreshedAt }; },
+    });
+    return { r, writes };
+  };
+  // The operator MUST pass cycleAsOf to the reader (so the composition can do the exact paramsHash read).
+  let sawCycle = null;
+  const authorized = await run(async ({ accountId, cycleAsOf }) => { sawCycle = cycleAsOf; return accountId === "acctFresh" ? { params: { to: cycleAsOf }, payload: { inventoryAvailable: false }, source_refreshed_at: "2026-09-08T03:15:00Z" } : null; });
+  ok("E (item 1): the operator passes cycleAsOf to readLiveBrandInventory and materializes when the exact-cycle publication exists",
+    sawCycle === CYCLE && authorized.r.events.find((e) => e.account === "acctFresh").status === "materialized" && authorized.writes.some((x) => x.payload.inventoryAvailable === true));
+  const denied = await run(async () => null); // no current-cycle publication (revoked / only older-cycle rows)
+  ok("E (item 1): no current-cycle publication (exact-read null) fails closed -> skip, 0 writes",
+    !denied.writes.length && denied.r.events.find((e) => e.account === "acctFresh").reason === "unauthorized-no-current-cycle-publication");
 }
 
 writeSync(1, `\nbrand-inventory-rebuild: ${passed} assertions passed\n`);

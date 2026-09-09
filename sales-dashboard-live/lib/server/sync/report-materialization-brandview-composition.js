@@ -13,14 +13,16 @@ import { discoverPrimaryAccountIds } from "./priority-control-pg-store.js";
 import { accountInScope, REGION_SCOPES } from "./scheduler-scope.js";
 import {
   buildBrandViewSnapshot, buildBrandViewPortfolioSnapshot, buildBrandViewBrandDirectory, brandNamesFromPayload,
-  BRAND_VIEW_VERSION, BRAND_VIEW_PORTFOLIO_VERSION,
+  BRAND_VIEW_VERSION, BRAND_VIEW_PORTFOLIO_VERSION, BRAND_INVENTORY_REPORT_VERSION, selectAuthoritativeInventorySnapshot,
 } from "../reports/brand-view.js";
+import { paramsHashFor } from "../report-store.js";
 import { collectBrandViewDependencyFingerprint } from "../reports/brand-view-dependency-fingerprint.js";
 import { campaignMappingRevision } from "../reports/campaign-ads-aggregation.js";
 import { ACTIVE_ADS_SOURCE_KEY } from "../active-ads-source.js";
 import { getCampaignBrandMappings } from "../supabase.js";
 import {
   getLatestReportSnapshot, getLatestReportSnapshotHydrated, getReportSnapshot, getLatestReportSnapshotMeta,
+  getInventorySnapshotCandidates,
   getLatestSourceProvenance, getAdsDailySourceRows, getDailyAdsCoverage, getSourceSnapshot, getSourceSnapshotPayload,
   saveReportSnapshot, publishSnapshotUpdate, claimRefreshLock, releaseRefreshLock,
 } from "../supabase.js";
@@ -53,7 +55,8 @@ export function buildBrandViewMaterializationRelease(overrides = {}) {
     publishUpdate = publishSnapshotUpdate,
     claimLockFn = claimRefreshLock,
     releaseLockFn = releaseRefreshLock,
-    getLiveSnapshot = getLatestReportSnapshot,
+    getExactSnapshot = getReportSnapshot,
+    getInventoryCandidates = getInventorySnapshotCandidates,
     buildSingle = buildBrandViewSnapshot,
     buildPortfolio = buildBrandViewPortfolioSnapshot,
     buildBrandsDir = buildBrandViewBrandDirectory,
@@ -98,6 +101,13 @@ export function buildBrandViewMaterializationRelease(overrides = {}) {
     getAdsCoverage: (accountId) => getAdsCoverageState(accountId, ACTIVE_ADS_SOURCE_KEY).catch(() => null),
     getMappingRev: async (accountId) => campaignMappingRevision(await getCampaignMappings({ accountId }).catch(() => [])),
     getCatalogValidatedAt: () => getCatalogValidatedAt().catch(() => null),
+    // Round-4 Defect 2: the inventory dependency identity is the SELECTED authoritative compact (the available LKG
+    // the builder actually serves), NOT the latest-by-updated_at row. So a selected-row change (a fresh available
+    // compact) flips the fingerprint even when the latest placeholder's metadata is unchanged, and the serve does
+    // NOT needlessly rebuild when an unavailable placeholder republishes but the selection is unchanged. Writer +
+    // serve use the SAME selection, so they agree.
+    getInventorySelected: (accountId) => getInventoryCandidates({ reportKey: BRAND_INVENTORY_LIVE_REPORT_KEY, accountId, reportVersion: BRAND_INVENTORY_REPORT_VERSION })
+      .then((rows) => selectAuthoritativeInventorySnapshot(rows)).catch(() => null),
   };
 
   // The org product-catalog rows (zero-export), read ONCE per portfolio-brand -- mirrors the serve's getBrandViewCatalogRows.
@@ -134,7 +144,7 @@ export function buildBrandViewMaterializationRelease(overrides = {}) {
     }).catch(() => null);
     let payload = null;
     try {
-      payload = await buildSingle({ accountId, brand, asOf, account, getSnapshot: getSnapshotHydrated, getAdsRows, getCampaignMappings });
+      payload = await buildSingle({ accountId, brand, asOf, account, getSnapshot: getSnapshotHydrated, getAdsRows, getCampaignMappings, getInventorySnapshots });
     } catch (_e) { return { notReady: "brand-view-build-failed" }; } // missing required brand-sales -> LKG preserved
     if (!payload) return { notReady: "brand-view-empty" };
     const sourceRefreshedAt = await getProvenance({ reportKey: BRAND_SALES_REPORT_KEY, accountIds: [accountId] }).catch(() => null);
@@ -149,7 +159,7 @@ export function buildBrandViewMaterializationRelease(overrides = {}) {
     }).catch(() => null);
     let payload = null;
     try {
-      payload = await buildPortfolio({ accountIds, brand, asOf, accountsById, getSnapshot: getSnapshotHydrated, getAdsRows, getCatalogRows, deadline: null, getCampaignMappings });
+      payload = await buildPortfolio({ accountIds, brand, asOf, accountsById, getSnapshot: getSnapshotHydrated, getAdsRows, getCatalogRows, deadline: null, getCampaignMappings, getInventorySnapshots });
     } catch (_e) { return { notReady: "portfolio-build-failed" }; }
     if (!payload) return { notReady: "portfolio-empty" };
     const sourceRefreshedAt = await getProvenance({ reportKey: BRAND_SALES_REPORT_KEY, accountIds }).catch(() => null);
@@ -169,11 +179,23 @@ export function buildBrandViewMaterializationRelease(overrides = {}) {
   // Defect A: the FRESH fba-plan snapshot reader + the PER-ACCOUNT authorization signal for the compact
   // brand-inventory rebuild (runBrandInventoryRebuild). Zero-export -- both read durable snapshots only.
   const readFbaPlan = ({ accountId }) => getSnapshotHydrated({ reportKey: "fba-plan", accountId });
-  // The DURABLE, scoped authorization the priority run's fenced + approved publish already established this cycle:
-  // the latest LIVE brand-inventory row for the account (params/{to}-agnostic, updated_at.desc). The safe-close
-  // disables the transient promoted WINDOW toggle but never erases this published row, so it is the coherent signal
-  // that this account is authorized for a zero-export compact refresh (the rebuild only replaces, never first-authorizes).
-  const readLiveBrandInventory = ({ accountId }) => getLiveSnapshot({ reportKey: BRAND_INVENTORY_LIVE_REPORT_KEY, accountId });
+  // Round-4 Defect 1: authorization is the priority run's EXACT current-cycle publication -- the brand-inventory row
+  // at the identity params {to: cycleAsOf} (paramsHash-exact), NOT the latest-by-updated_at row. Reading the EXACT
+  // cycle row decouples publication authorization from the latest DISPLAYED inventory: a lagging available rebuild
+  // (a different identity {to: its real inventory date}) can never invalidate authorization for a later fresh update
+  // in the same cycle, while a revoked account (no current-cycle publication) fails closed. A missing cycleAsOf ->
+  // null (the operator fails closed on it too).
+  const readLiveBrandInventory = ({ accountId, cycleAsOf }) => {
+    const cycle = cycleAsOf != null ? String(cycleAsOf).trim() : "";
+    if (!cycle) return Promise.resolve(null);
+    const paramsHash = paramsHashFor(BRAND_INVENTORY_REPORT_VERSION, { to: cycle });
+    return getExactSnapshot({ reportKey: BRAND_INVENTORY_LIVE_REPORT_KEY, accountId, paramsHash });
+  };
+  // Round-4 Defect 2: the inventory-candidate reader the Brand View builds SELECT the authoritative compact from
+  // (selectAuthoritativeInventorySnapshot) instead of trusting the latest-by-updated_at row -- two indexed reads
+  // (newest AVAILABLE compact + newest overall), NO recent-N cutoff. Zero-export (durable rows only). The SAME
+  // reader backs the serve (api/datadoe.js) so writer + serve select identically.
+  const getInventorySnapshots = ({ reportKey, accountId }) => getInventoryCandidates({ reportKey, accountId, reportVersion: BRAND_INVENTORY_REPORT_VERSION });
 
   return Object.freeze({
     operator, connections, hasPrimary: !!primaryApiKey,
@@ -181,7 +203,7 @@ export function buildBrandViewMaterializationRelease(overrides = {}) {
     readAccountBrands, readAccountSalesBrands,
     deriveBrandView, deriveBrandViewPortfolio,
     readSnapshot, persistSnapshot, claimLock, releaseLock,
-    readFbaPlan, readLiveBrandInventory,
+    readFbaPlan, readLiveBrandInventory, getInventorySnapshots,
     marketplaceToday: today,
   });
 }

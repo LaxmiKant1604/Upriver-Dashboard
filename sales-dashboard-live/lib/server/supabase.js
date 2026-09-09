@@ -457,6 +457,42 @@ export async function getLatestReportSnapshot({ reportKey, accountId }) {
  * named-brand Daily request can never fall back to (and leak) the ALL-brand snapshot, and vice versa. Scope keys
  * are matched against the JSONB params via `params->>key=eq.value`; the newest matching row (by updated_at) wins.
  */
+/**
+ * The candidate inventory snapshots the Brand View serve/materializer selects the AUTHORITATIVE compact from
+ * (Round-4 Defect 2 / Codex finding 3). The priority run republishes an unavailable placeholder at {to: cycle D-1}
+ * every cycle while the zero-export rebuild publishes a real AVAILABLE compact at {to: its real inventory date}; a
+ * single latest-by-updated_at read lets the fresh placeholder shadow a lagging available LKG. Instead of an
+ * arbitrary recent-N cutoff (which a long run of unavailable placeholders could push a valid available LKG out of),
+ * this returns exactly TWO indexed single-row reads, so the authoritative available LKG is ALWAYS found regardless
+ * of how many placeholders exist AND regardless of which path wrote it:
+ *   - the newest AVAILABLE compact, found by filtering the INLINE payload directly (payload->>inventoryAvailable =
+ *     'true'), so it works for a compact written by ANY path (the rebuild, the source-promoted publisher, or a
+ *     pre-existing row) with NO marker to stamp and NO backfill -- the compact payload is always inline + small; and
+ *   - the newest row overall (may be an unavailable placeholder).
+ * The pure selectAuthoritativeInventorySnapshot then prefers the available LKG (keeping its REAL, possibly older
+ * inventory date) and falls back to the latest row only when no available compact exists. Deduped by id.
+ */
+export async function getInventorySnapshotCandidates({ reportKey, accountId, reportVersion }) {
+  const availableQuery = new URLSearchParams({
+    select: "id,report_key,account_id,params_hash,params,payload,payload_storage_path,payload_bytes,source_refreshed_at,updated_at",
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    "payload->>inventoryAvailable": "eq.true",
+    order: "updated_at.desc",
+    limit: "1",
+  });
+  if (reportVersion != null) availableQuery.append("params->>reportVersion", `eq.${reportVersion}`);
+  const [availableRows, latest] = await Promise.all([
+    request(`/rest/v1/report_snapshots?${availableQuery}`).catch(() => []),
+    getLatestReportSnapshot({ reportKey, accountId }).catch(() => null),
+  ]);
+  const available = Array.isArray(availableRows) ? (availableRows[0] || null) : null;
+  const out = [];
+  if (available) out.push(available);
+  if (latest && (!available || String(latest.id) !== String(available.id))) out.push(latest);
+  return out;
+}
+
 export async function getLatestReportSnapshotForScope({ reportKey, accountId, reportVersion = null, scope = {} }) {
   const query = new URLSearchParams({
     select: "id,report_key,account_id,params_hash,params,payload,payload_storage_path,payload_bytes,source_refreshed_at,updated_at",

@@ -108,7 +108,13 @@ export async function collectBrandViewDependencyFingerprint({
     getAdsCoverage = async () => null,
     getMappingRev = async () => "",
     getCatalogValidatedAt = async () => null,
+    // Round-4 Defect 2: the inventory identity is the SELECTED authoritative compact (available LKG), not the latest
+    // brand-inventory row. When absent, fall back to the latest-row meta (byte-identical to the prior behavior).
+    getInventorySelected = null,
   } = readers;
+  const readInventoryIdentity = (accountId) => (typeof getInventorySelected === "function"
+    ? getInventorySelected(accountId)
+    : getSnapshotMeta({ reportKey: "brand-inventory", accountId }));
 
   const ids = [...new Set((accountIds || []).map(S))].filter(Boolean).sort();
 
@@ -121,7 +127,7 @@ export async function collectBrandViewDependencyFingerprint({
     Promise.all(ids.map(async (accountId) => {
       const [bs, bi, fp, lh, ads, map] = await Promise.all([
         safe(() => getSnapshotMeta({ reportKey: "brand-sales", accountId }), null),
-        safe(() => getSnapshotMeta({ reportKey: "brand-inventory", accountId }), null),
+        safe(() => readInventoryIdentity(accountId), null),
         safe(() => getSnapshotMeta({ reportKey: "fba-plan", accountId }), null),
         safe(() => getSnapshotMeta({ reportKey: "listing-health", accountId }), null),
         safe(() => getAdsCoverage(accountId), null),

@@ -467,6 +467,34 @@ export function isCompactInventorySnapshot(snapshot) {
     && Array.isArray(snapshot.payload?.inventoryByBrandCountry);
 }
 
+// SERVE SELECTION (Round-4 Defect 2): pick the AUTHORITATIVE compact brand-inventory snapshot for an account from a
+// set of recent brand-inventory rows, instead of blindly trusting the latest-by-updated_at row. The priority run
+// republishes an inventoryAvailable:false PLACEHOLDER at params {to: cycle D-1} every cycle (newest updated_at), while
+// the zero-export rebuild publishes a REAL available compact at params {to: its real inventory date} -- which, when
+// the fba inventory LAGS the cycle (LKG / LATEST_SNAPSHOT_INCOMPLETE), is a DIFFERENT row than the placeholder. A
+// latest-by-updated_at read lets the fresh placeholder SHADOW that available compact, regressing Brand View to
+// unavailable. So selection PREFERS a genuinely-available compact (the newest real inventory date; updated_at breaks a
+// tie) and only falls back to the newest UNAVAILABLE compact when no available one exists (honest unavailable). This
+// is pure LKG preference -- it never fabricates freshness and never rewrites; the available compact keeps its REAL
+// (possibly older) inventory date, and the fingerprint/serve staleness signal freshness independently. Returns the
+// selected row (a valid compact) or null when the set holds no valid compact (the caller then uses the legacy fallback).
+export function selectAuthoritativeInventorySnapshot(rows) {
+  const compacts = (Array.isArray(rows) ? rows : []).filter(isCompactInventorySnapshot);
+  if (!compacts.length) return null;
+  const available = compacts.filter((s) => s.payload && s.payload.inventoryAvailable === true);
+  const pool = available.length ? available : compacts;
+  const dateOf = (s) => String((s.payload && (s.payload.inventoryDate || s.payload.inventorySnapshotDate)) || "");
+  const timeOf = (s) => String(s.source_refreshed_at || s.updated_at || "");
+  // Newest REAL inventory date wins; a tie breaks to the newest provenance/updated_at. Among available compacts this
+  // is the freshest genuine stock; when none are available it is simply the newest placeholder (unavailable).
+  return pool.slice().sort((a, b) => {
+    const da = dateOf(a); const db = dateOf(b);
+    if (da !== db) return da < db ? 1 : -1;
+    const ta = timeOf(a); const tb = timeOf(b);
+    return ta < tb ? 1 : (ta > tb ? -1 : 0);
+  })[0];
+}
+
 /**
  * PURE, STRICT validation + fold of FBA Inventory Health rows into the compact
  * brand-inventory payload. `invRows` are the raw source rows; `brandByAsin` is a Map
@@ -670,7 +698,7 @@ export async function buildBrandViewBrandDirectory({ accountId, getSnapshot }) {
  * Returns null when this account has nothing for the brand, so the portfolio
  * build can skip it without treating it as an error.
  */
-export async function buildAccountBrandSlice({ accountId, brand, asOf, account, getSnapshot, getAdsRows, catalogRows = null, required = true, getCampaignMappings = async () => [] }) {
+export async function buildAccountBrandSlice({ accountId, brand, asOf, account, getSnapshot, getAdsRows, catalogRows = null, required = true, getCampaignMappings = async () => [], getInventorySnapshots = null }) {
   const salesSnapshot = await getSnapshot({ reportKey: "brand-sales", accountId });
   const salesPayload = salesSnapshot?.payload;
   if (!salesPayload?.rows?.length) {
@@ -748,7 +776,23 @@ export async function buildAccountBrandSlice({ accountId, brand, asOf, account, 
   // compact snapshot shows unavailable, never resurrecting a stale FBA Plan value. The
   // legacy fba-plan/listing-health fallback is allowed ONLY while no valid compact
   // snapshot exists yet.
-  const brandInventorySnapshot = await readOnce(BRAND_INVENTORY_SNAPSHOT_KEY);
+  // SERVE SELECTION (Round-4 Defect 2): when a multi-row inventory reader is wired, SELECT the authoritative compact
+  // (prefer a genuinely-available compact by newest real inventory date) across the account's recent brand-inventory
+  // rows, so a fresh unavailable placeholder republished this cycle cannot shadow a lagging AVAILABLE compact. Without
+  // the reader (legacy/tests) this is byte-identical to the single latest read. Cached under the same key as readOnce.
+  const readBrandInventory = async () => {
+    if (!payloadByKey.has(BRAND_INVENTORY_SNAPSHOT_KEY)) {
+      let selected = null;
+      if (typeof getInventorySnapshots === "function") {
+        const rows = await getInventorySnapshots({ reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, accountId }).catch(() => null);
+        selected = selectAuthoritativeInventorySnapshot(rows);
+      }
+      if (!selected) selected = await getSnapshot({ reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, accountId });
+      payloadByKey.set(BRAND_INVENTORY_SNAPSHOT_KEY, selected);
+    }
+    return payloadByKey.get(BRAND_INVENTORY_SNAPSHOT_KEY);
+  };
+  const brandInventorySnapshot = await readBrandInventory();
   const planSnapshot = await readOnce("fba-plan");
   const inventoryFallbackSnapshot = await readOnce(INVENTORY_FALLBACK_SNAPSHOT_KEY);
   const useCompact = isCompactInventorySnapshot(brandInventorySnapshot);
@@ -1070,9 +1114,9 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
 /**
  * The account-scoped Brand View report snapshot: exactly one account.
  */
-export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, getSnapshot, getAdsRows, getCatalogRows = null, getCampaignMappings = async () => [] }) {
+export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, getSnapshot, getAdsRows, getCatalogRows = null, getCampaignMappings = async () => [], getInventorySnapshots = null }) {
   const catalogRows = typeof getCatalogRows === "function" ? await getCatalogRows().catch(() => null) : null;
-  const slice = await buildAccountBrandSlice({ accountId, brand, asOf, account, getSnapshot, getAdsRows, catalogRows, required: true, getCampaignMappings });
+  const slice = await buildAccountBrandSlice({ accountId, brand, asOf, account, getSnapshot, getAdsRows, catalogRows, required: true, getCampaignMappings, getInventorySnapshots });
   return assembleBrandViewPayload({ slices: [slice], brand, asOf, scope: "account" });
 }
 
@@ -1084,7 +1128,7 @@ export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, 
  * can return a multi-megabyte saved Dashboard payload, and a serverless function
  * holding a dozen of those at once is how this route would run out of memory.
  */
-export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf, accountsById, getSnapshot, getAdsRows, getCatalogRows = null, deadline = null, getCampaignMappings = async () => [] }) {
+export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf, accountsById, getSnapshot, getAdsRows, getCatalogRows = null, deadline = null, getCampaignMappings = async () => [], getInventorySnapshots = null }) {
   // The reusable Product Catalog is org-scoped, so read it ONCE and reuse across every account slice (child_asin
   // -> product_brand is what maps each account's ad ASINs to this brand).
   const catalogRows = typeof getCatalogRows === "function" ? await getCatalogRows().catch(() => null) : null;
@@ -1107,6 +1151,7 @@ export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf,
       catalogRows,
       required: false,
       getCampaignMappings,
+      getInventorySnapshots,
     })));
     for (let j = 0; j < built.length; j += 1) slices[i + j] = built[j];
   }
