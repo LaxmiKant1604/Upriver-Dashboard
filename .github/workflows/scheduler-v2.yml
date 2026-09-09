@@ -255,17 +255,24 @@ jobs:
         if: always() && steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outcome == 'success' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success'
         run: node scripts/release/verify-bucket-readiness.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }} --account-scope=full --eligible-accounts=${{ steps.oli.outputs.full_complete == 'true' && ' ' || steps.oli.outputs.eligible_ids }}
 
+      # INDEPENDENT SALES PUBLICATION (Codex blocker 2): controls + BOTH publish paths are NO LONGER gated on
+      # steps.campaign.outcome. Campaign Ads is an INDEPENDENT best-effort source (like the FBA job) with its own
+      # compatibility preflight, <=5-seller recovery split and LKG isolation; its failure degrades the Daily ads band
+      # to HONESTLY UNAVAILABLE / stale (never a fabricated zero -- the derive + publisher render adsAvailability
+      # unavailable) and must NEVER block the OLI-driven sales dashboards (daily-reporting / brand-sales /
+      # brand-inventory). A Campaign failure is surfaced by the non-failing notice below; the final honesty gate reddens
+      # ONLY on the REQUIRED sales source (OLI). Safe-close fencing is unchanged.
       # (step 7, FULL scope) Open publication controls for this region x 3 keys (all_primary stays false).
       - name: Open publication controls (this region only)
         id: full_controls
-        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
+        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
         run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.region }} --account-scope=full --owner-token=${{ github.run_id }}-${{ github.run_attempt }}
 
       # (steps 6/8/9/10, FULL scope, COMPLETE region) Catalog reuse/refresh + derive + preflight EVERY account in this
       # region + publish this region x3 + live read-back into the NATURAL daily cycle. Runs ONLY when OLI covered the
       # WHOLE region (full_complete). Byte-identical to before. Reached ONLY after the strict D-1 proof.
       - name: Refresh Catalog + derive/preflight/publish this region at D-1 + live read-back (COMPLETE region)
-        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.oli.outputs.full_complete == 'true' && steps.campaign.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
+        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.oli.outputs.full_complete == 'true' && steps.readiness.outputs.proceed == 'true'
         run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.region }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }} --run-token=${{ github.run_id }}-${{ github.run_attempt }} --owner-generation=${{ steps.full_controls.outputs.generation }} --strict-d1
 
       # (steps 6/8/9/10, FULL scope, PARTIAL region -- Codex per-account isolation) Publish EXACTLY the healthy OLI-
@@ -281,7 +288,7 @@ jobs:
       # (from --eligible-accounts), NOT from the operation key.
       - name: Publish the HEALTHY OLI-eligible subset at D-1 into a dedicated cycle + live read-back (PARTIAL region)
         id: partial_publish
-        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.oli.outputs.full_complete != 'true' && steps.oli.outputs.publishable == 'true' && steps.campaign.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
+        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.oli.outputs.full_complete != 'true' && steps.oli.outputs.publishable == 'true' && steps.readiness.outputs.proceed == 'true'
         run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.region }} --eligible-accounts=${{ steps.oli.outputs.eligible_ids }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }} --run-token=${{ github.run_id }}-${{ github.run_attempt }} --owner-generation=${{ steps.full_controls.outputs.generation }} --strict-d1
 
       # Report the partial ONLY when the subset publish actually SUCCEEDED (never claim a publication on a failed step).
@@ -297,7 +304,7 @@ jobs:
 
       # (step 11, FULL scope) Rebuild + verify Brand View membership from ALL current brand-sales snapshots.
       - name: Rebuild + verify Brand View membership (this region's fresh + others' LKG; Supabase-only)
-        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
+        if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.readiness.outputs.proceed == 'true'
         run: node scripts/release/rebuild-brand-membership.mjs
 
       # ===================== BOOTSTRAP scope: TRUE SCOPED PUBLICATION of EXACTLY the wave accounts ==============
@@ -334,12 +341,24 @@ jobs:
         if: always() && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed != 'true' && steps.tokengate.outcome == 'success'
         run: echo "SKIPPED_INSUFFICIENT_TOKENS -- no creates, no controls, LKG unchanged (region=${{ steps.cfg.outputs.region }} requestedAsOf=${{ steps.cfg.outputs.asof }})."
 
-      # Keep the workflow honest after every independent source has had its chance and controls are safe-closed.
-      # continue-on-error above is sequencing only; it must never turn a genuine source failure into a green run.
-      - name: Report independent source failure after all attempts
-        if: always() && steps.guard.outputs.run_required == 'true' && steps.tokengate.outcome == 'success' && steps.tokengate.outputs.proceed == 'true' && (steps.oli.outcome != 'success' || steps.campaign.outcome != 'success')
+      # Campaign Ads UNAVAILABLE notice (non-failing): surfaced when the independent Campaign source failed but the
+      # OLI-driven SALES dashboards still published (ads shown honestly unavailable/stale, never a fabricated zero).
+      # This makes the degraded-ads state VISIBLE without reddening a run whose required sales source (OLI) succeeded.
+      - name: Report Campaign Ads unavailable (sales published independently)
+        if: always() && steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome != 'success'
         run: |
-          echo "SOURCE_REFRESH_FAILED -- OLI outcome=${{ steps.oli.outcome }} Campaign outcome=${{ steps.campaign.outcome }}. Independent attempts completed; publication stayed closed and LKG was preserved." >&2
+          echo "CAMPAIGN_ADS_UNAVAILABLE region=${{ steps.cfg.outputs.region }} campaign=${{ steps.campaign.outcome }} -- the OLI sales dashboards published independently; the Ads band is HONESTLY UNAVAILABLE/stale (never a fabricated zero). Ads self-heal on the next natural cycle."
+          echo "### Campaign Ads unavailable (${{ steps.cfg.outputs.region }}) -- sales published; ads band honestly unavailable/stale" >> "$GITHUB_STEP_SUMMARY"
+
+      # Keep the workflow honest after every source has had its chance and controls are safe-closed. The REQUIRED sales
+      # source is OLI: an OLI failure (fatal / all-deferred exits nonzero, or a genuine source failure) keeps the run
+      # RED (publication stayed closed, LKG preserved). Campaign is INDEPENDENT (best-effort ads) -- its failure is the
+      # non-failing notice above, NOT a red run, because sales published honestly with ads unavailable. continue-on-error
+      # on the source steps is sequencing only; it never turns a genuine SALES-source failure into a green run.
+      - name: Report required (OLI) source failure after all attempts
+        if: always() && steps.guard.outputs.run_required == 'true' && steps.tokengate.outcome == 'success' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome != 'success'
+        run: |
+          echo "SOURCE_REFRESH_FAILED -- OLI (required sales source) outcome=${{ steps.oli.outcome }} (Campaign outcome=${{ steps.campaign.outcome }}, independent). Publication stayed closed and LKG was preserved." >&2
           exit 1
 
   # FBA Shipment Plan + marketplace-capable AWD -- ISOLATED job, its OWN runner + its OWN always-safe-close. Once the

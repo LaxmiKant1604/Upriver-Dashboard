@@ -49,6 +49,14 @@ const eligibleArg = ((process.argv.find((a) => a.startsWith("--eligible-accounts
 let subsetFetchAccounts = null; let subsetCycleBucket = null;
 if (eligibleArg !== "") {
   if (!bucketArg) { console.error("STOP --eligible-accounts REQUIRES --bucket (the region the healthy subset belongs to)."); process.exit(2); }
+  // Healthy-subset publication is REGION-scoped (india|europe-au|us-ca) -- the ONLY regions the priority-partial cycle
+  // namespace + migration 20260924 regex permit. isRoutingScope also accepts the legacy us|non-us buckets, which the
+  // regex does NOT, so reject them HERE (before building the bucket or any write) rather than passing the general-
+  // namespace preflight and then hard-crashing on openCycle after a lease write. Fail closed, ZERO writes.
+  if (!["india", "europe-au", "us-ca"].includes(bucketArg)) {
+    console.error("STOP PRIORITY_PARTIAL_REGION_UNSUPPORTED: healthy-subset publication is region-scoped (india|europe-au|us-ca); got --bucket=" + bucketArg + " -- fail closed (ZERO writes).");
+    process.exit(2);
+  }
   const wanted = [...new Set(eligibleArg.split(",").map((s) => s.trim()).filter(Boolean))].sort();
   if (wanted.length === 0) { console.error("STOP --eligible-accounts was provided but parsed empty (fail closed)."); process.exit(2); }
   const wantedSet = new Set(wanted);
@@ -56,11 +64,34 @@ if (eligibleArg !== "") {
   const { fetchAccounts: fetchDirectory } = await import("../../lib/server/datadoe.js");
   // Deterministic dedicated cycle bucket: the SAME eligible set (a watchdog replay) resolves the SAME cycle (idempotent);
   // a DIFFERENT eligible set (readiness advanced) gets its own cycle -- neither ever touches the natural daily cycle.
-  subsetCycleBucket = "priority-partial-" + bucketArg + "-" + sha256(JSON.stringify(wanted)).slice(0, 12);
+  // Format priority-partial-<region>-<16 hex> matches the CHECK/open_sync_cycle regex added by migration 20260924
+  // (a DISTINCT namespace from bootstrap-<region>-<16hex>; never a disguised bootstrap cycle).
+  subsetCycleBucket = "priority-partial-" + bucketArg + "-" + sha256(JSON.stringify(wanted)).slice(0, 16);
   subsetFetchAccounts = async (apiKey) => {
     const rows = (await fetchDirectory(apiKey)) || [];
     return rows.filter((r) => wantedSet.has(String((r && (r.accountId ?? r.account_id ?? r.id)) || "").trim()));
   };
+  // PRODUCTION-SCHEMA PREFLIGHT (read-only, fail-closed): the priority-partial namespace is permitted ONLY once the
+  // approval-gated migration 20260924 is applied (it widens open_sync_cycle's guard + the sync_cycles bucket CHECK).
+  // Until then openCycle would raise 'Invalid bucket ...'. Probe open_sync_cycle's definition READ-ONLY: if it does
+  // not yet permit priority-partial, STOP with a clear typed PRIORITY_PARTIAL_MIGRATION_PENDING (ZERO control/lease/
+  // publish work; LKG preserved) instead of a raw SQL error -- and NEVER fall back to a bootstrap-shaped bucket.
+  {
+    const probe = new pg.Client({ connectionString: String(process.env.POSTGRES_URL).split("?")[0], ssl: { rejectUnauthorized: false } });
+    let permitted = false;
+    try {
+      await probe.connect();
+      const r = await probe.query("select 1 from pg_proc where proname = 'open_sync_cycle' and pg_get_functiondef(oid) ~ 'priority-partial' limit 1");
+      permitted = r.rowCount === 1;
+    } catch (e) { console.error("STOP PRIORITY_PARTIAL_PREFLIGHT_UNREADABLE: " + (e && e.message ? e.message : e) + " -- fail closed (LKG preserved; ZERO writes)."); try { await probe.end(); } catch { /* ignore */ } process.exit(1); }
+    finally { try { await probe.end(); } catch { /* ignore */ } }
+    if (!permitted) {
+      console.error("STOP PRIORITY_PARTIAL_MIGRATION_PENDING: open_sync_cycle does not yet permit the '" + subsetCycleBucket
+        + "' namespace. Apply the approval-gated migration 20260924_priority_partial_cycle_bucket.sql (MIGRATE_ONLY) first."
+        + " Healthy-subset publication is DEFERRED; the deferred + healthy accounts keep their dated last-known-good; ZERO writes.");
+      process.exit(1);
+    }
+  }
   console.log("priority-release: HEALTHY-SUBSET publication of " + wanted.length + " eligible account(s) in " + bucketArg
     + " into dedicated cycle bucket '" + subsetCycleBucket + "' (deferred accounts keep dated LKG, out of scope; natural daily cycle untouched).");
 }

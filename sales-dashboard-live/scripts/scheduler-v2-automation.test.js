@@ -256,6 +256,40 @@ test("C4f. all batches deferred (no healthy account): NOT fatal but NOT publisha
   assert.equal(c.deferredAccountIds.length, 5);
 });
 
+test("C4g. a FAILED job that ATTEMPTED an insane create count (create_export_count=100) is a SPEND breach -> fatal, publish NOTHING (attempted creates counted independently of successful data)", () => {
+  const c0 = oliCycle(6); // [A01..A05] (oli-0) + [A06] (oli-1)
+  const failHash = c0.sourceJobs.find((j) => c0.owners.filter((o) => o.request_hash === j.request_hash).map((o) => o.account_id).includes("A06")).request_hash;
+  for (const j of c0.sourceJobs) if (j.request_hash === failHash) { j.fetch_status = "failed"; j.error_code = "DATADOE_INITIAL_LOAD_INCOMPLETE"; j.terminal = true; j.create_export_count = 100; }
+  const c = classifyOliPublicationOutcome({ bucket: "us", ...c0 });
+  assert.equal(c.fatal, true, "a failed job with 100 attempted creates is a fatal spend breach: " + JSON.stringify(c.problems));
+  assert.ok(c.fatalProblems.some((p) => p.startsWith("bad-create-count:")), "the bad create count is recorded as FATAL (not swallowed by job-not-succeeded)");
+  assert.equal(c.publishable, false, "no publication under a spend breach");
+  assert.equal(c.outcome, "fatal");
+});
+
+test("C4h. a FAILED job with a WRONG (out-of-scope) owner is an ISOLATION breach -> fatal, publish NOTHING (owner integrity validated on failed jobs too)", () => {
+  const c0 = oliCycle(6);
+  const failHash = c0.sourceJobs.find((j) => c0.owners.filter((o) => o.request_hash === j.request_hash).map((o) => o.account_id).includes("A06")).request_hash;
+  for (const j of c0.sourceJobs) if (j.request_hash === failHash) { j.fetch_status = "failed"; j.terminal = true; }
+  c0.owners.push({ request_hash: failHash, account_id: "A99" }); // an account NOT in discovery, owned by the FAILED job
+  const c = classifyOliPublicationOutcome({ bucket: "us", ...c0 });
+  assert.equal(c.fatal, true, "a failed job owned by an out-of-scope account is a fatal isolation breach: " + JSON.stringify(c.problems));
+  assert.ok(c.fatalProblems.includes("owner-unexpected"), "the wrong owner is recorded as FATAL owner-unexpected");
+  assert.equal(c.publishable, false, "no publication under an isolation breach");
+  assert.equal(c.outcome, "fatal");
+});
+
+test("C4i. a FAILED (readiness) batch with a CLEAN create-count + in-scope owners is STILL only a per-batch defer (partial-publishable) -- integrity validation does not over-fatalize an honest deferral", () => {
+  const c0 = oliCycle(6);
+  const failHash = c0.sourceJobs.find((j) => c0.owners.filter((o) => o.request_hash === j.request_hash).map((o) => o.account_id).includes("A06")).request_hash;
+  for (const j of c0.sourceJobs) if (j.request_hash === failHash) { j.fetch_status = "failed"; j.error_code = "DATADOE_INITIAL_LOAD_INCOMPLETE"; j.terminal = true; j.create_export_count = 1; }
+  const c = classifyOliPublicationOutcome({ bucket: "us", ...c0 });
+  assert.equal(c.fatal, false, "a clean readiness defer (cec<=1, in-scope owner) is NOT fatal");
+  assert.equal(c.outcome, "partial-publishable");
+  assert.deepEqual(c.eligibleAccountIds, ["A01", "A02", "A03", "A04", "A05"]);
+  assert.deepEqual(c.deferredAccountIds, ["A06"]);
+});
+
 group("D. GitHub Actions workflow: INDEPENDENT per-bucket publish + always-safe-close shape");
 
 test("D1. scheduler-v2.yml: the THREE regional crons (0 3 india / 30 8 europe-au / 30 16 us-ca), region resolved FROM the fired cron, dispatch kept, concurrency, Node 24, >=90-min timeout", () => {
@@ -319,11 +353,19 @@ test("D2. workflow shape: INDEPENDENT per-region ordered pipeline -- per-region 
     assert.match(before, /steps\.tokengate\.outputs\.proceed == 'true'/, step + " is gated on the token-gate proceed");
   }
   assert.match(yml, /SKIPPED_INSUFFICIENT_TOKENS/, "the run visibly reports the insufficient-tokens skip");
-  assert.match(yml, /SOURCE_REFRESH_FAILED[^\n]*OLI outcome=\$\{\{ steps\.oli\.outcome \}\} Campaign outcome=\$\{\{ steps\.campaign\.outcome \}\}/, "a final aggregate step keeps genuine source failures red");
+  // INDEPENDENT SALES PUBLICATION (Codex blocker 2): the final honesty gate reddens on the REQUIRED sales source (OLI)
+  // ONLY -- a Campaign (ads) failure is an independent non-failing notice, not a red run (sales published, ads honestly
+  // unavailable). It must never turn a genuine OLI failure green.
+  assert.match(yml, /SOURCE_REFRESH_FAILED[^\n]*OLI \(required sales source\) outcome=\$\{\{ steps\.oli\.outcome \}\}/, "the honesty gate reddens on the required OLI source");
+  assert.match(yml, /if: always\(\)[^\n]*steps\.oli\.outcome != 'success'\s*\n\s*run:[\s\S]*?SOURCE_REFRESH_FAILED/, "the honesty gate fires on OLI failure (not on Campaign)");
+  assert.doesNotMatch(yml, /steps\.oli\.outcome != 'success' \|\| steps\.campaign\.outcome != 'success'/, "the honesty gate no longer reddens the run on a Campaign-only failure");
+  // The Campaign-unavailable NOTICE is non-failing (no `exit 1`) and fires only when OLI succeeded but Campaign did not.
+  assert.match(yml, /Report Campaign Ads unavailable[\s\S]{0,260}steps\.oli\.outcome == 'success' && steps\.campaign\.outcome != 'success'/, "the Campaign-unavailable notice fires on OLI-success + Campaign-failure");
+  assert.match(yml, /CAMPAIGN_ADS_UNAVAILABLE region=[^\n]*never a fabricated zero/, "the notice surfaces the degraded ads state honestly (never a fabricated zero)");
   for (const step of ["priority-control-package.mjs --apply", "priority-dashboards-release.mjs", "rebuild-brand-membership.mjs"]) {
     const at = idx(step); const before = yml.slice(Math.max(0, at - 420), at);
-    assert.match(before, /steps\.oli\.outcome == 'success'/, step + " requires successful OLI");
-    assert.match(before, /steps\.campaign\.outcome == 'success'/, step + " requires successful Campaign Ads");
+    assert.match(before, /steps\.oli\.outcome == 'success'/, step + " requires successful OLI (the sales source)");
+    assert.doesNotMatch(before, /steps\.campaign\.outcome == 'success'/, step + " is NOT gated on Campaign Ads (independent sales publication)");
     assert.match(before, /steps\.readiness\.outputs\.proceed == 'true'/, step + " requires strict D-1 readiness");
   }
   // Round-10 (blocker 4): safe-close runs after any pipeline execution, but ONLY when the matching --apply (full
@@ -434,6 +476,7 @@ test("D5. PER-ACCOUNT publication: the workflow separates COMPLETE (whole-region
   assert.match(partialStep, /--operation-key=priority-dashboards\/scheduled\/\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "the partial publish uses the VALID per-day catalog operation key (not a rejected scheduled-partial/ key)");
   assert.doesNotMatch(partialStep, /scheduled-partial/, "no rejected scheduled-partial operation key");
   assert.match(partialStep, /--strict-d1/, "the partial publish still fails closed below D-1 per account");
+  assert.doesNotMatch(partialStep, /steps\.campaign\.outcome == 'success'/, "the PARTIAL publish is NOT gated on Campaign Ads either (independent sales publication on both paths)");
   // The partial-publication REPORT runs only when the subset publish actually SUCCEEDED (never claims a publication
   // on a failed/skipped step -- a red partial must not print 'healthy accounts published').
   assert.match(yml, /Report a PARTIAL publication[\s\S]{0,200}steps\.partial_publish\.outcome == 'success'/, "the partial report is gated on the subset publish succeeding");
@@ -443,7 +486,7 @@ test("D5. PER-ACCOUNT publication: the workflow separates COMPLETE (whole-region
   // The partial outcome is reported honestly (never a false 'complete') and the deferred count is surfaced.
   assert.match(yml, /PARTIAL_PUBLICATION region=[^\n]*deferred=\$\{\{ steps\.oli\.outputs\.deferred_count \}\}/, "a partial publication is reported honestly with the deferred count");
   // The final honesty gate is UNCHANGED: a non-success OLI (fatal / all-deferred exits nonzero) keeps the run red.
-  assert.match(yml, /SOURCE_REFRESH_FAILED[^\n]*OLI outcome=\$\{\{ steps\.oli\.outcome \}\}/, "a fatal/all-deferred OLI (nonzero exit) still reddens the run (no false green)");
+  assert.match(yml, /SOURCE_REFRESH_FAILED[^\n]*OLI \(required sales source\) outcome=\$\{\{ steps\.oli\.outcome \}\}/, "a fatal/all-deferred OLI (nonzero exit) still reddens the run (no false green)");
 });
 
 test("D6. the release entrypoints implement the three-way outcome + healthy-subset scope (source guards)", () => {

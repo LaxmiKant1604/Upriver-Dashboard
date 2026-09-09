@@ -123,15 +123,18 @@ test("18/19. controls safe-close ALWAYS; the scheduler refreshes the active Camp
   assert.doesNotMatch(yml, /scheduled-asin-ads-refresh/i, "no retired ASIN Ads export step in the scheduler");
 });
 
-test("source failures are isolated for execution but fail closed for publication and final status", () => {
+test("source failures are isolated for execution; publication is gated on the REQUIRED sales source (OLI) + strict D-1, NOT on the independent Campaign Ads source (independent sales publication)", () => {
   assert.match(yml, /id:\s*oli\n\s*continue-on-error:\s*true/);
   assert.match(yml, /id:\s*campaign\n\s*continue-on-error:\s*true\n\s*if:\s*always\(\)[^\n]*steps\.tokengate\.outputs\.proceed == 'true'/);
-  assert.match(yml, /SOURCE_REFRESH_FAILED/, "the run remains visibly failed after all independent attempts");
+  assert.match(yml, /SOURCE_REFRESH_FAILED/, "a REQUIRED (OLI) source failure keeps the run visibly failed after all independent attempts");
   const applyAt = yml.indexOf("priority-control-package.mjs --apply");
   const applyGuard = yml.slice(Math.max(0, applyAt - 420), applyAt);
-  assert.match(applyGuard, /steps\.oli\.outcome == 'success'/);
-  assert.match(applyGuard, /steps\.campaign\.outcome == 'success'/);
+  assert.match(applyGuard, /steps\.oli\.outcome == 'success'/, "publication requires the REQUIRED sales source (OLI)");
+  assert.doesNotMatch(applyGuard, /steps\.campaign\.outcome == 'success'/, "publication is NOT gated on Campaign Ads -- an ads failure degrades to honestly unavailable, never blocks the OLI-driven sales dashboards (Codex blocker 2)");
   assert.match(applyGuard, /steps\.readiness\.outputs\.proceed == 'true'/);
+  // Campaign remains INDEPENDENT: its failure is a non-failing notice, and the honesty gate reddens on OLI only.
+  assert.match(yml, /CAMPAIGN_ADS_UNAVAILABLE/, "a Campaign failure is surfaced by a non-failing unavailable notice");
+  assert.doesNotMatch(yml, /steps\.oli\.outcome != 'success' \|\| steps\.campaign\.outcome != 'success'/, "the honesty gate no longer reddens the run on a Campaign-only failure");
 });
 
 test("US duplicate guard selects only exact D-1 identities for every account x three reports", () => {

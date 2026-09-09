@@ -17,7 +17,7 @@
 // 7-bit ASCII, LF, no top-level await, synchronous writeSync progress, dynamic imports after a dummy env.
 
 import assert from "node:assert/strict";
-import { writeSync } from "node:fs";
+import { writeSync, readFileSync } from "node:fs";
 
 process.env.SUPABASE_URL = process.env.SUPABASE_URL || "http://supabase.test";
 const SB_KEY_ENV = ["SUPABASE", "SERVICE", "ROLE", "KEY"].join("_");
@@ -272,6 +272,10 @@ function makeRelease(over = {}) {
     asOfOverride: over.asOfOverride,
     operationKey: over.operationKey,
     ...(over.openSuperseding ? { openSuperseding: over.openSuperseding } : {}),
+    // Healthy-subset seams (PP2): a dedicated partial cycle bucket + an explicit fetchAccounts subset + the fence.
+    ...(over.cycleBucket ? { cycleBucket: over.cycleBucket } : {}),
+    ...(over.fetchAccounts ? { fetchAccounts: over.fetchAccounts } : {}),
+    ...(over.getControlFence ? { getControlFence: over.getControlFence } : {}),
   });
 }
 
@@ -1032,6 +1036,131 @@ test("PP1d. terminal-succeeded is REQUIRED for a fresh write: with the SAME fres
   const okp = await relOk.publishAccount("A01");
   for (const r of okp.results) assert.equal(r.disposition, "published", "the same account publishes once its own cycle is terminal");
   assert.equal(liveStore.size, 3, "exactly 3 fresh live rows once terminal");
+});
+
+/* ===================== PP2. REAL eligible-subset flow: dedicated partial cycle creation + exact dashboard readback ===================== */
+group("PP2. eligible-subset flow through cycle creation + finalize scope + exact live readback (not only publisher injection)");
+
+const PARTIAL_BUCKET = "priority-partial-us-ca-0123456789abcdef"; // priority-partial-<region>-<16hex> (migration 20260924 regex)
+
+test("PP2a. cycle CREATION IDENTITY: with an eligible subset the release routes derive + finalize to the DEDICATED partial cycle bucket (never the natural region cycle)", async () => {
+  const runCycleBuckets = []; const cycleQueried = [];
+  const rel = priorityMod.buildPriorityDashboardsRelease({
+    cycleBucket: PARTIAL_BUCKET,
+    fetchAccounts: async () => [{ id: "A01", name: "A01", country: "US", currency: "USD", status: "active" }, { id: "A02", name: "A02", country: "US", currency: "USD", status: "active" }],
+    buildRuntime: () => ({ makeDeadline: () => ({}), preflightEvidence: async () => ({ accounts: [{ accountId: "A01" }, { accountId: "A02" }], today: TODAY }), run: async (opts) => { runCycleBuckets.push(opts && opts.cycleBucket); return { rollup: { stopped: false, continuationRequired: false, globalDrained: true, derived: { skipped: null, daily: { ready: true, saved: 2 }, brandView: { ready: true, saved: 2 }, brandInventory: { saved: 2 }, lineage: [0, 1, 2, 3, 4, 5] } } }; } }),
+    makeInnerAdapter: () => makeInner([]),
+    buildPublisher: () => ({ publish: async () => ({ disposition: "published" }), preflight: async () => ({ disposition: "ready" }) }),
+    reservation: makeFakeReservation(),
+    makeStore: () => ({ listSourceJobs: async () => [], listCycleOwners: async () => [], finalizeCycle: async () => ({}) }),
+    listReportJobs: async () => [],
+    getCycleByBucketDate: async (bucket) => { cycleQueried.push(bucket); return null; }, // absent -> derive opens a fresh cycle
+    getControlFence: () => ({ ownerToken: "t", generation: 1 }),
+  });
+  await rel.deriveBucket("us-ca");
+  assert.ok(runCycleBuckets.includes(PARTIAL_BUCKET), "the derive opens/uses the DEDICATED partial cycle bucket (cycle creation), not the natural region cycle: " + JSON.stringify(runCycleBuckets));
+  assert.ok(cycleQueried.every((b) => b === PARTIAL_BUCKET), "every cycle lookup during derive targets the partial bucket: " + JSON.stringify(cycleQueried));
+  assert.ok(!cycleQueried.includes("us-ca"), "the NATURAL region cycle is never queried by the subset flow");
+});
+
+test("PP2b. finalize scope + EXACT dashboard readback: an already-terminal partial cycle finalizes to EXACTLY the eligible subset; each healthy account's live dashboards read back at D-1; the deferred account's dated LKG is byte-identical", async () => {
+  const CAT_WARM = [{ source_key: CATALOG, request_hash: "cat-hash", fetch_status: "succeeded", create_export_count: 0, cache_object_path: "source-cache/v2/cat-hash.json" }];
+  const CAT_OWN = [{ request_hash: "cat-hash", account_id: ORG }];
+  const cycleQueried = [];
+  const liveStore = new Map();
+  // Seed A03 (deferred, OUT of the eligible subset) with DATED (older) last-known-good live rows.
+  const A03_LKG = new Map();
+  for (const rk of ["daily-reporting", "brand-sales", "brand-inventory"]) {
+    const c = publisherCore.SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[rk];
+    const oldParams = rk === "brand-inventory" ? { to: "2026-08-10" } : (rk === "daily-reporting" ? { from: "2026-03-19", to: "2026-08-10", brand: "ALL" } : { from: "2025-01-01", to: "2026-08-10" });
+    const ph = reportStore.paramsHashFor(c.liveReportVersion, oldParams);
+    const key = c.liveReportKey + "|A03|" + ph;
+    const row = { report_key: c.liveReportKey, account_id: "A03", params_hash: ph, params: { reportVersion: c.liveReportVersion, ...oldParams }, payload: { dated: "lkg-2026-08-10" }, payload_storage_path: null, source_refreshed_at: TS };
+    liveStore.set(key, row); A03_LKG.set(key, JSON.stringify(row));
+  }
+  const beforeSize = liveStore.size;
+  // The REAL publisher over the eligible subset [A01,A02] (both terminal-succeeded); publishLiveFenced writes liveStore.
+  const scope = ["A01", "A02"];
+  const pub = pubComposition.buildSchedulerV2Publisher({
+    connections: [{ id: "primary", apiKey: "k", accountPrefix: "" }],
+    fetchAccounts: async () => scope.map((id) => ({ id, name: id, country: "US", currency: "USD", status: "active" })),
+    getAccountRollout: async () => ({ read: "ok", allPrimary: false, enabledAccountIds: [...scope] }),
+    getSettings: async () => [{ report_key: "daily-reporting", schedule_enabled: true }, { report_key: "brand-sales", schedule_enabled: true }],
+    getPromotedSettings: async () => [{ report_key: "brand-inventory", publish_enabled: true }],
+    getApproval: async () => ({ read: "ok", approved: true }),
+    getJob: async (rk, acct) => ({ cycle_id: "cyc-p", validated: true, snapshot_params_hash: shadowHashFor(rk, acct), derive_status: "succeeded", save_status: "succeeded", cycle_status: "succeeded" }),
+    getSnapshot: async ({ reportKey, accountId }) => { const rk = reportKey.replace("scheduler-v2/", ""); const s = shadowSpecFor(rk, accountId); return { params_hash: shadowHashFor(rk, accountId), params: s.params, payload: s.payload, payload_storage_path: null, source_refreshed_at: TS }; },
+    getControlFence: () => ({ ownerToken: "t", generation: 1 }),
+    publishLiveFenced: async (args) => { liveStore.set(args.reportKey + "|" + args.accountId + "|" + args.paramsHash, { report_key: args.reportKey, account_id: args.accountId, params_hash: args.paramsHash, params: args.params, payload: args.payload, payload_storage_path: null, source_refreshed_at: args.sourceRefreshedAt }); return { outcome: "inserted" }; },
+  });
+  const rel = priorityMod.buildPriorityDashboardsRelease({
+    cycleBucket: PARTIAL_BUCKET,
+    fetchAccounts: async () => scope.map((id) => ({ id, name: id, country: "US", currency: "USD", status: "active" })),
+    buildRuntime: () => ({ makeDeadline: () => ({}), preflightEvidence: async () => ({ accounts: scope.map((accountId) => ({ accountId })), today: TODAY }), run: async () => ({}) }),
+    makeInnerAdapter: () => makeInner([]),
+    buildPublisher: () => pub,
+    reservation: (() => { const r = makeFakeReservation(); r._rows.set(OP(), { catalog_request_hash: "cat-hash", export_id: "e1", status: "created", tokens_spent: 2 }); return r; })(),
+    makeStore: () => ({ listSourceJobs: async () => CAT_WARM, listCycleOwners: async () => CAT_OWN, finalizeCycle: async () => ({ disposition: "finalized", cycle: { status: "succeeded" } }) }),
+    listReportJobs: async () => repJobsFor(["A01", "A02"]), // the eligible subset's validated report jobs (exact-count scope)
+    getCycleByBucketDate: async (bucket) => { cycleQueried.push(bucket); return { id: "cyc-p", bucket, status: "succeeded", trigger: "manual" }; },
+    getControlFence: () => ({ ownerToken: "t", generation: 1 }),
+  });
+  // FINALIZE: routes to the partial bucket + scopes to EXACTLY the eligible subset.
+  const fin = await rel.finalizeBucket("us-ca");
+  assert.ok(cycleQueried.includes(PARTIAL_BUCKET) && !cycleQueried.includes("us-ca"), "finalize targets the DEDICATED partial cycle bucket, never the natural region cycle");
+  assert.deepEqual([...(fin.accounts || [])].sort(), ["A01", "A02"], "finalize scopes to EXACTLY the eligible subset (A03 excluded)");
+  // PUBLISH each eligible account through the REAL publisher; then EXACT live readback at D-1.
+  const readback = releaseRunner.buildLiveReadback({
+    getReportSnapshot: async ({ reportKey, accountId, paramsHash }) => liveStore.get(reportKey + "|" + accountId + "|" + paramsHash) || null,
+    loadStoragePayload: async () => null, liveContracts: publisherCore.SCHEDULER_LIVE_SNAPSHOT_CONTRACTS, reportDerivations: reportDerivation.REPORT_DERIVATIONS, computeHash: reportStore.paramsHashFor,
+  });
+  for (const acct of scope) {
+    const outp = await rel.publishAccount(acct);
+    for (const r of outp.results) {
+      assert.equal(r.disposition, "published", acct + "/" + r.reportKey + " published fresh D-1");
+      const rb = await readback({ reportKey: r.reportKey, liveReportKey: r.liveReportKey, accountId: acct, paramsHash: r.paramsHash });
+      assert.deepEqual(rb, { ok: true }, acct + "/" + r.reportKey + " reads back at the EXACT live D-1 identity");
+    }
+  }
+  // A03 (deferred, out of scope) is untouched: its DATED LKG rows are byte-identical and no fresh A03 row was created.
+  for (const [key, json] of A03_LKG) assert.equal(JSON.stringify(liveStore.get(key)), json, "A03 dated LKG untouched: " + key.slice(0, 20));
+  for (const rk of ["daily-reporting", "brand-sales", "brand-inventory"]) assert.equal(liveStore.has(liveKeyFor(rk, "A03")), false, "no fresh D-1 A03 " + rk + " row");
+  assert.equal(liveStore.size, beforeSize + 2 * 3, "exactly the 2 eligible accounts x 3 dashboards were written; A03 unchanged");
+});
+
+/* ===================== PP3. production-schema compatibility: partial cycle bucket vs. live allow-list + migration ===================== */
+group("PP3. production-schema compatibility: the partial cycle bucket, the live allow-list, and migration 20260924");
+
+test("PP3a. the partial bucket format matches the migration regex; the CURRENT (pre-20260924) allow-list REJECTS it (so the migration is genuinely required, and the code never disguises it as bootstrap)", () => {
+  const bucket = "priority-partial-us-ca-0123456789abcdef";
+  const partialRe = /^priority-partial-(india|europe-au|us-ca)-[0-9a-f]{16}$/;
+  const bootstrapRe = /^bootstrap(-fba)?-(india|europe-au|us-ca)-[0-9a-f]{16}$/;
+  const fixed13 = ["us", "non-us", "us-fba", "non-us-fba", "india", "europe-au", "us-ca", "india-fba", "europe-au-fba", "us-ca-fba", "listing-health-v3-india", "listing-health-v3-europe-au", "listing-health-v3-us-ca"];
+  assert.match(bucket, partialRe, "the entrypoint bucket matches the migration's priority-partial regex");
+  assert.doesNotMatch(bucket, bootstrapRe, "it is a DISTINCT namespace -- never matches (is never disguised as) a bootstrap bucket");
+  assert.equal(fixed13.includes(bucket), false, "the CURRENT fixed allow-list does NOT contain it (pre-migration rejection -> the migration is required)");
+  // The entrypoint derives exactly this shape (region + 16 hex); assert the source builds a 16-hex region-anchored bucket.
+  const relSrc = readFileSync(new URL("../scripts/release/priority-dashboards-release.mjs", import.meta.url), "utf8");
+  assert.ok(relSrc.includes('"priority-partial-" + bucketArg + "-"') && relSrc.includes(".slice(0, 16)"), "the bucket is priority-partial-<region>-<sha256[:16]>");
+  assert.match(relSrc, /PRIORITY_PARTIAL_MIGRATION_PENDING/, "a read-only preflight fails closed until the migration is applied (never a raw Invalid-bucket crash)");
+  // Region guard (BEFORE any write): the legacy us|non-us buckets that isRoutingScope also accepts do NOT match the
+  // region-anchored priority-partial regex, so subset mode rejects them fail-closed instead of passing the general
+  // preflight and crashing on openCycle after a lease write.
+  assert.match(relSrc, /PRIORITY_PARTIAL_REGION_UNSUPPORTED/, "subset mode rejects a non-(india|europe-au|us-ca) bucket before any write");
+  assert.match(relSrc, /\["india", "europe-au", "us-ca"\]\.includes\(bucketArg\)/, "the region guard restricts the partial namespace to the three regex-permitted regions");
+});
+
+test("PP3b. migration 20260924 adds ONLY the priority-partial regex to sync_cycles_bucket_check + open_sync_cycle, PRESERVES the fixed values + the bootstrap regex, and does NOT touch record_onboarding_publication (no bootstrap disguise)", () => {
+  const mig = readFileSync(new URL("../supabase/migrations/20260924_priority_partial_cycle_bucket.sql", import.meta.url), "utf8");
+  assert.match(mig, /priority-partial-\(india\|europe-au\|us-ca\)-\[0-9a-f\]\{16\}/, "adds the priority-partial regex");
+  assert.match(mig, /bootstrap\(-fba\)\?-\(india\|europe-au\|us-ca\)-\[0-9a-f\]\{16\}/, "PRESERVES the existing bootstrap regex");
+  for (const v of ["'us-ca'", "'india'", "'europe-au'", "'listing-health-v3-india'"]) assert.ok(mig.includes(v), "preserves the fixed allow-list value " + v);
+  assert.match(mig, /alter table public\.sync_cycles drop constraint if exists sync_cycles_bucket_check/, "idempotently re-adds the sync_cycles bucket CHECK");
+  assert.match(mig, /create or replace function public\.open_sync_cycle/, "widens open_sync_cycle's guard");
+  assert.match(mig, /grant execute on function public\.open_sync_cycle[\s\S]*to service_role/, "re-enforces service_role-only execute");
+  // record_onboarding_publication may only be NAMED in a comment (explaining the non-overlap), NEVER in a DDL line.
+  assert.ok(mig.split("\n").every((ln) => ln.trim().startsWith("--") || !ln.includes("record_onboarding_publication")), "does NOT touch the bootstrap-only publication manifest in any DDL (no bootstrap disguise / lifecycle overlap)");
+  assert.ok(mig.split("\n").every((ln) => ln.trim().startsWith("--") || !/\bdrop\s+table\b/i.test(ln)), "never drops a table");
 });
 
 /* ===================== P11. the exact publication control package builder (prepared) ===================== */

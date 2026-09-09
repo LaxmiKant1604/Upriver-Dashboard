@@ -107,27 +107,36 @@ export function assessScheduledOliCycle({ bucket, discoveredAccounts, sourceJobs
     ownersByHash.get(h).push(S(o.account_id ?? o.accountId));
   }
 
+  // ATTEMPTED creates across ALL jobs -- a create-export POST spends the durable reservation whether or not the fetch
+  // then SUCCEEDED, so the spend/ceiling accounting must count it independently of successful data (a FAILED job that
+  // attempted 100 creates is a spend breach, never a mere "job-not-succeeded"). Eligibility (ownerUnion/seenHashes)
+  // counts ONLY succeeded jobs.
   let creates = 0;
   const ownerUnion = new Set();
   const seenHashes = new Set();
   for (const j of jobs) {
     const sk = S(j.source_key ?? j.sourceKey);
     if (sk !== OLI_SOURCE_KEY) { push("non-oli-source:" + sk); continue; }
-    if (S(j.fetch_status ?? j.fetchStatus) !== "succeeded") { push("job-not-succeeded"); continue; }
+    // INTEGRITY / OWNERSHIP / SPEND -- validated for EVERY job regardless of fetch outcome (a failed/pending job's
+    // create-count, request hash, and owner scope/size are all part of the run's integrity). A create-count that is
+    // not exactly 0 or 1, a blank hash, an oversized batch, an org-scope owner, or an out-of-scope owner is a breach
+    // whether the job succeeded or failed -- so it can never be smuggled past as a non-fatal per-batch deferral.
     const cec = Number(j.create_export_count ?? j.createExportCount);
     if (!(cec === 0 || cec === 1)) { push("bad-create-count:" + S(cec)); continue; }
-    creates += cec === 1 ? 1 : 0;
+    creates += cec === 1 ? 1 : 0; // ATTEMPTED create -- counted for the spend ceiling even on a failed job
     const h = S(j.request_hash ?? j.requestHash);
     if (!nb(h)) { push("blank-hash"); continue; }
-    seenHashes.add(h);
     const jobOwners = ownersByHash.get(h) || [];
-    if (!jobOwners.length) { push("owners-missing"); continue; }
     if (jobOwners.length > MAX_ACCOUNTS_PER_BATCH) push("batch-oversized:" + jobOwners.length);
     for (const a of jobOwners) {
       if (a === ORGANIZATION_SCOPE_KEY) { push("owner-org-scope"); continue; }
       if (!discoveredSet.has(a)) push("owner-unexpected");
-      ownerUnion.add(a);
     }
+    // ELIGIBILITY -- ONLY a SUCCEEDED job contributes owner coverage + a batch to the publishable set.
+    if (S(j.fetch_status ?? j.fetchStatus) !== "succeeded") { push("job-not-succeeded"); continue; }
+    seenHashes.add(h);
+    if (!jobOwners.length) { push("owners-missing"); continue; }
+    for (const a of jobOwners) if (a !== ORGANIZATION_SCOPE_KEY && discoveredSet.has(a)) ownerUnion.add(a);
   }
   for (const a of discovered) if (!ownerUnion.has(a)) push("owner-coverage-missing");
 

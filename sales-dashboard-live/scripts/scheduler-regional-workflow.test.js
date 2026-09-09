@@ -94,15 +94,20 @@ test("C1. scheduler-v2 has an isolated fba job: needs run, always()+shared-guard
   assert.match(schedulerYml, /token_proceed:\s*\$\{\{ steps\.tokengate\.outputs\.proceed \}\}/);
 });
 
-test("C1b. OLI, Campaign Ads and FBA have independent failure boundaries while publication stays all-source gated", () => {
+test("C1b. OLI, Campaign Ads and FBA have independent failure boundaries; INDEPENDENT sales publication (publication gated on the REQUIRED sales source OLI, NOT on Campaign Ads)", () => {
   assert.match(schedulerYml, /id:\s*oli\n\s*continue-on-error:\s*true/);
   assert.match(schedulerYml, /id:\s*campaign\n\s*continue-on-error:\s*true\n\s*if:\s*always\(\)/);
-  assert.match(schedulerYml, /SOURCE_REFRESH_FAILED/, "independent sequencing must not hide a real source failure");
+  assert.match(schedulerYml, /SOURCE_REFRESH_FAILED/, "independent sequencing must not hide a real REQUIRED-source (OLI) failure");
   const applyAt = schedulerYml.indexOf("priority-control-package.mjs --apply");
   const applyGuard = schedulerYml.slice(Math.max(0, applyAt - 420), applyAt);
+  // The publication controls require the REQUIRED sales source (OLI) + strict D-1 readiness -- but NO LONGER Campaign
+  // Ads: a Campaign failure degrades the ads band to honestly unavailable/stale and must never block sales publication
+  // (Codex blocker 2). The honesty gate reddens on OLI only; Campaign failure is a non-failing CAMPAIGN_ADS_UNAVAILABLE
+  // notice.
   assert.match(applyGuard, /steps\.oli\.outcome == 'success'/);
-  assert.match(applyGuard, /steps\.campaign\.outcome == 'success'/);
+  assert.doesNotMatch(applyGuard, /steps\.campaign\.outcome == 'success'/, "controls are NOT gated on Campaign Ads (independent sales publication)");
   assert.match(applyGuard, /steps\.readiness\.outputs\.proceed == 'true'/);
+  assert.match(schedulerYml, /CAMPAIGN_ADS_UNAVAILABLE/, "a Campaign failure is surfaced by a non-failing unavailable notice, not a publication block");
 });
 
 test("C2. fba-plan-golive carries NO cron (old 0 4 / 0 5 / 30 12 / 30 13 removed); manual modes preserved", () => {
