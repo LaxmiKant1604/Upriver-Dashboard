@@ -20,6 +20,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..", "..");
 const wf = readFileSync(path.join(repoRoot, ".github/workflows/scheduler-v2.yml"), "utf8");
 const flags = readFileSync(path.join(here, "..", "src/lib/feature-flags.js"), "utf8");
+const fbaGolive = readFileSync(path.join(here, "release", "fba-plan-golive.mjs"), "utf8");
 
 // Isolate the listing-health-v3 job block (from its key to the NEXT job key, if any).
 const v3Idx = wf.indexOf("\n  listing-health-v3:");
@@ -45,11 +46,15 @@ const matInvJob = matInvIdx > 0 ? wf.slice(matInvIdx, matInvEnd) : "";
 
 /* ===================== A. dependency order + gate (P1 FBA-completeness contract) ===================== */
 ok("A: the v3 job needs BOTH run and fba", /needs:\s*\[run,\s*fba\]/.test(v3Job));
-ok("A: P1 -- the v3 job is gated on a resolved region, fba success, AND fba_complete=='true' (not merely success)",
-  /needs\.run\.outputs\.region\s*!=\s*''/.test(v3Job) && /needs\.fba\.result\s*==\s*'success'/.test(v3Job) && /needs\.fba\.outputs\.fba_complete\s*==\s*'true'/.test(v3Job));
-ok("A: P1 -- the fba job EXPOSES fba_complete as a job output mapped from the id'd golive step",
-  /\n  fba:\n[\s\S]*?outputs:\s*\n\s*fba_complete:\s*\$\{\{\s*steps\.fba\.outputs\.fba_complete\s*\}\}/.test(beforeV3) && /id:\s*fba\b/.test(beforeV3));
-ok("A: P1 -- a PARTIAL region (fba exits success but fba_complete!='true') therefore SKIPS v3 (zero creates)", /needs\.fba\.outputs\.fba_complete\s*==\s*'true'/.test(v3Job));
+ok("A: optional-inventory -- the v3 job is gated on a resolved region, fba success, AND fba_published=='true' (runs on a partial FBA region)",
+  /needs\.run\.outputs\.region\s*!=\s*''/.test(v3Job) && /needs\.fba\.result\s*==\s*'success'/.test(v3Job) && /needs\.fba\.outputs\.fba_published\s*==\s*'true'/.test(v3Job));
+ok("A: the fba job EXPOSES fba_published as a job output mapped from the id'd golive step",
+  /\n  fba:\n[\s\S]*?outputs:\s*\n[\s\S]*?fba_published:\s*\$\{\{\s*steps\.fba\.outputs\.fba_published\s*\}\}/.test(beforeV3) && /id:\s*fba\b/.test(beforeV3));
+ok("A: optional-inventory -- a HARD FBA crash (zero accounts published, fba_published!='true') SKIPS v3; a PARTIAL region (some published) RUNS it", /needs\.fba\.outputs\.fba_published\s*==\s*'true'/.test(v3Job));
+// GATE/WRITER CONTRACT: fba-plan-golive MUST emit fba_published as a BOOLEAN string ("true"/"false"), never the
+// numeric account count -- otherwise the `== 'true'` string gate is unsatisfiable and v3 silently never runs.
+ok("A: the fba golive writer emits fba_published as a BOOLEAN (anyPublished > 0), not the numeric count",
+  /ghOut\("fba_published",\s*anyPublished\s*>\s*0\s*\?\s*"true"\s*:\s*"false"\)/.test(fbaGolive) && !/ghOut\("fba_published",\s*String\(anyPublished\)\)/.test(fbaGolive));
 ok("A: the fba job itself only needs run (v3 runs strictly after fba)", /^\s{2}fba:\s*$/m.test(wf) && /\n  fba:\n[\s\S]*?needs:\s*run\b/.test(wf));
 
 /* ===================== B. ONE shared inventory_asof (D-1, = asof), computed once, consumed by BOTH ===================== */

@@ -301,7 +301,12 @@ const fbaComplete = !anyFailure && !anyIncomplete;
 const completenessSummary = bucketCompleteness.map((b) => b.bucket + " " + b.published + "/" + b.expected + (b.failed.length ? " (failed " + b.failed.length + ")" : "")).join("; ");
 if (mode === "go-live") {
   ghOut("fba_complete", fbaComplete ? "true" : "false");
-  ghOut("fba_published", String(anyPublished));
+  // Emit a BOOLEAN string ("true"/"false"), not the numeric count -- the listing-health-v3 job gate is
+  // `needs.fba.outputs.fba_published == 'true'` (a GitHub Actions STRING compare), so a count like "8" would never
+  // equal "true" and would silently skip v3 on every region. true = at least one account published (partial OR
+  // complete FBA region -> v3 runs, adopting inventory per account); false = a hard FBA crash (zero published ->
+  // v3 skipped). The `anyPublished` COUNT is still used verbatim in the log lines below.
+  ghOut("fba_published", anyPublished > 0 ? "true" : "false");
   ghSum("### FBA go-live completeness\n- **fba_complete=" + fbaComplete + "** -- " + (completenessSummary || "(no buckets)") + "\n- Completeness is per-account (every eligible account published at its exact live identity); a green job is NOT completeness evidence.");
 }
 if (fbaComplete) {

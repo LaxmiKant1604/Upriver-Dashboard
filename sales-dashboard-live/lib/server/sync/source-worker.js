@@ -174,7 +174,7 @@ export function recoveryEligibility(jobRow) {
  * derivation. Never throws for an expected source failure — it records a safe failure and
  * returns a non-success outcome so the cycle continues.
  */
-async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly = false, budget = null, forceFreshOli = false }) {
+async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly = false, completeUnavailableOnMissingReuse = false, budget = null, forceFreshOli = false }) {
   const requestHash = job.requestHash;
   const requestKey = job.requestKey || "";
   const started = clock();
@@ -290,6 +290,16 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
     // typed MISSING_REUSABLE_SOURCE outcome as evidence. The create-export POST is never reached.
     if (reuseOnly) {
       progress.missingReusable += 1;
+      // OPTIONAL-SOURCE variant (v3 inventory Pass 2): when this reuse-only source is OPTIONAL, a missing adoptable
+      // cache is recorded COMPLETE-AS-UNAVAILABLE (fetch_status='skipped', terminal) instead of left pending, so the
+      // dedicated cycle can DRAIN + finalize 'succeeded' for the accounts whose required listings/OLI published while
+      // inventory stays honestly unavailable for the FBA-failed accounts. Still ZERO creates -- the POST is never
+      // reached. Default (flag false) is byte-identical to the rehearsal gate: leave the job pending, record nothing.
+      if (completeUnavailableOnMissingReuse && typeof store.recordSourceSkipped === "function") {
+        await store.recordSourceSkipped({ cycleId, requestHash, code: "MISSING_REUSABLE_SOURCE", message: "Reuse-only optional source has no adoptable cache; recorded complete-as-unavailable." });
+        progress.completeUnavailable = (progress.completeUnavailable || 0) + 1;
+        return { requestKey, requestHash, status: "complete-unavailable", validated: false, skipped: true, code: "MISSING_REUSABLE_SOURCE" };
+      }
       return { requestKey, requestHash, status: "missing-reusable-source", validated: false, code: "MISSING_REUSABLE_SOURCE" };
     }
     // Blocker 4d: when a FROZEN tranche budget is active, the create-claim goes through the ATOMIC pre-POST
@@ -540,6 +550,11 @@ export async function runSourceJobs({
   // durable cache adoption (or a saved export_id resume) creates ZERO exports and returns
   // MISSING_REUSABLE_SOURCE. NEVER a per-run/untrusted argument (see runtime-composition).
   reuseOnly = false,
+  // BUILD-TIME OPTIONAL-SOURCE flag (v3 inventory Pass 2). Only meaningful with reuseOnly: when true, a reuse-only
+  // job with no adoptable cache is recorded COMPLETE-AS-UNAVAILABLE (fetch_status='skipped', terminal) instead of
+  // left pending, so an OPTIONAL source (v3 FBA inventory) never blocks the cycle from draining/finalizing while its
+  // dependent fields stay unavailable. Default false => byte-identical to the rehearsal gate. NEVER a per-run arg.
+  completeUnavailableOnMissingReuse = false,
   // Blocker 4d: the FROZEN tranche budget context `{ trancheKey, planFingerprint }` (persisted before this
   // invocation). When present, every create-export goes through the atomic pre-POST reservation
   // (store.reserveExportCreate) so the create/AI-token ceilings can never be exceeded. null => the legacy
@@ -739,7 +754,7 @@ export async function runSourceJobs({
       continue;
     }
     const job = mergeJob(meta, jobRow);
-    const outcome = await runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly, budget, forceFreshOli });
+    const outcome = await runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, runWithDeadline, reuseOnly, completeUnavailableOnMissingReuse, budget, forceFreshOli });
     if (outcome) outcomes.push(outcome);
   }
 

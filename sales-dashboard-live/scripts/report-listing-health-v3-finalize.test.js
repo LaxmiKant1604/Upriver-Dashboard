@@ -32,7 +32,7 @@ function live({
     calls,
     discoverAccounts: async () => usAccounts,
     buildPlan: (args) => buildListingHealthV3Plan(args),
-    resolveCost: async () => ({ newExports: 2, reusedExports: 1, creates: 2, estimatedTokens: 4, inventoryAdoptable }),
+    resolveCost: async () => ({ newExports: 2, reusedExports: 1, creates: 2, estimatedTokens: 4, inventoryAdoptable, anyInventoryAdoptable: inventoryAdoptable, inventoryAdoptableCount: inventoryAdoptable ? 1 : 0, inventoryAdoptableByHash: {} }),
     checkBalance: async () => ({ usable: 1000 }),
     freezeBudget: async () => ({ planFingerprint: "fp-test", maxCreates: 2, maxTokens: 4, hashes: [{ requestHash: "h1", tokenCost: 2 }, { requestHash: "h2", tokenCost: 2 }] }), readFrozenBudget: async () => null,
     runSources: async () => { calls.runSources += 1; return sourceOut; },
@@ -93,12 +93,20 @@ await (async () => {
   ok("E: an already-terminal succeeded replay is a zero-create success (ok:true, complete, creates 0)", r.ok === true && r.phase === "complete" && r.cycleStatus === "succeeded" && r.creates === 0);
 })();
 
-/* ===================== F. deferral (inventory not adoptable) never finalizes; ok:false; cycle left open ===================== */
+/* ===================== F. OPTIONAL-INVENTORY: no adoptable inventory PROCEEDS + finalizes 'succeeded' ===================== */
 await (async () => {
+  // No account has adoptable FBA inventory. The operator PROCEEDS (listings/OLI publish); the reuse-only inventory
+  // Pass 2 records those accounts complete-as-unavailable ('skipped'), which is a NON-failure terminal state, so a
+  // clean report run still finalizes 'succeeded'. runSources reports drained (skipped inventory does not leave open work).
   const c = live({ inventoryAdoptable: false });
   const r = await run(c);
-  ok("F: inventory-not-adoptable defers BEFORE any work -> ok:false, phase deferred-inventory, zero creates/tokens/snapshots", r.ok === false && r.phase === "deferred-inventory" && r.deferred === true && r.creates === 0 && r.tokens === 0 && r.snapshots === 0);
-  ok("F: the deferral runs NO source/materialize/report/finalize (no v3 cycle opened; retry-safe)", c.calls.runSources === 0 && c.calls.materialize === 0 && c.calls.runReports === 0 && c.calls.finalizeCycle === 0);
+  ok("F: inventory-not-adoptable no longer defers -> the run PROCEEDS through source/materialize/report/finalize", c.calls.runSources === 1 && c.calls.materialize === 1 && c.calls.runReports === 1 && c.calls.finalizeCycle === 1 && r.phase !== "deferred-inventory");
+  ok("F: a 'succeeded' finalize with inventory unavailable is a real success (listings/OLI published, inventory partial)", r.ok === true && r.phase === "complete" && r.cycleStatus === "succeeded");
+  // A complete-as-unavailable ('skipped') inventory source is neither open nor failed, so it must NOT push finalize
+  // to partial/failed on its own: a drained report run with a skipped optional inventory still finalizes 'succeeded'.
+  const cSkip = live({ inventoryAdoptable: false, sourceOut: { drained: true, creates: 2, tokens: 4, inventoryCreated: false, completeUnavailable: 1 } });
+  const rSkip = await run(cSkip);
+  ok("F: a skipped (complete-as-unavailable) optional inventory does NOT push finalize to partial/failed", rSkip.ok === true && rSkip.phase === "complete" && rSkip.cycleStatus === "succeeded");
 })();
 
 writeSync(1, `\nreport-listing-health-v3-finalize: ${passed} assertions passed\n`);

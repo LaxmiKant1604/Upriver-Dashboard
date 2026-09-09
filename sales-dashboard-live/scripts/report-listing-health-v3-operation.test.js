@@ -44,7 +44,7 @@ function spies({
     calls,
     discoverAccounts: async () => { calls.discover += 1; return accounts; },
     buildPlan: (args) => { calls.buildPlan += 1; return buildListingHealthV3Plan(args); },
-    resolveCost: async () => { calls.resolveCost += 1; return cost || { newExports: 2, reusedExports: 1, creates: 2, estimatedTokens: 4, inventoryAdoptable }; },
+    resolveCost: async () => { calls.resolveCost += 1; return cost || { newExports: 2, reusedExports: 1, creates: 2, estimatedTokens: 4, inventoryAdoptable, anyInventoryAdoptable: inventoryAdoptable, inventoryAdoptableCount: inventoryAdoptable ? 1 : 0, inventoryAdoptableByHash: {} }; },
     checkBalance: async () => { calls.checkBalance += 1; return balance; },
     freezeBudget: async () => ({ planFingerprint: "fp-test", maxCreates: 2, maxTokens: 4, hashes: [{ requestHash: "h1", tokenCost: 2 }, { requestHash: "h2", tokenCost: 2 }] }), readFrozenBudget: async () => null,
     runSources: async () => { calls.runSources += 1; return sourceOut; },
@@ -134,13 +134,13 @@ await (async () => {
   ok("F: it saves the v3 shadow snapshot(s) and reports complete ONLY on a terminal succeeded finalize", r.ok === true && r.phase === "complete" && r.snapshots === 2 && r.dryRun === false && r.cycleStatus === "succeeded");
 })();
 
-/* ===================== G. inventory reuse-only: missing fresh inventory DEFERS the derive (LKG preserved) ===================== */
+/* ===================== G. OPTIONAL-INVENTORY: NO adoptable inventory no longer defers -- the run PROCEEDS ===================== */
 await (async () => {
-  const s = spies({ cost: { newExports: 2, reusedExports: 1, creates: 2, estimatedTokens: 4, inventoryAdoptable: false } });
+  const s = spies({ cost: { newExports: 2, reusedExports: 1, creates: 2, estimatedTokens: 4, inventoryAdoptable: false, anyInventoryAdoptable: false, inventoryAdoptableCount: 0, inventoryAdoptableByHash: { invA: false } } });
   const r = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...s }));
-  ok("G: with no fresh FBA Plan inventory, the deferral happens BEFORE any source/materialize work (no paid export)", s.calls.runSources === 0 && s.calls.materialize === 0 && s.calls.checkBalance === 0);
-  ok("G: the derive is DEFERRED (never publishes stale inventory as current); no report, no finalize; LKG preserved", r.phase === "deferred-inventory" && r.deferred === true && s.calls.runReports === 0 && r.snapshots === 0 && s.calls.finalizeCycle === 0);
-  ok("G: a deferral is ok:false with zero creates/tokens (scheduled CLI exits nonzero; NO v3 cycle opened)", r.ok === false && r.creates === 0 && r.tokens === 0);
+  ok("G: with no adoptable FBA inventory the operator PROCEEDS (no 'deferred-inventory' phase; region-wide prerequisite removed)", r.phase !== "deferred-inventory" && r.deferred !== true);
+  ok("G: it runs sources -> materialize -> report -> finalize (listings/OLI publish; inventory unavailable per account)", s.calls.runSources === 1 && s.calls.materialize === 1 && s.calls.runReports === 1 && s.calls.finalizeCycle === 1);
+  ok("G: it completes successfully with inventory adopted for zero accounts (partial publication)", r.ok === true && r.phase === "complete" && r.cycleStatus === "succeeded" && r.inventoryAdoptableCount === 0);
 })();
 
 /* ===================== H. freshness-aware cost (stale rejected / fresh reusable / next-cycle refresh / inventory) ===================== */

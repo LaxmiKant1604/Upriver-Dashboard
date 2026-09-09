@@ -73,6 +73,7 @@ const SUITES = [
   "test:brand-view-dependency-fingerprint",
   "test:brand-inventory-rebuild",
   "test:ads-provisional-tail",
+  "test:ads-content-rev",
   "test:report-materialization-coverage",
   "test:report-readonly-serve",
   "test:brand-view-readonly",

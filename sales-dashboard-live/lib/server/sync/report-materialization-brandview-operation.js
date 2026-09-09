@@ -41,35 +41,42 @@ export const BRAND_INVENTORY_MATERIALIZATION_REPORT = Object.freeze({
  * as inventoryAvailable:false; this makes it available the SAME day). ZERO DataDoe -- it reuses the already-validated
  * fba-plan fold via the pure compactInventoryFromFbaPlanPayload adapter (one inventory definition, no second export).
  *
- * Gated on the SAME source-promoted publish control the priority publisher checks (publish_enabled): when disabled,
- * it writes nothing and Brand View falls back to the legacy fba-plan inventory path. Per-account zero-vs-missing is
- * preserved: an account whose fba-plan has no available inventory (the source omitted it, or a validator failure left
- * only an old snapshot without inventory) leaves the existing compact untouched (honest unavailable, never a
- * fabricated zero). Newer-only: a compact already newer than this fba-plan evidence is preserved (LKG).
+ * AUTHORIZATION (lifecycle-coherent -- the fix for the promoted-control window bug): this job runs AFTER the
+ * priority run's safe-close AND the FBA job's safe-close, both of which DISABLE the source-promoted publish
+ * control (source_promoted_publish_settings.publish_enabled). publish_enabled is the priority publisher's per-run
+ * WINDOW toggle (opened by --apply, always closed by --rollback), NOT a durable "brand-inventory is live" flag, so
+ * gating the rebuild on it made the rebuild dead in production (Defect A stayed inert). Instead this rebuild is a
+ * PER-ACCOUNT REFRESH of an ALREADY-PUBLISHED live compact: it proceeds for an account ONLY when a LIVE
+ * brand-inventory snapshot already exists for it -- i.e. the priority run published one this cycle under its
+ * fenced + approved scoped window. The materializer therefore never FIRST-authorizes a report; it only replaces an
+ * authorized live identity with fresher, zero-export inventory. No global control is opened or left enabled, the
+ * scoped publication authority still flows from the priority run's fenced CAS publish, and an account the priority
+ * run did NOT publish (not authorized) keeps the legacy fba-plan fallback (skip, never a fabricated write).
+ *
+ * Per-account zero-vs-missing is preserved: an account whose fba-plan has no available inventory (the source
+ * omitted it, or a validator failure left only an old snapshot without inventory) leaves the existing compact
+ * untouched (honest unavailable, never a fabricated zero). Newer-only: a genuinely newer AVAILABLE compact (e.g. a
+ * later admin refresh) is preserved -- but an inventoryAvailable:false priority PLACEHOLDER never suppresses a fresh
+ * inventoryAvailable:true fold, even if the placeholder's provenance timestamp is numerically newer.
  *
  * @param {object} args { region, accounts:[{accountId,country,...}], dryRun, now }
  * @param {object} collaborators (all zero-export):
  *   readFbaPlan({ accountId }) -> the account's latest fba-plan snapshot { payload, source_refreshed_at } | null
- *   promotedPublishEnabled() -> boolean (brand-inventory source-promoted publish control)
+ *   readLiveBrandInventory({ accountId }) -> the account's latest LIVE brand-inventory snapshot | null (the
+ *       per-account authorization signal the priority run's fenced publish produced; the safe-close does not erase it)
  *   readSnapshot / persistSnapshot / claimLock / releaseLock (shared-core store contract)
  *   log?(msg)
  */
 export async function runBrandInventoryRebuild({ region, accounts, dryRun = false, now = () => new Date() }, collaborators = {}) {
   const {
-    readFbaPlan, promotedPublishEnabled,
+    readFbaPlan, readLiveBrandInventory,
     readSnapshot, persistSnapshot, claimLock = async () => true, releaseLock = async () => {},
     log = () => {},
   } = collaborators;
   const events = [];
   // Not wired (e.g. an older test harness / a dry non-FBA context) -> a green no-op that writes nothing.
-  if (typeof readFbaPlan !== "function" || typeof promotedPublishEnabled !== "function") {
+  if (typeof readFbaPlan !== "function" || typeof readLiveBrandInventory !== "function") {
     return { region: region || null, dryRun, events, summary: summarize(events), skipped: "not-wired" };
-  }
-  let enabled = false;
-  try { enabled = await promotedPublishEnabled(); } catch { enabled = false; }
-  if (!enabled) {
-    log(`brand-inventory-rebuild[${region || "-"}]: source-promoted publish disabled -> skip (0 writes; legacy fba-plan fallback serves inventory)`);
-    return { region: region || null, dryRun, events, summary: summarize(events), skipped: "promoted-publish-disabled" };
   }
 
   for (const a of accounts || []) {
@@ -80,6 +87,13 @@ export async function runBrandInventoryRebuild({ region, accounts, dryRun = fals
     }
     // eslint-disable-next-line no-loop-func
     await runUnit(events, async () => {
+      // PER-ACCOUNT AUTHORIZATION: refresh ONLY an account the priority run already published a live compact for
+      // (its fenced + approved scoped window authorized it this cycle). No live row -> not authorized -> skip this
+      // ONE account (legacy fba-plan fallback serves), never a global skip and never a first-time publish here.
+      const live = await readLiveBrandInventory({ accountId });
+      if (!live || !live.payload) {
+        return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "skipped", reason: "unauthorized-no-live-compact", preservedLkg: true, tokens: 0 };
+      }
       const plan = await readFbaPlan({ accountId });
       const payload = compactInventoryFromFbaPlanPayload(plan && plan.payload, accountId);
       if (!payload) {
@@ -87,12 +101,17 @@ export async function runBrandInventoryRebuild({ region, accounts, dryRun = fals
         return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "unavailable", preservedLkg: true, blockedBy: [{ reason: "fba-plan-no-available-inventory" }], tokens: 0 };
       }
       const sourceRefreshedAt = (plan && (plan.source_refreshed_at || plan.sourceRefreshedAt || plan.updated_at)) || null;
-      // NEWER-ONLY: never overwrite a compact that is already newer than this fba-plan evidence (LKG protection).
+      // NEWER-ONLY (corrected): preserve the existing compact ONLY when it is a genuinely newer AND AVAILABLE
+      // compact (e.g. a later admin refresh with real inventory). An inventoryAvailable:false priority PLACEHOLDER
+      // -- even one whose source_refreshed_at is numerically newer (it can carry the run's sales provenance) -- must
+      // NEVER suppress a fresh inventoryAvailable:true fold; that placeholder-collision was the exact way Defect A
+      // stayed unavailable. A same-{to} placeholder therefore falls through to the write below.
       if (!dryRun && typeof readSnapshot === "function" && sourceRefreshedAt) {
         const paramsHash = paramsHashFor(BRAND_INVENTORY_REPORT_VERSION, { to: payload.inventoryDate });
         const existing = await readSnapshot({ reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, accountId, paramsHash }).catch(() => null);
-        if (existing && existing.payload && String(existing.source_refreshed_at || "") > String(sourceRefreshedAt)) {
-          return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "unchanged", reason: "existing-newer", tokens: 0 };
+        if (existing && existing.payload && existing.payload.inventoryAvailable === true
+            && String(existing.source_refreshed_at || "") > String(sourceRefreshedAt)) {
+          return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "unchanged", reason: "existing-newer-available", tokens: 0 };
         }
       }
       return materializeSnapshot({
@@ -104,7 +123,7 @@ export async function runBrandInventoryRebuild({ region, accounts, dryRun = fals
     }, { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, scope: "brand-inventory" });
   }
   const summary = summarize(events);
-  log(`brand-inventory-rebuild[${region || "-"}]${dryRun ? " (dry-run)" : ""}: materialized ${summary.materialized}, unchanged ${summary.unchanged}, unavailable ${summary.unavailable}, error ${summary.error} across ${summary.units} accounts; tokens ${summary.tokens}`);
+  log(`brand-inventory-rebuild[${region || "-"}]${dryRun ? " (dry-run)" : ""}: materialized ${summary.materialized}, unchanged ${summary.unchanged}, unavailable ${summary.unavailable}, skipped ${summary.skipped}, error ${summary.error} across ${summary.units} accounts; tokens ${summary.tokens}`);
   return { region: region || null, dryRun, events, summary };
 }
 

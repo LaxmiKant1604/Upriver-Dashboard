@@ -115,9 +115,9 @@ export const SCHEDULED_FAMILY_REGISTRY = Object.freeze({
     frozenPlanParticipation: "own-cycle",
     ceiling: "computed-per-region",
     completionOutput: "terminal-succeeded-gate",
-    partialBehavior: "skip-typed-zero-creates",
+    partialBehavior: "stay-visibly-partial",
     watchdogIdempotency: "idempotent-replay",
-    notes: "P1: runs ONLY when needs.fba.outputs.fba_complete == 'true' (a real completeness contract, not needs.fba.result == 'success'); when FBA is partial it skips with a typed reason and zero creates/tokens.",
+    notes: "OPTIONAL-INVENTORY: runs whenever needs.fba.outputs.fba_published == 'true' (at least one account's FBA inventory published), NOT only on a complete region. On a partial FBA region each account ADOPTS its FBA inventory where the reuse-only cache is fresh and publishes listings/OLI regardless; inventory-dependent fields stay unavailable for the FBA-failed accounts (inventory Pass-2 records complete-as-unavailable, so the cycle still finalizes 'succeeded'). A hard FBA failure (zero published) leaves fba_published != 'true' and v3 is skipped. Inventory remains reuse-only (zero v3 creates).",
   },
   "materialize": {
     family: "materialize",

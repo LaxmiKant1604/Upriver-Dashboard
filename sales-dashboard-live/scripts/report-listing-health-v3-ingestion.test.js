@@ -45,7 +45,7 @@ function makeFakeRelease({ ceiling = 4, jobsAfter = null, recentCycleIds = [], t
     getExportCache: async () => null, // nothing cached -> everything would be a create in the cost helper
     getTokenBalance: async () => ({ read: "ok", usable: 3288 }),
     budgetPlanner: { isPremiumOf: () => false, trancheBudgetMode: () => "frozen" }, // listings/raw are STANDARD
-    runSourceCycle: async (args) => { calls.sourceCycle.push({ tranche: args.sourceTranche && args.sourceTranche.name, reuseOnly: args.reuseOnly, hasBudget: !!args.budget, cycleBucket: args.cycleBucket, bucket: args.bucket }); return { cycleId: "cyc-1", drained: true, succeeded: 2, failed: 0, skipped: 0 }; },
+    runSourceCycle: async (args) => { calls.sourceCycle.push({ tranche: args.sourceTranche && args.sourceTranche.name, reuseOnly: args.reuseOnly, completeUnavailableOnMissingReuse: !!args.completeUnavailableOnMissingReuse, hasBudget: !!args.budget, cycleBucket: args.cycleBucket, bucket: args.bucket }); return { cycleId: "cyc-1", drained: true, succeeded: 2, failed: 0, skipped: 0 }; },
     runReportsFn: async (a) => { calls.reports += 1; calls.reportPlanned = (a.plannedReports || []).length; calls.hasSaver = typeof a.saveSnapshot === "function"; calls.hasDerived = typeof a.loadDerivedContext === "function"; return { succeeded: (a.plannedReports || []).length, drained: true }; },
     materializeFn: async (a) => { calls.materialize += 1; calls.materializePlans = (a.plans || []).length; return { accounts: 8, aliasesWritten: 16, emptyAliases: 0, rejected: 0, batchMissing: 0, skippedStale: 0 }; },
     regionCeilings: { india: ceiling, "europe-au": 8, "us-ca": 4 },
@@ -80,6 +80,10 @@ await (async () => {
   ok("A: it ran TWO source passes", calls.sourceCycle.length === 2);
   ok("A: pass 1 = the NEW tranche, create mode, WITH the frozen budget", calls.sourceCycle[0].reuseOnly === false && calls.sourceCycle[0].hasBudget === true && /lhv3-new/.test(calls.sourceCycle[0].tranche));
   ok("A: pass 2 = the INVENTORY tranche, REUSE-ONLY, NO budget (never creates)", calls.sourceCycle[1].reuseOnly === true && calls.sourceCycle[1].hasBudget === false && /lhv3-inv/.test(calls.sourceCycle[1].tranche));
+  // OPTIONAL-INVENTORY: the complete-as-unavailable flag is set ONLY on the INV reuse pass, never on the NEW listings
+  // pass (a missing REQUIRED listings source still fails closed; only a missing optional inventory becomes 'skipped').
+  ok("A: completeUnavailableOnMissingReuse is true on the INVENTORY pass ONLY (NEW listings stays fail-closed)",
+    calls.sourceCycle[1].completeUnavailableOnMissingReuse === true && calls.sourceCycle[0].completeUnavailableOnMissingReuse === false);
   ok("A: both passes scope the account bucket to the real region (india), not the namespaced cycle key", calls.sourceCycle.every((c) => c.bucket === "india" && c.cycleBucket === "listing-health-v3-india"));
   ok("A: actual creates counted honestly = 4; inventory never created", res.creates === 4 && res.inventoryCreated === false && res.maxCreates === 4);
   ok("A: observed token estimate = 4 creates x 2 (an estimate, not a guaranteed max)", res.tokens === 8);

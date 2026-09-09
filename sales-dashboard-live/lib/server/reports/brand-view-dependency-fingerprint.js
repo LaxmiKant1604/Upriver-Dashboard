@@ -51,6 +51,11 @@ function adsIdentity(coverage) {
     latest: S(coverage.latestMetricDate),
     status: S(coverage.status),
     wins: winKey,
+    // CONTENT revision (Item 2): a durable per-(account, source) hash the Ads writer computes over the persisted
+    // row VALUES. A SAME-WINDOW correction (spend/sales/clicks change with unchanged coverage dates + latestMetricDate)
+    // changes rev and flips the fingerprint; an unchanged re-sync yields the SAME rev (replay-stable). Absent (no
+    // coverage / pre-migration) -> "" -> byte-identical to the coverage-only identity, so this is fail-soft.
+    rev: S(coverage.contentRev),
   };
 }
 

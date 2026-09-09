@@ -3591,6 +3591,21 @@ export async function recordSyncSourceFailure({ cycleId, requestHash, stage, cod
   }, { signal });
 }
 
+// v3 optional-inventory (Item 4): record a reuse-only OPTIONAL source COMPLETE-AS-UNAVAILABLE. fetch_status
+// 'skipped' is already a legal terminal state (no migration), and this NEVER touches create_export_count /
+// attempted_at / cache_object_path / last_good_fetched_at, so the one-attempt constraint holds and LKG is
+// preserved. It is a NON-failure terminal state: finalize counts it as neither open nor failed, so the dedicated
+// cycle drains + finalizes 'succeeded' for the accounts whose required sources published.
+export async function recordSyncSourceSkipped({ cycleId, requestHash, code = "MISSING_REUSABLE_SOURCE", message = null }, { signal = null } = {}) {
+  await patchSyncSourceJob(cycleId, requestHash, {
+    fetch_status: "skipped",
+    error_stage: null,
+    error_code: code,
+    error_message: message,
+    terminal: true,
+  }, { signal });
+}
+
 /* ===== Scheduler v2 Phase 1d: sync_report_jobs (report-derivation) wrappers =====
    The report worker (lib/server/sync/report-worker.js) drives these. fetch/derive/save
    statuses are tracked separately (a Supabase save failure is never a DataDoe fetch
@@ -4077,23 +4092,41 @@ export async function getDailyAdsCoverage(accountId, sourceKey, { signal = null 
   }
   let status = "missing";
   let latestMetricDate = null;
-  try {
+  let contentRev = null;
+  const readState = async (withContentRev) => {
     const query = new URLSearchParams({
-      select: "last_status,latest_metric_date",
+      select: withContentRev ? "last_status,latest_metric_date,content_rev" : "last_status,latest_metric_date",
       account_id: `eq.${accountId}`,
       source_key: `eq.${sourceKey}`,
       limit: "1",
     });
-    const state = await request(`/rest/v1/ads_sync_state?${query}`);
+    return request(`/rest/v1/ads_sync_state?${query}`);
+  };
+  try {
+    let state;
+    try {
+      // Item 2: fold the durable CONTENT revision so a same-window Ads correction flips the Brand View fingerprint.
+      state = await readState(adsContentRevColumnSupported);
+    } catch (colError) {
+      // Fail-soft: the ONLY tolerated degradation is a missing content_rev column (migration 20260923 pending).
+      // Retry WITHOUT it once and memoize; any other error falls through to the operational-failure handler below.
+      if (adsContentRevColumnSupported && isUnknownContentRevColumnError(colError)) {
+        adsContentRevColumnSupported = false;
+        state = await readState(false);
+      } else {
+        throw colError;
+      }
+    }
     if (state && state[0]) {
       status = state[0].last_status || "missing";
       latestMetricDate = state[0].latest_metric_date || null;
+      contentRev = state[0].content_rev || null;
     }
   } catch (stateError) {
     // ads_sync_state is migrated (20260729); a failure here is operational, not shadow-missing.
     if (read === "ok") { read = "read-failed"; error = "COVERAGE_READ_FAILED"; }
   }
-  return { windows, status, latestMetricDate, read, error };
+  return { windows, status, latestMetricDate, contentRev, read, error };
 }
 
 export async function recordAdsCoverageWindows(rows) {
@@ -4503,11 +4536,37 @@ export async function saveFxSnapshot(snapshot) {
   return rows[0] || null;
 }
 
+// Item 2 FAIL-SOFT: ads_sync_state.content_rev may not exist yet (migration 20260923 pending approval). This
+// process-level memo lets the reader + writer degrade to the pre-migration shape ONCE per process when the column
+// is absent, instead of failing every ads read/write. Once the column exists (fresh process post-apply) it stays true.
+let adsContentRevColumnSupported = true;
+function isUnknownContentRevColumnError(e) {
+  const m = String((e && e.message) || e || "").toLowerCase();
+  return m.includes("content_rev") || m.includes("pgrst204") || (m.includes("column") && m.includes("does not exist"));
+}
+const stripContentRev = (states) => states.map(({ content_rev, ...rest }) => rest);
+
 export async function upsertAdsSyncStates(states) {
   if (!states.length) return;
-  await request("/rest/v1/ads_sync_state?on_conflict=account_id,source_key", {
-    method: "POST",
-    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-    body: states,
-  });
+  const body = adsContentRevColumnSupported ? states : stripContentRev(states);
+  try {
+    await request("/rest/v1/ads_sync_state?on_conflict=account_id,source_key", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body,
+    });
+  } catch (e) {
+    // Fail-soft: the ONLY tolerated degradation is a missing content_rev column (pre-migration). Retry stripped
+    // ONCE; any other error is re-thrown unchanged (the sync's own error handling stays byte-identical).
+    if (adsContentRevColumnSupported && isUnknownContentRevColumnError(e)) {
+      adsContentRevColumnSupported = false;
+      await request("/rest/v1/ads_sync_state?on_conflict=account_id,source_key", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: stripContentRev(states),
+      });
+      return;
+    }
+    throw e;
+  }
 }

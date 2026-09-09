@@ -22,7 +22,6 @@ import { getCampaignBrandMappings } from "../supabase.js";
 import {
   getLatestReportSnapshot, getLatestReportSnapshotHydrated, getReportSnapshot, getLatestReportSnapshotMeta,
   getLatestSourceProvenance, getAdsDailySourceRows, getDailyAdsCoverage, getSourceSnapshot, getSourceSnapshotPayload,
-  getSourcePromotedPublishSettings,
   saveReportSnapshot, publishSnapshotUpdate, claimRefreshLock, releaseRefreshLock,
 } from "../supabase.js";
 
@@ -54,7 +53,7 @@ export function buildBrandViewMaterializationRelease(overrides = {}) {
     publishUpdate = publishSnapshotUpdate,
     claimLockFn = claimRefreshLock,
     releaseLockFn = releaseRefreshLock,
-    getPromotedSettings = getSourcePromotedPublishSettings,
+    getLiveSnapshot = getLatestReportSnapshot,
     buildSingle = buildBrandViewSnapshot,
     buildPortfolio = buildBrandViewPortfolioSnapshot,
     buildBrandsDir = buildBrandViewBrandDirectory,
@@ -167,14 +166,14 @@ export function buildBrandViewMaterializationRelease(overrides = {}) {
   const claimLock = ({ reportKey, accountId, paramsHash }) => claimLockFn({ reportKey, accountId, paramsHash, lockSeconds: 300 });
   const releaseLock = ({ reportKey, accountId, paramsHash }) => releaseLockFn({ reportKey, accountId, paramsHash });
 
-  // Defect A: the FRESH fba-plan snapshot reader + the source-promoted publish gate for the compact
-  // brand-inventory rebuild (runBrandInventoryRebuild). Zero-export -- the fba-plan snapshot is read durable.
+  // Defect A: the FRESH fba-plan snapshot reader + the PER-ACCOUNT authorization signal for the compact
+  // brand-inventory rebuild (runBrandInventoryRebuild). Zero-export -- both read durable snapshots only.
   const readFbaPlan = ({ accountId }) => getSnapshotHydrated({ reportKey: "fba-plan", accountId });
-  const promotedPublishEnabled = async () => {
-    const rows = (await getPromotedSettings()) || [];
-    const row = Array.isArray(rows) ? rows.find((r) => r && String(r.report_key ?? r.reportKey) === BRAND_INVENTORY_LIVE_REPORT_KEY) : null;
-    return !!row && row.publish_enabled === true;
-  };
+  // The DURABLE, scoped authorization the priority run's fenced + approved publish already established this cycle:
+  // the latest LIVE brand-inventory row for the account (params/{to}-agnostic, updated_at.desc). The safe-close
+  // disables the transient promoted WINDOW toggle but never erases this published row, so it is the coherent signal
+  // that this account is authorized for a zero-export compact refresh (the rebuild only replaces, never first-authorizes).
+  const readLiveBrandInventory = ({ accountId }) => getLiveSnapshot({ reportKey: BRAND_INVENTORY_LIVE_REPORT_KEY, accountId });
 
   return Object.freeze({
     operator, connections, hasPrimary: !!primaryApiKey,
@@ -182,7 +181,7 @@ export function buildBrandViewMaterializationRelease(overrides = {}) {
     readAccountBrands, readAccountSalesBrands,
     deriveBrandView, deriveBrandViewPortfolio,
     readSnapshot, persistSnapshot, claimLock, releaseLock,
-    readFbaPlan, promotedPublishEnabled,
+    readFbaPlan, readLiveBrandInventory,
     marketplaceToday: today,
   });
 }

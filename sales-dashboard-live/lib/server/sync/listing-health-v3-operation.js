@@ -94,14 +94,23 @@ export async function planListingHealthV3IngestionCost({ plan, getSourceExportCa
     } catch (_e) { /* treat as not-adoptable (fail toward a refresh, never toward a fabricated success) */ }
   }
   const createHashes = newExportHashes.filter((h) => !adoptable.has(h));
-  const inventoryAdoptable = reusedExportHashes.length > 0 && reusedExportHashes.every((h) => adoptable.has(h));
+  // PER-ACCOUNT (per reuse-hash) inventory adoptability (optional-inventory contract). The region no longer defers
+  // wholesale when ONE account's FBA inventory is not adoptable: the run proceeds, publishes listings/OLI for all
+  // accounts, adopts inventory where fresh, and leaves inventory-dependent fields unavailable for the rest.
+  const inventoryAdoptableByHash = Object.fromEntries(reusedExportHashes.map((h) => [h, adoptable.has(h)]));
+  const inventoryAdoptableCount = reusedExportHashes.filter((h) => adoptable.has(h)).length;
+  const anyInventoryAdoptable = inventoryAdoptableCount > 0;
   return {
     newExports, reusedExports,
     creates: createHashes.length,
     estimatedTokens: createHashes.length * Number(tokenPerExport),
     tokenPerExport: Number(tokenPerExport),
     createHashes, adoptedNewHashes: newExportHashes.filter((h) => adoptable.has(h)),
-    inventoryHashes: reusedExportHashes, inventoryAdoptable,
+    inventoryHashes: reusedExportHashes,
+    // Back-compat field kept, but it is NO LONGER a region-wide gate: it now reports whether ANY account's inventory
+    // is adoptable (the run proceeds regardless; inventory is adopted per account where fresh).
+    inventoryAdoptable: anyInventoryAdoptable,
+    inventoryAdoptableByHash, inventoryAdoptableCount, anyInventoryAdoptable,
     adoptable,
   };
 }
@@ -198,21 +207,16 @@ export async function runListingHealthV3Ingestion({
   if (Number(cost.creates || 0) > Number(ceilingCheck.ceiling)) {
     return fail("ceiling", `freshness-aware create count ${cost.creates} exceeds the region ceiling ${ceilingCheck.ceiling}; refusing (fail closed)`);
   }
-  ev.inventoryAdoptable = !!cost.inventoryAdoptable;
+  ev.inventoryAdoptable = !!cost.anyInventoryAdoptable;
+  ev.inventoryAdoptableCount = Number(cost.inventoryAdoptableCount || 0);
 
-  // P1 ORDERING GATE (LIVE only): DEFER on non-adoptable FBA Plan inventory IMMEDIATELY after cost/ceiling validation
-  // and BEFORE the balance check, runSources, openCycle/persistBudget, any export reservation/POST, materialize,
-  // reports, or finalize. This GUARANTEES no paid Listings/Listings-Raw export -- and NO v3 cycle -- is ever opened
-  // when the required inventory is unavailable (the FBA job can report success while one regional account lacks
-  // adoptable inventory). Returns a typed deferred-inventory result with creates=0, tokens=0, snapshots=0; LKG stands.
-  // Dry-run is unaffected: it falls through to the planned return below, which reports inventoryAdoptable + cost.
-  if (!dryRun && !cost.inventoryAdoptable) {
-    return {
-      ...ev, phase: "deferred-inventory", ok: false, deferred: true, dryRun: false,
-      creates: 0, tokens: 0, snapshots: 0, inventoryAdoptable: false,
-      note: "current FBA Plan inventory unavailable -- deferred BEFORE any cycle/create (no v3 cycle opened, zero creates/tokens); last-known-good preserved",
-    };
-  }
+  // OPTIONAL-INVENTORY CONTRACT (per-account partial publication): the run PROCEEDS regardless of inventory
+  // adoptability. Listings + durable OLI publish for every eligible account; FBA inventory is adopted PER ACCOUNT
+  // where its reuse-only cache is fresh, and inventory-dependent fields resolve unavailable for the rest (the derive
+  // yields inventory.available:false, never a fabricated zero). The region-wide "defer the whole region when ANY
+  // account's inventory is not adoptable" gate is REMOVED: it blocked every account on one account's FBA gap. The
+  // paid-create budget/ceiling/identity/authorization/balance gates below are UNCHANGED (they gate listings/
+  // listings-raw creates only), and inventory stays REUSE-ONLY (the inventoryCreated hard-guard still fails closed).
   if (!dryRun) {
     if (pricingKnown !== true) return fail("budget", "DataDoe pricing state is unknown; refusing to create (fail closed)");
     if (reservationSupported !== true) return fail("budget", "atomic pre-POST create reservation is unavailable; refusing to create (fail closed)");
@@ -301,7 +305,7 @@ export async function runListingHealthV3Ingestion({
 
   // DRY-RUN stops here -- ZERO creates, writes, and tokens.
   if (dryRun) {
-    return { ...ev, phase: "planned", ok: true, dryRun: true, creates: 0, tokens: 0, plannedCreates: Number(cost.creates || 0), estimatedTokens: Number(cost.estimatedTokens || 0), inventoryAdoptable: !!cost.inventoryAdoptable, note: gateEnabled ? "gate-enabled" : "gate-disabled (dry-run only)" };
+    return { ...ev, phase: "planned", ok: true, dryRun: true, creates: 0, tokens: 0, plannedCreates: Number(cost.creates || 0), estimatedTokens: Number(cost.estimatedTokens || 0), inventoryAdoptable: !!cost.anyInventoryAdoptable, anyInventoryAdoptable: !!cost.anyInventoryAdoptable, inventoryAdoptableCount: Number(cost.inventoryAdoptableCount || 0), inventoryAdoptableByHash: cost.inventoryAdoptableByHash || {}, note: gateEnabled ? "gate-enabled" : "gate-disabled (dry-run only)" };
   }
 
   // A live run also REQUIRES the finalize collaborator (the durable success gate). Refuse before any create if missing.
@@ -328,11 +332,10 @@ export async function runListingHealthV3Ingestion({
   const matRejected = Number((matSummary && matSummary.rejected) || 0);
   if (matRejected > 0) return fail("materialize", `materialization rejected ${matRejected} unattributable fragment(s); fail closed (last-known-good preserved)`);
 
-  // 10) INVARIANT (defense in depth): a LIVE run proved inventory adoptability at the pre-create gate ABOVE, before any
-  //     cycle/create. Reaching here with non-adoptable inventory would mean paid work happened before readiness -- the
-  //     exact P1 this ordering fix removes. It is unreachable in the normal flow; assert it can never permit a stale
-  //     derive (guards against a future re-ordering re-introducing the defect).
-  if (!cost.inventoryAdoptable) return fail("invariant", "inventory adoptability regressed after the pre-create gate; refusing to derive on stale inventory (fail closed; should be unreachable)");
+  // 10) OPTIONAL-INVENTORY: under partial inventory, a non-adoptable account is an EXPECTED state (its inventory
+  //     fields resolve unavailable in the derive), NOT a regression -- so there is no region-wide adoptability
+  //     invariant here. The zero-inventory-export contract is still enforced by the inventoryCreated hard-guard
+  //     above (a v3 inventory CREATE fails closed); inventory remains strictly reuse-only.
 
   // 11) run report jobs -> the scheduler-v2/listing-health-v3 SHADOW snapshot only. LKG preserved on any failure.
   let reportRes;

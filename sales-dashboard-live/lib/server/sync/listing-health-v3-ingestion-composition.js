@@ -232,11 +232,15 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
       bucket: region, cycleBucket, cycleDate, trigger: "manual", deadlineMs: Infinity, reserveMs: 0,
       sourceTranche: NEW, reuseOnly: false, budget,
     });
-    // Pass 2: inventory REUSE-ONLY (adopt the current FBA Plan cache; never a v3 create).
+    // Pass 2: inventory REUSE-ONLY (adopt the current FBA Plan cache; never a v3 create). OPTIONAL-INVENTORY:
+    // completeUnavailableOnMissingReuse marks an account with no adoptable FBA inventory cache COMPLETE-AS-UNAVAILABLE
+    // (terminal 'skipped') instead of leaving a blocking pending job, so the dedicated cycle DRAINS + finalizes
+    // 'succeeded' for the accounts whose required listings/OLI published while inventory stays unavailable for the
+    // FBA-failed accounts. This flag is set ONLY on the INV pass (Pass 1 NEW listings stays fail-closed on a miss).
     const p2 = await runSourceCycle({
       store: runtime.store, dataDoe: runtime.dataDoe, resolvePlan: resolveFromGenericPlan(plan),
       bucket: region, cycleBucket, cycleDate, trigger: "manual", deadlineMs: Infinity, reserveMs: 0,
-      sourceTranche: INV, reuseOnly: true, budget: null,
+      sourceTranche: INV, reuseOnly: true, completeUnavailableOnMissingReuse: true, budget: null,
     });
 
     // Actual creates = NEW-tranche jobs whose create_export_count > 0 (honest evidence, not the reserved ceiling).

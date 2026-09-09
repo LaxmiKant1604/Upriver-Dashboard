@@ -52,16 +52,16 @@ writeSync(1, "scheduled-family-registry (release guard)\n");
   ok("G5 (P1): fba completionOutput = fba_complete-job-output + partial stays visibly partial",
     fba.completionOutput === "fba_complete-job-output" && fba.partialBehavior === "stay-visibly-partial");
   const v3 = SCHEDULED_FAMILY_REGISTRY["listing-health-v3"];
-  ok("G6 (P1): listing-health-v3 depends on fba-inventory-health + skips typed with zero creates when incomplete",
-    v3.dependencies.includes("fba-inventory-health") && v3.partialBehavior === "skip-typed-zero-creates" && v3.completionOutput === "terminal-succeeded-gate");
+  ok("G6 (optional-inventory): listing-health-v3 depends on fba-inventory-health + stays visibly partial (per-account inventory adopted where fresh)",
+    v3.dependencies.includes("fba-inventory-health") && v3.partialBehavior === "stay-visibly-partial" && v3.completionOutput === "terminal-succeeded-gate");
 }
 
 // 5. Workflow parity: the declared owners/gates match the REAL scheduler-v2.yml.
 {
   const wf = readFileSync(path.join(ROOT, "../.github/workflows/scheduler-v2.yml"), "utf8");
   ok("G7 (P1 wiring): the fba job EXPORTS fba_complete as a job output", /outputs:\s*[\s\S]*?fba_complete:\s*\$\{\{\s*steps\.fba\.outputs\.fba_complete/.test(wf));
-  ok("G8 (P1 wiring): the listing-health-v3 job GATES on needs.fba.outputs.fba_complete == 'true' (not merely result == 'success')",
-    /needs\.fba\.outputs\.fba_complete\s*==\s*'true'/.test(wf));
+  ok("G8 (optional-inventory wiring): the listing-health-v3 job GATES on needs.fba.outputs.fba_published == 'true' (runs on a partial FBA region; still blocks a hard FBA crash)",
+    /needs\.fba\.outputs\.fba_published\s*==\s*'true'/.test(wf) && /fba_published:\s*\$\{\{\s*steps\.fba\.outputs\.fba_published/.test(wf));
   ok("G9: materialize + materialize-inventory jobs exist (zero-export owners)", /\bmaterialize:\s*\n/.test(wf) && /materialize-inventory:\s*\n/.test(wf));
   ok("G9b (Campaign Ads parity): the declared scheduled Campaign Ads family has a real refresh step in the run job",
     !!SCHEDULED_FAMILY_REGISTRY["campaign-performance"] && /Refresh Campaign Ads/.test(wf) && /scheduled-campaign-ads-refresh\.mjs/.test(wf));

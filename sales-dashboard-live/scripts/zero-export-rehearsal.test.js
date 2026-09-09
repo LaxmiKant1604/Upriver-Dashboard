@@ -128,6 +128,9 @@ function makeStore() {
     recordSourceFailure({ cycleId, requestHash, stage, code, terminal }) {
       Object.assign(jobsByCycle.get(cycleId).get(requestHash), { fetch_status: "failed", error_stage: stage, error_code: code, terminal: !!terminal });
     },
+    recordSourceSkipped({ cycleId, requestHash, code, message }) {
+      Object.assign(jobsByCycle.get(cycleId).get(requestHash), { fetch_status: "skipped", error_stage: null, error_code: code, error_message: message || null, terminal: true });
+    },
     updateCycleCounts() {},
     persistBudget({ cycleId, trancheKey, planFingerprint, maxCreates, maxTokens, hashes }) {
       const k = bkey(cycleId, trancheKey);
@@ -300,6 +303,26 @@ test("(3) missing durable evidence returns MISSING_REUSABLE_SOURCE and leaves th
   for (const row of store.listSourceJobs(res.cycleId)) {
     assert.equal(row.fetch_status, "pending", "(3) a missing reusable source stays PENDING (blocked, never failed)");
   }
+});
+
+test("(3b) OPTIONAL reuse-only (completeUnavailableOnMissingReuse) records the missing source COMPLETE-AS-UNAVAILABLE ('skipped', terminal), never a create", async () => {
+  const store = makeStore(); // NO caches seeded
+  const dd = tripwired(makeDataDoe());
+  const plan = bucketSync.planBucketSourceSync({
+    apiKey: API_KEY, bucket: BUCKET, accounts: FIVE,
+    coverageByAccountId: steadyCoverage(FIVE, dates.addDaysStr(ASOF, -7)),
+    catalogSnapshot: null, fbaSnapshotsByAccount: {}, asOf: ASOF, today: TODAY, catalogCarrierSeller: CATALOG_CARRIER,
+  });
+  const oli = plan.families.find((f) => f.sourceKey === "order-line-items");
+  const res = await worker.runSourceJobs({
+    store, dataDoe: dd, plannedJobs: oli.plannedJobs,
+    ownerIds: [...new Set(oli.plannedJobs.map((j) => j.owner.ownerId))],
+    bucket: BUCKET, cycleDate: "2026-08-23b", reuseOnly: true, completeUnavailableOnMissingReuse: true,
+  });
+  assert.equal(dd.totalCreates(), 0, "(3b) zero creates -- still reuse-only, the POST is never reached");
+  const rows = store.listSourceJobs(res.cycleId);
+  assert.ok(rows.length > 0 && rows.every((row) => row.fetch_status === "skipped"), "(3b) every missing optional reuse-only source is terminal 'skipped', NOT pending and NOT failed");
+  assert.ok(rows.every((row) => row.terminal === true), "(3b) the skipped rows are TERMINAL (the cycle can drain/finalize)");
 });
 
 test("(5) 30 accounts => six stable batches; 31 => seven with nothing reshuffled", () => {

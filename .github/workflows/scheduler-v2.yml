@@ -374,12 +374,15 @@ jobs:
     needs: [run, fba]
     # A BOOTSTRAP-scoped run never ingests v3 (its per-region export ceiling belongs to the natural daily
     # run; the new accounts' shadow snapshots land on the next full run instead).
-    # P1: v3 runs ONLY when the region's FBA is COMPLETE (fba_complete == 'true'), not merely when the fba job exited
-    # success -- a natural PARTIAL region (e.g. 10/11, Canada LATEST_SNAPSHOT_INCOMPLETE) exits success but is
-    # fba_complete=false, so v3 is SKIPPED (zero creates/tokens; the typed reason -- which accounts blocked
-    # completeness -- is in the fba job's own log/output). A hard FBA failure leaves fba_complete empty (also != 'true').
-    # materialize + materialize-inventory stay INDEPENDENT of this gate (they run LKG-preserving regardless).
-    if: always() && needs.run.outputs.region != '' && needs.fba.result == 'success' && needs.fba.outputs.fba_complete == 'true' && needs.run.outputs.scope != 'bootstrap'
+    # OPTIONAL-INVENTORY (per-account partial publication): v3 now runs whenever the FBA job PUBLISHED at least one
+    # account's inventory (fba_published == 'true'), NOT only when the whole region is complete. A natural PARTIAL
+    # region (e.g. 10/11, Canada LATEST_SNAPSHOT_INCOMPLETE) still ingests v3: each account ADOPTS its FBA inventory
+    # where the reuse-only cache is fresh and publishes listings/OLI regardless, while inventory-dependent fields stay
+    # unavailable for the FBA-failed accounts (the operator's per-account adoptability + the inventory Pass-2
+    # complete-as-unavailable contract). A HARD FBA failure (zero accounts published) leaves fba_published != 'true',
+    # so v3 is still SKIPPED when the FBA inventory cache is entirely absent. inventory stays REUSE-ONLY (zero v3
+    # creates); the shared inventory_asof threading is unchanged. materialize + materialize-inventory stay INDEPENDENT.
+    if: always() && needs.run.outputs.region != '' && needs.fba.result == 'success' && needs.fba.outputs.fba_published == 'true' && needs.run.outputs.scope != 'bootstrap'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     defaults:

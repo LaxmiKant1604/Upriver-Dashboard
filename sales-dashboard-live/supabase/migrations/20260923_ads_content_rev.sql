@@ -1,0 +1,21 @@
+-- Ads CONTENT REVISION (website report repair, Item 2) -- additive, nullable, service-role only.
+--
+-- The Brand View dependency fingerprint folds an Ads COVERAGE identity (covered windows + latest_metric_date +
+-- status). A DataDoe SAME-WINDOW correction -- the provider re-itemizes an already-covered day, changing
+-- spend/sales/clicks under an unchanged metric_date, covered window and latest_metric_date -- does NOT move any of
+-- those, so the fingerprint would not flip and the corrected values would never rebuild Brand View / portfolio.
+--
+-- content_rev is a durable per-(account_id, source_key) hash the Ads sync writer computes over the row VALUES it
+-- persists (canonical sha256 of [dimension_key, metric_date, marketplace, currency, metrics, dimensions]). It
+-- changes IFF the persisted content changes (a correction) and is byte-stable on an unchanged re-sync (so
+-- zero-write replay holds), unlike updated_at / source_refreshed_at / last_daily_sync_at which advance every run.
+--
+-- Additive + fail-soft: the column is NULL until the next successful sync populates it (no backfill). The reader
+-- (getDailyAdsCoverage) and writer (upsertAdsSyncStates) degrade to the pre-migration behaviour when the column is
+-- absent, so the code and this migration may ship in either order; the first sync after apply flips each account's
+-- fingerprint exactly once (NULL -> hash), an expected one-time Brand View/portfolio rebuild.
+--
+-- ads_sync_state has NO RLS policy (service-role only), matching 20260810_ads_sync_coverage.sql; this adds a plain
+-- nullable text column and changes no policy, index, trigger, or existing row.
+
+alter table public.ads_sync_state add column if not exists content_rev text;

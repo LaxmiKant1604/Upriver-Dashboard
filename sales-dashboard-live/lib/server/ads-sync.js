@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   claimRefreshLock,
   releaseRefreshLock,
@@ -459,7 +460,30 @@ function campaignMetricRecords(rows) {
   }));
 }
 
-function stateRecord(accountId, sourceKey, previous, mode, latestMetricDate, now) {
+// CONTENT REVISION (Item 2): a deterministic sha256 over the VALUES of one account's persisted rows in the fetched
+// window, canonicalized so key order / row order never affect it. It changes IFF the content changes (a same-window
+// spend/sales/clicks correction) and is byte-stable on an unchanged re-sync (so a Brand View zero-write replay
+// holds), unlike updated_at / source_refreshed_at / last_daily_sync_at which advance on every run. Hashed over the
+// rows already fetched + persisted -> ZERO extra DataDoe/token. Returns null for an empty account (no rows).
+export function adsWindowContentRev(rowsForAccount) {
+  const rows = Array.isArray(rowsForAccount) ? rowsForAccount : [];
+  if (!rows.length) return null;
+  const sortedKeysJson = (obj) => {
+    const o = obj && typeof obj === "object" ? obj : {};
+    const out = {};
+    for (const k of Object.keys(o).sort()) out[k] = o[k];
+    return JSON.stringify(out);
+  };
+  const lines = rows
+    .map((r) => [
+      String(r.dimension_key || ""), String(r.metric_date || ""), String(r.marketplace_country_code || ""),
+      String(r.currency || ""), sortedKeysJson(r.metrics), sortedKeysJson(r.dimensions),
+    ].join(""))
+    .sort();
+  return createHash("sha256").update(lines.join("")).digest("hex").slice(0, 40);
+}
+
+function stateRecord(accountId, sourceKey, previous, mode, latestMetricDate, now, contentRev) {
   return {
     account_id: accountId,
     source_key: sourceKey,
@@ -467,6 +491,9 @@ function stateRecord(accountId, sourceKey, previous, mode, latestMetricDate, now
     last_daily_sync_at: mode === "daily" ? now : previous?.last_daily_sync_at || null,
     last_monthly_sync_at: mode === "monthly" ? now : previous?.last_monthly_sync_at || null,
     latest_metric_date: latestMetricDate || previous?.latest_metric_date || null,
+    // Advance the content revision when this run persisted rows for the account; otherwise preserve the previous one
+    // (a covered-empty window keeps the prior content identity -> no spurious fingerprint flip).
+    content_rev: contentRev || previous?.content_rev || null,
     last_status: "succeeded",
     last_error: null,
   };
@@ -480,6 +507,8 @@ function failedStateRecord(accountId, sourceKey, previous, error, now) {
     last_daily_sync_at: previous?.last_daily_sync_at || null,
     last_monthly_sync_at: previous?.last_monthly_sync_at || null,
     latest_metric_date: previous?.latest_metric_date || null,
+    // A failed run NEVER changes the content identity -- preserve the previous rev (LKG content).
+    content_rev: previous?.content_rev || null,
     last_status: "failed",
     last_error: String(error.message || error).slice(0, 1000),
     updated_at: now,
@@ -494,7 +523,7 @@ function countryMatches(account, countries) {
 // timestamp (initial/daily/monthly) verbatim -- a controlled exact-window backfill is NOT a normal cadence run,
 // so it must never falsely stamp initial_seeded_at / last_daily_sync_at / last_monthly_sync_at. It only advances
 // latest_metric_date (from the durably-persisted rows) and marks last_status succeeded.
-function coverageStateRecord(accountId, sourceKey, previous, latestMetricDate, now) {
+function coverageStateRecord(accountId, sourceKey, previous, latestMetricDate, now, contentRev) {
   return {
     account_id: accountId,
     source_key: sourceKey,
@@ -502,6 +531,7 @@ function coverageStateRecord(accountId, sourceKey, previous, latestMetricDate, n
     last_daily_sync_at: previous?.last_daily_sync_at || null,
     last_monthly_sync_at: previous?.last_monthly_sync_at || null,
     latest_metric_date: latestMetricDate || previous?.latest_metric_date || null,
+    content_rev: contentRev || previous?.content_rev || null,
     last_status: "succeeded",
     last_error: null,
   };
@@ -896,11 +926,17 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
               await upsertMetrics(campaignMetricRecords(normalized));
             }
             const latestDateByAccount = new Map();
+            const rowsByAccount = new Map();
             for (const row of normalized) {
               if (!latestDateByAccount.get(row.account_id) || latestDateByAccount.get(row.account_id) < row.metric_date) {
                 latestDateByAccount.set(row.account_id, row.metric_date);
               }
+              if (!rowsByAccount.has(row.account_id)) rowsByAccount.set(row.account_id, []);
+              rowsByAccount.get(row.account_id).push(row);
             }
+            // Item 2: per-account CONTENT revision over the rows just persisted (canonical hash; zero extra I/O).
+            const contentRevByAccount = new Map();
+            for (const [accId, accRows] of rowsByAccount) contentRevByAccount.set(accId, adsWindowContentRev(accRows));
             if (coverageMode) {
               // Record the EXACT successful window, then REQUIRE a positive persistence acknowledgement (write ok
               // AND one recorded row per account) BEFORE marking the sync succeeded -- fail closed otherwise.
@@ -916,7 +952,7 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
                 continue;
               }
               // Confirmed: advance latest_metric_date + mark succeeded, PRESERVING cadence timestamps.
-              const savedStates = workingBatch.map(({ account, previous }) => coverageStateRecord(account.id, source.key, previous, latestDateByAccount.get(account.id), now));
+              const savedStates = workingBatch.map(({ account, previous }) => coverageStateRecord(account.id, source.key, previous, latestDateByAccount.get(account.id), now, contentRevByAccount.get(account.id)));
               await upsertStates(savedStates);
               savedStates.forEach((state) => states.set(`${state.account_id}|${state.source_key}`, state));
               summary.rows += normalized.length;
@@ -926,7 +962,7 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
               // NORMAL cadence path -- UNCHANGED behavior. Coverage recording stays best-effort (its return is
               // ignored: a missing/unmigrated table is a safe no-op that must never break a cadence sync).
               const savedStates = workingBatch.map(({ account, previous }) => stateRecord(
-                account.id, source.key, previous, mode, latestDateByAccount.get(account.id), now
+                account.id, source.key, previous, mode, latestDateByAccount.get(account.id), now, contentRevByAccount.get(account.id)
               ));
               await upsertStates(savedStates);
               await recordCoverage(workingBatch.map(({ account }) => ({

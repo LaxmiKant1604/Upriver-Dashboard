@@ -33,22 +33,31 @@ ok("A: the rebuilt compact passes isCompactInventorySnapshot (Brand View reads i
 const inv = brandInventory(compact, "Acme", "IN", null);
 ok("A: Brand View folds the compact to per-country FBA available (120 for Acme/IN)", inv.byCountry.get("IN") === 120 && inv.scope === "country");
 
-// ---- operator: per-account rebuild, control gate, zero-vs-missing, newer-only -----------------------------------
+// ---- operator: PER-ACCOUNT authorization (lifecycle-coherent), zero-vs-missing, newer-only --------------------
 const accounts = [
-  { accountId: "acctFresh", country: "IN" },  // fresh fba-plan -> materialize compact available
-  { accountId: "acctNoInv", country: "IN" },  // fba-plan present but no available inventory -> leave existing (unavailable)
-  { accountId: "acctOld", country: "IN" },    // fba-plan on an OLDER date -> rebuild with its REAL date (labeled, not D-1)
+  { accountId: "acctFresh", country: "IN" },   // authorized (priority published) + fresh fba-plan -> materialize available
+  { accountId: "acctNoInv", country: "IN" },   // authorized + fba-plan no inventory -> leave existing (unavailable)
+  { accountId: "acctOld", country: "IN" },     // authorized + older fba-plan -> rebuild with its REAL date (never D-1)
+  { accountId: "acctUnauth", country: "IN" },  // NOT authorized (no live compact this cycle) -> skip (legacy fallback)
 ];
 const plans = {
   acctFresh: { payload: freshPlan, source_refreshed_at: "2026-09-08T16:40:00Z" },
   acctNoInv: { payload: { inventoryAvailable: false }, source_refreshed_at: "2026-09-08T16:40:00Z" },
   acctOld: { payload: { inventoryAvailable: true, inventorySnapshotDate: "2026-09-02", inventoryByBrandCountry: [{ country: "IN", brand: "Acme", fbaAvailable: 40, skuCount: 1 }] }, source_refreshed_at: "2026-09-02T16:40:00Z" },
+  acctUnauth: { payload: freshPlan, source_refreshed_at: "2026-09-08T16:40:00Z" },
 };
-const runRebuild = async ({ promoted, existingReader } = {}) => {
+// The priority run published a live compact (placeholder, inventoryAvailable:false) THIS cycle for the authorized
+// accounts -- the per-account authorization signal that survives safe-close. acctUnauth has NO live row.
+const liveCompacts = {
+  acctFresh: { payload: { inventoryAvailable: false }, source_refreshed_at: "2026-09-09T03:15:00Z" },
+  acctNoInv: { payload: { inventoryAvailable: false }, source_refreshed_at: "2026-09-09T03:15:00Z" },
+  acctOld: { payload: { inventoryAvailable: false }, source_refreshed_at: "2026-09-09T03:15:00Z" },
+};
+const runRebuild = async ({ liveReader, existingReader } = {}) => {
   const writes = [];
   const r = await runBrandInventoryRebuild({ region: "india", accounts, dryRun: false }, {
     readFbaPlan: async ({ accountId }) => plans[accountId] || null,
-    promotedPublishEnabled: async () => promoted !== false,
+    readLiveBrandInventory: liveReader || (async ({ accountId }) => liveCompacts[accountId] || null),
     readSnapshot: existingReader || (async () => null),
     persistSnapshot: async (u) => { writes.push(u); return { savedAt: u.sourceRefreshedAt }; },
   });
@@ -58,9 +67,13 @@ const runRebuild = async ({ promoted, existingReader } = {}) => {
 {
   const { r, writes } = await runRebuild();
   const byAcct = (s) => r.events.filter((e) => e.status === s).map((e) => e.account).sort();
-  ok("B: fresh + old accounts materialize; no-inventory account stays unavailable (no write)",
-    JSON.stringify(byAcct("materialized")) === JSON.stringify(["acctFresh", "acctOld"]) && JSON.stringify(byAcct("unavailable")) === JSON.stringify(["acctNoInv"]));
-  ok("B: exactly two live compact writes (fresh + old); zero for the missing-inventory account", writes.length === 2);
+  ok("B: authorized fresh + old accounts materialize; no-inventory stays unavailable; unauthorized is skipped",
+    JSON.stringify(byAcct("materialized")) === JSON.stringify(["acctFresh", "acctOld"])
+    && JSON.stringify(byAcct("unavailable")) === JSON.stringify(["acctNoInv"])
+    && JSON.stringify(byAcct("skipped")) === JSON.stringify(["acctUnauth"]));
+  ok("B: the unauthorized account (no live compact this cycle) is skipped 'unauthorized-no-live-compact', 0 writes for it",
+    r.events.find((e) => e.account === "acctUnauth").reason === "unauthorized-no-live-compact" && !writes.find((w) => w.accountId === "acctUnauth"));
+  ok("B: exactly two live compact writes (authorized fresh + old); none for missing-inventory or unauthorized", writes.length === 2);
   const fresh = writes.find((w) => w.accountId === "acctFresh");
   ok("B: the fresh compact carries the fba-plan provenance + the compact report version (params.to = the date)",
     fresh.sourceRefreshedAt === "2026-09-08T16:40:00Z" && fresh.params.reportVersion === BRAND_INVENTORY_REPORT_VERSION && fresh.params.to === "2026-09-08");
@@ -70,17 +83,24 @@ const runRebuild = async ({ promoted, existingReader } = {}) => {
 }
 
 {
-  // Control gate: when the source-promoted publish control is disabled, write NOTHING (legacy fba-plan fallback serves).
-  const { r, writes } = await runRebuild({ promoted: false });
-  ok("C: source-promoted publish disabled => skip, zero writes", r.skipped === "promoted-publish-disabled" && writes.length === 0);
+  // PLACEHOLDER COLLISION (the exact Defect-A trap): the existing same-{to} compact is the priority's
+  // inventoryAvailable:false placeholder carrying a NEWER source_refreshed_at (the run's sales provenance). It must
+  // NOT suppress the fresh inventoryAvailable:true fold.
+  const placeholderNewer = async ({ reportKey, accountId }) => (reportKey === "brand-inventory" && accountId === "acctFresh"
+    ? { payload: { inventoryAvailable: false, inventoryByBrandCountry: [] }, source_refreshed_at: "2026-09-09T03:15:00Z" } : null); // newer than fba-plan 09-08
+  const { writes } = await runRebuild({ existingReader: placeholderNewer });
+  const fresh = writes.find((w) => w.accountId === "acctFresh");
+  ok("C: an inventoryAvailable:false placeholder with a newer timestamp does NOT suppress the fresh available fold",
+    !!fresh && fresh.payload.inventoryAvailable === true);
 }
 
 {
-  // Newer-only: an EXISTING compact newer than this fba-plan evidence is preserved (LKG), not overwritten.
-  const newerExisting = async ({ reportKey, accountId }) => (reportKey === "brand-inventory" && accountId === "acctFresh"
-    ? { payload: { inventoryAvailable: true }, source_refreshed_at: "2026-09-09T00:00:00Z" } : null); // newer than fba-plan 09-08
-  const { writes } = await runRebuild({ existingReader: newerExisting });
-  ok("D: an existing compact NEWER than the fba-plan is preserved (no overwrite of newer LKG)", !writes.find((w) => w.accountId === "acctFresh"));
+  // NEWER-ONLY (genuine): an existing AVAILABLE compact newer than this fba-plan is preserved (LKG), not overwritten.
+  const newerAvailable = async ({ reportKey, accountId }) => (reportKey === "brand-inventory" && accountId === "acctFresh"
+    ? { payload: { inventoryAvailable: true, inventoryByBrandCountry: [{ country: "IN", brand: "Acme", fbaAvailable: 999 }] }, source_refreshed_at: "2026-09-09T00:00:00Z" } : null); // newer + available
+  const { r, writes } = await runRebuild({ existingReader: newerAvailable });
+  ok("D: a genuinely newer AVAILABLE compact is preserved (no overwrite of newer LKG)",
+    !writes.find((w) => w.accountId === "acctFresh") && r.events.find((e) => e.account === "acctFresh").reason === "existing-newer-available");
 }
 
 writeSync(1, `\nbrand-inventory-rebuild: ${passed} assertions passed\n`);

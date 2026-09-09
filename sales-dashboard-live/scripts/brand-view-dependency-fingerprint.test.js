@@ -57,7 +57,7 @@ const world = {
     "brand-inventory|a1": { params_hash: "bih", source_refreshed_at: "2026-09-09T16:40:00Z" },
     "fba-plan|a1": { params_hash: "fph", source_refreshed_at: "2026-09-09T16:40:00Z" },
   },
-  ads: { a1: { windows: [{ from: "2026-07-08", to: "2026-09-08" }], status: "succeeded", latestMetricDate: "2026-09-06" } },
+  ads: { a1: { windows: [{ from: "2026-07-08", to: "2026-09-08" }], status: "succeeded", latestMetricDate: "2026-09-06", contentRev: "adsrev-1" } },
   mapRev: { a1: "rev-1" },
   catalog: "cat-2026-09-09",
 };
@@ -77,6 +77,19 @@ const advanced = JSON.parse(JSON.stringify(world));
 advanced.meta["brand-inventory|a1"] = { params_hash: "bih2", source_refreshed_at: "2026-09-10T16:40:00Z" };
 const serveFp2 = await collectBrandViewDependencyFingerprint({ ...args, readers: readersFrom(advanced) });
 ok("B: an inventory advance makes the current fingerprint differ from the stored one", serveFp2 !== writerFp);
+
+// Item 2: a SAME-WINDOW Ads CORRECTION (spend/sales/clicks change) flips ONLY the ads contentRev -- coverage
+// windows, latestMetricDate and status are all unchanged -- and MUST still change the fingerprint.
+const adsCorrected = JSON.parse(JSON.stringify(world));
+adsCorrected.ads.a1.contentRev = "adsrev-2"; // dates/windows/latest/status identical; only the row VALUES changed
+const serveFpAds = await collectBrandViewDependencyFingerprint({ ...args, readers: readersFrom(adsCorrected) });
+ok("B: a same-window Ads correction (contentRev-only change) flips the fingerprint (dates/windows/latest unchanged)", serveFpAds !== writerFp);
+// And the coverage-only identity WITHOUT the content rev would NOT have flipped -- proving the gap the rev closes.
+const adsNoRev = JSON.parse(JSON.stringify(world)); delete adsNoRev.ads.a1.contentRev;
+const adsNoRevCorrected = JSON.parse(JSON.stringify(adsCorrected)); delete adsNoRevCorrected.ads.a1.contentRev;
+const fpNoRevA = await collectBrandViewDependencyFingerprint({ ...args, readers: readersFrom(adsNoRev) });
+const fpNoRevB = await collectBrandViewDependencyFingerprint({ ...args, readers: readersFrom(adsNoRevCorrected) });
+ok("B: REGRESSION -- without contentRev the correction would NOT flip the fingerprint (the exact gap Item 2 closes)", fpNoRevA === fpNoRevB);
 
 // A reader that throws degrades to an absent identity (never throws, never a false 'unchanged').
 const throwyFp = await collectBrandViewDependencyFingerprint({ ...args, readers: {

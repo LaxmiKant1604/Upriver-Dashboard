@@ -15,7 +15,7 @@ import {
   openSyncCycle, claimSyncCycle, getSyncCycle, getSyncCycleByBucketDate, updateSyncCycleCounts, finalizeSyncCycle,
   upsertSyncSourceJob, getSyncSourceJobs, getSyncSourceJobsWithMeta, claimSourceExportAttempt, adoptSourceExportCache,
   claimSourceExportRecovery,
-  recordSyncSourceSuccess, recordSyncSourceFailure, recordSyncSourceExportCreated,
+  recordSyncSourceSuccess, recordSyncSourceFailure, recordSyncSourceSkipped, recordSyncSourceExportCreated,
   getSourceExportCache, sourceCacheStorageAdapter, sourceCacheMetadataAdapter,
   upsertSyncSourceJobOwners, getSyncSourceJobOwners, getSyncSourceJobOwnersForCycle, getSyncSourceJobsForOwners, recordSyncSourceJobOwnerStale,
   persistSourceTrancheBudget, reserveSourceExportCreate, getSourceTrancheBudget, getSourceTrancheBudgetHashes,
@@ -299,6 +299,9 @@ export function makeSupabaseSourceStore({ deadline = null } = {}) {
     })),
     recordSourceSuccess: (args) => w("source-success", true, (signal) => recordSyncSourceSuccess(args, { signal })),
     recordSourceFailure: (args) => w("source-failure", true, (signal) => recordSyncSourceFailure(args, { signal })),
+    // v3 optional-inventory: record a reuse-only optional source COMPLETE-AS-UNAVAILABLE (fetch_status='skipped',
+    // terminal) so a missing FBA inventory never blocks the dedicated cycle from draining. Zero export.
+    recordSourceSkipped: (args) => w("source-skipped", true, (signal) => recordSyncSourceSkipped(args, { signal })),
     updateCycleCounts: (cycleId, counts) => w("cycle-counts", true, (signal) => updateSyncCycleCounts(cycleId, counts, { signal })),
     // Blocker 4d wiring: the FROZEN per-(cycle, tranche) create/AI-token budget. persistBudget freezes the
     // reviewed plan ceilings once ('created' | 'exists'; drift RAISES PLAN_BUDGET_MISMATCH with no mutation);
@@ -428,6 +431,9 @@ export async function runStagedSourceCycle({
   sourceTranche = null,
   // BUILD-TIME reuseOnly rehearsal flag (Blocker 3); passed straight to runSourceJobs.
   reuseOnly = false,
+  // BUILD-TIME optional-source flag (v3 inventory Pass 2); passed straight to runSourceJobs. Only meaningful with
+  // reuseOnly: a missing adoptable cache is recorded complete-as-unavailable instead of left pending. NEVER a per-run arg.
+  completeUnavailableOnMissingReuse = false,
   // Blocker 4d: the FROZEN tranche budget context { trancheKey, planFingerprint } (persisted BEFORE this
   // invocation); passed straight to runSourceJobs so every create goes through the atomic pre-POST
   // reservation. null => the legacy one-attempt claim (behavior byte-identical). NEVER a per-run caller arg.
@@ -468,7 +474,7 @@ export async function runStagedSourceCycle({
       // cycleBucket namespaces runSourceJobs' OWN cycle resolution (getCycleByBucketDate + openCycle) to the SAME
       // namespaced cycle this driver opened above, so it never re-resolves the raw-bucket scheduler-v2 cycle.
       store, dataDoe, plannedJobs, ownerIds: [...ownerIdSet], bucket, cycleBucket, cycleDate, scheduledAt, trigger,
-      clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly, budget,
+      clock, deadlineMs, reserveMs, maxJobs: remaining, sourceTranche, reuseOnly, completeUnavailableOnMissingReuse, budget,
     });
     rollup.cycleId = res.cycleId;
     rollup.rounds = round + 1;
