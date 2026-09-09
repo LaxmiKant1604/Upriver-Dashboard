@@ -1,9 +1,27 @@
-# Handoff — Website report repair (COMMITTED) + scheduler permanent repair (DEPLOYED) + open acceptance gates
+# Handoff — Website report repair (rounds 1+2) + scheduler permanent repair (DEPLOYED) + open gates
 
-**Branch:** `main`   **HEAD:** `0cffb2e` (website report repair)   **origin/main:** push PENDING
-**Latest deploy:** Vercel Production **Ready** at code commit `583923d` (the repair commit deploys on push)
+**Branch:** `main`   **HEAD:** round-2 commit (below)   **origin/main:** push PENDING for round 2
+**Latest deploy:** Vercel Production **Ready** at `45f14e8` (round 1, Codex-confirmed). Round 2 deploys on push.
 **Date:** 2026-09-09
 **DataDoe this session:** 0 exports / 0 tokens   **api/*.js:** 12 (unchanged)
+
+## Round 2 (5 integration follow-ups) — code-complete, `npm run verify` 184/184
+
+Fixes real gaps in round 1 + completes v3: **(1)** brand-inventory rebuild was INERT in prod (gated on a
+safe-closed control) -> per-account authorization off the priority run's already-published live compact; **(2)**
+same-window Ads corrections now flip the fingerprint via a durable `ads_sync_state.content_rev` (migration
+`20260923` PENDING APPROVAL; code fail-soft); **(3)** Daily UI shows a verified-vs-pending ads-coverage band;
+**(4)** Listing Health v3 optional-inventory END-TO-END (per-account adoptability, reuse-only complete-as-unavailable,
+gate `fba_complete`->`fba_published`); **(5)** `sales` stays manual (order-count not zero-export-reproducible) +
+a quantified paid-source approval plan. The adversarial review caught + I fixed a HIGH bug: `fba_published` was a
+numeric count so the `== 'true'` gate was unsatisfiable (v3 would never run) — now emits a boolean.
+
+**Next: push `main` (Vercel deploy) + present migration `20260923_ads_content_rev.sql` for approval.** Then observe
+natural regional runs (do NOT dispatch). Detail: `PROJECT_MEMORY.md` (2026-09-09 round-2 entry) +
+`sales-dashboard-live/scratchpad/REPAIR-STATUS-MATRIX-20260909.md`.
+
+---
+## Round 1 (COMMITTED `0cffb2e`, DEPLOYED `45f14e8`)
 
 ## Latest: website-wide report repair (commit `0cffb2e`) — code-complete, NOT yet pushed/deployed
 
