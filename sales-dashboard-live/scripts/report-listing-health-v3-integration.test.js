@@ -170,10 +170,20 @@ const deriveV3 = (sources, context) => deriveReportSnapshot({ reportKey: "listin
   ok("E: Listings Raw disabled => derived with issuesAvailable false; buyable/discoverable/liveOffer null (nothing inferred)",
     rDg.status === "derived" && rDg.payload.issuesAvailable === false && rDg.payload.rows.every((x) => x.buyable === null && x.discoverable === null && x.liveOffer === null));
 
-  // LKG: a missing REQUIRED source (inventory) => unavailable, never a fabricated snapshot.
+  // OPTIONAL INVENTORY (Section 3 partial-data contract): a MISSING inventory source no longer blocks -- listings +
+  // durable OLI still publish, with inventory.available:false and FBA on-hand falling back to the Listings quantity
+  // (never a fabricated zero). This lets an account whose FBA failed publish while other accounts' FBA succeeded.
   const miss = v3Sources({ listings: baseListings, raw: [], inventory: baseInv });
   delete miss.sources["listing-health-v3:inventory"];
-  ok("E: a missing required source (inventory) => unavailable (LKG preserved, no snapshot)", deriveV3(miss.sources, ctx()).status === "unavailable");
+  const rMiss = deriveV3(miss.sources, ctx({ windowPreset: "30D" }));
+  ok("E: missing OPTIONAL inventory => still DERIVED (listings/OLI publish), inventory.available:false",
+    rMiss.status === "derived" && rMiss.payload.inventory && rMiss.payload.inventory.available === false);
+  ok("E: with inventory unavailable, FBA on-hand falls back to the Listings quantity (never a fabricated zero)",
+    (() => { const a = rMiss.payload.rows.find((x) => x.sku === "A"); return !!a && a.onHandFba === 30 && a.onHandFbaSource === "listings-fallback"; })());
+  // The truly-required LISTINGS source still blocks when missing (LKG preserved, no snapshot).
+  const missListings = v3Sources({ listings: baseListings, raw: [], inventory: baseInv });
+  delete missListings.sources["listing-health-v3:listings"];
+  ok("E: a missing REQUIRED source (listings) => unavailable (LKG preserved, no snapshot)", deriveV3(missListings.sources, ctx()).status === "unavailable");
   // Missing durable OLI => unavailable.
   ok("E: missing durable OLI => unavailable (LKG preserved)", deriveV3(sources, ctx({ listingHealthV3DurableOli: null })).status === "unavailable");
 })();

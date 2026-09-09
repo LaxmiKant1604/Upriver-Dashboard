@@ -21,10 +21,92 @@
 
 import {
   BRAND_VIEW_REPORT_KEY, BRAND_VIEW_VERSION, BRAND_VIEW_PORTFOLIO_REPORT_KEY, BRAND_VIEW_PORTFOLIO_VERSION,
+  BRAND_INVENTORY_SNAPSHOT_KEY, BRAND_INVENTORY_REPORT_VERSION, compactInventoryFromFbaPlanPayload,
   brandViewScopeId, brandViewPortfolioScopeId,
 } from "../reports/brand-view.js";
 import { buildBrandAccountMembership } from "../reports/brand-membership.js";
 import { materializeSnapshot, runUnit, summarize } from "./report-materialization-core.js";
+import { paramsHashFor } from "../report-store.js";
+
+// The compact brand-inventory family this operator REBUILDS from fresh fba-plan evidence (declared as data so the
+// registry/family guards can assert the exact set without importing the run loop).
+export const BRAND_INVENTORY_MATERIALIZATION_REPORT = Object.freeze({
+  reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, reportVersion: BRAND_INVENTORY_REPORT_VERSION, grain: "account",
+});
+
+/**
+ * REBUILD the compact brand-inventory (reportKey "brand-inventory") from each account's FRESH fba-plan report
+ * snapshot (Defect A). Runs in the FBA-aware materialize-inventory job AFTER the fba job, so the compact snapshot
+ * Brand View reads is CURRENT before the brand-view/portfolio derive runs (the priority run publishes it BEFORE FBA
+ * as inventoryAvailable:false; this makes it available the SAME day). ZERO DataDoe -- it reuses the already-validated
+ * fba-plan fold via the pure compactInventoryFromFbaPlanPayload adapter (one inventory definition, no second export).
+ *
+ * Gated on the SAME source-promoted publish control the priority publisher checks (publish_enabled): when disabled,
+ * it writes nothing and Brand View falls back to the legacy fba-plan inventory path. Per-account zero-vs-missing is
+ * preserved: an account whose fba-plan has no available inventory (the source omitted it, or a validator failure left
+ * only an old snapshot without inventory) leaves the existing compact untouched (honest unavailable, never a
+ * fabricated zero). Newer-only: a compact already newer than this fba-plan evidence is preserved (LKG).
+ *
+ * @param {object} args { region, accounts:[{accountId,country,...}], dryRun, now }
+ * @param {object} collaborators (all zero-export):
+ *   readFbaPlan({ accountId }) -> the account's latest fba-plan snapshot { payload, source_refreshed_at } | null
+ *   promotedPublishEnabled() -> boolean (brand-inventory source-promoted publish control)
+ *   readSnapshot / persistSnapshot / claimLock / releaseLock (shared-core store contract)
+ *   log?(msg)
+ */
+export async function runBrandInventoryRebuild({ region, accounts, dryRun = false, now = () => new Date() }, collaborators = {}) {
+  const {
+    readFbaPlan, promotedPublishEnabled,
+    readSnapshot, persistSnapshot, claimLock = async () => true, releaseLock = async () => {},
+    log = () => {},
+  } = collaborators;
+  const events = [];
+  // Not wired (e.g. an older test harness / a dry non-FBA context) -> a green no-op that writes nothing.
+  if (typeof readFbaPlan !== "function" || typeof promotedPublishEnabled !== "function") {
+    return { region: region || null, dryRun, events, summary: summarize(events), skipped: "not-wired" };
+  }
+  let enabled = false;
+  try { enabled = await promotedPublishEnabled(); } catch { enabled = false; }
+  if (!enabled) {
+    log(`brand-inventory-rebuild[${region || "-"}]: source-promoted publish disabled -> skip (0 writes; legacy fba-plan fallback serves inventory)`);
+    return { region: region || null, dryRun, events, summary: summarize(events), skipped: "promoted-publish-disabled" };
+  }
+
+  for (const a of accounts || []) {
+    const accountId = String((a && (a.accountId || a.id)) || "").trim();
+    if (!accountId || accountId.includes(":")) {
+      events.push({ report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId || "(blank)", status: "skipped", reason: "non-primary-or-blank", tokens: 0 });
+      continue;
+    }
+    // eslint-disable-next-line no-loop-func
+    await runUnit(events, async () => {
+      const plan = await readFbaPlan({ accountId });
+      const payload = compactInventoryFromFbaPlanPayload(plan && plan.payload, accountId);
+      if (!payload) {
+        // fba-plan absent / no available inventory / no strict date -> leave the existing compact (honest unavailable).
+        return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "unavailable", preservedLkg: true, blockedBy: [{ reason: "fba-plan-no-available-inventory" }], tokens: 0 };
+      }
+      const sourceRefreshedAt = (plan && (plan.source_refreshed_at || plan.sourceRefreshedAt || plan.updated_at)) || null;
+      // NEWER-ONLY: never overwrite a compact that is already newer than this fba-plan evidence (LKG protection).
+      if (!dryRun && typeof readSnapshot === "function" && sourceRefreshedAt) {
+        const paramsHash = paramsHashFor(BRAND_INVENTORY_REPORT_VERSION, { to: payload.inventoryDate });
+        const existing = await readSnapshot({ reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, accountId, paramsHash }).catch(() => null);
+        if (existing && existing.payload && String(existing.source_refreshed_at || "") > String(sourceRefreshedAt)) {
+          return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "unchanged", reason: "existing-newer", tokens: 0 };
+        }
+      }
+      return materializeSnapshot({
+        reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, reportVersion: BRAND_INVENTORY_REPORT_VERSION,
+        accountId, params: { to: payload.inventoryDate }, scopeLabel: "brand-inventory",
+        derived: { payload, sourceRefreshedAt },
+        dryRun, now, readSnapshot, persistSnapshot, claimLock, releaseLock,
+      });
+    }, { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, scope: "brand-inventory" });
+  }
+  const summary = summarize(events);
+  log(`brand-inventory-rebuild[${region || "-"}]${dryRun ? " (dry-run)" : ""}: materialized ${summary.materialized}, unchanged ${summary.unchanged}, unavailable ${summary.unavailable}, error ${summary.error} across ${summary.units} accounts; tokens ${summary.tokens}`);
+  return { region: region || null, dryRun, events, summary };
+}
 
 // The Brand View report families this operator OWNS (declared as data so the registry-to-operator coverage guard can
 // assert the exact set without importing the run loop).

@@ -63,6 +63,8 @@ writeSync(1, "scheduled-family-registry (release guard)\n");
   ok("G8 (P1 wiring): the listing-health-v3 job GATES on needs.fba.outputs.fba_complete == 'true' (not merely result == 'success')",
     /needs\.fba\.outputs\.fba_complete\s*==\s*'true'/.test(wf));
   ok("G9: materialize + materialize-inventory jobs exist (zero-export owners)", /\bmaterialize:\s*\n/.test(wf) && /materialize-inventory:\s*\n/.test(wf));
+  ok("G9b (Campaign Ads parity): the declared scheduled Campaign Ads family has a real refresh step in the run job",
+    !!SCHEDULED_FAMILY_REGISTRY["campaign-performance"] && /Refresh Campaign Ads/.test(wf) && /scheduled-campaign-ads-refresh\.mjs/.test(wf));
 }
 
 // 6. Source-registry parity: the durable daily source families are real registered sources.

@@ -3251,7 +3251,7 @@ function DashboardApp({ session, access, onSignOut }) {
   }, [planComputed, planSearch, planSort, selectedBrand]);
 
   const planTotals = useMemo(() => {
-    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, mtdDrr: 0, fbaDaysCover: null, custReserved: 0, reserved: 0, inboundPipeline: 0, awd: 0, awdInbound: 0, totalFbaInv: 0, amazonNetwork: 0, recommended: 0, restockCount: 0,
+    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, mtdDrr: 0, fbaDaysCover: null, custReserved: 0, reserved: 0, inboundPipeline: 0, awd: 0, awdInbound: 0, totalFbaInv: 0, amazonNetwork: 0, recommended: 0, restockCount: 0, evaluatedCount: 0,
       pipeline: 0, horizonDemand: 0, safetyStock: 0, targetInventory: 0, sellerWh: 0, shipWh: 0, production: 0 };
     let anyInv = false, anyAwd = false, anyAwdInbound = false;
     const add = (key, v) => { if (v != null && Number.isFinite(Number(v))) t[key] += Number(v); };
@@ -3270,6 +3270,10 @@ function DashboardApp({ session, access, onSignOut }) {
       if (r.awd !== null) { anyAwd = true; t.awd += r.awd; }
       if (r.awdInbound != null) { anyAwdInbound = true; t.awdInbound += Number(r.awdInbound); }
       if (r.recommended !== null) t.recommended += r.recommended;
+      // A row is ACTUALLY assessed for restock only when a recommendation could be computed (inventory + a run
+      // rate). remark is null otherwise. evaluatedCount lets the KPI/footer show "unavailable" instead of a
+      // misleading 0/OK when inventory is unavailable and nothing was assessed (Defect D). No formula change.
+      if (r.remark != null) t.evaluatedCount += 1;
       if (r.remark === "Restock") t.restockCount += 1;
       // Planning outputs (each null-safe; a null contributes nothing but never fabricates a 0 header total).
       add("horizonDemand", r.planning?.horizonDemand); add("safetyStock", r.planning?.safetyStockUnits);
@@ -3385,7 +3389,7 @@ function DashboardApp({ session, access, onSignOut }) {
       { id: "produce", group: "Planning", label: "Produce", chooserLabel: "Production requirement", thTitle: "max(0, shortage after Amazon/AWD network stock − Seller WH)", cell: (r) => td("produce", r.planning?.productionRequirement, "mono pt-strong"), foot: (t) => td("produce", t.production, "mono pt-strong") },
       { id: "stockout", group: "Planning", label: "Est. Stockout", chooserLabel: "Estimated stockout", thTitle: "Effective-through date + floor(Immediately Available / daily run rate)", cell: (r) => <td key="stockout" className="mono" title={r.planning?.estimatedStockoutDate ? "" : (r.planning?.stockoutReason || "")}>{r.planning?.estimatedStockoutDate ? fmtDateHuman(r.planning.estimatedStockoutDate) : <span className="dr-dash">—</span>}</td>, foot: () => <td key="stockout" className="mono">—</td> },
       { id: "priority", group: "Planning", label: "Priority", chooserLabel: "Priority", align: "left", cell: (r) => <td key="priority">{r.planning?.planningPriority && r.planning.planningPriority !== "Unknown" ? <span className={"pt-badge plan-prio-" + String(r.planning.planningPriority).toLowerCase()} title={r.planning.recommendedAction || ""}>{r.planning.planningPriority}</span> : "—"}</td>, foot: () => <td key="priority">—</td> },
-      { id: "remark", group: "Status", label: "Remark", chooserLabel: "Stock remark", align: "left", sortKey: "remark", cell: (r) => <td key="remark">{r.remark ? <span className={"pt-badge " + (r.remark === "Restock" ? "pt-badge-restock" : "pt-badge-ok")}>{r.remark}</span> : "—"}</td>, foot: (t) => <td key="remark">{t.restockCount > 0 ? `${t.restockCount} restock` : "OK"}</td> },
+      { id: "remark", group: "Status", label: "Remark", chooserLabel: "Stock remark", align: "left", sortKey: "remark", cell: (r) => <td key="remark">{r.remark ? <span className={"pt-badge " + (r.remark === "Restock" ? "pt-badge-restock" : "pt-badge-ok")}>{r.remark}</span> : "—"}</td>, foot: (t) => <td key="remark">{!t.evaluatedCount ? "—" : t.restockCount > 0 ? `${t.restockCount} restock` : "OK"}</td> },
 
       // ================= ADDITIVE columns: WDD demand + lead time + reorder (sit BESIDE the existing columns) =========
       // Demand reuses the shared SKU Movement v2 ordered-unit evidence; a missing/uncovered value is an em dash (never a
@@ -4883,7 +4887,7 @@ function DashboardApp({ session, access, onSignOut }) {
 
             <div className="plan-stat-row">
               <div className="plan-stat"><div className="plan-stat-label">ASINs</div><div className="plan-stat-value mono">{planRows.length.toLocaleString("en-US")}</div></div>
-              <div className="plan-stat"><div className="plan-stat-label">Needs Restock</div><div className="plan-stat-value mono">{planTotals.restockCount.toLocaleString("en-US")}</div></div>
+              <div className="plan-stat"><div className="plan-stat-label">Needs Restock</div><div className="plan-stat-value mono">{planTotals.evaluatedCount > 0 ? planTotals.restockCount.toLocaleString("en-US") : "—"}</div></div>
               <div className="plan-stat"><div className="plan-stat-label">Recommended Units</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.recommended) : "—"}</div></div>
               <div className="plan-stat"><div className="plan-stat-label">FBA Available</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.fbaAvailable) : "—"}</div></div>
               <div className="plan-stat"><div className="plan-stat-label">Total FBA Inv.</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.totalFbaInv) : "—"}</div></div>

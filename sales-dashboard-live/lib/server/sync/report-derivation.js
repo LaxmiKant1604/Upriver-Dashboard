@@ -1083,7 +1083,11 @@ const REGISTRY = {
   // buildAdvancedListingHealth which re-asserts the trusted-owner projection boundary + currency isolation.
   "listing-health-v3": {
     snapshotVersion: "listing-health/v3-oli-window",
-    optionalRequestKeys: ["listing-health-v3:listings-raw"],
+    // Inventory is now OPTIONAL (Defect A / Section 3 partial-data contract): the required LISTING evidence +
+    // durable OLI publish per account even when THIS account's FBA inventory failed; inventory-dependent fields
+    // (FBA on-hand from the snapshot) simply resolve unavailable for that account. Listings-Raw stays optional/
+    // degradable exactly as before. Listings + durable OLI remain the only hard-required evidence.
+    optionalRequestKeys: ["listing-health-v3:listings-raw", "listing-health-v3:inventory"],
     derivedSourceKeys: ["order-line-items", "product-catalog"],
     derivedContextKeys: ["listingHealthV3DurableOli", "listingHealthV3DurableCatalog"],
     derive: ({ sources, context }) => {
@@ -1093,22 +1097,35 @@ const REGISTRY = {
       }
       const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
       const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
-      // The TWO required owned exports (Raw is optional/degradable; OLI + catalog are derived durable deps below).
-      for (const key of ["listing-health-v3:listings", "listing-health-v3:inventory"]) {
-        const s = sources[key];
+      // The ONE hard-required owned export is LISTINGS (Raw + inventory are optional/degradable; OLI + catalog are
+      // derived durable deps below). A missing/failed/unreadable LISTINGS cache still blocks (LKG preserved).
+      {
+        const s = sources["listing-health-v3:listings"];
         if (!s || s.available !== true || !Array.isArray(s.rows)) {
-          throw deriveError(`listing-health-v3 ${key} is required but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
+          throw deriveError("listing-health-v3 listing-health-v3:listings is required but its cache is missing/failed/unreadable; last-known-good preserved.", "unavailable");
         }
       }
       // Listings is a single-account NO-DATE fragment (already isolated to this owner by the worker).
       const listingRows = noDateFragmentRows(sources["listing-health-v3:listings"], "listing-health-v3:listings", rawSellerId);
-      // Inventory is EXACTLY the single snapshot day [inventoryAsOf .. inventoryAsOf] (D-1), INDEPENDENT of
-      // the sales window (inventoryAsOf defaults to asOf but may lead it), recomputed + pinned here (never
-      // trusted). Both endpoints are the ONE date, so no cross-date row can ever be accepted or summed.
+      // Inventory is OPTIONAL and, when present, is EXACTLY the single snapshot day [inventoryAsOf .. inventoryAsOf]
+      // (D-1), INDEPENDENT of the sales window (inventoryAsOf defaults to asOf but may lead it), recomputed + pinned
+      // here (never trusted). Both endpoints are the ONE date, so no cross-date row can ever be accepted or summed.
+      // When inventory is ABSENT / not-a-validated-success (this account's FBA failed while other accounts' FBA
+      // succeeded), inventoryRows=[] -> buildAdvancedListingHealth yields inventory.available:false and FBA on-hand
+      // falls back to the Listings quantity or unavailable (never a fabricated zero). Listings/OLI still publish. A
+      // PRESENT-but-out-of-window inventory cache still fails closed (assertRowsInWindow) -- an integrity defect is
+      // never silently downgraded to "unavailable".
       const inventoryAsOf = context.inventoryAsOf == null ? asOf : String(context.inventoryAsOf);
       if (!isValidCalendarDate(inventoryAsOf)) throw new Error("listing-health-v3 inventoryAsOf must be a real calendar date.");
-      const inventoryRows = singleAccountFragmentRows(sources["listing-health-v3:inventory"], "listing-health-v3:inventory", rawSellerId, inventoryAsOf, inventoryAsOf);
-      assertRowsInWindow(inventoryRows, inventoryAsOf, inventoryAsOf, "listing-health-v3 inventory");
+      const inventorySource = sources["listing-health-v3:inventory"];
+      let inventoryRows = [];
+      if (inventorySource && inventorySource.available === true && Array.isArray(inventorySource.rows)) {
+        inventoryRows = singleAccountFragmentRows(inventorySource, "listing-health-v3:inventory", rawSellerId, inventoryAsOf, inventoryAsOf);
+        assertRowsInWindow(inventoryRows, inventoryAsOf, inventoryAsOf, "listing-health-v3 inventory");
+      } else if (inventorySource && inventorySource.disabled === true && sourceDisabledOutcome(inventorySource.disabledPolicy || null).blocks) {
+        // A TERMINALLY-disabled inventory source is a configuration block, not a partial-data state.
+        throw deriveError("listing-health-v3:inventory is terminally disabled; snapshot blocked.", "blocked");
+      }
       // Optional Listings (Raw JSON): validated success => enrich; approved degraded/disabled => issuesAvailable false;
       // anything else (pending/failed/unreadable) => unavailable (LKG preserved). Mirrors the v1 raw policy exactly.
       const rawSource = sources["listing-health-v3:listings-raw"];

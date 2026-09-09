@@ -150,17 +150,17 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     requiredSources: [OLI, CATALOG], optionalSources: [ADS, FBA],
     sourceOwner: "scheduler-v2", materializationOwner: "scheduler-v2:materialize",
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "D-1" },
-    provenanceFields: ["adsAvailable", "fbaAvailable", "inventoryScope", "updating"], lkgPolicy: "serve-last-known-good",
+    provenanceFields: ["adsAvailable", "fbaAvailable", "inventoryScope", "updating", "depFingerprint"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["brand-view"],
     serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
-    notes: "Published by the FBA-aware Brand View materializer (report-materialization-brandview job) per (account,brand) at the exact serve identity {accountId,brand,asOf=marketplaceToday(country)}; a read serves the stored snapshot (updating when brand-sales advanced, converging on the next scheduled publish -- no page-open write). FBA honestly unavailable (fbaAvailable:null) when no inventory snapshot; missing Ads mappings -> adsAvailable:false. Refresh=1 stays click-only.",
+    notes: "Published by the FBA-aware Brand View materializer (report-materialization-brandview job) per (account,brand) at the exact serve identity {accountId,brand,asOf=marketplaceToday(country)}. FRESHNESS is a DEPENDENCY FINGERPRINT over the COMPLETE contributing set (brand-sales + compact brand-inventory + fba-plan + Ads coverage + campaign->brand mapping + catalog + version), computed identically by the writer and the serve: a read serves the stored snapshot and flags updating when ANY dependency changed (inventory became available, Ads advanced, a mapping was edited) -- not just when brand-sales advanced -- converging on the next scheduled publish with no page-open write. The compact brand-inventory is REBUILT from the fresh fba-plan by the materialize-inventory job AFTER fba, so fbaAvailable reflects same-day D-1 inventory (null only when no inventory snapshot); missing Ads mappings -> adsAvailable:false. Refresh=1 stays click-only.",
   },
   "brand-view-portfolio": {
     reportKey: "brand-view-portfolio", reportVersion: null,
     requiredSources: [OLI, CATALOG], optionalSources: [ADS, FBA],
     sourceOwner: "scheduler-v2", materializationOwner: "scheduler-v2:materialize",
     grain: "account-region", freshness: { maxAgeHours: 24, coverage: "D-1" },
-    provenanceFields: ["adsAvailable", "fbaAvailable", "updating"], lkgPolicy: "serve-last-known-good",
+    provenanceFields: ["adsAvailable", "fbaAvailable", "updating", "depFingerprint"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["brand-view-portfolio"],
     serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
     notes: "The BACKEND PRODUCER that fixes non-convergence: the FBA-aware Brand View materializer publishes the CANONICAL region-brand account set (accountsForBrand(brand-sales membership) intersect region) at the exact serve identity {sortedAccountIds,brand,asOf=marketplaceToday(\"IN\"),region}. deferRebuildOnRead read serves the stored snapshot; a source advance flags updating and the next scheduled publish converges it WITHOUT a user Refresh. A restricted-subset user's different account set is a different identity (never served the canonical LKG; assertAccountAccess gates it) -- no unauthorized payload is precomputed.",
@@ -217,13 +217,17 @@ export const REPORT_MATERIALIZATION = Object.freeze({
   },
   "listing-health-v3": {
     reportKey: "listing-health-v3", reportVersion: vTag("listing-health-v3"),
-    requiredSources: [LISTINGS, LISTINGS_RAW, FBA], optionalSources: [OLI, CATALOG],
+    // Optional-inventory contract (Section 3): LISTINGS is the only hard-required owned export. LISTINGS_RAW and FBA
+    // inventory are OPTIONAL/degradable -- the derive publishes listings + durable OLI per account even when this
+    // account's FBA failed, with inventory-dependent fields resolving unavailable (never a fabricated zero). This
+    // matches the derive contract (report-derivation.js listing-health-v3 optionalRequestKeys).
+    requiredSources: [LISTINGS], optionalSources: [LISTINGS_RAW, FBA, OLI, CATALOG],
     sourceOwner: "scheduler-v2", materializationOwner: "scheduler-v2:v3-shadow",
     grain: "account", freshness: { maxAgeHours: 24, coverage: "latest-snapshot" },
     provenanceFields: ["inventory", "salesWindowStatus", "coverage", "evidence"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "shadow", capability: REPORT_CAPABILITIES["listing-health-v3"],
     serveMode: "derive-at-serve", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
-    notes: "SHADOW ingestion writes durable per-account aliases; serve derives read-only from them + durable OLI. UI flag LISTING_HEALTH_V3 is OFF.",
+    notes: "SHADOW ingestion writes durable per-account aliases; serve derives read-only from them + durable OLI. Inventory is OPTIONAL: an account whose FBA inventory failed still publishes listings/OLI with inventory.available:false (D-1 pin kept when inventory IS present). The region-wide FBA-completeness prerequisite (scheduler-v2.yml job gate + operation.js region-wide inventory defer) remains a SEPARATELY-REVIEWED rollout change. UI flag LISTING_HEALTH_V3 is OFF.",
   },
   // ----- reports with NO live scheduler owner: materialized only by an explicit user Refresh (DataDoe) today. Declared
   //       honestly as materializationOwner="manual-refresh" so the gap is visible + a future move is reviewable. -----

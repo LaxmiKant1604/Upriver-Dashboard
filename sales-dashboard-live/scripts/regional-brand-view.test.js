@@ -65,7 +65,7 @@ ok("region filter is role-independent (applies to admin requests too)", JSON.str
 
 const bvpIdx = datadoe.indexOf('if (action === "brand-view-portfolio") {');
 ok("datadoe has the brand-view-portfolio route", bvpIdx >= 0);
-const bvpBlock = datadoe.slice(bvpIdx, bvpIdx + 8000);
+const bvpBlock = datadoe.slice(bvpIdx, bvpIdx + 9000);
 ok("portfolio route validates the region param (normalizeRegionParam)", /normalizeRegionParam\(req\.query\.region\)/.test(bvpBlock));
 ok("portfolio route rejects an invalid region with 400 (no disclosure)", /RegionScopeError/.test(bvpBlock) && /status\(400\)/.test(bvpBlock));
 ok("portfolio route re-filters the account set from trusted metadata (filterAccountIdsToRegion)", /filterAccountIdsToRegion\(authorizedIds, accountsById, region\)/.test(bvpBlock));

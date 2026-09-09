@@ -582,6 +582,47 @@ export async function buildBrandInventorySnapshot({
   return { payload, asinBrandCount: brandByAsin.size };
 }
 
+/**
+ * PURE zero-export adapter: build the compact brand-inventory payload from an ALREADY-VALIDATED fba-plan report
+ * snapshot payload (Defect A). The fba-plan derive (derivation-core.js) already folds the validated FBA Inventory
+ * Health to the EXACT compact shape (inventoryByBrandCountry [{country, brand, fbaAvailable, skuCount}] +
+ * inventorySnapshotDate + inventoryAvailable), so there is ONE inventory definition and NO second paid export.
+ *
+ * The priority run publishes the compact BEFORE the FBA job runs, so it is inventoryAvailable:false; the FBA-aware
+ * materialize-inventory job (which runs AFTER fba) uses this adapter to REBUILD the compact from the fresh fba-plan,
+ * making Brand View's exclusive-compact consumer serve real inventory the SAME day.
+ *
+ * Returns null (never a fabricated zero) when the fba-plan carries no available inventory or no strict snapshot
+ * date -- the caller then leaves the existing (unavailable) compact untouched, preserving per-account
+ * zero-vs-missing semantics. An fba-plan on LKG (an older validated date) rebuilds with its REAL inventoryDate
+ * (labeled by that date downstream, never claimed D-1).
+ */
+export function compactInventoryFromFbaPlanPayload(planPayload, accountId) {
+  if (!planPayload || planPayload.inventoryAvailable !== true) return null;
+  const rows = Array.isArray(planPayload.inventoryByBrandCountry) ? planPayload.inventoryByBrandCountry : null;
+  if (!rows) return null;
+  const inventoryDate = trimmed(planPayload.inventorySnapshotDate || planPayload.inventoryDate);
+  // Never publish a compact with a fabricated/absent date -- the whole value of the D-1 contract is an honest date.
+  if (!isStrictCalendarDate(inventoryDate)) return null;
+  const inventoryByBrandCountry = [];
+  for (const entry of rows) {
+    const available = Number(entry && entry.fbaAvailable);
+    if (!Number.isFinite(available) || available < 0) return null; // malformed fold -> preserve previous compact
+    inventoryByBrandCountry.push({
+      country: trimmed(entry && entry.country).toUpperCase() || null,
+      brand: (entry && entry.brand != null) ? entry.brand : null,
+      fbaAvailable: available,
+      skuCount: Number.isFinite(Number(entry && entry.skuCount)) ? Number(entry.skuCount) : 0,
+    });
+  }
+  return {
+    accountId: String(accountId),
+    inventoryDate,
+    inventoryAvailable: true,
+    inventoryByBrandCountry,
+  };
+}
+
 /* ------------------------------------------------------------ the two builds */
 
 /**

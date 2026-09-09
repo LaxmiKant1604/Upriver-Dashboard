@@ -24,15 +24,28 @@ export async function materializeSnapshot({
   }
   const paramsHash = paramsHashFor(reportVersion, params);
   const sourceRefreshedAt = derived.sourceRefreshedAt || null;
+  // DEPENDENCY FINGERPRINT (Defect B): a stable hash of the COMPLETE contributing dependency set (brand-sales +
+  // inventory + Ads + mapping + catalog + version), supplied by the derive. When present it -- NOT the single
+  // source_refreshed_at timestamp -- is the idempotency authority: equal fingerprint => the whole dependency set
+  // is unchanged (zero-write replay); ANY changed dependency (including missing->available and available->
+  // unavailable) flips the fingerprint and yields exactly one update. Absent (every other report) => byte-identical
+  // legacy behavior: the source_refreshed_at equality probe below. The fingerprint is carried in the params jsonb
+  // (NOT in paramsHash -- computed above from the identity params only -- so the row identity is unchanged).
+  const depFingerprint = derived.depFingerprint || null;
+  const isUnchanged = (existing) => {
+    if (!existing || !existing.payload) return false;
+    if (depFingerprint) return String(existing.params?.depFingerprint || "") === String(depFingerprint);
+    return !!sourceRefreshedAt && String(existing.source_refreshed_at || "") === String(sourceRefreshedAt);
+  };
   if (dryRun) {
-    return { report: reportKey, account: accountId, scope: scopeLabel, status: "planned", paramsHash, sourceRefreshedAt, tokens: 0 };
+    return { report: reportKey, account: accountId, scope: scopeLabel, status: "planned", paramsHash, sourceRefreshedAt, depFingerprint, tokens: 0 };
   }
-  // Cheap idempotency probe: the exact identity is already stored with the same source provenance -> nothing to do.
+  // Cheap idempotency probe: the exact identity is already stored with the same dependency fingerprint (or, legacy,
+  // the same source provenance) -> nothing to do.
   if (typeof readSnapshot === "function") {
     const existing = await readSnapshot({ reportKey, accountId, paramsHash });
-    if (existing && existing.payload && sourceRefreshedAt
-        && String(existing.source_refreshed_at || "") === String(sourceRefreshedAt)) {
-      return { report: reportKey, account: accountId, scope: scopeLabel, status: "unchanged", paramsHash, sourceRefreshedAt, tokens: 0 };
+    if (isUnchanged(existing)) {
+      return { report: reportKey, account: accountId, scope: scopeLabel, status: "unchanged", paramsHash, sourceRefreshedAt, depFingerprint, tokens: 0 };
     }
   }
   const locked = await claimLock({ reportKey, accountId, paramsHash });
@@ -42,20 +55,21 @@ export async function materializeSnapshot({
   try {
     if (typeof readSnapshot === "function") {
       const fresh = await readSnapshot({ reportKey, accountId, paramsHash });
-      if (fresh && fresh.payload && sourceRefreshedAt
-          && String(fresh.source_refreshed_at || "") === String(sourceRefreshedAt)) {
-        return { report: reportKey, account: accountId, scope: scopeLabel, status: "unchanged", paramsHash, sourceRefreshedAt, tokens: 0 };
+      if (isUnchanged(fresh)) {
+        return { report: reportKey, account: accountId, scope: scopeLabel, status: "unchanged", paramsHash, sourceRefreshedAt, depFingerprint, tokens: 0 };
       }
     }
     const saved = await persistSnapshot({
       reportKey, reportVersion, accountId, paramsHash,
-      params: { reportVersion, ...params },
+      // Carry the dependency fingerprint in the stored params jsonb so a later replay/serve can compare it. It is
+      // NOT part of paramsHashFor, so the (report_key, account_id, params_hash) identity is byte-identical.
+      params: depFingerprint ? { reportVersion, ...params, depFingerprint } : { reportVersion, ...params },
       payload: derived.payload,
       sourceRefreshedAt: sourceRefreshedAt || undefined,
     });
     return {
       report: reportKey, account: accountId, scope: scopeLabel, status: "materialized",
-      paramsHash, sourceRefreshedAt: (saved && saved.savedAt) || sourceRefreshedAt, tokens: 0,
+      paramsHash, sourceRefreshedAt: (saved && saved.savedAt) || sourceRefreshedAt, depFingerprint, tokens: 0,
     };
   } finally {
     await releaseLock({ reportKey, accountId, paramsHash }).catch(() => {});

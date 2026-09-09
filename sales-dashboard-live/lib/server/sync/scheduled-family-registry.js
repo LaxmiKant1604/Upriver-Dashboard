@@ -42,6 +42,7 @@ export const COMPLETION_OUTPUTS = Object.freeze([
   "fba_complete-job-output", // P1: fba-plan-golive emits fba_complete to $GITHUB_OUTPUT; the job exports it
   "terminal-succeeded-gate", // only a terminal 'succeeded' ingestion counts (v3 honest finalize)
   "materialize-count",       // the count of materialized snapshots (zero-export jobs)
+  "campaign-coverage-ok",    // the Campaign Ads coverage refresh step outcome (covered within ceiling; publication gates on it)
 ]);
 export const PARTIAL_BEHAVIORS = Object.freeze([
   "d1-provisional-final-lkg", // publish real itemized D-1 as provisional, promote to final; never fabricate; LKG retained
@@ -84,6 +85,17 @@ export const SCHEDULED_FAMILY_REGISTRY = Object.freeze({
     partialBehavior: "defer-typed-lkg",
     watchdogIdempotency: "operation-key-frozen-budget",
     notes: "P0-A: frozen into the daily cycle by the OLI step; drained by the priority step as a case-(a) continuation (never case-c not-drained). Legacy OLI-only cycles are recovered by finalize + supersede (P0-B).",
+  },
+  "campaign-performance": {
+    family: "campaign-performance",
+    schedulerOwner: "scheduler-v2:run",
+    dependencies: [],
+    frozenPlanParticipation: "own-cycle",
+    ceiling: "computed-per-region",
+    completionOutput: "campaign-coverage-ok",
+    partialBehavior: "stay-visibly-partial",
+    watchdogIdempotency: "idempotent-replay",
+    notes: "The ONLY active Ads source (campaign-performance-v1). Refreshed ONCE per region in the run job (coverage mode, 21-day rolling window, <=5-seller batches with per-seller isolation + LKG retention). Independent of OLI/Catalog (an OLI failure never suppresses it); already-covered => zero creates (idempotent). Publication gates on steps.campaign.outcome == 'success'.",
   },
   "fba-inventory-health": {
     family: "fba-inventory-health",

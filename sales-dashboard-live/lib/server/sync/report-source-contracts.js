@@ -1331,10 +1331,37 @@ export function resolveDailyAdsAvailability(coverage, planned) {
     : (covered.to < requestedTo ? "stale" : "partial");
   // Merge ONLY rows inside the proven covered window; uncovered dates stay unavailable (never zero).
   const coveredRows = adRows.filter((row) => row.date >= covered.from && row.date <= covered.to);
+  // PROVISIONAL METRIC TAIL (Defect C, read-side honesty). The coverage store may mark a window successfully
+  // synced through covered.to while the provider has not yet itemized the most recent day(s) (a known ~1-2d
+  // item-level lag) -- so the durable latestMetricDate trails covered.to. Those trailing days are NOT proven-zero:
+  // exposing (latestMetricDate+1 .. covered.to) as PROVISIONAL lets the consumer show "ads through <latestMetricDate>,
+  // later days pending" instead of a completed zero-ad assessment through covered.to. It does NOT drop covered-empty
+  // semantics for a genuinely quiet day (a covered day with no row inside [covered.from..latestMetricDate] stays a
+  // real 0), never invents a zero, and never changes which rows merge. Only set when we HAVE metrics (a valid
+  // latestMetricDate) that stop strictly before the covered end; a fully-empty covered window (no latestMetricDate)
+  // is left to the existing status (a legitimately zero-ad account is not relabelled provisional).
+  const provisionalFrom = (isValidCalendarDate(latestMetricDate)
+    && latestMetricDate >= covered.from && latestMetricDate < covered.to)
+    ? addUtcDaysStr(latestMetricDate, 1) : null;
   return {
-    availability: { status, coveredFrom: covered.from, coveredTo: covered.to, requestedFrom, requestedTo, currency: accountCurrency, latestMetricDate, reason: null },
+    availability: {
+      status, coveredFrom: covered.from, coveredTo: covered.to, requestedFrom, requestedTo,
+      currency: accountCurrency, latestMetricDate, reason: null,
+      // Additive, optional: null unless a provider-lag tail is detected. Consumers that ignore it behave identically.
+      provisionalFrom, provisionalTo: provisionalFrom ? covered.to : null,
+    },
     adRows: coveredRows,
   };
+}
+
+// Local UTC date +N days (YYYY-MM-DD). Pure; no timezone ambiguity. Kept local so this contract module stays leaf.
+function addUtcDaysStr(dateStr, days) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ""));
+  if (!m) return null;
+  const t = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) + days * 86400000;
+  const d = new Date(t);
+  const p2 = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())}`;
 }
 
 /* ===================== SKU P&L: strict six-complete-calendar-month contract =====================

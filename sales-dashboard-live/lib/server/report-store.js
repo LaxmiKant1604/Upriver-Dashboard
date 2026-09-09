@@ -189,6 +189,15 @@ export async function serveSharedReport({
   // than it is flagged `updating:true` so the caller shows the last-known-good NOW and a zero-export rebuild is
   // known to be due (default null = the field is never added, behaviour byte-identical for every other report).
   contributingProvenanceAt = null,
+  // FRESHNESS BY DEPENDENCY FINGERPRINT (Brand View, Defect B): the CURRENT dependency fingerprint of the COMPLETE
+  // contributing set (brand-sales + inventory + Ads + mapping + catalog + version), computed identically to the
+  // writer. When set and a served snapshot's recorded params.depFingerprint DIFFERS (either direction -- including
+  // an optional dependency that became available/unavailable with unchanged brand-sales), the snapshot is stale:
+  // serve the last-known-good NOW + `updating:true`, and the scheduler's next pass republishes (its fingerprint now
+  // differs -> exactly one update). A stored snapshot WITH a matching fingerprint is fresh (the timestamp probe is
+  // not applied); a stored snapshot WITHOUT a fingerprint (legacy row) falls back to the timestamp probe. Default
+  // null = the fingerprint is never consulted (byte-identical for every other report).
+  contributingDepFingerprint = null,
   // 504 GUARD (Brand View portfolio): when true, a READ never runs the potentially-slow `deriveDurable` inline
   // (the serverless-timeout source); a missing snapshot returns a typed `updating` state instead. The bounded
   // rebuild happens only on an explicit refresh (below). Default false keeps the inline self-heal for every
@@ -235,9 +244,18 @@ export async function serveSharedReport({
     return String(snap.payload.campaignMappingRev || "") !== String(staleWhenMappingRev);
   };
   // Null-safe source-staleness probe: a served snapshot whose source provenance predates the newest contributing
-  // provenance is stale (a rebuild is due). Returns false whenever no provenance was supplied (never fabricates).
+  // provenance is stale (a rebuild is due). Returns false whenever nothing was supplied (never fabricates).
   const isSourceStale = (snap) => {
-    if (!contributingProvenanceAt || !snap) return false;
+    if (!snap) return false;
+    // Dependency-fingerprint staleness (Defect B): a mismatch in EITHER direction means the complete dependency
+    // set changed (an optional dependency became available/unavailable, Ads advanced, a mapping was edited) even
+    // when brand-sales provenance is unchanged. A present-and-equal fingerprint is authoritatively fresh (the
+    // timestamp probe is skipped); a legacy snapshot with no stored fingerprint falls back to the timestamp probe.
+    if (contributingDepFingerprint) {
+      const stored = String(snap.params?.depFingerprint || "");
+      if (stored) return stored !== String(contributingDepFingerprint);
+    }
+    if (!contributingProvenanceAt) return false;
     const snapAt = String(snap.source_refreshed_at || snap.updated_at || "");
     return !!snapAt && snapAt < String(contributingProvenanceAt);
   };

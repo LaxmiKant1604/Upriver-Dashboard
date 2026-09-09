@@ -16,7 +16,7 @@ loadReleaseEnv();
 // DYNAMIC imports AFTER loadReleaseEnv() -- lib/server/supabase.js reads env at module-eval and static ESM imports hoist
 // above the call above (CI already has env, but a local run needs .env.local loaded first). See report-materialization.mjs.
 const { buildBrandViewMaterializationRelease } = await import("../../lib/server/sync/report-materialization-brandview-composition.js");
-const { runBrandViewMaterialization } = await import("../../lib/server/sync/report-materialization-brandview-operation.js");
+const { runBrandViewMaterialization, runBrandInventoryRebuild } = await import("../../lib/server/sync/report-materialization-brandview-operation.js");
 const { REGION_SCOPES } = await import("../../lib/server/sync/scheduler-scope.js");
 
 const argv = process.argv.slice(2);
@@ -41,6 +41,15 @@ async function main() {
   const accounts = await release.discoverAccounts(region);
   log(`report-materialization-brandview[${region}] ${dryRun ? "DRY-RUN" : "LIVE"}: ${accounts.length} primary account(s).`);
   if (!accounts.length) { log("report-materialization-brandview: no primary accounts in this region. Nothing to materialize."); process.exit(0); }
+
+  // Defect A: FIRST rebuild the compact brand-inventory from each account's FRESH fba-plan snapshot (this job runs
+  // AFTER the fba job), so Brand View's exclusive-compact consumer reads CURRENT inventory below. Gated on the
+  // source-promoted publish control; zero-export. A tokens>0 here is impossible (no adapter) but re-checked below.
+  const invResult = await runBrandInventoryRebuild({ region, accounts, dryRun }, { ...release, log });
+  if (invResult && invResult.summary && invResult.summary.tokens !== 0) {
+    log("report-materialization-brandview: NON-ZERO token count in brand-inventory rebuild -- this path must never spend a token. Failing.");
+    process.exit(1);
+  }
 
   const result = await runBrandViewMaterialization({ region, accounts, dryRun }, { ...release, log });
   const s = result.summary;

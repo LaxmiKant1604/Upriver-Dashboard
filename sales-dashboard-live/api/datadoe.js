@@ -144,6 +144,27 @@ function campaignMappingsReader() {
   const fp = primaryOrgFingerprintOrNull();
   return async ({ accountId }) => (fp ? getCampaignBrandMappings({ organizationFingerprint: fp, connectionId: "primary", accountId }).catch(() => []) : []);
 }
+
+// The SHARED Brand View dependency-fingerprint readers (zero-export), byte-identical to the ones the scheduler's
+// Brand View materializer wires (report-materialization-brandview-composition.js). Because BOTH sides fingerprint
+// the same dependency set with the same readers, the serve's `contributingDepFingerprint` and the stored snapshot's
+// `params.depFingerprint` agree by construction: they match iff nothing changed, and differ (either direction --
+// including an optional dependency that became available/unavailable) the moment any dependency advances (Defect B).
+function brandViewDepFingerprintReaders() {
+  const fp = primaryOrgFingerprintOrNull();
+  const mappings = campaignMappingsReader();
+  return {
+    getSnapshotMeta: ({ reportKey, accountId }) => getLatestReportSnapshotMeta({ reportKey, accountId }).catch(() => null),
+    getAdsCoverage: (accountId) => getDailyAdsCoverage(accountId, ACTIVE_ADS_SOURCE_KEY).catch(() => null),
+    getMappingRev: async (accountId) => campaignMappingRevision(await mappings({ accountId }).catch(() => [])),
+    getCatalogValidatedAt: async () => {
+      if (!fp) return null;
+      const read = await getSourceSnapshot({ organizationFingerprint: fp, connectionId: "primary", sourceKey: "product-catalog", scopeKey: "__organization" }).catch(() => null);
+      const ptr = read && typeof read === "object" && "snapshot" in read ? read.snapshot : read;
+      return (ptr && (ptr.validated_at || ptr.payload_sha)) || null;
+    },
+  };
+}
 import { makeRouteDeadline } from "../lib/server/sync/source-bucket-sync-runtime.js";
 // Regional Brand View: server-side region validation + trusted-metadata membership filter (pure helpers over the
 // SINGLE canonical marketplace->region mapping the scheduler owns; no second mapping is introduced).
@@ -187,6 +208,7 @@ import { refreshCorrectedBrandSalesForAccount } from "../lib/server/reports/bran
 import { summarizeExplicitZeroOli, brandByAsinFromCatalog } from "../lib/server/reports/oli-quality.js";
 import { rederiveDailyV2, latestProvenDailyTo, DAILY_OLI_SOURCE_KEY } from "../lib/server/reports/daily-durable-rederive.js";
 import { campaignMappingRevision } from "../lib/server/reports/campaign-ads-aggregation.js";
+import { collectBrandViewDependencyFingerprint } from "../lib/server/reports/brand-view-dependency-fingerprint.js";
 import { rederiveSkuMovement, skuMovementProvenDates, skuMovementRefreshedAt } from "../lib/server/reports/sku-movement-durable-rederive.js";
 import { gatherReturnsEvidence } from "../lib/server/reports/returns-publish.js";
 import { RETURNS_ADVANCED_VERSION } from "../lib/server/reports/returns-advanced.js";
@@ -2839,6 +2861,13 @@ async function handleDataDoe(req, res) {
       // Brand View materializer republishes the fresh snapshot, and the frontend's bounded READ-ONLY poll converges on
       // it with no page-open write and no user Refresh.
       const singleProvenanceAt = await getLatestSourceProvenance({ reportKey: BRAND_SALES_REPORT_KEY, accountIds: [accountId] }).catch(() => null);
+      // Dependency fingerprint of the COMPLETE contributing set (Defect B): a served snapshot whose recorded
+      // fingerprint differs is flagged updating so the scheduler republishes -- even when brand-sales provenance is
+      // unchanged but inventory/Ads/mapping advanced. Computed with the SAME readers the materializer uses.
+      const singleDepFingerprint = await collectBrandViewDependencyFingerprint({
+        scope: "account", brand, accountIds: [accountId], reportVersion: BRAND_VIEW_VERSION,
+        readers: brandViewDepFingerprintReaders(),
+      }).catch(() => null);
       await serveSharedReport({
         res,
         refresh: wantsRefresh(req),
@@ -2852,6 +2881,7 @@ async function handleDataDoe(req, res) {
         userId: access.userId,
         label: "Brand View",
         contributingProvenanceAt: singleProvenanceAt,
+        contributingDepFingerprint: singleDepFingerprint,
         augmentResponse: oliCompletenessAugmentSingle(),
         build: () => buildBrandViewSnapshot({
           accountId,
@@ -2948,6 +2978,13 @@ async function handleDataDoe(req, res) {
       // The function's maxDuration is 60s; give the bounded rebuild 52s of build budget with 6s reserved for the
       // response so a slow rebuild returns typed "updating" (LKG served) rather than a 504.
       const portfolioDeadline = portfolioRefresh ? makeRouteDeadline({ budgetMs: 52_000, reserveMs: 6_000 }) : null;
+      // Dependency fingerprint over the region's contributing account set (Defect B) -- same readers the
+      // materializer uses, so a serve mismatch means the compact inventory / Ads / mapping advanced for some account
+      // and the next scheduled publish converges it (no page-open write).
+      const portfolioDepFingerprint = await collectBrandViewDependencyFingerprint({
+        scope: "portfolio", brand, accountIds, reportVersion: BRAND_VIEW_PORTFOLIO_VERSION,
+        readers: brandViewDepFingerprintReaders(),
+      }).catch(() => null);
       const buildPortfolio = () => buildBrandViewPortfolioSnapshot({
         accountIds,
         brand,
@@ -2982,6 +3019,7 @@ async function handleDataDoe(req, res) {
         // bounded rebuild runs only on an explicit refresh.
         deferRebuildOnRead: true,
         contributingProvenanceAt: portfolioProvenanceAt,
+        contributingDepFingerprint: portfolioDepFingerprint,
         routeDeadline: portfolioDeadline,
       });
       return;
