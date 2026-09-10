@@ -95,16 +95,36 @@ jobs:
       # is a SEPARATE, sequential invocation (its own control-package apply/publish/safe-close) capped at 7 minutes so
       # one region can never consume the whole budget; the loop continues on a per-region failure (isolation).
       - name: Reconcile OLI-dependent live dashboards, all regions in order (zero export)
+        id: reconcile
         run: |
           MODE='${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode || (vars.OLI_RECONCILE_LIVE == 'true' && 'live' || 'dry-run') }}'
           ONLY='${{ github.event.inputs.bucket }}'
           ASOF="$(date -u -d 'yesterday' +%F)"
+          echo "asof=$ASOF" >> "$GITHUB_OUTPUT"; echo "only=$ONLY" >> "$GITHUB_OUTPUT"; echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           LIVE=""; if [ "$MODE" = "live" ]; then LIVE="--live"; fi
           rc=0
           for REGION in india europe-au us-ca; do
             if [ -n "$ONLY" ] && [ "$ONLY" != "$REGION" ]; then echo "skip $REGION (dispatch restricted to $ONLY)"; continue; fi
             echo "::group::oli-reconcile $REGION mode=$MODE as-of=$ASOF"
-            timeout 420 node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic $LIVE || { echo "region $REGION reconcile exited nonzero (isolated; continuing)"; rc=1; }
+            # --deadline-seconds=330 makes the reconciler stop publishing NEW accounts + safe-close BEFORE the 420s hard
+            # kill (cooperative cleanup reserve). The always() step below reclaims controls if a region was still killed.
+            timeout 420 node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=330 $LIVE || { echo "region $REGION reconcile exited nonzero (isolated; continuing)"; rc=1; }
             echo "::endgroup::"
           done
+          exit $rc
+      # ABNORMAL-TERMINATION CLEANUP (blocker 5): ALWAYS reclaim + safe-close any controls a killed/timed-out region left
+      # open (the reviewed reclaim mode: acquire-if-free -> safe-close; a live owner blocks it). The workflow is NON-GREEN
+      # if any region's cleanup cannot be verified, so an unresolved open control plane can never be reported as success.
+      - name: Verify controls closed (reclaim any left open by an abnormal termination)
+        if: always() && steps.reconcile.outputs.mode == 'live'
+        run: |
+          ASOF='${{ steps.reconcile.outputs.asof }}'; ONLY='${{ steps.reconcile.outputs.only }}'
+          rc=0
+          for REGION in india europe-au us-ca; do
+            if [ -n "$ONLY" ] && [ "$ONLY" != "$REGION" ]; then continue; fi
+            echo "::group::oli-reconcile cleanup $REGION as-of=$ASOF"
+            node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --cleanup || { echo "region $REGION control cleanup UNVERIFIED"; rc=1; }
+            echo "::endgroup::"
+          done
+          if [ "$rc" != "0" ]; then echo "STOP OLI_RECONCILE_CLEANUP_UNVERIFIED: one or more regions' control plane could not be verified closed."; fi
           exit $rc

@@ -1,5 +1,41 @@
 # Project Memory
 
+## OLI reconciler — Codex 6-blocker follow-up: exact publication binding + typed control/deadline handling (2026-09-11, one focused commit on main, NOT pushed; verify green; code-complete, NOT production acceptance)
+
+Follow-up to 49ffb71 (preserved). Codex found 6 confirmed OLI-reconciliation blockers; all corrected. NO push/deploy/
+dispatch/migration/DataDoe export; OLI_RECONCILE_LIVE stays disabled; migration 20260924 stays unapplied; api/*.js=12.
+
+1. **UNBOUND JOB/LIVE DEFECT (reproduced first).** The reconciler trusted `depends_on`: a valid live at the same as-of
+   whose newer validated job's shadow was NEVER promoted returned PUBLICATION_NOT_REQUIRED. Now `evaluatePublicationBinding`
+   proves the live IS the promotion of the exact promotable job's `scheduler-v2/<key>` shadow -- canonical identity (shared
+   publisher contract: liveReportKey + liveParams hash) + EXACT `source_refreshed_at` + params + hydrated payload content.
+   An unpromoted newer job -> the live's source_refreshed_at differs -> STALE until that candidate is promoted.
+2. **EXACT PUBLICATION BINDING (replaces the trust).** `jobIsPromotable` requires derive_status=succeeded,
+   save_status=succeeded, validated, terminal cycle, nonblank snapshot_params_hash. NEW `getLatestReportJobLineage` fields
+   (derive/save status) + `readShadowSnapshot`/`readLiveSnapshot`/`loadStoragePayload` (storage-first hydration) +
+   `stableJson` content compare. No updated_at / date equality; no migration.
+3. **TYPED CLASSIFICATION (no text matching).** The runner now threads a typed `reason` (derive stopReason.code /
+   finalize refuse reason). `statusFromRelease` uses stage+status+leaseLost+reason via an explicit RETRYABLE allowlist:
+   catalog genuinely unavailable (SOURCE_UNAVAILABLE derive stop) -> DEFERRED; finalize integrity (catalog-not-org-scope
+   / catalog-job-count / catalog-hash-blank) -> hard FAILED (exit nonzero); CONTROL_LEASE_LOST/leaseLost -> DEFERRED. It
+   NEVER classifies by the word "catalog".
+4. **AUTHORITATIVE CONTROL OUTCOMES.** closeControls() is inspected: a failed OR COMMIT_UNKNOWN safe-close ->
+   outcome=failed, exit 1, controlCleanupUnresolved (never complete/ok:true after a successful publish). Apply
+   COMMIT_UNKNOWN (code 3) is a hard FAILED (reconcileRequired) -- NOT a zero-write deferral, NEVER a blind rollback/retry
+   (read-only reconciliation out of band). A confirmed-open plane is always safe-closed.
+5. **COOPERATIVE DEADLINE + ABNORMAL-TERMINATION CLEANUP.** `--deadline-seconds` (below the workflow's 420s hard cap) ->
+   the reconciler stops publishing NEW accounts and always safe-closes before a kill. A new `--cleanup` (reviewed reclaim)
+   invocation runs as an ALWAYS workflow step to reclaim+safe-close controls a killed region left open; the run is
+   NON-GREEN when cleanup cannot be verified.
+6. **PRODUCTION-SHAPE TEST** oli-reconcile-prodshape now drives the REAL buildOliPublicationReconciler composition (not
+   disconnected demos): permitted namespace + REAL control-package apply/generation/safe-close over an in-memory store +
+   REAL exact binding, covering unpromoted-newer-job, promotion+zero-write replay, apply COMMIT_UNKNOWN, safe-close
+   failure, typed Catalog integrity failure, forced-timeout cleanup, and zero DataDoe create/poll/download.
+
+Tests: continuation-ceiling 30, dependent-reports 14, revision 37, reconciler 51, prodshape 14, workflow 22. verify GREEN;
+git diff --check clean; node --check all-clean. Adversarial review 0 defects (incl. the no-blind-rollback-on-apply-
+commit-unknown fix). LIVE promotion OFF by default; production acceptance PENDING natural runs.
+
 ## OLI reconciler — Codex 5-blocker follow-up (2026-09-10, one focused commit on main, NOT pushed; verify green; code-complete, NOT production acceptance)
 
 Follow-up to 81df260 (preserved). Codex found 5 confirmed blockers in the OLI publication reconciler's LIVE wiring; all

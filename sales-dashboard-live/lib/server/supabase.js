@@ -3932,7 +3932,7 @@ export async function getLatestSyncReportJob(reportKey, accountId) {
 // against this depends_on -- a hash not present here means the OLI advanced and the live snapshot is stale.
 export async function getLatestReportJobLineage(reportKey, accountId) {
   const query = new URLSearchParams({
-    select: "cycle_id,report_key,account_id,validated,depends_on,snapshot_params_hash,latest_data_date,created_at,sync_cycles(status)",
+    select: "cycle_id,report_key,account_id,derive_status,save_status,validated,depends_on,snapshot_params_hash,latest_data_date,created_at,sync_cycles(status)",
     report_key: `eq.${reportKey}`,
     account_id: `eq.${accountId}`,
     order: "created_at.desc",
@@ -3945,6 +3945,8 @@ export async function getLatestReportJobLineage(reportKey, accountId) {
   return {
     reportKey: row.report_key,
     accountId: row.account_id,
+    deriveStatus: row.derive_status ?? null,
+    saveStatus: row.save_status ?? null,
     validated: row.validated === true,
     dependsOn: Array.isArray(row.depends_on) ? row.depends_on.map((h) => String(h)) : [],
     snapshotParamsHash: row.snapshot_params_hash ?? null,

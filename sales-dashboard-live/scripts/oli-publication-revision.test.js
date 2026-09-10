@@ -2,7 +2,7 @@
 // Offline + pure. 7-bit ASCII, LF.
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
-import { computeOliAccountRevision, classifyOliReportTarget, liveSnapshotAsOf, oliRevisionCoveredByJob, OLI_PUBLICATION_STATE } from "../lib/server/sync/oli-publication-revision.js";
+import { computeOliAccountRevision, classifyOliReportTarget, liveSnapshotAsOf, oliRevisionCoveredByJob, jobIsPromotable, evaluatePublicationBinding, stableJson, OLI_PUBLICATION_STATE } from "../lib/server/sync/oli-publication-revision.js";
 import { OLI_LINEAGE_STATUS } from "../lib/server/sync/source-durable-model.js";
 
 let passed = 0;
@@ -71,5 +71,33 @@ ok("eligible + live at the as-of + covered but readback FAILS -> STALE live-unve
 // (blocker 3) SAME date + SAME hash (job covers) + verified -> no-op.
 ok("SAME date + SAME OLI hash (job covers) + verified -> PUBLICATION_NOT_REQUIRED (no-op)", classifyOliReportTarget({ revision: posA, liveSnapshot: live(ASOF), readbackOk: true, requestedAsOf: ASOF, jobLineage: jobCovers }).state === OLI_PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED);
 ok("a live snapshot with NO readable as-of is STALE (never trusted as current)", classifyOliReportTarget({ revision: posA, liveSnapshot: { params: {} }, readbackOk: true, requestedAsOf: ASOF, jobLineage: jobCovers }).state === OLI_PUBLICATION_STATE.STALE);
+
+// ---- jobIsPromotable + evaluatePublicationBinding (blockers 1/2: EXACT publication binding, not depends_on trust) ----
+const goodJob = { deriveStatus: "succeeded", saveStatus: "succeeded", validated: true, cycleStatus: "succeeded", snapshotParamsHash: "sh1", dependsOn: ["h-a", "h-b", "catalog"] };
+ok("jobIsPromotable: succeeded+succeeded+validated+terminal+nonblank-hash", jobIsPromotable(goodJob) === true);
+ok("jobIsPromotable: rejects unvalidated / not-succeeded / running cycle / blank hash", !jobIsPromotable({ ...goodJob, validated: false }) && !jobIsPromotable({ ...goodJob, deriveStatus: "failed" }) && !jobIsPromotable({ ...goodJob, saveStatus: "failed" }) && !jobIsPromotable({ ...goodJob, cycleStatus: "running" }) && !jobIsPromotable({ ...goodJob, snapshotParamsHash: "" }));
+
+// Fake shared publisher contract + hash for the pure binding tests.
+const C = { liveReportKey: "daily-reporting", liveReportVersion: "dr-live", liveParams: (p) => ({ to: p.to }) };
+const H = (v, params) => v + "|" + stableJson(params);
+const shadow = { params_hash: "sh1", params: { reportVersion: "dr/shadow", accountId: "A01", to: ASOF }, source_refreshed_at: "2026-09-09T05:00:00Z" };
+const shadowPay = { rows: [{ d: 1 }] };
+const candHash = H(C.liveReportVersion, C.liveParams(shadow.params)); // liveParams uses only {to}
+const liveMatch = { report_key: "daily-reporting", account_id: "A01", params_hash: candHash, params: { reportVersion: "dr-live", to: ASOF }, source_refreshed_at: "2026-09-09T05:00:00Z" };
+const bind = (over = {}) => evaluatePublicationBinding({ revision: posA, accountId: "A01", job: goodJob, shadow, hydratedShadowPayload: shadowPay, live: liveMatch, hydratedLivePayload: shadowPay, contract: C, computeHash: H, ...over });
+
+ok("BINDING: live proven equal to the exact shadow candidate (identity + source_refreshed_at + params + payload) -> PUBLICATION_NOT_REQUIRED", bind().state === OLI_PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED);
+// (blocker 1) valid live at the same as-of + a newer validated job whose shadow was NOT promoted -> the live's
+// source_refreshed_at differs from the job's shadow -> STALE (until that exact candidate is promoted).
+ok("BINDING blocker 1: an UNPROMOTED newer job (live source_refreshed_at differs) -> STALE (never PUBLICATION_NOT_REQUIRED)", (() => { const c = bind({ live: { ...liveMatch, source_refreshed_at: "2026-09-08T00:00:00Z" } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-refresh-differs"; })());
+ok("BINDING: live MISSING (candidate never promoted) -> STALE live-unpromoted", (() => { const c = bind({ live: null, hydratedLivePayload: null }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-unpromoted"; })());
+ok("BINDING: live payload DIFFERS from the shadow candidate -> STALE live-payload-differs", (() => { const c = bind({ hydratedLivePayload: { rows: [{ d: 2 }] } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-payload-differs"; })());
+ok("BINDING: live identity mismatch (wrong params_hash) -> STALE live-identity-mismatch", (() => { const c = bind({ live: { ...liveMatch, params_hash: "WRONG" } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-identity-mismatch"; })());
+ok("BINDING: job NOT promotable -> STALE job-not-promotable (no valid candidate)", (() => { const c = bind({ job: { ...goodJob, validated: false } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "job-not-promotable"; })());
+ok("BINDING: durable OLI advanced past the job (depends_on missing a current hash) -> STALE oli-revision-changed", (() => { const c = bind({ job: { ...goodJob, dependsOn: ["h-a", "catalog"] } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "oli-revision-changed"; })());
+ok("BINDING: shadow MISSING -> STALE shadow-missing", (() => { const c = bind({ shadow: null, hydratedShadowPayload: null }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "shadow-missing"; })());
+ok("BINDING: shadow hash != job hash -> STALE shadow-hash-mismatch", (() => { const c = bind({ shadow: { ...shadow, params_hash: "OTHER" } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "shadow-hash-mismatch"; })());
+ok("BINDING: ineligible revision -> DEFERRED_PROVENANCE", (() => { const c = bind({ revision: missing }); return c.state === OLI_PUBLICATION_STATE.DEFERRED_PROVENANCE; })());
+ok("stableJson is key-order-stable", stableJson({ b: 1, a: [3, { y: 2, x: 1 }] }) === stableJson({ a: [3, { x: 1, y: 2 }], b: 1 }));
 
 writeSync(1, `\noli-publication-revision: ${passed} assertions passed\n`);

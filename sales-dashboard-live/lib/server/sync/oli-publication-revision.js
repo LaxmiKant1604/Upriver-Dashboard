@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 import { resolveOliLineageProvenance, OLI_LINEAGE_STATUS } from "./source-durable-model.js";
 
 const S = (v) => (v == null ? "" : String(v));
+const nb = (v) => S(v).trim() !== ""; // nonblank
 
 // The per-(account, report) reconciliation states (a subset of the WORK 9 status vocabulary that this pure classifier
 // can decide; the reconciler adds DERIVED / PUBLISHED_LIVE / READBACK_VERIFIED / FAILED_* from execution).
@@ -64,6 +65,62 @@ export function oliRevisionCoveredByJob(revision, jobLineage) {
   if (!jobLineage || jobLineage.validated !== true || !Array.isArray(jobLineage.dependsOn)) return false;
   const have = new Set(jobLineage.dependsOn.map((h) => String(h)));
   return revision.deps.every((h) => have.has(String(h)));
+}
+
+// Canonical JSON for exact content comparison (stable key order; used only to compare params/payload objects, never as
+// an identity substitute for a hash). Recurses arrays + plain objects; primitives via JSON.stringify.
+export function stableJson(v) {
+  if (v === null || typeof v !== "object") return JSON.stringify(v ?? null);
+  if (Array.isArray(v)) return "[" + v.map(stableJson).join(",") + "]";
+  return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + stableJson(v[k])).join(",") + "}";
+}
+
+// A report job is a PROMOTABLE publication candidate only when it is a fully-succeeded, validated derivation in a
+// TERMINAL cycle with a nonblank shadow hash -- the exact preconditions the publisher's success gate requires. Anything
+// weaker (unvalidated / not-succeeded / running cycle / blank hash) is NOT a candidate the live could have come from.
+export function jobIsPromotable(job) {
+  return !!job
+    && S(job.deriveStatus) === "succeeded"
+    && S(job.saveStatus) === "succeeded"
+    && job.validated === true
+    && (S(job.cycleStatus) === "succeeded" || S(job.cycleStatus) === "partial")
+    && nb(job.snapshotParamsHash);
+}
+
+/**
+ * EXACT PUBLICATION BINDING (blockers 1/2): prove the CURRENTLY-live report row IS the promotion of the exact,
+ * fully-validated report job's shadow -- never trust depends_on alone (an unpromoted newer job left the live stale).
+ * PUBLICATION_NOT_REQUIRED is returned ONLY when, for the latest promotable job:
+ *   - its durable OLI provenance covers the current revision (else the OLI advanced -> re-derive), AND
+ *   - its scheduler-v2/<key> shadow (at the job hash) exists + hydrates, AND
+ *   - the live row at the CANONICAL identity (shared publisher contract: liveReportKey + liveParams hash) exists, AND
+ *   - the live row is PROVEN EQUAL to that shadow candidate: canonical params_hash, EXACT source_refreshed_at (the
+ *     same derivation), live params (reportVersion + contract liveParams), and hydrated payload content.
+ * Everything else is STALE with a typed reason (the caller derives + promotes). Never uses updated_at or date equality.
+ * Inputs are pre-loaded/hydrated by the reconciler; this function is PURE.
+ */
+export function evaluatePublicationBinding({ revision, accountId, job, shadow, hydratedShadowPayload, live, hydratedLivePayload, contract, computeHash } = {}) {
+  if (!revision || revision.eligible !== true) return { state: OLI_PUBLICATION_STATE.DEFERRED_PROVENANCE, reason: (revision && revision.reason) || "not-eligible" };
+  if (!jobIsPromotable(job)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "job-not-promotable" };
+  if (!oliRevisionCoveredByJob(revision, job)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "oli-revision-changed" };
+  if (!contract || typeof contract.liveParams !== "function" || typeof computeHash !== "function") return { state: OLI_PUBLICATION_STATE.STALE, reason: "no-live-contract" };
+  const shadowParams = shadow && shadow.params && typeof shadow.params === "object" && !Array.isArray(shadow.params) ? shadow.params : null;
+  if (!shadow || !shadowParams) return { state: OLI_PUBLICATION_STATE.STALE, reason: "shadow-missing" };
+  if (S(shadow.params_hash) !== S(job.snapshotParamsHash)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "shadow-hash-mismatch" };
+  if (!nb(shadow.source_refreshed_at)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "shadow-refresh-blank" };
+  if (hydratedShadowPayload == null) return { state: OLI_PUBLICATION_STATE.STALE, reason: "shadow-payload-unavailable" };
+  const liveParams = contract.liveParams(shadowParams);
+  if (!liveParams || typeof liveParams !== "object") return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-params-underivable" };
+  const candHash = computeHash(contract.liveReportVersion, liveParams);
+  if (!live) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-unpromoted" };
+  if (S(live.report_key) !== S(contract.liveReportKey) || S(live.account_id) !== S(accountId) || S(live.params_hash) !== S(candHash)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-identity-mismatch" };
+  if (S(live.source_refreshed_at) !== S(shadow.source_refreshed_at)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-refresh-differs" }; // the live is a DIFFERENT derivation than this job's shadow
+  const liveParamsObj = live.params && typeof live.params === "object" && !Array.isArray(live.params) ? live.params : null;
+  if (!liveParamsObj || liveParamsObj.reportVersion !== contract.liveReportVersion) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-version" };
+  if (stableJson(contract.liveParams(liveParamsObj)) !== stableJson(liveParams)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-params-differ" };
+  if (hydratedLivePayload == null) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-payload-unavailable" };
+  if (stableJson(hydratedLivePayload) !== stableJson(hydratedShadowPayload)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-payload-differs" };
+  return { state: OLI_PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED, reason: null };
 }
 
 /**

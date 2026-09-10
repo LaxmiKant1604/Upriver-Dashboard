@@ -24,6 +24,11 @@ ok("DEFAULT is dry-run: --live only on a manual live dispatch OR when vars.OLI_R
 ok("periodic mode + as-of is a conservative D-1 (yesterday UTC)", /--mode=periodic\b/.test(wf) && /date -u -d 'yesterday' \+%F/.test(wf));
 ok("it installs deps (real report work) but references NO DataDoe export/token symbol (zero export)", /npm ci/.test(wf) && !/createExport|reserveTokens|exportsCreate|--force-latest/.test(wf));
 ok("it verifies required secrets fail-closed and never prints them", /missing required secret/.test(wf) && /POSTGRES_URL SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY/.test(wf));
+// blocker 5: cooperative deadline (reserve cleanup time within the 420s cap) + an ALWAYS cleanup step that reclaims any
+// controls a killed/timed-out region left open, making the run NON-GREEN when cleanup can't be verified.
+ok("(blocker 5) the reconcile passes --deadline-seconds (below the 420s hard cap) so safe-close runs before a kill", /--deadline-seconds=330/.test(wf) && /timeout 420 node/.test(wf));
+ok("(blocker 5) an ALWAYS cleanup step reclaims controls left open by an abnormal termination", /if: always\(\) && steps\.reconcile\.outputs\.mode == 'live'/.test(wf) && /--cleanup\b/.test(wf) && /reclaim/.test(wf.toLowerCase()));
+ok("(blocker 5) the workflow is NON-GREEN when a region's control cleanup cannot be verified", /OLI_RECONCILE_CLEANUP_UNVERIFIED/.test(wf) && /exit \$rc/.test(wf));
 
 // ---- scheduler-v2.yml immediate post-save reconcile step (WORK 6 + blocker 2) ----
 const stepStart = sched.indexOf("Immediate OLI publication reconcile");

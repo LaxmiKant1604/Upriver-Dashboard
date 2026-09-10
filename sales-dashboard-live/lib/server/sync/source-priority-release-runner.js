@@ -103,7 +103,10 @@ export async function runPriorityDashboardsRelease(deps = {}) {
   for (const b of targetBuckets) {
     const { rollup } = await release.deriveBucket(b);
     if (!rollup || rollup.stopped === true || (rollup.derived && rollup.derived.skipped != null)) {
-      return fail("derive:" + b, "derive did not complete: " + S(rollup && ((rollup.stopReason && rollup.stopReason.code) || (rollup.derived && rollup.derived.skipped))));
+      // Thread the TYPED derive-stop code (rollup.stopReason.code) so callers classify retryable source/readiness
+      // outcomes vs integrity failures WITHOUT text matching.
+      const reason = S(rollup && ((rollup.stopReason && rollup.stopReason.code) || (rollup.derived && rollup.derived.skipped))) || null;
+      return { ...fail("derive:" + b, "derive did not complete: " + reason), reason };
     }
     if (rollup.derived && rollup.derived.effectivePublishAsOf) effectiveByBucket[b] = S(rollup.derived.effectivePublishAsOf);
     // STRICT D-1: the derive was pinned to the requested D-1 (--as-of). If it nonetheless CLAMPED below D-1
@@ -154,7 +157,7 @@ export async function runPriorityDashboardsRelease(deps = {}) {
   const cycleIdByAccount = new Map();
   for (const b of targetBuckets) {
     const fin = await release.finalizeBucket(b);
-    if (!fin || !OK_FINALIZE.has(S(fin.disposition))) return fail("finalize:" + b, "finalize refused: " + S(fin && (fin.reason || fin.disposition)));
+    if (!fin || !OK_FINALIZE.has(S(fin.disposition))) { const reason = S(fin && (fin.reason || fin.disposition)) || null; return { ...fail("finalize:" + b, "finalize refused: " + reason), reason }; }
     for (const a of fin.accounts || []) { accounts.add(S(a)); cycleIdByAccount.set(S(a), S(fin.cycleId)); }
     log("finalize ok: " + b + " (" + (fin.accounts ? fin.accounts.length : 0) + " accounts, " + S(fin.cycleStatus) + ", cycle " + S(fin.cycleId).slice(0, 8) + ")");
   }

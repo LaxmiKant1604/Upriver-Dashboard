@@ -147,6 +147,9 @@ async function openControls(staleAccountIds) {
       ownerToken: OPERATOR, operationKey: CONTROL_OP_KEY, leaseTtlSeconds: 900,
       log: (m) => console.log("oli-reconcile controls: " + m),
     });
+    // APPLY COMMIT_UNKNOWN (code 3, blocker 4): the apply's commit ack was lost. NOT a zero-write deferral; the caller
+    // must NOT blind-rollback/retry (read-only reconciliation required). Surface it typed so the run exits nonzero.
+    if (r && Number(r.code) === 3) return { ok: false, commitUnknown: true, reason: "control-apply COMMIT_UNKNOWN (code 3) -- read-only reconciliation required (NO rollback/retry)" };
     if (!r || r.committed !== true) return { ok: false, reason: "controls apply did not commit (code " + (r && r.code) + (r && r.problem ? "/" + r.problem : "") + ")" };
     const gen = Number(r.leaseGeneration);
     if (!(Number.isSafeInteger(gen) && gen > 0)) return { ok: false, reason: "controls apply returned no valid fencing generation (" + String(r.leaseGeneration) + ")" };
@@ -157,10 +160,14 @@ async function openControls(staleAccountIds) {
 async function closeControls() {
   if (mode === "immediate") { leaseFence = null; return { ok: true }; } // the scheduler's safe-close owns the lease
   if (!leaseFence) return { ok: true };
+  const fence = leaseFence;
   try {
-    const r = await runControlPackageCli({ mode: "rollback", operator: OPERATOR, connectStore: connectPriorityControlStore, ownerToken: leaseFence.ownerToken, ownerGeneration: leaseFence.generation, operationKey: CONTROL_OP_KEY, log: (m) => console.log("oli-reconcile safe-close: " + m) });
+    const r = await runControlPackageCli({ mode: "rollback", operator: OPERATOR, connectStore: connectPriorityControlStore, ownerToken: fence.ownerToken, ownerGeneration: fence.generation, operationKey: CONTROL_OP_KEY, log: (m) => console.log("oli-reconcile safe-close: " + m) });
     leaseFence = null;
-    if (r && r.skipped === "lease-not-owner") return { ok: true };
+    if (r && r.skipped === "lease-not-owner") return { ok: true }; // a superseded/lost lease is a correct no-op close
+    // SAFE-CLOSE COMMIT_UNKNOWN (code 3, blocker 4): the close commit ack was lost -> controls may still be open ->
+    // control-cleanup-unresolved (never claim closed). No rollback/retry.
+    if (r && Number(r.code) === 3) return { ok: false, commitUnknown: true, reason: "safe-close COMMIT_UNKNOWN (code 3) -- controls may still be open; read-only reconciliation required" };
     if (!r || r.committed !== true) return { ok: false, reason: "safe-close did not commit (code " + (r && r.code) + ")" };
     return { ok: true };
   } catch (e) { leaseFence = null; return { ok: false, reason: "safe-close-error:" + (e && e.message ? e.message : e) }; }
@@ -183,7 +190,9 @@ async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revis
     makeInnerAdapter: makeNoExportInnerAdapter, fetchAccounts: fetchOne, cycleBucket,
   });
   const result = await runPriorityDashboardsRelease({ release, reconcile, readbackLive, assertNoCron, bucket: b, strictD1: true, verifyLease, log: () => {} });
-  return { code: result.code, ok: result.ok, stage: result.stage, problems: result.problems || [], published: result.publishedIdentities || [] };
+  // Preserve the runner's TYPED classification fields (status, leaseLost, stage, reason) so the reconciler classifies
+  // retryable-vs-integrity WITHOUT text matching (blocker 3).
+  return { code: result.code, ok: result.ok, stage: result.stage, status: result.status || null, leaseLost: result.leaseLost === true, reason: result.reason || null, problems: result.problems || [] };
 }
 
 // Brand View membership: the directory self-heals from the promoted bare brand-sales at read time
@@ -208,23 +217,49 @@ async function bucketAccounts(b) {
   return out;
 }
 
+// COOPERATIVE DEADLINE (blocker 5): the periodic workflow hard-kills a region after a fixed cap; --deadline-seconds
+// (set below that cap, reserving cleanup time) makes the reconciler stop publishing NEW accounts once elapsed, so the
+// ALWAYS safe-close runs before the kill. A separate --cleanup invocation (below) handles an ABNORMAL termination.
+const deadlineSec = Number(argOf("deadline-seconds")) || 0;
+const runStartMs = Date.now();
+const outOfTime = () => deadlineSec > 0 && (Date.now() - runStartMs) / 1000 > deadlineSec;
+
 const reconciler = buildOliPublicationReconciler({
   resolveOrg: async () => ({ organizationFingerprint: orgFp, connectionId: "primary" }),
   bucketAccounts,
   oliStart,
   readPositiveHistory: (args) => sb.getSourceOliHistoryRows(args),
   readZeroRowProof: (args) => sb.getSourceOliZeroRowProof(args),
-  readLatestLiveSnapshot: (args) => sb.getLatestReportSnapshot(args),
-  readLatestJobLineage: ({ reportKey, accountId }) => sb.getLatestReportJobLineage(reportKey, accountId),
-  readbackLive,
+  readLatestReportJob: ({ reportKey, accountId }) => sb.getLatestReportJobLineage(reportKey, accountId),
+  readShadowSnapshot: (args) => sb.getReportSnapshot(args),
+  readLiveSnapshot: (args) => sb.getReportSnapshot(args),
+  loadStoragePayload: (path) => sb.getReportSnapshotStoragePayload(path),
+  liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS,
+  computeHash: paramsHashFor,
   runReleaseForAccount,
   rebuildBrandViewMembership,
   openControls: dryRun ? (async () => ({ ok: true })) : openControls,
   closeControls: dryRun ? (async () => ({ ok: true })) : closeControls,
+  outOfTime,
   reportKeys: oliDependentLiveReportKeys(),
   withTimeout,
   log: (m) => console.log("oli-reconcile: " + m),
 });
+
+// ABNORMAL-TERMINATION CLEANUP (blocker 5): a distinct invocation the periodic workflow runs (always(), after the main
+// reconcile) to SAFE-CLOSE any priority controls a killed/timed-out reconcile left open. Uses the reviewed reclaim mode:
+// it acquires-if-free (a killed process's lease expires by TTL, or was already released -> nothing to reclaim) then
+// safe-closes; a LIVE owner blocks it (never interfering with a running reconcile). Exit 0 when cleanup is verified
+// (committed OR a correct not-owner/held skip); nonzero when cleanup could NOT be verified (workflow non-green).
+if (process.argv.includes("--cleanup")) {
+  try {
+    const r = await runControlPackageCli({ mode: "reclaim", operator: OPERATOR, connectStore: connectPriorityControlStore, ownerToken: OPERATOR, operationKey: CONTROL_OP_KEY, log: (m) => console.log("oli-reconcile cleanup: " + m) });
+    if (r && Number(r.code) === 3) { console.error("STOP OLI_RECONCILE_CLEANUP_COMMIT_UNKNOWN -- controls may still be open; read-only reconciliation required."); process.exit(1); }
+    const cleaned = !!(r && (r.committed === true || r.skipped === "lease-not-owner" || r.skipped === "lease-held" || r.reclaimNoop === true));
+    console.log("RESULT " + JSON.stringify({ mode: "cleanup", bucket, requestedAsOf: asOf, cleaned, disposition: r && (r.skipped || (r.committed ? "committed" : "noncommit")) }));
+    process.exit(cleaned ? 0 : 1);
+  } catch (e) { console.error("STOP OLI_RECONCILE_CLEANUP_UNVERIFIED: " + (e && e.message ? e.message : e)); process.exit(1); }
+}
 
 if (!dryRun) {
   const cron = await assertNoCron();
