@@ -1,5 +1,48 @@
 # Project Memory
 
+## OLI reconciler — Codex 5-blocker DEEP follow-up: D-1-in-binding, publisher-identical validation, typed-through-real-runner, evidence-based closure, in-flight deadline (2026-09-11, commit 8927358 on main, NOT pushed; verify 196/196; code-complete, NOT production acceptance)
+
+Follow-up to 62be1af (preserved; parent of 8927358). Codex found 5 DEEPER OLI-reconciliation blockers; all corrected,
+pure-code. NO push/deploy/dispatch/migration/DataDoe export; OLI_RECONCILE_LIVE stays disabled; migration 20260924 stays
+unapplied; api/*.js=12.
+
+1. **D-1 FRESHNESS INSIDE THE EXACT BINDING.** `evaluatePublicationBinding` now takes `requestedAsOf` and gates the
+   candidate: an older `to` is ALWAYS STALE (`candidate-older-than-requested-asof`) even when request hashes/content are
+   unchanged. The job/live binding SUPPLEMENTS the date gate; it never replaces it. (Root defect: an exact-bound live at
+   an older as-of previously returned PUBLICATION_NOT_REQUIRED.)
+2. **PUBLISHER-IDENTICAL BINDING VALIDATION.** Shadow: exact report_key + account_id + expected `snapshotVersion`; the
+   shadow hash RECOMPUTED from `params.reportVersion`+complete params equals BOTH `row.params_hash` AND
+   `job.snapshotParamsHash`; storage-first hydrate + the REAL `reportDerivations[rk].validatePayload`. Live: canonical
+   identity via the shared contract + the SHARED `buildLiveReadback` (identity / live-version / params-provenance
+   recomputed from the COMPLETE stored params / payload-contract) + EXACT `source_refreshed_at` + equal hydrated payload.
+   The SAME `readbackLive` instance is wired into BOTH `runPriorityDashboardsRelease` and the reconciler (one validator,
+   never a weaker parallel one). Reproductions a-f in oli-publication-revision.test.js (a: older `to`->STALE; b: forged
+   shadow hash; c: wrong version/account; d: contract-invalid payload; e: mutated live params under unchanged hash via
+   params-provenance; f: valid exact D-1 -> PUBLICATION_NOT_REQUIRED).
+3. **TYPED CLASSIFICATION THROUGH THE REAL RUNNER.** `runPriorityDashboardsRelease` returns structured `blockerCodes`
+   (`sourceKey:reason` from `blockedBy` + `derive:count-mismatch`/`derive:lineage-mismatch`/`derive:saved-zero`) on a
+   ready=false/saved=0 derive. `statusFromRelease` defers iff ALL codes are known-retryable readiness/coverage codes
+   (`RETRYABLE_BLOCKER_REASONS`), else FAILED_DERIVE; an unknown/empty code fails CLOSED (hard). SOURCE_UNAVAILABLE
+   (derive stopReason.code) defers; finalize-refuse -> `finalize:*` stage -> hard FAILED_PUBLISH. The prodshape suite
+   drives the REAL runner branch (`over.realRelease` -> runPriorityDashboardsRelease), never a fabricated `{reason}`.
+4. **EVIDENCE-BASED CONTROL CLOSURE.** Safe-close NEVER trusts `committed` or a lease-not-owner skip as proof closed: the
+   entrypoint's `readControlPlaneClosed()` READS rollout/dispatch/promoted/approvals (via CONTROLLED_REPORT_KEYS) and
+   requires PROVEN closed. Apply/close COMMIT_UNKNOWN -> ONLY read-only reconciliation (never a blind reclaim/rollback).
+   `--cleanup` INSPECTS first (already-closed -> exit 0, plane untouched), reclaims ONLY a free/expired plane (a live
+   owner blocks reclaim -> untouched), RE-INSPECTS, and is NON-GREEN unless proven closed. Prodshape blocker-4 proves
+   lease-not-owner != closed against the REAL control store.
+5. **REAL ABNORMAL-TERMINATION CLEANUP.** A cooperative `deadlineRace` (real `setTimeout`, `.unref()`) now bounds the
+   IN-FLIGHT account op (not only the gap between accounts): a never-resolving account -> DEFERRED_DEPENDENCY
+   (`deadline-in-flight`), the loop stops, and the ALWAYS safe-close still runs with exact owner/generation fencing. A
+   SEPARATE cleanup JOB (`needs: reconcile`, `if: always() && (dispatch live || vars.OLI_RECONCILE_LIVE)`) survives the
+   reconcile job's timeout/cancellation (a same-job step would be killed with it) and proves each live region's plane
+   closed. Prodshape blocker-5 drives a never-resolving account + the REAL control-package safe-close (fence released).
+
+Tests: revision 43, reconciler 57, prodshape 21, workflow 24, source-priority 131; full `npm run verify` 196/196 across
+172 suites (incl. build:check, 400s); `node --check` all-clean; `git diff --check` clean. Adversarial review: 0 defects
+(unknown/empty blocker codes fail closed; deadline sentinel checked before classify; apply-commit-unknown never
+blind-rolls-back). LIVE promotion OFF by default; production acceptance PENDING natural runs.
+
 ## OLI reconciler — Codex 6-blocker follow-up: exact publication binding + typed control/deadline handling (2026-09-11, one focused commit on main, NOT pushed; verify green; code-complete, NOT production acceptance)
 
 Follow-up to 49ffb71 (preserved). Codex found 6 confirmed OLI-reconciliation blockers; all corrected. NO push/deploy/
