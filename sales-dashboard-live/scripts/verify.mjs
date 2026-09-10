@@ -148,6 +148,7 @@ const SUITES = [
   "test:scheduler-superseding",
   "test:scheduler-hardening",
   "test:scheduler-recovery",
+  "test:cloudflare-scheduler-watchdog",
   "test:asin-ads-aggregation",
   "test:daily-durable-rederive",
   "test:daily-v2-backfill",
