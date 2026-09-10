@@ -806,7 +806,7 @@ test("F4k. MIXED + ISOLATION: a healthy POSITIVE account and a PROVEN-EMPTY acco
   for (const aid of ["A01", "A02"]) assert.equal(rollup.derived.lineage.filter((l) => l.accountId === aid && l.reportKey === "daily-reporting").length, 1, aid + ": one daily lineage event");
 });
 
-test("F4L. E2E runtime -> runPriorityDashboardsRelease -> finalize -> publisher -> live readback: 30 accounts incl 1 proven-empty => 90 saved jobs, EXACTLY 90 lineage events (one per report; proven-empty is metadata, never a duplicate), finalize + 30x3 canonical live promotion + readback succeed, zero duplicate saves/exports", async () => {
+test("F4L. REAL runtime -> runPriorityDashboardsRelease ORCHESTRATION (finalize/publish/readback are the runner's injected collaborators): 30 accounts incl 1 proven-empty => 90 saved jobs, EXACTLY 90 lineage events (one per report; proven-empty is provenanceKind metadata, never a duplicate) so the runner's lineageCount===saved derive-ok gate PASSES, and the run reaches code 0 with 90 canonical publishes; zero duplicate saves/exports. (The REAL finalizer count-verification + REAL publisher promotion + canonical readback are proven in source-priority-dashboards PP2.)", async () => {
   const N = 30;
   const ids = Array.from({ length: N }, (_, i) => "E" + String(i + 1).padStart(2, "0"));
   const provenEmpty = ids[N - 1];

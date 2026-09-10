@@ -989,7 +989,11 @@ function partialPublisherRelease({ scope, cycleStatusByAccount, liveStore, daily
     getJob: async (rk, acct) => ({ cycle_id: "cyc-" + acct, validated: true, snapshot_params_hash: shadowHashFor(rk, acct, dailyPayloadByAccount[acct]), derive_status: "succeeded", save_status: "succeeded", cycle_status: cycleStatusByAccount[acct] || "running" }),
     getSnapshot: async ({ reportKey, accountId }) => { const rk = reportKey.replace("scheduler-v2/", ""); const s = shadowSpecFor(rk, accountId, dailyPayloadByAccount[accountId]); return { params_hash: shadowHashFor(rk, accountId, dailyPayloadByAccount[accountId]), params: s.params, payload: s.payload, payload_storage_path: null, source_refreshed_at: TS }; },
     getControlFence: () => ({ ownerToken: "test-owner", generation: 1 }),
-    publishLiveFenced: async (args) => { liveStore.set(args.reportKey + "|" + args.accountId + "|" + args.paramsHash, { report_key: args.reportKey, account_id: args.accountId, params_hash: args.paramsHash, params: args.params, payload: args.payload }); return { outcome: "inserted" }; },
+    // Persist the EXACT live-snapshot row the real fenced write lands (report-publisher.js:301-309): identity columns +
+    // params + payload + the propagated source_refreshed_at (payload_storage_path null -> inline payload). Storing this
+    // faithfully lets the buildLiveReadback exact-identity contract verify a genuinely-promoted row (a dropped
+    // source_refreshed_at would be an un-real row that no readback could ever pass).
+    publishLiveFenced: async (args) => { liveStore.set(args.reportKey + "|" + args.accountId + "|" + args.paramsHash, { report_key: args.reportKey, account_id: args.accountId, params_hash: args.paramsHash, params: args.params, payload: args.payload, payload_storage_path: null, source_refreshed_at: args.sourceRefreshedAt }); return { outcome: "inserted" }; },
   });
   return priorityMod.buildPriorityDashboardsRelease({ buildRuntime: () => ({ makeDeadline: () => ({}), preflightEvidence: async () => ({}), run: async () => ({}) }), makeInnerAdapter: () => makeInner([]), buildPublisher: () => pub, reservation: makeFakeReservation(), makeStore: () => ({ listSourceJobs: async () => [], listCycleOwners: async () => [], finalizeCycle: async () => ({}) }), listReportJobs: async () => [], getCycleByBucketDate: async () => null });
 }
@@ -1024,6 +1028,43 @@ test("PP1a. the healthy OLI-eligible accounts publish fresh D-1 dashboards; the 
   for (const [key, json] of A03_LKG) assert.equal(JSON.stringify(liveStore.get(key)), json, "A03 LKG row " + key.slice(0, 24) + " untouched (byte-identical)");
   for (const rk of ["daily-reporting", "brand-sales", "brand-inventory"]) assert.equal(liveStore.has(liveKeyFor(rk, "A03")), false, "A03 got NO fresh D-1 " + rk + " row");
   assert.equal(liveStore.size, beforeSize + 2 * 3, "exactly the 2 healthy accounts x 3 reports were written; A03 unchanged");
+});
+
+test("PP2. REAL publisher composition e2e: 30 accounts incl 1 proven-empty publish EXACTLY 90 canonical live promotions via buildSchedulerV2Publisher; the exact-identity live readback contract passes for every row (incl. the proven-empty account, which promotes IDENTICALLY); zero duplicate promotions", async () => {
+  const N = 30;
+  const ids = Array.from({ length: N }, (_, i) => "E" + String(i + 1).padStart(2, "0"));
+  const provenEmpty = ids[N - 1];
+  const liveStore = new Map();
+  // 29 accounts carry usable daily sales; the proven-empty account (E30) carries an EMPTY daily payload (its OLI was
+  // a durable proven zero-row export). The REAL publisher promotes BOTH identically (each job is validated + its
+  // cycle terminal 'succeeded'); the proven-empty account is indistinguishable at the publisher boundary -- exactly
+  // the intended behaviour (its lineage cardinality is proven upstream by source-production-hardening F4L).
+  const dailyPayloadByAccount = {};
+  for (const id of ids) if (id !== provenEmpty) dailyPayloadByAccount[id] = { rows: [], brandFiltered: false, adsAvailability: { status: "unavailable" } };
+  const cycleStatusByAccount = Object.fromEntries(ids.map((id) => [id, "succeeded"]));
+  const rel = partialPublisherRelease({ scope: ids, cycleStatusByAccount, liveStore, dailyPayloadByAccount });
+
+  for (const acct of ids) {
+    const outp = await rel.publishAccount(acct);
+    assert.deepEqual(outp.results.map((r) => r.reportKey), ["daily-reporting", "brand-sales", "brand-inventory"], acct + " publishes the 3 priority reports");
+    for (const r of outp.results) assert.equal(r.disposition, "published", acct + "/" + r.reportKey + " promoted to its canonical live key");
+  }
+  // EXACTLY 90 canonical live promotions, all distinct, zero duplicate.
+  const expectedKeys = new Set();
+  for (const acct of ids) for (const rk of ["daily-reporting", "brand-sales", "brand-inventory"]) expectedKeys.add(liveKeyFor(rk, acct));
+  assert.equal(expectedKeys.size, 3 * N, "all 90 canonical keys are distinct");
+  assert.equal(liveStore.size, 3 * N, "EXACTLY 30 x 3 = 90 canonical live promotions (zero duplicate)");
+  for (const k of expectedKeys) assert.ok(liveStore.has(k), "canonical live key present");
+
+  // The EXACT-identity live READBACK contract (buildLiveReadback) passes for every promoted row -- sampled on the
+  // first positive account AND the proven-empty account across all three reports.
+  const readback = readbackFor(liveStore);
+  for (const acct of [ids[0], provenEmpty]) for (const rk of ["daily-reporting", "brand-sales", "brand-inventory"]) {
+    const c = publisherCore.SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[rk];
+    const lp = c.liveParams(shadowSpecFor(rk, acct, dailyPayloadByAccount[acct]).params);
+    const ph = reportStore.paramsHashFor(c.liveReportVersion, lp);
+    assert.deepEqual(await readback({ reportKey: c.liveReportKey, liveReportKey: c.liveReportKey, accountId: acct, paramsHash: ph }), { ok: true }, acct + "/" + rk + " exact-identity live readback ok");
+  }
 });
 
 test("PP1b. CAMPAIGN Ads failure with usable OLI sales: a healthy account STILL publishes daily + brand-sales (ads shown unavailable, sales never suppressed)", async () => {

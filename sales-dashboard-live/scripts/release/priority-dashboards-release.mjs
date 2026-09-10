@@ -63,55 +63,47 @@ if (eligibleArg !== "") {
   const { fetchAccounts: fetchDirectory } = await import("../../lib/server/datadoe.js");
   const { getDataDoeConnections } = await import("../../lib/server/datadoe-connections.js");
 
-  // LINEAGE-ELIGIBILITY PREFLIGHT (read-only; the SAME resolveOliLineageProvenance contract the derive runtime uses):
-  // before the dedicated partial-cycle IDENTITY is frozen, classify EVERY proposed account from durable evidence and
-  // DEFER any whose OLI provenance is missing/malformed/ambiguous -- INCLUDING a non-positive `row_count > 0` export
-  // (only explicit-zero / pending / cancelled rows) that the positive-sales history reader excludes and that has no
-  // succeeded row_count=0 export -- so it can never enter the frozen cycle and later block the healthy accounts. A
-  // proven-empty (durable zero-row export) account stays eligible. FAIL-SAFE: if the durable evidence is UNREADABLE
-  // we KEEP the proposed set (never wrongly defer on a read blip) and let the derive runtime remain the fail-closed
-  // authority. Zero exports/tokens/writes. Requires --as-of (the D-1 the workflow always passes for a partial run).
-  let wanted = proposed;
-  if (asOfArg) {
-    try {
-      // partitionPartialCycleByLineage composes the SAME shared resolveOliLineageProvenance the derive runtime uses.
-      const { partitionPartialCycleByLineage } = await import("../../lib/server/sync/source-durable-model.js");
-      const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
-      const OLI = "order-line-items";
-      const oliStart = sourceRegistryEntry(OLI).initialBackfill.start;
-      const primaryConn = (getDataDoeConnections() || []).find((c) => c.id === "primary");
-      const orgFp = primaryConn && (primaryConn.organizationFingerprint || organizationFingerprint(primaryConn.apiKey));
-      let hist = null; let zero = null;
-      if (orgFp) {
-        try { hist = await sb.getSourceOliHistoryRows({ organizationFingerprint: orgFp, connectionId: "primary", accountIds: proposed, from: oliStart, to: asOfArg }); } catch { hist = null; }
-        try { zero = await sb.getSourceOliZeroRowProof({ organizationFingerprint: orgFp, connectionId: "primary", accountIds: proposed, sourceKey: OLI }); } catch { zero = null; }
-      }
-      if (orgFp && Array.isArray(hist) && zero && zero.read === "ok" && zero.byAccount instanceof Map) {
-        const positiveHashesByAccount = new Map();
-        for (const rrow of hist) {
-          const aid = String(rrow.account_id ?? rrow.accountId ?? "").trim();
-          if (!aid) continue;
-          const hh = rrow.source_request_hash ?? rrow.sourceRequestHash;
-          if (!positiveHashesByAccount.has(aid)) positiveHashesByAccount.set(aid, []);
-          positiveHashesByAccount.get(aid).push(typeof hh === "string" && hh.trim() !== "" ? hh : null);
-        }
-        const part = partitionPartialCycleByLineage({ accountIds: proposed, positiveHashesByAccount, zeroRowExportsByAccount: zero.byAccount, oliStart, requestedAsOf: asOfArg });
-        wanted = part.eligible;
-        if (part.deferred.length) {
-          console.log("priority-release: LINEAGE PREFLIGHT deferred " + part.deferred.length + " proposed account(s) with unresolvable durable OLI provenance (kept dated LKG; cycle identity recomputed from the proven set): "
-            + part.deferred.map((d) => d.accountId.slice(0, 8) + ":" + d.reason).join(", "));
-        }
-      } else {
-        console.log("priority-release: LINEAGE PREFLIGHT SKIPPED (durable evidence unreadable) -- keeping the proposed set; the derive runtime remains the fail-closed authority.");
-      }
-    } catch (e) {
-      console.log("priority-release: LINEAGE PREFLIGHT SKIPPED (" + (e && e.message ? e.message : e) + ") -- keeping the proposed set; the derive runtime remains the fail-closed authority.");
+  // DEFENSE-IN-DEPTH LINEAGE RE-CHECK (read-only; genuinely FAIL CLOSED -- NO "keep the proposed set" path). The
+  // workflow's read-only priority-partial-preflight step already refined --eligible-accounts to the lineage-PROVEN
+  // set (via the SAME partitionPartialCycleByLineage / resolveOliLineageProvenance the derive runtime uses); this
+  // re-verifies that contract at the publish boundary and NEVER publishes under unproven or unreadable lineage.
+  // FAIL CLOSED (exit nonzero; ZERO publication-control / lease / cycle / reservation / publication write) when
+  // --as-of is missing, an evidence reader is unreadable/malformed/capped, ANY proposed account is now deferred (a
+  // preflight/publish mismatch), or none remain eligible (an all-deferred run is NOT a success). Zero exports/tokens.
+  if (!asOfArg) { console.error("STOP LINEAGE_RECHECK: --as-of is required for the partial publish lineage re-check (fail closed)."); process.exit(2); }
+  {
+    // partitionPartialCycleByLineage composes the SAME shared resolveOliLineageProvenance the derive runtime uses.
+    const { partitionPartialCycleByLineage } = await import("../../lib/server/sync/source-durable-model.js");
+    const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
+    const OLI = "order-line-items";
+    const oliStart = sourceRegistryEntry(OLI).initialBackfill.start;
+    const primaryConn = (getDataDoeConnections() || []).find((c) => c.id === "primary");
+    const orgFp = primaryConn && (primaryConn.organizationFingerprint || organizationFingerprint(primaryConn.apiKey));
+    if (!orgFp) { console.error("STOP LINEAGE_RECHECK_UNREADABLE: cannot resolve the primary organization fingerprint -- fail closed (ZERO publication writes)."); process.exit(1); }
+    let hist; let zeroRes;
+    try { hist = await sb.getSourceOliHistoryRows({ organizationFingerprint: orgFp, connectionId: "primary", accountIds: proposed, from: oliStart, to: asOfArg }); }
+    catch (e) { console.error("STOP LINEAGE_RECHECK_UNREADABLE: positive-sales history read failed/capped (" + (e && e.message ? e.message : e) + ") -- fail closed."); process.exit(1); }
+    try { zeroRes = await sb.getSourceOliZeroRowProof({ organizationFingerprint: orgFp, connectionId: "primary", accountIds: proposed, sourceKey: OLI }); }
+    catch (e) { console.error("STOP LINEAGE_RECHECK_UNREADABLE: zero-row proof read failed (" + (e && e.message ? e.message : e) + ") -- fail closed."); process.exit(1); }
+    if (!Array.isArray(hist)) { console.error("STOP LINEAGE_RECHECK_UNREADABLE: positive-sales history read is malformed -- fail closed."); process.exit(1); }
+    if (!zeroRes || zeroRes.read !== "ok" || !(zeroRes.byAccount instanceof Map)) { console.error("STOP LINEAGE_RECHECK_UNREADABLE: zero-row proof read state=" + (zeroRes && zeroRes.read) + " -- fail closed."); process.exit(1); }
+    const positiveHashesByAccount = new Map();
+    for (const rrow of hist) {
+      const aid = String(rrow.account_id ?? rrow.accountId ?? "").trim();
+      if (!aid) continue;
+      const hh = rrow.source_request_hash ?? rrow.sourceRequestHash;
+      if (!positiveHashesByAccount.has(aid)) positiveHashesByAccount.set(aid, []);
+      positiveHashesByAccount.get(aid).push(typeof hh === "string" && hh.trim() !== "" ? hh : null);
     }
+    const part = partitionPartialCycleByLineage({ accountIds: proposed, positiveHashesByAccount, zeroRowExportsByAccount: zeroRes.byAccount, oliStart, requestedAsOf: asOfArg });
+    if (part.deferred.length > 0) {
+      console.error("STOP LINEAGE_RECHECK_MISMATCH: " + part.deferred.length + " account(s) passed to the partial publish are NOT lineage-provable at the publish boundary ("
+        + part.deferred.map((d) => d.accountId.slice(0, 8) + ":" + d.reason).join(", ") + ") -- fail closed (the read-only preflight should have deferred them; ZERO publication writes).");
+      process.exit(1);
+    }
+    if (part.eligible.length === 0) { console.error("STOP LINEAGE_RECHECK_ALL_DEFERRED: no proposed account is lineage-provable -- ZERO publication (NOT a success)."); process.exit(1); }
   }
-  if (wanted.length === 0) {
-    console.log("priority-release: ALL proposed accounts were deferred by the lineage preflight -- ZERO publication (nothing to freeze/publish; deferred accounts keep their dated LKG).");
-    process.exit(0);
-  }
+  const wanted = proposed; // the workflow already refined the set; the re-check proved EXACTLY these remain eligible
   const wantedSet = new Set(wanted);
   // Deterministic dedicated cycle bucket: the SAME eligible set (a watchdog replay) resolves the SAME cycle (idempotent);
   // a DIFFERENT eligible set (readiness advanced) gets its own cycle -- neither ever touches the natural daily cycle.

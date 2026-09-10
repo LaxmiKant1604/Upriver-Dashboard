@@ -53,5 +53,59 @@ if (!cap.permitted) {
     + " ZERO publication-control/lease/cycle/reservation/publication writes occur (the earlier OLI/Campaign source refresh already ran independently; dashboard LKG preserved).");
   process.exit(1);
 }
-console.log("PRIORITY_PARTIAL_CAPABILITY_OK (" + bucket + "): open_sync_cycle + sync_cycles_bucket_check permit the priority-partial namespace; the workflow may open controls + publish the healthy subset.");
+console.log("PRIORITY_PARTIAL_CAPABILITY_OK (" + bucket + "): open_sync_cycle + sync_cycles_bucket_check permit the priority-partial namespace.");
+
+// ===================== LINEAGE ELIGIBILITY (read-only; genuinely FAIL CLOSED) =====================
+// Refine the PROPOSED OLI-eligible subset to EXACTLY the accounts whose durable OLI lineage is PROVABLE, using the
+// SAME resolveOliLineageProvenance the derive runtime uses (composed by partitionPartialCycleByLineage): a positive-
+// sales provenance OR a rigorously proven zero-row export chain is eligible; anything else -- INCLUDING a non-positive
+// `row_count > 0` export (only explicit-zero / pending / cancelled rows) that has no positive-sales rows and no
+// row_count=0 export -- is DEFERRED so it can never enter the frozen cycle and block the proven accounts. Strictly
+// READ-ONLY (GET reads + the pure partition; the capability probe above used a READ ONLY txn): ZERO controls / leases
+// / cycles / reservations / exports / writes. It EMITS the REFINED eligible_ids the workflow's partial_publish MUST
+// use. FAIL CLOSED (exit nonzero; zero publication writes) when an evidence reader is missing / malformed / capped /
+// timed-out / unreadable, OR when NO account remains eligible (an all-deferred run is NOT a successful publication).
+const proposed = [...new Set(String(argOf("eligible-accounts") || "").split(",").map((s) => s.trim()).filter(Boolean))].sort();
+const asOf = argOf("as-of");
+if (proposed.length === 0) { console.error("STOP PRIORITY_PARTIAL_LINEAGE: --eligible-accounts must be provided + nonempty for the lineage preflight (fail closed)."); process.exit(2); }
+if (!asOf || !/^\d{4}-\d{2}-\d{2}$/.test(asOf)) { console.error("STOP PRIORITY_PARTIAL_LINEAGE: --as-of=YYYY-MM-DD is required (fail closed)."); process.exit(2); }
+
+const sb = await import("../../lib/server/supabase.js");
+const { partitionPartialCycleByLineage } = await import("../../lib/server/sync/source-durable-model.js");
+const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
+const { getDataDoeConnections } = await import("../../lib/server/datadoe-connections.js");
+const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
+const OLI = "order-line-items";
+const oliStart = sourceRegistryEntry(OLI).initialBackfill.start;
+const primaryConn = (getDataDoeConnections() || []).find((c) => c.id === "primary");
+const orgFp = primaryConn && (primaryConn.organizationFingerprint || organizationFingerprint(primaryConn.apiKey));
+if (!orgFp) { console.error("STOP PRIORITY_PARTIAL_LINEAGE_UNREADABLE: cannot resolve the primary organization fingerprint -- fail closed (ZERO publication writes)."); process.exit(1); }
+
+const withTimeout = (p, ms, label) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timed out after " + ms + "ms")), ms))]);
+let hist; let zero;
+try { hist = await withTimeout(sb.getSourceOliHistoryRows({ organizationFingerprint: orgFp, connectionId: "primary", accountIds: proposed, from: oliStart, to: asOf }), 120000, "positive-history read"); }
+catch (e) { console.error("STOP PRIORITY_PARTIAL_LINEAGE_UNREADABLE: positive-sales history read failed/capped/timed-out (" + (e && e.message ? e.message : e) + ") -- fail closed (ZERO publication writes)."); process.exit(1); }
+try { zero = await withTimeout(sb.getSourceOliZeroRowProof({ organizationFingerprint: orgFp, connectionId: "primary", accountIds: proposed, sourceKey: OLI }), 120000, "zero-row proof read"); }
+catch (e) { console.error("STOP PRIORITY_PARTIAL_LINEAGE_UNREADABLE: zero-row proof read failed/timed-out (" + (e && e.message ? e.message : e) + ") -- fail closed."); process.exit(1); }
+if (!Array.isArray(hist)) { console.error("STOP PRIORITY_PARTIAL_LINEAGE_UNREADABLE: positive-sales history read returned a non-array (malformed) -- fail closed."); process.exit(1); }
+if (!zero || zero.read !== "ok" || !(zero.byAccount instanceof Map)) { console.error("STOP PRIORITY_PARTIAL_LINEAGE_UNREADABLE: zero-row proof read state=" + (zero && zero.read) + " (missing/malformed/unreadable) -- fail closed."); process.exit(1); }
+
+const positiveHashesByAccount = new Map();
+for (const r of hist) {
+  const aid = String(r.account_id ?? r.accountId ?? "").trim();
+  if (!aid) continue;
+  const hh = r.source_request_hash ?? r.sourceRequestHash;
+  if (!positiveHashesByAccount.has(aid)) positiveHashesByAccount.set(aid, []);
+  positiveHashesByAccount.get(aid).push(typeof hh === "string" && hh.trim() !== "" ? hh : null);
+}
+const part = partitionPartialCycleByLineage({ accountIds: proposed, positiveHashesByAccount, zeroRowExportsByAccount: zero.byAccount, oliStart, requestedAsOf: asOf });
+ghOut("eligible_ids", part.eligible.join(","));
+ghOut("eligible_count", String(part.eligible.length));
+ghOut("deferred_count", String(part.deferred.length));
+if (part.deferred.length) console.log("PRIORITY_PARTIAL_LINEAGE deferred " + part.deferred.length + " account(s) (kept dated LKG): " + part.deferred.map((d) => d.accountId.slice(0, 8) + ":" + d.reason).join(", "));
+if (part.eligible.length === 0) {
+  console.error("STOP PRIORITY_PARTIAL_ALL_DEFERRED (" + bucket + "): NO proposed account has provable durable OLI lineage -- ZERO publication (this is NOT a successful publication). Controls stay closed; deferred accounts keep dated LKG; typed deferral (non-success).");
+  process.exit(1);
+}
+console.log("PRIORITY_PARTIAL_LINEAGE_OK (" + bucket + "): " + part.eligible.length + " of " + proposed.length + " proposed account(s) have provable lineage; partial_publish uses EXACTLY these refined eligible_ids.");
 process.exit(0);

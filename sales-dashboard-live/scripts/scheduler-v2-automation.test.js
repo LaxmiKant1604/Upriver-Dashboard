@@ -482,7 +482,13 @@ test("D5. PER-ACCOUNT publication: the workflow separates COMPLETE (whole-region
   const partialStep = yml.slice(partialStart, yml.indexOf("Report a PARTIAL publication"));
   assert.match(partialStep, /steps\.oli\.outputs\.full_complete != 'true'/, "the partial publish runs only when NOT full_complete");
   assert.match(partialStep, /steps\.oli\.outputs\.publishable == 'true'/, "the partial publish runs only when publishable");
-  assert.match(partialStep, /priority-dashboards-release\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.region \}\} --eligible-accounts=\$\{\{ steps\.oli\.outputs\.eligible_ids \}\}/, "the partial publish scopes to EXACTLY the eligible ids");
+  // The partial publish scopes to the REFINED, lineage-PROVEN ids the READ-ONLY partial_preflight step emitted (NOT the
+  // raw OLI list): the preflight already deferred any lineage-unprovable account, so the frozen cycle + publish scope
+  // are exactly the proven set. Isolate JUST the run command (the step's preamble comment mentions both output names).
+  const partialRunAt = yml.indexOf("run: node scripts/release/priority-dashboards-release.mjs", partialStart);
+  const partialRun = yml.slice(partialRunAt, yml.indexOf("\n", partialRunAt));
+  assert.match(partialRun, /priority-dashboards-release\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.region \}\} --eligible-accounts=\$\{\{ steps\.partial_preflight\.outputs\.eligible_ids \}\}/, "the partial publish scopes to EXACTLY the REFINED lineage-proven eligible ids from partial_preflight");
+  assert.doesNotMatch(partialRun, /--eligible-accounts=\$\{\{ steps\.oli\.outputs\.eligible_ids \}\}/, "the partial publish does NOT scope to the raw OLI eligible ids (the read-only preflight already refined them by lineage)");
   // The catalog operation key MUST be a VALID scheduled key (assertPriorityOperationKey accepts only v2 |
   // scheduled/YYYY-MM-DD). A "scheduled-partial/..." key is rejected and would hard-fail the partial step (dead on
   // arrival). Cycle isolation comes from the entrypoint-derived dedicated cycle bucket, not the operation key.
@@ -496,8 +502,10 @@ test("D5. PER-ACCOUNT publication: the workflow separates COMPLETE (whole-region
   // Both publish paths renew the SAME control fence opened by the one full_controls --apply (per-account isolation is
   // scoped inside a region-wide fence -- leases preserved).
   assert.match(partialStep, /--owner-generation=\$\{\{ steps\.full_controls\.outputs\.generation \}\}/, "the partial publish renews the full_controls fence");
-  // The partial outcome is reported honestly (never a false 'complete') and the deferred count is surfaced.
-  assert.match(yml, /PARTIAL_PUBLICATION region=[^\n]*deferred=\$\{\{ steps\.oli\.outputs\.deferred_count \}\}/, "a partial publication is reported honestly with the deferred count");
+  // The partial outcome is reported honestly (never a false 'complete'): the PUBLISHED count is the REFINED
+  // (lineage-proven) eligible_count, and BOTH the OLI-deferred and the lineage-deferred counts are surfaced.
+  assert.match(yml, /PARTIAL_PUBLICATION region=[^\n]*published=\$\{\{ steps\.partial_preflight\.outputs\.eligible_count \}\}/, "a partial publication reports the REFINED lineage-proven published count");
+  assert.match(yml, /PARTIAL_PUBLICATION region=[^\n]*oli_deferred=\$\{\{ steps\.oli\.outputs\.deferred_count \}\}[^\n]*lineage_deferred=\$\{\{ steps\.partial_preflight\.outputs\.deferred_count \}\}/, "the partial notice surfaces BOTH the OLI-deferred and the lineage-deferred counts honestly");
   // The final honesty gate is UNCHANGED: a non-success OLI (fatal / all-deferred exits nonzero) keeps the run red.
   assert.match(yml, /SOURCE_REFRESH_FAILED[^\n]*OLI \(required sales source\) outcome=\$\{\{ steps\.oli\.outcome \}\}/, "a fatal/all-deferred OLI (nonzero exit) still reddens the run (no false green)");
 });

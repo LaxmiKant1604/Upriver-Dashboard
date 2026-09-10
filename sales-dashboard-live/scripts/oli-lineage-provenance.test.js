@@ -181,15 +181,31 @@ test("F4. ALL proposed accounts unresolvable -> eligible is EMPTY (the operator 
   assert.equal(p.deferred.length, 2);
 });
 
-test("F5. the release operator ACTUALLY wires the preflight: reads both durable readers, calls the partition, recomputes the cycle bucket from survivors, publishes nothing on empty, fail-safe on unreadable", () => {
+test("F5. the READ-ONLY partial preflight operator refines eligibility + genuinely FAILS CLOSED (emits refined eligible_ids; exits nonzero on unreadable/all-deferred; zero writes)", () => {
+  const pf = read("scripts/release/priority-partial-preflight.mjs");
+  assert.match(pf, /partitionPartialCycleByLineage\(/, "the preflight CALLS the shared partition (not comment-only)");
+  assert.match(pf, /getSourceOliHistoryRows\(/, "reads positive-sales provenance");
+  assert.match(pf, /getSourceOliZeroRowProof\(/, "reads the zero-row proof");
+  assert.match(pf, /ghOut\("eligible_ids", part\.eligible\.join/, "emits the REFINED eligible_ids for partial_publish");
+  assert.match(pf, /ghOut\("eligible_count"[\s\S]*ghOut\("deferred_count"/, "emits refined counts");
+  assert.match(pf, /timed out after/, "reads are timeout-bounded (fail closed on timeout)");
+  assert.match(pf, /PRIORITY_PARTIAL_LINEAGE_UNREADABLE[\s\S]{0,400}process\.exit\(1\)/, "unreadable/malformed/capped evidence -> exit nonzero (fail closed)");
+  assert.match(pf, /PRIORITY_PARTIAL_ALL_DEFERRED[\s\S]{0,300}process\.exit\(1\)/, "all-deferred -> exit nonzero (NOT a success)");
+  assert.doesNotMatch(pf, /process\.exit\(0\)[^\n]*deferred/i, "NEVER exit 0 on a deferral");
+  // no publication writes in the preflight (read-only): no control-apply / reservation / publish CALL. (It legitimately
+  // READS the open_sync_cycle function definition for the capability check -- that name is a read, not a write call.)
+  for (const w of ["priority-control-package", "--apply", "reserveOliFreshnessCreate", "publishLive", "priority-dashboards-release"]) assert.ok(!pf.includes(w), "preflight never references a write path: " + w);
+});
+
+test("F6. the partial-publish operator's DEFENSE-IN-DEPTH lineage re-check also fails closed (no keep-all, no false-green exit(0)); the frozen cycle identity is the refined set", () => {
   const mjs = read("scripts/release/priority-dashboards-release.mjs");
-  assert.match(mjs, /partitionPartialCycleByLineage\(/, "the operator CALLS the shared partition (not comment-only)");
-  assert.match(mjs, /getSourceOliHistoryRows\(/, "reads positive-sales provenance");
-  assert.match(mjs, /getSourceOliZeroRowProof\(/, "reads the zero-row proof");
-  assert.match(mjs, /wanted = part\.eligible/, "the frozen set becomes the PROVEN survivors");
-  assert.match(mjs, /sha256\(JSON\.stringify\(wanted\)\)/, "the cycle identity is recomputed from the survivors");
-  assert.match(mjs, /wanted\.length === 0[\s\S]{0,200}process\.exit\(0\)/, "zero eligible -> publish nothing");
-  assert.match(mjs, /keeping the proposed set; the derive runtime remains the fail-closed authority/, "fail-safe on unreadable evidence");
+  assert.match(mjs, /partitionPartialCycleByLineage\(/, "the publish operator re-checks via the shared partition");
+  assert.match(mjs, /LINEAGE_RECHECK_UNREADABLE[\s\S]{0,400}process\.exit\(1\)/, "unreadable/malformed evidence -> fail closed");
+  assert.match(mjs, /LINEAGE_RECHECK_MISMATCH[\s\S]{0,500}process\.exit\(1\)/, "any deferral at the publish boundary -> fail closed");
+  assert.match(mjs, /LINEAGE_RECHECK_ALL_DEFERRED[\s\S]{0,200}process\.exit\(1\)/, "all-deferred -> fail closed (NOT a success)");
+  assert.doesNotMatch(mjs, /keeping the proposed set/, "the fail-SAFE keep-all path is REMOVED");
+  assert.doesNotMatch(mjs, /deferred by the lineage preflight[\s\S]{0,120}process\.exit\(0\)/, "no false-green exit(0) on all-deferred");
+  assert.match(mjs, /sha256\(JSON\.stringify\(wanted\)\)/, "the cycle identity is over the refined (proposed==proven) set");
 });
 
 async function main() {

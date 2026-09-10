@@ -144,4 +144,47 @@ const NA = noticeSalesPublished.cond, NB = noticeNoPublication.cond;
   ok("S8 complete-success + campaign-success: neither Campaign notice fires", evalIf(NA, c) === false && evalIf(NB, c) === false);
 }
 
+/* ---------------- LINEAGE PREFLIGHT wiring (Codex: partial_publish uses the REFINED eligible_ids) ---------------- */
+const ppBlock = (yml.split(/\n\s+- name:/).find((b) => /Publish the HEALTHY lineage-proven subset/.test(b.split("\n")[0] || "")) || "");
+const pfBlock = (yml.split(/\n\s+- name:/).find((b) => /Partial-cycle preflight/.test(b.split("\n")[0] || "")) || "");
+const partialNotice = steps.find((s) => /Report a PARTIAL publication/.test(s.name));
+
+ok("the partial_preflight step passes the proposed eligible_ids + the effective as-of to the read-only lineage preflight",
+  /priority-partial-preflight\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.region \}\} --eligible-accounts=\$\{\{ steps\.oli\.outputs\.eligible_ids \}\} --as-of=\$\{\{ steps\.readiness\.outputs\.effective_asof \}\}/.test(pfBlock));
+ok("partial_publish uses the REFINED partial_preflight.outputs.eligible_ids (NOT the raw OLI list)",
+  /--eligible-accounts=\$\{\{ steps\.partial_preflight\.outputs\.eligible_ids \}\}/.test(ppBlock) && !/--eligible-accounts=\$\{\{ steps\.oli\.outputs\.eligible_ids \}\}/.test(ppBlock));
+ok("the PARTIAL publication notice fires ONLY on a successful partial_publish (gated on partial_publish.outcome == 'success')",
+  partialNotice && /steps\.partial_publish\.outcome == 'success'/.test(partialNotice.cond));
+ok("the PARTIAL publication notice reports the REFINED counts (published = partial_preflight.eligible_count; lineage_deferred present)",
+  /published=\$\{\{ steps\.partial_preflight\.outputs\.eligible_count \}\}/.test(yml) && /lineage_deferred=\$\{\{ steps\.partial_preflight\.outputs\.deferred_count \}\}/.test(yml));
+
+/* ---------------- SCENARIO: some proven -> publish the exact refined subset ---------------- */
+{
+  const c = S({ "steps.oli.outputs.full_complete": "false", "steps.partial_preflight.outcome": "success", "steps.partial_publish.outcome": "success" });
+  ok("SOME-PROVEN: preflight ok -> full_controls opens + partial_publish runs (publishing EXACTLY the refined subset)", evalIf(CTL, c) === true && evalIf(PP, c) === true);
+  ok("SOME-PROVEN: the PARTIAL publication notice fires (a real publication happened)", evalIf(partialNotice.cond, c) === true);
+}
+/* ---------------- SCENARIO: ALL DEFERRED (lineage preflight leaves zero eligible -> exits nonzero) ---------------- */
+{
+  // The lineage preflight exiting nonzero (all-deferred OR evidence-unreadable) => partial_preflight.outcome=failure.
+  const c = S({ "steps.oli.outputs.full_complete": "false", "steps.partial_preflight.outcome": "failure", "steps.partial_publish.outcome": "skipped", "steps.campaign.outcome": "failure" });
+  ok("ALL-DEFERRED: full_controls does NOT open (no controls)", evalIf(CTL, c) === false);
+  ok("ALL-DEFERRED: partial_publish does NOT run (no publish)", evalIf(PP, c) === false);
+  ok("ALL-DEFERRED: the PARTIAL publication (success) notice does NOT fire", evalIf(partialNotice.cond, c) === false);
+  ok("ALL-DEFERRED: the Campaign 'sales PUBLISHED' notice does NOT fire (no false-green publication claim)", evalIf(NA, c) === false);
+  ok("ALL-DEFERRED: the honest 'incomplete/unverified' Campaign notice fires instead", evalIf(NB, c) === true);
+}
+/* ---------------- SCENARIO: evidence UNREADABLE at preflight -> identical fail-closed outcome ---------------- */
+{
+  const c = S({ "steps.oli.outputs.full_complete": "false", "steps.partial_preflight.outcome": "failure", "steps.partial_publish.outcome": "skipped" });
+  ok("UNREADABLE-EVIDENCE: same fail-closed shape (no controls, no publish, no success notice)", evalIf(CTL, c) === false && evalIf(PP, c) === false && evalIf(partialNotice.cond, c) === false);
+}
+/* ---------------- SCENARIO: successful publish + readback -> success notice ONLY then ---------------- */
+{
+  const cOk = S({ "steps.oli.outputs.full_complete": "false", "steps.partial_preflight.outcome": "success", "steps.partial_publish.outcome": "success" });
+  const cFail = S({ "steps.oli.outputs.full_complete": "false", "steps.partial_preflight.outcome": "success", "steps.partial_publish.outcome": "failure" });
+  ok("SUCCESS-ONLY-THEN: the PARTIAL publication notice fires on partial_publish success (publish + readback proven by the step's own exit code)", evalIf(partialNotice.cond, cOk) === true);
+  ok("SUCCESS-ONLY-THEN: it does NOT fire when partial_publish (which includes the exact live readback) failed", evalIf(partialNotice.cond, cFail) === false);
+}
+
 writeSync(1, `\nscheduler-partial-publication-ordering: ${passed} checks passed\n`);

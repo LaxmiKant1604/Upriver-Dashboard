@@ -264,17 +264,21 @@ jobs:
         if: always() && steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outcome == 'success' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success'
         run: node scripts/release/verify-bucket-readiness.mjs --bucket=${{ steps.cfg.outputs.region }} --requested-as-of=${{ steps.cfg.outputs.asof }} --account-scope=full --eligible-accounts=${{ steps.oli.outputs.full_complete == 'true' && ' ' || steps.oli.outputs.eligible_ids }}
 
-      # PARTIAL-CYCLE SCHEMA CAPABILITY PREFLIGHT (READ-ONLY) -- runs BEFORE any publication control on a PARTIAL run.
-      # A partial publishes the healthy subset into a dedicated priority-partial-<region>-<16hex> cycle, which the
-      # production schema permits ONLY once migration 20260924 has widened the EXACT open_sync_cycle(text,date,
-      # timestamptz,text) guard + the sync_cycles_bucket_check constraint. If that capability is missing OR unreadable,
-      # this step exits nonzero BEFORE full_controls opens, so ZERO publication-control / lease / cycle / reservation /
-      # publication writes occur (the earlier OLI/Campaign source refresh already ran independently; LKG preserved).
-      # A COMPLETE region publishes into the natural cycle and does NOT need this (the step is skipped there).
-      - name: Partial-cycle schema capability preflight (read-only; before controls; PARTIAL region only)
+      # PARTIAL-CYCLE PREFLIGHT (READ-ONLY; SCHEMA CAPABILITY + LINEAGE ELIGIBILITY) -- runs BEFORE any publication
+      # control on a PARTIAL run. (a) It proves the production schema can OPEN a priority-partial-<region>-<16hex>
+      # cycle (migration 20260924 widened the EXACT open_sync_cycle guard + the sync_cycles_bucket_check constraint).
+      # (b) It then refines the PROPOSED OLI-eligible subset to EXACTLY the accounts with PROVABLE durable OLI lineage
+      # (positive-sales provenance OR a proven zero-row export chain), via the SAME resolver the derive runtime uses,
+      # deferring any missing/malformed/ambiguous/non-positive-row_count>0 account BEFORE the cycle identity is frozen,
+      # and EMITS the refined eligible_ids/eligible_count/deferred_count. It FAILS CLOSED (exits nonzero BEFORE
+      # full_controls opens -> ZERO publication-control / lease / cycle / reservation / publication write) when the
+      # capability is missing/unreadable, an evidence reader is missing/malformed/capped/timed-out/unreadable, OR NO
+      # account remains eligible (all-deferred is NOT a success). It is strictly READ-ONLY (the OLI/Campaign source
+      # refresh already ran independently; dashboard LKG preserved). A COMPLETE region skips this step entirely.
+      - name: Partial-cycle preflight (read-only; schema capability + LINEAGE eligibility; before controls; PARTIAL only)
         id: partial_preflight
         if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.oli.outputs.full_complete != 'true' && steps.oli.outputs.publishable == 'true' && steps.readiness.outputs.proceed == 'true'
-        run: node scripts/release/priority-partial-preflight.mjs --bucket=${{ steps.cfg.outputs.region }}
+        run: node scripts/release/priority-partial-preflight.mjs --bucket=${{ steps.cfg.outputs.region }} --eligible-accounts=${{ steps.oli.outputs.eligible_ids }} --as-of=${{ steps.readiness.outputs.effective_asof }}
 
       # INDEPENDENT SALES PUBLICATION (Codex blocker 2): controls + BOTH publish paths are NO LONGER gated on
       # steps.campaign.outcome. Campaign Ads is an INDEPENDENT best-effort source (like the FBA job) with its own
@@ -311,19 +315,22 @@ jobs:
       # exclusive per OLI outcome); a distinct "scheduled-partial/..." key is REJECTED by assertPriorityOperationKey.
       # The dedicated cycle isolation comes from the entrypoint-derived priority-partial-<region>-<hash> cycle bucket
       # (from --eligible-accounts), NOT from the operation key.
-      - name: Publish the HEALTHY OLI-eligible subset at D-1 into a dedicated cycle + live read-back (PARTIAL region)
+      # --eligible-accounts uses the REFINED, lineage-PROVEN ids from partial_preflight (NOT the raw OLI list): a
+      # lineage-deferred account is already excluded, so the frozen cycle identity + the publish scope are the proven
+      # set. The .mjs still runs its OWN defense-in-depth lineage re-check and fails closed on any deferral/unreadable.
+      - name: Publish the HEALTHY lineage-proven subset at D-1 into a dedicated cycle + live read-back (PARTIAL region)
         id: partial_publish
         if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.oli.outputs.full_complete != 'true' && steps.oli.outputs.publishable == 'true' && steps.readiness.outputs.proceed == 'true' && steps.partial_preflight.outcome == 'success'
-        run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.region }} --eligible-accounts=${{ steps.oli.outputs.eligible_ids }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }} --run-token=${{ github.run_id }}-${{ github.run_attempt }} --owner-generation=${{ steps.full_controls.outputs.generation }} --strict-d1
+        run: node scripts/release/priority-dashboards-release.mjs --bucket=${{ steps.cfg.outputs.region }} --eligible-accounts=${{ steps.partial_preflight.outputs.eligible_ids }} --as-of=${{ steps.readiness.outputs.effective_asof }} --operation-key=priority-dashboards/scheduled/${{ steps.cfg.outputs.asof }} --run-token=${{ github.run_id }}-${{ github.run_attempt }} --owner-generation=${{ steps.full_controls.outputs.generation }} --strict-d1
 
       # Report the partial ONLY when the subset publish actually SUCCEEDED (never claim a publication on a failed step).
       - name: Report a PARTIAL publication (healthy subset published; deferred accounts keep dated LKG)
         if: always() && steps.cfg.outputs.scope != 'bootstrap' && steps.partial_publish.outcome == 'success'
         run: |
-          echo "PARTIAL_PUBLICATION region=${{ steps.cfg.outputs.region }} eligible=${{ steps.oli.outputs.eligible_count }} deferred=${{ steps.oli.outputs.deferred_count }} -- the healthy accounts published fresh D-1; the deferred accounts keep their dated last-known-good and retry on the next natural cycle. NOT a complete-region publication."
+          echo "PARTIAL_PUBLICATION region=${{ steps.cfg.outputs.region }} published=${{ steps.partial_preflight.outputs.eligible_count }} oli_deferred=${{ steps.oli.outputs.deferred_count }} lineage_deferred=${{ steps.partial_preflight.outputs.deferred_count }} -- EXACTLY the lineage-PROVEN accounts published fresh D-1; every deferred account (OLI-deferred or lineage-deferred) keeps its dated last-known-good and retries on the next natural cycle. NOT a complete-region publication."
           {
-            echo "### D-1 publication (${{ steps.cfg.outputs.region }}): PARTIAL (healthy subset)";
-            echo "- eligible (published fresh): ${{ steps.oli.outputs.eligible_count }} · deferred (kept dated LKG): ${{ steps.oli.outputs.deferred_count }}";
+            echo "### D-1 publication (${{ steps.cfg.outputs.region }}): PARTIAL (lineage-proven subset)";
+            echo "- published (lineage-proven, fresh D-1): ${{ steps.partial_preflight.outputs.eligible_count }} · OLI-deferred: ${{ steps.oli.outputs.deferred_count }} · lineage-deferred: ${{ steps.partial_preflight.outputs.deferred_count }} (all kept dated LKG)";
             echo "- deferred accounts retry on the next natural cycle; this is NOT a complete-region publication.";
           } >> "$GITHUB_STEP_SUMMARY"
 
