@@ -1183,7 +1183,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         const saved = await dl.bound("shadow-save", (signal) => saveShadow(snap, params, signal, nowIso()), { write: true });
         return { complete: true, newlySaved: true, saved, lineage: "unavailable" };
       }
-      const note = (outcome, detail) => rollup.derived.lineage.push({ reportKey: snap.productionReportKey, accountId: snap.accountId, outcome, ...(detail ? { detail } : {}) });
+      const note = (outcome, detail, extra) => rollup.derived.lineage.push({ reportKey: snap.productionReportKey, accountId: snap.accountId, outcome, ...(detail ? { detail } : {}), ...(extra || {}) });
       // Provenance binding + fail-closed: a ready OLI-dependent account whose durable OLI provenance is
       // missing/malformed is NEVER saved/published with unproven lineage.
       const dep = dependsOnFor(snap.accountId, snap.productionReportKey);
@@ -1191,10 +1191,12 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         note("durable-oli-provenance-missing");
         return { complete: false, newlySaved: false, saved: null, lineage: "durable-oli-provenance-missing" };
       }
-      // A distinct, observable COMPLETE marker for the proven-empty path (durable zero-row OLI proof) -- emitted in
-      // ADDITION to the terminal save disposition below (recorded/recovered/already-complete), never replacing it,
-      // so a later save failure still reddens the batch. Its depends_on is the exports' real request hashes.
-      if (dep.provenEmpty) note(DURABLE_OLI_PROVEN_EMPTY);
+      // The proven-empty path (durable zero-row OLI proof) is recorded as METADATA on the ONE terminal lineage
+      // event below (provenanceKind: durable-oli-proven-empty), NOT as a separate event -- the release runner
+      // requires EXACTLY one lineage event per saved report. It never changes the terminal outcome, so an
+      // unsuccessful save is still classified by its real (non-complete) disposition. depends_on is the exports'
+      // real request hashes (bound in the upsert above).
+      const provenanceExtra = dep.provenEmpty ? { provenanceKind: DURABLE_OLI_PROVEN_EMPTY } : undefined;
       await dl.bound("report-lineage-upsert", (signal) => reportLineage.upsertReportJob({
         cycleId: rollup.cycleId, reportKey: snap.productionReportKey, reportVersion: snap.version,
         accountId: snap.accountId, connectionId: "primary", bucket,
@@ -1213,7 +1215,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
           note("already-complete-hash-mismatch", lease.snapshotParamsHash || "missing");
           return { complete: false, newlySaved: false, saved: null, lineage: "already-complete-hash-mismatch" };
         }
-        note("already-complete");
+        note("already-complete", null, provenanceExtra);
         return { complete: true, newlySaved: false, saved: null, lineage: "already-complete" };
       }
       // Round-9 finding 2: a TOTAL, accurately-resumable classification. held is resumable; terminal,
@@ -1317,7 +1319,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       }, { signal }), { write: true });
       const rdisp = rec && rec.disposition;
       if (rdisp === "reconciled" || rdisp === "already-complete") {
-        note(recovered ? "recovered" : "recorded");
+        note(recovered ? "recovered" : "recorded", null, provenanceExtra);
         return { complete: true, newlySaved, saved: newlySaved ? { paramsHash } : null, lineage: recovered ? "recovered" : "recorded" };
       }
       // Round-9 finding 2: reconcile failures are classified by their ACTUAL state, never blanket-transient.
@@ -1422,9 +1424,10 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     // mismatch, a snapshot integrity/conflict -- all TERMINAL/CONFIGURATION failures -- are NON-resumable
     // (continuationRequired is NOT set), so they can never create an endless continuation loop. The shared
     // cycle honestly stays open (finalize returns open-work) until a genuine resolution.
-    // A proven-empty account is COMPLETE (validly published-empty): its distinct marker joins the terminal save
-    // dispositions. durable-oli-provenance-missing is DELIBERATELY absent (still fail-closed / incomplete).
-    const COMPLETE_OUTCOMES = new Set(["recorded", "recovered", "already-complete", DURABLE_OLI_PROVEN_EMPTY]);
+    // The terminal SUCCESS outcomes (a proven-empty account reaches one of these too -- its zero-row provenance is
+    // carried as provenanceKind metadata ON the event, never as a separate event). durable-oli-provenance-missing
+    // is DELIBERATELY absent (still fail-closed / incomplete).
+    const COMPLETE_OUTCOMES = new Set(["recorded", "recovered", "already-complete"]);
     const RESUMABLE_OUTCOMES = new Set(["claim-held", "reconcile-lease-lost", "reconcile-snapshot-absent", "snapshot-newer"]);
     const incompleteLineage = (rollup.derived.lineage || []).filter((l) => !COMPLETE_OUTCOMES.has(l.outcome));
     if (incompleteLineage.length > 0) {

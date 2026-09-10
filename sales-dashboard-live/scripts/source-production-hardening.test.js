@@ -745,7 +745,14 @@ test("F4h. PROVEN-EMPTY: a covered zero-SALES account (no positive history) with
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "order-line-items").length, 0, "ZERO OLI creates (proven-empty is durable, no fetch)");
   assert.ok(rollup.derived.daily.saved >= 1, "the proven-empty account derived Daily off the durable zero-row proof");
-  assert.ok(rollup.derived.lineage.some((l) => l.accountId === "A01" && l.outcome === "durable-oli-proven-empty"), "A01 marked durable-oli-proven-empty (a COMPLETE outcome)");
+  // EXACTLY ONE terminal lineage event per (report, account) -- proven-empty is provenanceKind METADATA on it, not a
+  // separate event (the release runner requires exactly one lineage event per saved report).
+  for (const rk of ["daily-reporting", "brand-sales", "brand-inventory"]) {
+    const ev = rollup.derived.lineage.filter((l) => l.accountId === "A01" && l.reportKey === rk);
+    assert.equal(ev.length, 1, "EXACTLY one lineage event for A01 " + rk + " (no duplicate)");
+    assert.ok(["recorded", "recovered", "already-complete"].includes(ev[0].outcome), rk + ": the ONE event is a terminal success outcome");
+    assert.equal(ev[0].provenanceKind, "durable-oli-proven-empty", rk + ": proven-empty carried as provenanceKind metadata ON the terminal event");
+  }
   const catalogHash = (h.store.listSourceJobs(rollup.cycleId).find((j) => j.source_key === "product-catalog") || {}).request_hash;
   for (const rk of ["daily-reporting", "brand-sales"]) {
     const up = h.recorded.lineage.find((l) => l.op === "upsert" && l.reportKey === rk && l.accountId === "A01");
@@ -765,7 +772,7 @@ test("F4i. FAIL CLOSED: a zero-sales account whose zero-row export windows leave
   const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   assert.ok(rollup.derived.lineage.some((l) => l.accountId === "A01" && l.outcome === "durable-oli-provenance-missing"), "A01 fails closed: a gapped zero-row window is NOT proven-empty even with full coverage");
-  assert.ok(!rollup.derived.lineage.some((l) => l.accountId === "A01" && l.outcome === "durable-oli-proven-empty"), "A01 is NOT marked proven-empty");
+  assert.ok(!rollup.derived.lineage.some((l) => l.accountId === "A01" && l.provenanceKind === "durable-oli-proven-empty"), "A01 is NOT marked proven-empty");
   assert.ok(h.recorded.shadowSaves.every((s) => s.accountId !== "A01"), "no A01 snapshot saved without a proven window");
 });
 
@@ -793,8 +800,67 @@ test("F4k. MIXED + ISOLATION: a healthy POSITIVE account and a PROVEN-EMPTY acco
   assert.ok(up01 && up01.dependsOn.includes("oli-prov-A01"), "A01 binds its positive provenance");
   assert.ok(up02 && up02.dependsOn.includes("oli-empty-A02"), "A02 binds its proven-empty zero-row hash");
   assert.ok(!up01.dependsOn.includes("oli-empty-A02") && !up02.dependsOn.includes("oli-prov-A01"), "account isolation: neither borrows the other's OLI hash");
-  assert.ok(rollup.derived.lineage.some((l) => l.accountId === "A02" && l.outcome === "durable-oli-proven-empty"), "A02 marked proven-empty");
-  assert.ok(!rollup.derived.lineage.some((l) => l.accountId === "A01" && l.outcome === "durable-oli-proven-empty"), "A01 (positive) is NOT proven-empty");
+  assert.ok(rollup.derived.lineage.some((l) => l.accountId === "A02" && l.provenanceKind === "durable-oli-proven-empty"), "A02's terminal event carries provenanceKind proven-empty");
+  assert.ok(!rollup.derived.lineage.some((l) => l.accountId === "A01" && l.provenanceKind === "durable-oli-proven-empty"), "A01 (positive) is NOT proven-empty");
+  // exactly one lineage event per (report, account) for BOTH -- proven-empty never duplicates the count.
+  for (const aid of ["A01", "A02"]) assert.equal(rollup.derived.lineage.filter((l) => l.accountId === aid && l.reportKey === "daily-reporting").length, 1, aid + ": one daily lineage event");
+});
+
+test("F4L. E2E runtime -> runPriorityDashboardsRelease -> finalize -> publisher -> live readback: 30 accounts incl 1 proven-empty => 90 saved jobs, EXACTLY 90 lineage events (one per report; proven-empty is metadata, never a duplicate), finalize + 30x3 canonical live promotion + readback succeed, zero duplicate saves/exports", async () => {
+  const N = 30;
+  const ids = Array.from({ length: N }, (_, i) => "E" + String(i + 1).padStart(2, "0"));
+  const provenEmpty = ids[N - 1];
+  const h = durableOliProvenanceHarness({
+    primaryAccounts: ids.map((id) => dirAccount(id)),
+    zeroRowProof: { [provenEmpty]: [{ requestHash: "oli-empty-" + provenEmpty, from: "2025-01-01", to: TODAY }] },
+  });
+  // FBA snapshots for EVERY account (brand-inventory needs them) + positive OLI history for all BUT the proven-empty one.
+  for (const id of ids) {
+    h.snapStore.set("source-snapshots/v1/fba-inventory-health/" + id + ".json", { rows: [{ date: ASOF, sku: "SKU-A", child_asin: "B0A", marketplace_country_code: "US", available: 5 }] });
+    if (id !== provenEmpty) h.durableHistory.set(id + "|x", { accountId: id, saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1, sourceRequestHash: "oli-prov-" + id });
+  }
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+
+  // (blocker 1) THE runner's derive-ok invariant (source-priority-release-runner.js:135-137): equal per-account
+  // counts AND lineageCount === saved. A proven-empty account contributes EXACTLY one lineage event per report.
+  const ds = rollup.derived.daily.saved, bs = rollup.derived.brandView.saved, is = rollup.derived.brandInventory.saved;
+  assert.equal(ds, N); assert.equal(bs, N); assert.equal(is, N);
+  assert.equal(ds + bs + is, 3 * N, "90 saved report jobs (30 x 3)");
+  assert.equal(rollup.derived.lineage.length, 3 * N, "EXACTLY 90 lineage events (one per saved report; proven-empty NEVER duplicates)");
+  assert.ok(rollup.derived.lineage.every((l) => ["recorded", "recovered", "already-complete"].includes(l.outcome)), "every lineage event is a terminal success outcome");
+  for (const id of ids) for (const rk of ["daily-reporting", "brand-sales", "brand-inventory"]) {
+    const ev = rollup.derived.lineage.filter((l) => l.accountId === id && l.reportKey === rk);
+    assert.equal(ev.length, 1, id + "/" + rk + ": exactly one lineage event");
+    if (id === provenEmpty) assert.equal(ev[0].provenanceKind, "durable-oli-proven-empty", "proven-empty carried as metadata on its ONE event");
+    else assert.equal(ev[0].provenanceKind, undefined, "a positive account carries NO proven-empty metadata");
+  }
+  const saveKeys = h.recorded.shadowSaves.map((s) => s.accountId + "|" + s.reportKey);
+  assert.equal(new Set(saveKeys).size, saveKeys.length, "zero duplicate shadow saves (one per account/report)");
+  assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "order-line-items").length, 0, "zero OLI exports (proven-empty is durable)");
+
+  // (chain) the REAL runtime rollup -> runPriorityDashboardsRelease -> finalize -> publisher -> exact live readback.
+  const releaseRunner = await import("../lib/server/sync/source-priority-release-runner.js");
+  const THREE = ["daily-reporting", "brand-sales", "brand-inventory"];
+  const liveKeys = new Set();
+  const release = {
+    publishOrder: THREE, reportKeys: THREE,
+    deriveBucket: async () => ({ rollup }),
+    finalizeBucket: async () => ({ disposition: "finalized", cycleStatus: "succeeded", accounts: ids, cycleIdByAccount: Object.fromEntries(ids.map((a) => [a, "cyc-" + a])) }),
+    preflightAccount: async (a) => ({ accountId: a, results: THREE.map((rk) => ({ reportKey: rk, disposition: "ready", liveReportKey: rk, paramsHash: "ph_" + rk + "_" + a })) }),
+    publishAccount: async (a) => ({ accountId: a, results: THREE.map((rk) => { liveKeys.add(rk + "|" + a); return { reportKey: rk, disposition: "published", liveReportKey: rk, paramsHash: "ph_" + rk + "_" + a }; }) }),
+    catalogReservation: async () => ({ tokensSpent: 2, status: "created" }),
+  };
+  const r = await releaseRunner.runPriorityDashboardsRelease({
+    bucket: "us", release,
+    reconcile: async () => ({ ok: true }),
+    readbackLive: async () => ({ ok: true }),
+    assertNoCron: async () => ({ ok: true }),
+  });
+  assert.equal(r.code, 0, "the release reaches code 0 (the lineage=saved derive-ok gate passed WITH a proven-empty account): " + JSON.stringify(r.problems || r.stage));
+  assert.equal(r.ok, true);
+  assert.equal(liveKeys.size, 3 * N, "all 30x3 = 90 snapshots promoted to canonical live keys");
 });
 
 group("F5. atomic rolling-window replacement: removed grains cannot survive; replacement+ack one transaction");

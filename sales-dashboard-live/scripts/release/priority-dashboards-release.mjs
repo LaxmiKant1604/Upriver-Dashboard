@@ -57,11 +57,62 @@ if (eligibleArg !== "") {
     console.error("STOP PRIORITY_PARTIAL_REGION_UNSUPPORTED: healthy-subset publication is region-scoped (india|europe-au|us-ca); got --bucket=" + bucketArg + " -- fail closed (ZERO publication-control/lease/cycle/reservation/publication writes; source refresh already ran independently).");
     process.exit(2);
   }
-  const wanted = [...new Set(eligibleArg.split(",").map((s) => s.trim()).filter(Boolean))].sort();
-  if (wanted.length === 0) { console.error("STOP --eligible-accounts was provided but parsed empty (fail closed)."); process.exit(2); }
-  const wantedSet = new Set(wanted);
-  const { sha256 } = await import("../../lib/server/source-identity.js");
+  const proposed = [...new Set(eligibleArg.split(",").map((s) => s.trim()).filter(Boolean))].sort();
+  if (proposed.length === 0) { console.error("STOP --eligible-accounts was provided but parsed empty (fail closed)."); process.exit(2); }
+  const { sha256, organizationFingerprint } = await import("../../lib/server/source-identity.js");
   const { fetchAccounts: fetchDirectory } = await import("../../lib/server/datadoe.js");
+  const { getDataDoeConnections } = await import("../../lib/server/datadoe-connections.js");
+
+  // LINEAGE-ELIGIBILITY PREFLIGHT (read-only; the SAME resolveOliLineageProvenance contract the derive runtime uses):
+  // before the dedicated partial-cycle IDENTITY is frozen, classify EVERY proposed account from durable evidence and
+  // DEFER any whose OLI provenance is missing/malformed/ambiguous -- INCLUDING a non-positive `row_count > 0` export
+  // (only explicit-zero / pending / cancelled rows) that the positive-sales history reader excludes and that has no
+  // succeeded row_count=0 export -- so it can never enter the frozen cycle and later block the healthy accounts. A
+  // proven-empty (durable zero-row export) account stays eligible. FAIL-SAFE: if the durable evidence is UNREADABLE
+  // we KEEP the proposed set (never wrongly defer on a read blip) and let the derive runtime remain the fail-closed
+  // authority. Zero exports/tokens/writes. Requires --as-of (the D-1 the workflow always passes for a partial run).
+  let wanted = proposed;
+  if (asOfArg) {
+    try {
+      // partitionPartialCycleByLineage composes the SAME shared resolveOliLineageProvenance the derive runtime uses.
+      const { partitionPartialCycleByLineage } = await import("../../lib/server/sync/source-durable-model.js");
+      const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
+      const OLI = "order-line-items";
+      const oliStart = sourceRegistryEntry(OLI).initialBackfill.start;
+      const primaryConn = (getDataDoeConnections() || []).find((c) => c.id === "primary");
+      const orgFp = primaryConn && (primaryConn.organizationFingerprint || organizationFingerprint(primaryConn.apiKey));
+      let hist = null; let zero = null;
+      if (orgFp) {
+        try { hist = await sb.getSourceOliHistoryRows({ organizationFingerprint: orgFp, connectionId: "primary", accountIds: proposed, from: oliStart, to: asOfArg }); } catch { hist = null; }
+        try { zero = await sb.getSourceOliZeroRowProof({ organizationFingerprint: orgFp, connectionId: "primary", accountIds: proposed, sourceKey: OLI }); } catch { zero = null; }
+      }
+      if (orgFp && Array.isArray(hist) && zero && zero.read === "ok" && zero.byAccount instanceof Map) {
+        const positiveHashesByAccount = new Map();
+        for (const rrow of hist) {
+          const aid = String(rrow.account_id ?? rrow.accountId ?? "").trim();
+          if (!aid) continue;
+          const hh = rrow.source_request_hash ?? rrow.sourceRequestHash;
+          if (!positiveHashesByAccount.has(aid)) positiveHashesByAccount.set(aid, []);
+          positiveHashesByAccount.get(aid).push(typeof hh === "string" && hh.trim() !== "" ? hh : null);
+        }
+        const part = partitionPartialCycleByLineage({ accountIds: proposed, positiveHashesByAccount, zeroRowExportsByAccount: zero.byAccount, oliStart, requestedAsOf: asOfArg });
+        wanted = part.eligible;
+        if (part.deferred.length) {
+          console.log("priority-release: LINEAGE PREFLIGHT deferred " + part.deferred.length + " proposed account(s) with unresolvable durable OLI provenance (kept dated LKG; cycle identity recomputed from the proven set): "
+            + part.deferred.map((d) => d.accountId.slice(0, 8) + ":" + d.reason).join(", "));
+        }
+      } else {
+        console.log("priority-release: LINEAGE PREFLIGHT SKIPPED (durable evidence unreadable) -- keeping the proposed set; the derive runtime remains the fail-closed authority.");
+      }
+    } catch (e) {
+      console.log("priority-release: LINEAGE PREFLIGHT SKIPPED (" + (e && e.message ? e.message : e) + ") -- keeping the proposed set; the derive runtime remains the fail-closed authority.");
+    }
+  }
+  if (wanted.length === 0) {
+    console.log("priority-release: ALL proposed accounts were deferred by the lineage preflight -- ZERO publication (nothing to freeze/publish; deferred accounts keep their dated LKG).");
+    process.exit(0);
+  }
+  const wantedSet = new Set(wanted);
   // Deterministic dedicated cycle bucket: the SAME eligible set (a watchdog replay) resolves the SAME cycle (idempotent);
   // a DIFFERENT eligible set (readiness advanced) gets its own cycle -- neither ever touches the natural daily cycle.
   // Format priority-partial-<region>-<16 hex> matches the CHECK/open_sync_cycle regex added by migration 20260924

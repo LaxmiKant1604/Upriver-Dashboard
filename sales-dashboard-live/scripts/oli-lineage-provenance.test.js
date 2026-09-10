@@ -121,22 +121,75 @@ test("D1. getSourceOliZeroRowProof filters to active-owner + succeeded + row_cou
   assert.match(body, /read: "read-failed"|read: "schema-missing"/, "fail-closed typed read state (never a fabricated proof)");
 });
 
-group("E. runtime + preflight WIRING (one shared resolver; distinct COMPLETE marker)");
+group("E. shared module contract (the resolver + partition are the ONE shared implementation)");
 
-test("E1. the derive runtime imports the shared resolver, loads the zero-row proof, and marks durable-oli-proven-empty as COMPLETE", () => {
-  const src = read("lib/server/sync/source-bucket-sync-runtime.js");
-  assert.match(src, /resolveOliLineageProvenance/, "runtime uses the SHARED resolver (no second implementation)");
-  assert.match(src, /loadOliZeroRowProof/, "runtime loads the durable zero-row proof");
-  assert.match(src, /COMPLETE_OUTCOMES = new Set\(\["recorded", "recovered", "already-complete", DURABLE_OLI_PROVEN_EMPTY\]\)/, "proven-empty is a COMPLETE outcome; provenance-missing is NOT");
-  assert.match(src, /note\(DURABLE_OLI_PROVEN_EMPTY\)/, "the distinct proven-empty marker is emitted");
-  assert.match(src, /note\("durable-oli-provenance-missing"\)/, "the fail-closed missing outcome is preserved");
-});
-
-test("E2. the resolver + constants are exported from source-durable-model.js (imported by both runtime and preflight)", () => {
+test("E1. source-durable-model exports the shared resolver + the partition helper + constants", () => {
   assert.equal(typeof R.resolveOliLineageProvenance, "function");
+  assert.equal(typeof R.partitionPartialCycleByLineage, "function", "the preflight partition composes the shared resolver");
   assert.equal(R.OLI_LINEAGE_STATUS.PROVEN_EMPTY, "proven-empty");
   assert.equal(R.DURABLE_OLI_PROVEN_EMPTY, "durable-oli-proven-empty");
-  assert.equal(R.DURABLE_OLI_PROVENANCE_MISSING, "durable-oli-provenance-missing");
+});
+
+group("F. PREFLIGHT eligibility (BEHAVIORAL: partitionPartialCycleByLineage classifies the proposed cycle account set)");
+
+test("F1. positive -> eligible; proven-empty -> eligible; missing -> deferred (before the cycle identity is frozen)", () => {
+  const p = R.partitionPartialCycleByLineage({
+    accountIds: ["POS", "EMPTY", "MISS"],
+    positiveHashesByAccount: { POS: ["h1"] },
+    zeroRowExportsByAccount: { EMPTY: [{ requestHash: "z1", from: OLI_START, to: ASOF }] },
+    // MISS: no positive rows AND no zero-row export -> resolver 'missing'
+    oliStart: OLI_START, requestedAsOf: ASOF,
+  });
+  assert.deepEqual(p.eligible, ["EMPTY", "POS"]);
+  assert.deepEqual(p.deferred.map((d) => d.accountId), ["MISS"]);
+});
+
+test("F2. REPRODUCTION -- a non-positive `row_count > 0` export (only explicit-zero/pending/cancelled rows) is DEFERRED, never entering the frozen cycle to block healthy accounts", () => {
+  // Such an account has NO positive-sales history rows (the positive-sales reader excludes explicit-zero/pending/
+  // cancelled), and its export is row_count>0 so the zero-row (row_count=0) reader returns NOTHING for it -> the
+  // resolver sees no positive hashes AND no zero-row export -> 'missing' -> deferred. Healthy + proven-empty stay in.
+  const p = R.partitionPartialCycleByLineage({
+    accountIds: ["HEALTHY", "PROVEN_EMPTY", "CANCELLED_ONLY"],
+    positiveHashesByAccount: { HEALTHY: ["oli-h"] },
+    zeroRowExportsByAccount: { PROVEN_EMPTY: [{ requestHash: "z0", from: OLI_START, to: ASOF }] }, // CANCELLED_ONLY: absent from BOTH maps
+    oliStart: OLI_START, requestedAsOf: ASOF,
+  });
+  assert.deepEqual(p.eligible, ["HEALTHY", "PROVEN_EMPTY"], "the non-positive row_count>0 account is NOT eligible");
+  assert.deepEqual(p.deferred.map((d) => d.accountId), ["CANCELLED_ONLY"], "it is deferred at preflight (kept dated LKG)");
+});
+
+test("F3. the dedicated-cycle IDENTITY is recomputed from the PROVEN set (deferring an account changes the sha256; deferring none is byte-identical)", async () => {
+  const { sha256 } = await import("../lib/server/source-identity.js");
+  const bucketOf = (ids) => "priority-partial-europe-au-" + sha256(JSON.stringify([...ids].sort())).slice(0, 16);
+  const proposed = ["A", "B", "CANCELLED_ONLY"];
+  const p = R.partitionPartialCycleByLineage({
+    accountIds: proposed,
+    positiveHashesByAccount: { A: ["ha"], B: ["hb"] },
+    zeroRowExportsByAccount: {},
+    oliStart: OLI_START, requestedAsOf: ASOF,
+  });
+  assert.deepEqual(p.eligible, ["A", "B"]);
+  assert.notEqual(bucketOf(p.eligible), bucketOf(proposed), "the frozen cycle identity is over the survivors, NOT the proposed set");
+  // no deferral -> byte-identical identity (the whole-region healthy case is unchanged).
+  const all = R.partitionPartialCycleByLineage({ accountIds: ["A", "B"], positiveHashesByAccount: { A: ["ha"], B: ["hb"] }, oliStart: OLI_START, requestedAsOf: ASOF });
+  assert.equal(bucketOf(all.eligible), bucketOf(["A", "B"]), "no deferral -> identical cycle identity");
+});
+
+test("F4. ALL proposed accounts unresolvable -> eligible is EMPTY (the operator then publishes nothing)", () => {
+  const p = R.partitionPartialCycleByLineage({ accountIds: ["X", "Y"], oliStart: OLI_START, requestedAsOf: ASOF });
+  assert.deepEqual(p.eligible, []);
+  assert.equal(p.deferred.length, 2);
+});
+
+test("F5. the release operator ACTUALLY wires the preflight: reads both durable readers, calls the partition, recomputes the cycle bucket from survivors, publishes nothing on empty, fail-safe on unreadable", () => {
+  const mjs = read("scripts/release/priority-dashboards-release.mjs");
+  assert.match(mjs, /partitionPartialCycleByLineage\(/, "the operator CALLS the shared partition (not comment-only)");
+  assert.match(mjs, /getSourceOliHistoryRows\(/, "reads positive-sales provenance");
+  assert.match(mjs, /getSourceOliZeroRowProof\(/, "reads the zero-row proof");
+  assert.match(mjs, /wanted = part\.eligible/, "the frozen set becomes the PROVEN survivors");
+  assert.match(mjs, /sha256\(JSON\.stringify\(wanted\)\)/, "the cycle identity is recomputed from the survivors");
+  assert.match(mjs, /wanted\.length === 0[\s\S]{0,200}process\.exit\(0\)/, "zero eligible -> publish nothing");
+  assert.match(mjs, /keeping the proposed set; the derive runtime remains the fail-closed authority/, "fail-safe on unreadable evidence");
 });
 
 async function main() {

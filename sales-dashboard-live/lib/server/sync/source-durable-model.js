@@ -183,6 +183,29 @@ export function resolveOliLineageProvenance({ historyProvenanceHashes = [], zero
   return { status: OLI_LINEAGE_STATUS.PROVEN_EMPTY, deps: [...new Set(clean.map((e) => e.requestHash))].sort(), reason: null };
 }
 
+// Partition a set of PROPOSED healthy-subset accounts into eligible vs deferred using the SAME shared resolver the
+// derive runtime uses -- BEFORE the dedicated partial-cycle identity is frozen. The caller supplies the durable
+// evidence per account (positive-sales provenance hashes + the succeeded row_count=0 zero-row export chain). A
+// positive (nonempty) OR a rigorously proven-empty account is eligible; anything else (missing/malformed/
+// ambiguous -- INCLUDING a non-positive `row_count > 0` export that has NO positive-sales history rows and NO
+// row_count=0 export, so it resolves to neither nonempty nor proven-empty) is DEFERRED, so it can never enter the
+// frozen cycle and later block the independently-proven healthy accounts. PURE; deterministic (eligible sorted).
+export function partitionPartialCycleByLineage({ accountIds = [], positiveHashesByAccount = new Map(), zeroRowExportsByAccount = new Map(), oliStart, requestedAsOf } = {}) {
+  const eligible = [];
+  const deferred = [];
+  const get = (m, aid) => (m instanceof Map ? m.get(aid) : (m && m[aid])) || [];
+  for (const aid of (Array.isArray(accountIds) ? accountIds : [])) {
+    const res = resolveOliLineageProvenance({
+      historyProvenanceHashes: get(positiveHashesByAccount, aid),
+      zeroRowExports: get(zeroRowExportsByAccount, aid),
+      oliStart, requestedAsOf,
+    });
+    if (res.status === OLI_LINEAGE_STATUS.MISSING) deferred.push({ accountId: aid, reason: res.reason });
+    else eligible.push(aid);
+  }
+  return { eligible: [...new Set(eligible)].sort(), deferred };
+}
+
 /**
  * The canonical OLI slices of [from, to] that are NOT fully proven by the account's coverage windows.
  * Proven slices are returned under `covered` (never re-exported); missing ones under `missing` (the only
