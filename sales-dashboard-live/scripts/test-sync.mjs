@@ -82,8 +82,9 @@ test("automatic timing: GitHub Actions scheduler-v2 is the SINGLE scheduler (exa
   assert.equal((vercel.crons || []).length, 0, "Vercel must not invoke DataDoe automatically");
   const workflow = readFileSync(fileURLToPath(new URL("../../.github/workflows/scheduler-v2.yml", import.meta.url)), "utf8");
   // Cron is ACTIVE + REGIONAL: india 03:07 + europe-au 08:37 + us-ca 16:37 UTC (off the congested :00/:30
-  // boundaries), one GitHub primary per region. Two independent backups re-dispatch a missed cron: the Cloudflare
-  // watchdog (+20 min) and the GitHub-native scheduler-recovery.yml (every 10 min); the exact-live guard makes repeats no-ops.
+  // boundaries), one GitHub primary per region. Two independent recovery mechanisms re-dispatch a missed cron: a
+  // Cloudflare */10 global poller (20m grace, 3h window) and the GitHub-native scheduler-recovery.yml (3 crons/day,
+  // one per region at primary+40m); the exact-live duplicate guard makes repeats no-ops.
   const crons = [...workflow.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
   assert.deepEqual(crons, ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort(), "the three regional primaries (india / europe-au / us-ca)");
   assert.match(workflow, /^\s*workflow_dispatch\s*:/m, "manual dispatch remains available");

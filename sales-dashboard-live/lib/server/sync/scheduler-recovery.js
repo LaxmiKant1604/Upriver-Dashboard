@@ -2,10 +2,11 @@
 //
 // WHY: GitHub's scheduled-cron delivery is best-effort. On 2026-09-10 the india 03:00 primary produced NO
 // workflow run at all (it did not start, so it did not "fail" -- there was simply nothing to fail), and the
-// external Cloudflare watchdog also produced no invocation. account-onboarding kept running, so Actions was not
-// globally disabled. This module powers a lightweight GitHub-native backstop (scheduler-recovery.yml, every 10
-// min) that re-dispatches scheduler-v2 ONLY when a region's cron produced no run for the day -- without ever
-// retrying a run that started and failed, and without creating a duplicate paid cycle.
+// Cloudflare recovery poller also produced no invocation. account-onboarding kept running, so Actions was not
+// globally disabled. This module powers a LOW-COST GitHub-native FINAL backstop (scheduler-recovery.yml: exactly
+// three crons/day, one per region, at primary + 40m) that re-dispatches scheduler-v2 ONLY when a region's cron
+// produced no run for the day -- without ever retrying a run that started and failed, and without creating a
+// duplicate paid cycle. Cloudflare runs the frequent (*/10) poller independently; GitHub is the sparse safety net.
 //
 // It NEVER performs report work, NEVER touches DataDoe/DB, and NEVER prints credentials. It only decides, from a
 // snapshot of scheduler-v2 workflow runs + the current instant, whether to dispatch. All HTTP lives in the thin
@@ -13,22 +14,32 @@
 //
 // CONVERGENCE (anti-duplicate-spend): the durable cycle identity is region + requestedAsOf (D-1 = yesterday UTC),
 // i.e. opkey `scheduled-fresh/<region>/<D-1>`, computed INSIDE the dispatched run from the clock -- never from the
-// cron string or the dispatch_id. A scheduled run, the Cloudflare watchdog dispatch (external/<region>/<D-1>) and a
-// recovery dispatch (recovery/<region>/<D-1>) therefore ALL resolve to ONE opkey, ONE token/create budget and ONE
-// cycle. The read-only duplicate guard makes an already-published D-1 a zero-write no-op. This module additionally
-// treats a watchdog OR a prior recovery run as an EXISTING run, so simultaneous GitHub + Cloudflare recovery never
-// double-dispatches once either run is visible.
+// cron string or the dispatch_id. The scheduled primary run, the LEGACY Cloudflare watchdog dispatch
+// (cloudflare/<region>/<D-1>), a future/renamed Cloudflare dispatch (external/<region>/<D-1>) and a GitHub recovery
+// dispatch (recovery/<region>/<D-1>) therefore ALL resolve to ONE opkey, ONE token/create budget and ONE cycle. The
+// read-only duplicate guard makes an already-published D-1 a zero-write no-op. This module additionally treats a
+// Cloudflare recovery run (either prefix) OR a prior GitHub recovery run as an EXISTING run, so simultaneous
+// GitHub + Cloudflare recovery never double-dispatches once either run is visible.
 //
 // 7-bit ASCII, LF. No external deps.
 
-import { REGIONS, REGION_SCHEDULE } from "./campaign-region-routing.js";
+import {
+  REGIONS,
+  REGION_SCHEDULE,
+  RECOVERY_GRACE_MINUTES,
+  RECOVERY_WINDOW_MINUTES,
+  CLOUDFLARE_RECOVERY_POLLER_CRON,
+} from "./campaign-region-routing.js";
+
+export { RECOVERY_GRACE_MINUTES, RECOVERY_WINDOW_MINUTES, CLOUDFLARE_RECOVERY_POLLER_CRON };
 
 export const SCHEDULER_WORKFLOW_FILE = "scheduler-v2.yml";
 export const RUN_NAME_PREFIX = "scheduler-v2 "; // run-name is `scheduler-v2 <cron>` (schedule) or `scheduler-v2 <region>/<dispatch_id>` (dispatch)
-export const RECOVERY_GRACE_MINUTES = 20; // wait this long after the primary before recovery may act
-export const RECOVERY_WINDOW_MINUTES = 180; // bounded: stop checking 3h after the primary
-export const RECOVERY_DISPATCH_PREFIX = "recovery"; // recovery/<region>/<business-date>
-export const WATCHDOG_DISPATCH_PREFIX = "external"; // external/<region>/<business-date> (Cloudflare)
+export const RECOVERY_DISPATCH_PREFIX = "recovery"; // recovery/<region>/<business-date> (GitHub-native backstop)
+// The Cloudflare recovery dispatch id prefixes recognized as an EXISTING recovery run. Production currently
+// dispatches `cloudflare/<region>/<D-1>`; `external/<region>/<D-1>` is also recognized (documented/forward-compat).
+// Matched by EXACT run-name equality, never by substring.
+export const WATCHDOG_DISPATCH_PREFIXES = Object.freeze(["cloudflare", "external"]);
 
 // The regions that carry a daily primary schedule, in a stable order.
 export const SCHEDULED_REGIONS = Object.freeze([REGIONS.INDIA, REGIONS.EUROPE_AU, REGIONS.US_CA]);
@@ -61,6 +72,17 @@ export function scheduledRegions() {
 export function regionForPrimaryCron(cron) {
   const want = String(cron || "").trim();
   for (const r of scheduledRegions()) if (r.primaryCron === want) return r.region;
+  return null;
+}
+
+// Map a GITHUB RECOVERY cron string -> its region (the fired scheduler-recovery.yml cron), or null if unknown.
+// Deterministic 1:1 (from REGION_SCHEDULE.githubRecoveryCron); an unknown cron returns null so the entrypoint can
+// fail closed rather than guess a region.
+export function regionForRecoveryCron(cron) {
+  const want = String(cron || "").trim();
+  for (const region of SCHEDULED_REGIONS) {
+    if (String(REGION_SCHEDULE[region].githubRecoveryCron || "").trim() === want) return region;
+  }
   return null;
 }
 
@@ -121,8 +143,10 @@ export function dispatchRunName(region, dispatchId) {
 export function recoveryDispatchId(region, businessDate) {
   return RECOVERY_DISPATCH_PREFIX + "/" + region + "/" + businessDate;
 }
-export function watchdogDispatchId(region, businessDate) {
-  return WATCHDOG_DISPATCH_PREFIX + "/" + region + "/" + businessDate;
+// The Cloudflare recovery dispatch ids recognized for this region+day -- one per accepted prefix
+// (cloudflare/<region>/<D-1> is what production dispatches; external/<region>/<D-1> is also accepted).
+export function watchdogDispatchIds(region, businessDate) {
+  return WATCHDOG_DISPATCH_PREFIXES.map((prefix) => prefix + "/" + region + "/" + businessDate);
 }
 // The durable cycle identity every trigger for this region+day converges on (mirrors the workflow's opkey).
 export function durableCycleKey(region, businessDate) {
@@ -135,10 +159,11 @@ function runTitle(run) {
   return String((run && (run.display_title != null ? run.display_title : run.name)) || "");
 }
 
-// Does a run belong to THIS region's cycle for (scheduleDate, businessDate)? Matches EXACTLY three deterministic
-// identities: the scheduled primary (run-name == `scheduler-v2 <primaryCron>`, created on the schedule date), a
-// prior recovery dispatch, or a Cloudflare watchdog dispatch. A bootstrap/ad-hoc dispatch (any other dispatch_id)
-// is deliberately NOT matched.
+// Does a run belong to THIS region's cycle for (scheduleDate, businessDate)? Matches by EXACT run-name equality
+// (never substring) against the deterministic identities: the scheduled primary (`scheduler-v2 <primaryCron>`,
+// created on the schedule date), a GitHub recovery dispatch (recovery/<region>/<D-1>), or a Cloudflare recovery
+// dispatch under EITHER accepted prefix (cloudflare/<region>/<D-1> -- production -- or external/<region>/<D-1>). A
+// bootstrap/ad-hoc dispatch (any other dispatch_id) is deliberately NOT matched.
 export function isMatchingRun(run, { region, primaryCron, scheduleDate, businessDate }) {
   if (!run || typeof run !== "object") return false;
   const title = runTitle(run);
@@ -149,10 +174,11 @@ export function isMatchingRun(run, { region, primaryCron, scheduleDate, business
     return utcDateString(run.created_at) === scheduleDate;
   }
   if (event === "workflow_dispatch") {
-    return (
-      title === dispatchRunName(region, recoveryDispatchId(region, businessDate)) ||
-      title === dispatchRunName(region, watchdogDispatchId(region, businessDate))
-    );
+    const accepted = [
+      dispatchRunName(region, recoveryDispatchId(region, businessDate)),
+      ...watchdogDispatchIds(region, businessDate).map((id) => dispatchRunName(region, id)),
+    ];
+    return accepted.includes(title);
   }
   return false;
 }
@@ -229,8 +255,11 @@ export function decideRecoveryForRegion({ region, now, apiOk, runs }) {
   };
 }
 
-// Decide for EVERY scheduled region at instant `now`. At most one region is ever in-window (the three windows are
-// disjoint), so at most one decision can be a dispatch/report-failed; the rest skip. apiOk applies to all.
-export function decideRecovery({ now, apiOk, runs }) {
-  return SCHEDULED_REGIONS.map((region) => decideRecoveryForRegion({ region, now, apiOk, runs }));
+// Decide for the given `regions` at instant `now` (default: every scheduled region). The scheduled recovery path
+// passes exactly the ONE region its fired cron maps to; a manual (no-cron) run may evaluate all regions. The three
+// windows are disjoint, so at most one all-regions decision can be a dispatch/report-failed; the rest skip. apiOk
+// applies to all. Unknown regions are ignored (never fabricated).
+export function decideRecovery({ now, apiOk, runs, regions = SCHEDULED_REGIONS }) {
+  const list = (Array.isArray(regions) ? regions : SCHEDULED_REGIONS).filter((r) => SCHEDULED_REGIONS.includes(r));
+  return list.map((region) => decideRecoveryForRegion({ region, now, apiOk, runs }));
 }

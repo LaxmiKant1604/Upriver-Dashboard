@@ -52,7 +52,7 @@ ghSum("- source: **Ad Performance by Campaign & Date** (`campaign-performance-v1
 ghSum("- window: [" + dry.window.from + " .. " + dry.window.to + "] (" + dry.window.days + " days) · discovered accounts: **" + dry.accountCount + "**");
 for (const rp of dry.plan.regions) {
   const sch = REGION_SCHEDULE[rp.region];
-  ghSum("- region **" + rp.label + "** (primary " + sch.primaryUtc + " UTC / watchdog " + sch.watchdogUtc + " UTC): " + rp.accountCount + " accounts -> " + rp.batchCount + " batch(es) of <=5 sellers");
+  ghSum("- region **" + rp.label + "** (primary " + sch.primaryUtc + " UTC / recovery-eligible " + sch.recoveryEligibleUtc + "-" + sch.recoveryWindowEndUtc + " UTC): " + rp.accountCount + " accounts -> " + rp.batchCount + " batch(es) of <=5 sellers");
 }
 ghSum("- worst-case exports: **" + dry.plan.exportCount + "** · max token spend: **" + dry.plan.maxTokenSpend + "** (<= " + maxTokens + "? **" + dry.withinCeiling + "**)");
 ghSum("- usable DataDoe balance: **" + (dry.balanceProven ? dry.balance : "UNREADABLE (" + dry.balanceRead + ")") + "** · sufficient? **" + dry.balanceSufficient + "**");

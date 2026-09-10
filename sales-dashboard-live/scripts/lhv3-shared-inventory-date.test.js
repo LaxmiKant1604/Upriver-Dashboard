@@ -50,7 +50,7 @@ function shareOneIdentity(region, inventoryAsOf) {
 /* ===================== B. WATCHDOG re-dispatch (+20 min, same UTC day) ===================== */
 (() => {
   const primary = runJobInventoryAsOf(Date.parse("2026-09-06T08:37:00Z"));   // europe-au primary cron (off-boundary)
-  const watchdog = runJobInventoryAsOf(Date.parse("2026-09-06T08:57:00Z"));  // Cloudflare watchdog +20 min
+  const watchdog = runJobInventoryAsOf(Date.parse("2026-09-06T08:57:00Z"));  // Cloudflare recovery poll (+20m eligibility)
   ok("B: the watchdog run recomputes the SAME inventory_asof as the primary (same UTC day)", primary === watchdog);
   ok("B: both the primary and the watchdog resolve one FBA+v3 identity (idempotent replay)", shareOneIdentity("europe-au", primary) && shareOneIdentity("europe-au", watchdog) && v3ConfirmOpId("europe-au", primary) === v3ConfirmOpId("europe-au", watchdog));
 })();

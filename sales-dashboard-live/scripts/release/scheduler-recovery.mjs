@@ -1,27 +1,35 @@
 #!/usr/bin/env node
-// GitHub-native scheduler trigger RECOVERY -- thin entrypoint for scheduler-recovery.yml (every 10 min).
+// GitHub-native scheduler trigger RECOVERY -- thin entrypoint for scheduler-recovery.yml. It is the LOW-COST
+// GitHub-side FINAL backstop: exactly three scheduled runs/day (one per region, at primary + 40m). The frequent
+// (*/10) polling is Cloudflare's job; this is the independent safety net.
 //
 // It does NOT run any report job. It only: (1) reads a snapshot of recent scheduler-v2 workflow runs via the
-// GitHub REST API using the workflow-scoped GITHUB_TOKEN, (2) asks the PURE decision module whether any region's
-// primary cron produced no run for today (past its 20-min grace, within the bounded 3-hour window), and (3) if so
-// dispatches ONE scheduler-v2 run with dispatch_id `recovery/<region>/<business-date>`. All decision logic lives in
+// GitHub REST API using the workflow-scoped GITHUB_TOKEN, (2) asks the PURE decision module whether the region(s)
+// under evaluation produced no run for today (past the 20-min grace, within the bounded 3-hour window), and (3) if
+// so dispatches ONE scheduler-v2 run with dispatch_id `recovery/<region>/<business-date>`. On a scheduled run the
+// fired cron (--schedule) is mapped deterministically to its ONE region; a manual run with no --schedule evaluates
+// all regions (report-only under the dry-run default). All decision logic lives in
 // lib/server/sync/scheduler-recovery.js and is unit-tested offline; this file is the transport + logging shell.
 //
-// FAIL CLOSED: a missing/malformed/truncated API response NEVER means "no run" -- it means we cannot safely decide,
-// so we dispatch nothing and exit nonzero (the recovery run goes red, observably, without touching production).
-// It NEVER retries a run that started and failed, and NEVER prints the token or a complete Authorization header.
+// FAIL CLOSED: a missing/malformed/truncated API response (or an unknown recovery cron) NEVER means "no run" -- it
+// means we cannot safely decide, so we dispatch nothing and exit nonzero (the run goes red, observably, without
+// touching production). It NEVER retries a run that started and failed, and NEVER prints the token or a complete
+// Authorization header.
 //
-// Usage: node scripts/release/scheduler-recovery.mjs [--mode=live|dry-run] [--now=<ISO8601>]
-//   --mode=dry-run : decide + log only; never POST a dispatch (used for manual verification).
+// Usage: node scripts/release/scheduler-recovery.mjs [--mode=live|dry-run] [--schedule=<cron>] [--now=<ISO8601>]
+//   --mode         : live dispatches; dry-run decides + logs only (DEFAULT; manual runs must opt in to live).
+//   --schedule     : the fired recovery cron (github.event.schedule); maps to one region. Empty => all regions.
 //   --now=<ISO>    : override the clock (test/rehearsal only); defaults to the real current instant.
 //
 // 7-bit ASCII, LF.
 
 import {
   SCHEDULER_WORKFLOW_FILE,
+  SCHEDULED_REGIONS,
   decideRecovery,
   validateRunsResponse,
   utcDateString,
+  regionForRecoveryCron,
 } from "../../lib/server/sync/scheduler-recovery.js";
 
 const args = new Map();
@@ -29,7 +37,9 @@ for (const a of process.argv.slice(2)) {
   const m = /^--([^=]+)(?:=(.*))?$/.exec(a);
   if (m) args.set(m[1], m[2] == null ? "true" : m[2]);
 }
-const mode = String(args.get("mode") || "live");
+// Manual-safe DEFAULT is dry-run: a scheduled run is invoked with --mode=live by the workflow; a manual
+// workflow_dispatch defaults to dry-run and must OPT IN to live. An absent/blank --mode is treated as dry-run.
+const mode = String(args.get("mode") || "dry-run").trim() || "dry-run";
 if (mode !== "live" && mode !== "dry-run") {
   console.error(`scheduler-recovery: invalid --mode=${mode} (expected live|dry-run)`);
   process.exit(2);
@@ -39,6 +49,20 @@ const now = nowArg ? Date.parse(nowArg) : Date.now();
 if (Number.isNaN(now)) {
   console.error(`scheduler-recovery: invalid --now=${nowArg}`);
   process.exit(2);
+}
+
+// Which region(s) to evaluate. A SCHEDULED recovery is fired by exactly one region's cron (passed as --schedule
+// = github.event.schedule); map it deterministically to that ONE region and fail closed on an unknown cron. A
+// manual run with no --schedule evaluates ALL regions (report-only under the dry-run default).
+const firedSchedule = String(args.get("schedule") || "").trim();
+let regions = SCHEDULED_REGIONS;
+if (firedSchedule) {
+  const region = regionForRecoveryCron(firedSchedule);
+  if (!region) {
+    console.error(`scheduler-recovery: unknown recovery cron ${JSON.stringify(firedSchedule)} -- refusing (fail closed).`);
+    process.exit(1);
+  }
+  regions = [region];
 }
 
 const token = String(process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "").trim();
@@ -81,7 +105,7 @@ async function readRuns() {
 
 async function dispatchRecovery(decision) {
   // POST a single scheduler-v2 workflow_dispatch for the region, converging on the SAME durable cycle key
-  // (scheduled-fresh/<region>/<business-date>) as the missed primary + the Cloudflare watchdog.
+  // (scheduled-fresh/<region>/<business-date>) as the missed primary + the Cloudflare recovery poller.
   const res = await fetch(`${apiBase}/repos/${repo}/actions/workflows/${SCHEDULER_WORKFLOW_FILE}/dispatches`, {
     method: "POST",
     headers: {
@@ -103,7 +127,7 @@ async function dispatchRecovery(decision) {
 
 async function main() {
   const { ok: apiOk, runs, reason: apiReason } = await readRuns();
-  const decisions = decideRecovery({ now, apiOk, runs });
+  const decisions = decideRecovery({ now, apiOk, runs, regions });
 
   let failClosed = 0;
   let dispatched = 0;
@@ -113,6 +137,7 @@ async function main() {
 
   log(
     `scheduler-recovery[${mode}] now=${new Date(now).toISOString()} apiOk=${apiOk} apiReason=${apiReason} ` +
+      `firedSchedule=${firedSchedule || "(manual/all-regions)"} regions=${regions.join(",")} ` +
       `runsFetched=${Array.isArray(runs) ? runs.length : 0}`,
   );
 

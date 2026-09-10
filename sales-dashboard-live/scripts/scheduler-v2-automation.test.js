@@ -295,7 +295,7 @@ group("D. GitHub Actions workflow: INDEPENDENT per-bucket publish + always-safe-
 test("D1. scheduler-v2.yml: the THREE regional crons (0 3 india / 30 8 europe-au / 30 16 us-ca), region resolved FROM the fired cron, dispatch kept, concurrency, Node 24, >=90-min timeout", () => {
   const yml = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-v2.yml"), "utf8");
   assert.match(yml, /workflow_dispatch:/, "manual dispatch kept");
-  // The three GitHub primary crons -- one per region; the +20-min Cloudflare watchdog dispatches the same workflow.
+  // The three GitHub primary crons -- one per region; a Cloudflare */10 poller + a GitHub recovery backstop re-dispatch a miss.
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
   assert.deepEqual(crons, ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort(), "exactly the three regional primaries");
   // The region comes from WHICH cron fired -- deterministic mapping, never inferred from the clock.
@@ -459,7 +459,7 @@ test("D4. previous-day (D-1) freshness shape: refresh_mode input, scheduled-alwa
   assert.doesNotMatch(yml, /oli-force-latest\.mjs/, "the separate force-latest step is merged into the one D-1 OLI step");
   // the readiness proof is STRICT D-1 and the publish carries --strict-d1 (never publish a clamped D-2).
   assert.match(yml, /priority-dashboards-release\.mjs[^\n]*--strict-d1/, "release fails closed below D-1");
-  // schedules: the three regional primaries; the +20-min Cloudflare watchdog dispatches the same workflow per region.
+  // schedules: the three regional primaries; a Cloudflare */10 poller + GitHub recovery backstop re-dispatch a missed cron.
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
   assert.deepEqual(crons, ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort(), "india 03:07 + europe-au 08:37 + us-ca 16:37");
 });

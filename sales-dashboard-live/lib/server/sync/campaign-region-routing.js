@@ -23,15 +23,28 @@ const MARKETPLACE_TO_REGION = (() => {
   return m;
 })();
 
-// The regional triggers (UTC). primary + a watchdog 20 minutes later. No schedule is activated by this module.
-// The primary minutes are DELIBERATELY off the congested :00/:30 boundaries (moved 2026-09-10 after a missed
-// GitHub cron delivery on a :00 boundary): GitHub's scheduled-cron delivery is best-effort and is most often
-// delayed or dropped exactly at the top-of-hour / half-hour where the most repos schedule. The +20-min watchdog
-// tracks the primary (Cloudflare-owned; Codex updates the external cron to match this spec).
+// The recovery model (bounded, shared by all triggers). The Cloudflare recovery is ONE GLOBAL poller (not three
+// per-region crons); it applies this grace + bounded window PER REGION. The GitHub recovery is a low-cost
+// independent final backstop: exactly one check per region per day, inside the same window.
+export const RECOVERY_GRACE_MINUTES = 20; // a region is recovery-eligible only this long after its primary
+export const RECOVERY_WINDOW_MINUTES = 180; // and only until this bounded window closes (3h after the primary)
+// The SINGLE global Cloudflare recovery poller cron (Codex owns/implements it on Cloudflare). It is NOT three
+// per-region crons -- regional eligibility comes from the per-region grace/window below, not from separate crons.
+export const CLOUDFLARE_RECOVERY_POLLER_CRON = "*/10 * * * *";
+
+// The regional triggers (UTC). No schedule is activated by this module (display/spec only). Each region has ONE
+// GitHub primary cron. The primary minutes are DELIBERATELY off the congested :00/:30 boundaries (moved 2026-09-10
+// after a missed GitHub cron delivery on a :00 boundary): GitHub's scheduled-cron delivery is best-effort and is
+// most often delayed or dropped at the top-of-hour / half-hour where the most repos schedule.
+//   - recoveryEligibleUtc  = primary + 20m: the recovery grace start (when the Cloudflare poller + the GitHub
+//                            backstop may act) and the earliest either recovery trigger dispatches.
+//   - recoveryWindowEndUtc = primary + 180m: the bounded window end (no recovery dispatch after this).
+//   - githubRecoveryCron   = the ONE low-cost GitHub-native final backstop cron for this region (primary + 40m),
+//                            deterministically mapped 1:1 to the region and inside [eligible, windowEnd].
 export const REGION_SCHEDULE = Object.freeze({
-  [REGIONS.INDIA]: { label: "India", primaryUtc: "03:07", watchdogUtc: "03:27", primaryCron: "7 3 * * *", watchdogCron: "27 3 * * *", istPrimary: "08:37", istWatchdog: "08:57" },
-  [REGIONS.EUROPE_AU]: { label: "Europe + UK + Australia", primaryUtc: "08:37", watchdogUtc: "08:57", primaryCron: "37 8 * * *", watchdogCron: "57 8 * * *", istPrimary: "14:07", istWatchdog: "14:27" },
-  [REGIONS.US_CA]: { label: "US + Canada", primaryUtc: "16:37", watchdogUtc: "16:57", primaryCron: "37 16 * * *", watchdogCron: "57 16 * * *", istPrimary: "22:07", istWatchdog: "22:27" },
+  [REGIONS.INDIA]: { label: "India", primaryUtc: "03:07", primaryCron: "7 3 * * *", istPrimary: "08:37", recoveryEligibleUtc: "03:27", recoveryWindowEndUtc: "06:07", githubRecoveryUtc: "03:47", githubRecoveryCron: "47 3 * * *", istGithubRecovery: "09:17" },
+  [REGIONS.EUROPE_AU]: { label: "Europe + UK + Australia", primaryUtc: "08:37", primaryCron: "37 8 * * *", istPrimary: "14:07", recoveryEligibleUtc: "08:57", recoveryWindowEndUtc: "11:37", githubRecoveryUtc: "09:17", githubRecoveryCron: "17 9 * * *", istGithubRecovery: "14:47" },
+  [REGIONS.US_CA]: { label: "US + Canada", primaryUtc: "16:37", primaryCron: "37 16 * * *", istPrimary: "22:07", recoveryEligibleUtc: "16:57", recoveryWindowEndUtc: "19:37", githubRecoveryUtc: "17:17", githubRecoveryCron: "17 17 * * *", istGithubRecovery: "22:47" },
 });
 
 // The Campaign Ads window plan (days), from the source spec. Used by the planner + the future scheduler.

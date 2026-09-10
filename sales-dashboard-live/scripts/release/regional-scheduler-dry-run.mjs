@@ -84,7 +84,7 @@ for (const region of regionsToPlan) {
   grandExports += regionExports; grandTokens += regionTokens;
   const sched = REGION_SCHEDULE[region];
   perRegion.push({ region, label: sched.label, accounts: regionAccounts.length, oliBatches, campaignBatches, regionExports, regionTokens });
-  log("REGION " + region + " (" + sched.label + ", primary " + sched.primaryCron + " / watchdog " + sched.watchdogCron + "): "
+  log("REGION " + region + " (" + sched.label + ", primary " + sched.primaryCron + " / recovery-eligible " + sched.recoveryEligibleUtc + "-" + sched.recoveryWindowEndUtc + " UTC, GitHub backstop " + sched.githubRecoveryCron + "): "
     + regionAccounts.length + " accounts -> OLI " + oliBatches + " batch/" + oliTokens + "tok + Campaign " + campaignBatches + " batch/" + campaignTokens + "tok"
     + (catalogTokens ? " + Catalog 1/" + catalogTokens + "tok (shared)" : " + Catalog 0 (reuses shared)")
     + " => " + regionExports + " exports / " + regionTokens + " worst-case tokens");

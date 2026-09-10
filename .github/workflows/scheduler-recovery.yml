@@ -5,38 +5,50 @@ name: scheduler-recovery
 # produced NO run for the day (past a 20-minute grace, within a bounded 3-hour window), dispatches ONE scheduler-v2
 # run with dispatch_id `recovery/<region>/<business-date>`. It exists because GitHub's scheduled-cron delivery is
 # best-effort: on 2026-09-10 the india 03:00 primary produced no run at all (it did not start, so it did not
-# "fail"), and the external Cloudflare watchdog also produced no invocation. This is the independent GitHub-side
-# twin of that watchdog.
+# "fail"), and the Cloudflare recovery poller also produced no invocation.
 #
-# WHY IT CANNOT CAUSE DUPLICATE PAID WORK: a recovery dispatch, the missed primary (if it later arrives late) and
-# the Cloudflare watchdog ALL converge on ONE durable cycle identity -- opkey `scheduled-fresh/<region>/<D-1>`,
-# computed inside the dispatched run from the clock, never from the cron or dispatch_id. scheduler-v2's per-region
-# concurrency group serializes same-region runs, its read-only duplicate guard makes an already-published D-1 a
-# zero-write no-op, and its token/create budget + leases are keyed to that one cycle. This workflow additionally
-# treats a watchdog OR a prior recovery run as an EXISTING run, so it never double-dispatches once either is visible,
-# and it NEVER retries a run that started and failed.
+# DIVISION OF LABOUR: Cloudflare owns the FREQUENT recovery (one global */10 poller, 20-min grace, 3h bounded
+# per-region windows, dispatching cloudflare/<region>/<D-1>). This GitHub workflow is the LOW-COST INDEPENDENT FINAL
+# backstop: exactly THREE scheduled runs per day -- one per region, 40 minutes after that region's primary, so each
+# check lands inside the region's [primary+20m, primary+180m] recovery window:
+#   - india     47 3  * * *  (03:47 UTC / 09:17 IST)  -- primary 03:07 + 40m
+#   - europe-au 17 9  * * *  (09:17 UTC / 14:47 IST)  -- primary 08:37 + 40m
+#   - us-ca     17 17 * * *  (17:17 UTC / 22:47 IST)  -- primary 16:37 + 40m
+# Each cron maps DETERMINISTICALLY to exactly one region (resolved from github.event.schedule via the pure module,
+# never the wall clock). Target cost: 3 recovery jobs/day (not 144).
 #
-# COST: */10 = 144 runs/day. Each run is deliberately lightweight (checkout + setup-node + a pure Node script; NO
-# npm ci, NO DataDoe, NO DB), typically finishing in a few seconds, but GitHub Actions bills a 1-minute minimum per
-# job, so budget ~144 min/day (~4,300 min/month) on this PRIVATE repo. DataDoe tokens = 0 structurally.
+# WHY IT CANNOT CAUSE DUPLICATE PAID WORK: a recovery dispatch, the missed primary (if it later arrives late), and
+# the Cloudflare recovery dispatch ALL converge on ONE durable cycle identity -- opkey
+# `scheduled-fresh/<region>/<D-1>`, computed inside the dispatched run from the clock, never from the cron or
+# dispatch_id. scheduler-v2's per-region concurrency group serializes same-region runs, its read-only duplicate
+# guard makes an already-published D-1 a zero-write no-op, and its token/create budget + leases are keyed to that
+# one cycle. This workflow additionally treats a Cloudflare recovery run (cloudflare/<region>/<D-1> OR
+# external/<region>/<D-1>) or a prior GitHub recovery run as an EXISTING run, so it never double-dispatches once
+# either is visible, and it NEVER retries a run that started and failed.
+#
+# COST: 3 runs/day. Each is deliberately lightweight (checkout + setup-node + a pure Node script; NO npm ci, NO
+# DataDoe, NO DB), typically finishing in seconds. DataDoe tokens = 0 structurally.
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "47 3 * * *"   # india     recovery -- 03:47 UTC (primary 03:07 + 40m)
+    - cron: "17 9 * * *"   # europe-au recovery -- 09:17 UTC (primary 08:37 + 40m)
+    - cron: "17 17 * * *"  # us-ca     recovery -- 17:17 UTC (primary 16:37 + 40m)
   workflow_dispatch:
     inputs:
       mode:
-        description: "live (dispatch a missed region) | dry-run (decide + log only, never dispatch)"
+        description: "dry-run (default: decide + log only, never dispatch) | live (explicitly dispatch a missed region)"
         required: false
-        default: "live"
+        default: "dry-run"
         type: choice
         options:
-          - live
           - dry-run
+          - live
 
 concurrency:
-  # One recovery pass at a time; an overlapping/delayed */10 tick queues, never races. Its decisions are idempotent
-  # (a prior recovery/watchdog run is observed as EXISTING), so a queued duplicate tick is a zero-dispatch no-op.
+  # One recovery pass at a time; the three daily crons never overlap, and an overlapping/delayed tick queues rather
+  # than races. Decisions are idempotent (a prior recovery / Cloudflare run is observed as EXISTING), so a queued
+  # duplicate is a zero-dispatch no-op.
   group: scheduler-recovery
   cancel-in-progress: false
 
@@ -63,6 +75,8 @@ jobs:
         with:
           node-version: "24"
       # No `npm ci`: the recovery script imports only the pure decision module + uses the Node 24 global fetch, so
-      # it has zero third-party dependencies. Keeping the run dependency-free is what makes the */10 cadence cheap.
+      # it has zero third-party dependencies. Keeping the run dependency-free is what keeps this backstop cheap.
+      # --schedule is the fired recovery cron (empty on a manual dispatch => the script evaluates all regions). A
+      # scheduled run is ALWAYS live; a manual workflow_dispatch defaults to dry-run and must opt in to live.
       - name: Recover any missed scheduler-v2 regional trigger (inspect runs; dispatch only a truly-missed cron)
-        run: node scripts/release/scheduler-recovery.mjs --mode=${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'live' }}
+        run: node scripts/release/scheduler-recovery.mjs --mode=${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'live' }} --schedule="${{ github.event.schedule }}"

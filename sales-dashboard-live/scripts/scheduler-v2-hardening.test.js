@@ -37,8 +37,13 @@ test("12/13. the three regional crons each map deterministically to one region; 
   assert.match(yml, /"37 8 \* \* \*"\)\s*region="europe-au"/);
   assert.match(yml, /"37 16 \* \* \*"\)\s*region="us-ca"/);
   assert.doesNotMatch(yml, /30 10 \* \* \*/, "the legacy US GitHub primary is removed");
-  assert.match(yml, /Cloudflare watchdog 03:27 UTC/, "the +20min india watchdog is documented");
-  assert.match(yml, /Cloudflare watchdog 16:57 UTC/, "the +20min us-ca watchdog is documented");
+  // Honest recovery model: ONE global Cloudflare */10 poller + per-region eligibility windows (NOT three false
+  // per-region watchdog crons), plus the low-cost GitHub scheduler-recovery backstop.
+  assert.match(yml, /recovery-eligible 03:27-06:07 UTC/, "india recovery eligibility window documented");
+  assert.match(yml, /recovery-eligible 16:57-19:37 UTC/, "us-ca recovery eligibility window documented");
+  assert.match(yml, /Cloudflare: ONE global recovery poller \(cron \*\/10 UTC\)/, "Cloudflare is one global poller, not per-region crons");
+  assert.match(yml, /scheduler-recovery\.yml/, "the GitHub recovery backstop is referenced");
+  assert.doesNotMatch(yml, /Cloudflare watchdog \d\d:\d\d UTC/, "no false per-region Cloudflare watchdog cron times");
   assert.match(yml, /Unknown cron[^\n]*refusing \(fail closed\)/);
   // the unknown-cron guard is in the SAME cfg step, before install/preflight/token/fetch.
   const cfgIdx = yml.indexOf("Resolve region + requestedAsOf");

@@ -48,7 +48,7 @@ const BUSINESS_DATE = "2026-09-09";
 
 group("A. cron -> region mapping (exactly one correct region per cron)");
 
-test("A1. each primary cron maps to exactly one region; the set is the three new off-boundary primaries", () => {
+test("A1. each PRIMARY cron maps to exactly one region; the set is the three off-boundary primaries", () => {
   assert.equal(R.regionForPrimaryCron("7 3 * * *"), "india");
   assert.equal(R.regionForPrimaryCron("37 8 * * *"), "europe-au");
   assert.equal(R.regionForPrimaryCron("37 16 * * *"), "us-ca");
@@ -58,6 +58,19 @@ test("A1. each primary cron maps to exactly one region; the set is the three new
   assert.deepEqual(regions.map((r) => r.primaryCron).sort(), ["37 16 * * *", "37 8 * * *", "7 3 * * *"].sort());
 });
 
+test("A1b. each GITHUB RECOVERY cron maps to exactly one correct region; unknown recovery cron -> null (fail closed)", () => {
+  assert.equal(R.regionForRecoveryCron("47 3 * * *"), "india");
+  assert.equal(R.regionForRecoveryCron("17 9 * * *"), "europe-au");
+  assert.equal(R.regionForRecoveryCron("17 17 * * *"), "us-ca");
+  // A primary cron, the Cloudflare */10 poller, and junk are NOT recovery crons.
+  assert.equal(R.regionForRecoveryCron("7 3 * * *"), null);
+  assert.equal(R.regionForRecoveryCron("*/10 * * * *"), null);
+  assert.equal(R.regionForRecoveryCron("99 9 * * *"), null);
+  // 1:1 and total: exactly the three recovery crons, each a distinct region.
+  const mapped = ["47 3 * * *", "17 9 * * *", "17 17 * * *"].map((c) => R.regionForRecoveryCron(c));
+  assert.deepEqual([...new Set(mapped)].sort(), ["europe-au", "india", "us-ca"]);
+});
+
 test("A2. an unknown / legacy cron maps to no region (null), and a non-daily cron throws (fail closed)", () => {
   assert.equal(R.regionForPrimaryCron("0 3 * * *"), null, "the retired :00 boundary cron no longer maps");
   assert.equal(R.regionForPrimaryCron("*/10 * * * *"), null);
@@ -65,24 +78,36 @@ test("A2. an unknown / legacy cron maps to no region (null), and a non-daily cro
   assert.throws(() => R.parseDailyCron("61 3 * * *"), /out of range/);
 });
 
-group("B. cron / IST / UTC documentation agree (single source of truth)");
+group("B. cron / IST / UTC documentation agree (single source of truth; honest recovery model)");
 
-test("B1. each region's primaryCron minute/hour == primaryUtc, and IST == UTC + 5:30; watchdog == primary + 20m", () => {
-  // Check the UTC/IST documentation strings against the crons (the crons drive the actual schedule).
-  return import("../lib/server/sync/campaign-region-routing.js").then(({ REGION_SCHEDULE, REGIONS }) => {
+test("B1. primary/recovery-eligibility/GitHub-recovery times agree with the crons; Cloudflare = ONE global */10 poller", () => {
+  // Check the UTC/IST documentation strings against the crons + the grace/window constants (the crons + constants
+  // drive the actual schedule; REGION_SCHEDULE is display/spec only). Represents Cloudflare's GLOBAL poller cron and
+  // the per-region ELIGIBILITY window separately -- NOT three false per-region watchdog crons.
+  return import("../lib/server/sync/campaign-region-routing.js").then(({ REGION_SCHEDULE, REGIONS, RECOVERY_GRACE_MINUTES, RECOVERY_WINDOW_MINUTES, CLOUDFLARE_RECOVERY_POLLER_CRON }) => {
+    assert.equal(RECOVERY_GRACE_MINUTES, 20);
+    assert.equal(RECOVERY_WINDOW_MINUTES, 180);
+    assert.equal(CLOUDFLARE_RECOVERY_POLLER_CRON, "*/10 * * * *", "Cloudflare is ONE global poller, not per-region crons");
     const toMin = (hhmm) => { const [h, m] = hhmm.split(":").map(Number); return h * 60 + m; };
     for (const region of [REGIONS.INDIA, REGIONS.EUROPE_AU, REGIONS.US_CA]) {
       const s = REGION_SCHEDULE[region];
+      // primary cron <-> primaryUtc; IST = UTC + 5:30.
       const { minute, hour } = R.parseDailyCron(s.primaryCron);
       assert.equal(hour * 60 + minute, toMin(s.primaryUtc), region + " primaryCron matches primaryUtc");
       assert.equal((toMin(s.istPrimary) - toMin(s.primaryUtc) + 1440) % 1440, 330, region + " IST primary = UTC + 5:30");
-      const w = R.parseDailyCron(s.watchdogCron);
-      assert.equal(w.hour * 60 + w.minute, toMin(s.watchdogUtc), region + " watchdogCron matches watchdogUtc");
-      assert.equal((toMin(s.watchdogUtc) - toMin(s.primaryUtc) + 1440) % 1440, 20, region + " watchdog = primary + 20m");
-      assert.equal((toMin(s.istWatchdog) - toMin(s.watchdogUtc) + 1440) % 1440, 330, region + " IST watchdog = UTC + 5:30");
+      // recovery eligibility = primary + grace; window end = primary + window.
+      assert.equal((toMin(s.recoveryEligibleUtc) - toMin(s.primaryUtc) + 1440) % 1440, RECOVERY_GRACE_MINUTES, region + " recovery-eligible = primary + 20m");
+      assert.equal((toMin(s.recoveryWindowEndUtc) - toMin(s.primaryUtc) + 1440) % 1440, RECOVERY_WINDOW_MINUTES, region + " recovery-window-end = primary + 180m");
+      // GitHub recovery cron = primary + 40m, inside the window, IST = UTC + 5:30, maps back to this region.
+      const g = R.parseDailyCron(s.githubRecoveryCron);
+      assert.equal(g.hour * 60 + g.minute, toMin(s.githubRecoveryUtc), region + " githubRecoveryCron matches githubRecoveryUtc");
+      assert.equal((toMin(s.githubRecoveryUtc) - toMin(s.primaryUtc) + 1440) % 1440, 40, region + " GitHub recovery = primary + 40m");
+      assert.ok(toMin(s.githubRecoveryUtc) >= toMin(s.recoveryEligibleUtc) && toMin(s.githubRecoveryUtc) <= toMin(s.recoveryWindowEndUtc), region + " GitHub recovery inside the window");
+      assert.equal((toMin(s.istGithubRecovery) - toMin(s.githubRecoveryUtc) + 1440) % 1440, 330, region + " IST GitHub recovery = UTC + 5:30");
+      assert.equal(R.regionForRecoveryCron(s.githubRecoveryCron), region, region + " recovery cron maps back 1:1");
     }
     passed += 1; // this async test counts its own assertion block
-    out("  ok  B1. cron/IST/UTC documentation agree (single source of truth)");
+    out("  ok  B1. primary/recovery-eligibility/GitHub-recovery times agree; Cloudflare = one global */10 poller");
   });
 });
 
@@ -179,11 +204,16 @@ test("F1. once a RECOVERY dispatch run exists, a later check does NOT dispatch a
   assert.equal(d.reason, "run-exists");
 });
 
-test("F2. a CLOUDFLARE WATCHDOG dispatch run is treated as EXISTING -> GitHub recovery does not double-dispatch", () => {
-  const runs = [dispatchRun("india", "external/india/" + BUSINESS_DATE, "in_progress", null, "2026-09-10T03:27:00Z")];
-  const d = R.decideRecoveryForRegion({ region: "india", now: Date.parse(INDIA_IN_WINDOW), apiOk: true, runs });
-  assert.equal(d.action, "skip");
-  assert.equal(d.reason, "run-exists");
+test("F2. BOTH Cloudflare identities (cloudflare/ prod + external/) are treated as EXISTING -> no double-dispatch", () => {
+  for (const prefix of ["cloudflare", "external"]) {
+    const runs = [dispatchRun("india", prefix + "/india/" + BUSINESS_DATE, "in_progress", null, "2026-09-10T03:27:00Z")];
+    const d = R.decideRecoveryForRegion({ region: "india", now: Date.parse(INDIA_IN_WINDOW), apiOk: true, runs });
+    assert.equal(d.action, "skip", prefix + " must suppress dispatch");
+    assert.equal(d.reason, "run-exists");
+  }
+  // Matching is EXACT run-name equality, never substring: a look-alike dispatch id does NOT suppress.
+  const lookalike = [dispatchRun("india", "cloudflare-x/india/" + BUSINESS_DATE, "in_progress", null, "2026-09-10T03:27:00Z")];
+  assert.equal(R.decideRecoveryForRegion({ region: "india", now: Date.parse(INDIA_IN_WINDOW), apiOk: true, runs: lookalike }).action, "dispatch", "substring must NOT match");
 });
 
 test("F3. runs for a DIFFERENT region or a DIFFERENT business date never match this cycle", () => {
@@ -202,18 +232,21 @@ test("F3. runs for a DIFFERENT region or a DIFFERENT business date never match t
   assert.equal(R.decideRecoveryForRegion({ region: "india", now, apiOk: true, runs: staleSched }).action, "dispatch");
 });
 
-group("G. GitHub + Cloudflare identities converge on ONE durable cycle");
+group("G. GitHub, legacy Cloudflare, new Cloudflare + primary triggers converge on ONE durable cycle");
 
-test("G1. recovery + watchdog dispatch ids both resolve to the SAME durable cycle key = the production freshness key", () => {
+test("G1. GitHub recovery, cloudflare/, external/ and the primary all resolve to the SAME durable region+D-1 cycle = the production freshness key", () => {
   const region = "india";
   const B = BUSINESS_DATE;
   const cycleKey = R.durableCycleKey(region, B);
   assert.equal(cycleKey, "scheduled-fresh/india/" + B);
-  // Both external triggers embed (region, business-date); the dispatched run derives asof=business-date and thus
-  // opkey = scheduled-fresh/<region>/<business-date> regardless of which trigger fired.
-  assert.match(R.recoveryDispatchId(region, B), new RegExp("/" + region + "/" + B + "$"));
-  assert.match(R.watchdogDispatchId(region, B), new RegExp("/" + region + "/" + B + "$"));
-  // Prove it equals the ACTUAL production key function (normal mode), not just our mirror.
+  // Every trigger's dispatch id embeds (region, business-date); the dispatched run derives asof=business-date and
+  // thus opkey = scheduled-fresh/<region>/<business-date> regardless of which trigger fired (dispatch_id is not in
+  // the key). The primary scheduled run derives the same asof from the clock.
+  const ids = [R.recoveryDispatchId(region, B), ...R.watchdogDispatchIds(region, B)];
+  assert.deepEqual(ids, ["recovery/india/" + B, "cloudflare/india/" + B, "external/india/" + B]);
+  for (const id of ids) assert.match(id, new RegExp("/" + region + "/" + B + "$"));
+  // Prove the durable key equals the ACTUAL production key function (normal mode), not just our mirror -- so
+  // GitHub, legacy Cloudflare, new Cloudflare and the primary all converge on the exact production op key.
   assert.equal(freshnessOperationKey({ mode: "normal", bucket: region, requestedAsOf: B }), cycleKey);
 });
 
@@ -225,14 +258,36 @@ test("G2. business date = previous UTC day of the primary instant (matches the r
 
 group("H. workflow permissions + syntax (static)");
 
-test("H1. scheduler-recovery.yml: */10 cron, least-privilege permissions, own concurrency, node script only", () => {
+test("H1. scheduler-recovery.yml: EXACTLY three daily recovery crons (3 jobs/day, not 144), least-privilege, own concurrency", () => {
   assert.match(recoveryYml, /^name:\s*scheduler-recovery/m);
   const crons = [...recoveryYml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(crons, ["*/10 * * * *"], "exactly the every-10-minute recovery cron");
+  assert.deepEqual([...crons].sort(), ["17 17 * * *", "17 9 * * *", "47 3 * * *"].sort(), "exactly three daily recovery crons (one per region)");
+  assert.equal(crons.length, 3, "three recovery jobs/day, not an every-10-minute GitHub schedule");
+  assert.ok(!crons.includes("*/10 * * * *"), "the frequent */10 poller is Cloudflare's job, NOT a GitHub cron");
+  // Each recovery cron maps to exactly one region (via the pure module) -> deterministic 1:1.
+  const mapped = crons.map((c) => R.regionForRecoveryCron(c));
+  assert.deepEqual([...mapped].sort(), ["europe-au", "india", "us-ca"], "each cron maps to one distinct region");
   assert.match(recoveryYml, /permissions:\s*\n\s*#[\s\S]*?contents:\s*read\n\s*actions:\s*write/, "contents:read + actions:write only");
   assert.doesNotMatch(recoveryYml, /packages:|id-token:|deployments:|checks:/, "no extra permission scopes");
   assert.match(recoveryYml, /group:\s*scheduler-recovery\n\s*cancel-in-progress:\s*false/);
   assert.match(recoveryYml, /scheduler-recovery\.mjs/, "runs the recovery entrypoint");
+  // The fired cron is passed through so the script can map it to one region deterministically.
+  assert.match(recoveryYml, /--schedule="\$\{\{ github\.event\.schedule \}\}"/, "passes the fired cron to the script");
+});
+
+test("H1b. manual default is dry-run; scheduled runs are live; a scheduled recovery evaluates exactly ONE region", () => {
+  // Workflow: the workflow_dispatch input defaults to dry-run; the scheduled path resolves to live.
+  assert.match(recoveryYml, /inputs:\s*\n\s*mode:[\s\S]*?default:\s*"dry-run"/, "manual default is dry-run");
+  assert.match(recoveryYml, /options:\s*\n\s*- dry-run\s*\n\s*- live/, "dry-run listed first (default), live opt-in");
+  assert.match(recoveryYml, /github\.event_name == 'workflow_dispatch' && inputs\.mode \|\| 'live'/, "scheduled runs are live");
+  // Entrypoint: absent --mode defaults to dry-run (manual-safe); unknown recovery cron fails closed.
+  assert.match(entrySrc, /args\.get\("mode"\) \|\| "dry-run"/, "entrypoint mode defaults to dry-run");
+  assert.match(entrySrc, /regionForRecoveryCron/, "entrypoint maps the fired cron to one region");
+  assert.match(entrySrc, /unknown recovery cron[\s\S]*?process\.exit\(1\)/, "unknown recovery cron fails closed");
+  // A scheduled recovery (one fired cron) evaluates exactly one region.
+  const one = R.decideRecovery({ now: Date.parse(INDIA_IN_WINDOW), apiOk: true, runs: [], regions: ["india"] });
+  assert.equal(one.length, 1);
+  assert.equal(one[0].region, "india");
 });
 
 test("H2. the recovery workflow performs NO report/paid work (no DataDoe scripts, no npm ci, no DB secrets)", () => {
@@ -272,6 +327,31 @@ test("H4. the entrypoint fails closed, delegates to the pure module, and never l
     if (/console\.(log|error)/.test(line)) {
       assert.ok(!/token|Authorization|Bearer/i.test(line), "no console line may print a credential: " + line.trim());
     }
+  }
+  // The dispatched run is a NORMAL, FULL-scope run (same as a scheduled run) -- never force-latest or bootstrap.
+  assert.match(entrySrc, /refresh_mode:\s*"normal"[\s\S]*?run_scope:\s*"full"/, "recovery dispatches normal + full scope");
+});
+
+test("H5. NO report/token/budget/batching/D-1/publication behavior changed: scheduler-v2's paid pipeline anchors are intact", () => {
+  // The recovery layer is trigger-only. Prove the scheduler-v2 report/publication invariants are byte-present and
+  // unchanged (region+asof durable opkey, D-1 = previous UTC day, per-region token floors, strict-D1 publish, one
+  // Campaign refresh). If any were altered by the trigger edits, these anchors would move.
+  assert.match(schedulerYml, /opkey="scheduled-fresh\/\$region\/\$asof"/, "durable opkey = region + requestedAsOf (unchanged)");
+  assert.match(schedulerYml, /asof="\$\(date -u -d 'yesterday' \+%Y-%m-%d\)"/, "D-1 = previous UTC day (unchanged)");
+  assert.match(schedulerYml, /priority-dashboards-release\.mjs[^\n]*--strict-d1/, "strict-D1 publish (unchanged)");
+  assert.match(schedulerYml, /"india"\)\s*tokenmin=10/, "india token floor (unchanged)");
+  assert.match(schedulerYml, /"europe-au"\)\s*tokenmin=20/, "europe-au token floor (unchanged)");
+  assert.equal((schedulerYml.match(/scheduled-campaign-ads-refresh\.mjs/g) || []).length, 1, "exactly ONE Campaign refresh (unchanged)");
+  // The recovery module + entrypoint never touch a paid/report path in CODE (unambiguous identifiers only -- the
+  // entrypoint legitimately uses GITHUB_TOKEN + fetch, and the module uses ESM `export`, so those are not forbidden).
+  // Strip `//` line comments first: the module's own header HONESTLY says it "never touches DataDoe/DB", and that
+  // self-describing comment must not itself trip the guard.
+  const stripComments = (src) => src.split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n").toLowerCase();
+  const recoveryCode = stripComments(readFileSync(path.join(ROOT, "lib", "server", "sync", "scheduler-recovery.js"), "utf8"));
+  const entryCode = stripComments(entrySrc);
+  for (const forbidden of ["datadoe", "supabase", "postgres", "oli-refresh", "priority-dashboards", "fba-plan-golive", "campaign-ads-refresh"]) {
+    assert.ok(!recoveryCode.includes(forbidden), "recovery module code must not reference paid/report concept: " + forbidden);
+    assert.ok(!entryCode.includes(forbidden), "recovery entrypoint code must not reference paid/report concept: " + forbidden);
   }
 });
 

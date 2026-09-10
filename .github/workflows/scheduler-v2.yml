@@ -10,13 +10,16 @@ run-name: scheduler-v2 ${{ github.event_name == 'workflow_dispatch' && format('{
 # Each cron maps DETERMINISTICALLY to exactly one region (resolved from github.event.schedule, NEVER the wall clock);
 # accounts are discovered + routed every run by trusted stored marketplace evidence, so a newly connected seller
 # auto-joins its region with no config change:
-#   - india     @ 03:07 UTC (08:37 IST): IN accounts.                              Cloudflare watchdog 03:27 UTC.
-#   - europe-au @ 08:37 UTC (14:07 IST): European marketplaces incl GB/UK + AU.    Cloudflare watchdog 08:57 UTC.
-#   - us-ca     @ 16:37 UTC (22:07 IST): US + CA accounts.                          Cloudflare watchdog 16:57 UTC.
+#   - india     @ 03:07 UTC (08:37 IST): IN accounts.                              recovery-eligible 03:27-06:07 UTC.
+#   - europe-au @ 08:37 UTC (14:07 IST): European marketplaces incl GB/UK + AU.    recovery-eligible 08:57-11:37 UTC.
+#   - us-ca     @ 16:37 UTC (22:07 IST): US + CA accounts.                          recovery-eligible 16:57-19:37 UTC.
 #
 # The primary minutes are OFF the congested :00/:30 boundaries (moved 2026-09-10 after a :00-boundary cron was
-# never delivered by GitHub). Two INDEPENDENT recovery backstops re-dispatch a MISSED cron idempotently: the
-# external Cloudflare watchdog (+20 min) and the GitHub-native scheduler-recovery.yml (every 10 min, +20-min grace).
+# never delivered by GitHub). Two INDEPENDENT recovery mechanisms re-dispatch a MISSED cron idempotently, each with
+# a 20-minute grace and a bounded 3-hour per-region window (the "recovery-eligible" range above):
+#   - Cloudflare: ONE global recovery poller (cron */10 UTC), Cloudflare-owned; dispatches cloudflare/<region>/<D-1>.
+#   - GitHub: scheduler-recovery.yml -- a LOW-COST final backstop of 3 crons/day (one per region, primary + 40m);
+#     dispatches recovery/<region>/<D-1>. (Cloudflare does the frequent polling; GitHub is the sparse safety net.)
 # Both dispatch this SAME workflow; a delayed/duplicate trigger is a zero-write no-op (region guard + durable opkey).
 #
 # Each region run: read-only duplicate guard (a delayed/repeated trigger -- e.g. the watchdog -- is a zero-write no-op
@@ -56,7 +59,7 @@ on:
           - normal
           - force-latest
       dispatch_id:
-        description: "External scheduler identity used by the Cloudflare watchdog (external/<region>/<D-1>); ordinary manual runs may keep 'manual'."
+        description: "External recovery identity: the Cloudflare poller dispatches cloudflare/<region>/<D-1> (external/<region>/<D-1> also recognized); the GitHub scheduler-recovery backstop uses recovery/<region>/<D-1>. All converge on the same durable region+D-1 cycle. Ordinary manual runs may keep 'manual'."
         required: false
         default: "manual"
       run_scope:
@@ -71,7 +74,7 @@ on:
 concurrency:
   # One in-flight run PER REGION (regions are independent); a re-dispatch of the same region queues behind its own run.
   # Resolve scheduled crons to the SAME region key used by workflow_dispatch. This prevents a delayed native cron
-  # and its Cloudflare watchdog dispatch from running concurrently under different concurrency groups.
+  # and its Cloudflare/GitHub recovery dispatch from running concurrently under different concurrency groups.
   group: scheduler-v2-${{ github.event_name == 'schedule' && (github.event.schedule == '7 3 * * *' && 'india' || github.event.schedule == '37 8 * * *' && 'europe-au' || github.event.schedule == '37 16 * * *' && 'us-ca' || 'unknown') || inputs.region }}
   cancel-in-progress: false
 
@@ -194,7 +197,7 @@ jobs:
         if: steps.cfg.outputs.scope == 'bootstrap'
         run: node scripts/release/onboarding-dispatch-ack.mjs --region=${{ steps.cfg.outputs.region }} --dispatch-id=${{ inputs.dispatch_id }} --phase=running --run-token=${{ github.run_id }}-${{ github.run_attempt }}
 
-      # Per-REGION whole-workflow duplicate guard. A delayed GitHub cron and the +20min Cloudflare watchdog can both
+      # Per-REGION whole-workflow duplicate guard. A delayed GitHub cron and a +20min-grace recovery dispatch can both
       # dispatch the same region D-1. Before cycle/token/control I/O, prove the exact current region-account x 3-report
       # live identities through the real storage-first frontend payload read-back. Complete => green no-op with ZERO
       # creates/writes/tokens. Incomplete => continue through the unchanged fail-closed pipeline.
@@ -460,7 +463,7 @@ jobs:
   # Listing Health v3 SHADOW ingestion -- runs ONLY after THIS region's FBA inventory job SUCCEEDED, so v3's reuse-only
   # inventory tranche adopts the fresh FBA Plan inventory cache (zero inventory creates). It is NOT a new scheduler
   # owner: it is a dependent job of the SAME per-region workflow run, so it inherits the workflow-level per-region
-  # `concurrency` group -- a delayed native cron and its Cloudflare watchdog re-dispatch resolve to the same region,
+  # `concurrency` group -- a delayed native cron and its Cloudflare/GitHub recovery re-dispatch resolve to the same region,
   # the same shared inventory_asof, and therefore the same operation id + request hashes (a replay is a zero-create,
   # zero-duplicate-snapshot no-op via the durable dedicated cycle). The UI stays OFF (LISTING_HEALTH_V3 unchanged); this
   # job only enables the INGESTION env gate, and only within itself. It creates ONLY Listings + Listings-Raw exports

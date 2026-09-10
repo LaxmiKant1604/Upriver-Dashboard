@@ -8,7 +8,8 @@
 //   C. FBA runs as an ISOLATED, needs-gated job (independent failure boundary) using regional routing;
 //      fba-plan-golive carries no cron (old 0 4 / 0 5 / 30 12 / 30 13 removed); its manual modes are preserved.
 //   D. Returns & Refund Leakage stays manual-only (no cron).
-//   E. the three Cloudflare watchdog crons are the +20-minute twins (20 3 / 50 8 / 50 16), mapped 1:1 to the regions.
+//   E/F. the recovery model: ONE global Cloudflare */10 poller + per-region eligibility (primary+20..primary+180) +
+//        three low-cost GitHub backstop crons (primary+40, one per region) -- NOT three false per-region watchdog crons.
 //
 // 7-bit ASCII, LF, no top-level await, synchronous writeSync progress, dynamic imports after a dummy env.
 
@@ -28,7 +29,7 @@ const WF = path.resolve(ROOT, "..", ".github", "workflows");
 const read = (f) => readFileSync(path.join(WF, f), "utf8");
 const crons = (yml) => (yml.match(/^\s*-\s*cron:\s*"([^"]+)"/gm) || []).map((l) => l.match(/"([^"]+)"/)[1]);
 
-let schedulerYml, fbaYml, campaignYml, returnsYml, regionSched;
+let schedulerYml, fbaYml, campaignYml, returnsYml, regionSched, cloudflarePollerCron;
 // The old 2-bucket + FBA crons AND the retired :00/:30-boundary regional primaries (moved 2026-09-10 to off-boundary
 // minutes to dodge GitHub's dropped scheduled-cron deliveries) must all be gone from scheduler-v2.
 const LEGACY_CRONS = ["0 2 * * *", "30 10 * * *", "0 4 * * *", "0 5 * * *", "30 12 * * *", "30 13 * * *", "0 3 * * *", "30 8 * * *", "30 16 * * *"];
@@ -143,31 +144,43 @@ test("E1. across the report/paid workflows, the ONLY crons are the 3 regional pr
   assert.deepEqual([...total].sort(), ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort(), "only the 3 regional primaries exist in the report/paid workflows");
 });
 
-group("F. Cloudflare watchdog spec = the +20-minute twins mapped 1:1 to the regions");
+group("F. recovery model = ONE global Cloudflare poller + per-region eligibility + 3 daily GitHub backstop crons");
 
-test("F1. REGION_SCHEDULE carries the exact primary + watchdog crons required (off-boundary primaries + 20m twins)", () => {
+test("F1. REGION_SCHEDULE carries the off-boundary primaries + GitHub recovery crons (primary + 40m); NO false per-region watchdog crons", () => {
   assert.equal(regionSched.india.primaryCron, "7 3 * * *");
-  assert.equal(regionSched.india.watchdogCron, "27 3 * * *");
+  assert.equal(regionSched.india.githubRecoveryCron, "47 3 * * *");
   assert.equal(regionSched["europe-au"].primaryCron, "37 8 * * *");
-  assert.equal(regionSched["europe-au"].watchdogCron, "57 8 * * *");
+  assert.equal(regionSched["europe-au"].githubRecoveryCron, "17 9 * * *");
   assert.equal(regionSched["us-ca"].primaryCron, "37 16 * * *");
-  assert.equal(regionSched["us-ca"].watchdogCron, "57 16 * * *");
-});
-
-test("F2. each watchdog cron is EXACTLY its primary + 20 minutes (same hour)", () => {
+  assert.equal(regionSched["us-ca"].githubRecoveryCron, "17 17 * * *");
+  // The dishonest "three per-region Cloudflare watchdog crons" model is GONE.
   for (const region of ["india", "europe-au", "us-ca"]) {
-    const [pm, ph] = regionSched[region].primaryCron.split(" ");
-    const [wm, wh] = regionSched[region].watchdogCron.split(" ");
-    assert.equal(Number(wh), Number(ph), region + " watchdog shares the primary hour");
-    assert.equal(Number(wm), Number(pm) + 20, region + " watchdog = primary + 20 min");
+    assert.equal(regionSched[region].watchdogCron, undefined, region + " has no false per-region watchdog cron");
+    assert.equal(regionSched[region].watchdogUtc, undefined, region + " has no false per-region watchdog time");
   }
 });
 
-test("F3. the GitHub primary crons in scheduler-v2 match REGION_SCHEDULE (single source of truth)", () => {
+test("F2. Cloudflare recovery is ONE global */10 poller (not per-region crons); per-region eligibility = primary+20..primary+180", () => {
+  assert.equal(cloudflarePollerCron, "*/10 * * * *", "one global Cloudflare recovery poller cron");
+  const toMin = (hhmm) => { const [h, m] = hhmm.split(":").map(Number); return h * 60 + m; };
+  for (const region of ["india", "europe-au", "us-ca"]) {
+    const s = regionSched[region];
+    assert.equal((toMin(s.recoveryEligibleUtc) - toMin(s.primaryUtc) + 1440) % 1440, 20, region + " recovery-eligible = primary + 20m");
+    assert.equal((toMin(s.recoveryWindowEndUtc) - toMin(s.primaryUtc) + 1440) % 1440, 180, region + " window end = primary + 180m");
+    // The GitHub backstop cron is 40m after the primary and sits inside the eligibility window.
+    const [gm, gh] = s.githubRecoveryCron.split(" ");
+    assert.equal((Number(gh) * 60 + Number(gm) - toMin(s.primaryUtc) + 1440) % 1440, 40, region + " GitHub recovery cron = primary + 40m");
+  }
+});
+
+test("F3. the GitHub primary crons in scheduler-v2 match REGION_SCHEDULE, and the recovery crons match scheduler-recovery.yml (single source of truth)", () => {
   const c = crons(schedulerYml);
+  const recoveryCrons = crons(read("scheduler-recovery.yml"));
   for (const region of ["india", "europe-au", "us-ca"]) {
     assert.ok(c.includes(regionSched[region].primaryCron), region + " primary cron present in scheduler-v2.yml");
+    assert.ok(recoveryCrons.includes(regionSched[region].githubRecoveryCron), region + " recovery cron present in scheduler-recovery.yml");
   }
+  assert.equal(recoveryCrons.length, 3, "exactly three GitHub recovery crons (3 jobs/day)");
 });
 
 async function main() {
@@ -176,7 +189,9 @@ async function main() {
   fbaYml = read("fba-plan-golive.yml");
   campaignYml = read("campaign-ads-golive.yml");
   returnsYml = read("returns-leakage.yml");
-  regionSched = (await import("../lib/server/sync/campaign-region-routing.js")).REGION_SCHEDULE;
+  const routing = await import("../lib/server/sync/campaign-region-routing.js");
+  regionSched = routing.REGION_SCHEDULE;
+  cloudflarePollerCron = routing.CLOUDFLARE_RECOVERY_POLLER_CRON;
 
   let failures = 0;
   for (const t of tests) {
