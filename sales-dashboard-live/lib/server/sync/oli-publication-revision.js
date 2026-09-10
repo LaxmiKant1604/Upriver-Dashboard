@@ -87,39 +87,58 @@ export function jobIsPromotable(job) {
     && nb(job.snapshotParamsHash);
 }
 
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
 /**
  * EXACT PUBLICATION BINDING (blockers 1/2): prove the CURRENTLY-live report row IS the promotion of the exact,
- * fully-validated report job's shadow -- never trust depends_on alone (an unpromoted newer job left the live stale).
- * PUBLICATION_NOT_REQUIRED is returned ONLY when, for the latest promotable job:
- *   - its durable OLI provenance covers the current revision (else the OLI advanced -> re-derive), AND
- *   - its scheduler-v2/<key> shadow (at the job hash) exists + hydrates, AND
- *   - the live row at the CANONICAL identity (shared publisher contract: liveReportKey + liveParams hash) exists, AND
- *   - the live row is PROVEN EQUAL to that shadow candidate: canonical params_hash, EXACT source_refreshed_at (the
- *     same derivation), live params (reportVersion + contract liveParams), and hydrated payload content.
- * Everything else is STALE with a typed reason (the caller derives + promotes). Never uses updated_at or date equality.
- * Inputs are pre-loaded/hydrated by the reconciler; this function is PURE.
+ * fully-validated report job's shadow, with PUBLISHER-IDENTICAL validation AND the D-1 date gate. Never trust
+ * depends_on alone (an unpromoted newer job left the live stale) and never trust hashes/content alone (an older `to`
+ * is stale even when hashes/content are unchanged). PUBLICATION_NOT_REQUIRED ONLY when, for the latest promotable job:
+ *   - its durable OLI provenance covers the current revision, AND
+ *   - the D-1 candidate covers requestedAsOf (an older `to` -> STALE), AND
+ *   - the scheduler-v2/<key> shadow is publisher-valid: exact report_key + account_id + expected snapshotVersion; the
+ *     shadow hash RECOMPUTED from params.reportVersion+complete params equals BOTH row.params_hash AND
+ *     job.snapshotParamsHash; storage-first payload passes the REAL report payload validator, AND
+ *   - the live row at the CANONICAL identity (shared contract: liveReportKey + recomputed liveParams hash) is proven
+ *     valid by the SHARED publisher readback (liveReadback.ok) -- identity, live version, params-provenance (no
+ *     mutation/extra fields), and payload contract -- AND is PROVEN EQUAL to the shadow candidate (EXACT
+ *     source_refreshed_at + equal hydrated payload).
+ * Everything else is STALE with a typed reason. Never uses updated_at. Inputs are pre-loaded/hydrated + the shared
+ * `liveReadback` result is supplied by the reconciler; this function is PURE. `reportDerivations[reportKey]` supplies
+ * the expected shadow snapshotVersion + the real payload validator.
  */
-export function evaluatePublicationBinding({ revision, accountId, job, shadow, hydratedShadowPayload, live, hydratedLivePayload, contract, computeHash } = {}) {
+export function evaluatePublicationBinding({ revision, accountId, reportKey, requestedAsOf, expectedShadowKey, job, shadow, hydratedShadowPayload, live, hydratedLivePayload, liveReadback, contract, computeHash, reportDerivations } = {}) {
+  const stale = (reason) => ({ state: OLI_PUBLICATION_STATE.STALE, reason });
   if (!revision || revision.eligible !== true) return { state: OLI_PUBLICATION_STATE.DEFERRED_PROVENANCE, reason: (revision && revision.reason) || "not-eligible" };
-  if (!jobIsPromotable(job)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "job-not-promotable" };
-  if (!oliRevisionCoveredByJob(revision, job)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "oli-revision-changed" };
-  if (!contract || typeof contract.liveParams !== "function" || typeof computeHash !== "function") return { state: OLI_PUBLICATION_STATE.STALE, reason: "no-live-contract" };
+  if (!jobIsPromotable(job)) return stale("job-not-promotable");
+  if (!oliRevisionCoveredByJob(revision, job)) return stale("oli-revision-changed");
+  if (!contract || typeof contract.liveParams !== "function" || typeof computeHash !== "function") return stale("no-live-contract");
+  const derivation = reportDerivations && reportDerivations[reportKey];
+  if (!derivation || typeof derivation.validatePayload !== "function") return stale("no-report-derivation");
+  // ---- SHADOW: publisher-identical validation ----
   const shadowParams = shadow && shadow.params && typeof shadow.params === "object" && !Array.isArray(shadow.params) ? shadow.params : null;
-  if (!shadow || !shadowParams) return { state: OLI_PUBLICATION_STATE.STALE, reason: "shadow-missing" };
-  if (S(shadow.params_hash) !== S(job.snapshotParamsHash)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "shadow-hash-mismatch" };
-  if (!nb(shadow.source_refreshed_at)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "shadow-refresh-blank" };
-  if (hydratedShadowPayload == null) return { state: OLI_PUBLICATION_STATE.STALE, reason: "shadow-payload-unavailable" };
+  if (!shadow || !shadowParams) return stale("shadow-missing");
+  if (S(shadow.report_key) !== S(expectedShadowKey)) return stale("shadow-identity-report-key");
+  if (S(shadow.account_id) !== S(accountId)) return stale("shadow-identity-account");
+  if (S(shadowParams.reportVersion) !== S(derivation.snapshotVersion)) return stale("shadow-version");
+  const shadowRecomputed = computeHash(shadowParams.reportVersion, shadowParams);
+  if (S(shadowRecomputed) !== S(shadow.params_hash) || S(shadow.params_hash) !== S(job.snapshotParamsHash)) return stale("shadow-hash-mismatch");
+  if (!nb(shadow.source_refreshed_at)) return stale("shadow-refresh-blank");
+  if (hydratedShadowPayload == null) return stale("shadow-payload-unavailable");
+  if (derivation.validatePayload(hydratedShadowPayload) !== true || (hydratedShadowPayload && hydratedShadowPayload.dataUnavailable === true)) return stale("shadow-payload-invalid");
+  // ---- D-1 DATE GATE (blocker 1): the candidate must cover requestedAsOf even when hashes/content are unchanged ----
   const liveParams = contract.liveParams(shadowParams);
-  if (!liveParams || typeof liveParams !== "object") return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-params-underivable" };
+  if (!liveParams || typeof liveParams !== "object") return stale("live-params-underivable");
+  if (typeof requestedAsOf === "string" && DATE_RE.test(requestedAsOf) && (!nb(liveParams.to) || String(liveParams.to) < requestedAsOf)) return stale("candidate-older-than-requested-asof");
   const candHash = computeHash(contract.liveReportVersion, liveParams);
-  if (!live) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-unpromoted" };
-  if (S(live.report_key) !== S(contract.liveReportKey) || S(live.account_id) !== S(accountId) || S(live.params_hash) !== S(candHash)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-identity-mismatch" };
-  if (S(live.source_refreshed_at) !== S(shadow.source_refreshed_at)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-refresh-differs" }; // the live is a DIFFERENT derivation than this job's shadow
-  const liveParamsObj = live.params && typeof live.params === "object" && !Array.isArray(live.params) ? live.params : null;
-  if (!liveParamsObj || liveParamsObj.reportVersion !== contract.liveReportVersion) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-version" };
-  if (stableJson(contract.liveParams(liveParamsObj)) !== stableJson(liveParams)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-params-differ" };
-  if (hydratedLivePayload == null) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-payload-unavailable" };
-  if (stableJson(hydratedLivePayload) !== stableJson(hydratedShadowPayload)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-payload-differs" };
+  // ---- LIVE: canonical identity + the SHARED publisher readback (identity/version/params-provenance/payload) ----
+  if (!live) return stale("live-unpromoted");
+  if (S(live.report_key) !== S(contract.liveReportKey) || S(live.account_id) !== S(accountId) || S(live.params_hash) !== S(candHash)) return stale("live-identity-mismatch");
+  if (!liveReadback || liveReadback.ok !== true) return stale("live-readback:" + S(liveReadback && liveReadback.reason));
+  // ---- SHADOW <-> LIVE binding equality: the live IS this exact derivation's promotion ----
+  if (S(live.source_refreshed_at) !== S(shadow.source_refreshed_at)) return stale("live-refresh-differs");
+  if (hydratedLivePayload == null) return stale("live-payload-unavailable");
+  if (stableJson(hydratedLivePayload) !== stableJson(hydratedShadowPayload)) return stale("live-payload-differs");
   return { state: OLI_PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED, reason: null };
 }
 

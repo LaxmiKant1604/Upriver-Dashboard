@@ -77,26 +77,41 @@ const goodJob = { deriveStatus: "succeeded", saveStatus: "succeeded", validated:
 ok("jobIsPromotable: succeeded+succeeded+validated+terminal+nonblank-hash", jobIsPromotable(goodJob) === true);
 ok("jobIsPromotable: rejects unvalidated / not-succeeded / running cycle / blank hash", !jobIsPromotable({ ...goodJob, validated: false }) && !jobIsPromotable({ ...goodJob, deriveStatus: "failed" }) && !jobIsPromotable({ ...goodJob, saveStatus: "failed" }) && !jobIsPromotable({ ...goodJob, cycleStatus: "running" }) && !jobIsPromotable({ ...goodJob, snapshotParamsHash: "" }));
 
-// Fake shared publisher contract + hash for the pure binding tests.
+// Fake shared publisher contract + hash + report derivation for the pure binding tests. H = paramsHashFor-shape:
+// hash of (reportVersion + complete params). validatePayload rejects a payload lacking `valid:true` (a real contract).
 const C = { liveReportKey: "daily-reporting", liveReportVersion: "dr-live", liveParams: (p) => ({ to: p.to }) };
 const H = (v, params) => v + "|" + stableJson(params);
-const shadow = { params_hash: "sh1", params: { reportVersion: "dr/shadow", accountId: "A01", to: ASOF }, source_refreshed_at: "2026-09-09T05:00:00Z" };
-const shadowPay = { rows: [{ d: 1 }] };
-const candHash = H(C.liveReportVersion, C.liveParams(shadow.params)); // liveParams uses only {to}
+const RD = { "daily-reporting": { snapshotVersion: "dr/shadow", validatePayload: (p) => !!(p && p.valid === true) } };
+const shadowPay = { valid: true, rows: [{ d: 1 }] };
+const shParams = { reportVersion: "dr/shadow", accountId: "A01", to: ASOF };
+const shadow = { report_key: "scheduler-v2/daily-reporting", account_id: "A01", params_hash: H("dr/shadow", shParams), params: shParams, source_refreshed_at: "2026-09-09T05:00:00Z" };
+const candHash = H(C.liveReportVersion, C.liveParams(shParams));
 const liveMatch = { report_key: "daily-reporting", account_id: "A01", params_hash: candHash, params: { reportVersion: "dr-live", to: ASOF }, source_refreshed_at: "2026-09-09T05:00:00Z" };
-const bind = (over = {}) => evaluatePublicationBinding({ revision: posA, accountId: "A01", job: goodJob, shadow, hydratedShadowPayload: shadowPay, live: liveMatch, hydratedLivePayload: shadowPay, contract: C, computeHash: H, ...over });
+const jobWithShadowHash = { ...goodJob, snapshotParamsHash: shadow.params_hash };
+const bind = (over = {}) => evaluatePublicationBinding({ revision: posA, accountId: "A01", reportKey: "daily-reporting", requestedAsOf: ASOF, expectedShadowKey: "scheduler-v2/daily-reporting", job: jobWithShadowHash, shadow, hydratedShadowPayload: shadowPay, live: liveMatch, hydratedLivePayload: shadowPay, liveReadback: { ok: true }, contract: C, computeHash: H, reportDerivations: RD, ...over });
 
-ok("BINDING: live proven equal to the exact shadow candidate (identity + source_refreshed_at + params + payload) -> PUBLICATION_NOT_REQUIRED", bind().state === OLI_PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED);
-// (blocker 1) valid live at the same as-of + a newer validated job whose shadow was NOT promoted -> the live's
-// source_refreshed_at differs from the job's shadow -> STALE (until that exact candidate is promoted).
-ok("BINDING blocker 1: an UNPROMOTED newer job (live source_refreshed_at differs) -> STALE (never PUBLICATION_NOT_REQUIRED)", (() => { const c = bind({ live: { ...liveMatch, source_refreshed_at: "2026-09-08T00:00:00Z" } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-refresh-differs"; })());
+// (f) valid exact D-1 job/shadow/live -> PUBLICATION_NOT_REQUIRED.
+ok("BINDING (repro f): a valid exact D-1 job/shadow/live -> PUBLICATION_NOT_REQUIRED", bind().state === OLI_PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED);
+// (a) D-1 gate: requestedAsOf=Sep 10, exact bound job/live has to=Sep 9 -> STALE even though hashes/content unchanged.
+ok("BINDING (repro a): requestedAsOf newer than the candidate `to` -> STALE candidate-older-than-requested-asof (D-1 gate)", (() => { const c = bind({ requestedAsOf: "2026-09-10" }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "candidate-older-than-requested-asof"; })());
+// (b) forged stored shadow hash with mutated params -> recomputed hash != stored -> STALE.
+ok("BINDING (repro b): a forged shadow hash with mutated params -> STALE shadow-hash-mismatch", (() => { const c = bind({ shadow: { ...shadow, params: { ...shParams, to: "2026-09-08" } } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "shadow-hash-mismatch"; })());
+// (c) wrong shadow version / account -> STALE.
+ok("BINDING (repro c): wrong shadow report version -> STALE shadow-version", (() => { const c = bind({ shadow: { ...shadow, params: { ...shParams, reportVersion: "wrong" }, params_hash: H("wrong", { ...shParams, reportVersion: "wrong" }) }, job: { ...jobWithShadowHash, snapshotParamsHash: H("wrong", { ...shParams, reportVersion: "wrong" }) } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "shadow-version"; })());
+ok("BINDING (repro c): wrong shadow account -> STALE shadow-identity-account", (() => { const c = bind({ shadow: { ...shadow, account_id: "B99" } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "shadow-identity-account"; })());
+// (d) equal-but-contract-INVALID payload (both shadow+live) -> the real validator rejects -> STALE.
+ok("BINDING (repro d): a contract-invalid shadow payload -> STALE shadow-payload-invalid", (() => { const c = bind({ hydratedShadowPayload: { valid: false, rows: [] }, hydratedLivePayload: { valid: false, rows: [] } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "shadow-payload-invalid"; })());
+// (e) mutated live params under an unchanged stored hash -> the SHARED readback fails params-provenance -> STALE.
+ok("BINDING (repro e): a failing shared live readback (mutated live params) -> STALE live-readback", (() => { const c = bind({ liveReadback: { ok: false, reason: "params-provenance" } }); return c.state === OLI_PUBLICATION_STATE.STALE && /live-readback/.test(c.reason); })());
+// blocker-1 unpromoted newer job (live is a different derivation): source_refreshed_at differs.
+ok("BINDING (blocker 1): an UNPROMOTED newer job (live source_refreshed_at differs) -> STALE live-refresh-differs", (() => { const c = bind({ live: { ...liveMatch, source_refreshed_at: "2026-09-08T00:00:00Z" } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-refresh-differs"; })());
 ok("BINDING: live MISSING (candidate never promoted) -> STALE live-unpromoted", (() => { const c = bind({ live: null, hydratedLivePayload: null }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-unpromoted"; })());
-ok("BINDING: live payload DIFFERS from the shadow candidate -> STALE live-payload-differs", (() => { const c = bind({ hydratedLivePayload: { rows: [{ d: 2 }] } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-payload-differs"; })());
+ok("BINDING: live payload DIFFERS from the shadow candidate -> STALE live-payload-differs", (() => { const c = bind({ hydratedLivePayload: { valid: true, rows: [{ d: 2 }] } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-payload-differs"; })());
 ok("BINDING: live identity mismatch (wrong params_hash) -> STALE live-identity-mismatch", (() => { const c = bind({ live: { ...liveMatch, params_hash: "WRONG" } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-identity-mismatch"; })());
-ok("BINDING: job NOT promotable -> STALE job-not-promotable (no valid candidate)", (() => { const c = bind({ job: { ...goodJob, validated: false } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "job-not-promotable"; })());
-ok("BINDING: durable OLI advanced past the job (depends_on missing a current hash) -> STALE oli-revision-changed", (() => { const c = bind({ job: { ...goodJob, dependsOn: ["h-a", "catalog"] } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "oli-revision-changed"; })());
+ok("BINDING: job NOT promotable -> STALE job-not-promotable", (() => { const c = bind({ job: { ...jobWithShadowHash, validated: false } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "job-not-promotable"; })());
+ok("BINDING: durable OLI advanced past the job (depends_on missing a current hash) -> STALE oli-revision-changed", (() => { const c = bind({ job: { ...jobWithShadowHash, dependsOn: ["h-a", "catalog"] } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "oli-revision-changed"; })());
 ok("BINDING: shadow MISSING -> STALE shadow-missing", (() => { const c = bind({ shadow: null, hydratedShadowPayload: null }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "shadow-missing"; })());
-ok("BINDING: shadow hash != job hash -> STALE shadow-hash-mismatch", (() => { const c = bind({ shadow: { ...shadow, params_hash: "OTHER" } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "shadow-hash-mismatch"; })());
+ok("BINDING: wrong shadow report_key (identity) -> STALE shadow-identity-report-key", (() => { const c = bind({ shadow: { ...shadow, report_key: "scheduler-v2/brand-sales" } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "shadow-identity-report-key"; })());
 ok("BINDING: ineligible revision -> DEFERRED_PROVENANCE", (() => { const c = bind({ revision: missing }); return c.state === OLI_PUBLICATION_STATE.DEFERRED_PROVENANCE; })());
 ok("stableJson is key-order-stable", stableJson({ b: 1, a: [3, { y: 2, x: 1 }] }) === stableJson({ a: [3, { x: 1, y: 2 }], b: 1 }));
 

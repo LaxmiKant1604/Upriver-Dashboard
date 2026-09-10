@@ -13,7 +13,10 @@ const test = (name, fn) => tests.push({ name, fn });
 const REPORTS = ["brand-inventory", "brand-sales", "daily-reporting"];
 const ASOF = "2026-09-09";
 const CONTRACTS = Object.fromEntries(REPORTS.map((rk) => [rk, { liveReportKey: rk, liveReportVersion: rk + "-live", liveParams: (p) => ({ to: p.to }) }]));
+const RD = Object.fromEntries(REPORTS.map((rk) => [rk, { snapshotVersion: rk + "/shadow", validatePayload: (p) => !!(p && p.valid === true) }]));
 const HASH = (v, params) => v + "|" + JSON.stringify(params);
+const shParamsFor = (rk, accountId, to) => ({ reportVersion: rk + "/shadow", accountId, to: to || ASOF });
+const shHashFor = (rk, accountId, to) => HASH(rk + "/shadow", shParamsFor(rk, accountId, to));
 
 // Harness: REAL reconciler core + REAL revision/binding/registry; injected readers/control hooks/release. Per-account
 // publication state is modelled by shadowRefresh (advances when OLI advances) + liveRefresh (set on a successful
@@ -26,8 +29,9 @@ function makeHarness(over = {}) {
   const shadowRefresh = over.shadowRefresh || new Map(); // account -> ISO (job shadow freshness); default below
   const liveRefresh = over.liveRefresh || new Map();     // account -> ISO promoted freshness; absent = not promoted
   const jobPromotable = over.jobPromotable || new Map(); // account -> bool (default true)
-  const shadowPayload = over.shadowPayload || { rows: [] };
+  const shadowPayload = over.shadowPayload || { valid: true, rows: [] };
   const livePayload = over.livePayload || shadowPayload; // mismatch to model content drift
+  const candTo = over.candTo || ASOF; // the shadow/candidate `to` date (older than requestedAsOf models a stale D-1)
   const attempts = new Map();
   const releaseFor = over.releaseFor || (() => ({ ok: true, code: 0 }));
   const shRef = (a) => shadowRefresh.get(a) || "2026-09-09T05:00:00Z";
@@ -41,18 +45,21 @@ function makeHarness(over = {}) {
       if (!hashByAccount.has(accountId)) return null;
       const promo = jobPromotable.has(accountId) ? jobPromotable.get(accountId) : true;
       if (!promo) return { deriveStatus: "failed", saveStatus: "succeeded", validated: false, cycleStatus: "running", snapshotParamsHash: "", dependsOn: [] };
-      return { deriveStatus: "succeeded", saveStatus: "succeeded", validated: true, cycleStatus: "succeeded", snapshotParamsHash: "sh|" + reportKey + "|" + accountId, dependsOn: [...(jobDependsOn ? (jobDependsOn.get(accountId) || []) : (hashByAccount.get(accountId) || [])), "catalog"] };
+      return { deriveStatus: "succeeded", saveStatus: "succeeded", validated: true, cycleStatus: "succeeded", snapshotParamsHash: shHashFor(reportKey, accountId, candTo), dependsOn: [...(jobDependsOn ? (jobDependsOn.get(accountId) || []) : (hashByAccount.get(accountId) || [])), "catalog"] };
     },
-    readShadowSnapshot: async ({ reportKey, accountId, paramsHash }) => { const rk = reportKey.replace("scheduler-v2/", ""); if (!hashByAccount.has(accountId)) return null; return { params_hash: paramsHash, params: { reportVersion: rk + "/shadow", accountId, to: ASOF }, payload: shadowPayload, payload_storage_path: null, source_refreshed_at: shRef(accountId) }; },
-    readLiveSnapshot: async ({ reportKey, accountId, paramsHash }) => { if (!liveRefresh.has(accountId)) return null; return { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params: { reportVersion: CONTRACTS[reportKey].liveReportVersion, to: ASOF }, payload: livePayload, payload_storage_path: null, source_refreshed_at: liveRefresh.get(accountId) }; },
+    readShadowSnapshot: async ({ reportKey, accountId, paramsHash }) => { const rk = reportKey.replace("scheduler-v2/", ""); if (!hashByAccount.has(accountId)) return null; return { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params: shParamsFor(rk, accountId, candTo), payload: shadowPayload, payload_storage_path: null, source_refreshed_at: shRef(accountId) }; },
+    readLiveSnapshot: async ({ reportKey, accountId, paramsHash }) => { if (!liveRefresh.has(accountId)) return null; return { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params: { reportVersion: CONTRACTS[reportKey].liveReportVersion, to: candTo }, payload: livePayload, payload_storage_path: null, source_refreshed_at: liveRefresh.get(accountId) }; },
     loadStoragePayload: async () => null,
+    verifyLiveReadback: over.verifyLiveReadback || (async ({ accountId }) => ({ ok: liveRefresh.has(accountId) })),
     liveContracts: CONTRACTS,
     computeHash: HASH,
-    runReleaseForAccount: async ({ accountId, revisionId }) => { calls.release.push(accountId); calls.releaseRevisions.push({ accountId, revisionId }); const n = (attempts.get(accountId) || 0) + 1; attempts.set(accountId, n); const r = releaseFor(accountId, n, revisionId); if (r.ok) liveRefresh.set(accountId, shRef(accountId)); return r; },
+    reportDerivations: RD,
+    runReleaseForAccount: ({ accountId, revisionId }) => { calls.release.push(accountId); calls.releaseRevisions.push({ accountId, revisionId }); if (over.runReleaseNever) return new Promise(() => {}); const n = (attempts.get(accountId) || 0) + 1; attempts.set(accountId, n); const r = releaseFor(accountId, n, revisionId); if (r.ok) liveRefresh.set(accountId, shRef(accountId)); return Promise.resolve(r); },
     rebuildBrandViewMembership: async ({ accountIds }) => { calls.membership.push([...accountIds]); return over.membership || { ok: true, rebuilt: false, readbackVerified: false, mode: "self_heal_pending" }; },
     openControls: over.openControls || (async (ids) => { calls.openControls.push([...ids]); return { ok: true }; }),
     closeControls: over.closeControls || (async () => { calls.closeControls.push(1); return { ok: true }; }),
     outOfTime: over.outOfTime || (() => { calls.outOfTime += 1; return false; }),
+    deadlineRace: over.deadlineRace || ((p) => p),
     reportKeys: REPORTS,
     log: () => {},
   });
@@ -215,6 +222,26 @@ test("fail-closed: an unreadable zero-row proof read defers the whole run (zero 
   ok("fail closed (ok:false), DURABLE_OLI_UNREADABLE, zero release/control", out.ok === false && /DURABLE_OLI_UNREADABLE/.test(out.code) && h.calls.release.length === 0 && h.calls.openControls.length === 0);
 });
 
+// blocker 3: ready=false with a MIXED (retryable + unknown/integrity) blocker set -> hard FAILED, not deferred.
+test("blocker 3: a MIXED ready=false blocker set (retryable + unknown) -> hard FAILED_DERIVE (never deferred)", async () => {
+  const h = makeHarness({ releaseFor: () => ({ ok: false, code: 1, stage: "derive:india", blockerCodes: ["order-line-items:coverage-incomplete", "x:unknown-code"] }) });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("mixed/unknown blockers -> FAILED_DERIVE, ok:false", stateOf(out, "A01", "daily-reporting") === OLI_RECONCILE_STATUS.FAILED_DERIVE && out.ok === false);
+});
+test("blocker 3: an ALL-retryable ready=false blocker set -> DEFERRED_DEPENDENCY, ok:true", async () => {
+  const h = makeHarness({ releaseFor: () => ({ ok: false, code: 1, stage: "derive:india", blockerCodes: ["order-line-items:coverage-incomplete", "ads-campaign-date:ads-coverage-incomplete"] }) });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("all-retryable blockers -> DEFERRED_DEPENDENCY, ok:true", stateOf(out, "A01", "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && out.ok === true);
+});
+
+// blocker 5: a never-resolving in-flight account (deadlineRace sentinel) -> deferred + safe-close STILL runs.
+test("blocker 5: the deadline bounds an IN-FLIGHT never-resolving account -> deferred; safe-close still runs; ok:true", async () => {
+  const h = makeHarness({ accounts: [{ accountId: "A01" }], hashByAccount: new Map([["A01", ["h1"]]]),
+    runReleaseNever: true, deadlineRace: (p) => Promise.race([p, Promise.resolve({ __deadline: true })]) });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("A01 deferred (deadline-in-flight); safe-close ran; ok:true", stateOf(out, "A01", "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && rep(out, "A01")["daily-reporting"].reason === "deadline-in-flight" && h.calls.closeControls.length === 1 && out.ok === true);
+});
+
 test("item 23: the dashboard API reads the promoted canonical snapshot (bare report_key + account_id + params_hash)", () => {
   const api = readFileSync(new URL("../api/datadoe.js", import.meta.url), "utf8");
   const store = readFileSync(new URL("../lib/server/report-store.js", import.meta.url), "utf8");
@@ -237,6 +264,9 @@ test("entrypoint: reviewed priority-partial namespace + capability preflight; ty
   ok("apply + safe-close detect COMMIT_UNKNOWN (code 3) (blocker 4)", (mjs.match(/COMMIT_UNKNOWN \(code 3\)/g) || []).length >= 2 && /commitUnknown: true/.test(mjs));
   ok("runReleaseForAccount threads typed status/leaseLost/reason (blocker 3)", /status: result\.status/.test(mjs) && /leaseLost: result\.leaseLost === true/.test(mjs) && /reason: result\.reason/.test(mjs));
   ok("cooperative deadline (--deadline-seconds -> outOfTime) + --cleanup reclaim path (blocker 5)", /deadline-seconds/.test(mjs) && /const outOfTime = \(\)/.test(mjs) && /--cleanup/.test(mjs) && /mode: "reclaim"/.test(mjs));
+  ok("EVIDENCE-BASED closure (blocker 4): safe-close READS the real control plane and requires it PROVEN closed (never trusts committed / lease-not-owner)", /async function readControlPlaneClosed\(\)/.test(mjs) && /CONTROLLED_REPORT_KEYS/.test(mjs) && /const state = await readControlPlaneClosed\(\)/.test(mjs) && /if \(!state\.closed\) return \{ ok: false/.test(mjs));
+  ok("safe-close COMMIT_UNKNOWN does ONLY read-only reconciliation (no reclaim/rollback before the read)", /safe-close COMMIT_UNKNOWN \(code 3\) -- read-only reconciliation required/.test(mjs));
+  ok("--cleanup INSPECTS first, reclaims only a free/expired plane, then INSPECTS again and proves closed (blocker 5)", /const before = await readControlPlaneClosed\(\)/.test(mjs) && /const after = await readControlPlaneClosed\(\)/.test(mjs) && /OLI_RECONCILE_CLEANUP_COMMIT_UNKNOWN/.test(mjs));
   ok("the no-export adapter makes create/poll/download throw", /makeInnerAdapter: makeNoExportInnerAdapter/.test(mjs) && (mjs.match(/OLI_RECONCILER_NO_EXPORT/g) || []).length >= 3 && !/createExport\(/.test(mjs));
 });
 

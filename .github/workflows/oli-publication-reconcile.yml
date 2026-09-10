@@ -64,6 +64,10 @@ jobs:
     runs-on: ubuntu-latest
     # ONE job for all regions (one checkout + one npm ci). 25 < 30-minute tick; the per-region `timeout` caps each.
     timeout-minutes: 25
+    outputs:
+      asof: ${{ steps.reconcile.outputs.asof }}
+      only: ${{ steps.reconcile.outputs.only }}
+      mode: ${{ steps.reconcile.outputs.mode }}
     defaults:
       run:
         working-directory: sales-dashboard-live
@@ -106,19 +110,48 @@ jobs:
           for REGION in india europe-au us-ca; do
             if [ -n "$ONLY" ] && [ "$ONLY" != "$REGION" ]; then echo "skip $REGION (dispatch restricted to $ONLY)"; continue; fi
             echo "::group::oli-reconcile $REGION mode=$MODE as-of=$ASOF"
-            # --deadline-seconds=330 makes the reconciler stop publishing NEW accounts + safe-close BEFORE the 420s hard
-            # kill (cooperative cleanup reserve). The always() step below reclaims controls if a region was still killed.
+            # --deadline-seconds=330 makes the reconciler stop new accounts + bound the in-flight one + safe-close BEFORE
+            # the 420s hard kill (cooperative reserve). The SEPARATE always() cleanup job below reclaims + proves the
+            # control plane closed if a region was still hard-killed (a step here would be killed with the job).
             timeout 420 node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=330 $LIVE || { echo "region $REGION reconcile exited nonzero (isolated; continuing)"; rc=1; }
             echo "::endgroup::"
           done
           exit $rc
-      # ABNORMAL-TERMINATION CLEANUP (blocker 5): ALWAYS reclaim + safe-close any controls a killed/timed-out region left
-      # open (the reviewed reclaim mode: acquire-if-free -> safe-close; a live owner blocks it). The workflow is NON-GREEN
-      # if any region's cleanup cannot be verified, so an unresolved open control plane can never be reported as success.
-      - name: Verify controls closed (reclaim any left open by an abnormal termination)
-        if: always() && steps.reconcile.outputs.mode == 'live'
+
+  # ABNORMAL-TERMINATION CLEANUP (blocker 5): a SEPARATE job (`needs: reconcile`, `if: always()`) so it survives the
+  # reconcile job's timeout / cancellation -- a same-job step would be killed with it. It PROVES (read-only) each live
+  # region's priority control plane is closed and RECLAIMS only a free/expired plane (a live owner is left untouched).
+  # The job -- and therefore the workflow -- is NON-GREEN when any region's control plane cannot be proven closed, so an
+  # unresolved open control plane can never be reported as success. Exact owner/generation fencing is preserved (the
+  # reclaim acquires its own generation only on a free/expired lease).
+  cleanup:
+    needs: reconcile
+    # Gate on the LIVE decision RECOMPUTED here (not reconcile's outputs), so cleanup still runs if the reconcile job was
+    # hard-cancelled (its outputs would not propagate). always() -> runs after reconcile regardless of its outcome.
+    if: always() && (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'live' || vars.OLI_RECONCILE_LIVE == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify each live region's control plane is proven closed (reclaim only a free/expired plane)
         run: |
-          ASOF='${{ steps.reconcile.outputs.asof }}'; ONLY='${{ steps.reconcile.outputs.only }}'
+          ASOF='${{ needs.reconcile.outputs.asof }}'; ONLY='${{ needs.reconcile.outputs.only }}'
+          if [ -z "$ASOF" ]; then ASOF="$(date -u -d 'yesterday' +%F)"; fi
           rc=0
           for REGION in india europe-au us-ca; do
             if [ -n "$ONLY" ] && [ "$ONLY" != "$REGION" ]; then continue; fi
@@ -126,5 +159,5 @@ jobs:
             node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --cleanup || { echo "region $REGION control cleanup UNVERIFIED"; rc=1; }
             echo "::endgroup::"
           done
-          if [ "$rc" != "0" ]; then echo "STOP OLI_RECONCILE_CLEANUP_UNVERIFIED: one or more regions' control plane could not be verified closed."; fi
+          if [ "$rc" != "0" ]; then echo "STOP OLI_RECONCILE_CLEANUP_UNVERIFIED: one or more regions' control plane could not be proven closed."; fi
           exit $rc

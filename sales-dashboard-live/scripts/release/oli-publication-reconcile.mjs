@@ -62,7 +62,27 @@ const { runPriorityDashboardsRelease, buildLiveReadback } = await import("../../
 const { readPartialCycleCapability } = await import("../../lib/server/sync/priority-partial-capability.js");
 const { runControlPackageCli } = await import("../../lib/server/sync/source-priority-control-package.js");
 const { connectPriorityControlStore } = await import("../../lib/server/sync/priority-control-pg-store.js");
+const { CONTROLLED_REPORT_KEYS } = await import("../../lib/server/sync/report-controls.js");
 const sb = await import("../../lib/server/supabase.js");
+
+// READ-ONLY control-plane state reconciliation (blocker 4): PROVE the priority publication controls are closed --
+// rollout disabled, controlled dispatch paused, promoted disabled, approvals revoked -- from the actual rows, never
+// from a rollback disposition or a lease-not-owner skip. { read, closed, detail }. Connects + always ends its client.
+async function readControlPlaneClosed() {
+  let store = null;
+  try {
+    store = await connectPriorityControlStore();
+    const [rollout, dispatch, promoted, approvals] = await Promise.all([store.rolloutRows(), store.dispatchRows(), store.promotedRows(), store.approvalRows()]);
+    const controlled = new Set(CONTROLLED_REPORT_KEYS);
+    const enabledRollout = (rollout || []).filter((r) => r.enabled === true).length;
+    const enabledDispatch = (dispatch || []).filter((r) => r.schedule_enabled === true && controlled.has(String(r.report_key))).length;
+    const enabledPromoted = (promoted || []).filter((r) => r.publish_enabled === true).length;
+    const approved = (approvals || []).filter((r) => r.approved === true).length;
+    const detail = { enabledRollout, enabledDispatch, enabledPromoted, approved };
+    return { read: "ok", closed: enabledRollout + enabledDispatch + enabledPromoted + approved === 0, detail };
+  } catch (e) { return { read: "read-failed", closed: false, error: e && e.message ? e.message : String(e) }; }
+  finally { if (store && typeof store.end === "function") { try { await store.end(); } catch { /* ignore */ } } }
+}
 
 const OLI = "order-line-items";
 const oliStart = sourceRegistryEntry(OLI).initialBackfill.start;
@@ -164,11 +184,14 @@ async function closeControls() {
   try {
     const r = await runControlPackageCli({ mode: "rollback", operator: OPERATOR, connectStore: connectPriorityControlStore, ownerToken: fence.ownerToken, ownerGeneration: fence.generation, operationKey: CONTROL_OP_KEY, log: (m) => console.log("oli-reconcile safe-close: " + m) });
     leaseFence = null;
-    if (r && r.skipped === "lease-not-owner") return { ok: true }; // a superseded/lost lease is a correct no-op close
-    // SAFE-CLOSE COMMIT_UNKNOWN (code 3, blocker 4): the close commit ack was lost -> controls may still be open ->
-    // control-cleanup-unresolved (never claim closed). No rollback/retry.
-    if (r && Number(r.code) === 3) return { ok: false, commitUnknown: true, reason: "safe-close COMMIT_UNKNOWN (code 3) -- controls may still be open; read-only reconciliation required" };
-    if (!r || r.committed !== true) return { ok: false, reason: "safe-close did not commit (code " + (r && r.code) + ")" };
+    // SAFE-CLOSE COMMIT_UNKNOWN (code 3, blocker 4): the close commit ack was lost -> ONLY read-only reconciliation is
+    // permitted here (no reclaim/rollback until a read establishes the state). Report control-cleanup-unresolved.
+    if (r && Number(r.code) === 3) return { ok: false, commitUnknown: true, reason: "safe-close COMMIT_UNKNOWN (code 3) -- read-only reconciliation required" };
+    // EVIDENCE-BASED (blocker 4): NEVER trust `committed` or a lease-not-owner skip as proof controls are closed. READ
+    // the control-plane state and require it PROVEN closed (rollout/dispatch/promoted/approvals all closed).
+    const state = await readControlPlaneClosed();
+    if (state.read !== "ok") return { ok: false, reason: "control state UNREADABLE after safe-close (" + String(state.error) + ") -- cleanup unverified" };
+    if (!state.closed) return { ok: false, reason: "controls NOT proven closed after safe-close " + JSON.stringify(state.detail) };
     return { ok: true };
   } catch (e) { leaseFence = null; return { ok: false, reason: "safe-close-error:" + (e && e.message ? e.message : e) }; }
 }
@@ -190,9 +213,9 @@ async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revis
     makeInnerAdapter: makeNoExportInnerAdapter, fetchAccounts: fetchOne, cycleBucket,
   });
   const result = await runPriorityDashboardsRelease({ release, reconcile, readbackLive, assertNoCron, bucket: b, strictD1: true, verifyLease, log: () => {} });
-  // Preserve the runner's TYPED classification fields (status, leaseLost, stage, reason) so the reconciler classifies
-  // retryable-vs-integrity WITHOUT text matching (blocker 3).
-  return { code: result.code, ok: result.ok, stage: result.stage, status: result.status || null, leaseLost: result.leaseLost === true, reason: result.reason || null, problems: result.problems || [] };
+  // Preserve the runner's TYPED classification fields (status, leaseLost, stage, reason, blockerCodes) so the reconciler
+  // classifies retryable-vs-integrity WITHOUT text matching (blocker 3).
+  return { code: result.code, ok: result.ok, stage: result.stage, status: result.status || null, leaseLost: result.leaseLost === true, reason: result.reason || null, blockerCodes: result.blockerCodes || [], problems: result.problems || [] };
 }
 
 // Brand View membership: the directory self-heals from the promoted bare brand-sales at read time
@@ -223,6 +246,14 @@ async function bucketAccounts(b) {
 const deadlineSec = Number(argOf("deadline-seconds")) || 0;
 const runStartMs = Date.now();
 const outOfTime = () => deadlineSec > 0 && (Date.now() - runStartMs) / 1000 > deadlineSec;
+// Bound the IN-FLIGHT account operation: race the release against the remaining budget so a never-resolving account
+// cannot hang past the reserve (it resolves the DEADLINE_HIT sentinel; the reconciler then defers it + safe-closes).
+const deadlineRace = (p) => {
+  if (deadlineSec <= 0) return p;
+  const remainingMs = Math.max(0, deadlineSec * 1000 - (Date.now() - runStartMs));
+  let t; const timer = new Promise((resolve) => { t = setTimeout(() => resolve({ __deadline: true }), remainingMs); if (t && typeof t.unref === "function") t.unref(); });
+  return Promise.race([Promise.resolve(p).then((v) => { clearTimeout(t); return v; }), timer]);
+};
 
 const reconciler = buildOliPublicationReconciler({
   resolveOrg: async () => ({ organizationFingerprint: orgFp, connectionId: "primary" }),
@@ -234,31 +265,39 @@ const reconciler = buildOliPublicationReconciler({
   readShadowSnapshot: (args) => sb.getReportSnapshot(args),
   readLiveSnapshot: (args) => sb.getReportSnapshot(args),
   loadStoragePayload: (path) => sb.getReportSnapshotStoragePayload(path),
+  verifyLiveReadback: readbackLive, // the SHARED buildLiveReadback (publisher-grade live validation)
   liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS,
   computeHash: paramsHashFor,
+  reportDerivations: REPORT_DERIVATIONS,
   runReleaseForAccount,
   rebuildBrandViewMembership,
   openControls: dryRun ? (async () => ({ ok: true })) : openControls,
   closeControls: dryRun ? (async () => ({ ok: true })) : closeControls,
-  outOfTime,
+  outOfTime, deadlineRace,
   reportKeys: oliDependentLiveReportKeys(),
   withTimeout,
   log: (m) => console.log("oli-reconcile: " + m),
 });
 
-// ABNORMAL-TERMINATION CLEANUP (blocker 5): a distinct invocation the periodic workflow runs (always(), after the main
-// reconcile) to SAFE-CLOSE any priority controls a killed/timed-out reconcile left open. Uses the reviewed reclaim mode:
-// it acquires-if-free (a killed process's lease expires by TTL, or was already released -> nothing to reclaim) then
-// safe-closes; a LIVE owner blocks it (never interfering with a running reconcile). Exit 0 when cleanup is verified
-// (committed OR a correct not-owner/held skip); nonzero when cleanup could NOT be verified (workflow non-green).
+// ABNORMAL-TERMINATION CLEANUP (blockers 4/5): a distinct invocation the periodic cleanup JOB runs (always(), needs:
+// reconcile) to prove the priority control plane is closed after a killed/timed-out reconcile. EVIDENCE-BASED protocol:
+//   1. INSPECT (read-only) -- already proven closed? -> cleaned, exit 0 (never touch a plane, never reclaim needlessly).
+//   2. Otherwise attempt the reviewed RECLAIM (acquire ONLY a free/EXPIRED lease -> safe-close). A LIVE/unexpired owner
+//      BLOCKS reclaim (zero writes) -- the plane is left UNTOUCHED.
+//   3. RE-INSPECT (read-only) + require PROVEN closed. A live owner (still open) or a COMMIT_UNKNOWN -> UNVERIFIED,
+//      non-green -- never reported as "cleaned".
 if (process.argv.includes("--cleanup")) {
-  try {
-    const r = await runControlPackageCli({ mode: "reclaim", operator: OPERATOR, connectStore: connectPriorityControlStore, ownerToken: OPERATOR, operationKey: CONTROL_OP_KEY, log: (m) => console.log("oli-reconcile cleanup: " + m) });
-    if (r && Number(r.code) === 3) { console.error("STOP OLI_RECONCILE_CLEANUP_COMMIT_UNKNOWN -- controls may still be open; read-only reconciliation required."); process.exit(1); }
-    const cleaned = !!(r && (r.committed === true || r.skipped === "lease-not-owner" || r.skipped === "lease-held" || r.reclaimNoop === true));
-    console.log("RESULT " + JSON.stringify({ mode: "cleanup", bucket, requestedAsOf: asOf, cleaned, disposition: r && (r.skipped || (r.committed ? "committed" : "noncommit")) }));
-    process.exit(cleaned ? 0 : 1);
-  } catch (e) { console.error("STOP OLI_RECONCILE_CLEANUP_UNVERIFIED: " + (e && e.message ? e.message : e)); process.exit(1); }
+  const before = await readControlPlaneClosed();
+  if (before.read === "ok" && before.closed === true) { console.log("RESULT " + JSON.stringify({ mode: "cleanup", bucket, requestedAsOf: asOf, cleaned: true, disposition: "already-closed" })); process.exit(0); }
+  let reclaim = null;
+  try { reclaim = await runControlPackageCli({ mode: "reclaim", operator: OPERATOR, connectStore: connectPriorityControlStore, ownerToken: OPERATOR, operationKey: CONTROL_OP_KEY, log: (m) => console.log("oli-reconcile cleanup: " + m) }); }
+  catch (e) { reclaim = { committed: false, code: 1, error: e && e.message ? e.message : String(e) }; } // CONTROL_LEASE_HELD (a live/unexpired owner) -> untouched
+  if (reclaim && Number(reclaim.code) === 3) { console.error("STOP OLI_RECONCILE_CLEANUP_COMMIT_UNKNOWN -- read-only reconciliation required; controls NOT proven closed."); process.exit(1); }
+  const after = await readControlPlaneClosed();
+  const cleaned = after.read === "ok" && after.closed === true;
+  console.log("RESULT " + JSON.stringify({ mode: "cleanup", bucket, requestedAsOf: asOf, cleaned, reclaim: reclaim && (reclaim.skipped || (reclaim.committed ? "committed" : "refused-or-held")), before: before.detail || before.read, after: after.detail || after.read }));
+  if (!cleaned) console.error("STOP OLI_RECONCILE_CLEANUP_UNVERIFIED: controls NOT proven closed (a live owner is left untouched; retry after the lease expires).");
+  process.exit(cleaned ? 0 : 1);
 }
 
 if (!dryRun) {

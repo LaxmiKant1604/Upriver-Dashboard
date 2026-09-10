@@ -24,10 +24,14 @@ ok("DEFAULT is dry-run: --live only on a manual live dispatch OR when vars.OLI_R
 ok("periodic mode + as-of is a conservative D-1 (yesterday UTC)", /--mode=periodic\b/.test(wf) && /date -u -d 'yesterday' \+%F/.test(wf));
 ok("it installs deps (real report work) but references NO DataDoe export/token symbol (zero export)", /npm ci/.test(wf) && !/createExport|reserveTokens|exportsCreate|--force-latest/.test(wf));
 ok("it verifies required secrets fail-closed and never prints them", /missing required secret/.test(wf) && /POSTGRES_URL SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY/.test(wf));
-// blocker 5: cooperative deadline (reserve cleanup time within the 420s cap) + an ALWAYS cleanup step that reclaims any
+// blocker 5: cooperative deadline (reserve cleanup time within the 420s cap) so the in-flight account is bounded and the
+// safe-close runs BEFORE the hard kill; PLUS a SEPARATE cleanup JOB (needs: reconcile, if: always()) that survives the
+// reconcile job's own timeout/cancellation (a same-job step would be killed with it) and reclaims + proves closed any
 // controls a killed/timed-out region left open, making the run NON-GREEN when cleanup can't be verified.
-ok("(blocker 5) the reconcile passes --deadline-seconds (below the 420s hard cap) so safe-close runs before a kill", /--deadline-seconds=330/.test(wf) && /timeout 420 node/.test(wf));
-ok("(blocker 5) an ALWAYS cleanup step reclaims controls left open by an abnormal termination", /if: always\(\) && steps\.reconcile\.outputs\.mode == 'live'/.test(wf) && /--cleanup\b/.test(wf) && /reclaim/.test(wf.toLowerCase()));
+ok("(blocker 5) the reconcile passes --deadline-seconds (below the 420s hard cap) so the in-flight op is bounded + safe-close runs before a kill", /--deadline-seconds=330/.test(wf) && /timeout 420 node/.test(wf));
+ok("(blocker 5) the reconcile job exposes asof/only/mode outputs the cleanup job consumes", /outputs:[\s\S]{0,120}asof: \$\{\{ steps\.reconcile\.outputs\.asof \}\}[\s\S]{0,120}mode: \$\{\{ steps\.reconcile\.outputs\.mode \}\}/.test(wf));
+ok("(blocker 5) a SEPARATE cleanup JOB (needs: reconcile, if: always()) survives the reconcile job's timeout/cancellation", /\n  cleanup:\n/.test(wf) && /needs: reconcile\b/.test(wf) && /if: always\(\) && \(github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.mode == 'live' \|\| vars\.OLI_RECONCILE_LIVE == 'true'\)/.test(wf));
+ok("(blocker 5) the cleanup job reclaims controls left open by an abnormal termination (per region, --cleanup)", /--mode=periodic --cleanup\b/.test(wf) && /reclaim/.test(wf.toLowerCase()));
 ok("(blocker 5) the workflow is NON-GREEN when a region's control cleanup cannot be verified", /OLI_RECONCILE_CLEANUP_UNVERIFIED/.test(wf) && /exit \$rc/.test(wf));
 
 // ---- scheduler-v2.yml immediate post-save reconcile step (WORK 6 + blocker 2) ----

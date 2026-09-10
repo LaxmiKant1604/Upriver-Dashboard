@@ -9,6 +9,7 @@ import { writeSync } from "node:fs";
 import { readPartialCycleCapability, PARTIAL_CYCLE_CAPABILITY_PATTERN } from "../lib/server/sync/priority-partial-capability.js";
 import { runControlPackageCli } from "../lib/server/sync/source-priority-control-package.js";
 import { buildOliPublicationReconciler, OLI_RECONCILE_STATUS } from "../lib/server/sync/oli-publication-reconciler.js";
+import * as releaseRunner from "../lib/server/sync/source-priority-release-runner.js";
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -17,7 +18,11 @@ const test = (name, fn) => tests.push({ name, fn });
 const ASOF = "2026-09-09";
 const REPORTS = ["brand-inventory", "brand-sales", "daily-reporting"];
 const CONTRACTS = Object.fromEntries(REPORTS.map((rk) => [rk, { liveReportKey: rk, liveReportVersion: rk + "-live", liveParams: (p) => ({ to: p.to }) }]));
+const RD = Object.fromEntries(REPORTS.map((rk) => [rk, { snapshotVersion: rk + "/shadow", validatePayload: (p) => !!(p && p.valid === true) }]));
 const HASH = (v, params) => v + "|" + JSON.stringify(params);
+const shParamsFor = (rk, a) => ({ reportVersion: rk + "/shadow", accountId: a, to: ASOF });
+const shHashFor = (rk, a) => HASH(rk + "/shadow", shParamsFor(rk, a));
+const PAY = { valid: true, rows: [] };
 
 // The no-export inner adapter used by the real reconciler entrypoint -- proves the DataDoe transport is unreachable.
 const noExportAdapter = () => ({ create: async () => { throw new Error("OLI_RECONCILER_NO_EXPORT create"); }, poll: async () => { throw new Error("OLI_RECONCILER_NO_EXPORT poll"); }, download: async () => { throw new Error("OLI_RECONCILER_NO_EXPORT download"); } });
@@ -73,11 +78,13 @@ function buildProdShapeReconciler(over = {}) {
     oliStart: "2025-01-01",
     readPositiveHistory: async () => [{ account_id: "A01", source_request_hash: "h1" }],
     readZeroRowProof: async () => ({ read: "ok", byAccount: new Map() }),
-    readLatestReportJob: async () => ({ deriveStatus: "succeeded", saveStatus: "succeeded", validated: true, cycleStatus: "succeeded", snapshotParamsHash: "sh1", dependsOn: ["h1", "catalog"] }),
-    readShadowSnapshot: async ({ paramsHash }) => ({ params_hash: paramsHash, params: { reportVersion: "shadow", accountId: "A01", to: ASOF }, payload: { rows: [] }, payload_storage_path: null, source_refreshed_at: shadowRefresh.get("A01") }),
-    readLiveSnapshot: async ({ reportKey, accountId, paramsHash }) => (liveRefresh.has("A01") ? { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params: { reportVersion: CONTRACTS[reportKey].liveReportVersion, to: ASOF }, payload: { rows: [] }, payload_storage_path: null, source_refreshed_at: liveRefresh.get("A01") } : null),
+    readLatestReportJob: async ({ reportKey }) => ({ deriveStatus: "succeeded", saveStatus: "succeeded", validated: true, cycleStatus: "succeeded", snapshotParamsHash: shHashFor(reportKey, "A01"), dependsOn: ["h1", "catalog"] }),
+    readShadowSnapshot: async ({ reportKey, accountId, paramsHash }) => { const rk = reportKey.replace("scheduler-v2/", ""); return { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params: shParamsFor(rk, accountId), payload: PAY, payload_storage_path: null, source_refreshed_at: shadowRefresh.get("A01") }; },
+    readLiveSnapshot: async ({ reportKey, accountId, paramsHash }) => (liveRefresh.has("A01") ? { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params: { reportVersion: CONTRACTS[reportKey].liveReportVersion, to: ASOF }, payload: PAY, payload_storage_path: null, source_refreshed_at: liveRefresh.get("A01") } : null),
     loadStoragePayload: async () => null,
-    liveContracts: CONTRACTS, computeHash: HASH,
+    verifyLiveReadback: async () => ({ ok: liveRefresh.has("A01") }),
+    liveContracts: CONTRACTS, computeHash: HASH, reportDerivations: RD,
+    deadlineRace: over.deadlineRace || ((p) => p),
     // REAL control-package apply/safe-close over the in-memory store; capture the fence generation.
     openControls: async (ids) => {
       calls.openApply += 1;
@@ -102,6 +109,14 @@ function buildProdShapeReconciler(over = {}) {
       calls.release.push(accountId);
       // Prove the no-export adapter is unreachable for a create even inside the release path.
       try { await noExportAdapter().create(); } catch (e) { if (/OLI_RECONCILER_NO_EXPORT/.test(String(e && e.message))) calls.noExportCreateThrew += 1; }
+      if (over.neverResolves) { calls.release.push("__hang"); return new Promise(() => {}); } // never-resolving in-flight account (blocker 5)
+      if (over.realRelease) {
+        // Drive the REAL runPriorityDashboardsRelease branch so the TYPED classification comes from the real runner
+        // (not a fabricated reason). Preserve status/leaseLost/stage/reason/blockerCodes exactly as the runner produced.
+        const result = await releaseRunner.runPriorityDashboardsRelease({ release: over.realRelease, reconcile: async () => ({ ok: true }), readbackLive: async () => ({ ok: true }), assertNoCron: async () => ({ ok: true }), bucket: "india" });
+        if (result.ok) liveRefresh.set("A01", shadowRefresh.get("A01"));
+        return { code: result.code, ok: result.ok, stage: result.stage, status: result.status || null, leaseLost: result.leaseLost === true, reason: result.reason || null, blockerCodes: result.blockerCodes || [] };
+      }
       const r = over.releaseFor ? over.releaseFor(accountId) : { ok: true, code: 0 };
       if (r.ok) liveRefresh.set("A01", shadowRefresh.get("A01")); // a successful promote aligns the live to the job's shadow
       return r;
@@ -159,6 +174,56 @@ test("blocker 6: a forced timeout after controls open -> remaining accounts defe
 test("blocker 6: zero DataDoe create/poll/download are impossible (the no-export adapter throws on all three)", async () => {
   const a = noExportAdapter();
   for (const op of ["create", "poll", "download"]) { let threw = false; try { await a[op]({}); } catch (e) { threw = /OLI_RECONCILER_NO_EXPORT/.test(String(e && e.message)); } ok("adapter." + op + " throws", threw); }
+});
+
+// ---- blocker 3: TYPED classification through the REAL runPriorityDashboardsRelease branch (not a fabricated result) ----
+const RUNNER_REPORTS = ["daily-reporting", "brand-sales", "brand-inventory"];
+const fakeRelease = (deriveRollup) => ({
+  publishOrder: RUNNER_REPORTS, reportKeys: RUNNER_REPORTS,
+  deriveBucket: async () => ({ rollup: deriveRollup }),
+  finalizeBucket: async () => ({ disposition: "finalized", cycleStatus: "succeeded", accounts: ["A01"], cycleId: "cyc" }),
+  preflightAccount: async (a) => ({ accountId: a, results: RUNNER_REPORTS.map((rk) => ({ reportKey: rk, disposition: "ready", liveReportKey: rk, paramsHash: "ph_" + rk })) }),
+  publishAccount: async (a) => ({ accountId: a, results: RUNNER_REPORTS.map((rk) => ({ reportKey: rk, disposition: "published", liveReportKey: rk, paramsHash: "ph_" + rk })) }),
+  catalogReservation: async () => ({ tokensSpent: 0 }),
+});
+test("blocker 3: SOURCE_UNAVAILABLE from the REAL runner -> the reconciler DEFERS (typed, not text)", async () => {
+  const h = buildProdShapeReconciler({ realRelease: fakeRelease({ stopped: true, stopReason: { code: "SOURCE_UNAVAILABLE" } }) });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("A01 DEFERRED_DEPENDENCY (real runner surfaced reason=SOURCE_UNAVAILABLE); ok:true", st(out, "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && out.ok === true);
+});
+test("blocker 3: a ready=false readiness blocker (coverage-incomplete) from the REAL runner -> DEFER", async () => {
+  // A readiness gate produced NO snapshots (all saved 0, lineage 0); the only blockers are the retryable coverage codes.
+  const rollup = { alreadyComplete: false, derived: { daily: { ready: false, saved: 0, blockedBy: [{ sourceKey: "order-line-items", reason: "coverage-incomplete" }] }, brandView: { ready: false, saved: 0, blockedBy: [{ sourceKey: "order-line-items", reason: "coverage-incomplete" }] }, brandInventory: { ready: false, saved: 0, blockedBy: [] }, lineage: [] } };
+  const h = buildProdShapeReconciler({ realRelease: fakeRelease(rollup) });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("A01 DEFERRED_DEPENDENCY (all blockers are known-retryable readiness codes); ok:true", st(out, "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && out.ok === true);
+});
+test("blocker 3: a ready=false INTEGRITY blocker (count-mismatch) from the REAL runner -> hard FAILED, ok:false", async () => {
+  const rollup = { alreadyComplete: false, derived: { daily: { ready: true, saved: 8, blockedBy: [] }, brandView: { ready: true, saved: 8, blockedBy: [] }, brandInventory: { ready: true, saved: 7, blockedBy: [] }, lineage: new Array(23) } };
+  const h = buildProdShapeReconciler({ realRelease: fakeRelease(rollup) });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("A01 FAILED_DERIVE (integrity blocker derive:count-mismatch); outcome failed; ok:false", st(out, "daily-reporting") === OLI_RECONCILE_STATUS.FAILED_DERIVE && out.outcome === "failed" && out.ok === false);
+});
+
+// ---- blocker 4: control closure is EVIDENCE-BASED -- a lease-not-owner rollback is NOT proof of closed ----
+test("blocker 4: a REAL rollback closes the control rows; a SUPERSEDED-generation rollback (lease-not-owner) leaves them OPEN", async () => {
+  const store = inMemoryControlStore();
+  const apply = await runControlPackageCli({ mode: "apply", operator: "op:x", discoverAccounts: async () => ["A01"], connectStore: async () => store, ownerToken: "op:x", operationKey: "k", leaseTtlSeconds: 900 });
+  ok("apply opened rollout for A01", rolloutOpen(store).join(",") === "A01");
+  // A rollback with a WRONG generation is a lease-not-owner SKIP (committed:false) -- the controls are NOT closed.
+  const badClose = await runControlPackageCli({ mode: "rollback", operator: "op:x", connectStore: async () => store, ownerToken: "op:x", ownerGeneration: apply.leaseGeneration + 99, operationKey: "k" });
+  ok("a superseded-generation rollback is lease-not-owner (committed:false) and does NOT close the rows (evidence: still open)", badClose.committed !== true && rolloutOpen(store).length === 1);
+  // The correct-generation rollback actually closes -> evidence read shows closed.
+  const goodClose = await runControlPackageCli({ mode: "rollback", operator: "op:x", connectStore: async () => store, ownerToken: "op:x", ownerGeneration: apply.leaseGeneration, operationKey: "k" });
+  ok("the correct-generation rollback commits + the evidence read proves rollout/approvals closed", goodClose.committed === true && rolloutOpen(store).length === 0);
+});
+
+// ---- blocker 5: the deadline bounds an IN-FLIGHT (never-resolving) account -> defer + REAL safe-close still runs ----
+test("blocker 5: a never-resolving account after controls open -> deferred + the REAL control-package safe-close STILL releases the exact fence", async () => {
+  const store = inMemoryControlStore();
+  const h = buildProdShapeReconciler({ store, liveRefresh: new Map([["A01", "2026-09-08T00:00:00Z"]]), neverResolves: true, deadlineRace: (p) => Promise.race([p, Promise.resolve({ __deadline: true })]) });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("A01 deferred (deadline-in-flight), the REAL safe-close ran + released the exact fence, ok:true", st(out, "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && h.calls.closeRollback === 1 && store._s.lease === null && out.ok === true);
 });
 
 async function main() {

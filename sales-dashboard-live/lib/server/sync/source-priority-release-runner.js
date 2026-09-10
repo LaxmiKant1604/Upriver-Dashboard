@@ -133,12 +133,16 @@ export async function runPriorityDashboardsRelease(deps = {}) {
       const problems = [];
       const blockerText = (arr) => (Array.isArray(arr) && arr.length ? " blockedBy=[" + arr.map((b) => S(b.sourceKey) + ":" + S(b.reason) + (b.accounts ? "x" + b.accounts : "")).join(", ") + "]" : "");
       const asOfText = " (refreshAsOf=" + S(d.refreshAsOf) + ", effectivePublishAsOf=" + S(d.effectivePublishAsOf) + (d.asOfClamped ? ", clamped" : "") + ")";
-      if (daily.ready !== true) problems.push("daily-reporting not ready (ready=" + S(daily.ready) + ")" + blockerText(daily.blockedBy) + asOfText);
-      if (bv.ready !== true) problems.push("brand-sales not ready (ready=" + S(bv.ready) + ")" + blockerText(bv.blockedBy) + asOfText);
-      if (ds <= 0 || bs <= 0 || is <= 0) problems.push("saved report jobs = 0 (daily=" + ds + ", brand-sales=" + bs + ", brand-inventory=" + is + ")");
-      else if (ds !== bs || bs !== is) problems.push("inconsistent per-account counts (daily=" + ds + ", brand-sales=" + bs + ", brand-inventory=" + is + ") -- a missing or duplicate report job");
-      if (lineageCount !== ds + bs + is) problems.push("lineage " + lineageCount + " != saved " + (ds + bs + is));
-      if (problems.length) return fail("derive:" + b, ["derive produced no validated report jobs for " + b + " (a ready=false/saved=0 derive is NOT 'derive ok'): " + problems.join("; ")]);
+      // Collect STRUCTURED blocker codes (sourceKey:reason) from blockedBy so callers classify retryable readiness/
+      // source blockers vs integrity blockers WITHOUT parsing formatted text; countMismatch is an integrity blocker code.
+      const blockerCodes = [];
+      const collect = (arr) => { for (const x of (Array.isArray(arr) ? arr : [])) blockerCodes.push(S(x && x.sourceKey) + ":" + S(x && x.reason)); };
+      if (daily.ready !== true) { problems.push("daily-reporting not ready (ready=" + S(daily.ready) + ")" + blockerText(daily.blockedBy) + asOfText); collect(daily.blockedBy); }
+      if (bv.ready !== true) { problems.push("brand-sales not ready (ready=" + S(bv.ready) + ")" + blockerText(bv.blockedBy) + asOfText); collect(bv.blockedBy); }
+      if (ds <= 0 || bs <= 0 || is <= 0) { problems.push("saved report jobs = 0 (daily=" + ds + ", brand-sales=" + bs + ", brand-inventory=" + is + ")"); if (daily.ready === true && bv.ready === true) blockerCodes.push("derive:saved-zero"); }
+      else if (ds !== bs || bs !== is) { problems.push("inconsistent per-account counts (daily=" + ds + ", brand-sales=" + bs + ", brand-inventory=" + is + ") -- a missing or duplicate report job"); blockerCodes.push("derive:count-mismatch"); }
+      if (lineageCount !== ds + bs + is) { problems.push("lineage " + lineageCount + " != saved " + (ds + bs + is)); blockerCodes.push("derive:lineage-mismatch"); }
+      if (problems.length) return { ...fail("derive:" + b, ["derive produced no validated report jobs for " + b + " (a ready=false/saved=0 derive is NOT 'derive ok'): " + problems.join("; ")]), reason: blockerCodes[0] || "derive-not-ready", blockerCodes };
       log("derive ok: " + b + " (" + ds + " x 3 = " + (ds * 3) + " report jobs, lineage " + lineageCount + ", effectivePublishAsOf=" + S(d.effectivePublishAsOf) + (d.asOfClamped ? " CLAMPED from " + S(d.refreshAsOf) : "") + ")");
     } else {
       log("derive ok: " + b + " (already-complete cycle; jobs pre-exist -- finalizer re-verifies the exact count)");

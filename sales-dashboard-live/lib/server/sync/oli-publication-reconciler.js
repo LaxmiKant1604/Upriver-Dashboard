@@ -42,16 +42,25 @@ const noop = () => {};
 const RETRYABLE_STATUS = new Set(["CONTROL_LEASE_LOST", "DATADOE_D1_NOT_READY"]);
 const RETRYABLE_STAGES = new Set(["reconcile", "assert-no-cron", "assert-no-cron-final", "contention", "d1-not-ready"]);
 const RETRYABLE_DERIVE_CODES = new Set(["SOURCE_UNAVAILABLE", "SOURCE_PAUSED", "DATADOE_INITIAL_LOAD_INCOMPLETE", "DATADOE_D1_NOT_READY", "SOURCE_D1_NOT_READY", "SOURCE_READINESS_PENDING"]);
+// The KNOWN-retryable ready=false blocker reasons (durable-dashboards readiness/coverage). A derive whose blockers are
+// ALL in this set is retryable (source coverage not yet available); an integrity code (derive:count-mismatch /
+// derive:lineage-mismatch / derive:saved-zero), an UNKNOWN code, or a MIX with any non-retryable code is a HARD failure.
+const RETRYABLE_BLOCKER_REASONS = new Set(["ads-coverage-incomplete", "ads-coverage-no-accounts", "ads-coverage-read-not-ok", "ads-coverage-window-malformed", "ads-coverage-windows-not-array", "ads-evidence-missing", "backfill-start-not-reached", "coverage-incomplete", "no-accounts", "no-validated-snapshot", "source-unavailable"]);
+const blockerReason = (code) => { const s = String(code); const i = s.indexOf(":"); return i < 0 ? s : s.slice(i + 1); };
 function statusFromRelease(result) {
   if (result && result.ok === true && Number(result.code) === 0) return OLI_RECONCILE_STATUS.READBACK_VERIFIED;
   const stage = S(result && result.stage);
   const baseStage = stage.split(":")[0];
   const status = S(result && result.status);
   const reason = S(result && result.reason);
+  const blockerCodes = Array.isArray(result && result.blockerCodes) ? result.blockerCodes.map(S).filter(Boolean) : [];
   if (result && result.leaseLost === true) return OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY;
   if (RETRYABLE_STATUS.has(status)) return OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY;
   if (RETRYABLE_STAGES.has(stage) || RETRYABLE_STAGES.has(baseStage)) return OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY;
-  if (baseStage === "derive") return RETRYABLE_DERIVE_CODES.has(reason) ? OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY : OLI_RECONCILE_STATUS.FAILED_DERIVE;
+  if (baseStage === "derive") {
+    if (blockerCodes.length) return blockerCodes.every((c) => RETRYABLE_BLOCKER_REASONS.has(blockerReason(c))) ? OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY : OLI_RECONCILE_STATUS.FAILED_DERIVE;
+    return RETRYABLE_DERIVE_CODES.has(reason) ? OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY : OLI_RECONCILE_STATUS.FAILED_DERIVE;
+  }
   if (stage === "readback") return OLI_RECONCILE_STATUS.FAILED_READBACK;
   return OLI_RECONCILE_STATUS.FAILED_PUBLISH; // finalize / token-ceiling / publish-gates / publish / scope integrity
 }
@@ -76,18 +85,18 @@ function statusFromRelease(result) {
 export function buildOliPublicationReconciler({
   resolveOrg, bucketAccounts, oliStart,
   readPositiveHistory, readZeroRowProof,
-  readLatestReportJob, readShadowSnapshot, readLiveSnapshot, loadStoragePayload,
-  liveContracts, computeHash, shadowKeyFor = (rk) => "scheduler-v2/" + rk,
+  readLatestReportJob, readShadowSnapshot, readLiveSnapshot, loadStoragePayload, verifyLiveReadback,
+  liveContracts, computeHash, reportDerivations, shadowKeyFor = (rk) => "scheduler-v2/" + rk,
   runReleaseForAccount, rebuildBrandViewMembership,
   openControls = async () => ({ ok: true }), closeControls = async () => ({ ok: true }),
-  outOfTime = () => false,
+  outOfTime = () => false, deadlineRace = (p) => p,
   reportKeys = oliDependentLiveReportKeys(),
   withTimeout = (p) => p, clock = () => new Date(), log = noop,
 } = {}) {
-  for (const [name, fn] of [["resolveOrg", resolveOrg], ["bucketAccounts", bucketAccounts], ["readPositiveHistory", readPositiveHistory], ["readZeroRowProof", readZeroRowProof], ["readLatestReportJob", readLatestReportJob], ["readShadowSnapshot", readShadowSnapshot], ["readLiveSnapshot", readLiveSnapshot], ["loadStoragePayload", loadStoragePayload], ["runReleaseForAccount", runReleaseForAccount], ["rebuildBrandViewMembership", rebuildBrandViewMembership]]) {
+  for (const [name, fn] of [["resolveOrg", resolveOrg], ["bucketAccounts", bucketAccounts], ["readPositiveHistory", readPositiveHistory], ["readZeroRowProof", readZeroRowProof], ["readLatestReportJob", readLatestReportJob], ["readShadowSnapshot", readShadowSnapshot], ["readLiveSnapshot", readLiveSnapshot], ["loadStoragePayload", loadStoragePayload], ["verifyLiveReadback", verifyLiveReadback], ["runReleaseForAccount", runReleaseForAccount], ["rebuildBrandViewMembership", rebuildBrandViewMembership]]) {
     if (typeof fn !== "function") throw new Error(`buildOliPublicationReconciler requires ${name} (fail closed).`);
   }
-  if (!liveContracts || typeof computeHash !== "function") throw new Error("buildOliPublicationReconciler requires liveContracts + computeHash (fail closed).");
+  if (!liveContracts || typeof computeHash !== "function" || !reportDerivations) throw new Error("buildOliPublicationReconciler requires liveContracts + computeHash + reportDerivations (fail closed).");
   if (!S(oliStart) || !DATE_RE.test(S(oliStart))) throw new Error("buildOliPublicationReconciler requires a valid oliStart (fail closed).");
 
   // Storage-first payload hydration for a snapshot row (inline payload, else load the offloaded object). null on absence.
@@ -157,20 +166,26 @@ export function buildOliPublicationReconciler({
         // candidate (identity + source_refreshed_at + params + hydrated payload). A newer validated job whose shadow was
         // never promoted -> the live's source_refreshed_at differs -> STALE.
         const contract = liveContracts[rk];
-        let job = null, shadow = null, live = null, hydShadow = null, hydLive = null;
+        const expectedShadowKey = shadowKeyFor(rk);
+        let job = null, shadow = null, live = null, hydShadow = null, hydLive = null, liveReadback = null;
         try { job = await readLatestReportJob({ reportKey: rk, accountId }); } catch { job = null; }
         if (jobIsPromotable(job) && contract) {
-          try { shadow = await readShadowSnapshot({ reportKey: shadowKeyFor(rk), accountId, paramsHash: S(job.snapshotParamsHash) }); } catch { shadow = null; }
+          try { shadow = await readShadowSnapshot({ reportKey: expectedShadowKey, accountId, paramsHash: S(job.snapshotParamsHash) }); } catch { shadow = null; }
           hydShadow = await hydrate(shadow);
           const shadowParams = shadow && shadow.params && typeof shadow.params === "object" ? shadow.params : null;
           if (shadowParams) {
             const liveParams = contract.liveParams(shadowParams);
             const candHash = liveParams ? computeHash(contract.liveReportVersion, liveParams) : null;
-            if (candHash) { try { live = await readLiveSnapshot({ reportKey: contract.liveReportKey, accountId, paramsHash: candHash }); } catch { live = null; } }
-            hydLive = await hydrate(live);
+            if (candHash) {
+              try { live = await readLiveSnapshot({ reportKey: contract.liveReportKey, accountId, paramsHash: candHash }); } catch { live = null; }
+              hydLive = await hydrate(live);
+              // SHARED publisher-grade live validation (buildLiveReadback): identity + live version + params-provenance
+              // (no mutation/extra fields) + storage-first payload contract. Reused rather than reimplemented weaker.
+              try { liveReadback = await verifyLiveReadback({ reportKey: rk, liveReportKey: contract.liveReportKey, accountId, paramsHash: candHash }); } catch (e) { liveReadback = { ok: false, reason: "readback-threw:" + S(e && e.message) }; }
+            }
           }
         }
-        const cls = evaluatePublicationBinding({ revision, accountId, job, shadow, hydratedShadowPayload: hydShadow, live, hydratedLivePayload: hydLive, contract, computeHash });
+        const cls = evaluatePublicationBinding({ revision, accountId, reportKey: rk, requestedAsOf, expectedShadowKey, job, shadow, hydratedShadowPayload: hydShadow, live, hydratedLivePayload: hydLive, liveReadback, contract, computeHash, reportDerivations });
         rec.reports[rk] = { state: cls.state, reason: cls.reason || null };
         if (cls.state === OLI_PUBLICATION_STATE.STALE) anyStale = true;
       }
@@ -224,8 +239,12 @@ export function buildOliPublicationReconciler({
             if (deadlineHit || outOfTime()) { deadlineHit = true; markStale(accountId, OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-cleanup-reserved"); continue; }
             const rec = perAccount.find((r) => r.accountId === accountId);
             let result;
-            try { result = await runReleaseForAccount({ bucket, accountId, requestedAsOf, revisionId: rec.revisionId }); }
+            // The deadline bounds the IN-FLIGHT account operation (blocker 5): deadlineRace resolves the DEADLINE_HIT
+            // sentinel if the release does not finish in time, so a never-resolving account cannot hang past the reserve
+            // -> it is deferred, the loop stops, and the ALWAYS safe-close still runs.
+            try { result = await deadlineRace(runReleaseForAccount({ bucket, accountId, requestedAsOf, revisionId: rec.revisionId })); }
             catch (e) { result = { ok: false, code: 1, stage: "derive", reason: "release-threw", problems: ["release-threw: " + S(e && e.message)] }; }
+            if (result && result.__deadline === true) { deadlineHit = true; markStale(accountId, OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-in-flight"); continue; }
             const execStatus = statusFromRelease(result);
             const staleReports = reportKeys.filter((rk) => rec.reports[rk] && rec.reports[rk].state === OLI_PUBLICATION_STATE.STALE);
             if (execStatus === OLI_RECONCILE_STATUS.READBACK_VERIFIED) {
