@@ -474,16 +474,18 @@ test("fba-plan: a MISSING durable Catalog context is UNAVAILABLE (retryable defe
   assert.match(res.reason, /Product Catalog/, "the reason names the delayed durable dependency");
 });
 
-test("fba-plan: a delayed durable OLI that LATER becomes available RECOVERS (same account, dep materializes) (defect 3)", () => {
+test("fba-plan: a delayed durable OLI DERIVES once inputs arrive (unit-level; full next-cycle lifecycle proven separately) (defect 3)", () => {
+  // UNIT-LEVEL derivability only: the same account/inputs that deferred (unavailable) derive cleanly once the durable
+  // OLI is present. This proves the payload is derivable after the dependency materializes; the COMPLETE next-cycle
+  // worker/store lifecycle (cycle A unavailable + LKG preserved -> cycle B fresh + saved, no duplicate export/write)
+  // is proven by the "next-cycle recovery LIFECYCLE" worker/store test below.
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const sources = buildSources(planned, rows);
-  // Pass 1: durable OLI not yet materialized -> unavailable (retryable), no snapshot.
   const before = deriveReportSnapshot({ reportKey: "fba-plan", sources, context: { ...usContext(), fbaPlanDurableCatalog: sources["fba-plan:catalog"] } });
-  assert.equal(before.status, "unavailable", "delayed dependency defers, retryable");
-  // Pass 2: the SAME inputs once the durable OLI materializes -> derives cleanly (natural next-cycle recovery, no framework).
+  assert.equal(before.status, "unavailable", "delayed dependency defers (retryable), never terminal invalid");
   const after = deriveReportSnapshot({ reportKey: "fba-plan", sources, context: { ...usContext(), fbaPlanDurableOli: sources["fba-plan:oli-sales"], fbaPlanDurableCatalog: sources["fba-plan:catalog"] } });
   assert.equal(after.status, "derived", "once the delayed durable dependency is present the derive succeeds");
-  assert.ok(after.payload && Array.isArray(after.payload.rows), "a real payload is produced on recovery");
+  assert.ok(after.payload && Array.isArray(after.payload.rows), "a real payload is produced");
 });
 
 test("fba-plan: derivation is idempotent (same inputs -> identical payload)", () => {
@@ -725,20 +727,118 @@ test("fba-plan worker: a GENUINE integrity error records DERIVE_INVALID with the
   assert.ok(base.failures[0].message.length > 0 && base.failures[0].message.length <= 300, "the diagnostic is bounded (secret-free, capped)");
 });
 
-test("sanitizeReportDiagnostic: TRUNCATES to 300 chars and COLLAPSES whitespace/newlines (bounded, secret-free) (defect 3)", () => {
-  // Directly exercise the sanitizer's two distinctive behaviors (the worker's real derive messages are short + clean,
-  // so integration tests never hit these): a >300-char message with tabs/newlines/repeated spaces must come out
-  // single-spaced, trimmed, and EXACTLY 300 chars -- so removing .slice(0,300) or the \\s+ collapse is regression-caught.
-  const long = "  x" + "\t\n  y   z\n".repeat(200) + "  "; // >300 chars, many whitespace runs + newlines/tabs
+test("sanitizeReportDiagnostic: REDACTS credentials/urls/emails/ids (not just truncates), keeps the error class, and bounds to 300 (defect 3)", () => {
+  // REDACTION (the point of the fix) with SYNTHETIC secrets -- NO real secret is used. Each case must strip the secret
+  // yet keep the actionable error class. Redaction happens BEFORE truncation.
+  const skuConflict = sanitizeReportDiagnostic("fba-plan: SKU api_key=SYNTHETIC_KEY_ONLY maps to conflicting child ASINs (B012345678 vs B087654321) across sources; snapshot blocked (last-known-good preserved).");
+  assert.ok(!/SYNTHETIC_KEY_ONLY|B012345678|B087654321/.test(skuConflict), "the synthetic key + ASINs are redacted");
+  assert.match(skuConflict, /conflicting child ASINs .*snapshot blocked/, "the actionable error class survives");
+  const creds = sanitizeReportDiagnostic("Authorization: Bearer SYNTHETIC_TOKEN_ONLY api_key=SYNTHETIC_KEY_ONLY password=SYNTHETIC_PASSWORD_ONLY");
+  assert.ok(!/SYNTHETIC_TOKEN_ONLY|SYNTHETIC_KEY_ONLY|SYNTHETIC_PASSWORD_ONLY/.test(creds), "bearer token + api_key + password all redacted");
+  const mixed = sanitizeReportDiagnostic('derive failed {"password":"SYNTHETIC_PW_123"} contact ops@example.com see https://x.co/cb?token=SYNTHETICQTOKEN123');
+  assert.ok(!/SYNTHETIC_PW_123|ops@example\.com|SYNTHETICQTOKEN123|x\.co/.test(mixed), "JSON-quoted credential, email and URL (with query token) all redacted");
+  assert.match(mixed, /redacted-email/, "email replaced by a placeholder");
+  assert.match(mixed, /redacted-url/, "url replaced by a placeholder");
+  // Hyphenated source keys / plain classification words are NOT over-redacted (stay diagnostic).
+  assert.match(sanitizeReportDiagnostic("fba-plan:inventory-health must be exactly one single-account fragment; snapshot blocked."), /inventory-health.*snapshot blocked/);
+  assert.match(sanitizeReportDiagnostic("fba-plan requires durable Order Line Items evidence (source_oli_daily_history)."), /Order Line Items.*source_oli_daily_history/);
+
+  // TRUNCATION + whitespace collapse: a >300-char message with tabs/newlines/repeated spaces comes out single-spaced,
+  // trimmed, EXACTLY 300 chars -- so removing the cap or the collapse is regression-caught (redaction runs first).
+  const long = "  x" + "\t\n  y   z\n".repeat(200) + "  ";
   const s = sanitizeReportDiagnostic(long);
   assert.equal(s.length, 300, "truncated to exactly the 300-char cap");
   assert.ok(!/\s\s/.test(s), "no double-spaces (whitespace runs collapsed)");
   assert.ok(!/[\n\t]/.test(s), "no newlines or tabs (collapsed to single spaces)");
   assert.equal(s[0], "x", "leading whitespace trimmed");
-  // A short clean message passes through unchanged; a blank/nullish input falls back to a stable label.
-  assert.equal(sanitizeReportDiagnostic("snapshot blocked."), "snapshot blocked.");
-  assert.equal(sanitizeReportDiagnostic("   "), "derivation failed");
-  assert.equal(sanitizeReportDiagnostic(null), "derivation failed");
+  assert.equal(sanitizeReportDiagnostic("snapshot blocked."), "snapshot blocked.", "a clean short message passes through");
+  assert.equal(sanitizeReportDiagnostic("   "), "derivation failed", "blank -> stable fallback label");
+  assert.equal(sanitizeReportDiagnostic(null), "derivation failed", "nullish -> stable fallback label");
+});
+
+test("fba-plan worker: a SKU-conflict exception carrying a synthetic secret is REDACTED in the recorded error message (defect 3, Codex finding 1)", async () => {
+  // Route the REAL FBA_PLAN_SKU_ASIN_CONFLICT through runReportJobs: two inventory rows, same synthetic-secret SKU,
+  // distinct ASINs, available=1, same valid D-1 day. Prove the value passed to recordReportFailure (result.detail) is
+  // REDACTED, bounded, and retains the class -- NO real secret used. This is the transformation Codex reproduced.
+  const conflictInv = [
+    { date: ASOF, child_asin: "B012345678", sku: "api_key=SYNTHETIC_KEY_ONLY", available: 1, marketplace_country_code: "US" },
+    { date: ASOF, child_asin: "B087654321", sku: "api_key=SYNTHETIC_KEY_ONLY", available: 1, marketplace_country_code: "US" },
+  ];
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: conflictInv, awdRows: AWD });
+  const base = capturingReportPlan(planned, rows);
+  let saveCalls = 0; const saveSnapshot = async () => { saveCalls += 1; return { paramsHash: "ph" }; };
+  await runReportJobs({ store: base.store, cycleId: "cycSku", sourceRows: base.sourceRows, saveSnapshot, plannedReports: [base.plannedReport], loadDerivedContext: base.loadDerivedContext });
+  assert.equal(saveCalls, 0, "no snapshot saved for the conflict (integrity) invalid");
+  assert.equal(base.failures.length, 1);
+  assert.equal(base.failures[0].code, "DERIVE_INVALID", "a SKU/ASIN conflict is a genuine integrity error (terminal)");
+  const msg = base.failures[0].message;
+  assert.ok(!/SYNTHETIC_KEY_ONLY|B012345678|B087654321/.test(msg), "the recorded message leaks NO synthetic secret or ASIN");
+  assert.match(msg, /conflicting child ASINs/, "the actionable error class is retained");
+  assert.ok(msg.length > 0 && msg.length <= 300, "the recorded diagnostic is bounded");
+});
+
+// A two-cycle-aware store (report jobs keyed by cycleId; snapshots are cross-cycle LKG) to prove the natural
+// NEXT-CYCLE recovery lifecycle end to end through runReportJobs. The shared source cache + snapshot LKG persist
+// across cycles; a fresh cycle gets fresh pending report jobs.
+function makeLifecycleStore() {
+  const reportJobs = new Map();  // `${cycleId}|${rk}|${a}`
+  const snapshots = new Map();   // `${rk}|${a}` (cross-cycle LKG)
+  const sourceJobs = [];         // shared source deps (the cache), seeded succeeded
+  const saveCallsByCycle = {};
+  const jk = (c, rk, a) => `${c}|${rk}|${a}`;
+  const sk = (rk, a) => `${rk}|${a}`;
+  return {
+    _snapshots: snapshots, saveCallsByCycle,
+    _reportJob: (c, rk, a) => reportJobs.get(jk(c, rk, a)),
+    _sourceJobCount: () => sourceJobs.length,
+    seedSourceSucceeded(hash) { sourceJobs.push({ request_hash: hash, fetch_status: "succeeded" }); },
+    seedSnapshot(rk, a, payload) { snapshots.set(sk(rk, a), { payload, cycleId: "seed" }); },
+    listSourceJobs() { return sourceJobs.map((j) => ({ ...j })); },
+    upsertReportJob({ cycleId, reportKey, accountId, connectionId, bucket, reportVersion, dependsOn }) {
+      const k = jk(cycleId, reportKey, accountId);
+      if (reportJobs.has(k)) return;
+      reportJobs.set(k, { report_key: reportKey, account_id: accountId, connection_id: connectionId, bucket, report_version: reportVersion, depends_on: dependsOn || [], fetch_status: "pending", derive_status: "pending", save_status: "pending", validated: false });
+    },
+    listReportJobs(cycleId) { return [...reportJobs.entries()].filter(([k]) => k.startsWith(cycleId + "|")).map(([, j]) => ({ ...j })); },
+    claimReportDerive(cycleId, rk, a) { const j = reportJobs.get(jk(cycleId, rk, a)); if (j && j.derive_status === "pending") { j.derive_status = "running"; return true; } return false; },
+    recordReportBlocked({ cycleId, reportKey, accountId }) { Object.assign(reportJobs.get(jk(cycleId, reportKey, accountId)), { fetch_status: "blocked", derive_status: "skipped", save_status: "skipped" }); },
+    // Mirrors the production store: a non-save-stage failure sets derive_status="failed" REGARDLESS of the terminal
+    // flag (report jobs have no terminal column), so reportFinished treats it as finished this cycle.
+    recordReportFailure({ cycleId, reportKey, accountId, stage, code, message }) { Object.assign(reportJobs.get(jk(cycleId, reportKey, accountId)), { derive_status: stage === "save" ? "succeeded" : "failed", save_status: stage === "save" ? "failed" : "pending", error_code: code, error_message: message }); },
+    recordReportSuccess({ cycleId, reportKey, accountId }) { Object.assign(reportJobs.get(jk(cycleId, reportKey, accountId)), { fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true }); },
+  };
+}
+
+test("fba-plan worker/store: an UNAVAILABLE dependency in cycle A recovers in cycle B when saved inputs arrive -- LKG preserved, no duplicate export/write (defect 3 next-cycle lifecycle)", async () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const store = makeLifecycleStore();
+  // Owned source deps (inventory-health + AWD) are the shared cache, seeded succeeded ONCE (never re-created).
+  const owned = planned.filter((p) => p.requestKey === "fba-plan:inventory-health" || p.requestKey === "fba-plan:awd");
+  for (const p of owned) store.seedSourceSucceeded(p.requestHash);
+  const sources = owned.map((p) => ({ ...p, optional: p.requestKey === "fba-plan:awd" }));
+  const plannedReport = { reportKey: "fba-plan", accountId: ID, connectionId: "primary", bucket: "us", reportVersion: "fba-plan/v2d-5", sources, context: usContext() };
+  const sourceRows = (hash) => (Object.prototype.hasOwnProperty.call(rows, hash) ? { rows: rows[hash] } : { rows: [] });
+  const derived = buildSources(planned, rows);
+  store.seedSnapshot("scheduler-v2/fba-plan", ID, { asOf: "2025-07-01", rows: [{ asin: "PRIOR-LKG" }] }); // prior good snapshot
+  const sourceJobsAtStart = store._sourceJobCount();
+  const saveSnapshot = (cycle) => async ({ reportKey, accountId, payload }) => { store.saveCallsByCycle[cycle] = (store.saveCallsByCycle[cycle] || 0) + 1; store._snapshots.set(reportKey + "|" + accountId, { payload, cycleId: cycle }); return { paramsHash: "ph" }; };
+
+  // Cycle A: the durable OLI has NOT yet materialized -> unavailable defer. No snapshot saved; LKG intact.
+  const ctxNoOli = async ({ reportKey }) => (reportKey === "fba-plan" ? { fbaPlanDurableCatalog: derived["fba-plan:catalog"] } : {});
+  await runReportJobs({ store, cycleId: "cycA", sourceRows, saveSnapshot: saveSnapshot("cycA"), plannedReports: [plannedReport], loadDerivedContext: ctxNoOli });
+  assert.equal(store._reportJob("cycA", "fba-plan", ID).error_code, "SOURCE_UNAVAILABLE", "cycle A defers unavailable (not terminal invalid)");
+  assert.equal(store.saveCallsByCycle.cycA || 0, 0, "cycle A saved NO snapshot");
+  assert.deepEqual(store._snapshots.get("scheduler-v2/fba-plan|" + ID).payload.rows[0].asin, "PRIOR-LKG", "last-known-good preserved through cycle A");
+
+  // Cycle B: a FRESH cycle; the durable OLI + catalog are now saved -> derives + saves the fresh snapshot.
+  const ctxFull = async ({ reportKey }) => (reportKey === "fba-plan" ? { fbaPlanDurableOli: derived["fba-plan:oli-sales"], fbaPlanDurableCatalog: derived["fba-plan:catalog"] } : {});
+  await runReportJobs({ store, cycleId: "cycB", sourceRows, saveSnapshot: saveSnapshot("cycB"), plannedReports: [plannedReport], loadDerivedContext: ctxFull });
+  assert.equal(store._reportJob("cycB", "fba-plan", ID).derive_status, "succeeded", "cycle B re-derives and succeeds (natural next-cycle recovery)");
+  assert.equal(store.saveCallsByCycle.cycB, 1, "cycle B saved EXACTLY ONE snapshot (no duplicate write)");
+  assert.equal(store._snapshots.get("scheduler-v2/fba-plan|" + ID).cycleId, "cycB", "the recovered snapshot replaced the LKG in cycle B");
+  assert.ok(Array.isArray(store._snapshots.get("scheduler-v2/fba-plan|" + ID).payload.rows), "the recovered snapshot is a real fba-plan payload");
+  // No extra source export was created by the report worker across either cycle (report derivation is zero-export).
+  assert.equal(store._sourceJobCount(), sourceJobsAtStart, "no new/duplicate source export created across cycles A+B (report path is zero-export)");
 });
 
 /* ===================== BATCHED marketplace-safe planning + isolation (go-live) ===================== */

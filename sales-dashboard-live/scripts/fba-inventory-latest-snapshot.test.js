@@ -156,6 +156,18 @@ const latestDateRows = (rows) => { const max = rows.reduce((m, r) => (String(r.d
   ok("K2: a MULTI-day empty lookback is STILL EMPTY_PAYLOAD (unbounded empty proves nothing; not relabeled unavailable)", multi.complete === false && multi.reason === "EMPTY_PAYLOAD");
   const halfBound = compactLatestInventorySnapshot({ rows: [], seller: SELLER, marketplace: MKT, requestedFrom: "2026-09-08", requestedTo: "" });
   ok("K2: a half-bounded (from only) empty is STILL EMPTY_PAYLOAD (requires from===to, both real dates)", halfBound.complete === false && halfBound.reason === "EMPTY_PAYLOAD");
+
+  // CALENDAR validation (Codex finding 2): the window must be a REAL day (round-trip), not just YYYY-MM-DD shape. An
+  // impossible day/month is REJECTED (never mistaken for a bounded D-1 empty); a valid historical / leap day is honored.
+  const emptyBounded = (from, to) => compactLatestInventorySnapshot({ rows: [], seller: SELLER, marketplace: MKT, requestedFrom: from, requestedTo: to });
+  ok("K2-cal: an IMPOSSIBLE day (2026-02-30) is REJECTED (EMPTY_PAYLOAD), not accepted as bounded-empty", emptyBounded("2026-02-30", "2026-02-30").complete === false && emptyBounded("2026-02-30", "2026-02-30").reason === "EMPTY_PAYLOAD");
+  ok("K2-cal: an IMPOSSIBLE month/day (2026-99-99) is REJECTED (EMPTY_PAYLOAD)", emptyBounded("2026-99-99", "2026-99-99").complete === false && emptyBounded("2026-99-99", "2026-99-99").reason === "EMPTY_PAYLOAD");
+  ok("K2-cal: 0000-00-00 / month 00 is REJECTED (EMPTY_PAYLOAD)", emptyBounded("2026-00-00", "2026-00-00").reason === "EMPTY_PAYLOAD" && emptyBounded("0000-00-00", "0000-00-00").reason === "EMPTY_PAYLOAD");
+  ok("K2-cal: a NON-leap Feb 29 (2026-02-29) is REJECTED (EMPTY_PAYLOAD)", emptyBounded("2026-02-29", "2026-02-29").complete === false && emptyBounded("2026-02-29", "2026-02-29").reason === "EMPTY_PAYLOAD");
+  const leap = emptyBounded("2024-02-29", "2024-02-29");
+  ok("K2-cal: a VALID leap Feb 29 (2024-02-29) empty is accepted as bounded inventory-UNAVAILABLE", leap.complete === true && leap.empty === true && leap.inventoryAvailable === false);
+  const historical = emptyBounded("2025-01-15", "2025-01-15");
+  ok("K2-cal: a VALID historical exact-day empty is preserved (accepted; no comparison against today's D-1)", historical.complete === true && historical.empty === true && historical.snapshotDate === null);
 })();
 
 /* ===================== L. the exception is scoped to fba-inventory-health ONLY ===================== */

@@ -46,14 +46,29 @@ function reportFinished(jobRow) {
   return false;
 }
 
-// A bounded, secret-free operator diagnostic for a persisted report-job reason. deriveReportSnapshot exposes the real
-// exception message on `result.detail`, but for a plain (invalid) throw its `result.reason` is the GENERIC "derivation
-// threw" -- which drops the actual stage/cause and makes a delayed-dependency defer indistinguishable from a real
-// integrity error. Persist a sanitized, whitespace-collapsed, length-capped form so the failure is DIAGNOSABLE without
-// leaking raw payloads or credentials (the derive messages are code-authored operator strings; the cap bounds any
-// unexpected throw). Mirrors the source worker's safe() truncation discipline.
+// A bounded, SECRET-FREE operator diagnostic for a persisted report-job reason. deriveReportSnapshot exposes the real
+// exception message on `result.detail`; because the invalid path persists that detail and a derive exception may
+// interpolate row data (e.g. FBA_PLAN_SKU_ASIN_CONFLICT carries the raw SKU + child ASINs), the value must be REDACTED,
+// not merely truncated, before it is stored. REDACT-then-truncate: strip control characters; then redact URLs (incl.
+// any embedded query secrets), a credential following an auth keyword (incl. a nested "Bearer " prefix and JSON-quoted
+// values), a bare "Bearer <token>", emails, UUIDs, Amazon seller/marketplace ids + ASINs, and any other solid long
+// id/key-like token that CARRIES A DIGIT -- while KEEPING the code-authored error CLASS/stage words (hyphenated source
+// keys like "inventory-health"/"listing-health-v3" split on the hyphen and survive; "snapshot blocked", etc. survive)
+// so the diagnostic stays actionable. Redaction patterns mirror source-worker.js sanitizeErrorDetail (which is
+// transport-coupled and cannot be imported into this transport-free module). Finally collapse whitespace + cap at 300.
 export function sanitizeReportDiagnostic(value) {
-  return String(value == null ? "" : value).replace(/\s+/g, " ").trim().slice(0, 300) || "derivation failed";
+  let s = String(value == null ? "" : value);
+  s = Array.from(s, (c) => (c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127 ? " " : c)).join(""); // control chars -> space (no smuggled newlines/escapes)
+  s = s.replace(/\bhttps?:\/\/[^\s"'<>]+/gi, "[redacted-url]");                       // URLs incl. embedded query tokens/secrets
+  s = s.replace(/\b(authorization|api[_-]?key|access[_-]?token|client[_-]?secret|bearer|token|secret|password|passwd|pwd)\b\s*["']?\s*[:=]?\s*["']?\s*(?:bearer\s+)?[A-Za-z0-9._~+/=-]{3,}/gi, "$1 [redacted]"); // credential after a keyword (incl. JSON-quoted / nested Bearer)
+  s = s.replace(/\bbearer\s+[A-Za-z0-9._~+/=-]{3,}/gi, "bearer [redacted]");          // a bare "Bearer <token>"
+  s = s.replace(/\b[\w.+-]+@[\w-]+\.[\w.-]+\b/g, "[redacted-email]");                 // emails
+  s = s.replace(/\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g, "[redacted-id]"); // uuid
+  s = s.replace(/\bB0[A-Z0-9]{8}\b/g, "[redacted-id]");                               // Amazon ASIN (B0 + 8)
+  s = s.replace(/\bA[A-Z0-9]{12,13}\b/g, (m) => (/[0-9]/.test(m) ? "[redacted-id]" : m)); // Amazon seller/marketplace id (has a digit)
+  s = s.replace(/\b[A-Za-z0-9_]{16,}\b/g, (m) => (/[0-9]/.test(m) ? "[redacted-id]" : m)); // solid long id/key token WITH a digit (hyphenated keys are split -> kept)
+  s = s.replace(/\s+/g, " ").trim().slice(0, 300);
+  return s || "derivation failed";
 }
 
 // Normalize any date/timestamp to a STRICT YYYY-MM-DD (or null). Beyond the shape, the sliced

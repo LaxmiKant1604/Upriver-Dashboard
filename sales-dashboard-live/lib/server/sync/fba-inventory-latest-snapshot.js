@@ -27,6 +27,15 @@ export function isLatestSnapshotSource(sourceKey) { return LATEST_SNAPSHOT_SOURC
 
 const S = (v) => (v == null ? "" : String(v));
 const bytesOf = (rows) => { try { return Buffer.byteLength(JSON.stringify({ rows }), "utf8"); } catch { return Infinity; } };
+// Strict UTC calendar-date check (round-trip): an IMPOSSIBLE day/month (2026-02-30, 2026-99-99, 0000-00-00, a non-leap
+// Feb 29) normalizes to a DIFFERENT string and is REJECTED; a real day -- including a valid leap 2024-02-29 -- round-
+// trips unchanged and is accepted. Equivalent to report-source-contracts.js isValidCalendarDate, kept local so this
+// pure leaf stays dependency-free. (A plain YYYY-MM-DD SHAPE regex accepted impossible dates at the empty boundary.)
+const isRealCalendarDate = (v) => {
+  if (typeof v !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const dt = new Date(`${v}T00:00:00Z`);
+  return !Number.isNaN(dt.getTime()) && dt.toISOString().slice(0, 10) === v;
+};
 
 /**
  * Reduce a SINGLE-SELLER FBA inventory payload to its latest provably-complete date. PURE (no I/O; rows never mutated).
@@ -59,7 +68,10 @@ export function compactLatestInventorySnapshot({ rows, seller, marketplace, rowC
     // downstream derive reads the empty rows and resolves inventoryAvailable=false (no fabricated zero, no fresh date).
     const reqFrom = S(requestedFrom);
     const reqTo = S(requestedTo);
-    const boundedSingleDay = /^\d{4}-\d{2}-\d{2}$/.test(reqFrom) && reqFrom === reqTo;
+    // A REAL single-day window: both endpoints equal AND a genuine calendar date (round-trip, not just shape) -- so an
+    // impossible date (2026-02-30 / 2026-99-99) is never mistaken for a bounded D-1 request. Historical valid days are
+    // preserved (no comparison against today's D-1, since legitimate frozen replays use historical dates).
+    const boundedSingleDay = reqFrom === reqTo && isRealCalendarDate(reqFrom);
     if (!boundedSingleDay) {
       return { complete: false, reason: "EMPTY_PAYLOAD", proof: { rawRowCount: 0, requestedFrom: reqFrom || null, requestedTo: reqTo || null, boundedSingleDay: false } };
     }
