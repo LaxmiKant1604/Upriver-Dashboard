@@ -297,19 +297,19 @@ test("D1. scheduler-v2.yml: the THREE regional crons (0 3 india / 30 8 europe-au
   assert.match(yml, /workflow_dispatch:/, "manual dispatch kept");
   // The three GitHub primary crons -- one per region; the +20-min Cloudflare watchdog dispatches the same workflow.
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["0 3 * * *", "30 16 * * *", "30 8 * * *"].sort(), "exactly the three regional primaries");
+  assert.deepEqual(crons, ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort(), "exactly the three regional primaries");
   // The region comes from WHICH cron fired -- deterministic mapping, never inferred from the clock.
-  assert.match(yml, /"0 3 \* \* \*"\)\s*region="india"/, "03:00 UTC maps to india");
-  assert.match(yml, /"30 8 \* \* \*"\)\s*region="europe-au"/, "08:30 UTC maps to europe-au");
-  assert.match(yml, /"30 16 \* \* \*"\)\s*region="us-ca"/, "16:30 UTC maps to us-ca");
-  // The old 2-bucket crons are entirely gone.
-  for (const legacy of ["0 2 * * *", "30 10 * * *"]) assert.ok(!crons.includes(legacy), "legacy cron removed: " + legacy);
+  assert.match(yml, /"7 3 \* \* \*"\)\s*region="india"/, "03:07 UTC maps to india");
+  assert.match(yml, /"37 8 \* \* \*"\)\s*region="europe-au"/, "08:37 UTC maps to europe-au");
+  assert.match(yml, /"37 16 \* \* \*"\)\s*region="us-ca"/, "16:37 UTC maps to us-ca");
+  // The old 2-bucket crons AND the retired :00/:30-boundary regional primaries are entirely gone.
+  for (const legacy of ["0 2 * * *", "30 10 * * *", "0 3 * * *", "30 8 * * *", "30 16 * * *"]) assert.ok(!crons.includes(legacy), "legacy cron removed: " + legacy);
   assert.match(yml, /Unknown cron[^\n]*refusing/, "an unknown cron fails closed");
   const groupLine = yml.split("\n").find((line) => line.trim().startsWith("group: scheduler-v2-")) || "";
   assert.match(groupLine, /github\.event_name == 'schedule'/, "scheduled runs resolve their concurrency region");
-  assert.match(groupLine, /'0 3 \* \* \*' && 'india'/, "india primary uses the india concurrency key");
-  assert.match(groupLine, /'30 8 \* \* \*' && 'europe-au'/, "europe primary uses the europe-au concurrency key");
-  assert.match(groupLine, /'30 16 \* \* \*' && 'us-ca'/, "US primary uses the us-ca concurrency key");
+  assert.match(groupLine, /'7 3 \* \* \*' && 'india'/, "india primary uses the india concurrency key");
+  assert.match(groupLine, /'37 8 \* \* \*' && 'europe-au'/, "europe primary uses the europe-au concurrency key");
+  assert.match(groupLine, /'37 16 \* \* \*' && 'us-ca'/, "US primary uses the us-ca concurrency key");
   assert.match(groupLine, /\|\| inputs\.region/, "watchdog dispatch uses the same region key");
   assert.match(yml, /cancel-in-progress:\s*false/, "runs serialize, never overlap");
   assert.match(yml, /node-version:\s*"24"/, "Node 24");
@@ -385,14 +385,15 @@ test("D2. workflow shape: INDEPENDENT per-region ordered pipeline -- per-region 
   assert.doesNotMatch(yml, /api\/cron\/sync/, "never drives the deprecated Vercel cron endpoint");
 });
 
-test("D3. exactly ONE scheduled EXPORT owner remains: scheduler-v2. The only other scheduled workflow is the ZERO-EXPORT account-onboarding discovery worker; campaign-ads-golive + returns-leakage + fba-plan-golive stay MANUAL-ONLY", () => {
+test("D3. exactly ONE scheduled EXPORT owner remains: scheduler-v2. The two other scheduled workflows are ZERO-EXPORT trigger workers (account-onboarding discovery + scheduler-recovery); campaign-ads-golive + returns-leakage + fba-plan-golive stay MANUAL-ONLY", () => {
   const files = readdirSync(WORKFLOWS_DIR).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
   const scheduled = files.filter((f) => /\n\s*schedule:\s*\n/.test(readFileSync(resolve(WORKFLOWS_DIR, f), "utf8"))).sort();
-  // scheduler-v2 is the SOLE automatic owner of every PAID source. The account-onboarding worker is the ONE
-  // other scheduled workflow and is structurally ZERO-EXPORT: it may run ONLY the discovery operator (whose
-  // module graph contains no export adapter/create path); it never invokes an export/release/golive script.
-  assert.deepEqual(scheduled, ["account-onboarding.yml", "scheduler-v2.yml"],
-    "exactly the scheduler + the zero-export onboarding worker are scheduled; got " + JSON.stringify(scheduled));
+  // scheduler-v2 is the SOLE automatic owner of every PAID source. account-onboarding (discovery) and
+  // scheduler-recovery (trigger backstop) are the two other scheduled workflows and are structurally ZERO-EXPORT:
+  // each runs ONLY its own operator (whose module graph contains no export adapter/create path); neither invokes an
+  // export/release/golive script. scheduler-recovery only inspects + dispatches scheduler-v2 (it never runs a report).
+  assert.deepEqual(scheduled, ["account-onboarding.yml", "scheduler-recovery.yml", "scheduler-v2.yml"],
+    "exactly the scheduler + the two zero-export trigger workers are scheduled; got " + JSON.stringify(scheduled));
   const onboarding = readFileSync(resolve(WORKFLOWS_DIR, "account-onboarding.yml"), "utf8");
   const scriptCalls = [...onboarding.matchAll(/node scripts\/[^\s"']+/g)].map((m) => m[0]);
   assert.deepEqual(scriptCalls, ["node scripts/release/account-onboarding-discovery.mjs"],
@@ -401,6 +402,18 @@ test("D3. exactly ONE scheduled EXPORT owner remains: scheduler-v2. The only oth
   assert.match(onboarding, /cancel-in-progress:\s*false/, "overlapping onboarding crons queue, never race");
   for (const banned of ["fba-plan-golive", "priority-dashboards-release", "oli-refresh-d1", "campaign-ads", "listing-health-v3-ingestion", "returns-leakage"]) {
     assert.ok(!onboarding.includes(banned), "onboarding workflow never invokes " + banned);
+  }
+  // scheduler-recovery: exactly the recovery entrypoint, zero export/release/golive scripts, one dedicated
+  // concurrency group, and least-privilege permissions (contents:read + actions:write only).
+  const recovery = readFileSync(resolve(WORKFLOWS_DIR, "scheduler-recovery.yml"), "utf8");
+  const recoveryCalls = [...recovery.matchAll(/node scripts\/[^\s"']+/g)].map((m) => m[0]);
+  assert.deepEqual(recoveryCalls, ["node scripts/release/scheduler-recovery.mjs"],
+    "the recovery workflow runs ONLY the recovery entrypoint: " + JSON.stringify(recoveryCalls));
+  assert.match(recovery, /concurrency:\s*\n\s*#[\s\S]*?group:\s*scheduler-recovery/, "one dedicated recovery concurrency group");
+  assert.match(recovery, /cancel-in-progress:\s*false/, "overlapping recovery ticks queue, never race");
+  assert.match(recovery, /contents:\s*read\n\s*actions:\s*write/, "least-privilege: contents:read + actions:write only");
+  for (const banned of ["fba-plan-golive", "priority-dashboards-release", "oli-refresh-d1", "scheduled-campaign-ads", "listing-health-v3-ingestion", "report-materialization", "returns-leakage"]) {
+    assert.ok(!recovery.includes(banned), "recovery workflow never invokes " + banned);
   }
   for (const f of ["returns-leakage.yml", "campaign-ads-golive.yml", "fba-plan-golive.yml"]) {
     assert.ok(files.includes(f), f + " still exists (manual-only)");
@@ -448,7 +461,7 @@ test("D4. previous-day (D-1) freshness shape: refresh_mode input, scheduled-alwa
   assert.match(yml, /priority-dashboards-release\.mjs[^\n]*--strict-d1/, "release fails closed below D-1");
   // schedules: the three regional primaries; the +20-min Cloudflare watchdog dispatches the same workflow per region.
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["0 3 * * *", "30 16 * * *", "30 8 * * *"].sort(), "india 03:00 + europe-au 08:30 + us-ca 16:30");
+  assert.deepEqual(crons, ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort(), "india 03:07 + europe-au 08:37 + us-ca 16:37");
 });
 
 test("D5. PER-ACCOUNT publication: the workflow separates COMPLETE (whole-region, natural cycle) from PARTIAL-publishable (healthy OLI-eligible subset into a dedicated cycle; deferred accounts keep dated LKG); a fatal/all-deferred OLI exits nonzero and publishes nothing", () => {

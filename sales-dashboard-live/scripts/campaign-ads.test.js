@@ -70,10 +70,10 @@ test("RR4. planCampaignRun: export count = batch count; max spend = exports x pr
   passed += 1;
 });
 
-test("RR5. schedule times match the spec (UTC + watchdog +20m)", () => {
-  assert.equal(REGION_SCHEDULE[REGIONS.INDIA].primaryUtc, "03:00"); assert.equal(REGION_SCHEDULE[REGIONS.INDIA].watchdogUtc, "03:20");
-  assert.equal(REGION_SCHEDULE[REGIONS.EUROPE_AU].primaryUtc, "08:30"); assert.equal(REGION_SCHEDULE[REGIONS.EUROPE_AU].watchdogUtc, "08:50");
-  assert.equal(REGION_SCHEDULE[REGIONS.US_CA].primaryUtc, "16:30"); assert.equal(REGION_SCHEDULE[REGIONS.US_CA].watchdogUtc, "16:50");
+test("RR5. schedule times match the spec (off-boundary UTC + watchdog +20m)", () => {
+  assert.equal(REGION_SCHEDULE[REGIONS.INDIA].primaryUtc, "03:07"); assert.equal(REGION_SCHEDULE[REGIONS.INDIA].watchdogUtc, "03:27");
+  assert.equal(REGION_SCHEDULE[REGIONS.EUROPE_AU].primaryUtc, "08:37"); assert.equal(REGION_SCHEDULE[REGIONS.EUROPE_AU].watchdogUtc, "08:57");
+  assert.equal(REGION_SCHEDULE[REGIONS.US_CA].primaryUtc, "16:37"); assert.equal(REGION_SCHEDULE[REGIONS.US_CA].watchdogUtc, "16:57");
   passed += 1;
 });
 

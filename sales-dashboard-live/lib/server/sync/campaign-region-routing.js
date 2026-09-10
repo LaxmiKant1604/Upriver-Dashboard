@@ -24,10 +24,14 @@ const MARKETPLACE_TO_REGION = (() => {
 })();
 
 // The regional triggers (UTC). primary + a watchdog 20 minutes later. No schedule is activated by this module.
+// The primary minutes are DELIBERATELY off the congested :00/:30 boundaries (moved 2026-09-10 after a missed
+// GitHub cron delivery on a :00 boundary): GitHub's scheduled-cron delivery is best-effort and is most often
+// delayed or dropped exactly at the top-of-hour / half-hour where the most repos schedule. The +20-min watchdog
+// tracks the primary (Cloudflare-owned; Codex updates the external cron to match this spec).
 export const REGION_SCHEDULE = Object.freeze({
-  [REGIONS.INDIA]: { label: "India", primaryUtc: "03:00", watchdogUtc: "03:20", primaryCron: "0 3 * * *", watchdogCron: "20 3 * * *", istPrimary: "08:30", istWatchdog: "08:50" },
-  [REGIONS.EUROPE_AU]: { label: "Europe + UK + Australia", primaryUtc: "08:30", watchdogUtc: "08:50", primaryCron: "30 8 * * *", watchdogCron: "50 8 * * *", istPrimary: "14:00", istWatchdog: "14:20" },
-  [REGIONS.US_CA]: { label: "US + Canada", primaryUtc: "16:30", watchdogUtc: "16:50", primaryCron: "30 16 * * *", watchdogCron: "50 16 * * *", istPrimary: "22:00", istWatchdog: "22:20" },
+  [REGIONS.INDIA]: { label: "India", primaryUtc: "03:07", watchdogUtc: "03:27", primaryCron: "7 3 * * *", watchdogCron: "27 3 * * *", istPrimary: "08:37", istWatchdog: "08:57" },
+  [REGIONS.EUROPE_AU]: { label: "Europe + UK + Australia", primaryUtc: "08:37", watchdogUtc: "08:57", primaryCron: "37 8 * * *", watchdogCron: "57 8 * * *", istPrimary: "14:07", istWatchdog: "14:27" },
+  [REGIONS.US_CA]: { label: "US + Canada", primaryUtc: "16:37", watchdogUtc: "16:57", primaryCron: "37 16 * * *", watchdogCron: "57 16 * * *", istPrimary: "22:07", istWatchdog: "22:27" },
 });
 
 // The Campaign Ads window plan (days), from the source spec. Used by the planner + the future scheduler.

@@ -138,7 +138,7 @@ async function main() {
     assert.doesNotMatch(runJob, /fba-plan-golive\.mjs/, "the publish job never runs FBA");
     assert.match(yml, /\n\s{2}fba:\n[\s\S]*fba-plan-golive\.mjs --mode=go-live --region=/, "FBA is an isolated regional job");
     const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-    assert.deepEqual(crons, ["0 3 * * *", "30 16 * * *", "30 8 * * *"].sort());
+    assert.deepEqual(crons, ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort());
   });
 
   test("14. a successful workflow cannot report provenThrough below requestedAsOf: the strict D-1 gate publishes ONLY at status 'exact'", () => {

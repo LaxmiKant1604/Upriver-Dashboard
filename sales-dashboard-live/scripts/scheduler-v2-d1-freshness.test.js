@@ -206,9 +206,9 @@ async function main() {
 
   test("14. schedules: the three regional primaries; each cron deterministically maps to one region; SHA/event/cron in the summary", () => {
     const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-    assert.deepEqual(crons, ["0 3 * * *", "30 16 * * *", "30 8 * * *"].sort());
-    assert.match(yml, /"0 3 \* \* \*"\)\s*region="india"/); assert.match(yml, /"30 8 \* \* \*"\)\s*region="europe-au"/);
-    assert.match(yml, /"30 16 \* \* \*"\)\s*region="us-ca"/); assert.doesNotMatch(yml, /30 10 \* \* \*/);
+    assert.deepEqual(crons, ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort());
+    assert.match(yml, /"7 3 \* \* \*"\)\s*region="india"/); assert.match(yml, /"37 8 \* \* \*"\)\s*region="europe-au"/);
+    assert.match(yml, /"37 16 \* \* \*"\)\s*region="us-ca"/); assert.doesNotMatch(yml, /30 10 \* \* \*/);
     // the summary prints immutable metadata (SHA + event + cron) for provenance.
     assert.match(yml, /head\/workflow SHA/); assert.match(yml, /github\.sha/); assert.match(yml, /github\.event\.schedule/);
   });

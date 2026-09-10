@@ -10,9 +10,14 @@ run-name: scheduler-v2 ${{ github.event_name == 'workflow_dispatch' && format('{
 # Each cron maps DETERMINISTICALLY to exactly one region (resolved from github.event.schedule, NEVER the wall clock);
 # accounts are discovered + routed every run by trusted stored marketplace evidence, so a newly connected seller
 # auto-joins its region with no config change:
-#   - india     @ 03:00 UTC (08:30 IST): IN accounts.                              Cloudflare watchdog 03:20 UTC.
-#   - europe-au @ 08:30 UTC (14:00 IST): European marketplaces incl GB/UK + AU.    Cloudflare watchdog 08:50 UTC.
-#   - us-ca     @ 16:30 UTC (22:00 IST): US + CA accounts.                          Cloudflare watchdog 16:50 UTC.
+#   - india     @ 03:07 UTC (08:37 IST): IN accounts.                              Cloudflare watchdog 03:27 UTC.
+#   - europe-au @ 08:37 UTC (14:07 IST): European marketplaces incl GB/UK + AU.    Cloudflare watchdog 08:57 UTC.
+#   - us-ca     @ 16:37 UTC (22:07 IST): US + CA accounts.                          Cloudflare watchdog 16:57 UTC.
+#
+# The primary minutes are OFF the congested :00/:30 boundaries (moved 2026-09-10 after a :00-boundary cron was
+# never delivered by GitHub). Two INDEPENDENT recovery backstops re-dispatch a MISSED cron idempotently: the
+# external Cloudflare watchdog (+20 min) and the GitHub-native scheduler-recovery.yml (every 10 min, +20-min grace).
+# Both dispatch this SAME workflow; a delayed/duplicate trigger is a zero-write no-op (region guard + durable opkey).
 #
 # Each region run: read-only duplicate guard (a delayed/repeated trigger -- e.g. the watchdog -- is a zero-write no-op
 # once the exact D-1 is already live) -> cycle preflight -> token gate -> OLI refresh to D-1 -> Campaign Ads refresh
@@ -32,9 +37,10 @@ run-name: scheduler-v2 ${{ github.event_name == 'workflow_dispatch' && format('{
 on:
   schedule:
     # Each cron maps DETERMINISTICALLY to exactly one region (resolved from github.event.schedule, never the clock).
-    - cron: "0 3 * * *"    # india     PRIMARY -- 03:00 UTC / 08:30 IST
-    - cron: "30 8 * * *"   # europe-au PRIMARY -- 08:30 UTC / 14:00 IST
-    - cron: "30 16 * * *"  # us-ca     PRIMARY -- 16:30 UTC / 22:00 IST
+    # Minutes are OFF the congested :00/:30 boundaries to reduce GitHub's dropped/late scheduled-cron deliveries.
+    - cron: "7 3 * * *"    # india     PRIMARY -- 03:07 UTC / 08:37 IST
+    - cron: "37 8 * * *"   # europe-au PRIMARY -- 08:37 UTC / 14:07 IST
+    - cron: "37 16 * * *"  # us-ca     PRIMARY -- 16:37 UTC / 22:07 IST
   workflow_dispatch:
     inputs:
       region:
@@ -66,7 +72,7 @@ concurrency:
   # One in-flight run PER REGION (regions are independent); a re-dispatch of the same region queues behind its own run.
   # Resolve scheduled crons to the SAME region key used by workflow_dispatch. This prevents a delayed native cron
   # and its Cloudflare watchdog dispatch from running concurrently under different concurrency groups.
-  group: scheduler-v2-${{ github.event_name == 'schedule' && (github.event.schedule == '0 3 * * *' && 'india' || github.event.schedule == '30 8 * * *' && 'europe-au' || github.event.schedule == '30 16 * * *' && 'us-ca' || 'unknown') || inputs.region }}
+  group: scheduler-v2-${{ github.event_name == 'schedule' && (github.event.schedule == '7 3 * * *' && 'india' || github.event.schedule == '37 8 * * *' && 'europe-au' || github.event.schedule == '37 16 * * *' && 'us-ca' || 'unknown') || inputs.region }}
   cancel-in-progress: false
 
 permissions:
@@ -126,9 +132,9 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ]; then
             # Resolve the region from WHICH cron fired -- deterministic, never inferred from the wall clock.
             case "${{ github.event.schedule }}" in
-              "0 3 * * *")   region="india"     ;;
-              "30 8 * * *")  region="europe-au" ;;
-              "30 16 * * *") region="us-ca"     ;;
+              "7 3 * * *")   region="india"     ;;
+              "37 8 * * *")  region="europe-au" ;;
+              "37 16 * * *") region="us-ca"     ;;
               *) echo "Unknown cron '${{ github.event.schedule }}' -- refusing (fail closed)." >&2; exit 1 ;;
             esac
             # A SCHEDULED event is ALWAYS normal mode + FULL scope -- force-latest and the bootstrap scope

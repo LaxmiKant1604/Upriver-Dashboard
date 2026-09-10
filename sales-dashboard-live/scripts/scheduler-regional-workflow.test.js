@@ -29,21 +29,23 @@ const read = (f) => readFileSync(path.join(WF, f), "utf8");
 const crons = (yml) => (yml.match(/^\s*-\s*cron:\s*"([^"]+)"/gm) || []).map((l) => l.match(/"([^"]+)"/)[1]);
 
 let schedulerYml, fbaYml, campaignYml, returnsYml, regionSched;
-const LEGACY_CRONS = ["0 2 * * *", "30 10 * * *", "0 4 * * *", "0 5 * * *", "30 12 * * *", "30 13 * * *"];
+// The old 2-bucket + FBA crons AND the retired :00/:30-boundary regional primaries (moved 2026-09-10 to off-boundary
+// minutes to dodge GitHub's dropped scheduled-cron deliveries) must all be gone from scheduler-v2.
+const LEGACY_CRONS = ["0 2 * * *", "30 10 * * *", "0 4 * * *", "0 5 * * *", "30 12 * * *", "30 13 * * *", "0 3 * * *", "30 8 * * *", "30 16 * * *"];
 
 group("A. scheduler-v2 = the 3-region coordinator");
 
-test("A1. EXACTLY the three GitHub primary crons: 0 3 (india), 30 8 (europe-au), 30 16 (us-ca)", () => {
+test("A1. EXACTLY the three GitHub primary crons: 7 3 (india), 37 8 (europe-au), 37 16 (us-ca) -- off the :00/:30 boundaries", () => {
   const c = crons(schedulerYml);
-  assert.deepEqual([...c].sort(), ["0 3 * * *", "30 16 * * *", "30 8 * * *"].sort());
+  assert.deepEqual([...c].sort(), ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort());
   assert.equal(c.length, 3, "exactly three crons");
 });
 
 test("A2. each cron maps DETERMINISTICALLY to one region via a case on github.event.schedule (never the clock)", () => {
   assert.match(schedulerYml, /case "\$\{\{ github\.event\.schedule \}\}" in/);
-  assert.match(schedulerYml, /"0 3 \* \* \*"\)\s*region="india"/);
-  assert.match(schedulerYml, /"30 8 \* \* \*"\)\s*region="europe-au"/);
-  assert.match(schedulerYml, /"30 16 \* \* \*"\)\s*region="us-ca"/);
+  assert.match(schedulerYml, /"7 3 \* \* \*"\)\s*region="india"/);
+  assert.match(schedulerYml, /"37 8 \* \* \*"\)\s*region="europe-au"/);
+  assert.match(schedulerYml, /"37 16 \* \* \*"\)\s*region="us-ca"/);
 });
 
 test("A3. a region workflow_dispatch input exists (never a browser-supplied region; validated in cfg)", () => {
@@ -60,9 +62,9 @@ test("A4. NO legacy us/non-us (or old FBA) cron remains in scheduler-v2", () => 
 test("A5. native primaries and Cloudflare dispatches share the same per-region concurrency key", () => {
   const groupLine = schedulerYml.split("\n").find((line) => line.trim().startsWith("group: scheduler-v2-")) || "";
   assert.match(groupLine, /github\.event_name == 'schedule'/);
-  assert.match(groupLine, /github\.event\.schedule == '0 3 \* \* \*' && 'india'/);
-  assert.match(groupLine, /github\.event\.schedule == '30 8 \* \* \*' && 'europe-au'/);
-  assert.match(groupLine, /github\.event\.schedule == '30 16 \* \* \*' && 'us-ca'/);
+  assert.match(groupLine, /github\.event\.schedule == '7 3 \* \* \*' && 'india'/);
+  assert.match(groupLine, /github\.event\.schedule == '37 8 \* \* \*' && 'europe-au'/);
+  assert.match(groupLine, /github\.event\.schedule == '37 16 \* \* \*' && 'us-ca'/);
   assert.match(groupLine, /\|\| inputs\.region/);
   assert.ok(!groupLine.includes("github.event.schedule || inputs.region"), "cron text must not become the concurrency key");
 });
@@ -132,22 +134,24 @@ test("D1. returns-leakage carries NO cron", () => {
 
 group("E. the whole workflow tree has no legacy schedule + one cron owner");
 
-test("E1. across ALL workflows, the ONLY crons are the 3 regional primaries in scheduler-v2", () => {
+test("E1. across the report/paid workflows, the ONLY crons are the 3 regional primaries in scheduler-v2", () => {
+  // account-onboarding.yml (*/30, zero-export discovery) and scheduler-recovery.yml (*/10, zero-export trigger
+  // backstop) are the two NON-report scheduled workers; they are excluded here and asserted in their own suites.
   const all = ["scheduler-v2.yml", "fba-plan-golive.yml", "campaign-ads-golive.yml", "returns-leakage.yml", "db-migrate.yml", "regional-dry-run.yml"];
   let total = [];
   for (const f of all) total = total.concat(crons(read(f)));
-  assert.deepEqual([...total].sort(), ["0 3 * * *", "30 16 * * *", "30 8 * * *"].sort(), "only the 3 regional primaries exist anywhere");
+  assert.deepEqual([...total].sort(), ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort(), "only the 3 regional primaries exist in the report/paid workflows");
 });
 
 group("F. Cloudflare watchdog spec = the +20-minute twins mapped 1:1 to the regions");
 
-test("F1. REGION_SCHEDULE carries the exact primary + watchdog crons required", () => {
-  assert.equal(regionSched.india.primaryCron, "0 3 * * *");
-  assert.equal(regionSched.india.watchdogCron, "20 3 * * *");
-  assert.equal(regionSched["europe-au"].primaryCron, "30 8 * * *");
-  assert.equal(regionSched["europe-au"].watchdogCron, "50 8 * * *");
-  assert.equal(regionSched["us-ca"].primaryCron, "30 16 * * *");
-  assert.equal(regionSched["us-ca"].watchdogCron, "50 16 * * *");
+test("F1. REGION_SCHEDULE carries the exact primary + watchdog crons required (off-boundary primaries + 20m twins)", () => {
+  assert.equal(regionSched.india.primaryCron, "7 3 * * *");
+  assert.equal(regionSched.india.watchdogCron, "27 3 * * *");
+  assert.equal(regionSched["europe-au"].primaryCron, "37 8 * * *");
+  assert.equal(regionSched["europe-au"].watchdogCron, "57 8 * * *");
+  assert.equal(regionSched["us-ca"].primaryCron, "37 16 * * *");
+  assert.equal(regionSched["us-ca"].watchdogCron, "57 16 * * *");
 });
 
 test("F2. each watchdog cron is EXACTLY its primary + 20 minutes (same hour)", () => {

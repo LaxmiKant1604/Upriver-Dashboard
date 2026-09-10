@@ -1,0 +1,68 @@
+name: scheduler-recovery
+
+# GitHub-NATIVE trigger-recovery backstop for scheduler-v2. It is NOT a second scheduler and runs ZERO report work:
+# it only inspects scheduler-v2's own workflow runs via the GitHub REST API and, when a region's PRIMARY cron
+# produced NO run for the day (past a 20-minute grace, within a bounded 3-hour window), dispatches ONE scheduler-v2
+# run with dispatch_id `recovery/<region>/<business-date>`. It exists because GitHub's scheduled-cron delivery is
+# best-effort: on 2026-09-10 the india 03:00 primary produced no run at all (it did not start, so it did not
+# "fail"), and the external Cloudflare watchdog also produced no invocation. This is the independent GitHub-side
+# twin of that watchdog.
+#
+# WHY IT CANNOT CAUSE DUPLICATE PAID WORK: a recovery dispatch, the missed primary (if it later arrives late) and
+# the Cloudflare watchdog ALL converge on ONE durable cycle identity -- opkey `scheduled-fresh/<region>/<D-1>`,
+# computed inside the dispatched run from the clock, never from the cron or dispatch_id. scheduler-v2's per-region
+# concurrency group serializes same-region runs, its read-only duplicate guard makes an already-published D-1 a
+# zero-write no-op, and its token/create budget + leases are keyed to that one cycle. This workflow additionally
+# treats a watchdog OR a prior recovery run as an EXISTING run, so it never double-dispatches once either is visible,
+# and it NEVER retries a run that started and failed.
+#
+# COST: */10 = 144 runs/day. Each run is deliberately lightweight (checkout + setup-node + a pure Node script; NO
+# npm ci, NO DataDoe, NO DB), typically finishing in a few seconds, but GitHub Actions bills a 1-minute minimum per
+# job, so budget ~144 min/day (~4,300 min/month) on this PRIVATE repo. DataDoe tokens = 0 structurally.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "live (dispatch a missed region) | dry-run (decide + log only, never dispatch)"
+        required: false
+        default: "live"
+        type: choice
+        options:
+          - live
+          - dry-run
+
+concurrency:
+  # One recovery pass at a time; an overlapping/delayed */10 tick queues, never races. Its decisions are idempotent
+  # (a prior recovery/watchdog run is observed as EXISTING), so a queued duplicate tick is a zero-dispatch no-op.
+  group: scheduler-recovery
+  cancel-in-progress: false
+
+permissions:
+  # Minimum for this backstop: read the repo (checkout) + inspect AND dispatch scheduler-v2. actions:write is the
+  # least Actions permission that can BOTH list runs and POST a workflow_dispatch; no PAT and no new secret are used.
+  contents: read
+  actions: write
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      # Provided by the Actions runtime (actions:write). Used ONLY to read scheduler-v2 runs + POST one dispatch.
+      # Never printed. No DataDoe/Supabase/Postgres secret is referenced -- this workflow performs no report work.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      # No `npm ci`: the recovery script imports only the pure decision module + uses the Node 24 global fetch, so
+      # it has zero third-party dependencies. Keeping the run dependency-free is what makes the */10 cadence cheap.
+      - name: Recover any missed scheduler-v2 regional trigger (inspect runs; dispatch only a truly-missed cron)
+        run: node scripts/release/scheduler-recovery.mjs --mode=${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'live' }}

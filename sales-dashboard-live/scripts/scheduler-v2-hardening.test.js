@@ -32,13 +32,13 @@ test("external dispatches have a unique run title and a non-forgeable-by-schedul
 /* 12/13. correct cron -> correct region; unknown cron fails BEFORE any production I/O */
 test("12/13. the three regional crons each map deterministically to one region; unknown cron fails closed; +20min Cloudflare watchdog documented", () => {
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["0 3 * * *", "30 16 * * *", "30 8 * * *"].sort());
-  assert.match(yml, /"0 3 \* \* \*"\)\s*region="india"/);
-  assert.match(yml, /"30 8 \* \* \*"\)\s*region="europe-au"/);
-  assert.match(yml, /"30 16 \* \* \*"\)\s*region="us-ca"/);
+  assert.deepEqual(crons, ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort());
+  assert.match(yml, /"7 3 \* \* \*"\)\s*region="india"/);
+  assert.match(yml, /"37 8 \* \* \*"\)\s*region="europe-au"/);
+  assert.match(yml, /"37 16 \* \* \*"\)\s*region="us-ca"/);
   assert.doesNotMatch(yml, /30 10 \* \* \*/, "the legacy US GitHub primary is removed");
-  assert.match(yml, /Cloudflare watchdog 03:20 UTC/, "the +20min india watchdog is documented");
-  assert.match(yml, /Cloudflare watchdog 16:50 UTC/, "the +20min us-ca watchdog is documented");
+  assert.match(yml, /Cloudflare watchdog 03:27 UTC/, "the +20min india watchdog is documented");
+  assert.match(yml, /Cloudflare watchdog 16:57 UTC/, "the +20min us-ca watchdog is documented");
   assert.match(yml, /Unknown cron[^\n]*refusing \(fail closed\)/);
   // the unknown-cron guard is in the SAME cfg step, before install/preflight/token/fetch.
   const cfgIdx = yml.indexOf("Resolve region + requestedAsOf");

@@ -41,7 +41,7 @@ function shareOneIdentity(region, inventoryAsOf) {
 
 /* ===================== A. NORMAL scheduled run (cron fires at the regional UTC time) ===================== */
 (() => {
-  const now = Date.parse("2026-09-06T03:00:00Z"); // india 03:00 UTC cron
+  const now = Date.parse("2026-09-06T03:07:00Z"); // india 03:07 UTC cron (off-boundary primary)
   const iao = runJobInventoryAsOf(now);
   ok("A: inventory_asof is the previous UTC date (D-1) at cfg time", iao === "2026-09-05");
   ok("A: FBA and v3 share one inventory identity (normal)", shareOneIdentity("india", iao));
@@ -49,8 +49,8 @@ function shareOneIdentity(region, inventoryAsOf) {
 
 /* ===================== B. WATCHDOG re-dispatch (+20 min, same UTC day) ===================== */
 (() => {
-  const primary = runJobInventoryAsOf(Date.parse("2026-09-06T08:30:00Z"));   // europe-au primary cron
-  const watchdog = runJobInventoryAsOf(Date.parse("2026-09-06T08:50:00Z"));  // Cloudflare watchdog +20 min
+  const primary = runJobInventoryAsOf(Date.parse("2026-09-06T08:37:00Z"));   // europe-au primary cron (off-boundary)
+  const watchdog = runJobInventoryAsOf(Date.parse("2026-09-06T08:57:00Z"));  // Cloudflare watchdog +20 min
   ok("B: the watchdog run recomputes the SAME inventory_asof as the primary (same UTC day)", primary === watchdog);
   ok("B: both the primary and the watchdog resolve one FBA+v3 identity (idempotent replay)", shareOneIdentity("europe-au", primary) && shareOneIdentity("europe-au", watchdog) && v3ConfirmOpId("europe-au", primary) === v3ConfirmOpId("europe-au", watchdog));
 })();
