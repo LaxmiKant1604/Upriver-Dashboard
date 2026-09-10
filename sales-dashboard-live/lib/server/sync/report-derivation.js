@@ -1497,11 +1497,16 @@ export function deriveReportSnapshot({ reportKey, sources = {}, context = {} }) 
     // last-known-good (no snapshot is written).
     const typed = error && (error.deriveStatus === "blocked" || error.deriveStatus === "unavailable")
       ? error.deriveStatus : "invalid";
+    // `errorCode` is the throw's own SAFE classification token (e.g. FBA_PLAN_SKU_ASIN_CONFLICT) when present -- it
+    // carries NO interpolated row data. The worker persists this (or a per-stage static) for an invalid derive rather
+    // than the raw `detail` (whose message MAY interpolate an arbitrary row value -- a SKU / search query / ASIN --
+    // that could contain a credential). `detail` remains exposed for an in-memory/pure caller but is never persisted raw.
     return {
       status: typed, validated: false, payload: null, latestDataDate: null,
       errorStage: typed === "blocked" ? "fetch" : "derive",
       reason: typed === "invalid" ? "derivation threw" : (error && error.message ? error.message : String(error)),
       detail: error && error.message ? error.message : String(error),
+      errorCode: error && typeof error.code === "string" && error.code ? error.code : null,
     };
   }
   if (!entry.validatePayload(payload)) {

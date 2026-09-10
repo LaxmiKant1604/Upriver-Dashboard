@@ -60,8 +60,15 @@ export function sanitizeReportDiagnostic(value) {
   let s = String(value == null ? "" : value);
   s = Array.from(s, (c) => (c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127 ? " " : c)).join(""); // control chars -> space (no smuggled newlines/escapes)
   s = s.replace(/\bhttps?:\/\/[^\s"'<>]+/gi, "[redacted-url]");                       // URLs incl. embedded query tokens/secrets
-  s = s.replace(/\b(authorization|api[_-]?key|access[_-]?token|client[_-]?secret|bearer|token|secret|password|passwd|pwd)\b\s*["']?\s*[:=]?\s*["']?\s*(?:bearer\s+)?[A-Za-z0-9._~+/=-]{3,}/gi, "$1 [redacted]"); // credential after a keyword (incl. JSON-quoted / nested Bearer)
-  s = s.replace(/\bbearer\s+[A-Za-z0-9._~+/=-]{3,}/gi, "bearer [redacted]");          // a bare "Bearer <token>"
+  // Authorization header: the keyword + optional scheme word (Bearer/Basic/Digest/Negotiate/Token) + the COMPLETE
+  // payload (quoted to its close, or unquoted to a field boundary) -- so "Authorization: Basic <base64>" never leaves
+  // the scheme's payload behind, and a mixed-case header is covered.
+  s = s.replace(/\bauthorization\b\s*["']?\s*[:=]?\s*["']?\s*(?:bearer|basic|digest|negotiate|token)?\s*(?:"(?:\\.|[^"])*"?|'(?:\\.|[^'])*'?|[^\s,;)}\]]*)/gi, "authorization [redacted]");
+  // A credential after a sensitive keyword (key optionally quoted, JSON or =/: separator): consume the COMPLETE value
+  // -- a quoted string to its closing quote (spaces / punctuation / escaped quotes included; to end if unterminated)
+  // OR an unquoted run to a field boundary (whitespace or a structural , ; ) } ]). No allowlist subset is left behind.
+  s = s.replace(/["']?\b(api[_-]?key|access[_-]?token|client[_-]?secret|secret|password|passwd|pwd|token)\b["']?\s*[:=]\s*(?:"(?:\\.|[^"])*"?|'(?:\\.|[^'])*'?|[^\s,;)}\]]+)/gi, "$1 [redacted]");
+  s = s.replace(/\b(bearer|basic|digest|negotiate)\s+(?:"(?:\\.|[^"])*"?|'(?:\\.|[^'])*'?|[^\s,;)}\]]+)/gi, "$1 [redacted]"); // a bare "Bearer/Basic <payload>"
   s = s.replace(/\b[\w.+-]+@[\w-]+\.[\w.-]+\b/g, "[redacted-email]");                 // emails
   s = s.replace(/\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g, "[redacted-id]"); // uuid
   s = s.replace(/\bB0[A-Z0-9]{8}\b/g, "[redacted-id]");                               // Amazon ASIN (B0 + 8)
@@ -215,10 +222,18 @@ async function runOneReport({ store, cycleId, sourceRows, saveSnapshot, planned,
       await store.recordReportFailure({ cycleId, reportKey, accountId, stage: result.errorStage || "derive", code: result.status === "not-implemented" ? "DERIVE_NOT_IMPLEMENTED" : "SOURCE_UNAVAILABLE", message: sanitizeReportDiagnostic(result.reason), terminal: false, durationMs: clock() - started });
       return { reportKey, accountId, status: result.status };
     }
-    // A genuine integrity error (invalid): persist the SANITIZED underlying detail + stage, not the generic
-    // "derivation threw" reason -- so an operator can distinguish the real cause (and a delayed dependency, now typed
-    // unavailable above, never lands here as an indistinguishable permanent DERIVE_INVALID). LKG is preserved.
-    return fail(result.errorStage || "derive", "DERIVE_INVALID", sanitizeReportDiagnostic(result.detail || result.reason), true);
+    // A genuine integrity error (invalid): persist a SAFE diagnostic, NEVER the raw derive exception. The derive
+    // message MAY interpolate an arbitrary row value (a SKU / search query / ASIN) that could itself contain a
+    // credential, and no redactor can reliably scrub an arbitrary bare value -- so the durable message is the throw's
+    // own SAFE classification token (result.errorCode, e.g. FBA_PLAN_SKU_ASIN_CONFLICT) when present, else a per-stage
+    // STATIC message. Interpolated row values are excluded BY CONSTRUCTION (not by regex). This still distinguishes a
+    // real integrity error (coded/staged, terminal) from a delayed-dependency defer (SOURCE_UNAVAILABLE above); the
+    // report key + account + stage are recorded separately. sanitizeReportDiagnostic is a defense-in-depth pass over
+    // the (already value-free) message. LKG is preserved (no snapshot written).
+    const invalidMessage = result.errorCode
+      ? sanitizeReportDiagnostic(result.errorCode)
+      : `derivation produced an invalid snapshot at the ${result.errorStage || "derive"} stage; snapshot blocked (raw detail omitted for safety)`;
+    return fail(result.errorStage || "derive", "DERIVE_INVALID", sanitizeReportDiagnostic(invalidMessage), true);
   }
 
   // 5) VALIDATE the derived latest data date BEFORE saving. sync_report_jobs.latest_data_date

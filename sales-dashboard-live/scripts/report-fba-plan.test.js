@@ -712,10 +712,10 @@ test("fba-plan worker: a missing durable OLI records SOURCE_UNAVAILABLE (retryab
   assert.match(base.failures[0].message, /Order Line Items/, "the persisted reason names the delayed durable dependency (diagnosable)");
 });
 
-test("fba-plan worker: a GENUINE integrity error records DERIVE_INVALID with the REAL sanitized detail, not the generic 'derivation threw' (defect 3 diagnostics)", async () => {
+test("fba-plan worker: an UNCODED genuine integrity error records DERIVE_INVALID with a SAFE per-stage STATIC message (raw detail NOT persisted) (defect 3 diagnostics)", async () => {
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
-  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -9) }; // wrong inventory window => genuine integrity invalid
+  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -9) }; // wrong inventory window => genuine integrity invalid (uncoded)
   const base = capturingReportPlan(planned, rows);
   let saveCalls = 0; const saveSnapshot = async () => { saveCalls += 1; return { paramsHash: "ph" }; };
   await runReportJobs({ store: base.store, cycleId: "cycI", sourceRows: base.sourceRows, saveSnapshot, plannedReports: [base.plannedReport], loadDerivedContext: base.loadDerivedContext });
@@ -723,25 +723,47 @@ test("fba-plan worker: a GENUINE integrity error records DERIVE_INVALID with the
   assert.equal(base.failures.length, 1);
   assert.equal(base.failures[0].code, "DERIVE_INVALID", "a genuine integrity error stays terminal DERIVE_INVALID");
   assert.equal(base.failures[0].terminal, true);
-  assert.notEqual(base.failures[0].message, "derivation threw", "the persisted message is the REAL sanitized detail, not the generic label");
-  assert.ok(base.failures[0].message.length > 0 && base.failures[0].message.length <= 300, "the diagnostic is bounded (secret-free, capped)");
+  const msg = base.failures[0].message;
+  assert.notEqual(msg, "derivation threw", "not the useless generic label");
+  assert.match(msg, /invalid snapshot at the derive stage.*omitted for safety/, "an uncoded integrity error persists a SAFE per-stage static message");
+  assert.ok(!/single-account fragment/.test(msg), "the RAW derive detail is NOT persisted (only a safe static) -- an uncoded message could interpolate an arbitrary row value");
+  assert.ok(msg.length > 0 && msg.length <= 300, "bounded");
 });
 
-test("sanitizeReportDiagnostic: REDACTS credentials/urls/emails/ids (not just truncates), keeps the error class, and bounds to 300 (defect 3)", () => {
-  // REDACTION (the point of the fix) with SYNTHETIC secrets -- NO real secret is used. Each case must strip the secret
-  // yet keep the actionable error class. Redaction happens BEFORE truncation.
-  const skuConflict = sanitizeReportDiagnostic("fba-plan: SKU api_key=SYNTHETIC_KEY_ONLY maps to conflicting child ASINs (B012345678 vs B087654321) across sources; snapshot blocked (last-known-good preserved).");
-  assert.ok(!/SYNTHETIC_KEY_ONLY|B012345678|B087654321/.test(skuConflict), "the synthetic key + ASINs are redacted");
-  assert.match(skuConflict, /conflicting child ASINs .*snapshot blocked/, "the actionable error class survives");
-  const creds = sanitizeReportDiagnostic("Authorization: Bearer SYNTHETIC_TOKEN_ONLY api_key=SYNTHETIC_KEY_ONLY password=SYNTHETIC_PASSWORD_ONLY");
-  assert.ok(!/SYNTHETIC_TOKEN_ONLY|SYNTHETIC_KEY_ONLY|SYNTHETIC_PASSWORD_ONLY/.test(creds), "bearer token + api_key + password all redacted");
-  const mixed = sanitizeReportDiagnostic('derive failed {"password":"SYNTHETIC_PW_123"} contact ops@example.com see https://x.co/cb?token=SYNTHETICQTOKEN123');
-  assert.ok(!/SYNTHETIC_PW_123|ops@example\.com|SYNTHETICQTOKEN123|x\.co/.test(mixed), "JSON-quoted credential, email and URL (with query token) all redacted");
-  assert.match(mixed, /redacted-email/, "email replaced by a placeholder");
-  assert.match(mixed, /redacted-url/, "url replaced by a placeholder");
-  // Hyphenated source keys / plain classification words are NOT over-redacted (stay diagnostic).
-  assert.match(sanitizeReportDiagnostic("fba-plan:inventory-health must be exactly one single-account fragment; snapshot blocked."), /inventory-health.*snapshot blocked/);
+test("sanitizeReportDiagnostic: defense-in-depth REDACTION matrix -- consumes the COMPLETE credential value (no suffix), keeps the class, bounds to 300 (defect 3, Codex finding)", () => {
+  // The FULL matrix Codex required, with SYNTHETIC values only. For each input NO full value OR distinctive suffix may
+  // remain. "PRIVATE_SUFFIX" is the tell-tale end-of-value marker: the old allowlist stopped at punctuation/whitespace
+  // and left it behind. (This is the defense-in-depth layer; the primary boundary is the safe code/static contract.)
+  const SUF = "PRIVATE_SUFFIX";
+  const matrix = [
+    ['double-quoted + punctuation', 'password="alpha!PRIVATE_SUFFIX"', [SUF, "alpha!PRIVATE_SUFFIX", "!PRIVATE_SUFFIX"]],
+    ['JSON-quoted + whitespace', '{"password":"alpha PRIVATE_SUFFIX"}', [SUF, "alpha PRIVATE_SUFFIX"]],
+    ['single-quoted + punctuation', "password='alpha!PRIVATE_SUFFIX'", [SUF]],
+    ['unquoted key + punctuation', "password=alpha!PRIVATE_SUFFIX", [SUF]],
+    ['escaped quote inside value', 'password="al\\"pha PRIVATE_SUFFIX"', [SUF]],
+    ['api_key unquoted with hyphens', "api_key=SK-LIVE-PRIVATE_SUFFIX-999", [SUF]],
+    ['token JSON adjacent to another field', '{"token":"T PRIVATE_SUFFIX","x":1}', [SUF]],
+    ['Authorization Bearer', "Authorization: Bearer SYNTHETIC.TOKEN-PRIVATE_SUFFIX", [SUF]],
+    ['Authorization Basic (base64 payload)', "Authorization: Basic YWJjOnNlY3JldA==", ["YWJjOnNlY3JldA", "Basic YWJjOnNlY3JldA=="]],
+    ['mixed-case header + scheme', "AUTHORIZATION: bEaReR abcDEF123PRIVATE_SUFFIX", [SUF]],
+    ['URL query credential', "see https://x.co/cb?token=QSECRET_PRIVATE_SUFFIX&x=1", [SUF, "QSECRET_PRIVATE_SUFFIX"]],
+    ['malformed / truncated quote', 'password="alpha PRIVATE_SUFFIX', [SUF]],
+    ['adjacent sensitive fields', 'password="p1 PRIVATE_SUFFIX" token="t2 PRIVATE_SUFFIX"', [SUF]],
+    ['SKU-conflict raw (paren ASINs + keyword SKU)', "fba-plan: SKU api_key=K_PRIVATE_SUFFIX maps to conflicting child ASINs (B012345678 vs B087654321) across sources; snapshot blocked.", [SUF, "B012345678", "B087654321"]],
+    ['email', "notify ops@example.com about the failure", ["ops@example.com"]],
+  ];
+  for (const [label, input, forbidden] of matrix) {
+    const out = sanitizeReportDiagnostic(input);
+    for (const f of forbidden) assert.ok(!out.includes(f), `[${label}] must not leak ${JSON.stringify(f)} -- got: ${out}`);
+    assert.ok(out.length <= 300, `[${label}] bounded`);
+  }
+  // Placeholders present where expected.
+  assert.match(sanitizeReportDiagnostic("see https://x.co/cb?token=QSECRET_PRIVATE_SUFFIX"), /redacted-url/);
+  assert.match(sanitizeReportDiagnostic("notify ops@example.com"), /redacted-email/);
+  // Classification / hyphenated source keys are NOT over-redacted (stay diagnostic).
+  assert.match(sanitizeReportDiagnostic("fba-plan:inventory-health must be exactly one single-account fragment; snapshot blocked."), /inventory-health.*single-account fragment.*snapshot blocked/);
   assert.match(sanitizeReportDiagnostic("fba-plan requires durable Order Line Items evidence (source_oli_daily_history)."), /Order Line Items.*source_oli_daily_history/);
+  assert.match(sanitizeReportDiagnostic("reconciliation six-complete-calendar-month contract violated (not-six-complete-calendar-months); snapshot blocked."), /six-complete-calendar-month.*snapshot blocked/);
 
   // TRUNCATION + whitespace collapse: a >300-char message with tabs/newlines/repeated spaces comes out single-spaced,
   // trimmed, EXACTLY 300 chars -- so removing the cap or the collapse is regression-caught (redaction runs first).
@@ -756,13 +778,15 @@ test("sanitizeReportDiagnostic: REDACTS credentials/urls/emails/ids (not just tr
   assert.equal(sanitizeReportDiagnostic(null), "derivation failed", "nullish -> stable fallback label");
 });
 
-test("fba-plan worker: a SKU-conflict exception carrying a synthetic secret is REDACTED in the recorded error message (defect 3, Codex finding 1)", async () => {
-  // Route the REAL FBA_PLAN_SKU_ASIN_CONFLICT through runReportJobs: two inventory rows, same synthetic-secret SKU,
-  // distinct ASINs, available=1, same valid D-1 day. Prove the value passed to recordReportFailure (result.detail) is
-  // REDACTED, bounded, and retains the class -- NO real secret used. This is the transformation Codex reproduced.
+test("fba-plan worker: a SKU-conflict exception (SKU carrying a punctuation/space synthetic secret) records the SAFE CODE, never the raw value (defect 3, Codex finding 1)", async () => {
+  // Route the REAL FBA_PLAN_SKU_ASIN_CONFLICT through runReportJobs -- two inventory rows, SAME SKU, distinct ASINs,
+  // available=1, valid D-1 day. The SKU carries a synthetic secret WITH punctuation + a space (Codex's threat shape).
+  // The safe-diagnostic contract persists the throw's SAFE code (FBA_PLAN_SKU_ASIN_CONFLICT), NEVER the raw message
+  // that interpolated the SKU + ASINs -- so no value or suffix can survive. NO real secret used.
+  const secretSku = 'password="alpha!PRIVATE_SUFFIX"';
   const conflictInv = [
-    { date: ASOF, child_asin: "B012345678", sku: "api_key=SYNTHETIC_KEY_ONLY", available: 1, marketplace_country_code: "US" },
-    { date: ASOF, child_asin: "B087654321", sku: "api_key=SYNTHETIC_KEY_ONLY", available: 1, marketplace_country_code: "US" },
+    { date: ASOF, child_asin: "B012345678", sku: secretSku, available: 1, marketplace_country_code: "US" },
+    { date: ASOF, child_asin: "B087654321", sku: secretSku, available: 1, marketplace_country_code: "US" },
   ];
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: conflictInv, awdRows: AWD });
   const base = capturingReportPlan(planned, rows);
@@ -772,9 +796,26 @@ test("fba-plan worker: a SKU-conflict exception carrying a synthetic secret is R
   assert.equal(base.failures.length, 1);
   assert.equal(base.failures[0].code, "DERIVE_INVALID", "a SKU/ASIN conflict is a genuine integrity error (terminal)");
   const msg = base.failures[0].message;
-  assert.ok(!/SYNTHETIC_KEY_ONLY|B012345678|B087654321/.test(msg), "the recorded message leaks NO synthetic secret or ASIN");
-  assert.match(msg, /conflicting child ASINs/, "the actionable error class is retained");
-  assert.ok(msg.length > 0 && msg.length <= 300, "the recorded diagnostic is bounded");
+  assert.equal(msg, "FBA_PLAN_SKU_ASIN_CONFLICT", "the recorded message is the throw's SAFE classification CODE, not the raw exception");
+  assert.ok(!/PRIVATE_SUFFIX|alpha|password|B012345678|B087654321/.test(msg), "no synthetic secret, suffix, keyword, or ASIN survives (excluded by construction, not by regex)");
+  assert.ok(msg.length > 0 && msg.length <= 300, "bounded");
+});
+
+test("fba-plan worker: an ARBITRARY keyword-less bare-secret SKU cannot leak -- the safe contract (not the redactor) protects it (defect 3, Codex finding 1)", async () => {
+  // A bare secret in a SKU (no credential keyword, hyphenated, no digit) is exactly what a redactor CANNOT catch --
+  // proving the safe-diagnostic contract (persist the code, never the raw message) is the real boundary.
+  const bareSecretSku = "my-secret-passphrase-value";
+  const conflictInv = [
+    { date: ASOF, child_asin: "B012345678", sku: bareSecretSku, available: 1, marketplace_country_code: "US" },
+    { date: ASOF, child_asin: "B087654321", sku: bareSecretSku, available: 1, marketplace_country_code: "US" },
+  ];
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: conflictInv, awdRows: AWD });
+  const base = capturingReportPlan(planned, rows);
+  const saveSnapshot = async () => ({ paramsHash: "ph" });
+  await runReportJobs({ store: base.store, cycleId: "cycBare", sourceRows: base.sourceRows, saveSnapshot, plannedReports: [base.plannedReport], loadDerivedContext: base.loadDerivedContext });
+  assert.equal(base.failures.length, 1);
+  assert.equal(base.failures[0].message, "FBA_PLAN_SKU_ASIN_CONFLICT", "the code is persisted; the bare-secret SKU never reaches the durable message");
+  assert.ok(!/my-secret-passphrase-value/.test(base.failures[0].message), "the arbitrary bare-secret SKU does NOT leak (safe contract, not redaction)");
 });
 
 // A two-cycle-aware store (report jobs keyed by cycleId; snapshots are cross-cycle LKG) to prove the natural
