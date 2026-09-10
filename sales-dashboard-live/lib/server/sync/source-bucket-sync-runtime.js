@@ -42,6 +42,7 @@ import {
   resolveOliLineageProvenance, OLI_LINEAGE_STATUS, DURABLE_OLI_PROVEN_EMPTY,
 } from "./source-durable-model.js";
 import { SOURCE_REGISTRY, sourceRegistryEntry } from "./source-registry.js";
+import { OLI_LINEAGE_DEPENDS_ON } from "./oli-dependent-reports.js";
 import {
   deriveDurableDashboardSnapshots, DAILY_ADS_GRAIN, BRAND_VIEW_ADS_GRAIN,
   dailyReportingReadiness, brandViewReadiness,
@@ -1098,11 +1099,10 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       }
       return out.sort();
     };
-    const LINEAGE_DEPENDS_ON = {
-      "daily-reporting": [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY],
-      "brand-sales": [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY],
-      [BRAND_INVENTORY_SNAPSHOT_KEY]: [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY],
-    };
+    // The ONE authoritative source->report lineage map (lib/server/sync/oli-dependent-reports.js): the derive-time
+    // depends_on binding here and the OLI reconciler's target set read the SAME frozen object, so they can never drift.
+    // Its "brand-inventory" key IS BRAND_INVENTORY_SNAPSHOT_KEY (asserted by the oli-dependent-reports drift guard).
+    const LINEAGE_DEPENDS_ON = OLI_LINEAGE_DEPENDS_ON;
     // Durable-evidence lineage (provenance binding): the DURABLE OLI history each account's rows came from
     // carries their originating source_request_hash. When THIS cycle planned no new OLI export for an account
     // (its OLI is already fully proven -- the zero-OLI-create covered-account derivation), the report's OLI

@@ -1,5 +1,69 @@
 # Project Memory
 
+## OLI saved-data-to-dashboard publication system + P0 continuation-ceiling crash fix (2026-09-10, one focused commit on main, NOT pushed; verify 195 steps/171 suites green; code-complete, NOT production acceptance)
+
+Builds on the OLI proven-empty/partial work (3bbfad8/3a82165/709b956, all preserved). Implements a permanent ZERO-EXPORT
+OLI publication reconciler + fixes the current natural-run crash. NO push/deploy/dispatch/migration/DataDoe export.
+`api/*.js` stays 12. Migrations 20260923/24 untouched. No formula/report-key/D-1/schedule/token-ceiling/batching change.
+
+**P0 (run 34480475946 crash).** `scripts/release/oli-refresh-d1.mjs` declared `const ceilingCreates`/`ceilingTokens`
+then REASSIGNED them in the continuation-frozen branch -> `TypeError: Assignment to constant variable` at RUNTIME
+(node --check does NOT catch it; proven empirically). Fix (smallest, immutable): the fresh ceiling is
+`const recomputedCreates/recomputedTokens`; a NEW pure `resolveEffectiveOliCeiling()` in source-scheduled-oli.js
+composes the frozen-budget read + resolveOliCeiling + override into ONE immutable result, bound as
+`const effectiveCreates/effectiveTokens`; downstream execution (token-ceiling gate, escalation cap, RESULT) consumes
+the EFFECTIVE ceiling. A continuation uses the DURABLE frozen budget verbatim (advanced coverage never reduces it);
+fresh/bootstrap keep the recomputed ceiling; unreadable/malformed frozen budget defers (zero mutation). Regression:
+oli-continuation-ceiling.test.js executes the REAL extracted branch through the frozen-16-vs-14 crash scenario +
+a source guard proving no ceiling const is ever reassigned (resolveOliCeiling-only testing is insufficient).
+
+**Root cause of stranded saved-data (pipeline map).** Shadow snapshots (`scheduler-v2/<key>`) are promoted to the bare
+live key ONLY by an operator CLI (no cron), and finalize is per-bucket ALL-OR-NOTHING -- so durable OLI + validated
+shadows strand at the shadow key between manual runs, and one un-validated account blocks a whole bucket. brand-sales/
+brand-inventory have no serve-time self-heal (only `daily` does).
+
+**The system (all zero-export, reusing the reviewed release/runner/publisher primitives):**
+- **WORK 2 registry** `lib/server/sync/oli-dependent-reports.js` -- the ONE authoritative source->live-report map
+  `OLI_LINEAGE_DEPENDS_ON` (daily-reporting/brand-sales/brand-inventory, each OLI-inclusive). The runtime now IMPORTS it
+  (removed the inline literal -> single source). `oliDependentLiveReportKeys()` + fail-closed consistency assertion at
+  import. Drift guard (oli-dependent-reports.test.js): matches the publisher live contracts + source-registry
+  usedByReports; a FUTURE OLI report is discovered by one-line registration; removing a required one is caught.
+- **WORK 3 revision** `lib/server/sync/oli-publication-revision.js` (PURE) -- deterministic per-account durable OLI
+  revisionId over the COMPLETE boundary {orgFp, connId, accountId} + oliStart + requestedAsOf + SORTED proven request
+  hashes (via resolveOliLineageProvenance; positive OR proven-empty). MISSING/malformed/incomplete -> ineligible,
+  revisionId null (never fabricated). classifyOliReportTarget: DEFERRED_PROVENANCE / STALE (live-missing /
+  live-older-asof (content as-of from params.to, NEVER updated_at) / live-unverified) / PUBLICATION_NOT_REQUIRED.
+- **WORK 4 reconciler core** `lib/server/sync/oli-publication-reconciler.js` -- PURE ORCHESTRATION (imports ONLY the two
+  leaf modules; a static test proves NO transport symbol). Selects stale targets, runs each stale account's release
+  INDEPENDENTLY (per-account isolation), maps to READBACK_VERIFIED / FAILED_* / DEFERRED_* / LKG_PRESERVED, rebuilds
+  Brand View membership only AFTER brand-sales promotions, returns structured per-account/report results with
+  dataDoeCreates/tokens = 0 always. Entrypoint `scripts/release/oli-publication-reconcile.mjs` wires production readers +
+  the REAL buildPriorityDashboardsRelease/runPriorityDashboardsRelease/buildLiveReadback, FORCES a no-export inner
+  adapter (create/poll/download THROW -> a missing durable dep fails closed DEFERRED_DEPENDENCY, never a create), and
+  ACQUIRES-or-DEFERS the SAME control-plane lease (never steals from an active scheduler publish). DEFAULT DRY-RUN.
+- **WORK 6 immediate** scheduler-v2.yml step after the publish+membership-rebuild: reconciles EXACTLY the OLI-eligible
+  accounts at the effective as-of, `always()` + `continue-on-error` (never changes the scheduler's outcome), same
+  entrypoint, DRY-RUN unless repo var OLI_RECONCILE_LIVE=='true'.
+- **WORK 7 periodic** `.github/workflows/oli-publication-reconcile.yml` -- every 30 min (cron 13,43 offset), matrix over
+  the 3 regions (max-parallel 1, fail-fast false, per-region concurrency), contents:read only, DRY-RUN unless
+  OLI_RECONCILE_LIVE=='true' (safe to merge; proves the plan + zero-export until deliberately enabled after review).
+
+**Concurrency/idempotency (WORK 8):** the fenced CAS (publishLiveSnapshotFencedIfNewer, source_refreshed_at) gives one
+promotion per revision + already-current no-op + no-older-overwrites-newer; the reconciler defers if another owner holds
+the lease. Repeated reconciliation is a zero-write no-op (a published live snapshot classifies PUBLICATION_NOT_REQUIRED).
+
+**Tests:** oli-continuation-ceiling 30, oli-dependent-reports 14, oli-publication-revision 18, oli-publication-reconciler
+43 (items 4-9,15-20,23,24 + dependency-safety static/behavioral), oli-reconcile-workflow 18; the REAL publisher/readback
+composition is proven by source-priority-dashboards PP2 (709b956, still green). verify GREEN: 195 steps across 171 suites incl.
+build:check; git diff --check clean; node --check all-clean. Adversarial review (12 dimensions incl. paid-export
+reachability, races, LKG, stale-as-fresh, proven-empty) -- 0 substantiated defects.
+
+**Known conservative behavior / PROD ACCEPTANCE PENDING:** LIVE promotion is OFF by default (repo var OLI_RECONCILE_LIVE).
+The production LIVE wiring (per-account release execution, control-lease acquire/release, region discovery) is composed
+from reviewed primitives but PENDING natural-run validation (a green verify is not recovery evidence). A reconcile whose
+derive would need a DataDoe fetch fails closed (DEFERRED_DEPENDENCY) rather than touching the transport. The periodic
+as-of is a conservative yesterday-UTC D-1 (accounts not proven through it keep LKG for the next natural run).
+
 ## Scheduler per-account publication — TWO confirmed-finding fixes (2026-09-10, commit 139ede5 on main, NOT pushed; code verification only, NOT production acceptance)
 
 Follow-up to the 2 release-safety corrections (efd0d64, preserved). **verify 188/188; no push; migrations

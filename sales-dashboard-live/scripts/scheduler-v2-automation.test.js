@@ -385,15 +385,26 @@ test("D2. workflow shape: INDEPENDENT per-region ordered pipeline -- per-region 
   assert.doesNotMatch(yml, /api\/cron\/sync/, "never drives the deprecated Vercel cron endpoint");
 });
 
-test("D3. exactly ONE scheduled EXPORT owner remains: scheduler-v2. The two other scheduled workflows are ZERO-EXPORT trigger workers (account-onboarding discovery + scheduler-recovery); campaign-ads-golive + returns-leakage + fba-plan-golive stay MANUAL-ONLY", () => {
+test("D3. exactly ONE scheduled EXPORT owner remains: scheduler-v2. The other scheduled workflows are ZERO-EXPORT workers (account-onboarding discovery + scheduler-recovery + oli-publication-reconcile); campaign-ads-golive + returns-leakage + fba-plan-golive stay MANUAL-ONLY", () => {
   const files = readdirSync(WORKFLOWS_DIR).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
   const scheduled = files.filter((f) => /\n\s*schedule:\s*\n/.test(readFileSync(resolve(WORKFLOWS_DIR, f), "utf8"))).sort();
-  // scheduler-v2 is the SOLE automatic owner of every PAID source. account-onboarding (discovery) and
-  // scheduler-recovery (trigger backstop) are the two other scheduled workflows and are structurally ZERO-EXPORT:
-  // each runs ONLY its own operator (whose module graph contains no export adapter/create path); neither invokes an
-  // export/release/golive script. scheduler-recovery only inspects + dispatches scheduler-v2 (it never runs a report).
-  assert.deepEqual(scheduled, ["account-onboarding.yml", "scheduler-recovery.yml", "scheduler-v2.yml"],
-    "exactly the scheduler + the two zero-export trigger workers are scheduled; got " + JSON.stringify(scheduled));
+  // scheduler-v2 is the SOLE automatic owner of every PAID source. account-onboarding (discovery), scheduler-recovery
+  // (trigger backstop) and oli-publication-reconcile (zero-export dashboard promotion of already-saved durable OLI) are
+  // the other scheduled workflows and are structurally ZERO-EXPORT: each runs ONLY its own operator (whose module graph
+  // contains no export adapter/create path); none invokes an export/release/golive script that issues a paid create.
+  assert.deepEqual(scheduled, ["account-onboarding.yml", "oli-publication-reconcile.yml", "scheduler-recovery.yml", "scheduler-v2.yml"],
+    "exactly the scheduler + the three zero-export scheduled workers are scheduled; got " + JSON.stringify(scheduled));
+  // oli-publication-reconcile: exactly the reconciler entrypoint (its core module + revision/registry graph reaches no
+  // DataDoe export transport), no export/create/token/force-latest symbol anywhere in the workflow.
+  const reconcile = readFileSync(resolve(WORKFLOWS_DIR, "oli-publication-reconcile.yml"), "utf8");
+  const reconcileCalls = [...reconcile.matchAll(/node scripts\/[^\s"']+/g)].map((m) => m[0]);
+  assert.deepEqual([...new Set(reconcileCalls)], ["node scripts/release/oli-publication-reconcile.mjs"],
+    "the reconcile workflow runs ONLY the reconciler operator (zero-export): " + JSON.stringify(reconcileCalls));
+  for (const banned of ["createExport", "reserveTokens", "exportsCreate", "--force-latest", "oli-refresh-d1", "priority-control-package"]) {
+    assert.ok(!reconcile.includes(banned), "reconcile workflow never invokes/creates " + banned);
+  }
+  assert.match(reconcile, /permissions:[\s\S]{0,200}contents: read/, "reconcile workflow is least-privilege (contents: read)");
+  assert.doesNotMatch(reconcile, /actions: write/, "reconcile workflow needs no actions:write (it writes to the DB, not GitHub)");
   const onboarding = readFileSync(resolve(WORKFLOWS_DIR, "account-onboarding.yml"), "utf8");
   const scriptCalls = [...onboarding.matchAll(/node scripts\/[^\s"']+/g)].map((m) => m[0]);
   assert.deepEqual(scriptCalls, ["node scripts/release/account-onboarding-discovery.mjs"],

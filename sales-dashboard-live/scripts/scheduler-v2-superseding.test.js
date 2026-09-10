@@ -108,7 +108,7 @@ async function main() {
     assert.deepEqual({ c: oliBucketPlan(accountsN(22)).maxCreates, t: oliBucketPlan(accountsN(22)).maxTokens }, { c: 5, t: 10 });
     assert.deepEqual({ c: oliBucketPlan(accountsN(8)).maxCreates, t: oliBucketPlan(accountsN(8)).maxTokens }, { c: 2, t: 4 });
     assert.match(operator, /TOKEN_CEILING_EXCEEDED/, "a run exceeding the ceiling fails closed");
-    assert.match(operator, /batches\.slice\(0, Math\.max\(0, ceilingCreates - creates\)\)/, "the escalation is capped by the remaining create budget (normal + forced share one ceiling)");
+    assert.match(operator, /batches\.slice\(0, Math\.max\(0, effectiveCreates - creates\)\)/, "the escalation is capped by the remaining EFFECTIVE create budget (normal + forced share one ceiling; continuation uses the frozen ceiling)");
   });
 
   /* ---- windows + isolation + honesty ---- */

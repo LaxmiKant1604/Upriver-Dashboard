@@ -74,6 +74,30 @@ export function resolveOliCeiling({ isContinuation = false, frozenBudget = null,
 }
 
 /**
+ * EFFECTIVE OLI ceiling for the entrypoint (oli-refresh-d1.mjs). Composes the frozen-budget read + resolveOliCeiling
+ * + the frozen override into a SINGLE immutable result, so the entrypoint binds `const effectiveCreates/effectiveTokens`
+ * with no reassignment (the old code declared `const ceilingCreates` then reassigned it in the continuation branch ->
+ * TypeError: Assignment to constant variable at runtime whenever a real continuation-frozen cycle was hit -- the
+ * run 34480475946 crash). This is the real continuation branch, extracted so it can be executed under test with an
+ * injected `readFrozenBudget` (a fresh/superseding/bootstrap cycle keeps the recomputed ceiling and never reads).
+ *   - Fresh (isContinuation=false): effective = recomputed; readFrozenBudget is NOT called.
+ *   - Continuation: read the durable frozen budget (via readFrozenBudget); resolveOliCeiling then decides frozen-
+ *     verbatim / unfrozen-recomputed / defer (unreadable/malformed). A read that THROWS defers (ZERO mutation).
+ * Returns { ok:true, source, effectiveCreates, effectiveTokens } OR { ok:false, defer:true, reason, detail }.
+ */
+export async function resolveEffectiveOliCeiling({ isContinuation = false, recomputedCreates = 0, tokensPerCreate = OLI_TOKENS_PER_CREATE, readFrozenBudget = null } = {}) {
+  let frozenBudget = null; let frozenBudgetReadError = false;
+  if (isContinuation) {
+    if (typeof readFrozenBudget !== "function") return { ok: false, defer: true, reason: "FROZEN_BUDGET_READER_MISSING", detail: "no durable frozen-budget reader supplied on a continuation" };
+    try { frozenBudget = await readFrozenBudget(); }
+    catch { frozenBudgetReadError = true; }
+  }
+  const eff = resolveOliCeiling({ isContinuation, frozenBudget, frozenBudgetReadError, recomputedCreates, tokensPerCreate });
+  if (!eff.ok) return { ok: false, defer: eff.defer === true, reason: eff.reason, detail: eff.detail || null };
+  return { ok: true, source: eff.source, effectiveCreates: eff.creates, effectiveTokens: eff.tokens };
+}
+
+/**
  * STRICT post-drain assessment of a scheduled OLI cycle. Given the discovered primary accounts, the cycle's OLI
  * source jobs + owners, and the OLI family's remaining open-job count, prove EVERY invariant and return
  * { ok, problems, creates, tokens, batches, ceilingCreates, ceilingTokens }:

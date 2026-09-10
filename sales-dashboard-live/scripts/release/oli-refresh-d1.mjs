@@ -110,7 +110,7 @@ const fetchAccounts = accountScope === "bootstrap"
 const { buildBucketSourceSyncRuntime } = await import("../../lib/server/sync/source-bucket-sync-runtime.js");
 const { getSyncCycleByBucketDate, getSyncSourceJobs, getSyncSourceJobOwnersForCycle, getSourceCoverageWindows, openSupersedingSyncCycle, reserveOliFreshnessCreate, recordOliFreshnessExport, getOliCompleteness, getSourceTrancheBudget } = await import("../../lib/server/supabase.js");
 const { OLI_SOURCE_KEY, windowsProve } = await import("../../lib/server/sync/source-durable-model.js");
-const { classifyScheduledOliCycle, assessScheduledOliCycle, classifyOliPublicationOutcome, assessDurableOliCoverageComplete, oliBucketPlan, OLI_TOKENS_PER_CREATE, resolveOliCeiling } = await import("../../lib/server/sync/source-scheduled-oli.js");
+const { classifyScheduledOliCycle, assessScheduledOliCycle, classifyOliPublicationOutcome, assessDurableOliCoverageComplete, oliBucketPlan, OLI_TOKENS_PER_CREATE, resolveEffectiveOliCeiling } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { sourceRegistryEntry } = await import("../../lib/server/sync/source-registry.js");
 const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 const { freshnessOperationKey, attemptKindForMode } = await import("../../lib/server/sync/source-oli-freshness.js");
@@ -171,9 +171,12 @@ let cov0 = await coverageState();
 // state (0 behind) byte-identical to the old expectedBatches ceiling, and never enables runaway. Legacy us/non-us
 // steady-state runs are unchanged; a region's first run (or any lagged day) can now complete instead of tripping
 // a false TOKEN_CEILING_EXCEEDED.
-const ceilingCreates = plan.maxCreates + cov0.missing.length;
-const ceilingTokens = ceilingCreates * OLI_TOKENS_PER_CREATE;
-log(cov0.missing.length + "/" + ids.length + " account(s) behind D-1 (unreadable=" + cov0.anyUnreadable + "); create ceiling=" + ceilingCreates + " (" + plan.maxCreates + " batches + " + cov0.missing.length + " behind)");
+// RECOMPUTED (fresh) ceiling -- immutable. A fresh/superseding/bootstrap cycle consumes this; a CONTINUATION resolves
+// its own EFFECTIVE ceiling from the durable frozen budget below (never by reassigning these consts -- the old code
+// reassigned a `const ceilingCreates` inside the continuation branch and crashed at runtime: run 34480475946).
+const recomputedCreates = plan.maxCreates + cov0.missing.length;
+const recomputedTokens = recomputedCreates * OLI_TOKENS_PER_CREATE;
+log(cov0.missing.length + "/" + ids.length + " account(s) behind D-1 (unreadable=" + cov0.anyUnreadable + "); create ceiling=" + recomputedCreates + " (" + plan.maxCreates + " batches + " + cov0.missing.length + " behind)");
 if (cov0.durableComplete) { log("ALREADY_PUBLISHED_D1: durable coverage complete through D-1 -- ZERO creates, ZERO tokens (idempotent primary/fallback no-op)."); console.log("RESULT " + JSON.stringify({ ok: true, bucket, requestedAsOf, classification: "ALREADY_PUBLISHED_D1", creates: 0, tokens: 0, d1Complete: true, alreadyComplete: true, publicationOutcome: "complete", fullComplete: true, publishable: true })); if (accountScope === "full") emitFullCompleteOutputs(ids); process.exit(0); }
 if (cov0.anyUnreadable) { console.error("STOP OLI coverage unreadable -- fail closed (never classify freshness without evidence)."); process.exit(1); }
 
@@ -198,13 +201,13 @@ if (accountScope === "bootstrap") {
   budgetRef = bootstrapStepRef({ step: "oli", region: bucket, stepPlanHash: chk.stepPlanHash });
   const gate = await gateOnboardingBudget({
     waveKey: bootstrapScope.waveKey, ref: budgetRef, stepType: "oli", region: bucket,
-    accountSetHash: bootstrapScope.accountSetHash, stepPlanHash: chk.stepPlanHash, plannedTokens: ceilingTokens, plannedCreates: ceilingCreates,
+    accountSetHash: bootstrapScope.accountSetHash, stepPlanHash: chk.stepPlanHash, plannedTokens: recomputedTokens, plannedCreates: recomputedCreates,
   });
   if (!gate.ok) {
-    console.error("STOP ONBOARDING_BUDGET_REFUSED (" + gate.refusal + (gate.detail ? "/" + gate.detail : "") + "): planned " + ceilingTokens + " token(s) for " + budgetRef + " (wave " + bootstrapScope.waveKey + ") -- ZERO creates issued (fail closed before any POST).");
+    console.error("STOP ONBOARDING_BUDGET_REFUSED (" + gate.refusal + (gate.detail ? "/" + gate.detail : "") + "): planned " + recomputedTokens + " token(s) for " + budgetRef + " (wave " + bootstrapScope.waveKey + ") -- ZERO creates issued (fail closed before any POST).");
     process.exit(1);
   }
-  log("onboarding budget " + gate.disposition + " for " + budgetRef + ": runtime plan hash MATCHES approved; planned " + ceilingTokens + " token(s) (reserved " + gate.reservedTokens + "/" + gate.authorizedTokens + ")");
+  log("onboarding budget " + gate.disposition + " for " + budgetRef + ": runtime plan hash MATCHES approved; planned " + recomputedTokens + " token(s) (reserved " + gate.reservedTokens + "/" + gate.authorizedTokens + ")");
 }
 
 // Classify the (bucket, today) ACTIVE head. A terminal head below D-1 => SUPERSEDE; a running/pending head => run.
@@ -274,14 +277,18 @@ if (head && head.id) {
 // superseding cycle keeps the recomputed + authorized ceiling. Bootstrap scope keeps its wave-gated ceiling (above).
 // An unreadable/malformed frozen budget DEFERS here -- BEFORE the drain -- so zero creates are issued.
 const isContinuationCycle = accountScope !== "bootstrap" && head && head.id && workingCycleId === String(head.id);
-if (isContinuationCycle) {
-  let frozenBudget = null; let frozenBudgetReadError = false;
-  try { frozenBudget = await getSourceTrancheBudget({ cycleId: workingCycleId, trancheKey: "source-sync:" + OLI }); }
-  catch { frozenBudgetReadError = true; }
-  const eff = resolveOliCeiling({ isContinuation: true, frozenBudget, frozenBudgetReadError, recomputedCreates: ceilingCreates, tokensPerCreate: OLI_TOKENS_PER_CREATE });
-  if (!eff.ok) { console.error("STOP " + eff.reason + " (continuation" + (eff.detail ? ": " + eff.detail : "") + ") -- deferring before any create (ZERO mutation)."); process.exit(1); }
-  if (eff.source === "continuation-frozen") { ceilingCreates = eff.creates; ceilingTokens = eff.tokens; log("continuation: using DURABLE frozen OLI budget verbatim (creates=" + eff.creates + ", tokens=" + eff.tokens + "); live recompute is NOT the ceiling."); }
-}
+// EFFECTIVE ceiling (immutable): a continuation reads its DURABLE frozen OLI budget and uses it verbatim; a fresh/
+// superseding cycle keeps the recomputed ceiling. resolveEffectiveOliCeiling composes the read + resolve + override so
+// there is NO reassignment of the recomputed const (the run 34480475946 crash was a `const ceilingCreates` reassigned
+// in this branch). An unreadable/malformed frozen budget DEFERS here -- BEFORE the drain -- so zero creates are issued.
+const effective = await resolveEffectiveOliCeiling({
+  isContinuation: isContinuationCycle, recomputedCreates, tokensPerCreate: OLI_TOKENS_PER_CREATE,
+  readFrozenBudget: () => getSourceTrancheBudget({ cycleId: workingCycleId, trancheKey: "source-sync:" + OLI }),
+});
+if (!effective.ok) { console.error("STOP " + effective.reason + " (continuation" + (effective.detail ? ": " + effective.detail : "") + ") -- deferring before any create (ZERO mutation)."); process.exit(1); }
+if (effective.source === "continuation-frozen") log("continuation: using DURABLE frozen OLI budget verbatim (creates=" + effective.effectiveCreates + ", tokens=" + effective.effectiveTokens + "); live recompute is NOT the ceiling.");
+const effectiveCreates = effective.effectiveCreates;
+const effectiveTokens = effective.effectiveTokens;
 
 // P0-A: on the SCHEDULED FULL-REGION daily cycle, freeze the organization Product Catalog into the SAME cycle as OLI
 // (executing only OLI here) so the later priority step drains that frozen Catalog as a case-(a) continuation instead
@@ -321,7 +328,7 @@ while (iter < MAX_ITERS) {
 
 // Enforce the per-bucket create/token ceiling across ALL work on this attempt (normal + any forced).
 let creates = await oliCreatesSoFar(workingCycleId);
-if (creates > ceilingCreates) { console.error("STOP TOKEN_CEILING_EXCEEDED: " + creates + " creates > " + ceilingCreates + " (fail closed)."); process.exit(1); }
+if (creates > effectiveCreates) { console.error("STOP TOKEN_CEILING_EXCEEDED: " + creates + " creates > " + effectiveCreates + " (fail closed)."); process.exit(1); }
 
 // Re-read coverage. If any account is STILL behind D-1, escalate ONE bounded forced re-fetch of the still-missing
 // <=5-seller batches on THIS attempt (durable freshness reservation; idempotent by operation identity).
@@ -331,7 +338,7 @@ if (cov1.missing.length && !cov1.anyUnreadable) {
   const jobs = (await getSyncSourceJobs(workingCycleId)).filter((j) => (j.source_key ?? j.sourceKey) === OLI);
   const owners = await getSyncSourceJobOwnersForCycle(workingCycleId);
   const batches = planForceLatestBatches({ missingAccounts: cov1.missing, oliJobs: jobs, owners });
-  if (batches.length && creates < ceilingCreates) {
+  if (batches.length && creates < effectiveCreates) {
     const base = String(process.env.POSTGRES_URL).split("?")[0];
     const pgc = new pg.Client({ connectionString: base, ssl: { rejectUnauthorized: false } });
     await pgc.connect();
@@ -343,7 +350,7 @@ if (cov1.missing.length && !cov1.anyUnreadable) {
       record: async (hash, exportId, tokens) => recordOliFreshnessExport(operationKey, hash, exportId, tokens),
       log,
     };
-    try { const esc = await runOliForceLatest({ operationKey, batches: batches.slice(0, Math.max(0, ceilingCreates - creates)), deps }); log("escalation: creates=" + esc.creates + " adopted=" + esc.adopted + " ambiguous=" + esc.ambiguous + " problems=" + esc.problems.length); }
+    try { const esc = await runOliForceLatest({ operationKey, batches: batches.slice(0, Math.max(0, effectiveCreates - creates)), deps }); log("escalation: creates=" + esc.creates + " adopted=" + esc.adopted + " ambiguous=" + esc.ambiguous + " problems=" + esc.problems.length); }
     finally { try { await pgc.end(); } catch { /* ignore */ } }
     creates = await oliCreatesSoFar(workingCycleId);
     cov1 = await coverageState();
@@ -407,7 +414,7 @@ if (accountScope === "bootstrap") {
 // a complete run, and WITHOUT ignoring the exit code (a fatal breach still exits nonzero, publishing nothing). Bootstrap
 // scope is UNCHANGED (its dedicated wave publication is all-or-nothing per the frozen wave; keep the strict a.ok exit).
 const pub = classifyOliPublicationOutcome({ bucket, discoveredAccounts: discovered, sourceJobs: jobsF, owners: ownersF, open: await oliOpen(workingCycleId), extraCreatesHeadroom: cov0.missing.length, coverageMissingAccountIds: cov1.missing });
-console.log("RESULT " + JSON.stringify({ ok: a.ok, publicationOutcome: pub.outcome, fullComplete: pub.fullComplete, publishable: pub.publishable, fatal: pub.fatal, eligibleCount: pub.eligibleCount, deferredCount: pub.deferredCount, bucket, requestedAsOf, accountScope, operationKey, workingCycle: workingCycleId.slice(0, 8), creates: a.creates, tokens: a.tokens, ceilingTokens, classification, d1Complete, coverageBehindD1: cov1.missing.length, completeness: { provisional, final, sourceDefect: sourceDefect || realDefect, itemizedOrders, pendingOrders, pendingUnits, overallItemizedPct: overallPct }, blockedCodes, realDefect: realDefect > 0 }));
+console.log("RESULT " + JSON.stringify({ ok: a.ok, publicationOutcome: pub.outcome, fullComplete: pub.fullComplete, publishable: pub.publishable, fatal: pub.fatal, eligibleCount: pub.eligibleCount, deferredCount: pub.deferredCount, bucket, requestedAsOf, accountScope, operationKey, workingCycle: workingCycleId.slice(0, 8), creates: a.creates, tokens: a.tokens, ceilingTokens: effectiveTokens, classification, d1Complete, coverageBehindD1: cov1.missing.length, completeness: { provisional, final, sourceDefect: sourceDefect || realDefect, itemizedOrders, pendingOrders, pendingUnits, overallItemizedPct: overallPct }, blockedCodes, realDefect: realDefect > 0 }));
 
 if (accountScope === "bootstrap") {
   // Bootstrap: strict all-or-nothing over the frozen wave (unchanged). Its scoped publication proves readiness per
