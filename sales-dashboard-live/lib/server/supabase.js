@@ -3166,6 +3166,86 @@ export async function getSourceCoverageWindows({ organizationFingerprint, connec
   }
 }
 
+// Narrow, READ-ONLY durable ZERO-ROW OLI proof reader for the shared resolveOliLineageProvenance() proven-empty
+// path. For each requested account it returns the SUCCEEDED, bounded, row_count=0 OLI exports that account is an
+// ACTIVE owner of, as { requestHash, from, to } (windows read from the source job's request_meta). It joins the
+// durable ownership (sync_source_job_owners: the exact account <-> request_hash membership) with the durable source
+// jobs (sync_source_jobs: fetch_status + row_count + request_meta) -- a request_hash is content-addressed, so the
+// same bounded export is stable across cycles. It NEVER returns a positive-row, failed, unbounded, cross-org,
+// cross-connection, non-OLI, or non-owned export. FAIL CLOSED: a schema-missing / read-failed / row-cap read
+// returns read != 'ok' with an EMPTY map, so the resolver yields 'missing' (never a fabricated proven-empty).
+export async function getSourceOliZeroRowProof({
+  organizationFingerprint, connectionId = "primary", accountIds, sourceKey = "order-line-items",
+  ownerRequestKey = "source-oli:slice-v1", maxRows = 5000, pageRows = 1000, signal = null,
+} = {}) {
+  const byAccount = new Map();
+  const ids = [...new Set((Array.isArray(accountIds) ? accountIds : []).map((a) => String(a || "").trim()).filter(Boolean))];
+  if (!organizationFingerprint || ids.length === 0) return { read: "ok", byAccount, error: null };
+  const inList = (vals) => `in.(${vals.map((v) => `"${String(v).replaceAll('"', "")}"`).join(",")})`;
+  try {
+    // 1) ACTIVE OLI owner memberships for these accounts -> the exact account <-> request_hash edges (across cycles).
+    const hashesByAccount = new Map(); // accountId -> Set(request_hash)
+    const allHashes = new Set();
+    for (let offset = 0; ; offset += pageRows) {
+      const q = new URLSearchParams({
+        select: "account_id,request_hash",
+        organization_fingerprint: `eq.${organizationFingerprint}`,
+        connection_id: `eq.${connectionId}`,
+        owner_status: "eq.active",
+        request_key: `eq.${ownerRequestKey}`,
+        order: "request_hash.asc,account_id.asc",
+        limit: String(pageRows), offset: String(offset),
+      });
+      q.append("account_id", inList(ids));
+      const rows = await request(`/rest/v1/sync_source_job_owners?${q}`, { signal });
+      const list = Array.isArray(rows) ? rows : [];
+      for (const r of list) {
+        const aid = String(r.account_id || "").trim();
+        const h = String(r.request_hash || "").trim();
+        if (!aid || !h) continue;
+        if (!hashesByAccount.has(aid)) hashesByAccount.set(aid, new Set());
+        hashesByAccount.get(aid).add(h);
+        allHashes.add(h);
+      }
+      if (allHashes.size > maxRows) return { read: "read-failed", byAccount: new Map(), error: "OLI_ZERO_ROW_OWNER_LIMIT_EXCEEDED" };
+      if (list.length < pageRows) break;
+    }
+    if (allHashes.size === 0) return { read: "ok", byAccount, error: null };
+    // 2) The SUCCEEDED, bounded, row_count=0 OLI source jobs for those hashes -> requestHash -> { from, to }.
+    const metaByHash = new Map();
+    const hashArr = [...allHashes];
+    for (let i = 0; i < hashArr.length; i += 100) {
+      const q = new URLSearchParams({
+        select: "request_hash,request_meta",
+        organization_fingerprint: `eq.${organizationFingerprint}`,
+        connection_id: `eq.${connectionId}`,
+        source_key: `eq.${sourceKey}`,
+        fetch_status: "eq.succeeded",
+        row_count: "eq.0",
+      });
+      q.append("request_hash", inList(hashArr.slice(i, i + 100)));
+      const rows = await request(`/rest/v1/sync_source_jobs?${q}`, { signal });
+      for (const r of (Array.isArray(rows) ? rows : [])) {
+        const h = String(r.request_hash || "").trim();
+        const m = r.request_meta && typeof r.request_meta === "object" ? r.request_meta : null;
+        const from = m ? String(m.from || "").trim() : "";
+        const to = m ? String(m.to || "").trim() : "";
+        if (h && from && to && !metaByHash.has(h)) metaByHash.set(h, { from, to });
+      }
+    }
+    // 3) Per account: exactly the succeeded row_count=0 exports it owns, with their bounded windows + real hash.
+    for (const [aid, hs] of hashesByAccount) {
+      const exps = [];
+      for (const h of hs) { const m = metaByHash.get(h); if (m) exps.push({ requestHash: h, from: m.from, to: m.to }); }
+      if (exps.length) byAccount.set(aid, exps.sort((a, b) => (a.requestHash < b.requestHash ? -1 : 1)));
+    }
+    return { read: "ok", byAccount, error: null };
+  } catch (readError) {
+    if (isSchemaMissingError(readError)) return { read: "schema-missing", byAccount: new Map(), error: "OLI_ZERO_ROW_PROOF_SCHEMA_MISSING" };
+    return { read: "read-failed", byAccount: new Map(), error: "OLI_ZERO_ROW_PROOF_READ_FAILED" };
+  }
+}
+
 export async function recordSourceCoverageWindows(rows) {
   const payload = (rows || [])
     .filter((r) => r && r.organizationFingerprint && r.accountId && r.sourceKey && r.coveredFrom && r.coveredTo)

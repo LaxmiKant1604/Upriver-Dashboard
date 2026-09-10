@@ -435,6 +435,12 @@ function makeHarness(over = {}) {
       currency: r.currency, sales_amount: r.salesAmount, units: r.units,
       source_request_hash: r.sourceRequestHash ?? r.source_request_hash ?? null, // durable OLI provenance
     }))),
+    // Durable ZERO-ROW OLI proof reader (proven-empty lineage). Default = an EMPTY proof (offline, no network), so a
+    // zero-positive account stays fail-closed (durable-oli-provenance-missing) exactly as before unless a test opts
+    // in via `zeroRowProof` (accountId -> [{ requestHash, from, to }]) or overrides loadOliZeroRowProof directly.
+    loadOliZeroRowProof: over.loadOliZeroRowProof || (async () => ({
+      read: "ok", byAccount: new Map(Object.entries(over.zeroRowProof || {}).map(([aid, exps]) => [String(aid), exps])),
+    })),
     updateRunStatus: async () => ({ write: "ok" }),
     // Round-5: the REAL paramsHashFor hash (so the genuine publisher hash-provenance gate can accept these
     // saves) + a "save" lineage event so claim-BEFORE-save ordering is provable from one recorder.
@@ -726,6 +732,71 @@ test("F4g. fail closed: a covered account whose durable OLI history row LACKS it
 });
 
 /* ================================= F5. atomic OLI replacement ================================= */
+test("F4h. PROVEN-EMPTY: a covered zero-SALES account (no positive history) with a SUCCEEDED bounded row_count=0 OLI export chain covering [oliStart..asOf] derives; OLI depends_on binds the DURABLE zero-row request hash; lineage marks durable-oli-proven-empty", async () => {
+  const h = durableOliProvenanceHarness({
+    zeroRowProof: {
+      A01: [{ requestHash: "oli-empty-A01", from: "2025-01-01", to: TODAY }],
+      A02: [{ requestHash: "oli-empty-A02", from: "2025-01-01", to: TODAY }],
+    },
+  });
+  // NO durableHistory rows for A01/A02 (genuinely zero-sales) -- the zero-row proof is the ONLY OLI provenance.
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "order-line-items").length, 0, "ZERO OLI creates (proven-empty is durable, no fetch)");
+  assert.ok(rollup.derived.daily.saved >= 1, "the proven-empty account derived Daily off the durable zero-row proof");
+  assert.ok(rollup.derived.lineage.some((l) => l.accountId === "A01" && l.outcome === "durable-oli-proven-empty"), "A01 marked durable-oli-proven-empty (a COMPLETE outcome)");
+  const catalogHash = (h.store.listSourceJobs(rollup.cycleId).find((j) => j.source_key === "product-catalog") || {}).request_hash;
+  for (const rk of ["daily-reporting", "brand-sales"]) {
+    const up = h.recorded.lineage.find((l) => l.op === "upsert" && l.reportKey === rk && l.accountId === "A01");
+    assert.ok(up, rk + " lineage upserted for the proven-empty account");
+    assert.ok(up.dependsOn.includes("oli-empty-A01"), rk + ": OLI depends_on binds the durable zero-row export hash");
+    assert.ok(catalogHash && up.dependsOn.includes(catalogHash), rk + ": catalog depends_on from THIS cycle");
+    assert.ok(up.dependsOn.every((x) => x === "oli-empty-A01" || x === catalogHash), rk + ": no unproven/foreign hash");
+  }
+  assert.ok(h.recorded.shadowSaves.some((s) => s.accountId === "A01" && String(s.reportKey).endsWith("daily-reporting")), "A01 daily snapshot SAVED (published-empty), not skipped");
+});
+
+test("F4i. FAIL CLOSED: a zero-sales account whose zero-row export windows leave a GAP before D-1 is durable-oli-provenance-missing -- the window proof is REAL (coverage alone is never sufficient)", async () => {
+  const h = durableOliProvenanceHarness({
+    zeroRowProof: { A01: [{ requestHash: "oli-empty-A01", from: "2025-01-01", to: "2026-06-01" }] }, // ends BEFORE asOf 2026-08-19; readCoverage is still FULL
+  });
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.ok(rollup.derived.lineage.some((l) => l.accountId === "A01" && l.outcome === "durable-oli-provenance-missing"), "A01 fails closed: a gapped zero-row window is NOT proven-empty even with full coverage");
+  assert.ok(!rollup.derived.lineage.some((l) => l.accountId === "A01" && l.outcome === "durable-oli-proven-empty"), "A01 is NOT marked proven-empty");
+  assert.ok(h.recorded.shadowSaves.every((s) => s.accountId !== "A01"), "no A01 snapshot saved without a proven window");
+});
+
+test("F4j. FAIL CLOSED: a zero-sales account whose zero-row export has a BLANK request_hash is durable-oli-provenance-missing (never a fabricated hash)", async () => {
+  const h = durableOliProvenanceHarness({
+    zeroRowProof: { A01: [{ requestHash: "", from: "2025-01-01", to: TODAY }] }, // blank hash -> whole proof malformed -> fail closed
+  });
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  assert.ok(rollup.derived.lineage.some((l) => l.accountId === "A01" && l.outcome === "durable-oli-provenance-missing"), "A01 fails closed: a blank export hash is not provenance");
+  assert.ok(h.recorded.shadowSaves.every((s) => s.accountId !== "A01"), "no A01 snapshot saved");
+});
+
+test("F4k. MIXED + ISOLATION: a healthy POSITIVE account and a PROVEN-EMPTY account both derive in one batch; neither borrows the other's OLI hash", async () => {
+  const h = durableOliProvenanceHarness({
+    zeroRowProof: { A02: [{ requestHash: "oli-empty-A02", from: "2025-01-01", to: TODAY }] },
+  });
+  h.durableHistory.set("A01|x", { accountId: "A01", saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1, sourceRequestHash: "oli-prov-A01" }); // A01 positive
+  const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  const up01 = h.recorded.lineage.find((l) => l.op === "upsert" && l.reportKey === "daily-reporting" && l.accountId === "A01");
+  const up02 = h.recorded.lineage.find((l) => l.op === "upsert" && l.reportKey === "daily-reporting" && l.accountId === "A02");
+  assert.ok(up01 && up01.dependsOn.includes("oli-prov-A01"), "A01 binds its positive provenance");
+  assert.ok(up02 && up02.dependsOn.includes("oli-empty-A02"), "A02 binds its proven-empty zero-row hash");
+  assert.ok(!up01.dependsOn.includes("oli-empty-A02") && !up02.dependsOn.includes("oli-prov-A01"), "account isolation: neither borrows the other's OLI hash");
+  assert.ok(rollup.derived.lineage.some((l) => l.accountId === "A02" && l.outcome === "durable-oli-proven-empty"), "A02 marked proven-empty");
+  assert.ok(!rollup.derived.lineage.some((l) => l.accountId === "A01" && l.outcome === "durable-oli-proven-empty"), "A01 (positive) is NOT proven-empty");
+});
+
 group("F5. atomic rolling-window replacement: removed grains cannot survive; replacement+ack one transaction");
 
 test("F5a. a grain that DISAPPEARED from the corrected export is REMOVED by the window replacement", async () => {

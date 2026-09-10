@@ -136,6 +136,53 @@ export function windowsProve(windows, from, to) {
   return merged.some((w) => w.from <= from && w.to >= to);
 }
 
+// SHARED OLI lineage-provenance resolver -- the ONE implementation used by BOTH the partial-publication preflight
+// (defer a genuinely-missing account before freezing the healthy-subset cycle) and the derive runtime (bind the
+// report's OLI depends_on). PURE (no I/O), so preflight and runtime can never drift. It NEVER fabricates a
+// hash/coverage/success:
+//   - `nonempty`     : the account has positive-sales history rows -> depends_on = their exact source_request_hash
+//                      values. A blank/missing hash on ANY positive row fails closed (unchanged behaviour).
+//   - `proven-empty` : the account has NO positive-sales rows BUT a real, validated, bounded, SUCCEEDED,
+//                      row_count=0 durable OLI export chain (supplied by the caller from durable owner + source-job
+//                      evidence) whose windows GAPLESSLY prove [oliStart..requestedAsOf] -> depends_on = those
+//                      exports' exact durable request_hash values.
+//   - `missing`      : anything else (no rows AND no/short/malformed zero-row proof) -> fail closed.
+// The CALLER must pre-filter `zeroRowExports` to the exact organization fingerprint + connection + account + OLI
+// source key, an ACTIVE owner membership, source-job fetch_status='succeeded', and a validated bounded export with
+// row_count=0. This resolver additionally re-checks each export's shape (a real request_hash + real from<=to dates)
+// and the gapless window coverage (via the existing windowsProve). Coverage alone is NEVER sufficient: a
+// proven-empty verdict ALWAYS requires at least one real zero-row export hash, which becomes the durable depends_on.
+export const OLI_LINEAGE_STATUS = Object.freeze({ NONEMPTY: "nonempty", PROVEN_EMPTY: "proven-empty", MISSING: "missing" });
+export const DURABLE_OLI_PROVEN_EMPTY = "durable-oli-proven-empty";
+export const DURABLE_OLI_PROVENANCE_MISSING = "durable-oli-provenance-missing";
+
+export function resolveOliLineageProvenance({ historyProvenanceHashes = [], zeroRowExports = [], oliStart, requestedAsOf } = {}) {
+  const hist = Array.isArray(historyProvenanceHashes) ? historyProvenanceHashes : [];
+  if (hist.length > 0) {
+    // A positive-sales account: any blank/missing/malformed provenance hash fails closed (unchanged behaviour).
+    if (hist.some((h) => typeof h !== "string" || h.trim() === "")) {
+      return { status: OLI_LINEAGE_STATUS.MISSING, deps: [], reason: "positive-row-missing-hash" };
+    }
+    return { status: OLI_LINEAGE_STATUS.NONEMPTY, deps: [...new Set(hist.map((h) => String(h)))].sort(), reason: null };
+  }
+  // No positive-sales rows: a proven-empty verdict requires a real, bounded, succeeded, row_count=0 export chain.
+  const ex = Array.isArray(zeroRowExports) ? zeroRowExports : [];
+  if (ex.length === 0) return { status: OLI_LINEAGE_STATUS.MISSING, deps: [], reason: "no-zero-row-proof" };
+  // ANY malformed export (blank hash / non-date / inverted window) fails the WHOLE proof closed.
+  const clean = ex.filter((e) => e
+    && typeof e.requestHash === "string" && e.requestHash.trim() !== ""
+    && isDateStr(String(e.from)) && isDateStr(String(e.to)) && String(e.from) <= String(e.to));
+  if (clean.length !== ex.length) return { status: OLI_LINEAGE_STATUS.MISSING, deps: [], reason: "zero-row-proof-malformed" };
+  if (!isDateStr(String(oliStart)) || !isDateStr(String(requestedAsOf)) || String(oliStart) > String(requestedAsOf)) {
+    return { status: OLI_LINEAGE_STATUS.MISSING, deps: [], reason: "bad-derivation-window" };
+  }
+  // The zero-row exports' OWN windows must GAPLESSLY prove the required derivation window (reuses windowsProve).
+  if (!windowsProve(clean.map((e) => ({ from: String(e.from), to: String(e.to) })), String(oliStart), String(requestedAsOf))) {
+    return { status: OLI_LINEAGE_STATUS.MISSING, deps: [], reason: "zero-row-window-gap" };
+  }
+  return { status: OLI_LINEAGE_STATUS.PROVEN_EMPTY, deps: [...new Set(clean.map((e) => e.requestHash))].sort(), reason: null };
+}
+
 /**
  * The canonical OLI slices of [from, to] that are NOT fully proven by the account's coverage windows.
  * Proven slices are returned under `covered` (never re-exported); missing ones under `missing` (the only

@@ -87,6 +87,7 @@
     "test:source-schedule": "node scripts/source-schedule.test.js",
     "test:zero-export-rehearsal": "node scripts/zero-export-rehearsal.test.js",
     "test:source-production-hardening": "node scripts/source-production-hardening.test.js",
+    "test:oli-lineage-provenance": "node scripts/oli-lineage-provenance.test.js",
     "test:source-priority-dashboards": "node scripts/source-priority-dashboards.test.js",
     "test:scheduler-scope": "node scripts/scheduler-scope.test.js",
     "test:scheduler-regional-workflow": "node scripts/scheduler-regional-workflow.test.js",

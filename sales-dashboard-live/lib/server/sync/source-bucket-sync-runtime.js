@@ -39,6 +39,7 @@ import { REPORT_SOURCE_CONTRACTS } from "./report-source-contracts.js";
 import {
   OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY, ORGANIZATION_SCOPE_KEY,
   oliBackfillWindow, snapshotRefreshDecision, resolveEffectivePublishAsOf,
+  resolveOliLineageProvenance, OLI_LINEAGE_STATUS, DURABLE_OLI_PROVEN_EMPTY,
 } from "./source-durable-model.js";
 import { SOURCE_REGISTRY, sourceRegistryEntry } from "./source-registry.js";
 import {
@@ -52,7 +53,7 @@ import {
   getSourceControls, getSourceCoverageWindows, getSourceSnapshot,
   recordSourceSnapshot, upsertSourceRunStatus,
   replaceOliHistoryWindow, replaceOliDimensionalWindow, recordOliCompleteness, saveSourceSnapshotPayload, getSourceSnapshotPayload,
-  getSourceOliHistoryRows, getDailyAdsCoverage, getAsinAdsDailyRows, getActiveAdsDailyRows,
+  getSourceOliHistoryRows, getSourceOliZeroRowProof, getDailyAdsCoverage, getAsinAdsDailyRows, getActiveAdsDailyRows,
   getSourceOliOperationalUnitRows, getSourceOliDimensionalUnitRows, getSourceOliSalesEstimateRows, replaceOliSalesEstimatesWindow, getOliSkuAsinResolutionRows,
   listSourceBatchMembership, assignSourceAccountBatch,
   getReportSyncSettings, getSchedulerAccountRollout,
@@ -315,6 +316,11 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     loadSnapshotPayload = getSourceSnapshotPayload,
     recordSnapshot = recordSourceSnapshot,
     loadHistoryRows = getSourceOliHistoryRows,
+    // Narrow, READ-ONLY durable zero-row OLI proof reader (proven-empty lineage): for accounts with NO positive-
+    // sales history rows, it returns their succeeded, bounded, row_count=0 OLI exports (active owner membership),
+    // so a legitimately zero-sales covered account binds its report OLI depends_on to those real request hashes
+    // instead of failing closed with durable-oli-provenance-missing. Never creates/spends; injectable for tests.
+    loadOliZeroRowProof = getSourceOliZeroRowProof,
     // OLI SALES ESTIMATE (ADDITIVE, ZERO DataDoe): after each OLI persist, recompute the internal missing/zero-price
     // sales estimates from durable truth (operational units + dimensional references) and enrich the derive's Total
     // Sales. Build-time bound (never a run() arg); fully NON-FATAL at the call site so the priced Total Sales + LKG
@@ -1113,25 +1119,51 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       const h = r.source_request_hash ?? r.sourceRequestHash;
       oliProvenanceByAccount.get(aid).add(typeof h === "string" && h.trim() !== "" ? h : null);
     }
-    // Returns { deps: sorted hashes, oliMissing }. Non-OLI families always come from THIS cycle's succeeded
-    // jobs (catalog/FBA are fetched/refreshed per cycle). OLI comes from this cycle when present, else from the
-    // durable provenance (fail-closed when a ready OLI-dependent account has no/malformed durable provenance).
+    // PROVEN-EMPTY lineage (durable zero-row proof): a legitimately zero-sales account has NO positive-sales history
+    // rows, so oliProvenanceByAccount holds no entry for it. For EXACTLY those in-scope accounts (and only on the
+    // durable path where an OLI dependency must be bound from persisted evidence), load their SUCCEEDED, bounded,
+    // row_count=0 OLI exports (active owner membership) so the shared resolver can bind depends_on to those REAL
+    // request hashes instead of failing closed. Read-only; ZERO creates/tokens. A non-'ok' or empty read leaves the
+    // map empty for those accounts, so the resolver yields 'missing' (the unchanged fail-closed behaviour).
+    const oliZeroProofByAccount = new Map(); // accountId -> [{ requestHash, from, to }]
+    if (reportLineage && rollup.cycleId) {
+      const zeroPositiveIds = accounts
+        .map((a) => String(a.accountId))
+        .filter((aid) => !(oliProvenanceByAccount.get(aid) && oliProvenanceByAccount.get(aid).size > 0));
+      if (zeroPositiveIds.length > 0) {
+        try {
+          const proof = await dl.bound("oli-zero-row-proof", (signal) => loadOliZeroRowProof({
+            organizationFingerprint: orgFingerprint, connectionId: "primary",
+            accountIds: zeroPositiveIds, sourceKey: OLI_SOURCE_KEY, signal,
+          }));
+          if (proof && proof.read === "ok" && proof.byAccount instanceof Map) {
+            for (const [aid, exps] of proof.byAccount) oliZeroProofByAccount.set(String(aid), Array.isArray(exps) ? exps : []);
+          }
+        } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(e); /* fail closed: no proof -> resolver 'missing' */ }
+      }
+    }
+    // Returns { deps: sorted hashes, oliMissing, provenEmpty }. Non-OLI families always come from THIS cycle's
+    // succeeded jobs (catalog/FBA are fetched/refreshed per cycle). OLI comes from this cycle when present, else via
+    // the ONE shared resolveOliLineageProvenance: positive-sales provenance hashes, else a proven-empty zero-row
+    // export chain gaplessly covering [oliStart..effectivePublishAsOf]; anything else fails closed (oliMissing).
     const dependsOnFor = (accountId, reportKey) => {
       const families = LINEAGE_DEPENDS_ON[reportKey] || [];
-      if (!families.includes(OLI_SOURCE_KEY)) return { deps: succeededHashesFor(accountId, families), oliMissing: false };
+      if (!families.includes(OLI_SOURCE_KEY)) return { deps: succeededHashesFor(accountId, families), oliMissing: false, provenEmpty: false };
       const nonOli = families.filter((f) => f !== OLI_SOURCE_KEY);
       const otherHashes = succeededHashesFor(accountId, nonOli);
       const oliCycleHashes = succeededHashesFor(accountId, [OLI_SOURCE_KEY]);
-      let oliDeps;
-      let oliMissing = false;
       if (oliCycleHashes.length > 0) {
-        oliDeps = oliCycleHashes; // OLI fetched THIS cycle -> unchanged behaviour
-      } else {
-        oliDeps = [...(oliProvenanceByAccount.get(String(accountId)) || [])]; // persisted earlier -> durable provenance
-        oliMissing = oliDeps.length === 0 || oliDeps.some((h) => !h); // no rows / a row lacked its provenance
+        const deps = [...new Set([...otherHashes, ...oliCycleHashes])].sort(); // OLI fetched THIS cycle -> unchanged
+        return { deps, oliMissing: false, provenEmpty: false };
       }
-      const deps = [...new Set([...otherHashes, ...oliDeps.filter(Boolean)])].sort();
-      return { deps, oliMissing };
+      const res = resolveOliLineageProvenance({
+        historyProvenanceHashes: [...(oliProvenanceByAccount.get(String(accountId)) || [])],
+        zeroRowExports: oliZeroProofByAccount.get(String(accountId)) || [],
+        oliStart: brandViewWindow.from, requestedAsOf: effectivePublishAsOf,
+      });
+      if (res.status === OLI_LINEAGE_STATUS.MISSING) return { deps: [], oliMissing: true, provenEmpty: false };
+      const deps = [...new Set([...otherHashes, ...res.deps])].sort();
+      return { deps, oliMissing: false, provenEmpty: res.status === OLI_LINEAGE_STATUS.PROVEN_EMPTY };
     };
     // Round-7 finding 1: CLAIM-LEASE -> save-if-absent -> RECONCILE. The lease makes a commitUnknown
     // mid-derive recoverable: a fresh invocation observes 'already-complete' (nothing to do), 'held' (a live
@@ -1159,6 +1191,10 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         note("durable-oli-provenance-missing");
         return { complete: false, newlySaved: false, saved: null, lineage: "durable-oli-provenance-missing" };
       }
+      // A distinct, observable COMPLETE marker for the proven-empty path (durable zero-row OLI proof) -- emitted in
+      // ADDITION to the terminal save disposition below (recorded/recovered/already-complete), never replacing it,
+      // so a later save failure still reddens the batch. Its depends_on is the exports' real request hashes.
+      if (dep.provenEmpty) note(DURABLE_OLI_PROVEN_EMPTY);
       await dl.bound("report-lineage-upsert", (signal) => reportLineage.upsertReportJob({
         cycleId: rollup.cycleId, reportKey: snap.productionReportKey, reportVersion: snap.version,
         accountId: snap.accountId, connectionId: "primary", bucket,
@@ -1386,7 +1422,9 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     // mismatch, a snapshot integrity/conflict -- all TERMINAL/CONFIGURATION failures -- are NON-resumable
     // (continuationRequired is NOT set), so they can never create an endless continuation loop. The shared
     // cycle honestly stays open (finalize returns open-work) until a genuine resolution.
-    const COMPLETE_OUTCOMES = new Set(["recorded", "recovered", "already-complete"]);
+    // A proven-empty account is COMPLETE (validly published-empty): its distinct marker joins the terminal save
+    // dispositions. durable-oli-provenance-missing is DELIBERATELY absent (still fail-closed / incomplete).
+    const COMPLETE_OUTCOMES = new Set(["recorded", "recovered", "already-complete", DURABLE_OLI_PROVEN_EMPTY]);
     const RESUMABLE_OUTCOMES = new Set(["claim-held", "reconcile-lease-lost", "reconcile-snapshot-absent", "snapshot-newer"]);
     const incompleteLineage = (rollup.derived.lineage || []).filter((l) => !COMPLETE_OUTCOMES.has(l.outcome));
     if (incompleteLineage.length > 0) {

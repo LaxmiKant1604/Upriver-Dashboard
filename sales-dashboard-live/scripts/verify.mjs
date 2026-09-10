@@ -139,6 +139,7 @@ const SUITES = [
   "test:source-schedule",
   "test:zero-export-rehearsal",
   "test:source-production-hardening",
+  "test:oli-lineage-provenance",
   "test:source-priority-dashboards",
   "test:scheduler-scope",
   "test:scheduler-regional-workflow",
