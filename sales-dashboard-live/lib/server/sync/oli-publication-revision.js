@@ -52,6 +52,20 @@ export function liveSnapshotAsOf(liveSnapshot) {
   return typeof to === "string" && /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : "";
 }
 
+// Is the CURRENTLY-live report built from (at least) the current durable OLI revision? True iff the latest VALIDATED
+// report job's lineage `depends_on` contains EVERY current durable OLI request hash (revision.deps). A hash that is
+// present in the durable OLI but MISSING from the job's depends_on means the OLI advanced -- a same-as-of CORRECTED
+// export (new/added request hash) whose live snapshot is stale even though its `to` date is unchanged. A missing /
+// unvalidated job, or empty durable deps, is never "covered" (fail toward re-deriving). This is the request-hash
+// revision comparison (not date, not updated_at); the fenced CAS (source_refreshed_at) still prevents an older
+// derive from overwriting a newer live at write time.
+export function oliRevisionCoveredByJob(revision, jobLineage) {
+  if (!revision || revision.eligible !== true || !Array.isArray(revision.deps) || revision.deps.length === 0) return false;
+  if (!jobLineage || jobLineage.validated !== true || !Array.isArray(jobLineage.dependsOn)) return false;
+  const have = new Set(jobLineage.dependsOn.map((h) => String(h)));
+  return revision.deps.every((h) => have.has(String(h)));
+}
+
 /**
  * Classify ONE (account, report) reconciliation target. Migration-free staleness (no `updated_at` as identity): the
  * reconciler passes the account's durable revision, the LATEST live snapshot for (reportKey, accountId), that
@@ -63,13 +77,16 @@ export function liveSnapshotAsOf(liveSnapshot) {
  *   - eligible, live present, readback bad  -> STALE "live-unverified" (partial write / never verified)
  *   - eligible, live as-of >= requestedAsOf + verified -> PUBLICATION_NOT_REQUIRED (already current)
  */
-export function classifyOliReportTarget({ revision, liveSnapshot = null, readbackOk = false, requestedAsOf } = {}) {
+export function classifyOliReportTarget({ revision, liveSnapshot = null, readbackOk = false, requestedAsOf, jobLineage = null } = {}) {
   if (!revision || revision.eligible !== true) {
     return { state: OLI_PUBLICATION_STATE.DEFERRED_PROVENANCE, reason: (revision && revision.reason) || "not-eligible" };
   }
   if (!liveSnapshot) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-missing" };
   const liveTo = liveSnapshotAsOf(liveSnapshot);
   if (!liveTo || (typeof requestedAsOf === "string" && liveTo < requestedAsOf)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-older-asof" };
+  // Request-hash revision comparison: even at the SAME as-of, if the durable OLI advanced (a corrected/added export
+  // hash not in the latest validated job's depends_on), the live snapshot is stale and must be re-derived.
+  if (!oliRevisionCoveredByJob(revision, jobLineage)) return { state: OLI_PUBLICATION_STATE.STALE, reason: "oli-revision-changed" };
   if (readbackOk !== true) return { state: OLI_PUBLICATION_STATE.STALE, reason: "live-unverified" };
   return { state: OLI_PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED, reason: null };
 }

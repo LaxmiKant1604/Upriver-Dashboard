@@ -62,12 +62,13 @@ function statusFromRelease(result) {
  */
 export function buildOliPublicationReconciler({
   resolveOrg, bucketAccounts, oliStart,
-  readPositiveHistory, readZeroRowProof, readLatestLiveSnapshot, readbackLive,
+  readPositiveHistory, readZeroRowProof, readLatestLiveSnapshot, readLatestJobLineage, readbackLive,
   runReleaseForAccount, rebuildBrandViewMembership,
+  openControls = async () => ({ ok: true }), closeControls = async () => ({ ok: true }),
   reportKeys = oliDependentLiveReportKeys(),
   withTimeout = (p) => p, clock = () => new Date(), log = noop,
 } = {}) {
-  for (const [name, fn] of [["resolveOrg", resolveOrg], ["bucketAccounts", bucketAccounts], ["readPositiveHistory", readPositiveHistory], ["readZeroRowProof", readZeroRowProof], ["readLatestLiveSnapshot", readLatestLiveSnapshot], ["readbackLive", readbackLive], ["runReleaseForAccount", runReleaseForAccount], ["rebuildBrandViewMembership", rebuildBrandViewMembership]]) {
+  for (const [name, fn] of [["resolveOrg", resolveOrg], ["bucketAccounts", bucketAccounts], ["readPositiveHistory", readPositiveHistory], ["readZeroRowProof", readZeroRowProof], ["readLatestLiveSnapshot", readLatestLiveSnapshot], ["readLatestJobLineage", readLatestJobLineage], ["readbackLive", readbackLive], ["runReleaseForAccount", runReleaseForAccount], ["rebuildBrandViewMembership", rebuildBrandViewMembership]]) {
     if (typeof fn !== "function") throw new Error(`buildOliPublicationReconciler requires ${name} (fail closed).`);
   }
   if (!S(oliStart) || !DATE_RE.test(S(oliStart))) throw new Error("buildOliPublicationReconciler requires a valid oliStart (fail closed).");
@@ -125,13 +126,17 @@ export function buildOliPublicationReconciler({
       }
       let anyStale = false;
       for (const rk of reportKeys) {
-        let liveSnapshot = null; let readbackOk = false;
+        let liveSnapshot = null; let readbackOk = false; let jobLineage = null;
         try { liveSnapshot = await readLatestLiveSnapshot({ reportKey: rk, accountId }); } catch { liveSnapshot = null; }
         if (liveSnapshot && S(liveSnapshot.params_hash)) {
           try { const rb = await readbackLive({ reportKey: rk, liveReportKey: rk, accountId, paramsHash: S(liveSnapshot.params_hash) }); readbackOk = !!(rb && rb.ok === true); }
           catch { readbackOk = false; }
         }
-        const cls = classifyOliReportTarget({ revision, liveSnapshot, readbackOk, requestedAsOf });
+        // Request-hash revision comparison (blocker 3): the latest VALIDATED report job's depends_on is the lineage the
+        // live snapshot was derived from; classifyOliReportTarget marks the report stale when the current durable OLI
+        // provenance is NOT fully contained in it (a same-as-of corrected/added export).
+        try { jobLineage = await readLatestJobLineage({ reportKey: rk, accountId }); } catch { jobLineage = null; }
+        const cls = classifyOliReportTarget({ revision, liveSnapshot, readbackOk, requestedAsOf, jobLineage });
         rec.reports[rk] = { state: cls.state, reason: cls.reason || null };
         if (cls.state === OLI_PUBLICATION_STATE.STALE) anyStale = true;
       }
@@ -144,54 +149,72 @@ export function buildOliPublicationReconciler({
       return summarize({ bucket, requestedAsOf, mode, dryRun, startedAt, perAccount });
     }
 
-    // Execute ONLY the stale accounts, EACH INDEPENDENTLY (WORK 5 per-account isolation): one account's failure never
-    // blocks another; a failed account keeps its exact dated LKG. Zero DataDoe export (the injected release is wired
-    // with a create-refusing adapter). Track brand-sales promotions to trigger the Brand View membership rebuild.
+    // Execute ONLY the stale accounts, EACH INDEPENDENTLY (per-ACCOUNT isolation): one account's failure never blocks
+    // another; a failed account keeps its exact dated LKG. ACCOUNT-ATOMIC (blocker 4): the production runner preflights
+    // + publishes an account's three OLI-dependent dashboards as ONE unit over its frozen cycle, so per-account the
+    // three reports share the SAME outcome -- either all verified live, or all keep LKG. (Report-level isolation is NOT
+    // claimed; the shared-cycle finalize is the required integrity contract.) Zero DataDoe export (the injected release
+    // is wired with a create-refusing adapter). Healthy accounts are processed first (sorted), so an unresolved failure
+    // never prevents a healthy account from publishing. Brand-sales promotion (account-atomic) triggers the membership
+    // status. `revisionId` is threaded so the entrypoint can bind it into the deterministic partial-cycle identity.
+    // CONTROL LIFECYCLE (blocker 2): open the publication controls + capture the fence BEFORE publishing the stale set,
+    // and ALWAYS safe-close after (finally). Immediate mode reuses the scheduler's exact fence (a renew, no re-apply /
+    // no safe-close -- the scheduler closes it); periodic mode runs the reviewed control-package apply -> publish ->
+    // safe-close. A refused/deferred open (e.g. the scheduler holds the lease, or the control apply did not commit) is
+    // NOT a hard failure: every stale account keeps its dated LKG (DEFERRED_DEPENDENCY) and retries next pass.
     const brandSalesPromoted = [];
-    for (const accountId of staleAccounts) {
-      const rec = perAccount.find((r) => r.accountId === accountId);
-      let result;
-      try { result = await runReleaseForAccount({ bucket, accountId, requestedAsOf }); }
-      catch (e) { result = { ok: false, code: 1, stage: "derive", problems: ["release-threw: " + S(e && e.message)] }; }
-      const execStatus = statusFromRelease(result);
-      const publishedKeys = new Set((result && Array.isArray(result.published) ? result.published : []).filter((p) => p && /^(published|already-current|replaced|inserted)$/.test(S(p.disposition))).map((p) => S(p.reportKey)));
-      for (const rk of reportKeys) {
-        const wasStale = rec.reports[rk] && rec.reports[rk].state === OLI_PUBLICATION_STATE.STALE;
-        if (!wasStale) continue; // an already-current report on a partially-stale account is not touched
-        if (execStatus === OLI_RECONCILE_STATUS.READBACK_VERIFIED) {
-          // The account's release verified. A report is verified only if the runner actually promoted it (an empty
-          // published set means the runner reports success without per-report identities -> trust the verified run).
-          if (publishedKeys.size === 0 || publishedKeys.has(rk)) {
-            rec.reports[rk] = { state: OLI_RECONCILE_STATUS.READBACK_VERIFIED, reason: null };
-            if (rk === BRAND_VIEW_MEMBERSHIP_SOURCE_REPORT) brandSalesPromoted.push(accountId);
+    if (staleAccounts.length > 0) try {
+      const opened = await openControls(staleAccounts);
+      if (!opened || opened.ok !== true) {
+        for (const accountId of staleAccounts) {
+          const rec = perAccount.find((r) => r.accountId === accountId);
+          for (const rk of reportKeys) if (rec.reports[rk] && rec.reports[rk].state === OLI_PUBLICATION_STATE.STALE) rec.reports[rk] = { state: OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY, reason: "controls-not-opened:" + S(opened && opened.reason), lkgPreserved: true };
+        }
+        log(`OLI_RECONCILE controls not opened (${S(opened && opened.reason)}) -- deferring ${staleAccounts.length} account(s), ZERO publication writes.`);
+      } else {
+        for (const accountId of staleAccounts) {
+          const rec = perAccount.find((r) => r.accountId === accountId);
+          let result;
+          try { result = await runReleaseForAccount({ bucket, accountId, requestedAsOf, revisionId: rec.revisionId }); }
+          catch (e) { result = { ok: false, code: 1, stage: "derive", problems: ["release-threw: " + S(e && e.message)] }; }
+          const execStatus = statusFromRelease(result);
+          const staleReports = reportKeys.filter((rk) => rec.reports[rk] && rec.reports[rk].state === OLI_PUBLICATION_STATE.STALE);
+          if (execStatus === OLI_RECONCILE_STATUS.READBACK_VERIFIED) {
+            for (const rk of staleReports) rec.reports[rk] = { state: OLI_RECONCILE_STATUS.READBACK_VERIFIED, reason: null };
+            if (staleReports.includes(BRAND_VIEW_MEMBERSHIP_SOURCE_REPORT)) brandSalesPromoted.push(accountId);
           } else {
-            // An ok run that did not promote this report leaves it STALE for the next pass (never falsely verified).
-            rec.reports[rk] = { state: OLI_PUBLICATION_STATE.STALE, reason: "not-promoted-this-pass" };
+            for (const rk of staleReports) rec.reports[rk] = { state: execStatus, reason: (result && result.problems && result.problems[0]) || null, lkgPreserved: true };
           }
-        } else {
-          rec.reports[rk] = { state: execStatus, reason: (result && result.problems && result.problems[0]) || null, lkgPreserved: true };
         }
       }
+    } finally {
+      try { await closeControls(); } catch (e) { log("OLI_RECONCILE safe-close callback error (non-fatal): " + S(e && e.message)); }
     }
 
-    // Brand View membership/directory rebuild AFTER the brand-sales promotions succeeded (never before -- a stale
-    // brand-sales must not seed the directory). Best-effort + isolated: a rebuild failure does not fail the run.
-    let brandViewRebuilt = false;
+    // Brand View membership/directory status AFTER the brand-sales promotions (never before -- a stale brand-sales must
+    // not seed the directory). The rebuild callback reports honestly: it may perform + VERIFY a real rebuild, or report
+    // 'self_heal_pending' (the read-time serveSelfHealingBrandDirectory rebuilds from the now-current brand-sales on the
+    // next serve). NEVER claim rebuilt without readback evidence. A callback error is non-fatal but reported.
+    let brandView = { status: brandSalesPromoted.length ? "not-run" : "not-required", accounts: [...new Set(brandSalesPromoted)].sort() };
     if (brandSalesPromoted.length) {
-      try { const rb = await rebuildBrandViewMembership({ bucket, accountIds: [...new Set(brandSalesPromoted)].sort() }); brandViewRebuilt = !!(rb && rb.ok !== false); }
-      catch (e) { log("brand-view membership rebuild failed (non-fatal): " + S(e && e.message)); brandViewRebuilt = false; }
+      try {
+        const rb = await rebuildBrandViewMembership({ bucket, accountIds: brandView.accounts });
+        const verified = rb && rb.rebuilt === true && rb.readbackVerified === true;
+        brandView.status = verified ? "rebuilt-verified" : (rb && S(rb.mode)) || "self_heal_pending";
+      } catch (e) { log("brand-view membership rebuild callback failed (non-fatal): " + S(e && e.message)); brandView.status = "callback-error"; }
     }
 
-    log(`OLI_RECONCILE bucket=${bucket} asOf=${requestedAsOf} mode=${mode} examined=${scope.length} stale=${staleAccounts.length} brandViewRebuilt=${brandViewRebuilt}`);
-    return summarize({ bucket, requestedAsOf, mode, dryRun, startedAt, perAccount, brandViewRebuilt });
+    const summary = summarize({ bucket, requestedAsOf, mode, dryRun, startedAt, perAccount, brandView });
+    log(`OLI_RECONCILE bucket=${bucket} asOf=${requestedAsOf} mode=${mode} outcome=${summary.outcome} examined=${scope.length} stale=${staleAccounts.length} published=${summary.counts.targetsPublished} failed=${summary.counts.targetsFailed} brandView=${brandView.status}`);
+    return summary;
   }
 
   function fail(code, bucket, requestedAsOf, mode) {
     log("OLI_RECONCILE_FAILCLOSED " + code);
-    return { ok: false, code, bucket: S(bucket), requestedAsOf: S(requestedAsOf), mode, dataDoeCreates: 0, dataDoeTokens: 0, perAccount: [], counts: emptyCounts() };
+    return { ok: false, outcome: "failed", code, bucket: S(bucket), requestedAsOf: S(requestedAsOf), mode, dataDoeCreates: 0, dataDoeTokens: 0, perAccount: [], counts: emptyCounts(), brandView: { status: "not-run", accounts: [] } };
   }
 
-  function summarize({ bucket, requestedAsOf, mode, dryRun, startedAt, perAccount, brandViewRebuilt = false }) {
+  function summarize({ bucket, requestedAsOf, mode, dryRun, startedAt, perAccount, brandView = { status: "not-required", accounts: [] } }) {
     const counts = emptyCounts();
     for (const rec of perAccount) for (const rk of Object.keys(rec.reports)) {
       const st = rec.reports[rk].state;
@@ -202,10 +225,18 @@ export function buildOliPublicationReconciler({
       else if (st === OLI_RECONCILE_STATUS.DEFERRED_PROVENANCE || st === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY) counts.targetsDeferred += 1;
       else if (st === OLI_RECONCILE_STATUS.FAILED_DERIVE || st === OLI_RECONCILE_STATUS.FAILED_PUBLISH || st === OLI_RECONCILE_STATUS.FAILED_READBACK) counts.targetsFailed += 1;
     }
+    // HONEST OUTCOME (blocker 5): ok:true (exit 0) ONLY when there is no unresolved HARD failure. A hard failure
+    // (FAILED_DERIVE/PUBLISH/READBACK) -> outcome 'failed', exit nonzero. Deferrals (provenance/dependency) keep dated
+    // LKG and are honest, not failures, but they make the pass 'partial' (not everything reached live). A dry-run that
+    // still sees stale targets is 'partial' (a plan, not a completed publication).
+    const hardFailures = counts.targetsFailed;
+    const unpublished = counts.targetsStale + counts.targetsDeferred + counts.targetsFailed;
+    const outcome = hardFailures > 0 ? "failed" : (unpublished > 0 ? "partial" : "complete");
     return {
-      ok: true, code: "OK", bucket, requestedAsOf, mode, dryRun: !!dryRun, startedAt,
+      ok: hardFailures === 0, outcome, code: hardFailures === 0 ? "OK" : "HARD_FAILURES",
+      bucket, requestedAsOf, mode, dryRun: !!dryRun, startedAt,
       accountsExamined: perAccount.length,
-      dataDoeCreates: 0, dataDoeTokens: 0, brandViewRebuilt,
+      dataDoeCreates: 0, dataDoeTokens: 0, brandView,
       counts, perAccount,
     };
   }

@@ -3,19 +3,25 @@ name: oli-publication-reconcile
 # ZERO-EXPORT OLI publication reconciler (WORK 7). Every 30 minutes it re-derives + promotes the OLI-dependent
 # canonical live dashboards (daily-reporting / brand-sales / brand-inventory) for accounts whose ALREADY-SAVED durable
 # OLI advanced past -- or was never promoted to -- their live snapshots. It is the durable safety net for the promotion
-# stranding the scheduler's per-bucket, operator-CLI-only publication leaves behind (a validated shadow that never
-# reached the bare live key, or a healthy account blocked by a sibling's un-validated shadow in an all-or-nothing
-# finalize). It is NOT a second scheduler and NEVER creates a DataDoe export, reserves a token, refreshes a source, or
-# supersedes the daily export -- the reconciler's derive adapter is forced to refuse creates (zero export, structurally).
+# stranding the scheduler's per-bucket, operator-CLI-only publication leaves behind. It is NOT a second scheduler and
+# NEVER creates a DataDoe export, reserves a token, refreshes a source, or supersedes the daily export -- the
+# reconciler's derive adapter is forced to refuse creates (zero export, structurally).
+#
+# PERIODIC CONTROL LIFECYCLE: each region runs the reviewed control-package transaction -- apply (open the publication
+# controls for EXACTLY the stale accounts + acquire the control-plane lease + capture the generation) -> publish into
+# the reviewed priority-partial-<region>-<16hex> cycle namespace with that fence -> ALWAYS safe-close with the same
+# owner/generation. The control-plane lease is GLOBAL, so regions run SEQUENTIALLY (never in parallel) -- each holds the
+# lease only for its own apply/publish/safe-close window, so a busy region never blocks another for long.
+#
+# CAPACITY (blocker 6): ONE job (one checkout + one `npm ci`) loops the 3 regions in order, each wrapped in a 7-minute
+# hard cap, so the whole pass finishes in <= ~22 min -- comfortably inside the 30-minute tick, no queued-run backlog.
+# A per-region failure/timeout is isolated (the loop continues); region + account isolation and zero-export are kept.
 #
 # SAFETY POSTURE (default OFF for live promotion):
-#   - MANUAL runs (workflow_dispatch) default to DRY-RUN (read-only plan; zero writes) and must opt in to live.
-#   - SCHEDULED runs are DRY-RUN unless the repository variable OLI_RECONCILE_LIVE == 'true' is set deliberately
-#     (after Codex review + a natural-run validation). So merging this workflow is safe -- it only reports the plan and
-#     proves DataDoe creates/tokens = 0 until an operator explicitly enables live promotion.
-#   - It ACQUIRES the SAME control-plane lease the scheduler publishes under and DEFERS (never steals) when another
-#     owner holds it, so it can never race or supersede an in-flight daily publish. Region work is isolated (a matrix
-#     with bounded concurrency) and each region has its own concurrency group.
+#   - MANUAL runs default to DRY-RUN (read-only plan; zero writes) and must opt in to live.
+#   - SCHEDULED runs are DRY-RUN unless the repository variable OLI_RECONCILE_LIVE == 'true' is set deliberately (after
+#     Codex review + a natural-run validation). Merging this workflow is safe -- it only reports the plan + proves
+#     DataDoe creates/tokens = 0 until an operator enables live promotion.
 #
 # Required repository secrets (never printed): POSTGRES_URL, SUPABASE_URL (or VITE_SUPABASE_URL),
 # SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if a secondary connection is configured).
@@ -42,9 +48,10 @@ on:
         type: string
 
 concurrency:
-  # One reconcile pass per region at a time; a delayed/overlapping tick queues rather than races. The reconciler is
-  # idempotent (an already-current live snapshot is a zero-write no-op) so a queued duplicate is harmless.
-  group: oli-publication-reconcile-${{ github.event.inputs.bucket || 'all' }}
+  # ONE reconcile pass at a time (the control-plane lease is global). A delayed/overlapping tick QUEUES rather than
+  # races; the reconciler is idempotent (an already-current live snapshot is a zero-write no-op) so a queued duplicate
+  # is harmless. The tight per-region cap keeps a pass well under 30 min so the queue never backs up.
+  group: oli-publication-reconcile
   cancel-in-progress: false
 
 permissions:
@@ -55,14 +62,8 @@ permissions:
 jobs:
   reconcile:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      # Region isolation with bounded concurrency: one region at a time (max-parallel 1), each in its own bucket.
-      # fail-fast:false so one region's failure never cancels the others.
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        bucket: ["india", "europe-au", "us-ca"]
+    # ONE job for all regions (one checkout + one npm ci). 25 < 30-minute tick; the per-region `timeout` caps each.
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: sales-dashboard-live
@@ -74,23 +75,11 @@ jobs:
       DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
       DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
     steps:
-      # Skip regions not selected by a manual single-region dispatch.
-      - name: Resolve whether this region runs
-        id: gate
-        run: |
-          want='${{ github.event.inputs.bucket }}'
-          if [ -n "$want" ] && [ "$want" != '${{ matrix.bucket }}' ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"; echo "region ${{ matrix.bucket }} skipped (dispatch restricted to $want)"; exit 0
-          fi
-          echo "run=true" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
-        if: steps.gate.outputs.run == 'true'
       - uses: actions/setup-node@v4
-        if: steps.gate.outputs.run == 'true'
         with:
           node-version: "24"
       - name: Verify required secrets are present (fail closed; never print values)
-        if: steps.gate.outputs.run == 'true'
         run: |
           missing=""
           for v in POSTGRES_URL SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY; do
@@ -99,19 +88,23 @@ jobs:
           if [ -z "${SUPABASE_URL:-}" ] && [ -z "${VITE_SUPABASE_URL:-}" ]; then missing="$missing SUPABASE_URL|VITE_SUPABASE_URL"; fi
           if [ -n "$missing" ]; then echo "STOP missing required secret(s):$missing"; exit 1; fi
       - name: Install dependencies
-        if: steps.gate.outputs.run == 'true'
         run: npm ci
-      # DRY-RUN unless a manual dispatch selected 'live' OR the repository variable OLI_RECONCILE_LIVE=='true' is set.
-      # --as-of is yesterday UTC (a conservative D-1 target); an account whose durable OLI does not prove through it is
-      # deferred (keeps LKG) and picked up by the next natural scheduler run. ZERO DataDoe creates/tokens either way.
-      - name: Reconcile OLI-dependent live dashboards (zero export)
-        if: steps.gate.outputs.run == 'true'
+      # DRY-RUN unless a manual dispatch selected 'live' OR the repository variable OLI_RECONCILE_LIVE=='true'. --as-of is
+      # yesterday UTC (a conservative D-1 target); an account whose durable OLI does not prove through it is deferred
+      # (keeps LKG) and picked up by the next natural scheduler run. ZERO DataDoe creates/tokens either way. Each region
+      # is a SEPARATE, sequential invocation (its own control-package apply/publish/safe-close) capped at 7 minutes so
+      # one region can never consume the whole budget; the loop continues on a per-region failure (isolation).
+      - name: Reconcile OLI-dependent live dashboards, all regions in order (zero export)
         run: |
           MODE='${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode || (vars.OLI_RECONCILE_LIVE == 'true' && 'live' || 'dry-run') }}'
+          ONLY='${{ github.event.inputs.bucket }}'
           ASOF="$(date -u -d 'yesterday' +%F)"
-          echo "oli-reconcile ${{ matrix.bucket }} mode=$MODE as-of=$ASOF"
-          if [ "$MODE" = "live" ]; then
-            node scripts/release/oli-publication-reconcile.mjs --bucket=${{ matrix.bucket }} --as-of="$ASOF" --mode=periodic --live
-          else
-            node scripts/release/oli-publication-reconcile.mjs --bucket=${{ matrix.bucket }} --as-of="$ASOF" --mode=periodic
-          fi
+          LIVE=""; if [ "$MODE" = "live" ]; then LIVE="--live"; fi
+          rc=0
+          for REGION in india europe-au us-ca; do
+            if [ -n "$ONLY" ] && [ "$ONLY" != "$REGION" ]; then echo "skip $REGION (dispatch restricted to $ONLY)"; continue; fi
+            echo "::group::oli-reconcile $REGION mode=$MODE as-of=$ASOF"
+            timeout 420 node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic $LIVE || { echo "region $REGION reconcile exited nonzero (isolated; continuing)"; rc=1; }
+            echo "::endgroup::"
+          done
+          exit $rc

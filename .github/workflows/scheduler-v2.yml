@@ -340,21 +340,21 @@ jobs:
         run: node scripts/release/rebuild-brand-membership.mjs
 
       # (step 11b, FULL scope) IMMEDIATE post-save OLI publication reconcile (WORK 6): right after the OLI durable save +
-      # publish, re-derive + promote any OLI-dependent live dashboard the publish left stranded (a validated shadow that
-      # never reached the bare live key, or a healthy account blocked by a sibling's un-validated shadow in the per-bucket
-      # all-or-nothing finalize) -- for EXACTLY the OLI-eligible accounts, using ALREADY-SAVED durable OLI. It runs the
-      # SAME reconciler as the 30-minute oli-publication-reconcile.yml backstop, NEVER creates a DataDoe export/token
-      # (its derive adapter refuses creates), and acquires-or-DEFERS the control-plane lease so it cannot race the publish
-      # it just followed. always() so it also catches a PARTIAL/failed publish (exactly when stranding happens). DRY-RUN
-      # by default (reports the plan; zero writes) -- LIVE promotion ONLY when the repository variable
-      # OLI_RECONCILE_LIVE=='true' is set (after Codex review + natural validation). continue-on-error + additive: it
-      # NEVER changes the scheduler's own publication outcome or its honest failure status.
-      - name: Immediate OLI publication reconcile (zero export; dry-run unless OLI_RECONCILE_LIVE)
-        if: always() && steps.cfg.outputs.scope != 'bootstrap' && steps.oli.outcome == 'success' && steps.oli.outputs.eligible_ids != '' && steps.readiness.outputs.effective_asof != ''
+      # publish AND BEFORE safe-close (so the scheduler's full_controls lease is still open), re-derive + promote any
+      # OLI-dependent live dashboard the publish left stranded (a validated shadow that never reached the bare live key,
+      # or a healthy account blocked by a sibling in the per-bucket all-or-nothing finalize) -- for EXACTLY the OLI-
+      # eligible accounts, using ALREADY-SAVED durable OLI. It runs the SAME reconciler as the 30-minute backstop and
+      # NEVER creates a DataDoe export/token (its derive adapter refuses creates). It REUSES the scheduler's EXACT fence
+      # (--run-token + the full_controls --owner-generation), renewing it -- it NEVER re-acquires or steals the lease,
+      # and NEVER safe-closes (the scheduler's safe-close step below owns it). Gated on full_controls having emitted a
+      # generation. DRY-RUN by default -- LIVE promotion ONLY when the repository variable OLI_RECONCILE_LIVE=='true'.
+      # continue-on-error + additive: it NEVER changes the scheduler's own publication outcome or its honest status.
+      - name: Immediate OLI publication reconcile (zero export; reuses full_controls fence; dry-run unless OLI_RECONCILE_LIVE)
+        if: always() && steps.cfg.outputs.scope != 'bootstrap' && steps.oli.outcome == 'success' && steps.oli.outputs.eligible_ids != '' && steps.readiness.outputs.effective_asof != '' && steps.full_controls.outputs.generation != ''
         continue-on-error: true
         run: |
           if [ "${{ vars.OLI_RECONCILE_LIVE }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
-          node scripts/release/oli-publication-reconcile.mjs --bucket=${{ steps.cfg.outputs.region }} --as-of=${{ steps.readiness.outputs.effective_asof }} --mode=immediate --accounts=${{ steps.oli.outputs.eligible_ids }} $LIVE
+          node scripts/release/oli-publication-reconcile.mjs --bucket=${{ steps.cfg.outputs.region }} --as-of=${{ steps.readiness.outputs.effective_asof }} --mode=immediate --accounts=${{ steps.oli.outputs.eligible_ids }} --run-token=${{ github.run_id }}-${{ github.run_attempt }} --owner-generation=${{ steps.full_controls.outputs.generation }} $LIVE
 
       # ===================== BOOTSTRAP scope: TRUE SCOPED PUBLICATION of EXACTLY the wave accounts ==============
       # (bootstrap step A) Open publication controls for EXACTLY the frozen dispatch-wave accounts (resolved from

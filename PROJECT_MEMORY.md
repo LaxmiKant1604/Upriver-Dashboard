@@ -1,5 +1,43 @@
 # Project Memory
 
+## OLI reconciler — Codex 5-blocker follow-up (2026-09-10, one focused commit on main, NOT pushed; verify green; code-complete, NOT production acceptance)
+
+Follow-up to 81df260 (preserved). Codex found 5 confirmed blockers in the OLI publication reconciler's LIVE wiring; all
+corrected. NO push/deploy/dispatch/migration/DataDoe export; api/*.js=12; migrations 20260923/24 untouched.
+
+1. **CYCLE NAMESPACE.** The entrypoint created an unapproved `oli-reconcile-<region>-<hash>` cycle. Now it publishes into
+   the REVIEWED `priority-partial-<region>-<16hex>` namespace (migration 20260924), gated by a read-only exact
+   `readPartialCycleCapability` preflight (fail closed / defer if unapplied); the 16-hex identity is deterministic over
+   {accountId, durable revisionId}. Proven against the REAL capability guard in oli-reconcile-prodshape.
+2. **CONTROL + LEASE LIFECYCLE.** IMMEDIATE mode now RENEWS the scheduler's EXACT fence (`--run-token` +
+   the full_controls `--owner-generation`, both threaded from scheduler-v2.yml, before safe-close) -- it never
+   re-acquires/steals and never safe-closes (the scheduler owns that). PERIODIC mode runs the reviewed control-package
+   transaction: `runControlPackageCli` apply (open controls for EXACTLY the stale accounts + acquire lease + capture
+   generation) -> publish with that fence -> ALWAYS safe-close with the same owner/generation. No standalone lease
+   without controls. New reconciler `openControls`/`closeControls` hooks wrap exactly the stale set; control-gate
+   (rollout/report-settings/approvals + generation + release) proven with a real in-memory store in oli-reconcile-prodshape.
+3. **REAL OLI REVISION COMPARISON.** `revisionId` was computed but unused. New `getLatestReportJobLineage` reads the
+   latest VALIDATED report job's `depends_on`; `oliRevisionCoveredByJob` marks a report stale when the current durable
+   OLI request hashes are NOT all present in it -- so a SAME-AS-OF corrected/added export is re-derived. Tests: same-date
+   +new-hash->stale, same-date+same-hash->no-op, unvalidated/missing job->stale, no fabricated hash; older-can't-overwrite
+   is the fenced CAS (proven by the prodshape 2nd-pass zero-write no-op).
+4. **HONEST REPORT ISOLATION.** The runner publishes an account's 3 dashboards atomically over its frozen cycle, so the
+   reconciler is now ACCOUNT-ATOMIC (all three share one outcome) and DOES NOT claim report-level isolation. The
+   impossible partial-report fake test was REMOVED; a new test proves account-atomic (a failure marks all three failed).
+5. **HONEST OUTCOME + BRAND VIEW.** run() returns complete/partial/failed; `ok:true` (exit 0) ONLY when no unresolved HARD
+   failure (FAILED_DERIVE/PUBLISH/READBACK) remains; deferrals keep LKG and make the pass 'partial'; healthy accounts
+   processed first; entrypoint exits nonzero on hard failures. Brand View reports `self_heal_pending` (read-time
+   self-heal) -- never `rebuilt` without readback evidence.
+6. **SCHEDULE CAPACITY.** The 30-min workflow is now ONE job (one checkout + one npm ci) looping the 3 regions IN ORDER
+   (the global lease forbids parallel regions), each hard-capped at 7 min, job timeout 25 min < 30-min tick -> no backlog.
+7. **PRODUCTION-SHAPE TEST** oli-reconcile-prodshape: permitted namespace + real control-package apply/generation/
+   safe-close + real publisher canonical promotion + real readback + second-pass zero-write no-op; the no-export adapter
+   makes every DataDoe create/poll/download throw.
+
+Tests: oli-continuation-ceiling 30, oli-dependent-reports 14, oli-publication-revision 24, oli-publication-reconciler 56,
+oli-reconcile-prodshape 23, oli-reconcile-workflow 19. verify GREEN (196 steps/172 suites); git diff --check clean; node --check all-clean.
+Adversarial review 0 defects. LIVE promotion OFF by default (OLI_RECONCILE_LIVE); production acceptance PENDING natural runs.
+
 ## OLI saved-data-to-dashboard publication system + P0 continuation-ceiling crash fix (2026-09-10, one focused commit on main, NOT pushed; verify 195 steps/171 suites green; code-complete, NOT production acceptance)
 
 Builds on the OLI proven-empty/partial work (3bbfad8/3a82165/709b956, all preserved). Implements a permanent ZERO-EXPORT

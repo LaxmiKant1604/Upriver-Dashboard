@@ -2,7 +2,7 @@
 // Offline + pure. 7-bit ASCII, LF.
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
-import { computeOliAccountRevision, classifyOliReportTarget, liveSnapshotAsOf, OLI_PUBLICATION_STATE } from "../lib/server/sync/oli-publication-revision.js";
+import { computeOliAccountRevision, classifyOliReportTarget, liveSnapshotAsOf, oliRevisionCoveredByJob, OLI_PUBLICATION_STATE } from "../lib/server/sync/oli-publication-revision.js";
 import { OLI_LINEAGE_STATUS } from "../lib/server/sync/source-durable-model.js";
 
 let passed = 0;
@@ -51,11 +51,25 @@ ok("a corrected re-export (different request hashes) yields a DIFFERENT revision
 const live = (to) => ({ report_key: "daily-reporting", account_id: "A01", params_hash: "ph", params: { to } });
 ok("liveSnapshotAsOf reads the content as-of from params.to (never updated_at)", liveSnapshotAsOf(live("2026-09-09")) === "2026-09-09" && liveSnapshotAsOf({}) === "");
 
-ok("not eligible -> DEFERRED_PROVENANCE (never publish)", classifyOliReportTarget({ revision: missing, liveSnapshot: null, requestedAsOf: ASOF }).state === OLI_PUBLICATION_STATE.DEFERRED_PROVENANCE);
-ok("eligible + no live snapshot -> STALE live-missing", (() => { const c = classifyOliReportTarget({ revision: posA, liveSnapshot: null, requestedAsOf: ASOF }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-missing"; })());
-ok("eligible + live built for an OLDER as-of -> STALE live-older-asof (durable OLI advanced)", (() => { const c = classifyOliReportTarget({ revision: posA, liveSnapshot: live("2026-09-07"), readbackOk: true, requestedAsOf: ASOF }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-older-asof"; })());
-ok("eligible + live at the as-of but readback FAILS -> STALE live-unverified", (() => { const c = classifyOliReportTarget({ revision: posA, liveSnapshot: live(ASOF), readbackOk: false, requestedAsOf: ASOF }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-unverified"; })());
-ok("eligible + live at/after the as-of + readback OK -> PUBLICATION_NOT_REQUIRED (already current)", classifyOliReportTarget({ revision: posA, liveSnapshot: live(ASOF), readbackOk: true, requestedAsOf: ASOF }).state === OLI_PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED);
-ok("a live snapshot with NO readable as-of is STALE (never trusted as current)", classifyOliReportTarget({ revision: posA, liveSnapshot: { params: {} }, readbackOk: true, requestedAsOf: ASOF }).state === OLI_PUBLICATION_STATE.STALE);
+// posA.deps === ["h-a","h-b"]. A job whose depends_on CONTAINS both (plus catalog) COVERS the revision; a job missing
+// one (a corrected/added export hash) does NOT.
+const jobCovers = { validated: true, dependsOn: ["h-a", "h-b", "catalog-1"] };
+const jobStale = { validated: true, dependsOn: ["h-a", "catalog-1"] }; // h-b missing -> OLI advanced
+const jobUnvalidated = { validated: false, dependsOn: ["h-a", "h-b"] };
+ok("oliRevisionCoveredByJob: a validated job whose depends_on contains every current OLI hash -> covered", oliRevisionCoveredByJob(posA, jobCovers) === true);
+ok("oliRevisionCoveredByJob: a job MISSING a current OLI hash -> NOT covered (OLI advanced)", oliRevisionCoveredByJob(posA, jobStale) === false);
+ok("oliRevisionCoveredByJob: an UNVALIDATED job -> NOT covered", oliRevisionCoveredByJob(posA, jobUnvalidated) === false);
+ok("oliRevisionCoveredByJob: a missing job -> NOT covered (fail toward re-deriving)", oliRevisionCoveredByJob(posA, null) === false);
+ok("oliRevisionCoveredByJob: an ineligible revision is never covered", oliRevisionCoveredByJob(missing, jobCovers) === false);
+
+ok("not eligible -> DEFERRED_PROVENANCE (never publish)", classifyOliReportTarget({ revision: missing, liveSnapshot: null, requestedAsOf: ASOF, jobLineage: null }).state === OLI_PUBLICATION_STATE.DEFERRED_PROVENANCE);
+ok("eligible + no live snapshot -> STALE live-missing", (() => { const c = classifyOliReportTarget({ revision: posA, liveSnapshot: null, requestedAsOf: ASOF, jobLineage: jobCovers }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-missing"; })());
+ok("eligible + live built for an OLDER as-of -> STALE live-older-asof (durable OLI advanced)", (() => { const c = classifyOliReportTarget({ revision: posA, liveSnapshot: live("2026-09-07"), readbackOk: true, requestedAsOf: ASOF, jobLineage: jobCovers }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-older-asof"; })());
+// (blocker 3) SAME as-of + NEW OLI hash (job missing it) -> stale/reconcile, even with a verified readback.
+ok("SAME date + NEW OLI hash (job lineage stale) -> STALE oli-revision-changed", (() => { const c = classifyOliReportTarget({ revision: posA, liveSnapshot: live(ASOF), readbackOk: true, requestedAsOf: ASOF, jobLineage: jobStale }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "oli-revision-changed"; })());
+ok("eligible + live at the as-of + covered but readback FAILS -> STALE live-unverified", (() => { const c = classifyOliReportTarget({ revision: posA, liveSnapshot: live(ASOF), readbackOk: false, requestedAsOf: ASOF, jobLineage: jobCovers }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "live-unverified"; })());
+// (blocker 3) SAME date + SAME hash (job covers) + verified -> no-op.
+ok("SAME date + SAME OLI hash (job covers) + verified -> PUBLICATION_NOT_REQUIRED (no-op)", classifyOliReportTarget({ revision: posA, liveSnapshot: live(ASOF), readbackOk: true, requestedAsOf: ASOF, jobLineage: jobCovers }).state === OLI_PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED);
+ok("a live snapshot with NO readable as-of is STALE (never trusted as current)", classifyOliReportTarget({ revision: posA, liveSnapshot: { params: {} }, readbackOk: true, requestedAsOf: ASOF, jobLineage: jobCovers }).state === OLI_PUBLICATION_STATE.STALE);
 
 writeSync(1, `\noli-publication-revision: ${passed} assertions passed\n`);

@@ -3925,6 +3925,34 @@ export async function getLatestSyncReportJob(reportKey, accountId) {
   };
 }
 
+// OLI reconciler read (revision comparison): the LATEST sync_report_jobs row for one exact (report_key, account_id)
+// with its lineage `depends_on` (the source request hashes the currently-promoted live snapshot was derived from),
+// plus validated + snapshot_params_hash + latest_data_date. Read-only; returns a typed flat row or null. Used to
+// detect a SAME-AS-OF but content-CORRECTED OLI export: the current durable OLI provenance hashes are compared
+// against this depends_on -- a hash not present here means the OLI advanced and the live snapshot is stale.
+export async function getLatestReportJobLineage(reportKey, accountId) {
+  const query = new URLSearchParams({
+    select: "cycle_id,report_key,account_id,validated,depends_on,snapshot_params_hash,latest_data_date,created_at,sync_cycles(status)",
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    order: "created_at.desc",
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/sync_report_jobs?${query}`);
+  const row = Array.isArray(rows) ? rows[0] : null;
+  if (!row) return null;
+  const cycle = Array.isArray(row.sync_cycles) ? row.sync_cycles[0] : row.sync_cycles;
+  return {
+    reportKey: row.report_key,
+    accountId: row.account_id,
+    validated: row.validated === true,
+    dependsOn: Array.isArray(row.depends_on) ? row.depends_on.map((h) => String(h)) : [],
+    snapshotParamsHash: row.snapshot_params_hash ?? null,
+    latestDataDate: row.latest_data_date ?? null,
+    cycleStatus: cycle && typeof cycle === "object" ? (cycle.status ?? null) : null,
+  };
+}
+
 // Gate-7 publisher hydration: a report snapshot whose payload was offloaded to Storage is read back through
 // this ONE trusted loader (same private bucket as every dashboard snapshot object). Returns the parsed JSON
 // payload, or null when the object is absent; throws on a transport failure -- the publisher fails closed on
