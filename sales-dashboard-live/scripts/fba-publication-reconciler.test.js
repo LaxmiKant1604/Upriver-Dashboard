@@ -5,7 +5,7 @@
 // per-account read isolation; missing snapshot preserves LKG; readback failure -> non-green; manual dry-run -> zero
 // writes; zero provider export. Offline; zero network. 7-bit ASCII, LF.
 import assert from "node:assert/strict";
-import { writeSync } from "node:fs";
+import { writeSync, readFileSync } from "node:fs";
 import { buildFbaPublicationReconciler, FBA_RECONCILE_STATUS } from "../lib/server/sync/fba-publication-reconciler.js";
 
 let passed = 0;
@@ -193,6 +193,46 @@ test("dependency-safety: the FBA reconciler wrapper + core reference NO provider
     ok("core has no '" + sym + "'", !core.includes(sym));
   }
   ok("wrapper imports the FBA registry + FBA revision + shared core only (never datadoe/source-sync-driver)", /from "\.\/fba-dependent-reports\.js"/.test(wrap) && /from "\.\/fba-inventory-revision\.js"/.test(wrap) && /from "\.\/saved-data-reconciler\.js"/.test(wrap) && !/from "\.\.\/datadoe/.test(wrap) && !/source-sync-driver/.test(wrap));
+});
+
+// ENTRYPOINT GUARD (OLI-parity, closes an adversarial-review finding): the FBA zero-export invariant hinges on the
+// production entrypoint wiring the create-refusing adapter into the REAL release. Without this source-scan, a
+// regression that drops `makeInnerAdapter: makeNoExportInnerAdapter` (buildPriorityDashboardsRelease then DEFAULTS to
+// the real makeDataDoeAdapter export transport) or neuters the throwing adapter would ship GREEN. This mirrors
+// oli-publication-reconciler.test.js's entrypoint guard so the safety-critical wiring is regression-tested for FBA too.
+test("entrypoint guard: fba-publication-reconcile.mjs wires the NO-EXPORT adapter into the real release + the reviewed namespace/control/deadline/signal wiring", () => {
+  const mjs = readFileSync(new URL("./release/fba-publication-reconcile.mjs", import.meta.url), "utf8");
+  // (1) zero provider export: the no-export inner adapter is wired into buildPriorityDashboardsRelease, create/poll/
+  // download all throw (>=3 FBA_RECONCILER_NO_EXPORT), and NO real export transport symbol appears.
+  ok("makeInnerAdapter is the no-export adapter (never the default makeDataDoeAdapter)", /makeInnerAdapter: makeNoExportInnerAdapter/.test(mjs));
+  ok("create/poll/download all throw FBA_RECONCILER_NO_EXPORT (>=3)", (mjs.match(/FBA_RECONCILER_NO_EXPORT/g) || []).length >= 3);
+  ok("no real provider export/token transport symbol", !/createExport\(/.test(mjs) && !/makeDataDoeAdapter/.test(mjs) && !/exportsCreate/.test(mjs) && !/reserveTokens/.test(mjs) && !/oli-refresh-d1/.test(mjs));
+  // (2) reviewed priority-partial namespace + capability preflight; cycle bucket over {accountId, FBA revisionId}.
+  ok("cycle bucket is priority-partial-<region>-<16hex> over {accountId, revisionId}", /"priority-partial-" \+ b \+ "-" \+ sha256\(JSON\.stringify\(\[accountId, revisionId/.test(mjs));
+  ok("readPartialCycleCapability gates the namespace (fail closed)", /readPartialCycleCapability\(/.test(mjs) && /PRIORITY_PARTIAL_MIGRATION_PENDING/.test(mjs));
+  // (3) control lifecycle: immediate renews the scheduler fence; periodic apply + always safe-close; never acquireControlLease.
+  ok("immediate renews the fence; periodic apply + rollback safe-close; never a standalone acquire", /renewControlPlaneLease\(\{ ownerToken: runToken, generation: ownerGeneration/.test(mjs) && /runControlPackageCli\(\{[\s\S]{0,120}mode: "apply"/.test(mjs) && /runControlPackageCli\(\{ mode: "rollback"/.test(mjs) && !/acquireControlLease\(/.test(mjs));
+  ok("apply + safe-close detect COMMIT_UNKNOWN (code 3)", (mjs.match(/COMMIT_UNKNOWN \(code 3\)/g) || []).length >= 2 && /commitUnknown: true/.test(mjs));
+  // (4) EVIDENCE-BASED closure: safe-close READS the real control plane and requires it PROVEN closed.
+  ok("evidence-based closure (readControlPlaneClosed + require proven closed)", /async function readControlPlaneClosed\(\)/.test(mjs) && /CONTROLLED_REPORT_KEYS/.test(mjs) && /if \(!state\.closed\) return \{ ok: false/.test(mjs));
+  // (5) typed threading of the runner's classification (status/leaseLost/reason) -- no free-text matching.
+  ok("runReleaseForAccount threads typed status/leaseLost/reason", /status: result\.status/.test(mjs) && /leaseLost: result\.leaseLost === true/.test(mjs) && /reason: result\.reason/.test(mjs));
+  // (6) cooperative deadline + --cleanup reclaim path; REQUIRED (ref'd) timers (no .unref()).
+  ok("cooperative deadline (--deadline-seconds -> outOfTime) + --cleanup reclaim", /deadline-seconds/.test(mjs) && /const outOfTime = \(\)/.test(mjs) && /--cleanup/.test(mjs) && /mode: "reclaim"/.test(mjs));
+  ok("the deadline + settlement-grace timers are REQUIRED (no .unref() lets the loop empty into exit 13)", !/\.unref\s*\(\s*\)/.test(mjs));
+  // (7) REAL termination boundary: an aborted op has NO control fence + verifyLease returns not-owned.
+  ok("signal-aware runReleaseForAccount: aborted -> null fence + verifyLease not-owned (no write after deadline)", /runReleaseForAccount\(\{ bucket: b, accountId, requestedAsOf, revisionId, signal \}\)/.test(mjs) && /getControlFence: \(\) => \(aborted\(\) \? null : leaseFence\)/.test(mjs) && /const verifyLeaseForOp = async \(\) => \(aborted\(\) \? \{ ok: false/.test(mjs));
+  ok("the entrypoint AWAITS confirmed settlement after abort (grace-bounded awaitSettled + real AbortController)", /awaitSettled/.test(mjs) && /settled: false/.test(mjs) && /makeAbortController: \(\) => new AbortController\(\)/.test(mjs));
+  // (8) DRY-RUN default: LIVE only under --live (the workflow sets it from FBA_RECONCILE_LIVE), and dry-run neutralizes controls.
+  ok("dry-run default; openControls/closeControls are no-ops under dry-run (zero writes)", /const dryRun = !live/.test(mjs) && /openControls: dryRun \? \(async \(\) => \(\{ ok: true \}\)\) : openControls/.test(mjs) && /closeControls: dryRun \? \(async \(\) => \(\{ ok: true \}\)\) : closeControls/.test(mjs));
+});
+
+test("entrypoint guard: the periodic workflow is DRY-RUN unless FBA_RECONCILE_LIVE=='true'; MANUAL defaults to dry-run", () => {
+  const yml = readFileSync(new URL("../../.github/workflows/fba-publication-reconcile.yml", import.meta.url), "utf8");
+  ok("scheduled runs are dry-run unless vars.FBA_RECONCILE_LIVE == 'true'", /vars\.FBA_RECONCILE_LIVE == 'true' && 'live' \|\| 'dry-run'/.test(yml));
+  ok("manual dispatch defaults to dry-run", /default: "dry-run"/.test(yml));
+  ok("the cleanup gate mirrors the reconcile MODE==live decision EXACTLY (manual dry-run never cleans even if the repo flag is set)", /github\.event\.inputs\.mode == 'live'/.test(yml) && /github\.event_name != 'workflow_dispatch' && vars\.FBA_RECONCILE_LIVE == 'true'/.test(yml));
+  ok("least-privilege (contents: read), no actions:write", /permissions:[\s\S]{0,120}contents: read/.test(yml) && !/actions: write/.test(yml));
 });
 
 async function main() {
