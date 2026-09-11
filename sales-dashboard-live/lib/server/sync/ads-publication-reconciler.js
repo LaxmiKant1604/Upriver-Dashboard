@@ -30,8 +30,11 @@ const S = (v) => (v == null ? "" : String(v));
  * Build a SINGLE-REPORT Campaign-Ads publication reconciler for `reportKey` (daily-reporting or ppc-performance).
  * Ads-specific collaborators:
  *   readAdsCoverageState({ organizationFingerprint, connectionId, accountId, sourceKey, requestedAsOf })
- *       -> { windows:[{from,to}], contentRev, latestMetricDate, read }   (durable ads_sync_coverage + ads_sync_state,
- *          exactly getAdsCoverageAndState; content_rev degrades fail-soft when 20260923's column is absent).
+ *       -> { windows:[{from,to}], contentRev, latestMetricDate, read }   (durable ads_sync_coverage + ads_sync_state via
+ *          getDailyAdsCoverage). `sourceKey` is the REGISTRY grain (ads-campaign-date, ...); the reader MUST translate it
+ *          to the durable WORKER key (adsWorkerKeyForGrain: campaign-performance-v1, ...) that those tables are keyed by
+ *          before the read -- reading under the registry grain filters to zero rows, silently deferring every account.
+ *          content_rev degrades fail-soft when migration 20260923's column is absent.
  *   resolveMarketplace(accountId) -> "<marketplace>"   ("" -> the account defers, never a blank-market token).
  * Every other collaborator is passed straight through to the shared core (byte-identical pattern to the OLI/FBA wrappers).
  */

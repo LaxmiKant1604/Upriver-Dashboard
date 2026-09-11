@@ -9,7 +9,7 @@ import {
 import {
   ADS_SOURCE_KEYS, ADS_PRIMARY_SOURCE_KEY, ADS_CAMPAIGN_SOURCE_KEY, ADS_TARGETING_SOURCE_KEY, ADS_SEARCH_TERMS_SOURCE_KEY,
   adsDependentLiveReportKeys, isAdsDependentLiveReport, adsGrainsForReport, adsRequiredCoverageDays,
-  assertAdsDependentReportsConsistency,
+  assertAdsDependentReportsConsistency, ADS_GRAIN_WORKER_KEY, adsWorkerKeyForGrain,
 } from "../lib/server/sync/ads-dependent-reports.js";
 
 let passed = 0;
@@ -29,6 +29,11 @@ ok("registry: daily-reporting + ppc-performance are Ads-dependent", adsDependent
 ok("registry: daily requires campaign ONLY; ppc requires all three", adsGrainsForReport("daily-reporting").join(",") === ADS_CAMPAIGN_SOURCE_KEY && adsGrainsForReport("ppc-performance").length === 3);
 ok("registry: required coverage windows (daily 7, ppc 30)", adsRequiredCoverageDays("daily-reporting") === 7 && adsRequiredCoverageDays("ppc-performance") === 30);
 ok("registry: consistency assertion passes for the real map", (() => { try { assertAdsDependentReportsConsistency(); return true; } catch { return false; } })());
+// ---- DEFECT 1: registry grain -> durable WORKER key (ads_sync_coverage/state are keyed by the worker key) ----
+ok("worker key: campaign registry grain -> campaign-performance-v1", adsWorkerKeyForGrain(ADS_CAMPAIGN_SOURCE_KEY) === "campaign-performance-v1");
+ok("worker key: targeting -> keyword-targeting-performance-v1; search-terms -> search-terms-performance-v1", adsWorkerKeyForGrain(ADS_TARGETING_SOURCE_KEY) === "keyword-targeting-performance-v1" && adsWorkerKeyForGrain(ADS_SEARCH_TERMS_SOURCE_KEY) === "search-terms-performance-v1");
+ok("worker key: every registry grain maps to a DISTINCT worker key (never the registry key itself)", (() => { const ws = ADS_SOURCE_KEYS.map((k) => ADS_GRAIN_WORKER_KEY[k]); return ws.every((w) => w && !ADS_SOURCE_KEYS.includes(w)) && new Set(ws).size === ws.length; })());
+ok("worker key: an unknown grain FAILS CLOSED (never a silent zero-row read)", (() => { try { adsWorkerKeyForGrain("ads-unknown"); return false; } catch { return true; } })());
 
 // ---- strict continuous coverage evaluator (blocker 4) ----
 ok("coverage: a single window spanning [from..to] proves it", coverageProvesContinuousRange([{ from: "2026-09-01", to: ASOF }], REQ_DAILY, ASOF) === true);
@@ -75,5 +80,22 @@ ok("cross-org isolation (revisionId)", computeAdsReportRevision(daily({ organiza
 
 // ---- token determinism + grain-order independence ----
 ok("token deterministic + grain-order independent", adsContentProvenanceToken({ accountId: A, marketplace: "US", grainRevs: [{ sourceKey: ADS_TARGETING_SOURCE_KEY, contentRev: "t1" }, { sourceKey: ADS_CAMPAIGN_SOURCE_KEY, contentRev: "c1" }] }) === adsContentProvenanceToken({ accountId: A, marketplace: "US", grainRevs: [{ sourceKey: ADS_CAMPAIGN_SOURCE_KEY, contentRev: "c1" }, { sourceKey: ADS_TARGETING_SOURCE_KEY, contentRev: "t1" }] }));
+
+// ---- CROSS-PATH marketplace normalization: the hot-derive binding (raw trimmed country) and the reconciler (upper-
+// cased) MUST fold to the SAME token, else [token] is never a subset of durable_content_deps and the reconciler loops ----
+ok("token: marketplace is case/whitespace-normalized ('us' == 'US' == ' Us ')", adsContentProvenanceToken({ accountId: A, marketplace: "us", grainRevs: [{ sourceKey: ADS_CAMPAIGN_SOURCE_KEY, contentRev: "c1" }] }) === adsContentProvenanceToken({ accountId: A, marketplace: "US", grainRevs: [{ sourceKey: ADS_CAMPAIGN_SOURCE_KEY, contentRev: "c1" }] }) && adsContentProvenanceToken({ accountId: A, marketplace: " Us ", grainRevs: [{ sourceKey: ADS_CAMPAIGN_SOURCE_KEY, contentRev: "c1" }] }) === adsContentProvenanceToken({ accountId: A, marketplace: "US", grainRevs: [{ sourceKey: ADS_CAMPAIGN_SOURCE_KEY, contentRev: "c1" }] }));
+ok("revision: a lowercase directory country yields the SAME token + revisionId as the uppercased form (cross-path convergence)", (() => { const lo = computeAdsReportRevision(daily({ marketplace: "us" })); const hi = computeAdsReportRevision(daily({ marketplace: "US" })); return lo.eligible && hi.eligible && lo.contentDeps[0] === hi.contentDeps[0] && lo.revisionId === hi.revisionId; })());
+
+// ---- ITEM 4 CONVERGENCE LINCHPIN: the hot scheduler-derive binds durable_content_deps = [adsContentProvenanceToken(
+// campaign grain)] with the RAW directory country; the reconciler's daily revision.contentDeps[0] is computed from the
+// upper-cased directory. They MUST be byte-identical or [token] is never a subset of durable_content_deps -> the
+// reconciler re-derives forever (never converges). Proven with the actual hot-derive inputs (registry campaign grain
+// key, connectionId "primary", raw lowercase country) vs the reconciler's revision (upper-cased). ----
+ok("item 4: the hot-derive daily binding token == the reconciler's daily revision contentDeps (byte-identical -> convergence)", (() => {
+  const contentRev = "rev-c1";
+  const hotToken = adsContentProvenanceToken({ accountId: A, connectionId: "primary", marketplace: "us", grainRevs: [{ sourceKey: ADS_CAMPAIGN_SOURCE_KEY, contentRev }] });
+  const rev = computeAdsReportRevision(daily({ marketplace: "US", grains: { [ADS_CAMPAIGN_SOURCE_KEY]: grain({ contentRev }) } }));
+  return rev.eligible && rev.contentDeps.length === 1 && rev.contentDeps[0] === hotToken;
+})());
 
 writeSync(1, `\nads-publication-revision: ${passed} assertions passed\n`);

@@ -30,6 +30,30 @@ export const ADS_SEARCH_TERMS_SOURCE_KEY = "ads-search-terms-date";
 export const ADS_SOURCE_KEYS = Object.freeze([ADS_CAMPAIGN_SOURCE_KEY, ADS_TARGETING_SOURCE_KEY, ADS_SEARCH_TERMS_SOURCE_KEY]);
 export const ADS_PRIMARY_SOURCE_KEY = ADS_CAMPAIGN_SOURCE_KEY;
 
+// Registry grain key -> the DURABLE WORKER key the Ads sync architecture writes coverage/state under. The source-
+// registry FAMILY keys above (ads-campaign-date, ...) name the family; the durable coverage/state tables
+// (ads_sync_coverage / ads_sync_state) are keyed by the ADS WORKER key instead (ads-sync.js ADS_SOURCES[].key ==
+// scheduled-campaign-ads-runner.js CAMPAIGN_ADS_GRAIN == active-ads-source.js CAMPAIGN_ADS_SOURCE_KEY for the campaign
+// grain). The reconciler must therefore READ durable coverage/state under the WORKER key -- reading under the registry
+// grain (ads-campaign-date) filters ads_sync_coverage/state to zero rows, so EVERY account would silently defer
+// (unavailable), a green 100% no-op that never reconciles. The content-provenance token + durable_content_deps stay
+// keyed by the REGISTRY grain (what the normal derive and the hot-derive binding record), so the read key and the token
+// key are reconciled DELIBERATELY -- never conflated (passing the worker key as the grain everywhere would break the
+// ppc targeting/search-terms tokens). Kept as literals so this leaf pulls in NO runtime/transport module.
+export const ADS_GRAIN_WORKER_KEY = Object.freeze({
+  [ADS_CAMPAIGN_SOURCE_KEY]: "campaign-performance-v1",
+  [ADS_TARGETING_SOURCE_KEY]: "keyword-targeting-performance-v1",
+  [ADS_SEARCH_TERMS_SOURCE_KEY]: "search-terms-performance-v1",
+});
+
+// The durable worker key ads_sync_coverage / ads_sync_state are keyed by, for a registry Ads grain. Fail closed: an
+// unknown grain has no durable coverage and MUST NOT silently read zero rows (which would defer every account green).
+export function adsWorkerKeyForGrain(grainKey) {
+  const worker = ADS_GRAIN_WORKER_KEY[String(grainKey)];
+  if (!worker) throw new Error(`ads-dependent-reports: no durable worker key for Ads grain ${String(grainKey)} (fail closed).`);
+  return worker;
+}
+
 // Per-live-report Campaign-Ads-inclusive lineage families, keyed by the CANONICAL live report key (the publisher's
 // SCHEDULER_LIVE_SNAPSHOT_CONTRACTS key). Frozen so no caller mutates the shared map. Only the durably-reconcilable
 // Ads-dependent LIVE reports are listed (the durably-direct Campaign Ads workspace + the materialized brand-view are
@@ -95,6 +119,11 @@ export function assertAdsDependentReportsConsistency(map = ADS_LINEAGE_DEPENDS_O
     if (!(Number.isInteger(ADS_REPORT_COVERAGE_DAYS[k]) && ADS_REPORT_COVERAGE_DAYS[k] > 0)) throw new Error(`ads-dependent-reports: ${k} has no positive ADS_REPORT_COVERAGE_DAYS (fail closed).`);
   }
   if (adsReportKeysFrom(map).length !== keys.length) throw new Error("ads-dependent-reports: every declared report must be Ads-dependent (fail closed).");
+  // Module invariant: every registry Ads grain maps to a DISTINCT durable worker key (else the reconciler reads the
+  // wrong -- or zero -- coverage rows and silently defers). Checked at import alongside the lineage consistency.
+  const workerKeys = ADS_SOURCE_KEYS.map((k) => ADS_GRAIN_WORKER_KEY[k]);
+  if (workerKeys.some((w) => !w)) throw new Error("ads-dependent-reports: an Ads grain has no durable worker key (fail closed).");
+  if (new Set(workerKeys).size !== workerKeys.length) throw new Error("ads-dependent-reports: two Ads grains map to the same durable worker key (fail closed).");
 }
 
 assertAdsDependentReportsConsistency();

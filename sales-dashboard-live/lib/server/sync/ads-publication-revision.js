@@ -28,6 +28,13 @@ import { ADS_SOURCE_KEYS, ADS_PRIMARY_SOURCE_KEY } from "./ads-dependent-reports
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
 const asDay = (v) => S(v).slice(0, 10); // YYYY-MM-DD prefix of a date / timestamptz string
+// CANONICAL marketplace-country form for the content token. The token is produced by BOTH the reconciler
+// (computeAdsReportRevision) and the hot scheduler derive (durable_content_deps binding), from DIFFERENT directory-read
+// paths that normalize the country differently (the reconciler upper-cases; the hot derive kept the raw trimmed value).
+// A marketplace-code is a case-insensitive ISO code, so normalize it HERE -- at the single token chokepoint both paths
+// share -- so the two independently-computed tokens are byte-identical (else [token] would never be a subset of
+// durable_content_deps and the reconciler could never converge). A blank stays blank (rejected upstream).
+const normMarket = (v) => S(v).trim().toUpperCase();
 
 export const ADS_REVISION_STATUS = Object.freeze({ AVAILABLE: "available", COVERED_EMPTY: "covered-empty", MISSING: "missing" });
 
@@ -72,7 +79,7 @@ export function adsContentProvenanceToken({ accountId, connectionId = "primary",
     .map((g) => ({ k: S(g.sourceKey), rev: S(g.contentRev) }))
     .sort((a, b) => (a.k < b.k ? -1 : a.k > b.k ? 1 : 0));
   const body = folded.map((g) => g.k + "=" + g.rev).join(",");
-  return ["ads", S(accountId), S(connectionId), S(marketplace), body].join("|");
+  return ["ads", S(accountId), S(connectionId), normMarket(marketplace), body].join("|");
 }
 
 /**
@@ -92,6 +99,7 @@ export function computeAdsReportRevision({ organizationFingerprint, connectionId
   if (!nb(organizationFingerprint) || !nb(accountId)) return miss("incomplete-account-boundary");
   if (!isCalendarDate(requestedAsOf)) return miss("requested-asof-invalid");
   if (!isCalendarDate(requiredFrom) || requiredFrom > S(requestedAsOf)) return miss("required-window-invalid");
+  marketplace = normMarket(marketplace); // canonical form -> eligibility, revisionId, and the token all agree cross-path
   if (!nb(marketplace)) return miss("marketplace-unavailable"); // blank/unreadable marketplace defers (no blank-market token)
   const req = [...new Set((Array.isArray(requiredGrains) ? requiredGrains : []).map(S).filter((k) => ADS_SOURCE_KEYS.includes(k)))].sort();
   if (req.length === 0 || !req.includes(ADS_PRIMARY_SOURCE_KEY)) return miss("required-grains-invalid");

@@ -397,11 +397,11 @@ test("D3. exactly ONE scheduled EXPORT owner remains: scheduler-v2. The other sc
   // fba-publication-reconcile (zero-export dashboard promotion of already-saved durable FBA inventory) are the other
   // scheduled workflows and are structurally ZERO-EXPORT: each runs ONLY its own operator (whose module graph contains
   // no export adapter/create path); none invokes an export/release/golive script that issues a paid create.
-  assert.deepEqual(scheduled, ["account-onboarding.yml", "fba-publication-reconcile.yml", "oli-publication-reconcile.yml", "scheduler-recovery.yml", "scheduler-v2.yml"],
-    "exactly the scheduler + the four zero-export scheduled workers are scheduled; got " + JSON.stringify(scheduled));
-  // oli/fba-publication-reconcile: exactly the reconciler entrypoint (its core module + revision/registry graph reaches
-  // no DataDoe export transport), no export/create/token/force-latest symbol anywhere in the workflow.
-  for (const [wf, op] of [["oli-publication-reconcile.yml", "node scripts/release/oli-publication-reconcile.mjs"], ["fba-publication-reconcile.yml", "node scripts/release/fba-publication-reconcile.mjs"]]) {
+  assert.deepEqual(scheduled, ["account-onboarding.yml", "ads-publication-reconcile.yml", "fba-publication-reconcile.yml", "oli-publication-reconcile.yml", "scheduler-recovery.yml", "scheduler-v2.yml"],
+    "exactly the scheduler + the five zero-export scheduled workers are scheduled; got " + JSON.stringify(scheduled));
+  // oli/fba/ads-publication-reconcile: exactly the reconciler entrypoint (its core module + revision/registry graph
+  // reaches no DataDoe export transport), no export/create/token/force-latest symbol anywhere in the workflow.
+  for (const [wf, op] of [["oli-publication-reconcile.yml", "node scripts/release/oli-publication-reconcile.mjs"], ["fba-publication-reconcile.yml", "node scripts/release/fba-publication-reconcile.mjs"], ["ads-publication-reconcile.yml", "node scripts/release/ads-publication-reconcile.mjs"]]) {
     const reconcile = readFileSync(resolve(WORKFLOWS_DIR, wf), "utf8");
     const reconcileCalls = [...reconcile.matchAll(/node scripts\/[^\s"']+/g)].map((m) => m[0]);
     assert.deepEqual([...new Set(reconcileCalls)], [op],

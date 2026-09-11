@@ -37,6 +37,8 @@
   "test:ads-publication-revision": "node scripts/ads-publication-revision.test.js",
   "test:listings-durable-migration-audit": "node scripts/listings-durable-migration-audit.test.js",
   "test:fba-publication-reconciler": "node scripts/fba-publication-reconciler.test.js",
+  "test:ads-publication-reconciler": "node scripts/ads-publication-reconciler.test.js",
+  "test:ads-publication-reconciler-behavior": "node scripts/ads-publication-reconciler-behavior.test.js",
   "test:fba-reconcile-prodshape": "node scripts/fba-reconcile-prodshape.test.js",
     "test:source-tranche": "node scripts/source-tranche.test.js",
     "test:source-batching": "node scripts/source-batching.test.js",

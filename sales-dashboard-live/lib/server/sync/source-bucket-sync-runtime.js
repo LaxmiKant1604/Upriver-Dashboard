@@ -47,10 +47,12 @@ import {
   deriveDurableDashboardSnapshots, DAILY_ADS_GRAIN, BRAND_VIEW_ADS_GRAIN,
   dailyReportingReadiness, brandViewReadiness,
 } from "./durable-dashboards.js";
-import { ACTIVE_ADS_SOURCE_KEY, ACTIVE_ADS_REGISTRY_KEY } from "../active-ads-source.js";
+import { ACTIVE_ADS_SOURCE_KEY, ACTIVE_ADS_REGISTRY_KEY, CAMPAIGN_ADS_SOURCE_KEY } from "../active-ads-source.js";
 import { shadowSnapshotKey, REPORT_DERIVATIONS } from "./report-derivation.js";
 import { buildBrandInventorySnapshot, BRAND_INVENTORY_SNAPSHOT_KEY, BRAND_INVENTORY_REPORT_VERSION } from "../reports/brand-view.js";
 import { fbaContentProvenanceToken } from "./fba-inventory-revision.js";
+import { adsContentProvenanceToken } from "./ads-publication-revision.js";
+import { ADS_CAMPAIGN_SOURCE_KEY } from "./ads-dependent-reports.js";
 import {
   getSourceControls, getSourceCoverageWindows, getSourceSnapshot,
   recordSourceSnapshot, upsertSourceRunStatus,
@@ -1363,8 +1365,27 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
           throw err;
         }
       }
+      // Ads hot-derive binding (WORK A item 4): daily-reporting consumes the ACTIVE Campaign Ads grain, so bind its
+      // DURABLE Ads content-provenance token into durable_content_deps -- BYTE-IDENTICAL to computeAdsReportRevision's
+      // token (same helper, same registry grain key, same marketplace normalized at the token chokepoint) -- so the
+      // Campaign-Ads reconciler recognizes convergence (revision.contentDeps subset of durable_content_deps) and a
+      // same-date Ads correction (new content_rev -> new token) is provably NOT covered -> re-derive. This is the exact
+      // brand-inventory/FBA pattern (FBA token in durable_content_deps, OLI/catalog in depends_on). It NEVER affects the
+      // OLI reconciler (its daily revision.contentDeps is [] -> [] subset of anything). Bound ONLY when the ACTIVE grain
+      // IS Campaign (the reconciler is campaign-specific) and the account has a durable campaign content_rev +
+      // marketplace; otherwise [] (the reconciler re-derives once the campaign grain is durably readable).
+      const adsCountryByAccount = new Map(accounts.map((a) => [String(a.accountId), a.country]));
+      const dailyAdsContentDeps = (accountId) => {
+        if (ACTIVE_ADS_SOURCE_KEY !== CAMPAIGN_ADS_SOURCE_KEY) return [];
+        const cov = evidence.activeAdsCoverageStateByAccountId ? evidence.activeAdsCoverageStateByAccountId[accountId] : null;
+        const contentRev = cov && String(cov.read) === "ok" ? cov.contentRev : null;
+        const marketplace = adsCountryByAccount.get(String(accountId)) || "";
+        if (!(contentRev && String(contentRev).trim() !== "") || String(marketplace).trim() === "") return [];
+        return [adsContentProvenanceToken({ accountId, connectionId: "primary", marketplace, grainRevs: [{ sourceKey: ADS_CAMPAIGN_SOURCE_KEY, contentRev }] })];
+      };
       for (const snap of derived.daily.snapshots) {
         await ensureTime("snapshot-save");
+        snap.durableContentDeps = dailyAdsContentDeps(snap.accountId);
         const r = await saveWithLineage(snap, { reportVersion: snap.version, accountId: snap.accountId, from: dailyWindow.from, to: dailyWindow.to, brand: "ALL" });
         if (r.complete) dailySaved += 1;
       }
