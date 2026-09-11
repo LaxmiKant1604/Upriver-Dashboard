@@ -237,8 +237,9 @@ export async function runPriorityDashboardsRelease(deps = {}) {
 
 /**
  * Build the EXACT-identity live read-back used by the runner (step 6). Every collaborator is injected so it is
- * offline-testable; the CLI wires the production readers. Given { reportKey, liveReportKey, accountId, paramsHash }
- * -- the exact live identity the publish produced -- it loads the live snapshot by that EXACT natural key and
+ * offline-testable; the CLI wires the production readers. Given { reportKey, liveReportKey, accountId, paramsHash,
+ * signal? } -- the exact live identity the publish produced, plus an OPTIONAL AbortSignal threaded to the live read +
+ * storage hydration (omit it for byte-for-byte legacy behaviour) -- it loads the live snapshot by that EXACT key and
  * proves: the live-report-key matches the contract; the ROW's report_key + account_id echo the requested
  * identity (the published live params do NOT carry accountId -- identity comes from the row columns); the row's
  * params_hash echoes paramsHash; the stored params carry the expected live version + contract-derived live
@@ -251,12 +252,14 @@ export function buildLiveReadback({ getReportSnapshot, loadStoragePayload, liveC
     if (typeof fn !== "function") throw new Error(`buildLiveReadback requires ${name} (fail closed).`);
   }
   if (!liveContracts || !reportDerivations) throw new Error("buildLiveReadback requires liveContracts + reportDerivations (fail closed).");
-  return async ({ reportKey, liveReportKey, accountId, paramsHash }) => {
+  // The optional `signal` is threaded to the live read + storage hydration; callers that pass none are byte-for-byte
+  // unchanged (signal defaults null, exactly as an absent 2nd argument to the signal-aware readers).
+  return async ({ reportKey, liveReportKey, accountId, paramsHash, signal = null }) => {
     const contract = liveContracts[reportKey];
     if (!contract) return { ok: false, reason: "no-live-contract" };
     if (liveReportKey !== contract.liveReportKey) return { ok: false, reason: "live-report-key-mismatch" };
     if (!nb(paramsHash)) return { ok: false, reason: "blank-params-hash" };
-    const snap = await getReportSnapshot({ reportKey: liveReportKey, accountId, paramsHash });
+    const snap = await getReportSnapshot({ reportKey: liveReportKey, accountId, paramsHash }, { signal });
     if (!snap) return { ok: false, reason: "no-live-snapshot" };
     // The ROW's own identity echoes -- the live snapshot is keyed by (report_key, account_id, params_hash); the
     // published live params do NOT carry accountId, so identity is proven from the ROW columns, never from params.
@@ -272,7 +275,7 @@ export function buildLiveReadback({ getReportSnapshot, loadStoragePayload, liveC
     if (!nb(snap.source_refreshed_at)) return { ok: false, reason: "blank-refresh" };
     let payload;
     const path = S(snap.payload_storage_path).trim();
-    if (path) { try { payload = await loadStoragePayload(path); } catch { payload = null; } if (payload == null) return { ok: false, reason: "payload-dangling" }; }
+    if (path) { try { payload = await loadStoragePayload(path, { signal }); } catch { payload = null; } if (payload == null) return { ok: false, reason: "payload-dangling" }; }
     else { payload = snap.payload; if (payload == null) return { ok: false, reason: "payload-unavailable" }; }
     const entry = reportDerivations[reportKey];
     if (!entry || typeof entry.validatePayload !== "function" || entry.validatePayload(payload) !== true || (payload && payload.dataUnavailable === true)) return { ok: false, reason: "payload-contract" };

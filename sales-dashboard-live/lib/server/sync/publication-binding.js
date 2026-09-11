@@ -167,28 +167,40 @@ export async function hydrateSnapshotPayload(row, loadStoragePayload, { signal =
  * from that SINGLE candidate -- so a caller that needs a report's authoritative content + lineage (e.g. brand-inventory
  * reading brand-sales for attribution) can NEVER combine an older live payload with a newer unpromoted job's dependsOn.
  *
- * Every gate mirrors evaluatePublicationBinding EXCEPT the reconciliation-target-only checks (a source revision's deps
- * coverage + the exact requested-as-of): the candidate's own as-of (each date-valued live param) need only be a REAL
- * calendar date. All I/O is injected (offline-testable) + signal-threaded. Returns:
+ * Every gate mirrors evaluatePublicationBinding EXCEPT the reconciliation-target-only source-revision deps coverage
+ * (which the caller proves separately). The EXACT requested-as-of gate is OPT-IN: when `requestedAsOf` is supplied
+ * (non-null), it MUST be a real YYYY-MM-DD, the candidate's live `to` must EXIST + be a real calendar date, and
+ * `liveParams.to === requestedAsOf` EXACTLY -- so an older OR future candidate window DEFERS (the rolling `from` is NOT
+ * constrained). When `requestedAsOf` is omitted the candidate's own as-of need only be a REAL calendar date
+ * (callers not requesting exact-as-of are behaviorally unchanged). All I/O is injected (offline-testable) +
+ * signal-threaded; abort is rechecked immediately before AND after every awaited read (incl. the live read-back and
+ * storage hydration), returning a bounded fail("aborted") so the caller DEFERS (no partial/late work). Returns:
  *   { ok:true,  payload:<hydrated proven live/shadow payload>, dependsOn:[...job hashes], reason:null }   when proven
  *   { ok:false, payload:null, dependsOn:[], reason:<token> }                                              otherwise (DEFER)
  * A false result MUST make the caller DEFER (never combine separate "latest" records, never fabricate lineage).
  */
 export async function resolveValidatedLiveCandidate({
-  reportKey, accountId, signal = null,
+  reportKey, accountId, signal = null, requestedAsOf = null,
   readReportJob, readSnapshot, loadStoragePayload, verifyLiveReadback,
   liveContracts, computeHash, reportDerivations, shadowKeyFor = (rk) => "scheduler-v2/" + rk,
 } = {}) {
   const fail = (reason) => ({ ok: false, payload: null, dependsOn: [], reason });
+  const aborted = () => !!(signal && signal.aborted);
   if (!nb(reportKey) || !nb(accountId)) return fail("bad-args");
   const contract = liveContracts && liveContracts[reportKey];
   const derivation = reportDerivations && reportDerivations[reportKey];
   if (!contract || typeof contract.liveParams !== "function" || typeof computeHash !== "function") return fail("no-live-contract");
   if (!derivation || typeof derivation.validatePayload !== "function") return fail("no-report-derivation");
+  // OPT-IN exact requested-as-of: a supplied requestedAsOf MUST be a real calendar date (a malformed request defers
+  // before any read). The candidate's live `to` is matched against it below, after liveParams is derived.
+  if (requestedAsOf != null && !isCalendarDate(requestedAsOf)) return fail("requested-asof-invalid");
+  if (aborted()) return fail("aborted");
   let job; try { job = await readReportJob(reportKey, accountId, { signal }); } catch { job = null; }
+  if (aborted()) return fail("aborted");
   if (!jobIsPromotable(job)) return fail("job-not-promotable");
   const expectedShadowKey = shadowKeyFor(reportKey);
   let shadow; try { shadow = await readSnapshot({ reportKey: expectedShadowKey, accountId, paramsHash: S(job.snapshotParamsHash) }, { signal }); } catch { shadow = null; }
+  if (aborted()) return fail("aborted");
   const shadowParams = shadow && shadow.params && typeof shadow.params === "object" && !Array.isArray(shadow.params) ? shadow.params : null;
   if (!shadow || !shadowParams) return fail("shadow-missing");
   if (S(shadow.report_key) !== S(expectedShadowKey)) return fail("shadow-identity-report-key");
@@ -198,7 +210,9 @@ export async function resolveValidatedLiveCandidate({
   const shadowRecomputed = computeHash(shadowParams.reportVersion, shadowParams);
   if (S(shadowRecomputed) !== S(shadow.params_hash) || S(shadow.params_hash) !== S(job.snapshotParamsHash)) return fail("shadow-hash-mismatch");
   if (!nb(shadow.source_refreshed_at)) return fail("shadow-refresh-blank");
+  if (aborted()) return fail("aborted");
   const hydShadow = await hydrateSnapshotPayload(shadow, loadStoragePayload, { signal });
+  if (aborted()) return fail("aborted");
   if (hydShadow == null) return fail("shadow-payload-unavailable");
   let shadowPayloadOk = false;
   try { shadowPayloadOk = derivation.validatePayload(hydShadow) === true && !(hydShadow && hydShadow.dataUnavailable === true); }
@@ -208,14 +222,27 @@ export async function resolveValidatedLiveCandidate({
   if (!liveParams || typeof liveParams !== "object") return fail("live-params-underivable");
   // REAL calendar date for every date-valued live param (an impossible/future/malformed/absent date fails closed).
   for (const k of ["from", "to", "asOf", "through"]) { if (k in liveParams && !isCalendarDate(liveParams[k])) return fail("candidate-asof-invalid"); }
+  // EXACT requested-as-of (opt-in): the candidate window END must EQUAL requestedAsOf exactly -- an older OR a future
+  // `to` both DEFER. `to` must EXIST + be a real calendar date (a missing/malformed `to` defers). `from` (the rolling
+  // window start) is intentionally NOT constrained.
+  if (requestedAsOf != null) {
+    if (!isCalendarDate(liveParams.to)) return fail("candidate-asof-invalid");
+    if (S(liveParams.to) !== S(requestedAsOf)) return fail("candidate-asof-not-exact");
+  }
   const candHash = computeHash(contract.liveReportVersion, liveParams);
+  if (aborted()) return fail("aborted");
   let live; try { live = await readSnapshot({ reportKey: contract.liveReportKey, accountId, paramsHash: candHash }, { signal }); } catch { live = null; }
+  if (aborted()) return fail("aborted");
   if (!live) return fail("live-unpromoted");
   if (S(live.report_key) !== S(contract.liveReportKey) || S(live.account_id) !== S(accountId) || S(live.params_hash) !== S(candHash)) return fail("live-identity-mismatch");
-  let liveReadback; try { liveReadback = await verifyLiveReadback({ reportKey, liveReportKey: contract.liveReportKey, accountId, paramsHash: candHash }); } catch (e) { liveReadback = { ok: false, reason: "readback-threw:" + S(e && e.message) }; }
+  if (aborted()) return fail("aborted");
+  let liveReadback; try { liveReadback = await verifyLiveReadback({ reportKey, liveReportKey: contract.liveReportKey, accountId, paramsHash: candHash, signal }); } catch (e) { liveReadback = { ok: false, reason: "readback-threw:" + S(e && e.message) }; }
+  if (aborted()) return fail("aborted");
   if (!liveReadback || liveReadback.ok !== true) return fail("live-readback:" + S(liveReadback && liveReadback.reason));
   if (S(live.source_refreshed_at) !== S(shadow.source_refreshed_at)) return fail("live-refresh-differs");
+  if (aborted()) return fail("aborted");
   const hydLive = await hydrateSnapshotPayload(live, loadStoragePayload, { signal });
+  if (aborted()) return fail("aborted");
   if (hydLive == null) return fail("live-payload-unavailable");
   if (stableJson(hydLive) !== stableJson(hydShadow)) return fail("live-payload-differs");
   // PROVEN: the canonical live IS the promotion of the latest promotable job's shadow. Use ITS payload + ITS dependsOn.

@@ -89,12 +89,17 @@ group("C. FBA = isolated, needs-gated job with regional routing; no FBA cron");
 test("C1. scheduler-v2 has an isolated fba job: needs run, always()+shared-guard gate, regional invocation", () => {
   assert.match(schedulerYml, /\n\s{2}fba:\n/, "a separate fba job exists");
   assert.match(schedulerYml, /needs:\s*run/);
-  assert.match(schedulerYml, /if:\s*always\(\) && needs\.run\.outputs\.region != '' && \(needs\.run\.outputs\.already_published == 'true' \|\| needs\.run\.outputs\.token_proceed == 'true'\)/);
+  // FBA runs only when THIS invocation owns real regional work (execute_downstream) AND the token gate proceeded. The
+  // old `already_published == 'true'` disjunct was the duplicate-run hole (a delayed duplicate re-ran FBA); it is gone.
+  assert.match(schedulerYml, /if:\s*always\(\) && needs\.run\.outputs\.region != '' && needs\.run\.outputs\.execute_downstream == 'true' && needs\.run\.outputs\.token_proceed == 'true'/);
+  assert.doesNotMatch(schedulerYml, /needs\.run\.outputs\.already_published == 'true' \|\| needs\.run\.outputs\.token_proceed == 'true'/, "the FBA gate no longer runs on the already-published duplicate arm");
   assert.match(schedulerYml, /fba-plan-golive\.mjs --mode=go-live --region=\$\{\{ needs\.run\.outputs\.region \}\}/);
-  // The coordinator still exposes OLI readiness for observability, plus the shared guard outputs used by FBA.
+  // The coordinator still exposes OLI readiness for observability, the shared guard outputs, and the NEW typed
+  // execute_downstream signal (run_required=='true' -> real work) that every downstream regional job gates on.
   assert.match(schedulerYml, /oli_ready:\s*\$\{\{ steps\.guard\.outputs\.already_published == 'true' \|\| steps\.readiness\.outputs\.proceed == 'true' \}\}/);
   assert.match(schedulerYml, /already_published:\s*\$\{\{ steps\.guard\.outputs\.already_published \}\}/);
   assert.match(schedulerYml, /token_proceed:\s*\$\{\{ steps\.tokengate\.outputs\.proceed \}\}/);
+  assert.match(schedulerYml, /execute_downstream:\s*\$\{\{ steps\.guard\.outputs\.run_required == 'true' \}\}/);
 });
 
 test("C1b. OLI, Campaign Ads and FBA have independent failure boundaries; INDEPENDENT sales publication (publication gated on the REQUIRED sales source OLI, NOT on Campaign Ads)", () => {

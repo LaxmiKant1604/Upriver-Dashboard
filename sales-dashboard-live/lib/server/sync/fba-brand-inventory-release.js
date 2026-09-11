@@ -124,9 +124,12 @@ export function buildFbaBrandInventoryRelease({
 
     // (3) ONE PUBLISHER-IDENTICAL Brand Sales candidate (attribution) -- payload AND dependsOn from a SINGLE proven
     // candidate (the canonical live brand-sales that IS the promotion of the latest promotable brand-sales job's
-    // shadow). Never combine separate "latest" records. A non-proven candidate DEFERS (zero brand-inventory writes).
+    // shadow) AND built for the EXACT requestedAsOf D-1 window end (its live `to` must equal requestedAsOf -- an older
+    // OR future Brand Sales window DEFERS, so Brand Inventory dated requestedAsOf can never be attributed from a
+    // different report window). Never combine separate "latest" records. A non-proven candidate DEFERS -- and because
+    // this runs BEFORE the Brand Inventory cycle opens (step 5), a mismatch produces ZERO Brand Inventory writes.
     let bs;
-    try { bs = await resolveValidatedLiveCandidate({ reportKey: "brand-sales", accountId, signal, readReportJob, readSnapshot, loadStoragePayload, verifyLiveReadback: readbackLive, liveContracts, computeHash, reportDerivations, shadowKeyFor }); }
+    try { bs = await resolveValidatedLiveCandidate({ reportKey: "brand-sales", accountId, signal, requestedAsOf, readReportJob, readSnapshot, loadStoragePayload, verifyLiveReadback: readbackLive, liveContracts, computeHash, reportDerivations, shadowKeyFor }); }
     catch (e) { return defer("brand-sales-candidate-threw:" + S(e && e.message)); }
     if (aborted()) return DEADLINE();
     if (!bs || bs.ok !== true) return defer("brand-sales-candidate-" + S(bs && bs.reason));
@@ -242,9 +245,14 @@ export function buildFbaBrandInventoryRelease({
     if (pdisp !== "published" && pdisp !== "already-current") return hardFail("publish", "publish-" + S(pdisp));
     if (!nb(res.liveReportKey) || !nb(res.paramsHash)) return hardFail("publish", "publish-missing-live-identity");
 
+    // The publish already LANDED (an issued remote write). The read-back is a READ-ONLY confirmation, threaded with the
+    // signal. If aborted BEFORE it, do NOT start it and NEVER claim the published write was undone -- return the bounded
+    // deadline result; the content-addressed CAS makes the next pass's re-publish an idempotent no-op that re-confirms.
+    if (aborted()) return DEADLINE();
     let rb;
-    try { rb = await readbackLive({ reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, liveReportKey: res.liveReportKey, accountId, paramsHash: res.paramsHash }); }
+    try { rb = await readbackLive({ reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, liveReportKey: res.liveReportKey, accountId, paramsHash: res.paramsHash, signal }); }
     catch (e) { rb = { ok: false, reason: "readback-threw:" + S(e && e.message) }; }
+    if (aborted()) return DEADLINE();
     if (!rb || rb.ok !== true) return hardFail("readback", "live-readback-failed:" + S(rb && rb.reason));
 
     log("fba-brand-inventory: published + read back brand-inventory for " + accountId + " (" + pdisp + ")");

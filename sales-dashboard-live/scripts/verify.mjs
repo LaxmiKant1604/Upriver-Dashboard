@@ -86,6 +86,7 @@ const SUITES = [
   "test:listing-health-v3-identity-guard",
   "test:lhv3-shared-inventory-date",
   "test:scheduler-v2-lhv3-workflow",
+  "test:scheduler-duplicate-run-gating",
   "test:region-view",
   "test:regional-brand-view",
   "test:insights",

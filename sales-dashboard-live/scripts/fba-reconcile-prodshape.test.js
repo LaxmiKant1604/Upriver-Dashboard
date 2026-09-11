@@ -175,18 +175,24 @@ function makeWorld(over = {}) {
   // world.jobs after construction). Shadow params carry accountId + reportVersion (folded into the params hash), a real
   // ordered from/to range; the canonical live carries only the contract's liveParams (from/to). Shadow<->live are proven
   // equal (identical source_refreshed_at + identical payload); the payload passes REPORT_DERIVATIONS['brand-sales']. ----
-  const bs = { version: "brand-sales/v2d-2", from: "2026-09-01", to: "2026-09-10", refresh: "2026-09-09T08:00:00Z" };
+  // over.bsTo overrides the candidate window END (for exact-requested-as-of tests: older/future/malformed dates);
+  // over.bsMissingTo drops `to` entirely; over.bsShadowStoragePath makes the shadow payload storage-first (for the
+  // storage-hydration abort test). Default candidate ends on ASOF (= the FBA requestedAsOf), so it binds exactly.
+  const bsTo = over.bsMissingTo ? undefined : (over.bsTo != null ? over.bsTo : "2026-09-10");
+  const bs = { version: "brand-sales/v2d-2", from: "2026-09-01", to: bsTo, refresh: "2026-09-09T08:00:00Z" };
   bs.payload = { rows: [], catalogBrands: ["BrandA"], asinBrand: { ASIN1: "BrandA" } };
-  bs.shadowParams = { accountId: A, reportVersion: bs.version, from: bs.from, to: bs.to };
+  bs.shadowParams = bsTo === undefined ? { accountId: A, reportVersion: bs.version, from: bs.from } : { accountId: A, reportVersion: bs.version, from: bs.from, to: bsTo };
   bs.BSH = paramsHashFor(bs.version, bs.shadowParams);
-  bs.liveParams = { from: bs.from, to: bs.to };
+  bs.liveParams = bsTo === undefined ? { from: bs.from } : { from: bs.from, to: bsTo };
   bs.candHash = paramsHashFor(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS["brand-sales"].liveReportVersion, bs.liveParams);
   bs.shadowKey = BS_SHADOW_KEY + "|" + A + "|" + bs.BSH;
   bs.liveKey = "brand-sales|" + A + "|" + bs.candHash;
+  bs.shadowStoragePath = over.bsShadowStoragePath || null;
   if (!over.noBrandSales) {
     cycles.set("bs-seed", { id: "cyc-bs", bucket: "bs", cycle_date: ASOF, status: "succeeded", trigger: "manual", created_at: "2026-09-09T08:00:00Z" });
-    jobs.push({ cycle_id: "cyc-bs", report_key: "brand-sales", account_id: A, connection_id: "primary", bucket: "bs", depends_on: ["oli-h", "catalog"], durable_content_deps: [], derive_status: "succeeded", save_status: "succeeded", validated: true, snapshot_params_hash: bs.BSH, latest_data_date: bs.to, created_at: 0 });
-    snaps.set(bs.shadowKey, { report_key: BS_SHADOW_KEY, account_id: A, params_hash: bs.BSH, params: { ...bs.shadowParams }, payload: bs.payload, payload_storage_path: null, source_refreshed_at: bs.refresh });
+    jobs.push({ cycle_id: "cyc-bs", report_key: "brand-sales", account_id: A, connection_id: "primary", bucket: "bs", depends_on: ["oli-h", "catalog"], durable_content_deps: [], derive_status: "succeeded", save_status: "succeeded", validated: true, snapshot_params_hash: bs.BSH, latest_data_date: bs.to || null, created_at: 0 });
+    if (bs.shadowStoragePath) world._storage[bs.shadowStoragePath] = bs.payload;
+    snaps.set(bs.shadowKey, { report_key: BS_SHADOW_KEY, account_id: A, params_hash: bs.BSH, params: { ...bs.shadowParams }, payload: bs.shadowStoragePath ? null : bs.payload, payload_storage_path: bs.shadowStoragePath, source_refreshed_at: bs.refresh });
     // Live params echo the contract's live version (the real publisher stores it; buildLiveReadback checks it), while
     // params_hash re-derives from ONLY the contract.liveParams output (from/to) -- exactly the publisher's identity.
     snaps.set(bs.liveKey, { report_key: "brand-sales", account_id: A, params_hash: bs.candHash, params: { reportVersion: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS["brand-sales"].liveReportVersion, ...bs.liveParams }, payload: bs.payload, payload_storage_path: null, source_refreshed_at: bs.refresh });
@@ -198,8 +204,16 @@ function makeWorld(over = {}) {
 // Wire the REAL dedicated release with a WORLD, mirroring the entrypoint's runReleaseForAccount composition exactly
 // (only the storage is in-memory + the candidate readers are the entrypoint's). `abortWhen` (optional) makes the named
 // awaited phase abort the controller AFTER completing -- so the release observes the abort at its NEXT recheck.
-function wireRelease(world, { leaseFence, aborted = () => false, controller = null, abortWhen = null } = {}) {
-  const readbackLive = buildLiveReadback({ getReportSnapshot: world.getReportSnapshot, loadStoragePayload: world.getReportSnapshotStoragePayload, liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS, reportDerivations: REPORT_DERIVATIONS, computeHash: paramsHashFor });
+function wireRelease(world, { leaseFence, aborted = () => false, controller = null, abortWhen = null, abortOnReadback = null, abortOnStorage = null } = {}) {
+  const rawReadback = buildLiveReadback({ getReportSnapshot: world.getReportSnapshot, loadStoragePayload: world.getReportSnapshotStoragePayload, liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS, reportDerivations: REPORT_DERIVATIONS, computeHash: paramsHashFor });
+  // abortOnReadback=<reportKey>: abort the controller the instant that report's live read-back settles (models the
+  // deadline firing DURING the awaited read-back). abortOnStorage=<path>: abort when that storage object is hydrated.
+  const readbackLive = (controller && abortOnReadback)
+    ? async (a) => { const r = await rawReadback(a); if (String(a && a.reportKey) === abortOnReadback) controller.abort(); return r; }
+    : rawReadback;
+  const loadStoragePayload = (controller && abortOnStorage)
+    ? async (path, opt) => { const r = await world.getReportSnapshotStoragePayload(path, opt); if (String(path) === abortOnStorage) controller.abort(); return r; }
+    : (path, opt) => world.getReportSnapshotStoragePayload(path, opt);
   const publisher = buildSchedulerV2Publisher({
     connections: [{ id: "primary", apiKey: "k", organizationFingerprint: "org-1", label: "primary" }],
     // RAW DataDoe account shape (decorateDataDoeAccount reads account.id -> publicAccountId; primary returns it
@@ -224,7 +238,7 @@ function wireRelease(world, { leaseFence, aborted = () => false, controller = nu
     // BLOCKER 1: the candidate readers (resolveValidatedLiveCandidate wires these) -- the entrypoint's exact wiring.
     readReportJob: (reportKey, a, opt) => world.getLatestReportJobLineage(reportKey, a, opt),
     readSnapshot: (args, opt) => world.getReportSnapshot(args, opt),
-    loadStoragePayload: (path, opt) => world.getReportSnapshotStoragePayload(path, opt),
+    loadStoragePayload,
     liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS, reportDerivations: REPORT_DERIVATIONS,
     buildInventorySnapshot: buildBrandInventorySnapshot, computeHash: paramsHashFor,
     upsertReportJob: wrapAbort("upsert", world.upsertReportJob), claimLease: wrapAbort("claim", world.claimLease),
@@ -443,6 +457,48 @@ test("blocker 1: live source_refreshed_at DIFFERS from the shadow (not the same 
 });
 
 // ---------------------------------------------------------------------------------------------------------------------
+// WORK 1A -- the Brand Sales candidate must be built for EXACTLY the requested D-1 window end. The FBA release passes
+// requestedAsOf=ASOF; the candidate's live `to` must EQUAL it. An older OR future window DEFERS at the exact-as-of gate;
+// a malformed / impossible / missing `to` DEFERS at the contract's live-params derivation (orderedRange rejects a bad
+// date before the exact-as-of gate). Every refused case = zero Brand Inventory writes; Brand Sales + Daily Reporting are
+// never written or republished (so Brand Inventory dated ASOF is never attributed from a different report window).
+// ---------------------------------------------------------------------------------------------------------------------
+async function expectCandidateDeferOver(name, over) {
+  const world = makeWorld(over);
+  const h = buildProd(world);
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  const fp = invFootprint(world);
+  ok(name + ": brand-inventory DEFERRED_DEPENDENCY", st(out) === FBA_RECONCILE_STATUS.DEFERRED_DEPENDENCY && out.ok === true);
+  ok(name + ": ZERO brand-inventory live/shadow/job writes (LKG preserved)", fp.published === 0 && fp.shadow === 0 && fp.invJobs === 0 && fp.live === false);
+  ok(name + ": Brand Sales + Daily Reporting NEVER written/republished", !world.writes.upsertedReportKeys.includes("brand-sales") && !world.writes.upsertedReportKeys.includes("daily-reporting") && !world.writes.publishedLiveKeys.includes("brand-sales") && !world.writes.publishedLiveKeys.includes("daily-reporting") && !world.writes.shadowSavedKeys.includes(BS_SHADOW_KEY));
+}
+
+test("work1A: EXACT requested-as-of candidate (to === requestedAsOf) SUCCEEDS + publishes brand-inventory; Brand Sales/Daily Reporting untouched", async () => {
+  const world = makeWorld({ bsTo: ASOF }); // candidate window ends EXACTLY on the FBA requested D-1
+  const h = buildProd(world);
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("exact-as-of candidate -> READBACK_VERIFIED", st(out) === FBA_RECONCILE_STATUS.READBACK_VERIFIED && out.ok === true);
+  ok("brand-inventory published with the PROVEN candidate's OLI deps", world.jobs.some((j) => j.report_key === RK && j.depends_on.join(",") === "oli-h,catalog") && !!liveRow(world));
+  ok("neither Brand Sales nor Daily Reporting was written or published", !world.writes.upsertedReportKeys.includes("brand-sales") && !world.writes.upsertedReportKeys.includes("daily-reporting") && !world.writes.publishedLiveKeys.includes("brand-sales") && !world.writes.publishedLiveKeys.includes("daily-reporting"));
+});
+
+test("work1A: VALID OLDER candidate window (to = requestedAsOf-1) DEFERS (exact-as-of gate) -> zero brand-inventory writes", async () => {
+  await expectCandidateDeferOver("older-window", { bsTo: "2026-09-09" });
+});
+test("work1A: VALID FUTURE candidate window (to = requestedAsOf+1) DEFERS (exact-as-of gate) -> zero brand-inventory writes", async () => {
+  await expectCandidateDeferOver("future-window", { bsTo: "2026-09-11" });
+});
+test("work1A: MALFORMED candidate `to` (not a date) DEFERS -> zero brand-inventory writes", async () => {
+  await expectCandidateDeferOver("malformed-to", { bsTo: "not-a-date" });
+});
+test("work1A: IMPOSSIBLE calendar `to` (2026-02-30) DEFERS -> zero brand-inventory writes", async () => {
+  await expectCandidateDeferOver("impossible-to", { bsTo: "2026-02-30" });
+});
+test("work1A: MISSING candidate `to` DEFERS -> zero brand-inventory writes", async () => {
+  await expectCandidateDeferOver("missing-to", { bsMissingTo: true });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
 // BLOCKER 2 -- preserve the termination boundary. An abort OBSERVED during any awaited release phase must start NO later
 // durable write and NO publish. Driven through the REAL dedicated release with a controller aborted right after the
 // named phase's own await settles.
@@ -466,6 +522,37 @@ for (const { phase, next, label } of PHASES) {
     ok(`${phase}: NO brand-inventory live publish landed after the abort`, world.writes.publishedLiveKeys.length === 0);
   });
 }
+
+// WORK 1B -- abort OBSERVED during a live read-back or storage hydration must return a BOUNDED deadline result, start NO
+// subsequent write, and NEVER claim an issued write was undone. Driven through the REAL release with the controller
+// aborted the instant the named read settles (the release rechecks abort immediately after every such awaited read).
+test("work1B (behavioral): abort during the BRAND SALES candidate live read-back -> deadline-aborted; ZERO brand-inventory writes (candidate resolves BEFORE the cycle opens)", async () => {
+  const world = makeWorld();
+  const controller = new AbortController();
+  const { release } = wireRelease(world, { leaseFence: { ownerToken: "op", generation: 1 }, aborted: () => controller.signal.aborted, controller, abortOnReadback: "brand-sales" });
+  const res = await release.runForAccount({ accountId: A, requestedAsOf: ASOF, cycleBucket: "priority-partial-india-x", signal: controller.signal });
+  ok("bounded deadline-aborted result", res.ok === false && res.status === "DEADLINE_ABORTED");
+  ok("ZERO brand-inventory writes (no cycle open / upsert / shadow / publish)", world.writes.openCalls === 0 && world.writes.upsertedReportKeys.length === 0 && world.writes.shadowSavedKeys.length === 0 && world.writes.publishedLiveKeys.length === 0);
+});
+
+test("work1B (behavioral): abort during BRAND SALES storage hydration -> deadline-aborted; ZERO brand-inventory writes", async () => {
+  const world = makeWorld({ bsShadowStoragePath: "storage/bs-shadow" });
+  const controller = new AbortController();
+  const { release } = wireRelease(world, { leaseFence: { ownerToken: "op", generation: 1 }, aborted: () => controller.signal.aborted, controller, abortOnStorage: "storage/bs-shadow" });
+  const res = await release.runForAccount({ accountId: A, requestedAsOf: ASOF, cycleBucket: "priority-partial-india-x", signal: controller.signal });
+  ok("bounded deadline-aborted result", res.ok === false && res.status === "DEADLINE_ABORTED");
+  ok("ZERO brand-inventory writes", world.writes.openCalls === 0 && world.writes.upsertedReportKeys.length === 0 && world.writes.shadowSavedKeys.length === 0 && world.writes.publishedLiveKeys.length === 0);
+});
+
+test("work1B (behavioral): abort during the FINAL brand-inventory live read-back -> deadline-aborted; the publish already LANDED (exactly one), NO subsequent write, never a claimed undo/success", async () => {
+  const world = makeWorld();
+  const controller = new AbortController();
+  const { release } = wireRelease(world, { leaseFence: { ownerToken: "op", generation: 1 }, aborted: () => controller.signal.aborted, controller, abortOnReadback: "brand-inventory" });
+  const res = await release.runForAccount({ accountId: A, requestedAsOf: ASOF, cycleBucket: "priority-partial-india-x", signal: controller.signal });
+  ok("bounded deadline-aborted result (NOT a claimed readback-verified success)", res.ok === false && res.status === "DEADLINE_ABORTED");
+  ok("the brand-inventory publish LANDED exactly once -- an issued write is NEVER claimed undone", world.writes.publishedLiveKeys.filter((k) => k === RK).length === 1 && !!liveRow(world));
+  ok("no write starts after the read-back abort (the read-back is the last step)", world.writes.publishedLiveKeys.length === 1);
+});
 
 test("blocker 2 (fenced CAS final defense): a NULL control fence makes the REAL publisher's live CAS write ZERO rows", async () => {
   // Establish a real live row + a ready brand-inventory shadow via a normal successful reconcile.

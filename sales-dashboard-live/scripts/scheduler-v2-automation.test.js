@@ -376,7 +376,11 @@ test("D2. workflow shape: INDEPENDENT per-region ordered pipeline -- per-region 
   assert.match(yml, /--operation-key=priority-dashboards\/scheduled\/\$\{\{ steps\.cfg\.outputs\.asof \}\}/, "date-scoped (requestedAsOf) operation key");
   // FBA now runs as an ISOLATED, needs-gated job (independent failure boundary) -- NOT a step of the publish job.
   assert.match(yml, /\n\s{2}fba:\n[\s\S]*needs:\s*run/, "an isolated fba job depends on the run job");
-  assert.match(yml, /if:\s*always\(\) && needs\.run\.outputs\.region != '' && \(needs\.run\.outputs\.already_published == 'true' \|\| needs\.run\.outputs\.token_proceed == 'true'\)/, "the FBA job gets an independent attempt after the shared guards, even when a source failed");
+  // FBA runs only when THIS invocation owns real regional work (execute_downstream) AND the token gate proceeded. The
+  // former `already_published == 'true'` disjunct was the duplicate-run hole (a delayed duplicate re-ran FBA); it is
+  // gone, so a proven duplicate (execute_downstream=='false') SKIPS the FBA job entirely (zero FBA export creates).
+  assert.match(yml, /if:\s*always\(\) && needs\.run\.outputs\.region != '' && needs\.run\.outputs\.execute_downstream == 'true' && needs\.run\.outputs\.token_proceed == 'true'/, "FBA gets an independent attempt only when the run owns real work (execute_downstream) and the token gate proceeded");
+  assert.doesNotMatch(yml, /needs\.run\.outputs\.already_published == 'true' \|\| needs\.run\.outputs\.token_proceed == 'true'/, "the FBA gate no longer runs on the already-published duplicate arm (the duplicate-run defect)");
   assert.match(yml, /fba-plan-golive\.mjs --mode=go-live --region=\$\{\{ needs\.run\.outputs\.region \}\}/, "the fba job uses the SAME regional routing");
   // The publish (run) job itself never invokes an FBA script (the isolation boundary); ASIN + Vercel-cron stay absent.
   const runJob = yml.slice(idx("jobs:"), idx("\n  fba:"));
