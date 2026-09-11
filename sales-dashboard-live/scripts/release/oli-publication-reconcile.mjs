@@ -259,20 +259,25 @@ const outOfTime = () => deadlineSec > 0 && (Date.now() - runStartMs) / 1000 > de
 // Bound the IN-FLIGHT account operation: race the release against the remaining budget so a stuck account cannot hang
 // past the reserve (it resolves the DEADLINE_HIT sentinel; the reconciler then ABORTS the op, AWAITS its confirmed
 // settlement, and safe-closes). The `signal` arg is unused here (the reconciler owns the AbortController); it keeps the
-// injected contract explicit.
+// injected contract explicit. The timer is INTENTIONALLY REF'D (never unreferenced): it is a REQUIRED handle that must
+// keep the Node event loop alive while the reconciler awaits the deadline -- an unreferenced timer that is the only
+// pending handle lets Node exit (code 13, unsettled top-level await) before the deadline fires + cleanup runs. It is
+// always clearTimeout'd once the op wins, and self-completes when it fires, so it never lingers.
 const deadlineRace = (p, _signal) => {
   if (deadlineSec <= 0) return p;
   const remainingMs = Math.max(0, deadlineSec * 1000 - (Date.now() - runStartMs));
-  let t; const timer = new Promise((resolve) => { t = setTimeout(() => resolve({ __deadline: true }), remainingMs); if (t && typeof t.unref === "function") t.unref(); });
+  let t; const timer = new Promise((resolve) => { t = setTimeout(() => resolve({ __deadline: true }), remainingMs); });
   return Promise.race([Promise.resolve(p).then((v) => { clearTimeout(t); return v; }), timer]);
 };
 // After a deadline abort, AWAIT the op's CONFIRMED settlement (defect 1), bounded by a short grace. A cooperative op
-// settles promptly once its fence is revoked (a resolve OR a throw both count as settled -> the op stopped); a
-// non-cooperative op that will not stop returns { settled:false } so the reconciler reports the run non-green (the hard
-// region kill + the separate always() cleanup job are the ultimate backstop). Never resolves settled:true by timeout.
+// settles promptly once its fence is revoked -> { settled:true } (a resolve OR a rejection both mean the op STOPPED). A
+// non-cooperative op that will not stop within the grace -> { settled:false }; the reconciler then leaves the lease held
+// + reports the run non-green (the separate cleanup job reclaims after TTL). Like the deadline timer, the grace timer is
+// INTENTIONALLY REF'D (never unreferenced): it must keep the loop alive so the settled/unsettled decision (and the
+// finally cleanup) is reached instead of Node exiting early on an otherwise-empty loop. It never resolves settled:true.
 const SETTLE_GRACE_MS = 8000;
 const awaitSettled = (p) => {
-  let t; const grace = new Promise((resolve) => { t = setTimeout(() => resolve({ settled: false }), SETTLE_GRACE_MS); if (t && typeof t.unref === "function") t.unref(); });
+  let t; const grace = new Promise((resolve) => { t = setTimeout(() => resolve({ settled: false }), SETTLE_GRACE_MS); });
   return Promise.race([
     Promise.resolve(p).then(() => { clearTimeout(t); return { settled: true }; }, () => { clearTimeout(t); return { settled: true }; }),
     grace,

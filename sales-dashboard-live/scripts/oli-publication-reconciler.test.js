@@ -4,6 +4,7 @@
 // end-to-end composition is proven by oli-reconcile-prodshape. Offline. 7-bit ASCII, LF.
 import assert from "node:assert/strict";
 import { writeSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { buildOliPublicationReconciler, OLI_RECONCILE_STATUS } from "../lib/server/sync/oli-publication-reconciler.js";
 
 let passed = 0;
@@ -261,14 +262,34 @@ test("defect 1: the deadline ABORTS the in-flight op + AWAITS its confirmed sett
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
   ok("A01 deferred (deadline-in-flight); the op was ABORTED then settled; safe-close ran AFTER; ok:true", stateOf(out, "A01", "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && rep(out, "A01")["daily-reporting"].reason === "deadline-in-flight" && rep(out, "A01")["daily-reporting"].terminationConfirmed === true && aborted === true && h.calls.closeControls.length === 1 && out.ok === true);
 });
-// defect 1: a NON-cooperative op that will not stop even after abort cannot be CONFIRMED terminated -> the run is NON-GREEN
-// (control-cleanup-unresolved), never falsely reported clean. The injected awaitSettled models the entrypoint's grace.
-test("defect 1: an op that ignores the abort (never settles) -> termination UNCONFIRMED -> ok:false, controlCleanupUnresolved", async () => {
+// defect 1: a NON-cooperative op that will not stop even after abort cannot be CONFIRMED terminated. The reconciler MUST
+// NOT safe-close (that would release a fence the op may still be using) -- it leaves the lease + controls INTACT for the
+// separate cleanup job and reports NON-GREEN. The injected awaitSettled models the entrypoint's grace expiring.
+test("defect 1: an op that ignores the abort (settled:false) -> UNCONFIRMED -> NO safe-close, lease/controls held, ok:false", async () => {
   const h = makeHarness({ accounts: [{ accountId: "A01" }], hashByAccount: new Map([["A01", ["h1"]]]),
     runReleaseIgnoresAbort: true, deadlineRace: (p) => Promise.race([p, Promise.resolve({ __deadline: true })]),
     awaitSettled: async () => ({ settled: false }) });
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
-  ok("A01 deferred (termination-unconfirmed); ok:false; controlCleanupUnresolved; safe-close still ran", stateOf(out, "A01", "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && rep(out, "A01")["daily-reporting"].reason === "deadline-termination-unconfirmed" && out.ok === false && out.controlCleanupUnresolved === true && h.calls.closeControls.length === 1);
+  ok("A01 deferred (termination-unconfirmed); NO closeControls (fence left intact); ok:false; controlCleanupUnresolved", stateOf(out, "A01", "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && rep(out, "A01")["daily-reporting"].reason === "deadline-termination-unconfirmed" && out.ok === false && out.controlCleanupUnresolved === true && h.calls.closeControls.length === 0);
+});
+// defect 1: if awaitSettled THROWS, treat it as settled:false (fail closed), NEVER settled:true -> same result as an
+// unconfirmed settlement: NO safe-close, lease/controls held, non-green.
+test("defect 1: awaitSettled THROWS -> treated as UNCONFIRMED (fail closed) -> NO safe-close, lease held, ok:false", async () => {
+  const h = makeHarness({ accounts: [{ accountId: "A01" }], hashByAccount: new Map([["A01", ["h1"]]]),
+    runReleaseIgnoresAbort: true, deadlineRace: (p) => Promise.race([p, Promise.resolve({ __deadline: true })]),
+    awaitSettled: async () => { throw new Error("grace-timer-blew-up"); } });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("awaitSettled throw is fail-closed: A01 termination-unconfirmed; NO closeControls; ok:false; controlCleanupUnresolved", stateOf(out, "A01", "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && rep(out, "A01")["daily-reporting"].reason === "deadline-termination-unconfirmed" && out.ok === false && out.controlCleanupUnresolved === true && h.calls.closeControls.length === 0);
+});
+// defect 3 (required timers): a REAL Node subprocess whose ONLY pending work is a top-level await on a promise resolved
+// by a REF'd timer (mirrors deadlineRace/awaitSettled) must NOT exit 13 (unsettled top-level await) before cleanup runs.
+// The .unref()'d variant is the bug it guards: it exits 13 with cleanup never reached.
+test("defect 3: a REQUIRED (ref'd) deadline/settlement timer keeps Node alive through cleanup (no premature exit 13)", () => {
+  const run = (script) => spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 15000 });
+  const refd = run('let cleanup="NOT_RUN"; const s=await new Promise((r)=>{ setTimeout(()=>r("settled"), 80); }); cleanup="RAN"; process.stdout.write("RESULT "+JSON.stringify({s,cleanup}));');
+  ok("ref'd timer: process exits 0 and cleanup RAN after the awaited promise settled (no exit 13)", refd.status === 0 && /"cleanup":"RAN"/.test(refd.stdout) && /"s":"settled"/.test(refd.stdout));
+  const unrefd = run('let cleanup="NOT_RUN"; const s=await new Promise((r)=>{ const t=setTimeout(()=>r("settled"), 80); t.unref(); }); cleanup="RAN"; process.stdout.write("RESULT "+JSON.stringify({s,cleanup}));');
+  ok("CONTRAST: an UNREF'd timer exits 13 with cleanup NEVER reached (proves the ref'd timer is required)", unrefd.status === 13 && !/"cleanup":"RAN"/.test(unrefd.stdout || ""));
 });
 
 test("item 23: the dashboard API reads the promoted canonical snapshot (bare report_key + account_id + params_hash)", () => {
@@ -299,6 +320,7 @@ test("entrypoint: reviewed priority-partial namespace + capability preflight; ty
   ok("the no-export adapter makes create/poll/download throw", /makeInnerAdapter: makeNoExportInnerAdapter/.test(mjs) && (mjs.match(/OLI_RECONCILER_NO_EXPORT/g) || []).length >= 3 && !/createExport\(/.test(mjs));
   ok("REAL termination boundary (defect 1): runReleaseForAccount is SIGNAL-AWARE -- an aborted op has NO control fence + verifyLease returns not-owned, so no publication write lands after the deadline", /runReleaseForAccount\(\{ bucket: b, accountId, requestedAsOf, revisionId, signal \}\)/.test(mjs) && /getControlFence: \(\) => \(aborted\(\) \? null : leaseFence\)/.test(mjs) && /const verifyLeaseForOp = async \(\) => \(aborted\(\) \? \{ ok: false/.test(mjs));
   ok("(defect 1) the entrypoint AWAITS confirmed settlement after abort (grace-bounded awaitSettled + real AbortController), never merely dropping the losing promise", /awaitSettled/.test(mjs) && /settled: false/.test(mjs) && /makeAbortController: \(\) => new AbortController\(\)/.test(mjs));
+  ok("(defect 3) the deadline + settlement-grace timers are REQUIRED (ref'd) -- no t.unref() call lets the loop empty into exit 13 before cleanup", !/\.unref\s*\(\s*\)/.test(mjs) && /const timer = new Promise\(\(resolve\) => \{ t = setTimeout/.test(mjs) && /const grace = new Promise\(\(resolve\) => \{ t = setTimeout/.test(mjs));
 });
 
 async function main() {

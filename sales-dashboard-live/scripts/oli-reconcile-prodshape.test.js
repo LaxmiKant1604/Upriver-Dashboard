@@ -128,6 +128,8 @@ function buildProdShapeReconciler(over = {}) {
         if (signal && signal.aborted) return stop();
         if (signal && typeof signal.addEventListener === "function") signal.addEventListener("abort", stop, { once: true });
       });
+      // NON-cooperative op: never settles EVEN after abort (the reconciler's awaitSettled grace expires -> unconfirmed).
+      if (over.ignoresAbort) { calls.release.push("__ignores-abort"); return new Promise(() => {}); }
       if (over.realRelease) {
         // Drive the REAL runPriorityDashboardsRelease branch so the TYPED classification comes from the real runner
         // (not a fabricated reason). Preserve status/leaseLost/stage/reason/blockerCodes exactly as the runner produced.
@@ -255,6 +257,21 @@ test("defect 1: a delayed write AFTER the deadline is aborted -> zero post-deadl
   ok("the op OBSERVED the abort at its write boundary and performed NO write after the deadline", h.calls.abortObservedBeforeWrite === 1 && h.calls.writesAfterDeadline === 0);
   ok("the live snapshot was NOT advanced past its older LKG (no publication write landed)", liveRefresh.get("A01") === "2026-09-08T00:00:00Z");
   ok("the REAL safe-close ran ONLY AFTER the op settled (confirmed termination) + released the exact fence; A01 deferred; ok:true", h.calls.opSettledSeq > 0 && h.calls.closeRollback === 1 && h.calls.opSettledSeq < h.calls.closeSeq && store._s.lease === null && st(out, "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && out.ok === true);
+});
+// ---- defect 1 (production-shape): a NON-cooperative op that will NOT stop -> the reconciler must NOT safe-close (never
+// tear down a fence an in-flight op may still be using). The exact lease + controls stay HELD; the run is non-green. Then
+// the SEPARATE cleanup path (after the owner's lease expires) reclaims the free/expired plane and PROVES it closed. ----
+test("defect 1: an op that will NOT stop -> NO safe-close, lease + controls remain HELD, non-green; then the separate cleanup reclaims the expired lease + proves the plane closed", async () => {
+  const store = inMemoryControlStore();
+  const h = buildProdShapeReconciler({ store, liveRefresh: new Map([["A01", "2026-09-08T00:00:00Z"]]), ignoresAbort: true,
+    deadlineRace: (p) => Promise.race([p, Promise.resolve({ __deadline: true })]), awaitSettled: async () => ({ settled: false }) });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  // Phase 1: the reconciler did NOT run safe-close; the EXACT lease + the open rollout controls are left INTACT; non-green.
+  ok("NO safe-close ran; the exact lease is STILL held; rollout still OPEN; A01 deferred; ok:false; controlCleanupUnresolved", h.calls.closeRollback === 0 && store._s.lease !== null && rolloutOpen(store).length === 1 && st(out, "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && out.ok === false && out.controlCleanupUnresolved === true);
+  // Phase 2: the owner's lease has since expired -> the SEPARATE cleanup reclaims the now-free/expired plane (a different
+  // operator) and safe-closes it; the evidence read proves rollout closed + the lease released.
+  const reclaim = await runControlPackageCli({ mode: "reclaim", operator: "oli-reconcile:cleanup", connectStore: async () => store, ownerToken: "oli-reconcile:cleanup", operationKey: "oli-reconcile/india/" + ASOF });
+  ok("the separate cleanup RECLAIM committed + PROVED the plane closed (rollout disabled) + released the lease", reclaim.committed === true && rolloutOpen(store).length === 0 && store._s.lease === null);
 });
 
 async function main() {

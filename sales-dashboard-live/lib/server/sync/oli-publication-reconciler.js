@@ -263,16 +263,20 @@ export function buildOliPublicationReconciler({
             if (result && result.__deadline === true) {
               deadlineHit = true;
               if (typeof ac.abort === "function") ac.abort(); // request termination
-              let settled = { settled: true };
-              try { settled = await awaitSettled(opPromise); } catch { settled = { settled: true }; } // AWAIT confirmed stop
-              if (settled && settled.settled === false) {
-                // Could NOT confirm the op stopped within the settlement grace -> do NOT treat safe-close as clean: flag
-                // the run control-cleanup-unresolved (non-green). The hard region kill + the separate always() cleanup
-                // job are the backstop for a truly non-cooperative op.
+              // AWAIT CONFIRMED settlement, FAIL CLOSED: ONLY an explicit { settled:true } proves the op stopped. A
+              // { settled:false } (grace exceeded) AND any THROW from awaitSettled both mean we CANNOT prove it stopped
+              // -- the op may still be running and still holding the control fence, so we must NOT close/release it.
+              let confirmedStopped = false;
+              try { const s = await awaitSettled(opPromise); confirmedStopped = !!(s && s.settled === true); }
+              catch { confirmedStopped = false; }
+              if (confirmedStopped) {
+                markStale(accountId, OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-in-flight", { terminationConfirmed: true });
+              } else {
+                // Termination UNCONFIRMED: the op may STILL be running against the fence. Do NOT safe-close here (the
+                // `finally` skips it) -- leave the EXACT lease + controls INTACT (they expire by TTL) for the SEPARATE
+                // cleanup job to reclaim + prove closed. The run is control-cleanup-unresolved (non-green).
                 control.terminationUnconfirmed = true;
                 markStale(accountId, OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-termination-unconfirmed", { terminationConfirmed: false });
-              } else {
-                markStale(accountId, OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-in-flight", { terminationConfirmed: true });
               }
               continue;
             }
@@ -287,12 +291,18 @@ export function buildOliPublicationReconciler({
           }
         }
       } finally {
-        // ALWAYS safe-close a CONFIRMED-open control plane. Its result is AUTHORITATIVE (blocker 4): a failed OR
-        // COMMIT_UNKNOWN safe-close leaves controls possibly open -> control-cleanup-unresolved (outcome failed, exit
-        // nonzero). Immediate mode's no-op close returns ok:true. An APPLY COMMIT_UNKNOWN is NOT safe-closed here (never
-        // a blind rollback of a lease we may hold) -- it is already control-cleanup-unresolved and needs out-of-band
-        // read-only reconciliation (the workflow's reclaim cleanup + the run's nonzero exit surface it).
-        if (control.opened) {
+        // Safe-close a CONFIRMED-open control plane. Its result is AUTHORITATIVE (blocker 4): a failed OR COMMIT_UNKNOWN
+        // safe-close leaves controls possibly open -> control-cleanup-unresolved (outcome failed, exit nonzero). Immediate
+        // mode's no-op close returns ok:true. An APPLY COMMIT_UNKNOWN is NOT safe-closed here (never a blind rollback of a
+        // lease we may hold). And when a deadline abort could NOT confirm the in-flight op stopped
+        // (control.terminationUnconfirmed), we MUST NOT close/release the fence here either -- the op may still be running
+        // against it; closing would tear down a lease still in use. In that ONE case we deliberately LEAVE the exact lease
+        // + controls INTACT (they expire by TTL) for the SEPARATE cleanup job (reclaim-only-a-free/expired-plane) to prove
+        // closed; the run is already non-green (controlCleanupUnresolved via terminationUnconfirmed).
+        if (control.opened && control.terminationUnconfirmed === true) {
+          control.reason = "termination-unconfirmed-lease-held-for-cleanup";
+          log("OLI_RECONCILE termination UNCONFIRMED after deadline abort -- NOT safe-closing (the op may still hold the fence); LEAVING the exact lease + controls INTACT for the separate cleanup job to reclaim after TTL expiry; run is NON-GREEN.");
+        } else if (control.opened) {
           try {
             const closed = await closeControls();
             control.closeOk = !!(closed && closed.ok === true);
