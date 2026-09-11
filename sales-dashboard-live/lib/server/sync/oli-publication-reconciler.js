@@ -90,6 +90,12 @@ export function buildOliPublicationReconciler({
   runReleaseForAccount, rebuildBrandViewMembership,
   openControls = async () => ({ ok: true }), closeControls = async () => ({ ok: true }),
   outOfTime = () => false, deadlineRace = (p) => p,
+  // REAL termination boundary (defect 1): an AbortController per in-flight account op, and a helper that AWAITS the
+  // op's CONFIRMED settlement after an abort. The default awaits fully (a resolve OR a throw both count as settled);
+  // the entrypoint supplies a grace-bounded variant that returns { settled:false } when a non-cooperative op will not
+  // stop -- so the run is reported control-cleanup-unresolved (non-green) rather than falsely "clean".
+  makeAbortController = () => new AbortController(),
+  awaitSettled = async (p) => { try { await p; } catch { /* a rejection is a settlement -- the op stopped */ } return { settled: true }; },
   reportKeys = oliDependentLiveReportKeys(),
   withTimeout = (p) => p, clock = () => new Date(), log = noop,
 } = {}) {
@@ -185,7 +191,12 @@ export function buildOliPublicationReconciler({
             }
           }
         }
-        const cls = evaluatePublicationBinding({ revision, accountId, reportKey: rk, requestedAsOf, expectedShadowKey, job, shadow, hydratedShadowPayload: hydShadow, live, hydratedLivePayload: hydLive, liveReadback, contract, computeHash, reportDerivations });
+        // FAIL CLOSED per (account, report): evaluatePublicationBinding is pure but calls the REAL payload validator +
+        // contract/computeHash; an unexpected throw here must STALE THIS report only (LKG preserved), never crash the
+        // whole regional scan. (validatePayload throwing is also caught inside the binding as shadow-payload-validator-threw.)
+        let cls;
+        try { cls = evaluatePublicationBinding({ revision, accountId, reportKey: rk, requestedAsOf, expectedShadowKey, job, shadow, hydratedShadowPayload: hydShadow, live, hydratedLivePayload: hydLive, liveReadback, contract, computeHash, reportDerivations }); }
+        catch (e) { cls = { state: OLI_PUBLICATION_STATE.STALE, reason: "binding-threw:" + S(e && e.message) }; }
         rec.reports[rk] = { state: cls.state, reason: cls.reason || null };
         if (cls.state === OLI_PUBLICATION_STATE.STALE) anyStale = true;
       }
@@ -212,7 +223,7 @@ export function buildOliPublicationReconciler({
     // safe-close. A refused/deferred open (e.g. the scheduler holds the lease, or the control apply did not commit) is
     // NOT a hard failure: every stale account keeps its dated LKG (DEFERRED_DEPENDENCY) and retries next pass.
     const brandSalesPromoted = [];
-    const control = { opened: false, applyCommitUnknown: false, closeOk: true, cleanupUnresolved: false, reason: null };
+    const control = { opened: false, applyCommitUnknown: false, closeOk: true, cleanupUnresolved: false, terminationUnconfirmed: false, reason: null };
     const markStale = (accountId, state, reason, extra) => { const rec = perAccount.find((r) => r.accountId === accountId); for (const rk of reportKeys) if (rec.reports[rk] && rec.reports[rk].state === OLI_PUBLICATION_STATE.STALE) rec.reports[rk] = { state, reason, lkgPreserved: true, ...(extra || {}) }; };
     if (staleAccounts.length > 0) {
       let opened = { ok: false, reason: "not-opened" };
@@ -239,12 +250,32 @@ export function buildOliPublicationReconciler({
             if (deadlineHit || outOfTime()) { deadlineHit = true; markStale(accountId, OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-cleanup-reserved"); continue; }
             const rec = perAccount.find((r) => r.accountId === accountId);
             let result;
-            // The deadline bounds the IN-FLIGHT account operation (blocker 5): deadlineRace resolves the DEADLINE_HIT
-            // sentinel if the release does not finish in time, so a never-resolving account cannot hang past the reserve
-            // -> it is deferred, the loop stops, and the ALWAYS safe-close still runs.
-            try { result = await deadlineRace(runReleaseForAccount({ bucket, accountId, requestedAsOf, revisionId: rec.revisionId })); }
+            // REAL TERMINATION BOUNDARY (defect 1): the deadline bounds the IN-FLIGHT account op. We start the op with an
+            // AbortSignal; if the deadline fires (deadlineRace resolves the __deadline sentinel) we ABORT the op and then
+            // AWAIT its CONFIRMED settlement BEFORE the safe-close runs -- a signal-aware runReleaseForAccount refuses
+            // every further DB/publication write once aborted, so NO write can land after the deadline. Merely dropping
+            // the losing promise (Promise.race alone) is NOT a termination boundary and is forbidden here.
+            const ac = makeAbortController() || {};
+            const signal = ac.signal;
+            const opPromise = Promise.resolve().then(() => runReleaseForAccount({ bucket, accountId, requestedAsOf, revisionId: rec.revisionId, signal }));
+            try { result = await deadlineRace(opPromise, signal); }
             catch (e) { result = { ok: false, code: 1, stage: "derive", reason: "release-threw", problems: ["release-threw: " + S(e && e.message)] }; }
-            if (result && result.__deadline === true) { deadlineHit = true; markStale(accountId, OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-in-flight"); continue; }
+            if (result && result.__deadline === true) {
+              deadlineHit = true;
+              if (typeof ac.abort === "function") ac.abort(); // request termination
+              let settled = { settled: true };
+              try { settled = await awaitSettled(opPromise); } catch { settled = { settled: true }; } // AWAIT confirmed stop
+              if (settled && settled.settled === false) {
+                // Could NOT confirm the op stopped within the settlement grace -> do NOT treat safe-close as clean: flag
+                // the run control-cleanup-unresolved (non-green). The hard region kill + the separate always() cleanup
+                // job are the backstop for a truly non-cooperative op.
+                control.terminationUnconfirmed = true;
+                markStale(accountId, OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-termination-unconfirmed", { terminationConfirmed: false });
+              } else {
+                markStale(accountId, OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-in-flight", { terminationConfirmed: true });
+              }
+              continue;
+            }
             const execStatus = statusFromRelease(result);
             const staleReports = reportKeys.filter((rk) => rec.reports[rk] && rec.reports[rk].state === OLI_PUBLICATION_STATE.STALE);
             if (execStatus === OLI_RECONCILE_STATUS.READBACK_VERIFIED) {
@@ -309,7 +340,9 @@ export function buildOliPublicationReconciler({
     // HONEST OUTCOME (blocker 4/5): ok:true (exit 0) ONLY when there is no unresolved HARD failure AND controls are
     // proven closed (control cleanup resolved) AND the control-apply did not COMMIT_UNKNOWN. A hard failure or an
     // unresolved safe-close -> outcome 'failed', exit nonzero. Deferrals keep dated LKG and are honest -> 'partial'.
-    const controlCleanupUnresolved = control.cleanupUnresolved === true || control.applyCommitUnknown === true;
+    // A deadline whose in-flight op could NOT be CONFIRMED stopped (termination unconfirmed, defect 1) is also
+    // control-cleanup-unresolved: we cannot prove no write is still pending, so the run must be non-green.
+    const controlCleanupUnresolved = control.cleanupUnresolved === true || control.applyCommitUnknown === true || control.terminationUnconfirmed === true;
     const hardFailures = counts.targetsFailed;
     const hardBlocked = hardFailures > 0 || controlCleanupUnresolved;
     const unpublished = counts.targetsStale + counts.targetsDeferred + counts.targetsFailed;

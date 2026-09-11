@@ -126,9 +126,13 @@ jobs:
   # reclaim acquires its own generation only on a free/expired lease).
   cleanup:
     needs: reconcile
-    # Gate on the LIVE decision RECOMPUTED here (not reconcile's outputs), so cleanup still runs if the reconcile job was
-    # hard-cancelled (its outputs would not propagate). always() -> runs after reconcile regardless of its outcome.
-    if: always() && (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'live' || vars.OLI_RECONCILE_LIVE == 'true')
+    # Gate on the SAME effective-mode==live decision the reconcile step computes (recomputed here, not read from
+    # reconcile's outputs, so cleanup still runs if the reconcile job was hard-cancelled and its outputs never
+    # propagated). always() -> runs after reconcile regardless of its outcome. MUST match the reconcile MODE expression
+    # EXACTLY (defect 2): a MANUAL dry-run is zero-write and its cleanup must NOT run EVEN IF vars.OLI_RECONCILE_LIVE is
+    # 'true' -- the repo flag only decides SCHEDULED runs. Effective live iff: (manual dispatch AND inputs.mode==live) OR
+    # (NOT a manual dispatch AND the repo flag is 'true').
+    if: always() && ((github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'live') || (github.event_name != 'workflow_dispatch' && vars.OLI_RECONCILE_LIVE == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:

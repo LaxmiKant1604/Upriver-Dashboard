@@ -92,8 +92,31 @@ const bind = (over = {}) => evaluatePublicationBinding({ revision: posA, account
 
 // (f) valid exact D-1 job/shadow/live -> PUBLICATION_NOT_REQUIRED.
 ok("BINDING (repro f): a valid exact D-1 job/shadow/live -> PUBLICATION_NOT_REQUIRED", bind().state === OLI_PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED);
-// (a) D-1 gate: requestedAsOf=Sep 10, exact bound job/live has to=Sep 9 -> STALE even though hashes/content unchanged.
-ok("BINDING (repro a): requestedAsOf newer than the candidate `to` -> STALE candidate-older-than-requested-asof (D-1 gate)", (() => { const c = bind({ requestedAsOf: "2026-09-10" }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "candidate-older-than-requested-asof"; })());
+// (a) EXACT REQUESTED-AS-OF IDENTITY (defect 4): the candidate `to` must EQUAL requestedAsOf exactly; older / future /
+// impossible-calendar / missing are STALE even though hashes + payload content are unchanged. A shadow whose `to` we
+// change must keep an internally-consistent recomputed/stored/job hash (else it would STALE at shadow-hash-mismatch
+// FIRST, not at the as-of gate) -- shadowForTo rebuilds that so the as-of gate is what actually fires.
+const shadowForTo = (to) => { const p = { ...shParams }; if (to === undefined) delete p.to; else p.to = to; const h = H("dr/shadow", p); return { shadow: { ...shadow, params: p, params_hash: h }, job: { ...jobWithShadowHash, snapshotParamsHash: h } }; };
+ok("BINDING (defect 4, equal): candidate `to` === requestedAsOf -> PUBLICATION_NOT_REQUIRED", bind().state === OLI_PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED);
+ok("BINDING (defect 4, older): candidate `to` before requestedAsOf -> STALE candidate-asof-not-exact", (() => { const c = bind({ ...shadowForTo("2026-09-08"), live: { ...liveMatch, params: { reportVersion: "dr-live", to: "2026-09-08" } } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "candidate-asof-not-exact"; })());
+ok("BINDING (defect 4, future/wrong-cycle): candidate `to` after requestedAsOf -> STALE candidate-asof-not-exact", (() => { const c = bind({ ...shadowForTo("2026-09-10") }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "candidate-asof-not-exact"; })());
+ok("BINDING (defect 4, impossible calendar date): candidate `to`=2026-02-30 -> STALE candidate-asof-invalid (round-trip, not regex shape)", (() => { const c = bind({ ...shadowForTo("2026-02-30") }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "candidate-asof-invalid"; })());
+ok("BINDING (defect 4, malformed shape): candidate `to`=2026-9-9 -> STALE candidate-asof-invalid", (() => { const c = bind({ ...shadowForTo("2026-9-9") }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "candidate-asof-invalid"; })());
+ok("BINDING (defect 4, missing): candidate `to` absent -> STALE candidate-asof-invalid", (() => { const c = bind({ ...shadowForTo(undefined) }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "candidate-asof-invalid"; })());
+ok("BINDING (defect 4, requestedAsOf itself impossible): -> STALE requested-asof-invalid", (() => { const c = bind({ requestedAsOf: "2026-02-30" }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "requested-asof-invalid"; })());
+// (defect 3) PUBLISHER-IDENTICAL account provenance: the shadow ROW account_id echoes A01 but its stored
+// params.accountId is B99 -- with an internally-consistent recomputed/stored/job hash -- MUST be STALE, never NOT_REQUIRED.
+ok("BINDING (defect 3): shadow.account_id=A01 but params.accountId=B99 (consistent hash) -> STALE shadow-params-account", (() => {
+  const p = { ...shParams, accountId: "B99" }; const h = H("dr/shadow", p);
+  const c = bind({ shadow: { ...shadow, account_id: "A01", params: p, params_hash: h }, job: { ...jobWithShadowHash, snapshotParamsHash: h } });
+  return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "shadow-params-account";
+})());
+// validatePayload can THROW on a malformed payload -> the binding must fail closed as STALE (never crash the scan).
+ok("BINDING (fail-closed): a validatePayload that THROWS -> STALE shadow-payload-validator-threw (no crash)", (() => {
+  const RDthrow = { "daily-reporting": { snapshotVersion: "dr/shadow", validatePayload: () => { throw new Error("boom"); } } };
+  const c = bind({ reportDerivations: RDthrow });
+  return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "shadow-payload-validator-threw";
+})());
 // (b) forged stored shadow hash with mutated params -> recomputed hash != stored -> STALE.
 ok("BINDING (repro b): a forged shadow hash with mutated params -> STALE shadow-hash-mismatch", (() => { const c = bind({ shadow: { ...shadow, params: { ...shParams, to: "2026-09-08" } } }); return c.state === OLI_PUBLICATION_STATE.STALE && c.reason === "shadow-hash-mismatch"; })());
 // (c) wrong shadow version / account -> STALE.

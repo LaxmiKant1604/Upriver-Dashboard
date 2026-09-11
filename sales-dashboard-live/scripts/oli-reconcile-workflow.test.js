@@ -30,9 +30,41 @@ ok("it verifies required secrets fail-closed and never prints them", /missing re
 // controls a killed/timed-out region left open, making the run NON-GREEN when cleanup can't be verified.
 ok("(blocker 5) the reconcile passes --deadline-seconds (below the 420s hard cap) so the in-flight op is bounded + safe-close runs before a kill", /--deadline-seconds=330/.test(wf) && /timeout 420 node/.test(wf));
 ok("(blocker 5) the reconcile job exposes asof/only/mode outputs the cleanup job consumes", /outputs:[\s\S]{0,120}asof: \$\{\{ steps\.reconcile\.outputs\.asof \}\}[\s\S]{0,120}mode: \$\{\{ steps\.reconcile\.outputs\.mode \}\}/.test(wf));
-ok("(blocker 5) a SEPARATE cleanup JOB (needs: reconcile, if: always()) survives the reconcile job's timeout/cancellation", /\n  cleanup:\n/.test(wf) && /needs: reconcile\b/.test(wf) && /if: always\(\) && \(github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.mode == 'live' \|\| vars\.OLI_RECONCILE_LIVE == 'true'\)/.test(wf));
+ok("(blocker 5) a SEPARATE cleanup JOB (needs: reconcile, if: always()) survives the reconcile job's timeout/cancellation", /\n  cleanup:\n/.test(wf) && /needs: reconcile\b/.test(wf) && /\n    if: always\(\) && /.test(wf));
 ok("(blocker 5) the cleanup job reclaims controls left open by an abnormal termination (per region, --cleanup)", /--mode=periodic --cleanup\b/.test(wf) && /reclaim/.test(wf.toLowerCase()));
 ok("(blocker 5) the workflow is NON-GREEN when a region's control cleanup cannot be verified", /OLI_RECONCILE_CLEANUP_UNVERIFIED/.test(wf) && /exit \$rc/.test(wf));
+
+// ---- defect 2: the cleanup-job gate must EVALUATE identically to the reconcile job's effective-mode==live decision ----
+// A manual DRY-RUN must be zero-write: cleanup must NOT run even when vars.OLI_RECONCILE_LIVE=='true' (the repo flag
+// decides SCHEDULED runs only). We EXTRACT both GitHub-Actions expressions from the YAML and EVALUATE them (not a
+// source-string match) across the full 2x2x2 truth table, asserting cleanup runs IFF the effective mode is 'live'.
+function ghaToJs(expr) {
+  let js = String(expr)
+    .replace(/always\(\)/g, "true")
+    .replace(/github\.event_name/g, "ctx.event_name")
+    .replace(/github\.event\.inputs\.mode/g, "ctx.inputs_mode")
+    .replace(/vars\.OLI_RECONCILE_LIVE/g, "ctx.oli_live");
+  js = js.replace(/!=/g, "!==").replace(/([^!<>=])==/g, "$1===");
+  return js;
+}
+function ghaEval(expr, ctx) { return Function("ctx", "return (" + ghaToJs(expr) + ");")(ctx); }
+// The reconcile step's effective MODE (the `${{ ... }}` inside MODE='...').
+const modeExpr = (wf.match(/MODE='\$\{\{\s*([\s\S]*?)\s*\}\}'/) || [])[1];
+ok("(defect 2) the reconcile MODE expression is present", typeof modeExpr === "string" && /event_name/.test(modeExpr));
+// The cleanup job's `if:` (the whole condition, including the always() && prefix).
+const cleanupIf = (wf.match(/\n  cleanup:\n[\s\S]*?\n    if: (.*)/) || [])[1];
+ok("(defect 2) the cleanup job if-condition is present", typeof cleanupIf === "string" && /event_name/.test(cleanupIf));
+const TRUTH = [
+  { name: "manual dry-run (flag=true) -> NOT live -> NO cleanup (zero-write preserved)", ctx: { event_name: "workflow_dispatch", inputs_mode: "dry-run", oli_live: "true" }, live: false },
+  { name: "manual live -> live -> cleanup runs", ctx: { event_name: "workflow_dispatch", inputs_mode: "live", oli_live: "false" }, live: true },
+  { name: "scheduled + flag true -> live -> cleanup runs", ctx: { event_name: "schedule", inputs_mode: "", oli_live: "true" }, live: true },
+  { name: "scheduled + flag false -> NOT live -> NO cleanup", ctx: { event_name: "schedule", inputs_mode: "", oli_live: "false" }, live: false },
+];
+for (const row of TRUTH) {
+  const effLive = ghaEval(modeExpr, row.ctx) === "live";
+  const cleanupRuns = ghaEval(cleanupIf, row.ctx) === true;
+  ok("(defect 2) " + row.name, effLive === row.live && cleanupRuns === row.live && cleanupRuns === effLive);
+}
 
 // ---- scheduler-v2.yml immediate post-save reconcile step (WORK 6 + blocker 2) ----
 const stepStart = sched.indexOf("Immediate OLI publication reconcile");

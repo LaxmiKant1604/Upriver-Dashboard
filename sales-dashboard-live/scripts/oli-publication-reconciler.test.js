@@ -54,12 +54,27 @@ function makeHarness(over = {}) {
     liveContracts: CONTRACTS,
     computeHash: HASH,
     reportDerivations: RD,
-    runReleaseForAccount: ({ accountId, revisionId }) => { calls.release.push(accountId); calls.releaseRevisions.push({ accountId, revisionId }); if (over.runReleaseNever) return new Promise(() => {}); const n = (attempts.get(accountId) || 0) + 1; attempts.set(accountId, n); const r = releaseFor(accountId, n, revisionId); if (r.ok) liveRefresh.set(accountId, shRef(accountId)); return Promise.resolve(r); },
+    runReleaseForAccount: ({ accountId, revisionId, signal }) => {
+      calls.release.push(accountId); calls.releaseRevisions.push({ accountId, revisionId });
+      // COOPERATIVE never-finishing op (defect 1): it does NOT settle on its own but OBSERVES the abort and then settles
+      // WITHOUT writing (models the signal-aware real runReleaseForAccount). If it is never aborted it never resolves,
+      // so the ONLY way the reconciler proceeds is by ABORTING it and AWAITING that confirmed settlement.
+      if (over.runReleaseNever) return new Promise((resolve) => {
+        const stop = () => resolve({ ok: false, code: 1, stage: "reconcile", status: "DEADLINE_ABORTED", reason: "deadline-aborted", aborted: true, blockerCodes: [] });
+        if (signal && signal.aborted) return stop();
+        if (signal && typeof signal.addEventListener === "function") signal.addEventListener("abort", stop, { once: true });
+      });
+      // NON-cooperative op: never settles even after abort (tests the termination-UNCONFIRMED -> non-green path).
+      if (over.runReleaseIgnoresAbort) { calls.release.push(accountId + ":ignores-abort"); return new Promise(() => {}); }
+      const n = (attempts.get(accountId) || 0) + 1; attempts.set(accountId, n); const r = releaseFor(accountId, n, revisionId); if (r.ok) liveRefresh.set(accountId, shRef(accountId)); return Promise.resolve(r);
+    },
     rebuildBrandViewMembership: async ({ accountIds }) => { calls.membership.push([...accountIds]); return over.membership || { ok: true, rebuilt: false, readbackVerified: false, mode: "self_heal_pending" }; },
     openControls: over.openControls || (async (ids) => { calls.openControls.push([...ids]); return { ok: true }; }),
     closeControls: over.closeControls || (async () => { calls.closeControls.push(1); return { ok: true }; }),
     outOfTime: over.outOfTime || (() => { calls.outOfTime += 1; return false; }),
     deadlineRace: over.deadlineRace || ((p) => p),
+    ...(over.makeAbortController ? { makeAbortController: over.makeAbortController } : {}),
+    ...(over.awaitSettled ? { awaitSettled: over.awaitSettled } : {}),
     reportKeys: REPORTS,
     log: () => {},
   });
@@ -234,12 +249,26 @@ test("blocker 3: an ALL-retryable ready=false blocker set -> DEFERRED_DEPENDENCY
   ok("all-retryable blockers -> DEFERRED_DEPENDENCY, ok:true", stateOf(out, "A01", "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && out.ok === true);
 });
 
-// blocker 5: a never-resolving in-flight account (deadlineRace sentinel) -> deferred + safe-close STILL runs.
-test("blocker 5: the deadline bounds an IN-FLIGHT never-resolving account -> deferred; safe-close still runs; ok:true", async () => {
+// defect 1: REAL termination boundary. The in-flight op does NOT settle on its own -- it settles ONLY after the
+// reconciler ABORTS it. So the reconciler MUST abort + AWAIT the confirmed settlement before safe-close (a mere
+// Promise.race that dropped the losing promise would proceed WITHOUT the op having stopped -> this test would hang or
+// safe-close early). The op's abort listener resolving is the evidence it was terminated.
+test("defect 1: the deadline ABORTS the in-flight op + AWAITS its confirmed settlement -> deferred; safe-close after termination; ok:true", async () => {
+  let aborted = false;
+  const mkAc = () => { const ac = new AbortController(); const s = ac.signal; const wrap = { get signal() { return s; }, abort: () => { aborted = true; ac.abort(); } }; return wrap; };
   const h = makeHarness({ accounts: [{ accountId: "A01" }], hashByAccount: new Map([["A01", ["h1"]]]),
-    runReleaseNever: true, deadlineRace: (p) => Promise.race([p, Promise.resolve({ __deadline: true })]) });
+    runReleaseNever: true, makeAbortController: mkAc, deadlineRace: (p) => Promise.race([p, Promise.resolve({ __deadline: true })]) });
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
-  ok("A01 deferred (deadline-in-flight); safe-close ran; ok:true", stateOf(out, "A01", "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && rep(out, "A01")["daily-reporting"].reason === "deadline-in-flight" && h.calls.closeControls.length === 1 && out.ok === true);
+  ok("A01 deferred (deadline-in-flight); the op was ABORTED then settled; safe-close ran AFTER; ok:true", stateOf(out, "A01", "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && rep(out, "A01")["daily-reporting"].reason === "deadline-in-flight" && rep(out, "A01")["daily-reporting"].terminationConfirmed === true && aborted === true && h.calls.closeControls.length === 1 && out.ok === true);
+});
+// defect 1: a NON-cooperative op that will not stop even after abort cannot be CONFIRMED terminated -> the run is NON-GREEN
+// (control-cleanup-unresolved), never falsely reported clean. The injected awaitSettled models the entrypoint's grace.
+test("defect 1: an op that ignores the abort (never settles) -> termination UNCONFIRMED -> ok:false, controlCleanupUnresolved", async () => {
+  const h = makeHarness({ accounts: [{ accountId: "A01" }], hashByAccount: new Map([["A01", ["h1"]]]),
+    runReleaseIgnoresAbort: true, deadlineRace: (p) => Promise.race([p, Promise.resolve({ __deadline: true })]),
+    awaitSettled: async () => ({ settled: false }) });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("A01 deferred (termination-unconfirmed); ok:false; controlCleanupUnresolved; safe-close still ran", stateOf(out, "A01", "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && rep(out, "A01")["daily-reporting"].reason === "deadline-termination-unconfirmed" && out.ok === false && out.controlCleanupUnresolved === true && h.calls.closeControls.length === 1);
 });
 
 test("item 23: the dashboard API reads the promoted canonical snapshot (bare report_key + account_id + params_hash)", () => {
@@ -268,6 +297,8 @@ test("entrypoint: reviewed priority-partial namespace + capability preflight; ty
   ok("safe-close COMMIT_UNKNOWN does ONLY read-only reconciliation (no reclaim/rollback before the read)", /safe-close COMMIT_UNKNOWN \(code 3\) -- read-only reconciliation required/.test(mjs));
   ok("--cleanup INSPECTS first, reclaims only a free/expired plane, then INSPECTS again and proves closed (blocker 5)", /const before = await readControlPlaneClosed\(\)/.test(mjs) && /const after = await readControlPlaneClosed\(\)/.test(mjs) && /OLI_RECONCILE_CLEANUP_COMMIT_UNKNOWN/.test(mjs));
   ok("the no-export adapter makes create/poll/download throw", /makeInnerAdapter: makeNoExportInnerAdapter/.test(mjs) && (mjs.match(/OLI_RECONCILER_NO_EXPORT/g) || []).length >= 3 && !/createExport\(/.test(mjs));
+  ok("REAL termination boundary (defect 1): runReleaseForAccount is SIGNAL-AWARE -- an aborted op has NO control fence + verifyLease returns not-owned, so no publication write lands after the deadline", /runReleaseForAccount\(\{ bucket: b, accountId, requestedAsOf, revisionId, signal \}\)/.test(mjs) && /getControlFence: \(\) => \(aborted\(\) \? null : leaseFence\)/.test(mjs) && /const verifyLeaseForOp = async \(\) => \(aborted\(\) \? \{ ok: false/.test(mjs));
+  ok("(defect 1) the entrypoint AWAITS confirmed settlement after abort (grace-bounded awaitSettled + real AbortController), never merely dropping the losing promise", /awaitSettled/.test(mjs) && /settled: false/.test(mjs) && /makeAbortController: \(\) => new AbortController\(\)/.test(mjs));
 });
 
 async function main() {

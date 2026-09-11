@@ -66,7 +66,8 @@ test("blocker 1 namespace: readPartialCycleCapability permits ONLY with the migr
 
 // A reconciler wired to the REAL control-package transaction + REAL binding + injected typed release + no-export adapter.
 function buildProdShapeReconciler(over = {}) {
-  const calls = { openApply: 0, closeRollback: 0, release: [], noExportCreateThrew: 0 };
+  const calls = { openApply: 0, closeRollback: 0, release: [], noExportCreateThrew: 0, writesAfterDeadline: 0, abortObservedBeforeWrite: 0, opSettledSeq: 0, closeSeq: 0 };
+  const seqRef = { n: 0 };
   const store = over.store || inMemoryControlStore(over.storeOpts || {});
   const shadowRefresh = over.shadowRefresh || new Map([["A01", "2026-09-09T09:00:00Z"]]);
   const liveRefresh = over.liveRefresh || new Map(); // absent -> live missing (unpromoted)
@@ -97,7 +98,7 @@ function buildProdShapeReconciler(over = {}) {
     },
     closeControls: async () => {
       if (!leaseFence) return { ok: true };
-      calls.closeRollback += 1;
+      calls.closeRollback += 1; calls.closeSeq = ++seqRef.n;
       const r = await runControlPackageCli({ mode: "rollback", operator: OPERATOR, connectStore: async () => store, ownerToken: leaseFence.ownerToken, ownerGeneration: leaseFence.generation, operationKey: "oli-reconcile/india/" + ASOF });
       leaseFence = null;
       if (r && r.skipped === "lease-not-owner") return { ok: true };
@@ -105,11 +106,28 @@ function buildProdShapeReconciler(over = {}) {
       if (!r || r.committed !== true) return { ok: false, reason: "safe-close-noncommit code " + (r && r.code) };
       return { ok: true };
     },
-    runReleaseForAccount: async ({ accountId }) => {
+    runReleaseForAccount: async ({ accountId, signal }) => {
       calls.release.push(accountId);
       // Prove the no-export adapter is unreachable for a create even inside the release path.
       try { await noExportAdapter().create(); } catch (e) { if (/OLI_RECONCILER_NO_EXPORT/.test(String(e && e.message))) calls.noExportCreateThrew += 1; }
-      if (over.neverResolves) { calls.release.push("__hang"); return new Promise(() => {}); } // never-resolving in-flight account (blocker 5)
+      // REAL TERMINATION BOUNDARY regression (defect 1): the op reaches its WRITE point only after a real delay -- i.e.
+      // AFTER the deadline. At the write boundary it MUST honor the abort: if aborted it performs NO write (a durable
+      // publish = setting liveRefresh) and settles as aborted; only an un-aborted op writes. Asserts no write lands after
+      // the deadline and that the op settled (recording its sequence) BEFORE the safe-close ran.
+      if (over.delayedWriteAfterDeadline) {
+        return await new Promise((resolve) => {
+          setTimeout(() => {
+            if (signal && signal.aborted) { calls.abortObservedBeforeWrite += 1; calls.opSettledSeq = ++seqRef.n; resolve({ ok: false, code: 1, stage: "reconcile", status: "DEADLINE_ABORTED", reason: "deadline-aborted", aborted: true, blockerCodes: [] }); return; }
+            calls.writesAfterDeadline += 1; liveRefresh.set("A01", shadowRefresh.get("A01")); calls.opSettledSeq = ++seqRef.n; resolve({ ok: true, code: 0, stage: "complete" });
+          }, 15);
+        });
+      }
+      // COOPERATIVE never-finishing op: settles ONLY after abort, WITHOUT writing (models the signal-aware real op).
+      if (over.neverResolves) return await new Promise((resolve) => {
+        const stop = () => { calls.opSettledSeq = ++seqRef.n; resolve({ ok: false, code: 1, stage: "reconcile", status: "DEADLINE_ABORTED", reason: "deadline-aborted", aborted: true, blockerCodes: [] }); };
+        if (signal && signal.aborted) return stop();
+        if (signal && typeof signal.addEventListener === "function") signal.addEventListener("abort", stop, { once: true });
+      });
       if (over.realRelease) {
         // Drive the REAL runPriorityDashboardsRelease branch so the TYPED classification comes from the real runner
         // (not a fabricated reason). Preserve status/leaseLost/stage/reason/blockerCodes exactly as the runner produced.
@@ -123,6 +141,8 @@ function buildProdShapeReconciler(over = {}) {
     },
     rebuildBrandViewMembership: async () => ({ ok: true, rebuilt: false, mode: "self_heal_pending" }),
     outOfTime: over.outOfTime || (() => false),
+    makeAbortController: () => new AbortController(),
+    ...(over.awaitSettled ? { awaitSettled: over.awaitSettled } : {}),
     reportKeys: REPORTS,
     log: () => {},
   });
@@ -218,12 +238,23 @@ test("blocker 4: a REAL rollback closes the control rows; a SUPERSEDED-generatio
   ok("the correct-generation rollback commits + the evidence read proves rollout/approvals closed", goodClose.committed === true && rolloutOpen(store).length === 0);
 });
 
-// ---- blocker 5: the deadline bounds an IN-FLIGHT (never-resolving) account -> defer + REAL safe-close still runs ----
-test("blocker 5: a never-resolving account after controls open -> deferred + the REAL control-package safe-close STILL releases the exact fence", async () => {
+// ---- blocker 5: the deadline bounds an IN-FLIGHT account -> abort + confirmed settlement -> defer + REAL safe-close ----
+test("blocker 5: an in-flight account (settles ONLY on abort) after controls open -> deferred + the REAL control-package safe-close STILL releases the exact fence", async () => {
   const store = inMemoryControlStore();
   const h = buildProdShapeReconciler({ store, liveRefresh: new Map([["A01", "2026-09-08T00:00:00Z"]]), neverResolves: true, deadlineRace: (p) => Promise.race([p, Promise.resolve({ __deadline: true })]) });
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
-  ok("A01 deferred (deadline-in-flight), the REAL safe-close ran + released the exact fence, ok:true", st(out, "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && h.calls.closeRollback === 1 && store._s.lease === null && out.ok === true);
+  ok("A01 deferred (deadline-in-flight), op settled on abort, the REAL safe-close ran + released the exact fence, ok:true", st(out, "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && h.calls.closeRollback === 1 && store._s.lease === null && out.ok === true && h.calls.opSettledSeq > 0 && h.calls.opSettledSeq < h.calls.closeSeq);
+});
+// ---- defect 1 (production-shape): an in-flight op that ATTEMPTS A DELAYED WRITE after the deadline is ABORTED so NO
+// write lands after the deadline, and the REAL safe-close begins ONLY AFTER the op's termination is confirmed. ----
+test("defect 1: a delayed write AFTER the deadline is aborted -> zero post-deadline write; safe-close runs only after confirmed termination; fence released", async () => {
+  const store = inMemoryControlStore();
+  const liveRefresh = new Map([["A01", "2026-09-08T00:00:00Z"]]); // an older live -> STALE -> the account is released
+  const h = buildProdShapeReconciler({ store, liveRefresh, delayedWriteAfterDeadline: true, deadlineRace: (p) => Promise.race([p, Promise.resolve({ __deadline: true })]) });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("the op OBSERVED the abort at its write boundary and performed NO write after the deadline", h.calls.abortObservedBeforeWrite === 1 && h.calls.writesAfterDeadline === 0);
+  ok("the live snapshot was NOT advanced past its older LKG (no publication write landed)", liveRefresh.get("A01") === "2026-09-08T00:00:00Z");
+  ok("the REAL safe-close ran ONLY AFTER the op settled (confirmed termination) + released the exact fence; A01 deferred; ok:true", h.calls.opSettledSeq > 0 && h.calls.closeRollback === 1 && h.calls.opSettledSeq < h.calls.closeSeq && store._s.lease === null && st(out, "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && out.ok === true);
 });
 
 async function main() {

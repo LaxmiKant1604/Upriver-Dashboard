@@ -89,6 +89,16 @@ export function jobIsPromotable(job) {
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+// A REAL calendar date (YYYY-MM-DD): the regex shape alone is NOT enough -- an impossible day (2026-02-30, 2026-13-01)
+// must be rejected. Validated by round-tripping through UTC: Date silently rolls month/day overflow forward, so a value
+// that does not reproduce itself after normalization is not a real calendar date.
+export function isCalendarDate(v) {
+  const s = S(v);
+  if (!DATE_RE.test(s)) return false;
+  const d = new Date(s + "T00:00:00Z");
+  return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
+
 /**
  * EXACT PUBLICATION BINDING (blockers 1/2): prove the CURRENTLY-live report row IS the promotion of the exact,
  * fully-validated report job's shadow, with PUBLISHER-IDENTICAL validation AND the D-1 date gate. Never trust
@@ -120,16 +130,29 @@ export function evaluatePublicationBinding({ revision, accountId, reportKey, req
   if (!shadow || !shadowParams) return stale("shadow-missing");
   if (S(shadow.report_key) !== S(expectedShadowKey)) return stale("shadow-identity-report-key");
   if (S(shadow.account_id) !== S(accountId)) return stale("shadow-identity-account");
+  // PUBLISHER-IDENTICAL account provenance (report-publisher.js `accountOk`): the shadow's STORED params.accountId must
+  // ALSO equal the requested account -- the row column alone is insufficient (a row whose params were bound to another
+  // account, even with internally-consistent recomputed/stored/job hashes, must be STALE, never PUBLICATION_NOT_REQUIRED).
+  if (S(shadowParams.accountId) !== S(accountId)) return stale("shadow-params-account");
   if (S(shadowParams.reportVersion) !== S(derivation.snapshotVersion)) return stale("shadow-version");
   const shadowRecomputed = computeHash(shadowParams.reportVersion, shadowParams);
   if (S(shadowRecomputed) !== S(shadow.params_hash) || S(shadow.params_hash) !== S(job.snapshotParamsHash)) return stale("shadow-hash-mismatch");
   if (!nb(shadow.source_refreshed_at)) return stale("shadow-refresh-blank");
   if (hydratedShadowPayload == null) return stale("shadow-payload-unavailable");
-  if (derivation.validatePayload(hydratedShadowPayload) !== true || (hydratedShadowPayload && hydratedShadowPayload.dataUnavailable === true)) return stale("shadow-payload-invalid");
-  // ---- D-1 DATE GATE (blocker 1): the candidate must cover requestedAsOf even when hashes/content are unchanged ----
+  // The REAL report payload validator can THROW on a malformed payload; a throw must fail CLOSED as STALE for THIS
+  // account (LKG preserved) -- never crash the whole regional scan.
+  let shadowPayloadOk = false;
+  try { shadowPayloadOk = derivation.validatePayload(hydratedShadowPayload) === true && !(hydratedShadowPayload && hydratedShadowPayload.dataUnavailable === true); }
+  catch { return stale("shadow-payload-validator-threw"); }
+  if (!shadowPayloadOk) return stale("shadow-payload-invalid");
+  // ---- EXACT REQUESTED-AS-OF IDENTITY (defect 4): the candidate window end MUST equal requestedAsOf EXACTLY, and both
+  // must be REAL calendar dates. Missing / malformed / impossible-calendar / older / future(wrong-cycle) -> STALE, even
+  // when the request hashes + payload content are unchanged. This SUPPLEMENTS the binding; it never replaces it.
   const liveParams = contract.liveParams(shadowParams);
   if (!liveParams || typeof liveParams !== "object") return stale("live-params-underivable");
-  if (typeof requestedAsOf === "string" && DATE_RE.test(requestedAsOf) && (!nb(liveParams.to) || String(liveParams.to) < requestedAsOf)) return stale("candidate-older-than-requested-asof");
+  if (!isCalendarDate(requestedAsOf)) return stale("requested-asof-invalid");
+  if (!isCalendarDate(liveParams.to)) return stale("candidate-asof-invalid");
+  if (S(liveParams.to) !== S(requestedAsOf)) return stale("candidate-asof-not-exact");
   const candHash = computeHash(contract.liveReportVersion, liveParams);
   // ---- LIVE: canonical identity + the SHARED publisher readback (identity/version/params-provenance/payload) ----
   if (!live) return stale("live-unpromoted");

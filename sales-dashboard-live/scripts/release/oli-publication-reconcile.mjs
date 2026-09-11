@@ -204,15 +204,25 @@ const verifyLease = async () => {
 // PER-ACCOUNT release execution: each stale account derives + finalizes + publishes + reads back in ITS OWN dedicated
 // priority-partial cycle (deterministic 16-hex over {accountId, revisionId}) with the no-export adapter + the captured
 // fence. strictD1 keeps a lagged account on its LKG. The three OLI-dependent dashboards publish account-atomically.
-async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revisionId }) {
+async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revisionId, signal }) {
+  // TERMINATION BOUNDARY (defect 1): a deadline ABORT invalidates THIS op's control fence so no further publication
+  // write can land. The runner calls verifyLease() immediately before each account publish, and the report_snapshots
+  // CAS fences on the live control fence; once aborted, verifyLease returns not-owned AND getControlFence returns null,
+  // so the publish STOPS at the contention gate (before publishAccount) or the CAS writes ZERO rows. An op aborted
+  // before it starts does no work at all. The parent-owned module lease (leaseFence) is untouched -- only THIS op's
+  // view of it is revoked -- so the safe-close still releases the exact fence.
+  const aborted = () => !!(signal && signal.aborted);
+  if (aborted()) return { code: 1, ok: false, stage: "reconcile", status: "DEADLINE_ABORTED", leaseLost: false, reason: "deadline-aborted", aborted: true, blockerCodes: [], problems: ["deadline-aborted before start (no work performed)"] };
   const cycleBucket = "priority-partial-" + b + "-" + sha256(JSON.stringify([accountId, revisionId || ""])).slice(0, 16);
   const fetchOne = async (apiKey) => ((await fetchDirectory(apiKey)) || []).filter((r) => String((r && (r.accountId ?? r.account_id ?? r.id)) || "").trim() === accountId);
   const release = buildPriorityDashboardsRelease({
     asOfOverride: requestedAsOf, operationKey: "priority-dashboards/scheduled/" + requestedAsOf,
-    getCycleByBucketDate: sb.getBaseSyncCycleByBucketDate, getControlFence: () => leaseFence,
+    getCycleByBucketDate: sb.getBaseSyncCycleByBucketDate,
+    getControlFence: () => (aborted() ? null : leaseFence), // aborted -> NO fence -> the write-boundary CAS writes zero rows
     makeInnerAdapter: makeNoExportInnerAdapter, fetchAccounts: fetchOne, cycleBucket,
   });
-  const result = await runPriorityDashboardsRelease({ release, reconcile, readbackLive, assertNoCron, bucket: b, strictD1: true, verifyLease, log: () => {} });
+  const verifyLeaseForOp = async () => (aborted() ? { ok: false, reason: "deadline-aborted" } : verifyLease());
+  const result = await runPriorityDashboardsRelease({ release, reconcile, readbackLive, assertNoCron, bucket: b, strictD1: true, verifyLease: verifyLeaseForOp, log: () => {} });
   // Preserve the runner's TYPED classification fields (status, leaseLost, stage, reason, blockerCodes) so the reconciler
   // classifies retryable-vs-integrity WITHOUT text matching (blocker 3).
   return { code: result.code, ok: result.ok, stage: result.stage, status: result.status || null, leaseLost: result.leaseLost === true, reason: result.reason || null, blockerCodes: result.blockerCodes || [], problems: result.problems || [] };
@@ -246,13 +256,27 @@ async function bucketAccounts(b) {
 const deadlineSec = Number(argOf("deadline-seconds")) || 0;
 const runStartMs = Date.now();
 const outOfTime = () => deadlineSec > 0 && (Date.now() - runStartMs) / 1000 > deadlineSec;
-// Bound the IN-FLIGHT account operation: race the release against the remaining budget so a never-resolving account
-// cannot hang past the reserve (it resolves the DEADLINE_HIT sentinel; the reconciler then defers it + safe-closes).
-const deadlineRace = (p) => {
+// Bound the IN-FLIGHT account operation: race the release against the remaining budget so a stuck account cannot hang
+// past the reserve (it resolves the DEADLINE_HIT sentinel; the reconciler then ABORTS the op, AWAITS its confirmed
+// settlement, and safe-closes). The `signal` arg is unused here (the reconciler owns the AbortController); it keeps the
+// injected contract explicit.
+const deadlineRace = (p, _signal) => {
   if (deadlineSec <= 0) return p;
   const remainingMs = Math.max(0, deadlineSec * 1000 - (Date.now() - runStartMs));
   let t; const timer = new Promise((resolve) => { t = setTimeout(() => resolve({ __deadline: true }), remainingMs); if (t && typeof t.unref === "function") t.unref(); });
   return Promise.race([Promise.resolve(p).then((v) => { clearTimeout(t); return v; }), timer]);
+};
+// After a deadline abort, AWAIT the op's CONFIRMED settlement (defect 1), bounded by a short grace. A cooperative op
+// settles promptly once its fence is revoked (a resolve OR a throw both count as settled -> the op stopped); a
+// non-cooperative op that will not stop returns { settled:false } so the reconciler reports the run non-green (the hard
+// region kill + the separate always() cleanup job are the ultimate backstop). Never resolves settled:true by timeout.
+const SETTLE_GRACE_MS = 8000;
+const awaitSettled = (p) => {
+  let t; const grace = new Promise((resolve) => { t = setTimeout(() => resolve({ settled: false }), SETTLE_GRACE_MS); if (t && typeof t.unref === "function") t.unref(); });
+  return Promise.race([
+    Promise.resolve(p).then(() => { clearTimeout(t); return { settled: true }; }, () => { clearTimeout(t); return { settled: true }; }),
+    grace,
+  ]);
 };
 
 const reconciler = buildOliPublicationReconciler({
@@ -274,6 +298,7 @@ const reconciler = buildOliPublicationReconciler({
   openControls: dryRun ? (async () => ({ ok: true })) : openControls,
   closeControls: dryRun ? (async () => ({ ok: true })) : closeControls,
   outOfTime, deadlineRace,
+  makeAbortController: () => new AbortController(), awaitSettled,
   reportKeys: oliDependentLiveReportKeys(),
   withTimeout,
   log: (m) => console.log("oli-reconcile: " + m),
