@@ -56,4 +56,11 @@ ok("workflow: concurrency prevents overlap (no cancel) + bounded < 30 min", /gro
 ok("workflow: off-boundary cron staggered from OLI (:17/:47)", /cron: "17,47 \* \* \* \*"/.test(yml));
 ok("workflow: least-privilege (contents: read), no actions:write", /permissions:[\s\S]{0,240}contents: read/.test(yml) && !/actions: write/.test(yml));
 
+// ---- IMMEDIATE HOOK (WORK A item 6): scheduler-v2.yml runs the daily Ads reconcile in a post-run job, zero-export,
+// dry-run unless ADS_RECONCILE_LIVE, self-owned lease (periodic mode), gated inside the duplicate-run suppression graph.
+const schedYml = readFileSync(path.join(repoRoot, ".github/workflows/scheduler-v2.yml"), "utf8");
+ok("scheduler-v2: a dedicated ads_reconcile job runs after run+fba, gated on execute_downstream + token gate + non-bootstrap", /\n {2}ads_reconcile:\n[\s\S]{0,400}needs: \[run, fba\][\s\S]{0,400}needs\.run\.outputs\.execute_downstream == 'true'[\s\S]{0,120}needs\.run\.outputs\.token_proceed == 'true'[\s\S]{0,120}needs\.run\.outputs\.scope != 'bootstrap'/.test(schedYml));
+ok("scheduler-v2: the immediate hook runs ONLY ads-publication-reconcile.mjs (periodic, deadline-bounded) -- zero export", /ads_reconcile:[\s\S]{0,1600}node scripts\/release\/ads-publication-reconcile\.mjs --bucket=\$\{\{ needs\.run\.outputs\.region \}\} --as-of=\$\{\{ needs\.run\.outputs\.effective_asof \}\} --mode=periodic --deadline-seconds=300/.test(schedYml));
+ok("scheduler-v2: the immediate hook is DRY-RUN unless vars.ADS_RECONCILE_LIVE == 'true' (mirrors OLI/FBA hooks)", /ads_reconcile:[\s\S]{0,1600}vars\.ADS_RECONCILE_LIVE }}" = "true" \]; then LIVE="--live"/.test(schedYml) && /ads_reconcile:[\s\S]{0,1600}continue-on-error: true/.test(schedYml));
+
 writeSync(1, `\nads-publication-reconciler: ${passed} assertions passed\n`);

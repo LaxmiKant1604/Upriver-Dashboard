@@ -70,6 +70,7 @@ const GATES = {
   materialize: jobIf("materialize"),
   "materialize-inventory": jobIf("materialize-inventory"),
   "bootstrap-ack": jobIf("bootstrap-ack"),
+  ads_reconcile: jobIf("ads_reconcile"), // WORK A item 6: immediate Campaign-Ads daily reconcile (zero-export, dry-run default)
 };
 for (const [job, cond] of Object.entries(GATES)) ok(`parsed a job-level if: for '${job}'`, typeof cond === "string" && cond.length > 0);
 const DOWNSTREAM_DATA = ["fba", "listing-health-v3", "materialize", "materialize-inventory"]; // the four that create/publish/materialize
@@ -137,6 +138,20 @@ const allDataSkip = (c) => DOWNSTREAM_DATA.every((j) => !runs(j, c));
 {
   const dup = ctx({ result: "success", runRequired: "false", alreadyPublished: "true", tokenProceed: "" });
   ok("duplicate: EVERY create/publish/materialize job's gate evaluates FALSE (a skipped job executes nothing)", DOWNSTREAM_DATA.every((j) => runs(j, dup) === false));
+}
+// 9. WORK A item 6: the immediate Campaign-Ads daily reconcile job (ads_reconcile) is gated EXACTLY like the other
+// real-work downstream jobs -- it RUNS on a genuine full-scope run, is SUPPRESSED on a delayed duplicate (so a duplicate
+// never opens a control lease / re-publishes daily), SKIPS a bootstrap wave (scope gate), and is fail-closed when the
+// guard is unreadable. This keeps the zero-export Ads reconcile inside the duplicate-run suppression graph.
+{
+  const first = ctx({ runRequired: "true", alreadyPublished: "false", tokenProceed: "true" });
+  ok("ads_reconcile: genuine first run (full scope) -> RUNS", runs("ads_reconcile", first) === true);
+  const dup = ctx({ result: "success", runRequired: "false", alreadyPublished: "true", tokenProceed: "" });
+  ok("ads_reconcile: delayed duplicate (already published) -> SKIPPED (no lease, no re-publish)", runs("ads_reconcile", dup) === false);
+  const boot = ctx({ scope: "bootstrap", runRequired: "true", alreadyPublished: "false", tokenProceed: "true" });
+  ok("ads_reconcile: bootstrap wave -> SKIPPED (scope != 'bootstrap' gate; the next full run reconciles)", runs("ads_reconcile", boot) === false);
+  const thrown = ctx({ result: "failure", runRequired: "", alreadyPublished: "", tokenProceed: "" });
+  ok("ads_reconcile: guard unreadable (run_required='') -> SKIPPED (fail closed)", runs("ads_reconcile", thrown) === false);
 }
 
 // ---- REGRESSION: run 34576893181 (India, delayed GitHub native run after Cloudflare 34558730613 already published D-1) -
