@@ -1,5 +1,43 @@
 # Project Memory
 
+## OLI reconciler — Codex 4-defect DEEP follow-up: real deadline termination boundary, exact-mode cleanup gate, publisher-identical account check, exact requested-as-of identity (2026-09-11, commit 9c3ce28 on main, NOT pushed; verify 196/196; code-complete, NOT production acceptance)
+
+Follow-up to 8927358 (preserved; 9c3ce28's grandparent-of-record is b64f042 the docs commit). Codex reproduced 4
+remaining defects; all fixed, pure-code. NO push/deploy/dispatch/migration/DataDoe; OLI_RECONCILE_LIVE stays disabled;
+migration 20260924 stays unapplied; api/*.js=12.
+
+1. **P0 -- Promise.race is NOT cancellation.** The old `deadlineRace` returned `__deadline` while the release kept
+   running and could still write. NOW a REAL termination boundary: the reconciler starts the op with an AbortSignal and,
+   on the deadline, ABORTS it then AWAITS its CONFIRMED settlement BEFORE safe-close (`awaitSettled`; a resolve OR throw
+   counts as settled). `.mjs runReleaseForAccount` is signal-aware -- once aborted, `getControlFence()` returns null and
+   `verifyLease` returns not-owned, so the runner stops at the contention gate AND the write-boundary CAS writes ZERO
+   rows (`publisher-composition.js fencedPublishLive` fails closed on a null fence -- verified). A non-cooperative op that
+   will not stop within the entrypoint's 8s settlement grace -> `control.terminationUnconfirmed` -> controlCleanupUnresolved
+   (NON-GREEN), never falsely clean; the hard region kill + separate always() cleanup job are the backstop. Production-shape
+   regression: a DELAYED write AFTER the deadline is aborted at its write boundary (zero post-deadline write, live LKG
+   unchanged) and safe-close runs ONLY after the op settled (opSettledSeq < closeSeq).
+2. **P0 -- manual dry-run must stay zero-write.** The cleanup JOB `if` now mirrors the reconcile MODE==live decision
+   EXACTLY: `(manual dispatch AND inputs.mode==live) OR (NOT manual dispatch AND vars.OLI_RECONCILE_LIVE==true)`. A MANUAL
+   dry-run no longer runs cleanup EVEN IF the repo flag is true (the flag decides SCHEDULED runs only). An EVALUATED
+   truth-table test extracts BOTH GitHub-Actions expressions from the YAML and evaluates them across all four combos (not
+   a source-string match): manual-dry-run(flag=true)->no cleanup; manual-live->cleanup; scheduled+flag-true->cleanup;
+   scheduled+flag-false->no cleanup; and asserts cleanup runs IFF effective mode is live.
+3. **P1 -- publisher-identical account validation.** `evaluatePublicationBinding` now ALSO requires
+   `shadow.params.accountId === accountId` (report-publisher.js `accountOk`), not just the row `account_id`. Repro:
+   row account_id=A01 but params.accountId=B99 with an internally-consistent recomputed/stored/job hash -> STALE
+   (`shadow-params-account`), never PUBLICATION_NOT_REQUIRED.
+4. **P1 -- exact requested-as-of identity.** The candidate `liveParams.to` must EQUAL requestedAsOf EXACTLY, validated as
+   a REAL calendar date via UTC round-trip (`isCalendarDate`, not regex shape). Older/future/impossible/malformed/missing
+   all STALE (`candidate-asof-not-exact` / `candidate-asof-invalid`; an impossible requestedAsOf -> `requested-asof-invalid`).
+   Replaced the prior `>= requestedAsOf` D-1 gate. Tests: equal, older, future, impossible (2026-02-30), malformed shape,
+   missing, impossible requestedAsOf.
+
+**Fail-closed:** `validatePayload` can THROW -> the binding returns STALE `shadow-payload-validator-threw`; the reconciler
+also wraps the whole binding call so any unexpected throw STALEs THAT report only (`binding-threw:*`), never crashing the
+regional scan. Tests: revision 51, reconciler 60, prodshape 24, workflow 30, source-priority 131; full `npm run verify`
+196/196 across 172 suites (incl. build:check, 436s); node --check + git diff --check clean. Adversarial review (the 4
+named risks) 0 defects. LIVE promotion OFF by default; production acceptance PENDING natural runs.
+
 ## OLI reconciler — Codex 5-blocker DEEP follow-up: D-1-in-binding, publisher-identical validation, typed-through-real-runner, evidence-based closure, in-flight deadline (2026-09-11, commit 8927358 on main, NOT pushed; verify 196/196; code-complete, NOT production acceptance)
 
 Follow-up to 62be1af (preserved; parent of 8927358). Codex found 5 DEEPER OLI-reconciliation blockers; all corrected,
