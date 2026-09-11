@@ -8,9 +8,11 @@
 //   - a NEW DAY yields a NEW request hash -> the live dashboard built from an OLDER day is provably stale (the request
 //     hash the reconciler binds is NOT in the live report job's depends_on), and
 //   - a SAME-DATE correction keeps the SAME request hash but changes payload_sha; that content change is folded into
-//     revisionId (the deterministic cycle-bucket identity) but is NOT, on its own, detectable through the report job's
-//     depends_on (which records the date-addressed request hash, not payload_sha). Intra-day same-date corrections are
-//     therefore repaired on the next date advance; see fba-dependent-reports.js for the durable-content-dep follow-up.
+//     revisionId (the deterministic cycle-bucket identity) AND is recorded as a durable CONTENT-provenance token
+//     (fbaContentProvenanceToken, below) in the brand-inventory report job's durable_content_deps (migration 20260925).
+//     revisionCoveredByJob compares that token, so an intra-day same-date correction is detected + repaired on the very
+//     next reconcile pass (new payload_sha -> new token -> not covered -> STALE -> re-derive); it is NOT deferred to the
+//     next date advance.
 //
 // The revision proves the durable snapshot is the requested D-1 snapshot by matching source_request_hash against the
 // entrypoint-recomputed resolvedFbaSnapshot({asOf:requestedAsOf}).requestHash. A valid single-day EMPTY snapshot

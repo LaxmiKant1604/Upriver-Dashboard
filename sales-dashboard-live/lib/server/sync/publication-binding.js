@@ -151,6 +151,77 @@ export function evaluatePublicationBinding({ revision, accountId, reportKey, req
   return { state: PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED, reason: null };
 }
 
+// STORAGE-FIRST payload hydration for a snapshot row: a nonblank payload_storage_path is authoritative (hydrated via
+// the injected loader, signal-threaded); else the inline payload. null on absence/dangling. Shared by the reconciler
+// core + resolveValidatedLiveCandidate so hydration is identical everywhere.
+export async function hydrateSnapshotPayload(row, loadStoragePayload, { signal = null } = {}) {
+  if (!row) return null;
+  const path = S(row.payload_storage_path ?? row.payloadStoragePath);
+  if (path) { try { return await loadStoragePayload(path, { signal }); } catch { return null; } }
+  return row.payload == null ? null : row.payload;
+}
+
+/**
+ * Resolve ONE PUBLISHER-IDENTICAL live candidate for (reportKey, accountId): PROVE the CURRENTLY-CANONICAL LIVE report
+ * IS the promotion of the LATEST PROMOTABLE report job's shadow, and return the proven payload + that job's dependsOn
+ * from that SINGLE candidate -- so a caller that needs a report's authoritative content + lineage (e.g. brand-inventory
+ * reading brand-sales for attribution) can NEVER combine an older live payload with a newer unpromoted job's dependsOn.
+ *
+ * Every gate mirrors evaluatePublicationBinding EXCEPT the reconciliation-target-only checks (a source revision's deps
+ * coverage + the exact requested-as-of): the candidate's own as-of (each date-valued live param) need only be a REAL
+ * calendar date. All I/O is injected (offline-testable) + signal-threaded. Returns:
+ *   { ok:true,  payload:<hydrated proven live/shadow payload>, dependsOn:[...job hashes], reason:null }   when proven
+ *   { ok:false, payload:null, dependsOn:[], reason:<token> }                                              otherwise (DEFER)
+ * A false result MUST make the caller DEFER (never combine separate "latest" records, never fabricate lineage).
+ */
+export async function resolveValidatedLiveCandidate({
+  reportKey, accountId, signal = null,
+  readReportJob, readSnapshot, loadStoragePayload, verifyLiveReadback,
+  liveContracts, computeHash, reportDerivations, shadowKeyFor = (rk) => "scheduler-v2/" + rk,
+} = {}) {
+  const fail = (reason) => ({ ok: false, payload: null, dependsOn: [], reason });
+  if (!nb(reportKey) || !nb(accountId)) return fail("bad-args");
+  const contract = liveContracts && liveContracts[reportKey];
+  const derivation = reportDerivations && reportDerivations[reportKey];
+  if (!contract || typeof contract.liveParams !== "function" || typeof computeHash !== "function") return fail("no-live-contract");
+  if (!derivation || typeof derivation.validatePayload !== "function") return fail("no-report-derivation");
+  let job; try { job = await readReportJob(reportKey, accountId, { signal }); } catch { job = null; }
+  if (!jobIsPromotable(job)) return fail("job-not-promotable");
+  const expectedShadowKey = shadowKeyFor(reportKey);
+  let shadow; try { shadow = await readSnapshot({ reportKey: expectedShadowKey, accountId, paramsHash: S(job.snapshotParamsHash) }, { signal }); } catch { shadow = null; }
+  const shadowParams = shadow && shadow.params && typeof shadow.params === "object" && !Array.isArray(shadow.params) ? shadow.params : null;
+  if (!shadow || !shadowParams) return fail("shadow-missing");
+  if (S(shadow.report_key) !== S(expectedShadowKey)) return fail("shadow-identity-report-key");
+  if (S(shadow.account_id) !== S(accountId)) return fail("shadow-identity-account");
+  if (S(shadowParams.accountId) !== S(accountId)) return fail("shadow-params-account");
+  if (S(shadowParams.reportVersion) !== S(derivation.snapshotVersion)) return fail("shadow-version");
+  const shadowRecomputed = computeHash(shadowParams.reportVersion, shadowParams);
+  if (S(shadowRecomputed) !== S(shadow.params_hash) || S(shadow.params_hash) !== S(job.snapshotParamsHash)) return fail("shadow-hash-mismatch");
+  if (!nb(shadow.source_refreshed_at)) return fail("shadow-refresh-blank");
+  const hydShadow = await hydrateSnapshotPayload(shadow, loadStoragePayload, { signal });
+  if (hydShadow == null) return fail("shadow-payload-unavailable");
+  let shadowPayloadOk = false;
+  try { shadowPayloadOk = derivation.validatePayload(hydShadow) === true && !(hydShadow && hydShadow.dataUnavailable === true); }
+  catch { return fail("shadow-payload-validator-threw"); }
+  if (!shadowPayloadOk) return fail("shadow-payload-invalid");
+  const liveParams = contract.liveParams(shadowParams);
+  if (!liveParams || typeof liveParams !== "object") return fail("live-params-underivable");
+  // REAL calendar date for every date-valued live param (an impossible/future/malformed/absent date fails closed).
+  for (const k of ["from", "to", "asOf", "through"]) { if (k in liveParams && !isCalendarDate(liveParams[k])) return fail("candidate-asof-invalid"); }
+  const candHash = computeHash(contract.liveReportVersion, liveParams);
+  let live; try { live = await readSnapshot({ reportKey: contract.liveReportKey, accountId, paramsHash: candHash }, { signal }); } catch { live = null; }
+  if (!live) return fail("live-unpromoted");
+  if (S(live.report_key) !== S(contract.liveReportKey) || S(live.account_id) !== S(accountId) || S(live.params_hash) !== S(candHash)) return fail("live-identity-mismatch");
+  let liveReadback; try { liveReadback = await verifyLiveReadback({ reportKey, liveReportKey: contract.liveReportKey, accountId, paramsHash: candHash }); } catch (e) { liveReadback = { ok: false, reason: "readback-threw:" + S(e && e.message) }; }
+  if (!liveReadback || liveReadback.ok !== true) return fail("live-readback:" + S(liveReadback && liveReadback.reason));
+  if (S(live.source_refreshed_at) !== S(shadow.source_refreshed_at)) return fail("live-refresh-differs");
+  const hydLive = await hydrateSnapshotPayload(live, loadStoragePayload, { signal });
+  if (hydLive == null) return fail("live-payload-unavailable");
+  if (stableJson(hydLive) !== stableJson(hydShadow)) return fail("live-payload-differs");
+  // PROVEN: the canonical live IS the promotion of the latest promotable job's shadow. Use ITS payload + ITS dependsOn.
+  return { ok: true, payload: hydShadow, dependsOn: Array.isArray(job.dependsOn) ? job.dependsOn.map((h) => String(h)) : [], reason: null };
+}
+
 /**
  * Classify ONE (account, report) reconciliation target from the durable revision + the LATEST live snapshot for
  * (reportKey, accountId) + that snapshot's exact-identity readback result + the durable proven as-of (an eligible

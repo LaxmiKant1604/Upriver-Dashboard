@@ -246,8 +246,11 @@ test("entrypoint guard: fba-publication-reconcile.mjs drives the DEDICATED brand
   // (6) cooperative deadline + --cleanup reclaim path; REQUIRED (ref'd) timers (no .unref()).
   ok("cooperative deadline (--deadline-seconds -> outOfTime) + --cleanup reclaim", /deadline-seconds/.test(mjs) && /const outOfTime = \(\)/.test(mjs) && /--cleanup/.test(mjs) && /mode: "reclaim"/.test(mjs));
   ok("the deadline + settlement-grace timers are REQUIRED (no .unref() lets the loop empty into exit 13)", !/\.unref\s*\(\s*\)/.test(mjs));
-  // (7) REAL termination boundary: an aborted op has NO control fence + verifyLease returns not-owned.
-  ok("signal-aware runReleaseForAccount: aborted -> null fence + verifyLease not-owned (no write after deadline)", /runReleaseForAccount\(\{ bucket: b, accountId, requestedAsOf, revisionId, signal \}\)/.test(mjs) && /getControlFence: \(\) => \(aborted\(\) \? null : leaseFence\)/.test(mjs) && /const verifyLeaseForOp = async \(\) => \(aborted\(\) \? \{ ok: false/.test(mjs));
+  // (7) termination-boundary WIRING (structural only): the entrypoint threads the op's signal into runReleaseForAccount
+  // and revokes the control fence + verifyLease when aborted. The BEHAVIORAL proof that no later write/publish starts on
+  // an abort observed mid-phase -- and that a null fence makes the live CAS write zero rows -- is driven end-to-end in
+  // fba-reconcile-prodshape.test.js ("blocker 2 (behavioral)" + "fenced CAS final defense"), not asserted from source.
+  ok("wiring: signal-threaded runReleaseForAccount + aborted -> null fence + verifyLease not-owned", /runReleaseForAccount\(\{ bucket: b, accountId, requestedAsOf, revisionId, signal \}\)/.test(mjs) && /getControlFence: \(\) => \(aborted\(\) \? null : leaseFence\)/.test(mjs) && /const verifyLeaseForOp = async \(\) => \(aborted\(\) \? \{ ok: false/.test(mjs));
   ok("the entrypoint AWAITS confirmed settlement after abort (grace-bounded awaitSettled + real AbortController)", /awaitSettled/.test(mjs) && /settled: false/.test(mjs) && /makeAbortController: \(\) => new AbortController\(\)/.test(mjs));
   // (8) DRY-RUN default: LIVE only under --live (the workflow sets it from FBA_RECONCILE_LIVE), and dry-run neutralizes controls.
   ok("dry-run default; openControls/closeControls are no-ops under dry-run (zero writes)", /const dryRun = !live/.test(mjs) && /openControls: dryRun \? \(async \(\) => \(\{ ok: true \}\)\) : openControls/.test(mjs) && /closeControls: dryRun \? \(async \(\) => \(\{ ok: true \}\)\) : closeControls/.test(mjs));

@@ -3942,7 +3942,7 @@ export async function getLatestSyncReportJob(reportKey, accountId) {
 // plus validated + snapshot_params_hash + latest_data_date. Read-only; returns a typed flat row or null. Used to
 // detect a SAME-AS-OF but content-CORRECTED OLI export: the current durable OLI provenance hashes are compared
 // against this depends_on -- a hash not present here means the OLI advanced and the live snapshot is stale.
-export async function getLatestReportJobLineage(reportKey, accountId) {
+export async function getLatestReportJobLineage(reportKey, accountId, { signal = null } = {}) {
   // durable_content_deps (migration 20260925, PREPARED-UNAPPLIED) records per-source CONTENT provenance (e.g. the FBA
   // snapshot's payload_sha) that a DATE-addressed depends_on hash cannot represent. FAIL-SOFT: select it, and if the
   // column is absent (migration not yet applied) retry WITHOUT it -> durableContentDeps degrades to [] (the
@@ -3956,7 +3956,7 @@ export async function getLatestReportJobLineage(reportKey, accountId) {
       order: "created_at.desc",
       limit: "1",
     });
-    return request(`/rest/v1/sync_report_jobs?${query}`);
+    return request(`/rest/v1/sync_report_jobs?${query}`, { signal });
   };
   let rows;
   try { rows = await fetchRows(true); }

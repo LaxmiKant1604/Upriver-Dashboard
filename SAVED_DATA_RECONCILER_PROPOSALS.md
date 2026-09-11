@@ -113,40 +113,48 @@ saved rows. **STOP-AND-REPORT.**
 
 ---
 
-## C. FBA same-date intra-day corrections — bounded gap + prepared content-provenance link
+## C. FBA same-date intra-day corrections — CLOSED via durable content-provenance (implemented)
 
 The FBA reconciler (shipped) reconciles `brand-inventory` for the **missing / unpromoted /
 older-as-of / date-advanced** cases from EXISTING durable records with **zero working-behavior
-change**: the durable FBA `source_request_hash` is DATE-addressed and is already recorded in
-`brand-inventory`'s `depends_on` (proven by `source-production-hardening.test.js`'s account-exact
-lineage assertions), so `revisionCoveredByJob` correctly marks a dashboard built from an OLDER
-day's FBA export STALE.
+change**: the durable FBA `source_request_hash` is DATE-addressed, so `revisionCoveredByJob`
+correctly marks a dashboard built from an OLDER day's FBA export STALE.
 
-**The bounded gap.** Because the FBA request hash is DATE-addressed (`from === to === D-1`), an
-**intra-day SAME-DATE correction** (the provider re-itemizes the same D-1 snapshot, changing
-`payload_sha` under an unchanged `source_request_hash`) is NOT, on its own, detectable through
-`depends_on`. Such a correction is repaired on the **next date advance** (D-1 rolls forward -> new
-request hash -> the reconciler re-derives from the current, corrected durable FBA). Detecting it
-**intra-day, content-grounded and efficiently** is not possible from existing durable records:
-`payload_sha` is not recorded anywhere the reconciler can compare against the live dashboard (the
-FBA snapshot is persisted separately from — and its `payload_sha` is not folded into — the
-brand-inventory lineage), and `source_snapshots.validated_at` advances on every re-persist (a
-timestamp, not a content signal), so it cannot serve as the authority.
+**The former bounded gap — now closed.** Because the FBA request hash is DATE-addressed
+(`from === to === D-1`), an **intra-day SAME-DATE correction** (the provider re-itemizes the same
+D-1 snapshot, changing `payload_sha` under an unchanged `source_request_hash`) is NOT detectable
+through `depends_on` alone — the request hash is unchanged. This was previously a bounded gap
+repaired only on the next date advance. It is now **detected and repaired immediately** via a
+durable CONTENT-provenance dependency (below).
 
-### Prepared change (do not apply): record the durable FBA content identity in brand-inventory lineage
+### Implemented change: record the durable FBA content identity (migration PREPARED-UNAPPLIED)
 
-The minimal, additive change (analogous to the Ads `content_rev` migration `20260923`, which
-existed for exactly this same-window-correction reason) is to fold the durable FBA snapshot's
-`payload_sha` into `brand-inventory`'s `depends_on` at derive time (the FBA snapshot — with its
-`payload_sha` — is already READ at brand-inventory derive time via `readSnapshot` in
-`source-bucket-sync-runtime.js`). With `"fba-content:" + payload_sha` present in `depends_on`, the
-FBA revision's `deps` can include that content token and the SAME `revisionCoveredByJob` mechanism
-detects a same-date correction (new `payload_sha` not covered by the prior job -> STALE). This is a
-change to the hot derive-time lineage binding used by the normal scheduler, so it is deliberately
-NOT applied here (it needs its own review + a re-run of the scheduler/source-bucket-sync suites);
-it is a small, additive follow-up once the FBA reconciler passes a natural production cycle. No
-database migration is required for this one (it changes only what strings are written into the
-existing `sync_report_jobs.depends_on` array).
+A new additive column `sync_report_jobs.durable_content_deps jsonb` (migration **20260925**,
+PREPARED but UNAPPLIED and APPROVAL-GATED) records a durable FBA CONTENT-provenance token. The SQL
+file `supabase/migrations/20260925_sync_report_jobs_durable_content_deps.sql` DOES live in
+`supabase/migrations/` (like every prepared migration in this repo), so its "unapplied" state rests
+ONLY on it being absent from the `app_schema_migrations` ledger — a plain `npm run db:migrate` (no
+`MIGRATE_ONLY`) globs every `.sql` there and WOULD apply it. Until explicit sign-off, do NOT run a
+plain `db:migrate`; apply EXACTLY this one file, when approved, via
+`MIGRATE_ONLY=20260925_sync_report_jobs_durable_content_deps.sql npm run db:migrate` (matching the
+file's own header). The column is read fail-soft and written only when non-empty (exactly the Ads
+`content_rev` `20260923` pattern), so the code runs correctly whether or not it has been applied. The
+token:
+
+```
+fbaContentProvenanceToken = "<sourceKey>|<accountId>|<connectionId>|<requestHash>|<payload_sha>"
+```
+
+with NO as-of field — the FBA request hash already IS the D-1 identity, so the token is
+path-independent. BOTH derive paths record the SAME token: the normal scheduler brand-inventory
+derive (`source-bucket-sync-runtime.js`, from the hydrated FBA snapshot it already reads) AND the
+reconciler's dedicated release (`fba-brand-inventory-release.js`). `revisionCoveredByJob` now
+requires `revision.contentDeps ⊆ job.durable_content_deps` IN ADDITION to `deps ⊆ depends_on`, so a
+same-date correction (new `payload_sha` -> new token -> not covered) is STALE and is re-derived on
+the next reconcile pass. A SEPARATE column (not `depends_on`) is used deliberately: `depends_on` is
+the OLI-shared lineage the OLI reconciler reads, and OLI revisions carry no `contentDeps`, so their
+`revisionCoveredByJob` behaviour is byte-for-byte unchanged. Production acceptance still requires
+applying migration 20260925 + a natural cycle before FBA live promotion is enabled.
 
 ---
 
@@ -155,7 +163,7 @@ existing `sync_report_jobs.depends_on` array).
 | Family | Zero-export reconcilable from existing durable records? | Action taken |
 |---|---|---|
 | OLI (existing) | yes | refactored onto the shared core, byte-for-byte preserved |
-| FBA Inventory → brand-inventory | yes, except intra-day same-date corrections | **shipped** (dry-run default) + bounded-gap note (C) |
+| FBA Inventory → brand-inventory | yes (incl. intra-day same-date corrections, via durable content-provenance) | **shipped** (dry-run default); same-date gap CLOSED (C); migration 20260925 prepared-unapplied |
 | FBA Inventory → fba-plan | no (derive reads TTL cache; US needs non-durable AWD) | documented; needs a durable-inventory bridge (future) |
 | Listings | **no** (cycle-cache only; no content revision) | **STOP-AND-REPORT** + prepared design (A) |
 | Listings Raw | **no** (cycle-cache only; v3 has no live contract) | **STOP-AND-REPORT** + prepared design (B) |

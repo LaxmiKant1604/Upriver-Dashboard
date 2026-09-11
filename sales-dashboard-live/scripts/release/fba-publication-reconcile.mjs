@@ -15,10 +15,10 @@
 //
 // It shares the SAME reviewed execution seam as the OLI reconciler: the priority-partial-<region>-<16hex> cycle
 // namespace (deterministic over {accountId, FBA revisionId}, permitted by migration 20260924), the control-package
-// apply/publish/safe-close, the strict-D1 priority release (which re-derives the account's brand-inventory from the
-// HYDRATED durable FBA rows), and the shared publisher-grade live read-back. The GLOBAL control-plane lease serializes
-// this against the OLI reconciler + the scheduler, and the publisher's content CAS makes a redundant re-publish an
-// idempotent no-op. 7-bit ASCII, LF.
+// apply/publish/safe-close, the DEDICATED brand-inventory-ONLY release (which re-derives EXACTLY brand-inventory from
+// the HYDRATED durable FBA rows -- NEVER the daily-reporting/brand-sales trio), and the shared publisher-grade live
+// read-back. The GLOBAL control-plane lease serializes this against the OLI reconciler + the scheduler, and the
+// publisher's content CAS makes a redundant re-publish an idempotent no-op. 7-bit ASCII, LF.
 
 import pg from "pg";
 import { appendFileSync } from "node:fs";
@@ -182,10 +182,13 @@ const verifyLease = async () => {
 };
 
 // PER-ACCOUNT release execution: each stale account derives + finalizes + publishes + reads back in ITS OWN dedicated
-// priority-partial cycle (deterministic 16-hex over {accountId, FBA revisionId}) with the no-export adapter + the
-// captured fence. strictD1 keeps a lagged account on its LKG. The account's brand-inventory is re-derived from the
-// HYDRATED durable FBA rows (buildBrandInventorySnapshot) as part of the account-atomic priority trio (daily-reporting
-// + brand-sales re-derive idempotently from durable OLI when OLI is unchanged).
+// priority-partial cycle (deterministic 16-hex over {accountId, FBA revisionId}) with the captured fence. The account's
+// brand-inventory is re-derived from the HYDRATED durable FBA rows (buildBrandInventorySnapshot) EXACTLY -- NEVER the
+// daily-reporting/brand-sales trio. Daily Reporting is never touched; Brand Sales is READ ONLY (its exact validated
+// live candidate, for asinBrand attribution) and never re-derived or republished. A lagged / unprovable account defers
+// on its LKG (zero brand-inventory writes). The deadline AbortSignal is threaded into every supported durable
+// read/write below, and the publisher is fenced on THIS op's control fence (aborted -> null fence -> the CAS writes
+// zero rows).
 async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revisionId, signal }) {
   const aborted = () => !!(signal && signal.aborted);
   if (aborted()) return { code: 1, ok: false, stage: "reconcile", status: "DEADLINE_ABORTED", leaseLost: false, reason: "deadline-aborted", aborted: true, blockerCodes: [], problems: ["deadline-aborted before start (no work performed)"] };
@@ -199,22 +202,29 @@ async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revis
   const verifyLeaseForOp = async () => (aborted() ? { ok: false, reason: "deadline-aborted" } : verifyLease());
   const release = buildFbaBrandInventoryRelease({
     resolveOrg: async () => ({ organizationFingerprint: orgFp, connectionId: "primary" }),
-    openCycle: (args) => sb.openSyncCycle(args),
-    getCycleByBucketDate: (bk, date) => sb.getBaseSyncCycleByBucketDate(bk, date),
+    // Every supported durable collaborator forwards the release's { signal } (2nd arg) to the Supabase transport, so an
+    // observed abort stops any in-flight read/write; the release rechecks abort after each phase + before each write.
+    openCycle: (args, opt) => sb.openSyncCycle(args, opt),
+    getCycleByBucketDate: (bk, date, opt) => sb.getBaseSyncCycleByBucketDate(bk, date, opt),
     readFbaSnapshot,
-    loadSnapshotPayload: (path) => sb.getSourceSnapshotPayload(path),
+    loadSnapshotPayload: (path, opt) => sb.getSourceSnapshotPayload(path, opt),
     resolveExpectedRequestHash,
     resolveAccountCountry,
-    readBrandSalesSnapshot: ({ accountId: a }) => sb.getLatestReportSnapshot({ reportKey: "brand-sales", accountId: a }),
-    loadReportPayload: (path) => sb.getReportSnapshotStoragePayload(path),
-    readBrandSalesLineage: ({ accountId: a }) => sb.getLatestReportJobLineage("brand-sales", a),
+    // BLOCKER 1: ONE publisher-identical Brand Sales candidate (resolveValidatedLiveCandidate wires these) -- the
+    // canonical live brand-sales PROVEN to be the promotion of the LATEST PROMOTABLE brand-sales job's shadow. Its
+    // payload AND dependsOn come from that SINGLE proven candidate; any non-proven candidate defers this account.
+    readReportJob: (reportKey, a, opt) => sb.getLatestReportJobLineage(reportKey, a, opt),
+    readSnapshot: (args, opt) => sb.getReportSnapshot(args, opt),
+    loadStoragePayload: (path, opt) => sb.getReportSnapshotStoragePayload(path, opt),
+    liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS,
+    reportDerivations: REPORT_DERIVATIONS,
     buildInventorySnapshot: buildBrandInventorySnapshot,
     computeHash: paramsHashFor,
-    upsertReportJob: (job) => sb.upsertSyncReportJob(job),
+    upsertReportJob: (job, opt) => sb.upsertSyncReportJob(job, opt),
     claimLease: (cycleId, reportKey, a, opts) => sb.claimReportDeriveLease(cycleId, reportKey, a, opts),
-    saveShadow: (args) => sb.saveShadowSnapshotIfNewer(args),
-    reconcileSuccess: (args) => sb.reconcileReportDeriveSuccess(args),
-    finalizeCycle: ({ cycleId }) => sb.finalizeSyncCycle(cycleId),
+    saveShadow: (args, opt) => sb.saveShadowSnapshotIfNewer(args, opt),
+    reconcileSuccess: (args, opt) => sb.reconcileReportDeriveSuccess(args, opt),
+    finalizeCycle: ({ cycleId }, opt) => sb.finalizeSyncCycle(cycleId, opt),
     publisher, readbackLive, verifyLease: verifyLeaseForOp,
     log: () => {},
   });
@@ -259,8 +269,8 @@ async function bucketAccounts(b) {
 
 // The durable FBA snapshot reader (per account). read!='ok' or a missing snapshot is a PER-ACCOUNT defer inside the
 // FBA adapter (LKG preserved), never a whole-run failure.
-async function readFbaSnapshot({ organizationFingerprint: org, connectionId, accountId }) {
-  return sb.getSourceSnapshot({ organizationFingerprint: org, connectionId, sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: accountId });
+async function readFbaSnapshot({ organizationFingerprint: org, connectionId, accountId, signal = null }) {
+  return sb.getSourceSnapshot({ organizationFingerprint: org, connectionId, sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: accountId, signal });
 }
 
 // The recomputed D-1 request hash for EXACTLY the single-day inventory export -- the identity the durable snapshot's
