@@ -17,9 +17,16 @@
 // Campaign Ads) through the SAME reviewed priority release + fenced publisher + content-CAS the OLI reconciler uses --
 // so an Ads-triggered daily reconcile is byte-identical to an OLI-triggered one, records the complete OLI/Catalog
 // lineage union, and the fenced source_refreshed_at CAS makes concurrent OLI/Ads reconciliation converge on the newest
-// valid content (an older derive is a no-op). daily-reporting depends on the CAMPAIGN grain only; the ppc-performance
-// operation (campaign + targeting + search-terms) is a separate dedicated release, added next. It shares the reviewed
-// priority-partial namespace + control-package (immediate RENEWS the scheduler fence; periodic apply/safe-close). A
+// valid content (an older derive is a no-op). daily-reporting depends on the CAMPAIGN grain only.
+//
+// ppc-performance is DELIBERATELY NOT reconciled here (scope decision 2026-09-12). Although ads-dependent-reports.js
+// registers it as Ads-dependent (campaign + targeting + search-terms) so its revision isolation is modelled + tested,
+// the ppc-performance report is SUPERSEDED (report-materialization-registry.js: "no live publisher -- superseded by the
+// Campaign Ads workspace view"); its snapshot is produced only on a MANUAL user refresh, and adding a scheduled
+// publisher would contravene that product decision. This entrypoint therefore reconciles ONLY daily-reporting. The
+// shared wrapper (buildAdsReportReconciler) still supports a ppc operation (exercised by the behavior test's isolation
+// cases), so it can be wired later IF ppc-performance is intentionally un-superseded -- it is NOT wired today. It shares
+// the reviewed priority-partial namespace + control-package (immediate RENEWS the scheduler fence; periodic apply/safe-close). A
 // Campaign Ads failure NEVER suppresses valid OLI sales: an unavailable Ads grain defers ONLY this Ads operation for
 // that account, and daily's re-derive still publishes OLI sales from the durable union. 7-bit ASCII, LF.
 
@@ -257,8 +264,8 @@ const awaitSettled = (p) => {
   return Promise.race([Promise.resolve(p).then(() => { clearTimeout(t); return { settled: true }; }, () => { clearTimeout(t); return { settled: true }; }), grace]);
 };
 
-// The daily-reporting Ads reconciliation operation (report-specific, blocker 5). ppc-performance is a separate operation
-// (dedicated release) added next. Shared collaborators are identical across operations.
+// The daily-reporting Ads reconciliation operation (report-specific, blocker 5). ppc-performance is DELIBERATELY NOT
+// wired (superseded -- see the header); the shared collaborators below would be identical for it if ever un-superseded.
 function buildOperation(reportKey, runRelease) {
   return buildAdsReportReconciler({
     reportKey,
@@ -305,7 +312,7 @@ if (!dryRun) {
   if (!cron.ok) { console.error("STOP ADS_RECONCILE: " + cron.reason + " -- fail closed."); process.exit(1); }
 }
 
-// Run the daily-reporting operation. (ppc-performance is a separate operation, added in the next increment.)
+// Run the daily-reporting operation ONLY. (ppc-performance is intentionally NOT reconciled -- superseded; see header.)
 const daily = buildOperation("daily-reporting", runReleaseForAccount);
 const out = await daily.run({ bucket, requestedAsOf: asOf, accountIds: accountsArg.length ? accountsArg : null, mode, dryRun });
 

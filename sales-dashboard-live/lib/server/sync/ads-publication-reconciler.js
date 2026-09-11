@@ -4,8 +4,11 @@
 // ALREADY-SAVED durable Ads rows. ZERO provider export.
 //
 // REPORT-SPECIFIC (Codex blocker 5): this builds ONE SINGLE-REPORT reconciler operation. daily-reporting and
-// ppc-performance are reconciled by SEPARATE operations, each with its own required Ads grains + coverage window, so a
-// missing PPC-only grain never blocks daily and a targeting/search-terms-only correction never marks daily changed.
+// ppc-performance would be reconciled by SEPARATE operations, each with its own required Ads grains + coverage window, so
+// a missing PPC-only grain never blocks daily and a targeting/search-terms-only correction never marks daily changed.
+// NOTE (scope decision 2026-09-12): only daily-reporting is wired into the production entrypoint. ppc-performance is
+// SUPERSEDED (no live publisher -- served on manual refresh), so no scheduled ppc release is wired; this wrapper's ppc
+// path stays modelled + tested (the behavior test's isolation cases) so it can be enabled later if ppc is un-superseded.
 // The shared OLI/FBA core is unchanged (it already applies one revision per account across its reportKeys; here
 // reportKeys is a single report). No post-promotion hook (the Campaign Ads workspace is durably-direct + never
 // republished; brand-view is materialized elsewhere).
