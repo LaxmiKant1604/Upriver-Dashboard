@@ -76,6 +76,7 @@ export function buildAdsReportReconciler({
             latestMetricDate: st ? st.latestMetricDate : null,
             windows: st && Array.isArray(st.windows) ? st.windows : [],
             read: st ? S(st.read) : "read-failed",
+            syncStatus: st ? S(st.status) : "read-failed", // ads_sync_state.last_status -- only "succeeded" is eligible (fail closed)
           };
         }
         let marketplace = "";

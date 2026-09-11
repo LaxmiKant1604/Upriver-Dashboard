@@ -20,7 +20,7 @@ const ORG = "org-1", A = "A01", ASOF = "2026-09-10";
 const REQ_DAILY = subUtcDaysStr(ASOF, adsRequiredCoverageDays("daily-reporting") - 1); // 7-day -> 2026-09-04
 const REQ_PPC = subUtcDaysStr(ASOF, adsRequiredCoverageDays("ppc-performance") - 1);   // 30-day
 // A grain durably + CONTINUOUSLY covered from well before the window through D-1, with activity.
-const grain = (over = {}) => ({ contentRev: "rev-c1", latestMetricDate: ASOF, windows: [{ from: "2026-07-01", to: ASOF }], read: "ok", ...over });
+const grain = (over = {}) => ({ contentRev: "rev-c1", latestMetricDate: ASOF, windows: [{ from: "2026-07-01", to: ASOF }], read: "ok", syncStatus: "succeeded", ...over });
 const daily = (over = {}) => ({ organizationFingerprint: ORG, connectionId: "primary", accountId: A, marketplace: "US", requestedAsOf: ASOF, requiredFrom: REQ_DAILY, requiredGrains: [ADS_CAMPAIGN_SOURCE_KEY], grains: { [ADS_CAMPAIGN_SOURCE_KEY]: grain() }, ...over });
 const ppc = (over = {}) => ({ organizationFingerprint: ORG, connectionId: "primary", accountId: A, marketplace: "US", requestedAsOf: ASOF, requiredFrom: REQ_PPC, requiredGrains: [ADS_CAMPAIGN_SOURCE_KEY, ADS_TARGETING_SOURCE_KEY, ADS_SEARCH_TERMS_SOURCE_KEY], grains: { [ADS_CAMPAIGN_SOURCE_KEY]: grain(), [ADS_TARGETING_SOURCE_KEY]: grain({ contentRev: "t1" }), [ADS_SEARCH_TERMS_SOURCE_KEY]: grain({ contentRev: "s1" }) }, ...over });
 
@@ -50,6 +50,12 @@ ok("daily eligible (campaign continuously covered) -> AVAILABLE + one content to
 ok("daily defer: campaign coverage gapped ending at D-1 -> unavailable", computeAdsReportRevision(daily({ grains: { [ADS_CAMPAIGN_SOURCE_KEY]: grain({ windows: [{ from: "2026-07-01", to: "2026-09-06" }, { from: "2026-09-09", to: ASOF }] }) } })).eligible === false);
 ok("daily defer: campaign blank content_rev -> unavailable", computeAdsReportRevision(daily({ grains: { [ADS_CAMPAIGN_SOURCE_KEY]: grain({ contentRev: "" }) } })).eligible === false);
 ok("daily defer: campaign read not ok -> unavailable", computeAdsReportRevision(daily({ grains: { [ADS_CAMPAIGN_SOURCE_KEY]: grain({ read: "read-failed" }) } })).eligible === false);
+// FAIL CLOSED on the durable Ads sync status: a `failed`-after-succeeded state (content_rev + succeeded windows preserved,
+// last_status='failed') must be INELIGIBLE -- publishing it would replace valid live Ads with a degraded band. A
+// `running`/`pending` in-flight re-sync likewise defers; only "succeeded" is eligible.
+ok("daily defer: campaign sync status 'failed' (content_rev + coverage intact) -> INELIGIBLE (never replace valid Ads)", computeAdsReportRevision(daily({ grains: { [ADS_CAMPAIGN_SOURCE_KEY]: grain({ syncStatus: "failed" }) } })).eligible === false);
+ok("daily defer: campaign sync status 'running' (in-flight re-sync) -> INELIGIBLE", computeAdsReportRevision(daily({ grains: { [ADS_CAMPAIGN_SOURCE_KEY]: grain({ syncStatus: "running" }) } })).eligible === false);
+ok("daily defer: campaign sync status missing/blank -> INELIGIBLE (fail closed)", computeAdsReportRevision(daily({ grains: { [ADS_CAMPAIGN_SOURCE_KEY]: grain({ syncStatus: "" }) } })).eligible === false);
 ok("daily defer: impossible requestedAsOf (2026-02-30) -> unavailable (real UTC calendar)", computeAdsReportRevision(daily({ requestedAsOf: "2026-02-30", requiredFrom: "2026-02-24" })).eligible === false);
 ok("daily defer: BLANK marketplace -> unavailable (never a blank-market token)", computeAdsReportRevision(daily({ marketplace: "" })).eligible === false);
 

@@ -88,7 +88,9 @@ export function adsContentProvenanceToken({ accountId, connectionId = "primary",
  *                     The token folds EXACTLY these; the campaign grain is mandatory.
  *   requiredFrom   -- the start of the report's required continuous-coverage window (requestedAsOf-(days-1)); the
  *                     reconciler computes it from adsRequiredCoverageDays(reportKey).
- *   grains         -- { [sourceKey]: { contentRev, latestMetricDate, windows:[{from,to}], read } } for the account.
+ *   grains         -- { [sourceKey]: { contentRev, latestMetricDate, windows:[{from,to}], read, syncStatus } } for the
+ *                     account. `syncStatus` is ads_sync_state.last_status (getDailyAdsCoverage `status`); only a
+ *                     "succeeded" grain is eligible (a failed/running state defers -- see the loop below).
  * Returns { eligible:true, status, revisionId:<32hex>, deps:[], contentDeps:[<token>], reason:null } when EVERY required
  * grain is read:'ok' + nonblank content_rev + CONTINUOUSLY covered over [requiredFrom .. requestedAsOf]; else
  * { eligible:false, status:MISSING, ... reason } (defer -> unavailable, never a fabricated zero). A missing PPC-only
@@ -109,6 +111,14 @@ export function computeAdsReportRevision({ organizationFingerprint, connectionId
   for (const sk of req) {
     const e = g[sk];
     if (!e || S(e.read) !== "ok" || !nb(e.contentRev)) return miss("ads-grain-unavailable:" + sk);
+    // FAIL CLOSED on the durable Ads SYNC STATUS (ads_sync_state.last_status, surfaced by getDailyAdsCoverage as
+    // `syncStatus`). Only a terminal-SUCCESS grain is eligible for reconciliation: a `failed`-after-succeeded state
+    // preserves the prior content_rev + succeeded coverage windows but marks the LATEST attempt failed, and
+    // buildDailyAdsCoverage then renders the ads band UNAVAILABLE -- publishing it would REPLACE valid live Ads with a
+    // degraded state (only the scheduler may publish sales with Ads unavailable). A `running`/`pending` in-flight
+    // re-sync likewise defers (the reconciler waits for a settled grain). This gate is reconciler-only: the scheduler's
+    // hot path uses buildDailyAdsCoverage directly and never calls computeAdsReportRevision.
+    if (S(e.syncStatus) !== "succeeded") return miss("ads-grain-not-succeeded:" + sk + ":" + (S(e.syncStatus) || "unknown"));
     if (!coverageProvesContinuousRange(e.windows, requiredFrom, requestedAsOf)) return miss("ads-grain-coverage-gap:" + sk);
     grainRevs.push({ sourceKey: sk, contentRev: S(e.contentRev) });
     if (nb(asDay(e.latestMetricDate))) anyActivity = true;

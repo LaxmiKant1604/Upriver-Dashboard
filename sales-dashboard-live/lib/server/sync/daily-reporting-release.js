@@ -41,11 +41,11 @@ import { enrichOrderedOliHistory } from "./oli-enriched-history.js";
 import { resolveUniqueMarketplaceByAccount, authoritativeMarketplace } from "./oli-sales-estimate.js";
 import {
   resolveOliLineageProvenance, OLI_LINEAGE_STATUS, resolveEffectivePublishAsOf, oliBackfillWindow,
-  OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, ORGANIZATION_SCOPE_KEY,
+  snapshotRefreshDecision, OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, ORGANIZATION_SCOPE_KEY,
 } from "./source-durable-model.js";
-import { adsContentProvenanceToken } from "./ads-publication-revision.js";
-import { ADS_CAMPAIGN_SOURCE_KEY } from "./ads-dependent-reports.js";
-import { ACTIVE_ADS_SOURCE_KEY, CAMPAIGN_ADS_SOURCE_KEY } from "../active-ads-source.js";
+import { computeAdsReportRevision, subUtcDaysStr } from "./ads-publication-revision.js";
+import { ADS_CAMPAIGN_SOURCE_KEY, adsGrainsForReport, adsRequiredCoverageDays } from "./ads-dependent-reports.js";
+import { CAMPAIGN_ADS_SOURCE_KEY } from "../active-ads-source.js";
 import { monthBackStr } from "../date-windows.js";
 
 const S = (v) => (v == null ? "" : String(v));
@@ -96,6 +96,7 @@ export function buildDailyReportingRelease({
   verifyLease = async () => ({ ok: true }),
   snapshotBytes = (p) => Buffer.byteLength(JSON.stringify(p == null ? null : p), "utf8"),
   leaseSeconds = 300,
+  clock = () => Date.now(), // UTC execution-day authority for the Catalog freshness policy (never the requestedAsOf)
   log = () => {},
 } = {}) {
   for (const [name, fn] of [["resolveOrg", resolveOrg], ["resolveAccountMeta", resolveAccountMeta], ["openCycle", openCycle], ["getCycleByBucketDate", getCycleByBucketDate], ["finalizeCycle", finalizeCycle], ["readOliHistory", readOliHistory], ["readOliCoverage", readOliCoverage], ["readOliZeroProof", readOliZeroProof], ["readCatalogSnapshot", readCatalogSnapshot], ["loadCatalogPayload", loadCatalogPayload], ["readActiveAdsRows", readActiveAdsRows], ["readAdsCoverage", readAdsCoverage], ["upsertReportJob", upsertReportJob], ["claimLease", claimLease], ["saveShadow", saveShadow], ["reconcileSuccess", reconcileSuccess], ["computeHash", computeHash], ["readbackLive", readbackLive]]) {
@@ -106,12 +107,37 @@ export function buildDailyReportingRelease({
   const dailyEntry = reportDerivations[DAILY_REPORT_KEY];
   if (!dailyEntry || typeof dailyEntry.derive !== "function" || typeof dailyEntry.validatePayload !== "function") throw new Error("buildDailyReportingRelease requires reportDerivations['daily-reporting'] with derive + validatePayload (fail closed).");
   const SHADOW = shadowKeyFor(DAILY_REPORT_KEY);
+  const REQUIRED_GRAINS = adsGrainsForReport(DAILY_REPORT_KEY);           // [ads-campaign-date]
+  const REQUIRED_COVERAGE_DAYS = adsRequiredCoverageDays(DAILY_REPORT_KEY); // 7 (the daily eligibility window)
 
-  async function runForAccount({ accountId, requestedAsOf, cycleBucket, signal }) {
+  // Recompute the EXACT Daily Campaign-Ads revision from a fresh coverage read (the SAME computeAdsReportRevision the
+  // reconciler used to produce `revisionId`). Returns { rev } or a typed defer -- the ONE fail-closed gate for the Ads
+  // half: coverage read != ok / blank content_rev / malformed-or-gapped required coverage / blank marketplace all make
+  // the revision ineligible -> DEFER (never publish degraded Ads / replace valid live Ads with unavailable). A revision
+  // whose id != the reconciler's supplied `revisionId` means the Ads content changed between scan and release -> DEFER
+  // (do NOT publish new content inside an old revision namespace; the next pass uses the new revision).
+  const recomputeAdsRevision = async ({ organizationFingerprint, connectionId, accountId, marketplace, requestedAsOf, expectedRevisionId, aborted, opt }) => {
+    let cov;
+    try { cov = await readAdsCoverage(accountId, CAMPAIGN_ADS_SOURCE_KEY, opt); }
+    catch (e) { return { defer: defer("ads-coverage-read-threw:" + S(e && e.message)) }; }
+    if (aborted()) return { defer: DEADLINE() };
+    const grains = { [ADS_CAMPAIGN_SOURCE_KEY]: { contentRev: cov ? cov.contentRev : null, latestMetricDate: cov ? cov.latestMetricDate : null, windows: cov && Array.isArray(cov.windows) ? cov.windows : [], read: cov ? S(cov.read) : "read-failed", syncStatus: cov ? S(cov.status) : "read-failed" } };
+    const requiredFrom = subUtcDaysStr(requestedAsOf, REQUIRED_COVERAGE_DAYS - 1);
+    const rev = computeAdsReportRevision({ organizationFingerprint, connectionId, accountId, marketplace, requestedAsOf, requiredFrom, requiredGrains: REQUIRED_GRAINS, grains });
+    if (!rev || rev.eligible !== true) return { defer: defer("ads-evidence-unavailable:" + S(rev && rev.reason)) };
+    if (S(rev.revisionId) !== S(expectedRevisionId)) return { defer: defer("ads-revision-changed-since-scan", "SOURCE_READINESS_PENDING") };
+    return { rev, cov };
+  };
+
+  async function runForAccount({ accountId, requestedAsOf, cycleBucket, revisionId, signal }) {
     const aborted = () => !!(signal && signal.aborted);
     const opt = { signal };
     if (aborted()) return DEADLINE();
     if (!nb(accountId) || !/^\d{4}-\d{2}-\d{2}$/.test(S(requestedAsOf)) || !nb(cycleBucket)) return hardFail("derive", "bad-args");
+    // The reconciler's per-account revision id (the exact computeAdsReportRevision id it classified as stale). The
+    // release recomputes the revision from fresh evidence and REQUIRES a match -- a blank id can never match, so defer.
+    if (!nb(revisionId)) return defer("no-revision-id");
+    const today = new Date(clock()).toISOString().slice(0, 10); // UTC execution day (the Catalog freshness authority)
 
     const org = await resolveOrg();
     if (aborted()) return DEADLINE();
@@ -144,41 +170,55 @@ export function buildDailyReportingRelease({
     catch (e) { return defer("oli-coverage-read-threw:" + S(e && e.message)); }
     if (aborted()) return DEADLINE();
 
+    // (2) CATALOG evidence -- MATCH the scheduler's gatherEvidence/validateSnapshot contract (source-bucket-sync-runtime
+    // .js :533-564) before opening a cycle: freshness policy (snapshotRefreshDecision at the UTC execution day),
+    // content-address hydration (enforced INSIDE loadCatalogPayload=getSourceSnapshotPayload), and row-count integrity
+    // (rows.length === snapshot.row_count). A missing / stale / dangling / count-mismatched catalog DEFERS with zero writes.
     let catalogSnapshot = null;
     try { const cr = await readCatalogSnapshot({ organizationFingerprint, connectionId, sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY, signal }); catalogSnapshot = cr && S(cr.read) === "ok" ? (cr.snapshot || null) : null; }
     catch (e) { return defer("catalog-snapshot-read-threw:" + S(e && e.message)); }
     if (aborted()) return DEADLINE();
     if (!catalogSnapshot || !nb(S(catalogSnapshot.object_path ?? catalogSnapshot.objectPath)) || !nb(S(catalogSnapshot.validated_at ?? catalogSnapshot.validatedAt))) return defer("no-catalog-snapshot");
+    // FRESHNESS: the catalog is a daily-snapshot source -- a validated_at day BEFORE the UTC execution day is stale and
+    // its rows must NOT feed a derive (identical to validateSnapshot :537-547). Wrapped like the hot path (a non-daily
+    // source would throw; catalog is daily-snapshot so the policy applies).
+    try { if (snapshotRefreshDecision({ sourceKey: CATALOG_SOURCE_KEY, lastValidatedAt: catalogSnapshot.validated_at ?? catalogSnapshot.validatedAt, today }).refresh) return defer("catalog-stale", "SOURCE_READINESS_PENDING"); }
+    catch { /* non-daily-snapshot source: no freshness policy (catalog IS daily-snapshot, so this never fires) */ }
     const catalogRequestHash = S(catalogSnapshot.source_request_hash ?? catalogSnapshot.sourceRequestHash);
     if (!nb(catalogRequestHash)) return defer("catalog-hash-unresolved");
     let catalogRows;
     try { const p = await loadCatalogPayload(S(catalogSnapshot.object_path ?? catalogSnapshot.objectPath), opt); catalogRows = Array.isArray(p) ? p : (p && Array.isArray(p.rows) ? p.rows : null); }
-    catch (e) { return defer("catalog-payload-unreadable:" + S(e && e.message)); }
+    catch (e) { return defer("catalog-dangling:" + S(e && e.message)); } // content-address mismatch / unreadable object
     if (aborted()) return DEADLINE();
     if (!Array.isArray(catalogRows)) return defer("catalog-rows-unavailable");
+    if (catalogRows.length !== Number(catalogSnapshot.row_count ?? catalogSnapshot.rowCount)) return defer("catalog-integrity"); // hydrated rows must match the snapshot row_count
 
-    // ONE Ads coverage read reused for BOTH the derive coverage AND the content token (worker key, not the registry grain).
-    let adsCov = null;
-    try { adsCov = await readAdsCoverage(accountId, CAMPAIGN_ADS_SOURCE_KEY, opt); }
-    catch (e) { adsCov = { windows: [], status: "missing", latestMetricDate: null, contentRev: null, read: "read-failed", error: "COVERAGE_READ_FAILED" }; }
-    if (aborted()) return DEADLINE();
-
-    // Active Campaign Ads metric rows WITH their typed read state (byte-identical to runtime :949-958): a failed/limited
-    // read is NEVER flattened to []+"ok" -- metricsRead travels into buildDailyAdsCoverage so Daily never reports a false
-    // zero-Ads result. Ads never blocks the sales snapshot.
-    let adRows = [];
-    let metricsRead = "read-failed";
-    try { const rows = await readActiveAdsRows(accountId, dailyFrom, requestedAsOf, opt); adRows = Array.isArray(rows) ? rows : []; metricsRead = Array.isArray(rows) ? "ok" : "read-failed"; }
-    catch (e) { adRows = []; metricsRead = e && e.code === "ADS_ROW_LIMIT_EXCEEDED" ? "limit-exceeded" : "read-failed"; }
-    if (aborted()) return DEADLINE();
-
-    // (2) EXACT D-1 proof (byte-identical to runtime :972-982): the account must prove gapless durable OLI coverage
+    // (3) EXACT D-1 proof (byte-identical to runtime :972-982): the account must prove gapless durable OLI coverage
     // through EXACTLY requestedAsOf. A tail lag / interior gap clamps the effective as-of below requestedAsOf -> DEFER
     // (never publish a clamped D-2 window labelled D-1; do NOT reuse rederiveDailyV2's clampToProven).
     const eff = resolveEffectivePublishAsOf({ coverageByAccountId: { [accountId]: oliWindows }, accountIds: [accountId], from: brandViewWindow.from, refreshAsOf: requestedAsOf });
     if (S(eff && eff.effectiveAsOf) !== S(requestedAsOf)) return defer("daily-not-d1", "SOURCE_READINESS_PENDING");
 
-    // (3) ENRICH history (READ-ONLY: ordered units + estimate-included Total Sales from the ALREADY-MATERIALIZED
+    // (4) CAMPAIGN ADS evidence -- FAIL-CLOSED (this Ads-specific reconciler must NEVER replace valid live Ads with an
+    // unavailable state; only the scheduler may publish sales with Ads unavailable). Recompute the EXACT Daily Ads
+    // revision from a FRESH coverage read + REQUIRE it to equal the reconciler's supplied revisionId -> any coverage
+    // read failure / blank content_rev / gapped-or-malformed required coverage / blank marketplace / revision drift
+    // DEFERS before any write. Then read the metric rows FAIL-CLOSED (a throw / row-limit / non-array result DEFERS --
+    // never a false zero-Ads []). Finally RE-READ the coverage after the metric read and require the SAME revision, to
+    // exclude a concurrent content-revision correction landing mid-release. durable_content_deps is the EXACT token the
+    // recomputed revision emits (so it can never drift from the reconciler's revision.contentDeps -> no false convergence).
+    const r1 = await recomputeAdsRevision({ organizationFingerprint, connectionId, accountId, marketplace, requestedAsOf, expectedRevisionId: revisionId, aborted, opt });
+    if (r1.defer) return r1.defer;
+    let adRows;
+    try { const rows = await readActiveAdsRows(accountId, dailyFrom, requestedAsOf, opt); if (!Array.isArray(rows)) return defer("ads-metric-malformed"); adRows = rows; }
+    catch (e) { return defer(e && e.code === "ADS_ROW_LIMIT_EXCEEDED" ? "ads-metric-row-limit" : "ads-metric-read-failed:" + S(e && e.message)); }
+    if (aborted()) return DEADLINE();
+    const r2 = await recomputeAdsRevision({ organizationFingerprint, connectionId, accountId, marketplace, requestedAsOf, expectedRevisionId: revisionId, aborted, opt });
+    if (r2.defer) return r2.defer; // a content-rev change between the coverage read and the metric read -> defer to the next pass
+    const adsCov = r2.cov;
+    const durableContentDeps = Array.isArray(r1.rev.contentDeps) ? r1.rev.contentDeps : [];
+
+    // ENRICH history (READ-ONLY: ordered units + estimate-included Total Sales from the ALREADY-MATERIALIZED
     // estimates -- this release NEVER recomputes/writes estimates). Additive + non-fatal, byte-identical to runtime
     // :1000-1035 minus the recompute write: on ANY failure historyRows stays the priced rows (Total Sales never regressed).
     try {
@@ -199,12 +239,15 @@ export function buildDailyReportingRelease({
     } catch { /* additive: keep the priced Total Sales + LKG */ }
     if (aborted()) return DEADLINE();
 
-    // (4) DERIVE daily-reporting ONLY via the ONE canonical adapter (byte-identical to durable-dashboards.js :350-370).
+    // (5) DERIVE daily-reporting ONLY via the ONE canonical adapter (byte-identical to durable-dashboards.js :350-370).
+    // metricsRead is ALWAYS "ok" here -- a failed/limited/malformed metric read already DEFERRED above, so Ads are never
+    // rendered "unavailable" by this reconciler (a successful [] is a valid covered-empty). adsCov is the RE-READ,
+    // revision-matched coverage.
     const source = slicedOliSourceFromHistory({ historyRows, accountId, rawSellerId, from: dailyFrom, to: requestedAsOf });
     const adsCoverage = buildDailyAdsCoverage({
       accountId, rawSellerId, currency, from: dailyFrom, to: requestedAsOf,
-      metricRows: metricsRead === "ok" ? adRows : [], metricsRead,
-      coverageState: adsCov || { windows: [], status: "missing", latestMetricDate: null, read: "read-failed", error: "COVERAGE_READ_FAILED" },
+      metricRows: adRows, metricsRead: "ok",
+      coverageState: adsCov,
     });
     let payload;
     try {
@@ -216,9 +259,10 @@ export function buildDailyReportingRelease({
     if (aborted()) return DEADLINE();
     if (!dailyEntry.validatePayload(payload)) return hardFail("derive", "daily-payload-malformed");
 
-    // (5) Identity + lineage. depends_on = catalog hash UNION the OLI lineage provenance (byte-identical to the runtime
+    // (6) Identity + lineage. depends_on = catalog hash UNION the OLI lineage provenance (byte-identical to the runtime
     // dependsOnFor + computeOliAccountRevision, so the OLI reconciler still classifies daily covered). durable_content_deps
-    // = the Campaign Ads content token (matches the hot-derive binding + the reconciler's revision.contentDeps).
+    // is the EXACT token the recomputed Ads revision emitted (r1.rev.contentDeps), so it can never drift from the Ads
+    // reconciler's revision.contentDeps.
     const shadowVersion = S(dailyEntry.snapshotVersion);
     const params = { reportVersion: shadowVersion, accountId, from: dailyFrom, to: requestedAsOf, brand: "ALL" };
     const paramsHash = computeHash(shadowVersion, params);
@@ -235,13 +279,7 @@ export function buildDailyReportingRelease({
     if (!oli || oli.status === OLI_LINEAGE_STATUS.MISSING) return defer("durable-oli-provenance-missing", "SOURCE_READINESS_PENDING");
     const dependsOn = [...new Set([catalogRequestHash, ...(oli.deps || [])])].sort();
 
-    let durableContentDeps = [];
-    const contentRev = adsCov && S(adsCov.read) === "ok" ? adsCov.contentRev : null;
-    if (ACTIVE_ADS_SOURCE_KEY === CAMPAIGN_ADS_SOURCE_KEY && nb(contentRev) && nb(marketplace)) {
-      durableContentDeps = [adsContentProvenanceToken({ accountId, connectionId: "primary", marketplace, grainRevs: [{ sourceKey: ADS_CAMPAIGN_SOURCE_KEY, contentRev }] })];
-    }
-
-    // (6) open the dedicated cycle (WRITE) -- abort-check immediately before every write from here on.
+    // (7) open the dedicated cycle (WRITE) -- abort-check immediately before every write from here on.
     if (aborted()) return DEADLINE();
     try { await openCycle({ bucket: cycleBucket, cycleDate: requestedAsOf, trigger: "manual" }, opt); }
     catch (e) { return defer("cycle-open-threw:" + S(e && e.message)); }
@@ -295,7 +333,7 @@ export function buildDailyReportingRelease({
       if (rdisp !== "reconciled" && rdisp !== "already-complete") return hardFail("derive", "reconcile-" + S(rdisp || "malformed"));
     }
 
-    // (6b) finalize ONLY this dedicated cycle (directly; never the trio finalizeBucket).
+    // (8) finalize ONLY this dedicated cycle (directly; never the trio finalizeBucket).
     if (aborted()) return DEADLINE();
     let fin;
     try { fin = await finalizeCycle({ cycleId }, opt); }
@@ -304,7 +342,7 @@ export function buildDailyReportingRelease({
     const fdisp = fin && fin.disposition;
     if (fdisp !== "finalized" && fdisp !== "already-terminal") return hardFail("finalize", "finalize-" + S(fdisp || "malformed"));
 
-    // (7) preflight + publish + read back ONLY daily-reporting (reviewed fenced publisher + CAS + buildLiveReadback).
+    // (9) preflight + publish + read back ONLY daily-reporting (reviewed fenced publisher + CAS + buildLiveReadback).
     if (aborted()) return DEADLINE();
     let pf;
     try { pf = await publisher.preflight(DAILY_REPORT_KEY, accountId); }

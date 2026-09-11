@@ -20,8 +20,8 @@ import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
 import { buildAdsReportReconciler, ADS_RECONCILE_STATUS } from "../lib/server/sync/ads-publication-reconciler.js";
 import { buildDailyReportingRelease } from "../lib/server/sync/daily-reporting-release.js";
-import { adsWorkerKeyForGrain, ADS_CAMPAIGN_SOURCE_KEY } from "../lib/server/sync/ads-dependent-reports.js";
-import { adsContentProvenanceToken } from "../lib/server/sync/ads-publication-revision.js";
+import { adsWorkerKeyForGrain, ADS_CAMPAIGN_SOURCE_KEY, adsRequiredCoverageDays } from "../lib/server/sync/ads-dependent-reports.js";
+import { adsContentProvenanceToken, computeAdsReportRevision, subUtcDaysStr } from "../lib/server/sync/ads-publication-revision.js";
 import { buildSchedulerV2Publisher } from "../lib/server/sync/publisher-composition.js";
 import { buildLiveReadback } from "../lib/server/sync/source-priority-release-runner.js";
 import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "../lib/server/sync/report-publisher.js";
@@ -46,6 +46,16 @@ const BS_SHADOW = "scheduler-v2/brand-sales";
 const INV_SHADOW = "scheduler-v2/brand-inventory";
 const BW = oliBackfillWindow(ASOF);          // OLI backfill window (wide provenance window)
 const DAILY_FROM = monthBackStr(ASOF, 5);    // daily payload window start
+// Fixed UTC execution-day clock so the Catalog freshness policy (validatedDate < today -> stale) uses today == ASOF,
+// matching the seeded catalog validated_at (a real wall clock would mark the fixture's catalog stale).
+const TEST_CLOCK = () => Date.parse("2026-09-10T12:00:00Z");
+// The EXACT Ads revision id the reconciler produces for the fixture (= what the dedicated release recomputes + requires).
+// Used by the DIRECT-release scenarios (abort / null-fence) that bypass the reconciler.
+const expectedRevisionId = (contentRev = "cr-A", marketplace = MKT) => computeAdsReportRevision({
+  organizationFingerprint: "org-1", connectionId: "primary", accountId: A, marketplace,
+  requestedAsOf: ASOF, requiredFrom: subUtcDaysStr(ASOF, adsRequiredCoverageDays(RK) - 1), requiredGrains: [ADS_CAMPAIGN_SOURCE_KEY],
+  grains: { [ADS_CAMPAIGN_SOURCE_KEY]: { contentRev, latestMetricDate: "2026-09-08", windows: [{ from: BW.from, to: ASOF }], read: "ok", syncStatus: "succeeded" } },
+}).revisionId;
 
 // A faithful in-memory control store for runControlPackageTransaction (row-shaped state + the full lease interface).
 function inMemoryControlStore() {
@@ -88,6 +98,10 @@ function makeWorld(over = {}) {
     { child_asin: "B0A", sku: "SKU-A", parent_asin: "P", product_name: "A", product_brand: "Acme" },
     { child_asin: "B0B", sku: "SKU-B", parent_asin: "P", product_name: "B", product_brand: "Bolt" },
   ];
+  // Catalog snapshot: validated_at day defaults to ASOF (fresh under TEST_CLOCK today==ASOF); row_count defaults to the
+  // hydrated rows length (integrity match). Overrides model the stale-catalog + row_count-mismatch defer scenarios.
+  const catalogValidatedAt = over.catalogValidatedAt || "2026-09-10T06:00:00Z";
+  const catalogRowCount = over.catalogRowCount != null ? over.catalogRowCount : catalogRows.length;
   // OLI coverage window: gapless [BW.from .. covTo]; covTo < ASOF models "D-1 not ready" (the effective as-of clamps below ASOF).
   const covTo = over.oliCovTo || ASOF;
   const adState = { windows: [{ from: BW.from, to: ASOF }], status: "succeeded", latestMetricDate: "2026-09-08", contentRev: over.adsContentRev || "cr-A", read: "ok" };
@@ -99,7 +113,7 @@ function makeWorld(over = {}) {
     readOliHistory: async () => (over.noHistory ? [] : historyRows.map((r) => ({ ...r }))),
     readOliCoverage: async () => ({ read: "ok", windows: [{ from: BW.from, to: covTo }] }),
     readOliZeroProof: async () => ({ read: "ok", byAccount: new Map() }),
-    readCatalogSnapshot: async () => (over.noCatalog ? { read: "ok", snapshot: null } : { read: "ok", snapshot: { object_path: "obj/cat", source_request_hash: "catalog", validated_at: "2026-09-10T06:00:00Z" } }),
+    readCatalogSnapshot: async () => (over.noCatalog ? { read: "ok", snapshot: null } : { read: "ok", snapshot: { object_path: "obj/cat", source_request_hash: "catalog", validated_at: catalogValidatedAt, row_count: catalogRowCount } }),
     loadCatalogPayload: async () => ({ rows: catalogRows.map((r) => ({ ...r })) }),
     readActiveAdsRows: async () => adRows.map((r) => ({ ...r, metrics: { ...r.metrics } })),
     readAdsCoverage: async () => ({ ...adState, windows: adState.windows.map((w) => ({ ...w })) }),
@@ -197,7 +211,7 @@ function makeWorld(over = {}) {
 // Wire the REAL dedicated daily release + REAL fenced publisher with a WORLD, mirroring the entrypoint's
 // runReleaseForAccount composition. `abortWhen` makes the named awaited phase abort AFTER completing (the release
 // observes it at its NEXT recheck); abortOnReadback aborts the instant the live read-back settles.
-function wireRelease(world, { leaseFence, aborted = () => false, controller = null, abortWhen = null, abortOnReadback = null, failReadback = false } = {}) {
+function wireRelease(world, { leaseFence, aborted = () => false, controller = null, abortWhen = null, abortOnReadback = null, failReadback = false, clock = TEST_CLOCK } = {}) {
   const rawReadback = buildLiveReadback({ getReportSnapshot: world.getReportSnapshot, loadStoragePayload: world.getReportSnapshotStoragePayload, liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS, reportDerivations: REPORT_DERIVATIONS, computeHash: paramsHashFor });
   const readbackLive = failReadback
     ? async () => ({ ok: false, reason: "forced-readback-failure" })
@@ -232,7 +246,7 @@ function wireRelease(world, { leaseFence, aborted = () => false, controller = nu
     upsertReportJob: wrapAbort("upsert", world.upsertReportJob), claimLease: wrapAbort("claim", world.claimLease),
     saveShadow: wrapAbort("shadow", world.saveShadow), reconcileSuccess: wrapAbort("reconcile", world.reconcileSuccess),
     computeHash: paramsHashFor, liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS, reportDerivations: REPORT_DERIVATIONS,
-    publisher, readbackLive,
+    publisher, readbackLive, clock,
     verifyLease: async () => (aborted() ? { ok: false } : { ok: !!(typeof leaseFence === "function" ? leaseFence() : leaseFence) }),
     log: () => {},
   });
@@ -249,7 +263,7 @@ function buildProd(world, over = {}) {
     const aborted = () => !!(signal && signal.aborted);
     const cycleBucket = "priority-partial-india-" + String(revisionId || "x").slice(0, 16);
     const { release } = wireRelease(world, { ...(over.wire || {}), leaseFence: () => leaseFence, aborted, controller: over.controller });
-    const r = await release.runForAccount({ accountId, requestedAsOf, cycleBucket, signal });
+    const r = await release.runForAccount({ accountId, requestedAsOf, cycleBucket, revisionId, signal });
     return { code: r.code, ok: r.ok, stage: r.stage, status: r.status || null, leaseLost: r.leaseLost === true, reason: r.reason || null, blockerCodes: r.blockerCodes || [], problems: r.problems || [] };
   };
   const openControls = async (ids) => {
@@ -305,6 +319,14 @@ const siblingsUnchangedAndUntouched = (before, after) =>
   && JSON.stringify(before.bsShadow) === JSON.stringify(after.bsShadow) && JSON.stringify(before.invShadow) === JSON.stringify(after.invShadow)
   && after.bsJobs === before.bsJobs && after.invJobs === before.invJobs
   && after.published === 0 && after.upserted === 0 && after.shadowed === 0;
+// Drive the REAL dedicated release directly (bypassing the reconciler) with a matching revisionId + valid fence.
+const driveRelease = (world, { revisionId = expectedRevisionId(), cycleBucket = "priority-partial-india-x", wire = {} } = {}) => {
+  const { release } = wireRelease(world, { leaseFence: { ownerToken: "op", generation: 1 }, ...wire });
+  return release.runForAccount({ accountId: A, requestedAsOf: ASOF, cycleBucket, revisionId, signal: { aborted: false } });
+};
+// ZERO durable writes of ANY kind (no cycle opened, no report-job upsert, no shadow save, no live publish) -- the exact
+// proof that a fail-closed defer happened BEFORE any write, so the Daily LKG is byte-identical.
+const zeroWrites = (world) => world.writes.openCalls === 0 && world.writes.upsertedReportKeys.length === 0 && world.writes.shadowSavedKeys.length === 0 && world.writes.publishedLiveKeys.length === 0;
 
 // (1) UNPROMOTED -> REAL dedicated release derives+publishes+reads-back ONLY daily-reporting; zero sibling writes.
 test("scope: UNPROMOTED daily -> REAL dedicated release publishes ONLY daily-reporting (siblings byte-identical, zero sibling writes); zero export", async () => {
@@ -384,7 +406,7 @@ test("termination boundary: abort during each awaited phase (open/upsert/claim/s
     const before = siblingFootprint(world);
     const controller = new AbortController();
     const { release } = wireRelease(world, { leaseFence: { ownerToken: "op", generation: 1 }, aborted: () => controller.signal.aborted, controller, abortWhen: phase });
-    const res = await release.runForAccount({ accountId: A, requestedAsOf: ASOF, cycleBucket: "priority-partial-india-x", signal: controller.signal });
+    const res = await release.runForAccount({ accountId: A, requestedAsOf: ASOF, cycleBucket: "priority-partial-india-x", revisionId: expectedRevisionId(), signal: controller.signal });
     ok(`abort@${phase}: release deferred (never ok), NO live daily row published + NO sibling writes`, res.ok !== true && !liveRow(world) && world.writes.publishedLiveKeys.length === 0 && siblingsUnchangedAndUntouched(before, siblingFootprint(world)));
   }
 });
@@ -394,7 +416,7 @@ test("fenced CAS final defense: a NULL control fence makes the real publisher li
   const world = makeWorld();
   // Wire the release with a permanently-null fence (aborted() true) + drive the release directly.
   const { release } = wireRelease(world, { leaseFence: () => null, aborted: () => true });
-  const out = await release.runForAccount({ accountId: A, requestedAsOf: ASOF, cycleBucket: "priority-partial-india-nullfence", signal: { aborted: false } });
+  const out = await release.runForAccount({ accountId: A, requestedAsOf: ASOF, cycleBucket: "priority-partial-india-nullfence", revisionId: expectedRevisionId(), signal: { aborted: false } });
   ok("release returns a deadline/contention deferral (never ok); ZERO live daily rows written", out.ok !== true && world.writes.publishedLiveKeys.filter((k) => k === RK).length === 0 && !liveRow(world));
 });
 
@@ -407,6 +429,89 @@ test("readback failure -> FAILED_READBACK (non-green); zero sibling writes", asy
   ok("A01 FAILED_READBACK; outcome failed; ok:false", st(out) === ADS_RECONCILE_STATUS.FAILED_READBACK && out.outcome === "failed" && out.ok === false);
   const after = siblingFootprint(world);
   ok("siblings received ZERO writes on a readback failure (their LKG preserved)", after.published === 0 && after.upserted === 0 && after.shadowed === 0 && JSON.stringify(before.bsLive) === JSON.stringify(after.bsLive) && JSON.stringify(before.invLive) === JSON.stringify(after.invLive));
+});
+
+// ============================ Codex-required Ads-evidence-race / Catalog-parity / LKG scenarios ============================
+
+// REQ 1 -- outer revision eligible, then the release COVERAGE REREAD fails: zero cycle/report-job/shadow/live writes; LKG.
+test("REQ1: coverage REREAD (post metric-read) fails -> DEFER before any write; zero writes; Daily LKG byte-identical; siblings untouched", async () => {
+  const world = makeWorld();
+  const before = siblingFootprint(world);
+  let covCalls = 0;
+  world.readAdsCoverage = async () => { covCalls += 1; if (covCalls >= 2) throw new Error("coverage-reread-boom"); return { windows: [{ from: BW.from, to: ASOF }], status: "succeeded", latestMetricDate: "2026-09-08", contentRev: "cr-A", read: "ok" }; };
+  const res = await driveRelease(world); // r1 ok (matches) -> metric read ok -> r2 (reread) throws -> defer
+  ok("release DEFERS (never ok) on a coverage reread failure", res.ok !== true);
+  ok("ZERO writes of any kind (no cycle/job/shadow/live) -> Daily LKG intact; siblings untouched", zeroWrites(world) && !liveRow(world) && siblingsUnchangedAndUntouched(before, siblingFootprint(world)));
+});
+
+// REQ 2 -- outer revision eligible, then the metric-row read THROWS (and, separately, hits the row limit): zero writes,
+// no Ads token, LKG. NEVER a false zero-Ads publish / never replaces valid Ads with unavailable.
+test("REQ2: metric-row read THROWS -> DEFER; zero writes; no Ads token recorded; siblings untouched", async () => {
+  for (const err of [new Error("metric-boom"), Object.assign(new Error("cap"), { code: "ADS_ROW_LIMIT_EXCEEDED" })]) {
+    const world = makeWorld();
+    const before = siblingFootprint(world);
+    world.readActiveAdsRows = async () => { throw err; };
+    const res = await driveRelease(world);
+    ok(`metric read (${err.code || "throw"}) -> DEFER, zero writes, no token`, res.ok !== true && zeroWrites(world) && !liveRow(world) && world.jobs.every((j) => j.report_key !== RK) && siblingsUnchangedAndUntouched(before, siblingFootprint(world)));
+  }
+});
+
+// REQ 3 -- a successful metrics read returning [] with VALID coverage is a valid COVERED-EMPTY: still publishes ONCE.
+test("REQ3: covered-empty ([] metric rows + valid coverage) still publishes daily-reporting ONCE; siblings untouched", async () => {
+  const world = makeWorld();
+  const before = siblingFootprint(world);
+  world.readActiveAdsRows = async () => []; // valid empty (NOT a read failure)
+  const res = await driveRelease(world);
+  ok("covered-empty publishes (release ok) + a live daily row exists", res.ok === true && !!liveRow(world));
+  ok("ONLY daily-reporting written; siblings byte-identical + zero sibling writes", world.writes.publishedLiveKeys.join(",") === RK && siblingsUnchangedAndUntouched(before, siblingFootprint(world)));
+});
+
+// REQ 4 -- Ads content_rev changed between the reconciler scan and the release: the OLD revision namespace performs zero
+// writes and DEFERS (do not publish new content inside an old revision id).
+test("REQ4: content_rev changed since scan (release sees cr-B, supplied revisionId is cr-A) -> DEFER, zero writes; siblings untouched", async () => {
+  const world = makeWorld({ adsContentRev: "cr-B" }); // the release's fresh read sees cr-B
+  const before = siblingFootprint(world);
+  const res = await driveRelease(world, { revisionId: expectedRevisionId("cr-A") }); // the reconciler scanned cr-A
+  ok("release DEFERS (ads-revision-changed-since-scan): recomputed id != supplied id", res.ok !== true);
+  ok("ZERO writes; no live daily row; siblings untouched (old revision namespace publishes nothing)", zeroWrites(world) && !liveRow(world) && siblingsUnchangedAndUntouched(before, siblingFootprint(world)));
+});
+
+// REQ 5 -- a STALE Catalog snapshot (validated_at day < the UTC execution day) DEFERS before opening a cycle.
+test("REQ5: stale Catalog (validated_at < today) -> DEFER before cycle open; zero writes; siblings untouched", async () => {
+  const world = makeWorld({ catalogValidatedAt: "2026-09-08T06:00:00Z" }); // < today (2026-09-10) -> stale
+  const before = siblingFootprint(world);
+  const res = await driveRelease(world);
+  ok("release DEFERS on a stale catalog BEFORE any cycle open", res.ok !== true && world.writes.openCalls === 0);
+  ok("ZERO writes; no live daily row; siblings untouched", zeroWrites(world) && !liveRow(world) && siblingsUnchangedAndUntouched(before, siblingFootprint(world)));
+});
+
+// REQ 6 -- a Catalog row_count MISMATCH (hydrated rows.length != snapshot.row_count) DEFERS before opening a cycle.
+test("REQ6: Catalog row_count mismatch -> DEFER before cycle open; zero writes; siblings untouched", async () => {
+  const world = makeWorld({ catalogRowCount: 999 }); // hydrated payload has 2 rows -> mismatch
+  const before = siblingFootprint(world);
+  const res = await driveRelease(world);
+  ok("release DEFERS on a catalog row_count mismatch BEFORE any cycle open", res.ok !== true && world.writes.openCalls === 0);
+  ok("ZERO writes; no live daily row; siblings untouched", zeroWrites(world) && !liveRow(world) && siblingsUnchangedAndUntouched(before, siblingFootprint(world)));
+});
+
+// REQ 7 (the confirmed HIGH defect) -- a valid live daily is published (Ads succeeded, cr-A); THEN the durable Ads sync
+// enters a `failed`-after-succeeded state (content_rev + succeeded coverage intact, last_status='failed'). The reconciler
+// must DEFER (revision ineligible on the sync status) and RETAIN the valid live daily byte-for-byte -- NEVER replace it
+// with a degraded/unavailable Ads snapshot. Only the scheduler may publish sales with Ads unavailable.
+test("REQ7: a failed-after-succeeded Ads sync status -> DEFER + retain the valid live daily (LKG); never replace with unavailable; siblings untouched", async () => {
+  const world = makeWorld();
+  const h = buildProd(world);
+  await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" }); // pass 1: publish valid cr-A live
+  const liveA = JSON.stringify(liveRow(world).payload);
+  ok("pass 1 published a valid live daily (Ads available)", !!liveRow(world) && liveRow(world).payload.adsAvailability && liveRow(world).payload.adsAvailability.status !== "failed");
+  // The ads sync now reports last_status='failed' but preserves content_rev + the succeeded coverage windows.
+  world.readAdsCoverage = async () => ({ windows: [{ from: BW.from, to: ASOF }], status: "failed", latestMetricDate: "2026-09-08", contentRev: "cr-A", read: "ok" });
+  const before = siblingFootprint(world);
+  const pubBefore = world.writes.publishedLiveKeys.length;
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" }); // pass 2: failed status
+  ok("pass 2 DEFERS (revision ineligible on the failed sync status); no release ran", st(out) === ADS_RECONCILE_STATUS.DEFERRED_PROVENANCE);
+  ok("the valid live daily is RETAINED byte-for-byte (never overwritten by a degraded/unavailable snapshot)", JSON.stringify(liveRow(world).payload) === liveA && world.writes.publishedLiveKeys.length === pubBefore);
+  ok("siblings byte-identical + zero sibling writes", siblingsUnchangedAndUntouched(before, siblingFootprint(world)));
 });
 
 async function main() {

@@ -48,7 +48,7 @@ const shParamsFor = (rk, accountId, to) => ({ reportVersion: "scheduler-v2/" + r
 const shHashFor = (rk, accountId, to) => HASH("scheduler-v2/" + rk, shParamsFor(rk, accountId, to));
 
 // A durably + CONTINUOUSLY covered grain from well before the window through D-1, with activity, at content_rev `rev`.
-const grainRow = (rev, over = {}) => ({ contentRev: rev, latestMetricDate: ASOF, windows: [{ from: "2026-07-01", to: ASOF }], read: "ok", ...over });
+const grainRow = (rev, over = {}) => ({ contentRev: rev, latestMetricDate: ASOF, windows: [{ from: "2026-07-01", to: ASOF }], read: "ok", status: "succeeded", ...over });
 // The CURRENT content token for a report's required grains (what computeAdsReportRevision produces as contentDeps[0]).
 const tokenFor = (accountId, requiredGrains, grainsByWorkerKey, marketplace = MKT) => {
   const grainRevs = requiredGrains.map((g) => ({ sourceKey: g, contentRev: (grainsByWorkerKey.get(adsWorkerKeyForGrain(g)) || {}).contentRev }));

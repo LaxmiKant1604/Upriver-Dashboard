@@ -235,7 +235,7 @@ async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revis
     publisher, readbackLive, verifyLease: verifyLeaseForOp,
     log: () => {},
   });
-  const result = await release.runForAccount({ accountId, requestedAsOf, cycleBucket, signal });
+  const result = await release.runForAccount({ accountId, requestedAsOf, cycleBucket, revisionId, signal });
   return { code: result.code, ok: result.ok, stage: result.stage, status: result.status || null, leaseLost: result.leaseLost === true, reason: result.reason || null, blockerCodes: result.blockerCodes || [], problems: result.problems || [] };
 }
 
