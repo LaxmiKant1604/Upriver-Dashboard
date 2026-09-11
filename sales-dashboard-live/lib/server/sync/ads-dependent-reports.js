@@ -39,6 +39,23 @@ export const ADS_LINEAGE_DEPENDS_ON = Object.freeze({
   "ppc-performance": Object.freeze([ADS_CAMPAIGN_SOURCE_KEY, ADS_TARGETING_SOURCE_KEY, ADS_SEARCH_TERMS_SOURCE_KEY]),
 });
 
+// Per-report REQUIRED continuous-coverage window (days, inclusive, ending at the requested D-1). The reconciler proves
+// the report's Ads grains are durably + CONTINUOUSLY covered over [requestedAsOf-(days-1) .. requestedAsOf] (never a
+// MAX(covered_to) span that hides a gap). ppc-performance uses the 30-day PPC window; daily-reporting uses its 7-day
+// minimum (the derive re-validates the exact live window + degrades honestly, so this is a lower-bound eligibility
+// gate, not the report's full window). Kept here beside the lineage so a new report declares both together.
+export const ADS_REPORT_COVERAGE_DAYS = Object.freeze({
+  "daily-reporting": 7,
+  "ppc-performance": 30,
+});
+
+// The required continuous-coverage window (days) for a report, or 1 (D-1 itself) when undeclared (fail toward the
+// strictest single-day proof rather than an unbounded span).
+export function adsRequiredCoverageDays(reportKey) {
+  const d = ADS_REPORT_COVERAGE_DAYS[reportKey];
+  return Number.isInteger(d) && d > 0 ? d : 1;
+}
+
 const includesAnyAds = (fams) => Array.isArray(fams) && ADS_SOURCE_KEYS.some((k) => fams.includes(k));
 
 // The Ads-inclusive live report keys of ANY lineage-families map, sorted + deduped.
@@ -75,6 +92,7 @@ export function assertAdsDependentReportsConsistency(map = ADS_LINEAGE_DEPENDS_O
     if (!includesAnyAds(fams)) throw new Error(`ads-dependent-reports: ${k} is declared but includes no Ads source grain (fail closed).`);
     if (!fams.includes(ADS_PRIMARY_SOURCE_KEY)) throw new Error(`ads-dependent-reports: ${k} must include the required campaign grain ${ADS_PRIMARY_SOURCE_KEY} (fail closed).`);
     for (const f of fams) if (!ADS_SOURCE_KEYS.includes(f)) throw new Error(`ads-dependent-reports: ${k} declares unknown Ads grain ${f} (fail closed).`);
+    if (!(Number.isInteger(ADS_REPORT_COVERAGE_DAYS[k]) && ADS_REPORT_COVERAGE_DAYS[k] > 0)) throw new Error(`ads-dependent-reports: ${k} has no positive ADS_REPORT_COVERAGE_DAYS (fail closed).`);
   }
   if (adsReportKeysFrom(map).length !== keys.length) throw new Error("ads-dependent-reports: every declared report must be Ads-dependent (fail closed).");
 }

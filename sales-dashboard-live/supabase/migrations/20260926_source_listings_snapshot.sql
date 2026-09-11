@@ -90,7 +90,9 @@ begin
     or p_as_of is null
     or coalesce(btrim(p_object_path), '') = '' or coalesce(btrim(p_payload_sha), '') = ''
     or coalesce(btrim(p_source_request_hash), '') = ''
-    or p_row_count is null or p_row_count < 0 or p_validated_at is null then
+    or p_row_count is null or p_row_count < 0
+    or p_payload_bytes is null or p_payload_bytes < 0
+    or p_validated_at is null then
     raise exception 'record_source_listings_snapshot: incomplete validated listings snapshot evidence';
   end if;
   select * into v_existing from public.source_listings_snapshot
@@ -119,15 +121,36 @@ begin
       end if;
     end;
   end if;
-  if p_validated_at < v_existing.validated_at then
-    return 'stale-save';
-  end if;
-  if p_validated_at = v_existing.validated_at then
-    if v_existing.payload_sha = p_payload_sha and v_existing.object_path = p_object_path then
-      return 'unchanged';
-    end if;
+  -- An account's marketplace is IMMUTABLE; a different marketplace for the same (org, connection, account) is a
+  -- cross-marketplace conflict -> fail closed (never overwrite), independent of dates. (marketplace is intentionally
+  -- NOT in the PK; this guard enforces the isolation the PK omits, so the store never claims marketplace isolation it
+  -- does not check.)
+  if p_marketplace <> v_existing.marketplace then
     return 'conflict';
   end if;
+  -- LOGICAL FRESHNESS: as_of (the business evidence date == the D-1 the payload covers) DOMINATES validated_at, so a
+  -- DELAYED D-2 save whose validated_at (wall clock) is LATER can NEVER overwrite a D-1 pointer.
+  if p_as_of < v_existing.as_of then
+    return 'stale-save';
+  end if;
+  if p_as_of = v_existing.as_of then
+    if p_validated_at < v_existing.validated_at then
+      return 'stale-save';
+    end if;
+    if p_validated_at = v_existing.validated_at then
+      -- EXACT unchanged: EVERY relevant identity field must be equal, else fail closed as 'conflict' (never a
+      -- silent partial overwrite of equal-timestamp conflicting evidence).
+      if v_existing.marketplace = p_marketplace and v_existing.as_of = p_as_of
+         and v_existing.object_path = p_object_path and v_existing.payload_sha = p_payload_sha
+         and v_existing.row_count = p_row_count and v_existing.payload_bytes = p_payload_bytes
+         and v_existing.source_request_hash = p_source_request_hash and v_existing.source_key = 'listings' then
+        return 'unchanged';
+      end if;
+      return 'conflict';
+    end if;
+    -- same as_of, strictly-newer validated_at -> a same-date CORRECTION -> fall through to replace.
+  end if;
+  -- Reached ONLY when p_as_of > v_existing.as_of (D-1 advanced) OR same as_of with strictly-newer validated_at.
   update public.source_listings_snapshot set
     marketplace = p_marketplace, as_of = p_as_of, object_path = p_object_path, payload_sha = p_payload_sha,
     row_count = p_row_count, payload_bytes = p_payload_bytes, source_request_hash = p_source_request_hash,
@@ -144,7 +167,13 @@ create trigger source_listings_snapshot_touch
   before update on public.source_listings_snapshot
   for each row execute function public.touch_updated_at();
 
--- RLS + ACL: RLS on (default deny), direct table writes revoked from everyone, service_role SELECT only; the sole
+-- SECURITY DEFINER FUNCTION ACL: a definer function is EXECUTE-able by PUBLIC by default (a privilege-escalation
+-- surface -- it runs as its owner). Revoke EXECUTE from public/anon/authenticated and grant it ONLY to service_role
+-- (the sole backend caller). Table ACL alone is INSUFFICIENT for a definer RPC.
+revoke all on function public.record_source_listings_snapshot(text, text, text, text, date, text, text, integer, bigint, text, timestamptz) from public, anon, authenticated;
+grant execute on function public.record_source_listings_snapshot(text, text, text, text, date, text, text, integer, bigint, text, timestamptz) to service_role;
+
+-- RLS + TABLE ACL: RLS on (default deny), direct table writes revoked from everyone, service_role SELECT only; the sole
 -- write path is the SECURITY DEFINER record_source_listings_snapshot RPC (exactly like source_snapshots).
 alter table public.source_listings_snapshot enable row level security;
 revoke all on table public.source_listings_snapshot from public, anon, authenticated, service_role;

@@ -1,21 +1,25 @@
 // Campaign-Ads publication RECONCILER -- the Ads FAMILY WRAPPER over the shared saved-data reconciler core
-// (saved-data-reconciler.js). It re-derives + promotes the Ads-dependent canonical live dashboards (daily-reporting +
-// ppc-performance) for accounts whose durable Campaign Ads content advanced past (or was same-date corrected relative
-// to) their live snapshots, using ALREADY-SAVED durable Ads rows. ZERO provider export.
+// (saved-data-reconciler.js). It re-derives + promotes an Ads-dependent canonical live dashboard for accounts whose
+// durable Campaign Ads content advanced past (or was same-date corrected relative to) their live snapshot, using
+// ALREADY-SAVED durable Ads rows. ZERO provider export.
 //
-// The reconciliation ENGINE (scope iteration, exact publication binding, typed classification, control lifecycle,
-// deadline/abort/confirmed-settlement, honest outcome, per-account isolation, zero-export) is the SHARED core. This
-// wrapper supplies ONLY the Ads-specific ADAPTER: the durable Ads evidence read (per-account, per-grain coverage +
-// content_rev, each fail-closed) and the deterministic Ads revision (computeAdsAccountRevision). No post-promotion hook
-// (the Campaign Ads workspace is durably-direct and is NEVER republished; brand-view is materialized elsewhere).
+// REPORT-SPECIFIC (Codex blocker 5): this builds ONE SINGLE-REPORT reconciler operation. daily-reporting and
+// ppc-performance are reconciled by SEPARATE operations, each with its own required Ads grains + coverage window, so a
+// missing PPC-only grain never blocks daily and a targeting/search-terms-only correction never marks daily changed.
+// The shared OLI/FBA core is unchanged (it already applies one revision per account across its reportKeys; here
+// reportKeys is a single report). No post-promotion hook (the Campaign Ads workspace is durably-direct + never
+// republished; brand-view is materialized elsewhere).
 //
-// DEPENDENCY-SAFE: imports ONLY the Ads leaf registry + the Ads revision module + the shared reconciler core. It has NO
-// import path to a DataDoe export transport or a token reservation; the production entrypoint forces the release's inner
-// adapter to refuse creates (zero export, structurally). NEVER suppresses valid OLI sales: an unavailable Ads grain
-// defers ONLY the Ads-dependent reports for THAT account and never touches OLI's own reconciliation. 7-bit ASCII, LF.
+// NEVER suppresses valid OLI sales: an unavailable Ads grain defers ONLY this Ads report for that account. When the
+// report is daily-reporting (shared with OLI), the release re-derives it from the FULL durable union (OLI + Catalog +
+// Ads) through the same fenced publisher + content-CAS as the OLI reconciler, so concurrent OLI/Ads reconciliation
+// converges on the newest valid content (the CAS's source_refreshed_at fence makes an older derive a no-op).
+//
+// DEPENDENCY-SAFE: imports ONLY the Ads leaf registry + the Ads revision module + the shared core -- no export transport
+// path. 7-bit ASCII, LF.
 
-import { adsDependentLiveReportKeys, ADS_SOURCE_KEYS } from "./ads-dependent-reports.js";
-import { computeAdsAccountRevision } from "./ads-publication-revision.js";
+import { adsGrainsForReport, adsRequiredCoverageDays, isAdsDependentLiveReport } from "./ads-dependent-reports.js";
+import { computeAdsReportRevision, subUtcDaysStr } from "./ads-publication-revision.js";
 import { buildSavedDataReconciler, RECONCILE_STATUS } from "./saved-data-reconciler.js";
 
 export const ADS_RECONCILE_STATUS = RECONCILE_STATUS;
@@ -23,16 +27,16 @@ export const ADS_RECONCILE_STATUS = RECONCILE_STATUS;
 const S = (v) => (v == null ? "" : String(v));
 
 /**
- * Build the Campaign-Ads publication reconciler. Ads-specific collaborators:
+ * Build a SINGLE-REPORT Campaign-Ads publication reconciler for `reportKey` (daily-reporting or ppc-performance).
+ * Ads-specific collaborators:
  *   readAdsCoverageState({ organizationFingerprint, connectionId, accountId, sourceKey, requestedAsOf })
  *       -> { windows:[{from,to}], contentRev, latestMetricDate, read }   (durable ads_sync_coverage + ads_sync_state,
- *          exactly getAdsCoverageAndState; coveredThrough is derived here as the MAX covered_to. The reader degrades
- *          content_rev fail-soft when migration 20260923's column is absent. A reader may instead return coveredThrough
- *          directly.)
- *   resolveMarketplace(accountId) -> "<marketplace>"   (for cross-marketplace token isolation; "" when unknown)
+ *          exactly getAdsCoverageAndState; content_rev degrades fail-soft when 20260923's column is absent).
+ *   resolveMarketplace(accountId) -> "<marketplace>"   ("" -> the account defers, never a blank-market token).
  * Every other collaborator is passed straight through to the shared core (byte-identical pattern to the OLI/FBA wrappers).
  */
-export function buildAdsPublicationReconciler({
+export function buildAdsReportReconciler({
+  reportKey,
   resolveOrg, bucketAccounts, readAdsCoverageState, resolveMarketplace = () => "",
   readLatestReportJob, readShadowSnapshot, readLiveSnapshot, loadStoragePayload, verifyLiveReadback,
   liveContracts, computeHash, reportDerivations, shadowKeyFor = (rk) => "scheduler-v2/" + rk,
@@ -41,31 +45,30 @@ export function buildAdsPublicationReconciler({
   outOfTime = () => false, deadlineRace = (p) => p,
   makeAbortController = () => new AbortController(),
   awaitSettled = async (p) => { try { await p; } catch { /* settled */ } return { settled: true }; },
-  reportKeys = adsDependentLiveReportKeys(),
   withTimeout = (p) => p, clock = () => new Date(), log = () => {},
 } = {}) {
-  if (typeof readAdsCoverageState !== "function") throw new Error("buildAdsPublicationReconciler requires readAdsCoverageState (fail closed).");
-  if (typeof resolveMarketplace !== "function") throw new Error("buildAdsPublicationReconciler requires resolveMarketplace (fail closed).");
+  if (!isAdsDependentLiveReport(reportKey)) throw new Error(`buildAdsReportReconciler: ${S(reportKey)} is not an Ads-dependent live report (fail closed).`);
+  if (typeof readAdsCoverageState !== "function") throw new Error("buildAdsReportReconciler requires readAdsCoverageState (fail closed).");
+  if (typeof resolveMarketplace !== "function") throw new Error("buildAdsReportReconciler requires resolveMarketplace (fail closed).");
+  const requiredGrains = adsGrainsForReport(reportKey); // daily -> [campaign]; ppc -> [campaign, search, targeting]
+  const requiredCoverageDays = adsRequiredCoverageDays(reportKey);
+  if (requiredGrains.length === 0) throw new Error(`buildAdsReportReconciler: ${S(reportKey)} declares no Ads grains (fail closed).`);
 
-  // The Ads ADAPTER: read the durable per-account, per-grain coverage + content_rev (timeout-bounded + fail-closed: a
-  // durable read that THROWS defers the WHOLE run rather than publishing blind), then the deterministic Ads revision.
   const adapter = {
     async readScopeEvidence({ organizationFingerprint, connectionId, scope, requestedAsOf, withTimeout: wt }) {
       const timeout = typeof wt === "function" ? wt : withTimeout;
       const perAccount = new Map();
       for (const accountId of scope) {
         const grains = {};
-        for (const sourceKey of ADS_SOURCE_KEYS) {
+        for (const sourceKey of requiredGrains) { // ONLY this report's required grains (daily never reads targeting/search)
           let st;
           try { st = await timeout(readAdsCoverageState({ organizationFingerprint, connectionId, accountId, sourceKey, requestedAsOf }), "ads-coverage-state:" + sourceKey); }
           catch (e) { return { ok: false, failCode: "DURABLE_ADS_UNREADABLE: coverage-state " + S(sourceKey) + " " + S(e && e.message) }; }
-          // A hard read failure (not schema-missing) fails the whole run closed; schema-missing/absent grain -> that grain
-          // is simply not proven (the revision treats it as unavailable), never a fabricated zero.
           if (st && S(st.read) === "read-failed") return { ok: false, failCode: "DURABLE_ADS_UNREADABLE: coverage-state read-failed " + S(sourceKey) };
           grains[sourceKey] = {
             contentRev: st ? st.contentRev : null,
             latestMetricDate: st ? st.latestMetricDate : null,
-            coveredThrough: st ? maxCoveredThrough(st) : null,
+            windows: st && Array.isArray(st.windows) ? st.windows : [],
             read: st ? S(st.read) : "read-failed",
           };
         }
@@ -76,10 +79,11 @@ export function buildAdsPublicationReconciler({
       return { ok: true, perAccount };
     },
     computeAccountRevision({ organizationFingerprint, connectionId, accountId, requestedAsOf, evidence }) {
-      return computeAdsAccountRevision({
+      const requiredFrom = subUtcDaysStr(requestedAsOf, requiredCoverageDays - 1);
+      return computeAdsReportRevision({
         organizationFingerprint, connectionId, accountId,
         marketplace: (evidence && evidence.marketplace) || "",
-        requestedAsOf,
+        requestedAsOf, requiredFrom, requiredGrains,
         grains: (evidence && evidence.grains) || {},
       });
     },
@@ -91,20 +95,9 @@ export function buildAdsPublicationReconciler({
     liveContracts, computeHash, reportDerivations, shadowKeyFor,
     runReleaseForAccount,
     revisionChangedReason: "ads-revision-changed",
-    reportKeys,
+    reportKeys: [reportKey],
     openControls, closeControls,
     outOfTime, deadlineRace, makeAbortController, awaitSettled,
     withTimeout, clock, log,
   });
-}
-
-// The MAX covered_to across the reader's coverage windows (the durable coverage the account proves through). Blank when
-// there are no windows. getAdsCoverageAndState returns { windows:[{from,to}], ... }; a reader may instead pre-compute
-// coveredThrough. NEVER falls back to latestMetricDate -- coverage must be PROVEN by a window, never inferred.
-function maxCoveredThrough(st) {
-  if (st && S(st.coveredThrough).trim() !== "") return S(st.coveredThrough).slice(0, 10);
-  const windows = st && Array.isArray(st.windows) ? st.windows : [];
-  let max = "";
-  for (const w of windows) { const to = S(w && w.to).slice(0, 10); if (to && to > max) max = to; }
-  return max;
 }

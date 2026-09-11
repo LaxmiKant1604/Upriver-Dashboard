@@ -1,49 +1,71 @@
-// Durable Campaign-Ads revision identity -- PURE (no I/O; the reconciler + the normal derive supply the durable Ads
-// evidence). The Ads analog of computeOliAccountRevision / computeFbaAccountRevision.
+// Durable Campaign-Ads REPORT-SPECIFIC revision identity -- PURE (no I/O; the reconciler + the normal derive supply the
+// durable Ads evidence). The Ads analog of computeOliAccountRevision / computeFbaAccountRevision.
 //
 // Durable Ads is stored per account+grain in public.ads_daily_source_rows (campaign-performance-v1 etc.) with a
-// per-account+grain ads_sync_state.content_rev + ads_sync_coverage window (migration 20260923, APPLIED). The content_rev
-// is a byte-stable committed-content revision (committedContentRev in ads-sync.js): a same-window CORRECTION flips it,
-// and a nonempty->empty transition flips it too. Because Ads content is grain-scoped and different reports consume
-// different grain subsets (daily-reporting: campaign only; ppc-performance: campaign + targeting + search-terms), and
-// the shared reconciler core applies ONE revision per account across ALL reportKeys, the revision carries a SINGLE
-// per-account COMPOSITE content token folding EVERY durably-covered grain's content_rev (no as-of field). Both dependent reports record
-// the SAME composite token in their sync_report_jobs.durable_content_deps (migration 20260925), so:
-//   - a same-date correction on ANY covered grain flips its content_rev -> the composite changes -> every dependent
-//     report is STALE (no under-detection);
-//   - a report that does not consume a changed grain (e.g. daily-reporting when only targeting changed) is also flagged
-//     STALE, but re-deriving it from unchanged durable inputs yields the SAME payload -> the fenced content-CAS makes it
-//     an idempotent no-op (already-current, ZERO live write). Over-detection is SAFE; it never marks stale-as-fresh.
-// The token is path-independent (no as-of field), exactly like fbaContentProvenanceToken: the exact requested-as-of is
-// enforced separately by the publication binding's D-1 gate, so the token binds only the durable CONTENT identity.
-// MISSING / not-covered-through-D-1 / blank-content-rev evidence is INELIGIBLE (unavailable; defer, never a fabricated
-// zero). A genuine covered-through-D-1 grain is proven, so its (real) zero rows are a valid available-zero. 7-bit ASCII, LF.
+// per-account+grain ads_sync_state.content_rev + ads_sync_coverage windows (migration 20260923, APPLIED). content_rev is
+// a byte-stable committed-content revision (committedContentRev / adsWindowContentRev, ads-sync.js): a same-window
+// CORRECTION flips it, and a D-1 coverage advance flips it too.
+//
+// REPORT-SPECIFIC (Codex blocker 5): different reports consume different Ads grains -- daily-reporting the CAMPAIGN
+// grain only; ppc-performance CAMPAIGN + TARGETING + SEARCH-TERMS. The revision is therefore computed PER REPORT (the
+// caller runs one single-report reconciler operation per Ads-dependent report) and its content token folds ONLY that
+// report's REQUIRED grains. So a targeting/search-terms-only correction changes ppc-performance's token but NOT
+// daily-reporting's -- daily is never falsely marked changed, and a missing PPC-only grain never blocks daily.
+//
+// FAIL-CLOSED (Codex blocker 4): dates are validated by REAL UTC calendar round-trip (isCalendarDate), so an impossible
+// date defers; a blank/unreadable marketplace defers (never a blank-market token); coverage is proven by the strict
+// continuous-range evaluator (coverageProvesContinuousRange), NEVER MAX(covered_to) -- a gap anywhere in the required
+// window (even one ending at D-1) is unavailable. A grain that is missing / unreadable / blank-content_rev / gapped is
+// unavailable; a grain proven CONTINUOUSLY covered through D-1 with no activity is a genuine covered-empty
+// (available-zero). The token is path-independent (no as-of field, exactly like fbaContentProvenanceToken) so the normal
+// derive and the reconciler produce identical tokens; the exact requested-as-of is enforced by the publication binding's
+// D-1 gate. 7-bit ASCII, LF.
 
 import { createHash } from "node:crypto";
+import { isCalendarDate } from "./publication-binding.js";
 import { ADS_SOURCE_KEYS, ADS_PRIMARY_SOURCE_KEY } from "./ads-dependent-reports.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const asDay = (v) => S(v).slice(0, 10); // YYYY-MM-DD prefix of a date / timestamptz string
 
-// Ads revision status vocabulary (parallels OLI_LINEAGE_STATUS / FBA_REVISION_STATUS). AVAILABLE = the required campaign
-// grain is durably covered through D-1 with a content revision; COVERED_EMPTY = covered-through-D-1 but the grain proved
-// empty (a genuine available-zero); MISSING = no proven coverage / blank content rev (defer -> unavailable, never zero).
 export const ADS_REVISION_STATUS = Object.freeze({ AVAILABLE: "available", COVERED_EMPTY: "covered-empty", MISSING: "missing" });
 
-// The AUTHORITATIVE durable Ads CONTENT-provenance token: a deterministic, self-describing, subset-checkable string
-// binding the EXACT durable Ads content an Ads-dependent report consumed -- account + connection + marketplace + the
-// SORTED (grain -> content_rev) tuples for every durably-covered grain. Recorded in the report job's
-// durable_content_deps (migration 20260925) by BOTH the normal scheduler derive and the reconciler derive (SAME
-// semantics), and it is the revision's ONLY contentDeps entry the shared revisionCoveredByJob checks against. Never a
-// bare sha (ambiguous with a request hash) -- a pipe-delimited provenance string. content_rev (adsWindowContentRev,
-// ads-sync.js) is a content sha over the durable rows across the MAX Ads coverage window, so BOTH a same-date
-// correction AND a D-1 coverage advance flip it -> the token changes -> the live dashboard built from the old content
-// is provably STALE. There is deliberately NO as-of / covered-through field in the token (only content_rev), exactly
-// like fbaContentProvenanceToken: a through/as-of field would let the normal derive's cycle as-of and the reconciler's
-// requested as-of disagree and produce non-equal tokens for the SAME durable content (perpetual re-derive). The exact
-// requested-as-of is enforced separately by the publication binding's D-1 gate.
+// UTC calendar-day arithmetic on YYYY-MM-DD (production code; not a workflow script, so Date is available).
+export function addUtcDaysStr(d, n) {
+  const dt = new Date(S(d) + "T00:00:00Z");
+  if (!Number.isFinite(dt.getTime())) return "";
+  dt.setUTCDate(dt.getUTCDate() + n);
+  return dt.toISOString().slice(0, 10);
+}
+export const subUtcDaysStr = (d, n) => addUtcDaysStr(d, -n);
+
+// STRICT continuous-coverage proof: does the union of coverage windows contain ONE continuous segment spanning the
+// entire [from .. to] (inclusive), with NO interior gap? Windows are {from,to} (or covered_from/covered_to). Two
+// windows are continuous iff the next starts on or before the day AFTER the current segment's end. A gap anywhere in
+// [from .. to] -- even when some later window ends exactly at `to` -- returns false (never MAX(covered_to) as proof).
+export function coverageProvesContinuousRange(windows, from, to) {
+  if (!isCalendarDate(from) || !isCalendarDate(to) || from > to) return false;
+  const wins = (Array.isArray(windows) ? windows : [])
+    .map((w) => ({ f: asDay(w && (w.from ?? w.covered_from ?? w.coveredFrom)), t: asDay(w && (w.to ?? w.covered_to ?? w.coveredTo)) }))
+    .filter((w) => isCalendarDate(w.f) && isCalendarDate(w.t) && w.f <= w.t)
+    .sort((a, b) => (a.f < b.f ? -1 : a.f > b.f ? 1 : (a.t < b.t ? -1 : a.t > b.t ? 1 : 0)));
+  let segF = null, segT = null;
+  for (const w of wins) {
+    if (segF === null) { segF = w.f; segT = w.t; continue; }
+    if (w.f <= addUtcDaysStr(segT, 1)) { if (w.t > segT) segT = w.t; } // adjacent/overlapping -> extend the segment
+    else { if (segF <= from && segT >= to) return true; segF = w.f; segT = w.t; } // interior gap -> new segment
+  }
+  return segF !== null && segF <= from && segT >= to;
+}
+
+// The AUTHORITATIVE durable Ads CONTENT-provenance token for ONE report: a deterministic, self-describing,
+// subset-checkable string binding account + connection + marketplace + the SORTED (grain -> content_rev) tuples for the
+// report's REQUIRED grains. Recorded in the report job's durable_content_deps (migration 20260925) by BOTH the normal
+// derive and the reconciler derive, and it is the revision's ONLY contentDeps entry the shared revisionCoveredByJob
+// checks. NO as-of/covered-through field (matches fbaContentProvenanceToken) so the derive side and the reconciler
+// produce identical tokens for the same content; the D-1 gate lives in the publication binding. A blank marketplace is
+// rejected upstream (computeAdsReportRevision), so this never emits a blank-market token for an eligible account.
 export function adsContentProvenanceToken({ accountId, connectionId = "primary", marketplace = "", grainRevs = [] } = {}) {
   const folded = [...(Array.isArray(grainRevs) ? grainRevs : [])]
     .filter((g) => g && ADS_SOURCE_KEYS.includes(S(g.sourceKey)) && nb(g.contentRev))
@@ -54,46 +76,39 @@ export function adsContentProvenanceToken({ accountId, connectionId = "primary",
 }
 
 /**
- * Deterministic durable Campaign-Ads revision for ONE account. Inputs:
- *   grains -- { [sourceKey]: { contentRev, latestMetricDate, coveredThrough, read } } for the Ads grains the account has;
- *             coveredThrough is the MAX ads_sync_coverage covered_to (YYYY-MM-DD or timestamptz), read is 'ok' on a
- *             successful durable read. A grain is FOLDED (counts toward the content token + eligibility) ONLY when it is
- *             read:'ok', durably covered THROUGH requestedAsOf (D-1), and carries a nonblank content_rev.
- *   marketplace -- the account's marketplace (bound into the token for cross-marketplace isolation; "" when unknown).
- * Returns:
- *   { eligible:true,  status, revisionId:<32 hex>, deps:[], contentDeps:[<ads content token>], reason:null }  when provable
- *   { eligible:false, status, revisionId:null, deps:[], contentDeps:[], reason:<token> }                       otherwise (defer)
- * The REQUIRED campaign grain (ADS_PRIMARY_SOURCE_KEY) must be covered-through-D-1 with a content_rev, else the account
- * is UNAVAILABLE (never a fabricated zero). `deps` is EMPTY (Ads is not bound into report depends_on in the normal
- * derive -- see ads-dependent-reports.js); all Ads provenance is carried by the single composite content token in
- * contentDeps, which the shared revisionCoveredByJob checks against the report job's durable_content_deps.
+ * Deterministic durable Campaign-Ads revision for ONE (account, report). Inputs:
+ *   requiredGrains -- the report's REQUIRED Ads grains (daily-reporting: [ads-campaign-date]; ppc-performance: all 3).
+ *                     The token folds EXACTLY these; the campaign grain is mandatory.
+ *   requiredFrom   -- the start of the report's required continuous-coverage window (requestedAsOf-(days-1)); the
+ *                     reconciler computes it from adsRequiredCoverageDays(reportKey).
+ *   grains         -- { [sourceKey]: { contentRev, latestMetricDate, windows:[{from,to}], read } } for the account.
+ * Returns { eligible:true, status, revisionId:<32hex>, deps:[], contentDeps:[<token>], reason:null } when EVERY required
+ * grain is read:'ok' + nonblank content_rev + CONTINUOUSLY covered over [requiredFrom .. requestedAsOf]; else
+ * { eligible:false, status:MISSING, ... reason } (defer -> unavailable, never a fabricated zero). A missing PPC-only
+ * grain fails ONLY ppc's operation, never daily's (they are separate operations with different requiredGrains).
  */
-export function computeAdsAccountRevision({ organizationFingerprint, connectionId = "primary", accountId, marketplace = "", requestedAsOf, grains = {} } = {}) {
+export function computeAdsReportRevision({ organizationFingerprint, connectionId = "primary", accountId, marketplace = "", requestedAsOf, requiredFrom, requiredGrains = [], grains = {} } = {}) {
   const miss = (reason) => ({ eligible: false, status: ADS_REVISION_STATUS.MISSING, revisionId: null, deps: [], contentDeps: [], reason });
-  if (!nb(organizationFingerprint) || !nb(accountId) || !DATE_RE.test(S(requestedAsOf))) return miss("incomplete-account-boundary");
+  if (!nb(organizationFingerprint) || !nb(accountId)) return miss("incomplete-account-boundary");
+  if (!isCalendarDate(requestedAsOf)) return miss("requested-asof-invalid");
+  if (!isCalendarDate(requiredFrom) || requiredFrom > S(requestedAsOf)) return miss("required-window-invalid");
+  if (!nb(marketplace)) return miss("marketplace-unavailable"); // blank/unreadable marketplace defers (no blank-market token)
+  const req = [...new Set((Array.isArray(requiredGrains) ? requiredGrains : []).map(S).filter((k) => ADS_SOURCE_KEYS.includes(k)))].sort();
+  if (req.length === 0 || !req.includes(ADS_PRIMARY_SOURCE_KEY)) return miss("required-grains-invalid");
   const g = grains && typeof grains === "object" ? grains : {};
-  // A grain is durably PROVEN for this as-of iff the read succeeded, coverage extends THROUGH requestedAsOf, and a
-  // content_rev exists. Anything weaker is unavailable for that grain (never a manufactured zero).
-  const proven = (sk) => {
+  const grainRevs = [];
+  let anyActivity = false;
+  for (const sk of req) {
     const e = g[sk];
-    if (!e || S(e.read) !== "ok") return null;
-    if (!nb(e.contentRev)) return null;
-    const through = asDay(e.coveredThrough);
-    if (!DATE_RE.test(through) || through < S(requestedAsOf)) return null;
-    return { sourceKey: sk, contentRev: S(e.contentRev), coveredThrough: through, latestMetricDate: asDay(e.latestMetricDate) };
-  };
-  // REQUIRED campaign grain: without proven durable coverage through D-1 + a content_rev, Ads is UNAVAILABLE for this
-  // account -- defer, never publish a fabricated zero, never shadow a proven LKG with an unproven snapshot.
-  const primary = proven(ADS_PRIMARY_SOURCE_KEY);
-  if (!primary) return miss("ads-campaign-not-covered-through-d1");
-  // Fold every PROVEN grain (campaign required + targeting/search when present) into the composite content token.
-  const grainRevs = ADS_SOURCE_KEYS.map(proven).filter(Boolean);
+    if (!e || S(e.read) !== "ok" || !nb(e.contentRev)) return miss("ads-grain-unavailable:" + sk);
+    if (!coverageProvesContinuousRange(e.windows, requiredFrom, requestedAsOf)) return miss("ads-grain-coverage-gap:" + sk);
+    grainRevs.push({ sourceKey: sk, contentRev: S(e.contentRev) });
+    if (nb(asDay(e.latestMetricDate))) anyActivity = true;
+  }
   const contentToken = adsContentProvenanceToken({ accountId, connectionId, marketplace, grainRevs });
-  // COVERED_EMPTY vs AVAILABLE: a proven grain whose latest metric date is blank/absent is a genuine covered-empty
-  // (available-zero); otherwise there is real Ads activity. Either way the account is ELIGIBLE (coverage is proven).
-  const status = nb(primary.latestMetricDate) ? ADS_REVISION_STATUS.AVAILABLE : ADS_REVISION_STATUS.COVERED_EMPTY;
+  const status = anyActivity ? ADS_REVISION_STATUS.AVAILABLE : ADS_REVISION_STATUS.COVERED_EMPTY;
   const revisionId = createHash("sha256")
-    .update([S(organizationFingerprint), S(connectionId), S(accountId), S(marketplace), S(requestedAsOf), status, contentToken].join("|"))
+    .update([S(organizationFingerprint), S(connectionId), S(accountId), S(marketplace), S(requestedAsOf), S(requiredFrom), status, req.join(","), contentToken].join("|"))
     .digest("hex").slice(0, 32);
   return { eligible: true, status, revisionId, deps: [], contentDeps: [contentToken], reason: null };
 }
