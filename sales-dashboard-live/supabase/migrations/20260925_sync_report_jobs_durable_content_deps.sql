@@ -1,0 +1,48 @@
+-- ============================================================================
+-- 20260925_sync_report_jobs_durable_content_deps.sql
+--
+-- *** PREPARED / UNAPPLIED -- APPROVAL-GATED. DO NOT APPLY WITHOUT EXPLICIT SIGN-OFF. ***
+-- Apply (only when approved) EXACTLY this one file:
+--   MIGRATE_ONLY=20260925_sync_report_jobs_durable_content_deps.sql npm run db:migrate
+-- It adds ONE additive, nullable-defaulted column to public.sync_report_jobs. No data is altered; no policy,
+-- index, trigger, constraint, or existing row is touched. It may ship in EITHER order relative to the code:
+-- the reader (getLatestReportJobLineage) and writer (upsertSyncReportJob) DEGRADE to the pre-migration
+-- behaviour when the column is absent (isSchemaMissingError fail-soft, exactly like ads_sync_state.content_rev
+-- migration 20260923).
+--
+-- WHY (blockers 1 + 2 of the FBA saved-data reconciler):
+--   depends_on (jsonb, added by 20260807_scheduler_v2.sql:135) is DOCUMENTED as "array of request_hash this
+--   report needs" and every reader maps each entry via String(h) (getLatestReportJobLineage). It therefore
+--   cannot SAFELY carry per-source CONTENT provenance: the durable FBA inventory snapshot's request hash is
+--   DATE-addressed (from === to === inventoryAsOf === D-1), so a SAME-DATE provider correction keeps the SAME
+--   request hash while its content (payload_sha) changes -- invisible to a request-hash-only depends_on, so the
+--   brand-inventory dashboard would never re-publish the corrected inventory. Overloading depends_on with a
+--   content hash would (a) be undocumented request-hash-field overloading and (b) break the String(h)/
+--   request-hash-mapping consumers.
+--
+--   durable_content_deps records the CONTENT-provenance identity of durable sources a report consumed that are
+--   NOT current-cycle export jobs (the durable FBA inventory snapshot: in priority mode every source except
+--   Catalog is paused, so there is no FBA fetch job in the cycle to bind a request hash from). Each entry is a
+--   deterministic, human-readable, canonical provenance string
+--       "<sourceKey>|<accountId>|<connectionId>|<requestHash>|<contentSha>"
+--   (fbaContentProvenanceToken, lib/server/sync/fba-inventory-revision.js). The FBA request hash is the D-1 request
+--   identity (from===to===inventoryAsOf AND the account's raw seller id), so it binds both the requested D-1 and the
+--   account; contentSha (payload_sha) binds the content. The token changes iff ANY identity field changes --
+--   including payload_sha on a same-date correction. The reconciler's
+--   revisionCoveredByJob additionally requires the revision's contentDeps to be a subset of the latest validated
+--   report job's durable_content_deps, so a corrected-but-same-date live dashboard is classified STALE and
+--   re-published, while a byte-identical replay stays PUBLICATION_NOT_REQUIRED. OLI reports carry no contentDeps
+--   (the column stays '[]'), so OLI behaviour is byte-for-byte unchanged.
+--
+-- Additive + fail-soft: the column is '[]'::jsonb until the next successful derive populates it (no backfill).
+-- Until this migration is applied, the FBA reconciler still runs (dry-run by default) but cannot reach the
+-- zero-write PUBLICATION_NOT_REQUIRED steady state for FBA (durable_content_deps reads as [] -> the content dep
+-- is never "covered"); FBA live activation therefore requires BOTH this migration applied AND the repository
+-- variable FBA_RECONCILE_LIVE == 'true'.
+--
+-- sync_report_jobs already exists (20260807_scheduler_v2.sql); this adds a plain nullable-defaulted jsonb column
+-- and changes no policy/index/trigger/constraint. Idempotent (add column if not exists).
+-- ============================================================================
+
+alter table public.sync_report_jobs
+  add column if not exists durable_content_deps jsonb not null default '[]'::jsonb;

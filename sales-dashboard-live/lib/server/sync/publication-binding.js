@@ -30,17 +30,27 @@ export function liveSnapshotAsOf(liveSnapshot) {
 }
 
 // Is the CURRENTLY-live report built from (at least) the current durable source revision? True iff the latest VALIDATED
-// report job's lineage `depends_on` contains EVERY current durable request/content hash (revision.deps). A hash that is
-// present in the durable source but MISSING from the job's depends_on means the source advanced -- a same-as-of
-// CORRECTED export (new/added request hash) whose live snapshot is stale even though its `to` date is unchanged. A
-// missing / unvalidated job, or empty durable deps, is never "covered" (fail toward re-deriving). This is the request-
-// hash revision comparison (not date, not updated_at); the fenced CAS (source_refreshed_at) still prevents an older
-// derive from overwriting a newer live at write time.
+// report job's lineage covers EVERY current durable dependency of the revision:
+//   - revision.deps  (source REQUEST hashes) must all be present in the job's `depends_on`; AND
+//   - revision.contentDeps (durable CONTENT provenance tokens, e.g. the FBA snapshot's
+//     "<sourceKey>|<account>|<conn>|<asOf>|<requestHash>|<contentSha>" -- see fba-inventory-revision.js) must all be
+//     present in the job's `durable_content_deps` (migration 20260925; a report that consumed a durable source whose
+//     request hash is DATE-addressed records the content identity here so a SAME-DATE content correction is provable).
+// A dep present in the durable source but MISSING from the job means the source advanced -- a same-as-of CORRECTED
+// export whose live snapshot is stale even though its `to` date is unchanged. A missing / unvalidated job, or a
+// revision with NEITHER kind of dep, is never "covered" (fail toward re-deriving). This is the request-hash + content
+// revision comparison (not date, not updated_at); the fenced CAS (source_refreshed_at) still prevents an older derive
+// from overwriting a newer live at write time. OLI revisions carry no contentDeps, so their behaviour is unchanged.
 export function revisionCoveredByJob(revision, jobLineage) {
-  if (!revision || revision.eligible !== true || !Array.isArray(revision.deps) || revision.deps.length === 0) return false;
+  if (!revision || revision.eligible !== true) return false;
+  const deps = Array.isArray(revision.deps) ? revision.deps : [];
+  const contentDeps = Array.isArray(revision.contentDeps) ? revision.contentDeps : [];
+  if (deps.length === 0 && contentDeps.length === 0) return false;
   if (!jobLineage || jobLineage.validated !== true || !Array.isArray(jobLineage.dependsOn)) return false;
-  const have = new Set(jobLineage.dependsOn.map((h) => String(h)));
-  return revision.deps.every((h) => have.has(String(h)));
+  const haveDeps = new Set(jobLineage.dependsOn.map((h) => String(h)));
+  if (!deps.every((h) => haveDeps.has(String(h)))) return false;
+  const haveContent = new Set(Array.isArray(jobLineage.durableContentDeps) ? jobLineage.durableContentDeps.map((h) => String(h)) : []);
+  return contentDeps.every((h) => haveContent.has(String(h)));
 }
 
 // Canonical JSON for exact content comparison (stable key order; used only to compare params/payload objects, never as

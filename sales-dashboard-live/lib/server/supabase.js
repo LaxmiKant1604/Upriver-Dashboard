@@ -3743,20 +3743,32 @@ export async function upsertSyncReportJob(job, { signal = null } = {}) {
   if (job.connectionId !== "primary" && job.connectionId !== "dd-secondary") {
     throw new Error(`upsertSyncReportJob requires an explicit connection_id of 'primary' or 'dd-secondary' (got "${job.connectionId}").`);
   }
-  await request("/rest/v1/sync_report_jobs?on_conflict=cycle_id,report_key,account_id", {
+  const baseBody = {
+    cycle_id: job.cycleId,
+    report_key: job.reportKey,
+    report_version: job.reportVersion || "",
+    account_id: job.accountId,
+    connection_id: job.connectionId,
+    bucket: job.bucket,
+    depends_on: job.dependsOn || [],
+  };
+  const post = (body) => request("/rest/v1/sync_report_jobs?on_conflict=cycle_id,report_key,account_id", {
     method: "POST",
     signal,
     headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
-    body: {
-      cycle_id: job.cycleId,
-      report_key: job.reportKey,
-      report_version: job.reportVersion || "",
-      account_id: job.accountId,
-      connection_id: job.connectionId,
-      bucket: job.bucket,
-      depends_on: job.dependsOn || [],
-    },
+    body,
   });
+  // durable_content_deps (migration 20260925, PREPARED-UNAPPLIED) is written ONLY when a report actually consumed a
+  // durable CONTENT-provenance source (the FBA snapshot); OLI/daily/brand-sales pass none, so their insert body is
+  // byte-identical to before (no extra column, no schema-missing retry). FAIL-SOFT: if the column is absent (migration
+  // not applied) the insert with the column errors schema-missing and we retry the base body -- the content dep is then
+  // simply not persisted (the reconciler degrades to re-derive-not-covered until the migration lands), never a crash.
+  const contentDeps = Array.isArray(job.durableContentDeps) ? job.durableContentDeps : [];
+  if (contentDeps.length > 0) {
+    try { await post({ ...baseBody, durable_content_deps: contentDeps }); return; }
+    catch (e) { if (!isSchemaMissingError(e)) throw e; /* column absent -> fall through to the base insert */ }
+  }
+  await post(baseBody);
 }
 
 // Atomic single-derive guard: transition pending -> running for exactly this (cycle, report,
@@ -3931,14 +3943,24 @@ export async function getLatestSyncReportJob(reportKey, accountId) {
 // detect a SAME-AS-OF but content-CORRECTED OLI export: the current durable OLI provenance hashes are compared
 // against this depends_on -- a hash not present here means the OLI advanced and the live snapshot is stale.
 export async function getLatestReportJobLineage(reportKey, accountId) {
-  const query = new URLSearchParams({
-    select: "cycle_id,report_key,account_id,derive_status,save_status,validated,depends_on,snapshot_params_hash,latest_data_date,created_at,sync_cycles(status)",
-    report_key: `eq.${reportKey}`,
-    account_id: `eq.${accountId}`,
-    order: "created_at.desc",
-    limit: "1",
-  });
-  const rows = await request(`/rest/v1/sync_report_jobs?${query}`);
+  // durable_content_deps (migration 20260925, PREPARED-UNAPPLIED) records per-source CONTENT provenance (e.g. the FBA
+  // snapshot's payload_sha) that a DATE-addressed depends_on hash cannot represent. FAIL-SOFT: select it, and if the
+  // column is absent (migration not yet applied) retry WITHOUT it -> durableContentDeps degrades to [] (the
+  // pre-migration behaviour, exactly like ads_sync_state.content_rev / migration 20260923).
+  const baseSelect = "cycle_id,report_key,account_id,derive_status,save_status,validated,depends_on,snapshot_params_hash,latest_data_date,created_at,sync_cycles(status)";
+  const fetchRows = (withContentDeps) => {
+    const query = new URLSearchParams({
+      select: withContentDeps ? baseSelect + ",durable_content_deps" : baseSelect,
+      report_key: `eq.${reportKey}`,
+      account_id: `eq.${accountId}`,
+      order: "created_at.desc",
+      limit: "1",
+    });
+    return request(`/rest/v1/sync_report_jobs?${query}`);
+  };
+  let rows;
+  try { rows = await fetchRows(true); }
+  catch (e) { if (isSchemaMissingError(e)) rows = await fetchRows(false); else throw e; }
   const row = Array.isArray(rows) ? rows[0] : null;
   if (!row) return null;
   const cycle = Array.isArray(row.sync_cycles) ? row.sync_cycles[0] : row.sync_cycles;
@@ -3949,6 +3971,7 @@ export async function getLatestReportJobLineage(reportKey, accountId) {
     saveStatus: row.save_status ?? null,
     validated: row.validated === true,
     dependsOn: Array.isArray(row.depends_on) ? row.depends_on.map((h) => String(h)) : [],
+    durableContentDeps: Array.isArray(row.durable_content_deps) ? row.durable_content_deps.map((h) => String(h)) : [],
     snapshotParamsHash: row.snapshot_params_hash ?? null,
     latestDataDate: row.latest_data_date ?? null,
     cycleStatus: cycle && typeof cycle === "object" ? (cycle.status ?? null) : null,

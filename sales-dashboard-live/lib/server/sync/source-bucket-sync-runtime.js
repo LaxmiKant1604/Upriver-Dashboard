@@ -50,6 +50,7 @@ import {
 import { ACTIVE_ADS_SOURCE_KEY, ACTIVE_ADS_REGISTRY_KEY } from "../active-ads-source.js";
 import { shadowSnapshotKey, REPORT_DERIVATIONS } from "./report-derivation.js";
 import { buildBrandInventorySnapshot, BRAND_INVENTORY_SNAPSHOT_KEY, BRAND_INVENTORY_REPORT_VERSION } from "../reports/brand-view.js";
+import { fbaContentProvenanceToken } from "./fba-inventory-revision.js";
 import {
   getSourceControls, getSourceCoverageWindows, getSourceSnapshot,
   recordSourceSnapshot, upsertSourceRunStatus,
@@ -1201,6 +1202,11 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         cycleId: rollup.cycleId, reportKey: snap.productionReportKey, reportVersion: snap.version,
         accountId: snap.accountId, connectionId: "primary", bucket,
         dependsOn: dep.deps,
+        // Durable CONTENT provenance (migration 20260925, fail-soft): a report that consumed a durable source whose
+        // request hash cannot represent a same-date content correction (the FBA inventory snapshot for brand-inventory)
+        // records its content token here so the reconciler's revision.contentDeps is provably covered. Set ONLY by the
+        // producing block (brand-inventory); every other report leaves it undefined -> [] -> byte-identical insert.
+        durableContentDeps: Array.isArray(snap.durableContentDeps) ? snap.durableContentDeps : [],
       }, { signal }), { write: true });
       // Round-8 finding 1: the claim uses DATABASE-authoritative time -- NO caller clock is passed.
       const lease = await dl.bound("report-lineage-claim", (signal) => reportLineage.claimLease(
@@ -1406,10 +1412,20 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
           brandInventory.skipped.push({ accountId: account.accountId, reason: "contract-refused" });
           continue;
         }
+        // Durable FBA CONTENT-provenance token for this brand-inventory job (blockers 1+2): bind the EXACT durable FBA
+        // snapshot this derive consumed (its request hash + payload_sha) so the FBA reconciler's revision.contentDeps is
+        // provably covered by durable_content_deps -- and a SAME-DATE correction (new payload_sha) is provably NOT.
+        // Only when a durable FBA snapshot actually backed this account (priority runs with no FBA snapshot publish
+        // inventoryAvailable:false with NO content token, so the reconciler correctly re-derives once FBA arrives).
+        const fbaSnap = evidence.fbaSnapshotsByAccount ? evidence.fbaSnapshotsByAccount[account.accountId] : null;
+        const durableContentDeps = fbaSnap
+          ? [fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: account.accountId, connectionId: "primary", requestHash: fbaSnap.source_request_hash ?? fbaSnap.sourceRequestHash, contentSha: fbaSnap.payload_sha ?? fbaSnap.payloadSha })]
+          : [];
         const snap = {
           reportKey: shadowSnapshotKey(BRAND_INVENTORY_SNAPSHOT_KEY), productionReportKey: BRAND_INVENTORY_SNAPSHOT_KEY,
           accountId: account.accountId, version: BRAND_INVENTORY_REPORT_VERSION,
           payload: built.payload, latestDataDate: built.payload.inventoryDate || null,
+          durableContentDeps,
         };
         const r = await saveWithLineage(snap, { reportVersion: snap.version, accountId: snap.accountId, to: invWindow.to });
         if (r.complete) brandInventory.saved += 1;
