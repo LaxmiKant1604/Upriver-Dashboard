@@ -22,11 +22,16 @@ const yml = readFileSync(path.join(repoRoot, ".github/workflows/ads-publication-
 const wrapper = readFileSync(path.join(here, "..", "lib/server/sync/ads-publication-reconciler.js"), "utf8");
 const revision = readFileSync(path.join(here, "..", "lib/server/sync/ads-publication-revision.js"), "utf8");
 
-// ---- ENTRYPOINT: report-specific reconciler via the reviewed priority release; structural zero export ----
+// ---- ENTRYPOINT: report-specific reconciler via the DEDICATED daily-only release; structural zero export ----
+const rel = readFileSync(path.join(here, "..", "lib/server/sync/daily-reporting-release.js"), "utf8");
 ok("entrypoint drives buildAdsReportReconciler (report-specific operation, blocker 5)", /buildAdsReportReconciler\(/.test(mjs) && /buildOperation\("daily-reporting"/.test(mjs));
-ok("daily-reporting re-derives from the FULL union via the reviewed priority release + runner", /buildPriorityDashboardsRelease\(/.test(mjs) && /runPriorityDashboardsRelease\(/.test(mjs));
-ok("NO real provider export/token transport symbol in the entrypoint", !/createExport\(/.test(mjs) && !/makeDataDoeAdapter/.test(mjs) && !/exportsCreate/.test(mjs) && !/reserveTokens/.test(mjs) && !/source-sync-driver/.test(mjs));
-ok("structural zero export: the inner adapter REFUSES create/poll/download", /ADS_RECONCILER_NO_EXPORT/.test(mjs) && /makeNoExportInnerAdapter/.test(mjs) && (mjs.match(/ADS_RECONCILER_NO_EXPORT/g) || []).length >= 3);
+// SCOPE (P0 fix): daily-reporting re-derives via the DEDICATED daily-only release (buildDailyReportingRelease.runForAccount
+// through the fenced buildSchedulerV2Publisher) -- NEVER the priority TRIO release (which would derive+publish brand-sales
+// + brand-inventory too). A regression that reintroduces the trio fails CI.
+ok("daily-reporting re-derives via the DEDICATED daily-only release (never the trio)", /buildDailyReportingRelease\(/.test(mjs) && /release\.runForAccount\(/.test(mjs) && /buildSchedulerV2Publisher\(/.test(mjs) && !/buildPriorityDashboardsRelease/.test(mjs) && !/runPriorityDashboardsRelease/.test(mjs) && !/source-priority-dashboards/.test(mjs));
+ok("the dedicated release module targets ONLY daily-reporting (reportKeys:[daily-reporting]; no QUOTED sibling report-key or sibling shadow-key)", /reportKeys: \[DAILY_REPORT_KEY\]/.test(rel) && /DAILY_REPORT_KEY = "daily-reporting"/.test(rel) && !/"brand-sales"/.test(rel) && !/"brand-inventory"/.test(rel) && !/scheduler-v2\/brand-/.test(rel) && !/reportDerivations\["brand/.test(rel));
+ok("NO real provider export/token transport symbol in the entrypoint OR the dedicated release (structural zero export)", [mjs, rel].every((s) => !/createExport\(/.test(s) && !/makeDataDoeAdapter/.test(s) && !/exportsCreate/.test(s) && !/reserveTokens/.test(s) && !/source-sync-driver/.test(s)) && !/from "\.\.\/datadoe/.test(rel));
+ok("structural zero export: no throwing inner adapter, no export transport reachable from the release path", !/makeNoExportInnerAdapter/.test(mjs) && !/ADS_RECONCILER_NO_EXPORT/.test(mjs) && !/makeInnerAdapter/.test(mjs));
 ok("durable Ads evidence read via getDailyAdsCoverage (durable coverage + content_rev; zero export)", /getDailyAdsCoverage\(/.test(mjs) && /readAdsCoverageState/.test(mjs));
 ok("DEFECT-1 GUARD: coverage read translates the REGISTRY grain to the durable WORKER key (adsWorkerKeyForGrain); token stays registry-keyed", /adsWorkerKeyForGrain/.test(mjs) && /getDailyAdsCoverage\(accountId, adsWorkerKeyForGrain\(sourceKey\)\)/.test(mjs) && !/getDailyAdsCoverage\(accountId, sourceKey\)/.test(mjs));
 ok("marketplace resolved from the authoritative directory (isolation) + threaded to the revision", /resolveMarketplace/.test(mjs));

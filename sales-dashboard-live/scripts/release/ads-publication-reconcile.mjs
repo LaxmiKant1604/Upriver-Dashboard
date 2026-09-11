@@ -61,14 +61,18 @@ console.log(`ads-reconcile: bucket=${bucket} as-of=${asOf} mode=${mode} ${dryRun
 
 const { buildAdsReportReconciler } = await import("../../lib/server/sync/ads-publication-reconciler.js");
 const { sha256, organizationFingerprint } = await import("../../lib/server/source-identity.js");
-const { getDataDoeConnections, classifyDirectoryAccounts } = await import("../../lib/server/datadoe-connections.js");
+const { getDataDoeConnections, classifyDirectoryAccounts, resolveDataDoeAccountIds } = await import("../../lib/server/datadoe-connections.js");
 const { adsWorkerKeyForGrain } = await import("../../lib/server/sync/ads-dependent-reports.js");
 const { fetchAccounts: fetchDirectory } = await import("../../lib/server/datadoe.js");
 const { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } = await import("../../lib/server/sync/report-publisher.js");
 const { REPORT_DERIVATIONS } = await import("../../lib/server/sync/report-derivation.js");
 const { paramsHashFor } = await import("../../lib/server/report-store.js");
-const { buildPriorityDashboardsRelease } = await import("../../lib/server/sync/source-priority-dashboards.js");
-const { runPriorityDashboardsRelease, buildLiveReadback } = await import("../../lib/server/sync/source-priority-release-runner.js");
+// DEDICATED daily-reporting-ONLY release (replaces the priority TRIO release, which derived+published daily-reporting
+// AND brand-sales AND brand-inventory -- a P0 scope leak). The Ads reconciler now re-derives/saves/publishes/reads-back
+// EXACTLY scheduler-v2/daily-reporting; Brand Sales + Brand Inventory get zero writes.
+const { buildDailyReportingRelease } = await import("../../lib/server/sync/daily-reporting-release.js");
+const { buildSchedulerV2Publisher } = await import("../../lib/server/sync/publisher-composition.js");
+const { buildLiveReadback } = await import("../../lib/server/sync/source-priority-release-runner.js");
 const { readPartialCycleCapability } = await import("../../lib/server/sync/priority-partial-capability.js");
 const { runControlPackageCli } = await import("../../lib/server/sync/source-priority-control-package.js");
 const { connectPriorityControlStore } = await import("../../lib/server/sync/priority-control-pg-store.js");
@@ -110,13 +114,12 @@ const readbackLive = buildLiveReadback({
   computeHash: paramsHashFor,
 });
 
-// NO-EXPORT inner adapter: the reconciler derives ONLY from already-saved durable Ads/OLI/Catalog. Any create/poll/
-// download from inside the derive fails closed here, so the reconciler can never touch a DataDoe export transport.
-const makeNoExportInnerAdapter = () => ({
-  create: async () => { throw new Error("ADS_RECONCILER_NO_EXPORT: the reconciler never creates a DataDoe export (fail closed)."); },
-  poll: async () => { throw new Error("ADS_RECONCILER_NO_EXPORT: the reconciler never polls a DataDoe export (fail closed)."); },
-  download: async () => { throw new Error("ADS_RECONCILER_NO_EXPORT: the reconciler never downloads a DataDoe export (fail closed)."); },
-});
+// STRUCTURAL ZERO EXPORT: the dedicated daily-reporting release (daily-reporting-release.js) reads ONLY durable data
+// (source_oli_history + source_snapshots(catalog) + durable Campaign Ads rows/coverage + report_snapshots) and writes
+// ONLY the fenced daily-reporting report_snapshots CAS. It takes NO provider export adapter and the whole reconcile path
+// imports NO provider export transport, so there is no create / poll / download to reach; zero provider export is
+// STRUCTURAL, not a throwing-adapter guard. (The entrypoint guard test asserts this by source-scanning both this file
+// and the dedicated release module for transport symbols.)
 
 async function assertNoCron() {
   const client = makePgReadOnly();
@@ -129,7 +132,6 @@ async function assertNoCron() {
   } catch (e) { return { ok: false, reason: "cron read failed: " + (e && e.message) }; }
   finally { try { await client.end(); } catch { /* ignore */ } }
 }
-async function reconcile() { const cron = await assertNoCron(); return cron.ok ? { ok: true } : { ok: false, problems: [cron.reason] }; }
 
 let leaseFence = null;
 const OPERATOR = "ads-reconcile:" + bucket + ":" + (runToken || asOf);
@@ -193,23 +195,47 @@ const verifyLease = async () => {
   catch (e) { return { ok: false, reason: "renew-error:" + (e && e.message ? e.message : e) }; }
 };
 
-// PER-ACCOUNT release: daily-reporting re-derives from the FULL durable union (OLI + Catalog + Ads) via the SAME
-// reviewed priority release the OLI reconciler uses (its daily derive reads durable Ads through the daily-ads loader,
-// so a same-date Ads correction is picked up). strictD1 keeps a lagged account on its LKG. Concurrency with the OLI
-// reconciler is safe: the fenced content-CAS (source_refreshed_at) makes an older source combination a no-op.
+// PER-ACCOUNT release: the DEDICATED daily-reporting-ONLY release (daily-reporting-release.js) re-derives + publishes
+// EXACTLY scheduler-v2/daily-reporting for this account over its own priority-partial cycle -- NEVER brand-sales or
+// brand-inventory. It reproduces the hot path's daily derive byte-for-byte (durable OLI + Catalog + Campaign Ads, the
+// same enrichment + the ONE canonical REPORT_DERIVATIONS["daily-reporting"].derive), binds the SAME OLI/Catalog
+// depends_on + the Campaign Ads content token, and publishes through the reviewed FENCED publisher + canonical readback.
+// The publisher is fenced on THIS op's control fence (aborted -> null fence -> the CAS writes zero rows); verifyLease
+// heartbeats before publish. Concurrency with the OLI reconciler is safe: the fenced content-CAS (source_refreshed_at)
+// makes an older source combination a no-op, and daily's lineage is byte-identical so the OLI reconciler still sees it
+// covered. Zero provider export, STRUCTURALLY (the release imports no export transport).
 async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revisionId, signal }) {
   const aborted = () => !!(signal && signal.aborted);
   if (aborted()) return { code: 1, ok: false, stage: "reconcile", status: "DEADLINE_ABORTED", leaseLost: false, reason: "deadline-aborted", aborted: true, blockerCodes: [], problems: ["deadline-aborted before start (no work performed)"] };
   const cycleBucket = "priority-partial-" + b + "-" + sha256(JSON.stringify([accountId, revisionId || ""])).slice(0, 16);
-  const fetchOne = async (apiKey) => ((await fetchDirectory(apiKey)) || []).filter((r) => String((r && (r.accountId ?? r.account_id ?? r.id)) || "").trim() === accountId);
-  const release = buildPriorityDashboardsRelease({
-    asOfOverride: requestedAsOf, operationKey: "priority-dashboards/scheduled/" + requestedAsOf,
-    getCycleByBucketDate: sb.getBaseSyncCycleByBucketDate,
-    getControlFence: () => (aborted() ? null : leaseFence), // aborted -> NO fence -> the write-boundary CAS writes zero rows
-    makeInnerAdapter: makeNoExportInnerAdapter, fetchAccounts: fetchOne, cycleBucket,
-  });
+  const publisher = buildSchedulerV2Publisher({ getControlFence: () => (aborted() ? null : leaseFence) });
   const verifyLeaseForOp = async () => (aborted() ? { ok: false, reason: "deadline-aborted" } : verifyLease());
-  const result = await runPriorityDashboardsRelease({ release, reconcile, readbackLive, assertNoCron, bucket: b, strictD1: true, verifyLease: verifyLeaseForOp, log: () => {} });
+  const release = buildDailyReportingRelease({
+    resolveOrg: async () => ({ organizationFingerprint: orgFp, connectionId: "primary" }),
+    resolveAccountMeta,
+    // Every supported durable collaborator forwards the release's { signal } (2nd arg) to the Supabase transport, so an
+    // observed abort stops any in-flight read/write; the release rechecks abort after each phase + before each write.
+    openCycle: (args, opt) => sb.openSyncCycle(args, opt),
+    getCycleByBucketDate: (bk, date, opt) => sb.getBaseSyncCycleByBucketDate(bk, date, opt),
+    finalizeCycle: ({ cycleId }, opt) => sb.finalizeSyncCycle(cycleId, opt),
+    readOliHistory: (args) => sb.getSourceOliHistoryRows(args),
+    readOliCoverage: (args) => sb.getSourceCoverageWindows(args),
+    readOliZeroProof: (args) => sb.getSourceOliZeroRowProof(args),
+    readCatalogSnapshot: (args) => sb.getSourceSnapshot(args),
+    loadCatalogPayload: (path, opt) => sb.getSourceSnapshotPayload(path, opt),
+    readActiveAdsRows: (a, from, to, opt) => sb.getActiveAdsDailyRows(a, from, to, opt),
+    readAdsCoverage: (a, workerKey, opt) => sb.getDailyAdsCoverage(a, workerKey, opt),
+    upsertReportJob: (job, opt) => sb.upsertSyncReportJob(job, opt),
+    claimLease: (cycleId, reportKey, a, opts) => sb.claimReportDeriveLease(cycleId, reportKey, a, opts),
+    saveShadow: (args, opt) => sb.saveShadowSnapshotIfNewer(args, opt),
+    reconcileSuccess: (args, opt) => sb.reconcileReportDeriveSuccess(args, opt),
+    computeHash: paramsHashFor,
+    liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS,
+    reportDerivations: REPORT_DERIVATIONS,
+    publisher, readbackLive, verifyLease: verifyLeaseForOp,
+    log: () => {},
+  });
+  const result = await release.runForAccount({ accountId, requestedAsOf, cycleBucket, signal });
   return { code: result.code, ok: result.ok, stage: result.stage, status: result.status || null, leaseLost: result.leaseLost === true, reason: result.reason || null, blockerCodes: result.blockerCodes || [], problems: result.problems || [] };
 }
 
@@ -233,6 +259,10 @@ async function bucketAccounts(b) {
 // so it matches the hot-derive binding's token; reading under the registry key would filter to zero rows -> every
 // account defers -> a green no-op that never reconciles. Marketplace resolves from the authoritative primary directory.
 const readAdsCoverageState = ({ accountId, sourceKey }) => sb.getDailyAdsCoverage(accountId, adsWorkerKeyForGrain(sourceKey));
+// Directory metadata (accountId -> { country, rawSellerId, currency }) for the region, from the authoritative primary
+// directory (read-only accounts GET, never an export). country -> the reconciler's marketplace + the Ads content token;
+// rawSellerId + currency -> the dedicated release's daily derive (slicedOliSourceFromHistory + the daily context, so the
+// payload is byte-identical to the scheduler's). dd-secondary/colon-prefixed ids + accounts without a country excluded.
 let directoryMeta = null;
 async function loadDirectoryMeta() {
   if (directoryMeta) return directoryMeta;
@@ -243,11 +273,21 @@ async function loadDirectoryMeta() {
     const id = String((a && (a.accountId ?? a.id)) || "").trim();
     const country = String((a && a.country) || "").trim().toUpperCase();
     if (!id || id.includes(":") || !country) continue;
-    directoryMeta.set(id, country);
+    let rawSellerId = "";
+    try { const res = resolveDataDoeAccountIds([id], connections); rawSellerId = res && res.rawAccountIds && res.rawAccountIds.length === 1 ? String(res.rawAccountIds[0]) : ""; } catch { rawSellerId = ""; }
+    // currency normalized EXACTLY as the hot path's bindPrimaryBucketAccounts (source-bucket-sync-runtime.js): a blank
+    // currency becomes null (never ""), so the dedicated release's daily context.currency is byte-identical.
+    directoryMeta.set(id, { country, rawSellerId, currency: String((a && a.currency) || "") || null });
   }
   return directoryMeta;
 }
-async function resolveMarketplace(accountId) { const m = await loadDirectoryMeta(); return m.get(String(accountId)) || ""; }
+async function resolveMarketplace(accountId) { const m = (await loadDirectoryMeta()).get(String(accountId)); return m ? m.country : ""; }
+// The dedicated release's per-account identity: rawSellerId (OLI history slice + derive context), currency (derive
+// context), marketplace (the Ads content token). Blank rawSellerId -> the release defers (never derives a bad slice).
+async function resolveAccountMeta(accountId) {
+  const m = (await loadDirectoryMeta()).get(String(accountId));
+  return m ? { rawSellerId: m.rawSellerId, currency: m.currency ?? null, marketplace: m.country } : { rawSellerId: "", currency: null, marketplace: "" };
+}
 
 const deadlineSec = Number(argOf("deadline-seconds")) || 0;
 const runStartMs = Date.now();

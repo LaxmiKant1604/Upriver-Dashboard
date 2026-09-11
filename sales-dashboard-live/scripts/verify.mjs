@@ -110,6 +110,7 @@ const SUITES = [
   "test:fba-publication-reconciler",
   "test:ads-publication-reconciler",
   "test:ads-publication-reconciler-behavior",
+  "test:ads-reconcile-prodshape",
   "test:fba-reconcile-prodshape",
   "test:source-tranche",
   "test:source-batching",
