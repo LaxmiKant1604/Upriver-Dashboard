@@ -1,0 +1,151 @@
+name: fba-publication-reconcile
+
+# ZERO-EXPORT FBA-inventory publication reconciler. Every 30 minutes it re-derives + promotes the FBA-dependent
+# canonical live dashboard(s) -- today EXACTLY "brand-inventory" -- for accounts whose ALREADY-SAVED durable FBA
+# inventory (public.source_snapshots, source_key='fba-inventory-health') advanced past -- or was never promoted to --
+# their live snapshot. It is the durable safety net for a stranded promotion (a fresh FBA snapshot whose brand-inventory
+# was never re-derived/promoted, or a healthy account blocked by a sibling in the account-atomic finalize). It is NOT a
+# second scheduler and NEVER creates a DataDoe export, reserves a token, refreshes a source, or supersedes any export --
+# the reconciler's derive adapter is forced to refuse creates (zero export, structurally).
+#
+# It shares the SAME reviewed execution seam as the OLI reconciler (priority-partial-<region>-<16hex> cycle namespace,
+# migration 20260924; the control-package apply/publish/safe-close; the strict-D1 priority release; the shared
+# publisher-grade live read-back). The control-plane lease is GLOBAL, so regions run SEQUENTIALLY, and this reconciler
+# is serialized against the OLI reconciler + the scheduler by that same lease; the publisher's content CAS makes a
+# redundant re-publish an idempotent no-op.
+#
+# NOTE (consolidation follow-up): once FBA passes a natural production cycle, the OLI + FBA periodic reconcilers should
+# be CONSOLIDATED into ONE generalized saved-data-reconcile workflow that loops families x regions (activation step 4).
+# They are kept as two closely-mirrored workflows for now so enabling/validating FBA never risks the proven OLI path.
+#
+# SAFETY POSTURE (default OFF for live promotion):
+#   - MANUAL runs default to DRY-RUN (read-only plan; zero writes) and must opt in to live.
+#   - SCHEDULED runs are DRY-RUN unless the repository variable FBA_RECONCILE_LIVE == 'true' is set deliberately (after
+#     Codex review + a natural-run validation). Merging this workflow is safe -- it only reports the plan + proves
+#     DataDoe creates/tokens = 0 until an operator enables live promotion.
+
+on:
+  schedule:
+    # Every 30 minutes, OFFSET 17 minutes away from the exact hour/half-hour (and away from the OLI reconciler's 13/43
+    # offset) so it never lands on a scheduler boundary and never starts in lock-step with the OLI reconciler.
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry-run (default: read-only plan, ZERO writes) | live (derive + promote stale FBA-dependent dashboards)"
+        required: false
+        default: "dry-run"
+        type: choice
+        options:
+          - dry-run
+          - live
+      bucket:
+        description: "restrict to one region (india|europe-au|us-ca); blank = all three"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  # ONE FBA reconcile pass at a time. It ALSO shares the global control-plane lease with the OLI reconciler + scheduler,
+  # so an overlapping tick QUEUES rather than races; the reconciler is idempotent (an already-current live snapshot is a
+  # zero-write no-op) so a queued duplicate is harmless.
+  group: fba-publication-reconcile
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      asof: ${{ steps.reconcile.outputs.asof }}
+      only: ${{ steps.reconcile.outputs.only }}
+      mode: ${{ steps.reconcile.outputs.mode }}
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Verify required secrets are present (fail closed; never print values)
+        run: |
+          missing=""
+          for v in POSTGRES_URL SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY; do
+            if [ -z "${!v:-}" ]; then missing="$missing $v"; fi
+          done
+          if [ -z "${SUPABASE_URL:-}" ] && [ -z "${VITE_SUPABASE_URL:-}" ]; then missing="$missing SUPABASE_URL|VITE_SUPABASE_URL"; fi
+          if [ -n "$missing" ]; then echo "STOP missing required secret(s):$missing"; exit 1; fi
+      - name: Install dependencies
+        run: npm ci
+      # DRY-RUN unless a manual dispatch selected 'live' OR the repository variable FBA_RECONCILE_LIVE=='true'. --as-of is
+      # yesterday UTC (a conservative D-1 target); an account whose durable FBA does not prove through it is deferred
+      # (keeps LKG). ZERO DataDoe creates/tokens either way. Each region is a SEPARATE, sequential invocation capped at
+      # 7 minutes; the loop continues on a per-region failure (isolation).
+      - name: Reconcile FBA-dependent live dashboards, all regions in order (zero export)
+        id: reconcile
+        run: |
+          MODE='${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode || (vars.FBA_RECONCILE_LIVE == 'true' && 'live' || 'dry-run') }}'
+          ONLY='${{ github.event.inputs.bucket }}'
+          ASOF="$(date -u -d 'yesterday' +%F)"
+          echo "asof=$ASOF" >> "$GITHUB_OUTPUT"; echo "only=$ONLY" >> "$GITHUB_OUTPUT"; echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          LIVE=""; if [ "$MODE" = "live" ]; then LIVE="--live"; fi
+          rc=0
+          for REGION in india europe-au us-ca; do
+            if [ -n "$ONLY" ] && [ "$ONLY" != "$REGION" ]; then echo "skip $REGION (dispatch restricted to $ONLY)"; continue; fi
+            echo "::group::fba-reconcile $REGION mode=$MODE as-of=$ASOF"
+            timeout 420 node scripts/release/fba-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=330 $LIVE || { echo "region $REGION reconcile exited nonzero (isolated; continuing)"; rc=1; }
+            echo "::endgroup::"
+          done
+          exit $rc
+
+  # ABNORMAL-TERMINATION CLEANUP: a SEPARATE job (needs: reconcile, if: always()) so it survives a timeout/cancellation.
+  # It PROVES (read-only) each live region's priority control plane is closed and RECLAIMS only a free/expired plane (a
+  # live owner is left untouched). Non-green when any region's control plane cannot be proven closed. The if-gate mirrors
+  # the reconcile MODE==live decision EXACTLY: a MANUAL dry-run is zero-write and its cleanup must NOT run even if
+  # vars.FBA_RECONCILE_LIVE is 'true' (the repo flag only decides SCHEDULED runs).
+  cleanup:
+    needs: reconcile
+    if: always() && ((github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'live') || (github.event_name != 'workflow_dispatch' && vars.FBA_RECONCILE_LIVE == 'true'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify each live region's control plane is proven closed (reclaim only a free/expired plane)
+        run: |
+          ASOF='${{ needs.reconcile.outputs.asof }}'; ONLY='${{ needs.reconcile.outputs.only }}'
+          if [ -z "$ASOF" ]; then ASOF="$(date -u -d 'yesterday' +%F)"; fi
+          rc=0
+          for REGION in india europe-au us-ca; do
+            if [ -n "$ONLY" ] && [ "$ONLY" != "$REGION" ]; then continue; fi
+            echo "::group::fba-reconcile cleanup $REGION as-of=$ASOF"
+            node scripts/release/fba-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --cleanup || { echo "region $REGION control cleanup UNVERIFIED"; rc=1; }
+            echo "::endgroup::"
+          done
+          if [ "$rc" != "0" ]; then echo "STOP FBA_RECONCILE_CLEANUP_UNVERIFIED: one or more regions' control plane could not be proven closed."; fi
+          exit $rc
