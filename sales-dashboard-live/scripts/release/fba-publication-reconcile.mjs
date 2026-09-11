@@ -59,8 +59,10 @@ const { fetchAccounts: fetchDirectory } = await import("../../lib/server/datadoe
 const { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } = await import("../../lib/server/sync/report-publisher.js");
 const { REPORT_DERIVATIONS } = await import("../../lib/server/sync/report-derivation.js");
 const { paramsHashFor } = await import("../../lib/server/report-store.js");
-const { buildPriorityDashboardsRelease } = await import("../../lib/server/sync/source-priority-dashboards.js");
-const { runPriorityDashboardsRelease, buildLiveReadback } = await import("../../lib/server/sync/source-priority-release-runner.js");
+const { buildFbaBrandInventoryRelease } = await import("../../lib/server/sync/fba-brand-inventory-release.js");
+const { buildSchedulerV2Publisher } = await import("../../lib/server/sync/publisher-composition.js");
+const { buildBrandInventorySnapshot } = await import("../../lib/server/reports/brand-view.js");
+const { buildLiveReadback } = await import("../../lib/server/sync/source-priority-release-runner.js");
 const { readPartialCycleCapability } = await import("../../lib/server/sync/priority-partial-capability.js");
 const { runControlPackageCli } = await import("../../lib/server/sync/source-priority-control-package.js");
 const { connectPriorityControlStore } = await import("../../lib/server/sync/priority-control-pg-store.js");
@@ -102,13 +104,11 @@ const readbackLive = buildLiveReadback({
   computeHash: paramsHashFor,
 });
 
-// NO-EXPORT inner adapter: the reconciler derives ONLY from already-saved durable data. Any create/poll/download from
-// inside the derive fails closed here, so the reconciler can never touch a DataDoe export transport.
-const makeNoExportInnerAdapter = () => ({
-  create: async () => { throw new Error("FBA_RECONCILER_NO_EXPORT: the reconciler never creates a DataDoe export (fail closed)."); },
-  poll: async () => { throw new Error("FBA_RECONCILER_NO_EXPORT: the reconciler never polls a DataDoe export (fail closed)."); },
-  download: async () => { throw new Error("FBA_RECONCILER_NO_EXPORT: the reconciler never downloads a DataDoe export (fail closed)."); },
-});
+// STRUCTURAL ZERO EXPORT: the dedicated brand-inventory release (fba-brand-inventory-release.js) reads ONLY durable
+// data (source_snapshots + report_snapshots) + writes ONLY the fenced report_snapshots CAS. It takes NO provider
+// export adapter and the whole reconcile path imports NO provider export transport, so there is no create / poll /
+// download to reach; zero provider export is STRUCTURAL, not a throwing-adapter guard. (The FBA entrypoint guard test
+// asserts this by source-scanning both this file and the dedicated release module for transport symbols.)
 
 async function assertNoCron() {
   const client = makePgReadOnly();
@@ -120,11 +120,6 @@ async function assertNoCron() {
     return n.rows[0].n === 0 ? { ok: true } : { ok: false, reason: "scheduler cron present (" + n.rows[0].n + ")" };
   } catch (e) { return { ok: false, reason: "cron read failed: " + (e && e.message) }; }
   finally { try { await client.end(); } catch { /* ignore */ } }
-}
-async function reconcile() {
-  const cron = await assertNoCron();
-  if (!cron.ok) return { ok: false, problems: [cron.reason] };
-  return { ok: true };
 }
 
 let leaseFence = null;
@@ -194,17 +189,45 @@ const verifyLease = async () => {
 async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revisionId, signal }) {
   const aborted = () => !!(signal && signal.aborted);
   if (aborted()) return { code: 1, ok: false, stage: "reconcile", status: "DEADLINE_ABORTED", leaseLost: false, reason: "deadline-aborted", aborted: true, blockerCodes: [], problems: ["deadline-aborted before start (no work performed)"] };
+  // DEDICATED brand-inventory-ONLY release (blocker 3): re-derive + publish EXACTLY brand-inventory for this account
+  // over its own priority-partial cycle -- NEVER daily-reporting or brand-sales. The publisher is fenced on THIS op's
+  // control fence (aborted -> null fence -> the CAS writes zero rows); verifyLease heartbeats it before publish. The
+  // release reads only durable data (source_snapshots FBA + the account's validated live brand-sales) + writes only the
+  // fenced brand-inventory report_snapshots CAS -- zero provider export, structurally.
   const cycleBucket = "priority-partial-" + b + "-" + sha256(JSON.stringify([accountId, revisionId || ""])).slice(0, 16);
-  const fetchOne = async (apiKey) => ((await fetchDirectory(apiKey)) || []).filter((r) => String((r && (r.accountId ?? r.account_id ?? r.id)) || "").trim() === accountId);
-  const release = buildPriorityDashboardsRelease({
-    asOfOverride: requestedAsOf, operationKey: "priority-dashboards/scheduled/" + requestedAsOf,
-    getCycleByBucketDate: sb.getBaseSyncCycleByBucketDate,
-    getControlFence: () => (aborted() ? null : leaseFence),
-    makeInnerAdapter: makeNoExportInnerAdapter, fetchAccounts: fetchOne, cycleBucket,
-  });
+  const publisher = buildSchedulerV2Publisher({ getControlFence: () => (aborted() ? null : leaseFence) });
   const verifyLeaseForOp = async () => (aborted() ? { ok: false, reason: "deadline-aborted" } : verifyLease());
-  const result = await runPriorityDashboardsRelease({ release, reconcile, readbackLive, assertNoCron, bucket: b, strictD1: true, verifyLease: verifyLeaseForOp, log: () => {} });
+  const release = buildFbaBrandInventoryRelease({
+    resolveOrg: async () => ({ organizationFingerprint: orgFp, connectionId: "primary" }),
+    openCycle: (args) => sb.openSyncCycle(args),
+    getCycleByBucketDate: (bk, date) => sb.getBaseSyncCycleByBucketDate(bk, date),
+    readFbaSnapshot,
+    loadSnapshotPayload: (path) => sb.getSourceSnapshotPayload(path),
+    resolveExpectedRequestHash,
+    resolveAccountCountry,
+    readBrandSalesSnapshot: ({ accountId: a }) => sb.getLatestReportSnapshot({ reportKey: "brand-sales", accountId: a }),
+    loadReportPayload: (path) => sb.getReportSnapshotStoragePayload(path),
+    readBrandSalesLineage: ({ accountId: a }) => sb.getLatestReportJobLineage("brand-sales", a),
+    buildInventorySnapshot: buildBrandInventorySnapshot,
+    computeHash: paramsHashFor,
+    upsertReportJob: (job) => sb.upsertSyncReportJob(job),
+    claimLease: (cycleId, reportKey, a, opts) => sb.claimReportDeriveLease(cycleId, reportKey, a, opts),
+    saveShadow: (args) => sb.saveShadowSnapshotIfNewer(args),
+    reconcileSuccess: (args) => sb.reconcileReportDeriveSuccess(args),
+    finalizeCycle: ({ cycleId }) => sb.finalizeSyncCycle(cycleId),
+    publisher, readbackLive, verifyLease: verifyLeaseForOp,
+    log: () => {},
+  });
+  const result = await release.runForAccount({ accountId, requestedAsOf, cycleBucket, signal });
   return { code: result.code, ok: result.ok, stage: result.stage, status: result.status || null, leaseLost: result.leaseLost === true, reason: result.reason || null, blockerCodes: result.blockerCodes || [], problems: result.problems || [] };
+}
+
+// Marketplace country for an account (for buildBrandInventorySnapshot). Read-only directory lookup; blank when
+// unresolvable (the release still derives, but the payload's country attribution degrades honestly).
+async function resolveAccountCountry(accountId) {
+  const meta = await loadDirectoryMeta();
+  const m = meta.get(String(accountId));
+  return m ? String(m.country) : "";
 }
 
 // Directory metadata (accountId -> { rawSellerId, country }) for the region, resolved from the authoritative primary

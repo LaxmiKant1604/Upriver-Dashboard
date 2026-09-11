@@ -7,6 +7,8 @@
 import assert from "node:assert/strict";
 import { writeSync, readFileSync } from "node:fs";
 import { buildFbaPublicationReconciler, FBA_RECONCILE_STATUS } from "../lib/server/sync/fba-publication-reconciler.js";
+import { fbaContentProvenanceToken } from "../lib/server/sync/fba-inventory-revision.js";
+import { FBA_INVENTORY_SOURCE_KEY } from "../lib/server/sync/source-durable-model.js";
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -24,7 +26,8 @@ const shHashFor = (accountId, to) => HASH("brand-inventory/shadow", shParamsFor(
 // Harness: REAL FBA reconciler + REAL revision/binding + injected readers/control/release. Per-account durable FBA
 // snapshot modelled by snapshotByAccount; the expected D-1 request hash by expectedHashByAccount (default = the
 // snapshot's own request hash, i.e. a proven-D-1 snapshot). Staleness is modelled by liveRefresh (set on a successful
-// promote) + jobDependsOn (default = the account's current FBA request hash -> covered).
+// promote) + jobDurableContentDeps (the report job's durable_content_deps; default = the account's CURRENT FBA content
+// token -> covered; set to [] or an OLD token to model a not-covered same-date/date-advance correction).
 function makeHarness(over = {}) {
   const calls = { release: [], openControls: [], closeControls: [], releaseRevisions: [], snapshotReads: [] };
   const snapshotByAccount = over.snapshotByAccount || new Map([
@@ -32,7 +35,7 @@ function makeHarness(over = {}) {
     ["A02", { source_request_hash: "rh-A02", payload_sha: "ps-A02", row_count: 0 }], // valid EMPTY (unavailable, not zero)
   ]); // A03 (in accounts, not here) -> no snapshot -> DEFERRED_PROVENANCE
   const expectedHashByAccount = over.expectedHashByAccount || null; // null -> derive from the snapshot (proven-D-1)
-  const jobDependsOn = over.jobDependsOn || null; // null -> [snapshot.request_hash] (covered)
+  const jobDurableContentDeps = over.jobDurableContentDeps || null; // null -> [current content token] (covered)
   const shadowRefresh = over.shadowRefresh || new Map();
   const liveRefresh = over.liveRefresh || new Map();
   const jobPromotable = over.jobPromotable || new Map();
@@ -43,7 +46,9 @@ function makeHarness(over = {}) {
   const releaseFor = over.releaseFor || (() => ({ ok: true, code: 0 }));
   const shRef = (a) => shadowRefresh.get(a) || "2026-09-10T05:00:00Z";
   const expectedHashOf = (a) => (expectedHashByAccount ? (expectedHashByAccount.get(a) || "") : (snapshotByAccount.get(a) ? snapshotByAccount.get(a).source_request_hash : ""));
-  const depsOf = (a) => (jobDependsOn ? (jobDependsOn.get(a) || []) : (snapshotByAccount.get(a) ? [snapshotByAccount.get(a).source_request_hash] : []));
+  // The CURRENT FBA content token for account a (what computeFbaAccountRevision produces as contentDeps[0]).
+  const tokenOf = (a) => { const s = snapshotByAccount.get(a); return s ? fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: a, connectionId: "primary", requestHash: s.source_request_hash, contentSha: s.payload_sha }) : ""; };
+  const contentDepsOf = (a) => (jobDurableContentDeps ? (jobDurableContentDeps.get(a) || []) : (snapshotByAccount.get(a) ? [tokenOf(a)] : []));
   const reconciler = buildFbaPublicationReconciler({
     resolveOrg: async () => over.org || ({ organizationFingerprint: "org-1", connectionId: "primary" }),
     bucketAccounts: async () => over.accounts || [{ accountId: "A01" }, { accountId: "A02" }, { accountId: "A03" }],
@@ -52,8 +57,10 @@ function makeHarness(over = {}) {
     readLatestReportJob: async ({ accountId }) => {
       if (!snapshotByAccount.has(accountId)) return null;
       const promo = jobPromotable.has(accountId) ? jobPromotable.get(accountId) : true;
-      if (!promo) return { deriveStatus: "failed", saveStatus: "succeeded", validated: false, cycleStatus: "running", snapshotParamsHash: "", dependsOn: [] };
-      return { deriveStatus: "succeeded", saveStatus: "succeeded", validated: true, cycleStatus: "succeeded", snapshotParamsHash: shHashFor(accountId, candTo), dependsOn: [...depsOf(accountId), "catalog"] };
+      if (!promo) return { deriveStatus: "failed", saveStatus: "succeeded", validated: false, cycleStatus: "running", snapshotParamsHash: "", dependsOn: [], durableContentDeps: [] };
+      // brand-inventory's depends_on carries the OLI/Catalog attribution provenance (a non-empty array for the binding
+      // guard); the FBA content provenance is in durable_content_deps.
+      return { deriveStatus: "succeeded", saveStatus: "succeeded", validated: true, cycleStatus: "succeeded", snapshotParamsHash: shHashFor(accountId, candTo), dependsOn: ["oli-h", "catalog"], durableContentDeps: contentDepsOf(accountId) };
     },
     readShadowSnapshot: async ({ reportKey, accountId, paramsHash }) => { if (!snapshotByAccount.has(accountId)) return null; return { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params: shParamsFor(accountId, candTo), payload: shadowPayload, payload_storage_path: null, source_refreshed_at: shRef(accountId) }; },
     readLiveSnapshot: async ({ reportKey, accountId, paramsHash }) => { if (!liveRefresh.has(accountId)) return null; return { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params: { reportVersion: CONTRACTS[reportKey].liveReportVersion, to: candTo }, payload: livePayload, payload_storage_path: null, source_refreshed_at: liveRefresh.get(accountId) }; },
@@ -95,14 +102,31 @@ test("test 2: current durable FBA already promoted (live bound + verified) -> PU
   ok("no controls opened, no release ran (zero writes)", h.calls.openControls.length === 0 && h.calls.release.length === 0 && out.outcome !== "failed");
 });
 
-// (3) durable FBA advanced to a NEW day (request hash advanced past the live job's depends_on) -> STALE -> republish.
-test("test 3: durable FBA DATE-ADVANCED (new request hash not in the live job's depends_on) -> STALE -> re-derive + promote", async () => {
-  const liveRefresh = new Map([["A01", "2026-09-10T05:00:00Z"]]); // a live exists
-  const jobDependsOn = new Map([["A01", ["rh-A01-OLDER-DAY"]]]); // job bound to the OLDER day's FBA hash
-  const snapshotByAccount = new Map([["A01", { source_request_hash: "rh-A01-D1", payload_sha: "ps-new", row_count: 9 }]]);
-  const h = makeHarness({ accounts: [{ accountId: "A01" }], snapshotByAccount, jobDependsOn, liveRefresh });
+// (3) SAME-DATE correction: same request hash, NEW payload_sha -> the live job's durable_content_deps holds the OLD
+// content token -> NOT covered -> STALE -> re-derive + promote (blocker 2). Also covers date-advance (a new day yields
+// a new token, likewise not covered).
+test("test 3: durable FBA SAME-DATE correction (new payload_sha) -> content token not covered -> STALE -> re-derive + promote", async () => {
+  const liveRefresh = new Map([["A01", "2026-09-10T05:00:00Z"]]); // a live exists (built from the OLD content)
+  const snapshotByAccount = new Map([["A01", { source_request_hash: "rh-A01", payload_sha: "ps-CORRECTED", row_count: 9 }]]);
+  // the latest job recorded the OLD content token (built before the same-date correction)
+  const oldToken = fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: "A01", connectionId: "primary", requestHash: "rh-A01", contentSha: "ps-OLD" });
+  const jobDurableContentDeps = new Map([["A01", [oldToken]]]);
+  const h = makeHarness({ accounts: [{ accountId: "A01" }], snapshotByAccount, jobDurableContentDeps, liveRefresh });
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
-  ok("A01 re-derived (current FBA request hash is not in the live job's depends_on -> fba-revision-changed)", stateOf(out, "A01", "brand-inventory") === FBA_RECONCILE_STATUS.READBACK_VERIFIED && h.calls.release.length === 1);
+  ok("A01 re-derived (corrected payload_sha's content token is NOT in the job's durable_content_deps -> fba-revision-changed)", stateOf(out, "A01", "brand-inventory") === FBA_RECONCILE_STATUS.READBACK_VERIFIED && h.calls.release.length === 1);
+});
+
+// (2b) same content already published: the job's durable_content_deps HOLDS the current content token -> covered ->
+// PUBLICATION_NOT_REQUIRED (the blocker-1 requirement: the next unchanged pass opens no controls before classifying).
+test("test 2b: current FBA content already promoted (durable_content_deps holds the current token) -> PUBLICATION_NOT_REQUIRED, zero writes", async () => {
+  const h = makeHarness({
+    accounts: [{ accountId: "A01" }],
+    snapshotByAccount: new Map([["A01", { source_request_hash: "rh-A01", payload_sha: "ps-A01", row_count: 5 }]]),
+    liveRefresh: new Map([["A01", "2026-09-10T05:00:00Z"]]),
+    // jobDurableContentDeps defaults to [current token] -> covered
+  });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("A01 already current -> PUBLICATION_NOT_REQUIRED; NO controls opened; NO release (zero writes before opening controls)", stateOf(out, "A01", "brand-inventory") === "PUBLICATION_NOT_REQUIRED" && h.calls.openControls.length === 0 && h.calls.release.length === 0);
 });
 
 // (4) one bad account (ineligible) does not block healthy accounts.
@@ -195,18 +219,20 @@ test("dependency-safety: the FBA reconciler wrapper + core reference NO provider
   ok("wrapper imports the FBA registry + FBA revision + shared core only (never datadoe/source-sync-driver)", /from "\.\/fba-dependent-reports\.js"/.test(wrap) && /from "\.\/fba-inventory-revision\.js"/.test(wrap) && /from "\.\/saved-data-reconciler\.js"/.test(wrap) && !/from "\.\.\/datadoe/.test(wrap) && !/source-sync-driver/.test(wrap));
 });
 
-// ENTRYPOINT GUARD (OLI-parity, closes an adversarial-review finding): the FBA zero-export invariant hinges on the
-// production entrypoint wiring the create-refusing adapter into the REAL release. Without this source-scan, a
-// regression that drops `makeInnerAdapter: makeNoExportInnerAdapter` (buildPriorityDashboardsRelease then DEFAULTS to
-// the real makeDataDoeAdapter export transport) or neuters the throwing adapter would ship GREEN. This mirrors
-// oli-publication-reconciler.test.js's entrypoint guard so the safety-critical wiring is regression-tested for FBA too.
-test("entrypoint guard: fba-publication-reconcile.mjs wires the NO-EXPORT adapter into the real release + the reviewed namespace/control/deadline/signal wiring", () => {
+// ENTRYPOINT GUARD (blocker 3): the FBA reconcile path re-derives + publishes ONLY brand-inventory via the DEDICATED
+// release (buildFbaBrandInventoryRelease), NEVER the priority trio (buildPriorityDashboardsRelease/
+// runPriorityDashboardsRelease), and its zero-export is STRUCTURAL -- the dedicated release + entrypoint import NO
+// DataDoe export transport at all (no makeDataDoeAdapter / source-sync-driver / createExport / /exports). This
+// source-scan makes a regression that reintroduces the trio release or a real export transport fail CI.
+test("entrypoint guard: fba-publication-reconcile.mjs drives the DEDICATED brand-inventory release (never the trio) + structural zero export + the reviewed namespace/control/deadline/signal wiring", () => {
   const mjs = readFileSync(new URL("./release/fba-publication-reconcile.mjs", import.meta.url), "utf8");
-  // (1) zero provider export: the no-export inner adapter is wired into buildPriorityDashboardsRelease, create/poll/
-  // download all throw (>=3 FBA_RECONCILER_NO_EXPORT), and NO real export transport symbol appears.
-  ok("makeInnerAdapter is the no-export adapter (never the default makeDataDoeAdapter)", /makeInnerAdapter: makeNoExportInnerAdapter/.test(mjs));
-  ok("create/poll/download all throw FBA_RECONCILER_NO_EXPORT (>=3)", (mjs.match(/FBA_RECONCILER_NO_EXPORT/g) || []).length >= 3);
-  ok("no real provider export/token transport symbol", !/createExport\(/.test(mjs) && !/makeDataDoeAdapter/.test(mjs) && !/exportsCreate/.test(mjs) && !/reserveTokens/.test(mjs) && !/oli-refresh-d1/.test(mjs));
+  const rel = readFileSync(new URL("../lib/server/sync/fba-brand-inventory-release.js", import.meta.url), "utf8");
+  // (1) ISOLATION + STRUCTURAL zero export: the dedicated brand-inventory release is wired; the trio release is NOT;
+  // and NO export transport symbol appears in EITHER the entrypoint or the dedicated release module.
+  ok("the entrypoint drives buildFbaBrandInventoryRelease.runForAccount (dedicated brand-inventory release)", /buildFbaBrandInventoryRelease\(/.test(mjs) && /release\.runForAccount\(/.test(mjs));
+  ok("the entrypoint NEVER uses the priority trio release (buildPriorityDashboardsRelease / runPriorityDashboardsRelease)", !/buildPriorityDashboardsRelease/.test(mjs) && !/runPriorityDashboardsRelease/.test(mjs));
+  ok("no real provider export/token transport symbol in the entrypoint", !/createExport\(/.test(mjs) && !/makeDataDoeAdapter/.test(mjs) && !/exportsCreate/.test(mjs) && !/reserveTokens/.test(mjs) && !/oli-refresh-d1/.test(mjs) && !/source-sync-driver/.test(mjs));
+  ok("no export transport symbol in the dedicated release module (reads only durable data + writes the fenced CAS)", !/createExport/.test(rel) && !/makeDataDoeAdapter/.test(rel) && !/exportsCreate/.test(rel) && !/reserveTokens/.test(rel) && !/source-sync-driver/.test(rel) && !/from "\.\.\/datadoe/.test(rel));
   // (2) reviewed priority-partial namespace + capability preflight; cycle bucket over {accountId, FBA revisionId}.
   ok("cycle bucket is priority-partial-<region>-<16hex> over {accountId, revisionId}", /"priority-partial-" \+ b \+ "-" \+ sha256\(JSON\.stringify\(\[accountId, revisionId/.test(mjs));
   ok("readPartialCycleCapability gates the namespace (fail closed)", /readPartialCycleCapability\(/.test(mjs) && /PRIORITY_PARTIAL_MIGRATION_PENDING/.test(mjs));
