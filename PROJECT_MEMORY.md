@@ -1,5 +1,39 @@
 # Project Memory
 
+## OLI reconciler — Codex termination-boundary HARDENING: no close while op alive, fail-closed settlement, required (ref'd) timers (2026-09-11, commit 4e45c53 on main, NOT pushed; verify 196/196; code-complete, NOT production acceptance)
+
+Follow-up to 9c3ce28 (preserved; parent 2ffbc76). Codex re-review confirmed the previous round's defects 2/3/4 fixed;
+this fixes the remaining P0 termination-boundary defects ONLY. NO push/deploy/dispatch/migration/DataDoe;
+OLI_RECONCILE_LIVE stays disabled; migration 20260924 unapplied. Exact D-1 / account-binding / dry-run / zero-export /
+fencing / COMMIT_UNKNOWN behavior UNCHANGED. Files: oli-publication-reconciler.js, oli-publication-reconcile.mjs +
+the reconciler & prodshape tests (4 files).
+
+1. **NEVER close/release the fence while the op may still run.** When the in-flight op's termination is NOT CONFIRMED
+   (`awaitSettled` did not return `{settled:true}`), the reconciler NO LONGER calls closeControls -- closing would tear
+   down a control fence an op may still be using at its write boundary. It marks `control.terminationUnconfirmed`
+   (-> controlCleanupUnresolved, NON-GREEN) and leaves the EXACT lease + controls INTACT; the lease expires by TTL and
+   the SEPARATE cleanup job reclaims the free/expired plane + proves it closed. The `finally` now takes a no-close branch
+   on terminationUnconfirmed; only the confirmed-stopped path (op already settled) safe-closes.
+2. **awaitSettled throwing = settled:false (fail closed), NEVER settled:true.** Only an explicit `{settled:true}`
+   confirms the op stopped; a throw, `{settled:false}`, or any malformed return all leave the run unconfirmed (lease
+   held, non-green). Previously the catch wrongly defaulted to settled:true.
+3. **Removed `.unref()` from the deadline + settlement-grace timers** (entrypoint). They are REQUIRED handles that must
+   keep the Node event loop alive through abort -> settlement determination -> finally cleanup; an unreferenced timer
+   that is the only pending handle lets Node exit 13 (unsettled top-level await) BEFORE cleanup runs. Verified empirically
+   (ref'd -> exit 0 + cleanup; unref'd -> exit 13, cleanup skipped). Timers are still clearTimeout'd on the winning path
+   and self-complete when they fire, so they never linger; the no-deadline path creates no timers.
+4. **Tests** (reconciler 64 / prodshape 26): cooperative abort settles -> safe-close runs afterward; non-cooperative
+   abort (settled:false) -> NO safe-close, lease/controls HELD, non-green; awaitSettled THROWS -> same fail-closed
+   result, no safe-close; a REAL Node subprocess whose only pending work is a top-level await on a ref'd-timer promise
+   exits 0 with cleanup reached (the `.unref()`'d contrast exits 13); and after lease expiry the SEPARATE cleanup path
+   (runControlPackageCli mode:"reclaim") reclaims the expired plane + proves rollout closed + releases the lease. An
+   entrypoint-guard asserts the .mjs has no `.unref()` call on those timers.
+
+Tests: revision 51, reconciler 64, prodshape 26, workflow 30, source-priority 131; full `npm run verify` 196/196 across
+172 suites (incl. build:check, 434s); node --check + git diff --check clean. Adversarial review (writes-after-close,
+throw-as-settled, premature-exit-13, lease-teardown-while-alive) 0 defects. LIVE promotion OFF by default; PRODUCTION
+ACCEPTANCE PENDING natural runs (a green verify is NOT recovery evidence).
+
 ## OLI reconciler — Codex 4-defect DEEP follow-up: real deadline termination boundary, exact-mode cleanup gate, publisher-identical account check, exact requested-as-of identity (2026-09-11, commit 9c3ce28 on main, NOT pushed; verify 196/196; code-complete, NOT production acceptance)
 
 Follow-up to 8927358 (preserved; 9c3ce28's grandparent-of-record is b64f042 the docs commit). Codex reproduced 4
