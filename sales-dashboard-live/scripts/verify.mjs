@@ -105,6 +105,8 @@ const SUITES = [
   "test:oli-reconcile-prodshape",
   "test:oli-reconcile-workflow",
   "test:fba-publication-revision",
+  "test:ads-publication-revision",
+  "test:listings-durable-migration-audit",
   "test:fba-publication-reconciler",
   "test:fba-reconcile-prodshape",
   "test:source-tranche",
