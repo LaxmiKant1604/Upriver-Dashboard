@@ -170,3 +170,35 @@ applying migration 20260925 + a natural cycle before FBA live promotion is enabl
 
 No migration was applied. No GitHub variable was set. No workflow was dispatched. No provider
 export/token was performed.
+
+---
+
+## D. LISTING HEALTH V3 — proposed CANONICAL LIVE contract (WORK D; DECISION-READY, NOT implemented)
+
+Listing Health v3 today is a **shadow-only, read-only preview**: the scheduler writes `scheduler-v2/listing-health-v3`
+shadows (100 at D-1 in prod), the UI tab is behind the default-OFF `LISTING_HEALTH_V3` flag, and `api/datadoe.js`
+action `listing-health-v3` (`serveListingHealthV3Preview`) serves the SHADOW directly. There is **no** entry in
+`SCHEDULER_LIVE_SNAPSHOT_CONTRACTS`, so there is no live promotion identity. The Listings/Raw reconciler (WORK C)
+therefore rebuilds only the **validated shadow** and must NOT promote live until this contract is approved. This
+section is the exact contract Codex must approve **before** LHv3 becomes a live-promoted, user-visible report.
+
+| Field | Proposed value |
+|---|---|
+| Live report key (`liveReportKey`) | `listing-health-v3` (bare; the shadow stays `scheduler-v2/listing-health-v3`) |
+| Live report version (`liveReportVersion`) | `listing-health-v3-shared-v1` (NEW; distinct from the shadow `snapshotVersion` `listing-health/v3-oli-window`) |
+| Live params + params hash | `liveParams(shadowParams) = isCalendarDate(p.to) ? { to: p.to } : null`; `paramsHash = paramsHashFor("listing-health-v3-shared-v1", { to })` — a point-in-time as-of report, mirroring `brand-inventory` (to-only) |
+| API / dashboard route identity | `api/datadoe.js` action `listing-health-v3` → switch `serveListingHealthV3Preview` to read the **live** row (`getReportSnapshot({ reportKey:"listing-health-v3", accountId, paramsHash })`) instead of the shadow, still capability-gated + behind `LISTING_HEALTH_V3`. **No new api/*.js** (reuse the existing action; count stays 12) |
+| `validatePayload` | REUSE the existing strict LHv3 validator verbatim (accountId/asOf/rows[]/catalogBrands[]/currencies[]/issuesAvailable:boolean/window/coverage/salesWindowStatus/inventory/listingCount/issuesUnavailableReason/`salesSource==="order-line-items"`) |
+| Source lineage requirements | REQUIRED: `order-line-items` (durable OLI) + `product-catalog` (durable) + **durable `listings`** (from WORK B `source_listings_snapshot`); OPTIONAL (degrade, never fail): `listing-health-v3:listings-raw` + `listing-health-v3:inventory`. `issuesAvailable:false` when optional raw/inventory absent — the existing contract, preserved |
+| Shadow→live publisher mapping | Add `"listing-health-v3"` to `SCHEDULER_LIVE_SNAPSHOT_CONTRACTS`; the reviewed fenced `buildSchedulerV2Publisher` promotes the validated `scheduler-v2/listing-health-v3` shadow to the bare live key at the canonical hash (publisher-identical validation) |
+| Readback identity | `buildLiveReadback({ reportKey:"listing-health-v3", liveReportKey:"listing-health-v3", accountId, paramsHash })` — canonical live identity + payload contract, exactly like every other live report |
+| Relationship to Listing Health v1 | ADDITIVE. `listing-health` (v1) stays the default live page + its own live contract; v3 is a separate report behind `LISTING_HEALTH_V3`. **No v1 retirement or data cutover proposed here** |
+| UI flag / cutover | `LISTING_HEALTH_V3` stays default OFF. Live serving is gated by the flag; promotion is gated by a NEW `LISTINGS_RECONCILE_LIVE` (or a dedicated `LHV3_PUBLISH_LIVE`) default-OFF variable. Cutover is flag-flip only; no forced migration of users |
+| Rollback + LKG | Standard: fenced CAS (older never overwrites newer live), LKG preserved on every defer/failure; disabling the flag reverts serving to the shadow/v1; the live row is content-addressed so a bad promotion is superseded by the next validated one, never silently lost |
+
+**What Codex must approve before LHv3 is user-visible:** (1) the new live report key + `listing-health-v3-shared-v1`
+version + the to-only params contract; (2) adding `listing-health-v3` to `SCHEDULER_LIVE_SNAPSHOT_CONTRACTS`; (3) the
+`api/datadoe.js` serve switch from shadow to live (behind the flag); (4) the durable Listings store (§A) being
+finalized + applied FIRST (LHv3 live requires durable `listings` evidence); (5) the promote/UI cutover variable. Until
+all five are approved, WORK C reconciles the LHv3 **shadow only** and performs shadow readback/validation, never live
+promotion.
