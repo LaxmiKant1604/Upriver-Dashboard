@@ -484,6 +484,37 @@ jobs:
         id: fba
         run: node scripts/release/fba-plan-golive.mjs --mode=go-live --region=${{ needs.run.outputs.region }} --max-tokens=${{ steps.fcfg.outputs.maxtok }} --inventory-as-of=${{ needs.run.outputs.inventory_asof }} --account-scope=${{ needs.run.outputs.scope }} --dispatch-id=${{ inputs.dispatch_id }} --run-token=${{ github.run_id }}-${{ github.run_attempt }}
 
+      # (fba step 2) IMMEDIATE post-save FBA publication reconcile (blocker 4). Right after the FBA inventory drain +
+      # fba-plan publish -- i.e. once the durable FBA inventory (source_snapshots, fba-inventory-health) is saved +
+      # validated -- re-derive + promote any FBA-dependent live dashboard (today EXACTLY brand-inventory) that the
+      # earlier priority `run` job published from STALE/absent FBA inventory (the run job publishes brand-inventory
+      # BEFORE this fba job drains fresh FBA). It runs the SAME reconciler as the 30-min backstop and NEVER creates a
+      # DataDoe export/token (the dedicated brand-inventory release reads only durable data + writes only the fenced
+      # brand-inventory CAS -- zero export, structurally).
+      #
+      # NO FENCE TO REUSE (unlike OLI step 11b): the FBA fba-plan control package is ALWAYS safe-closed INSIDE
+      # advanceFbaPlanBucket before fba-plan-golive returns, and the run job's full_controls was already safe-closed
+      # (step 12) before this fba job runs -- so there is NO open owner_token/generation here. This therefore runs the
+      # reconciler's OWN reviewed independent lifecycle (--mode=periodic: self-owned control-package apply -> publish ->
+      # evidence-based safe-close), NEVER reusing or stealing a lease and NEVER inventing an expired fence.
+      #
+      # It passes NO --accounts: the workflow cannot know which accounts' durable FBA "advanced" (fba-plan-golive emits
+      # no per-account advanced signal), and the reconciler's per-account revision gate + exact publication binding are
+      # the AUTHORITY -- they promote ONLY accounts whose durable FBA advanced past their live brand-inventory, while an
+      # unchanged account is a zero-write PUBLICATION_NOT_REQUIRED no-op. So "only advanced accounts are republished" is
+      # enforced by the revision gate, byte-identical to the proven 30-min backstop invocation.
+      #
+      # DRY-RUN default; LIVE only when the repo var FBA_RECONCILE_LIVE=='true' (a manual dry-run performs zero writes
+      # regardless of the flag, since scheduled and manual gating lives inside the .mjs + the workflow flag). Additive +
+      # continue-on-error: it NEVER changes fba_complete/fba_published, NEVER writes the FBA source, and an immediate
+      # failure is left for the 30-min fba-publication-reconcile.yml backstop (incl. its always() --cleanup job).
+      - name: Immediate FBA publication reconcile (zero export; self-owned lease; dry-run unless FBA_RECONCILE_LIVE)
+        if: always() && needs.run.outputs.scope != 'bootstrap' && steps.fba.outcome == 'success' && needs.run.outputs.inventory_asof != ''
+        continue-on-error: true
+        run: |
+          if [ "${{ vars.FBA_RECONCILE_LIVE }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
+          node scripts/release/fba-publication-reconcile.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --mode=periodic --deadline-seconds=300 $LIVE
+
   # Listing Health v3 SHADOW ingestion -- runs ONLY after THIS region's FBA inventory job SUCCEEDED, so v3's reuse-only
   # inventory tranche adopts the fresh FBA Plan inventory cache (zero inventory creates). It is NOT a new scheduler
   # owner: it is a dependent job of the SAME per-region workflow run, so it inherits the workflow-level per-region
