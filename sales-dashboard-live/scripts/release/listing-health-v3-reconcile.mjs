@@ -251,6 +251,10 @@ const loadDurableContext = makeListingHealthV3DurableContextLoader({
   connections,
   getCatalogSnapshot: (args) => sb.getSourceSnapshot(args),
   loadCatalogPayload: (path, opt) => sb.getSourceSnapshotPayload(path, opt),
+  // STRICT reconciler mode (WORK C/D blockers 3+4): a durable OLI coverage/completeness READ FAILURE or a Catalog
+  // integrity failure DEFERS (never degrades valid live LKG); buildObjectPath validates the catalog namespace.
+  strict: true,
+  buildObjectPath: sb.sourceSnapshotObjectPath,
 });
 
 // The authoritative per-account identity for the dependency bundle: marketplace = the directory country (uppercased),

@@ -26,11 +26,15 @@ const D1_HASH = paramsHashFor(LIVE_VERSION, { to: EXPECTED_D1 });
 
 ok("expectedListingHealthV3LiveAsOf is UTC-yesterday (D-1)", EXPECTED_D1 === "2026-09-04");
 
-// A structurally valid listing-health-v3 payload (passes the STRICT REPORT_DERIVATIONS validatePayload).
+// The canonical 30D default window for a given `to` (D-1): from = to-(30-1). Matches resolveListingHealthWindow.
+const WINDOW_FROM = "2026-08-06"; // 2026-09-04 minus 29 days
+// A structurally valid listing-health-v3 payload that ALSO passes the LHv3 semantic-identity hook (accountId===acct,
+// asOf===to, canonical 30D window {kind,from,to,days}). Overridable via `extra` for the negative cases.
 const validPayload = (asOf = EXPECTED_D1, extra = {}) => ({
   accountId: ACCT, asOf, rows: [], catalogBrands: [], currencies: [], issuesAvailable: true,
-  window: { preset: "30D" }, coverage: {}, salesWindowStatus: "covered", inventory: { available: false },
-  listingCount: 0, issuesUnavailableReason: null, salesSource: "order-line-items", ...extra,
+  window: { kind: "30D", from: WINDOW_FROM, to: asOf, days: 30 },
+  coverage: { requestedFrom: WINDOW_FROM, requestedTo: asOf, coveredFrom: WINDOW_FROM, coveredTo: asOf, complete: true, gaps: [] }, salesWindowStatus: "covered",
+  inventory: { available: false }, listingCount: 0, issuesUnavailableReason: null, salesSource: "order-line-items", ...extra,
 });
 // A promoted live row keyed by the EXACT expected D-1 (params_hash = D1_HASH), payload inline unless a storage path.
 const liveRow = (o = {}) => ({
@@ -100,6 +104,25 @@ function make(cfg = {}) {
   ok("payload dataUnavailable:true -> payload-contract", (await make({ row: liveRow({ payload: validPayload(EXPECTED_D1, { dataUnavailable: true }) }) })({ accountId: ACCT })).reason === "payload-contract");
   ok("no promoted row -> no-live-snapshot", (await make({ row: null })({ accountId: ACCT })).reason === "no-live-snapshot");
   ok("blank account -> blank-account (never a cross-account read)", (await make({ row: liveRow() })({ accountId: "" })).reason === "blank-account");
+}
+
+// ---- SEMANTIC identity (Codex blocker 1 repro): a structurally-valid row whose PAYLOAD is for a different account or
+//      a different day/window is REJECTED even at the exact D-1 row identity + params_hash ----
+{
+  const wrong = validPayload(EXPECTED_D1, { accountId: "OTHER", asOf: "2026-09-03", window: { kind: "30D", from: "2026-08-05", to: "2026-09-03", days: 30 } });
+  ok("EXACT repro: exact-D-1 row identity + params_hash but payload account=OTHER + asOf/window=D-2 -> NOT ok", (await make({ row: liveRow({ payload: wrong }) })({ accountId: ACCT })).ok === false);
+  ok("payload.accountId mismatch -> semantic payload-account-mismatch", (await make({ row: liveRow({ payload: validPayload(EXPECTED_D1, { accountId: "OTHER" }) }) })({ accountId: ACCT })).reason.includes("payload-account-mismatch"));
+  ok("payload.asOf = D-2 (row/params D-1) -> semantic payload-asof-mismatch", (await make({ row: liveRow({ payload: validPayload(EXPECTED_D1, { asOf: "2026-09-03" }) }) })({ accountId: ACCT })).reason.includes("payload-asof-mismatch"));
+  ok("payload.window.to = D-2 -> semantic payload-window-to", (await make({ row: liveRow({ payload: validPayload(EXPECTED_D1, { window: { kind: "30D", from: WINDOW_FROM, to: "2026-09-03", days: 30 } }) }) })({ accountId: ACCT })).reason.includes("payload-window-to"));
+  ok("payload.window.kind = 7D -> semantic payload-window-kind", (await make({ row: liveRow({ payload: validPayload(EXPECTED_D1, { window: { kind: "7D", from: "2026-08-29", to: EXPECTED_D1, days: 7 } }) }) })({ accountId: ACCT })).reason.includes("payload-window-kind"));
+  ok("payload.window.from shifted (not to-29) -> semantic payload-window-from", (await make({ row: liveRow({ payload: validPayload(EXPECTED_D1, { window: { kind: "30D", from: "2026-08-01", to: EXPECTED_D1, days: 30 } }) }) })({ accountId: ACCT })).reason.includes("payload-window-from"));
+  ok("payload.window.to a malformed calendar date (2026-02-30) -> semantic reject", (await make({ row: liveRow({ payload: validPayload(EXPECTED_D1, { asOf: "2026-02-30", window: { kind: "30D", from: "2026-02-01", to: "2026-02-30", days: 30 } }) }) })({ accountId: ACCT })).ok === false);
+  ok("the CANONICAL exact-D-1 payload with the 30D window passes the semantic hook (regression of the happy path)", (await make({ row: liveRow() })({ accountId: ACCT })).ok === true);
+  // coverage internal consistency (Codex blocker 1: "coverage/window dates are real and internally consistent")
+  ok("coverage.requestedFrom != window.from -> semantic payload-coverage-window", (await make({ row: liveRow({ payload: validPayload(EXPECTED_D1, { coverage: { requestedFrom: "2026-01-01", requestedTo: EXPECTED_D1, complete: true, gaps: [] } }) }) })({ accountId: ACCT })).reason.includes("payload-coverage-window"));
+  ok("coverage.complete=true with non-empty gaps -> semantic payload-coverage-gaps", (await make({ row: liveRow({ payload: validPayload(EXPECTED_D1, { coverage: { requestedFrom: WINDOW_FROM, requestedTo: EXPECTED_D1, complete: true, gaps: [{ from: "2026-08-10", to: "2026-08-11" }] } }) }) })({ accountId: ACCT })).reason.includes("payload-coverage-gaps"));
+  ok("coverage.coveredTo outside the window -> semantic payload-coverage-range", (await make({ row: liveRow({ payload: validPayload(EXPECTED_D1, { coverage: { requestedFrom: WINDOW_FROM, requestedTo: EXPECTED_D1, coveredTo: "2027-01-01", complete: false, gaps: [] } }) }) })({ accountId: ACCT })).reason.includes("payload-coverage-range"));
+  ok("missing coverage object -> NOT ok (rejected by the structural validatePayload before the semantic hook)", (await make({ row: liveRow({ payload: validPayload(EXPECTED_D1, { coverage: null }) }) })({ accountId: ACCT })).ok === false);
 }
 
 writeSync(1, `\nlisting-health-v3-live-resolver: ${passed} assertions passed\n`);

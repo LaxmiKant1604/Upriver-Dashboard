@@ -42,6 +42,14 @@ export function buildLivePromotedResolver({ getReportSnapshot, loadStoragePayloa
     else { payload = snap.payload; if (payload == null) return { ok: false, reason: "payload-unavailable" }; }
     const entry = reportDerivations[reportKey];
     if (!entry || typeof entry.validatePayload !== "function" || entry.validatePayload(payload) !== true || (payload && payload.dataUnavailable === true)) return { ok: false, reason: "payload-contract" };
+    // OPTIONAL per-report SEMANTIC identity: prove the payload's OWN account/date/window agree with the requested
+    // account + the live params.to. A report contract with no hook is byte-for-byte unchanged (OLI/FBA/Ads); only
+    // listing-health-v3 defines one today. A structurally-valid but wrong-account / wrong-day / wrong-window payload
+    // fails here (it can never masquerade as this account's exact-D-1 promotion).
+    if (typeof contract.semanticIdentity === "function") {
+      const sem = contract.semanticIdentity(payload, { accountId, to: liveParams.to });
+      if (!sem || sem.ok !== true) return { ok: false, reason: "semantic-identity:" + S(sem && sem.reason) };
+    }
     return { ok: true, payload };
   };
 }

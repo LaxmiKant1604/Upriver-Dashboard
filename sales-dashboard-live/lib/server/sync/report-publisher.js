@@ -34,6 +34,7 @@ import { SCHEDULER_V2_READY_REPORT_KEYS, SOURCE_PROMOTED_REPORT_KEYS } from "./r
 import { resolveRolloutAccounts } from "./account-rollout.js";
 import { isValidCalendarDate } from "./report-source-contracts.js";
 import { paramsHashFor } from "../report-store.js";
+import { listingHealthV3SemanticIdentity } from "../reports/listing-health-v3-live-identity.js";
 
 // Round-6 fix 3: the publisher's CODE-readiness set = the 13 approved DISPATCH keys plus the
 // source-promoted keys (compact brand-inventory). Source-promoted keys are publishable through the SAME
@@ -135,6 +136,10 @@ export const SCHEDULER_LIVE_SNAPSHOT_CONTRACTS = Object.freeze({
   "listing-health-v3": Object.freeze({
     liveReportKey: "listing-health-v3", liveReportVersion: "listing-health-v3-shared-v1",
     liveParams: (p) => (isDate(p.to) ? { to: p.to } : null),
+    // WORK C/D blocker 1: prove the promoted payload's OWN accountId/asOf/window agree with the account + params.to
+    // (the exact D-1) + the canonical 30D default window. Run by the shared live resolver (readback + serve) AND above,
+    // before the CAS. Only this report defines the hook -> every other report's live proof is byte-for-byte unchanged.
+    semanticIdentity: listingHealthV3SemanticIdentity,
   }),
 });
 
@@ -296,6 +301,13 @@ export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId, p
     // LIVE identity -- canonical mapping; a missing/malformed planned param fails closed.
     const liveParams = contract.liveParams(params);
     if (!liveParams) return { disposition: "invalid-snapshot", ...base };
+    // OPTIONAL per-report SEMANTIC identity (WORK C/D blocker 1): prove the payload's OWN account/date/window agree
+    // with the promoted account + live params.to, BEFORE the live CAS -- so a structurally-valid but wrong-account /
+    // wrong-day / wrong-window payload is never promoted. A contract with no hook is byte-for-byte unchanged.
+    if (typeof contract.semanticIdentity === "function") {
+      const sem = contract.semanticIdentity(payload, { accountId: acct, to: liveParams.to });
+      if (!sem || sem.ok !== true) return { disposition: "invalid-snapshot", ...base };
+    }
     const paramsHash = paramsHashFor(contract.liveReportVersion, liveParams);
 
     // READ-ONLY PREFLIGHT: every gate (code readiness, dispatch/promoted control, primary rollout resolved

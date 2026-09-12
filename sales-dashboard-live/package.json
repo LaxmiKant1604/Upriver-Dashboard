@@ -44,6 +44,7 @@
   "test:ads-reconcile-prodshape": "node scripts/ads-reconcile-prodshape.test.js",
   "test:fba-reconcile-prodshape": "node scripts/fba-reconcile-prodshape.test.js",
   "test:listing-health-v3-dependency-bundle": "node scripts/listing-health-v3-dependency-bundle.test.js",
+  "test:listing-health-v3-fingerprint-invariant": "node scripts/listing-health-v3-fingerprint-invariant.test.js",
   "test:listing-health-v3-reconcile-prodshape": "node scripts/listing-health-v3-reconcile-prodshape.test.js",
   "test:listing-health-v3-live-resolver": "node scripts/listing-health-v3-live-resolver.test.js",
   "test:listing-health-v3-live-contract": "node scripts/listing-health-v3-live-contract.test.js",

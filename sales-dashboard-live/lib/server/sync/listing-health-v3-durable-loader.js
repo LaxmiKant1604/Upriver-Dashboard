@@ -56,6 +56,14 @@ export function makeListingHealthV3DurableContextLoader({
   getCompleteness = getOliCompleteness,
   getCatalogSnapshot,
   loadCatalogPayload,
+  // STRICT reconciler mode (WORK C/D blockers 3 + 4; default OFF -> preview/shadow behavior byte-unchanged): a durable
+  // READ FAILURE (throw / typed read!=ok) on OLI coverage OR completeness returns {} (the derive/bundle then DEFERS,
+  // preserving valid live LKG) instead of degrading to []; a genuine successful EMPTY set stays honest. The Catalog is
+  // additionally integrity-checked (payload_sha embedded in the recomputed object-path namespace + rows.length===
+  // row_count); a mandatory-catalog integrity failure returns {} (defer). `buildObjectPath` (= sourceSnapshotObjectPath)
+  // is required for the strict catalog namespace recompute.
+  strict = false,
+  buildObjectPath = null,
 } = {}) {
   return async ({ reportKey, accountId, planned, signal = null }) => {
     if (reportKey !== "listing-health-v3") return {};
@@ -93,17 +101,22 @@ export function makeListingHealthV3DurableContextLoader({
     let coverageWindows;
     try {
       const cov = await getOliCoverage({ organizationFingerprint: orgFingerprint, connectionId, accountId: S(accountId), sourceKey: OLI_SOURCE_KEY, signal });
+      // STRICT (reconciler): a typed read failure (read!=ok) is a READ FAILURE, not "no coverage" -> defer (never
+      // degrade valid live LKG by presenting rows as uncovered when coverage is merely unreadable).
+      if (strict && cov && typeof cov === "object" && "read" in cov && cov.read !== "ok") return {};
       const raw = cov && cov.read === "ok" ? (cov.windows || []) : (Array.isArray(cov) ? cov : []);
       coverageWindows = normalizeCoverageWindows(raw);
     } catch (_e) { return {}; }
 
-    // 3) Completeness rows for the window (provisional/final). A read failure degrades to [] (non-fatal: the payload
-    //    then treats completeness as provisional/unknown), never blocks.
+    // 3) Completeness rows for the window (provisional/final). PREVIEW: a read failure degrades to [] (advisory).
+    //    STRICT (reconciler): a read THROW or a non-array response is a READ FAILURE -> defer (never degrade a valid
+    //    live payload to "provisional/unknown"); a genuine successful empty array stays honest.
     let completenessRows = [];
     try {
       const comp = await getCompleteness({ organizationFingerprint: orgFingerprint, connectionId, accountIds: [S(accountId)], from: win.from, to: win.to }, { signal });
+      if (strict && !Array.isArray(comp)) return {};
       completenessRows = Array.isArray(comp) ? comp : [];
-    } catch (_e) { completenessRows = []; }
+    } catch (_e) { if (strict) return {}; completenessRows = []; }
 
     const listingHealthV3DurableOli = { available: true, rows, coverageWindows, completenessRows };
 
@@ -118,12 +131,27 @@ export function makeListingHealthV3DurableContextLoader({
     } catch (_e) { return { listingHealthV3DurableOli }; }
     const catalogSnapshot = catRead && typeof catRead === "object" && "snapshot" in catRead ? catRead.snapshot : catRead;
     const catalogReadOk = !catRead || typeof catRead !== "object" || !("read" in catRead) || catRead.read === "ok";
+    // STRICT (reconciler): a typed catalog read failure DEFERS (mandatory catalog; return {} not "omit catalog then
+    // degrade"). PREVIEW: unreadable/missing catalog -> omit (the derive blocks on the missing catalog).
+    if (strict && catRead && typeof catRead === "object" && "read" in catRead && catRead.read !== "ok") return {};
     if (!catalogReadOk || !catalogSnapshot || !catalogSnapshot.object_path) return { listingHealthV3DurableOli };
+    // STRICT: full Catalog pointer integrity -- the object_path must belong to the expected org/conn/product-catalog/
+    // __organization namespace and embed the declared payload_sha (getSourceSnapshotPayload additionally recomputes the
+    // content-address sha on hydrate). A mandatory-catalog integrity failure DEFERS (return {}).
+    if (strict) {
+      const catSha = S(catalogSnapshot.payload_sha);
+      const expectedCatPath = typeof buildObjectPath === "function"
+        ? buildObjectPath({ organizationFingerprint: orgFingerprint, connectionId, sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY, payloadSha: catSha })
+        : null;
+      if (!catSha || !S(catalogSnapshot.object_path).endsWith("/" + catSha + ".json") || (expectedCatPath && S(catalogSnapshot.object_path) !== expectedCatPath)) return {};
+    }
     let catalogRows = [];
     try {
       const payload = await loadCatalogPayload(catalogSnapshot.object_path, { signal });
       catalogRows = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.rows) ? payload.rows : []);
-    } catch (_e) { return { listingHealthV3DurableOli }; }
+    } catch (_e) { if (strict) return {}; return { listingHealthV3DurableOli }; }
+    // STRICT: hydrated rows.length must equal the pointer's declared row_count.
+    if (strict && Number.isInteger(Number(catalogSnapshot.row_count)) && catalogRows.length !== Number(catalogSnapshot.row_count)) return {};
 
     // Surface the catalog's content-addressed payload_sha + validated_at so the dependency-bundle fingerprint can fold
     // the exact catalog content identity (WORK C/D blocker 1); additive -- the derive ignores these extra fields.

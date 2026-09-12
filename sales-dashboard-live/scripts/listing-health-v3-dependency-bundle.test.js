@@ -36,14 +36,16 @@ const durableCtxOk = () => ({
   listingHealthV3DurableCatalog: { available: true, rows: [{ child_asin: "ASIN-A", product_name: "P A", product_brand: "BrandX" }], payloadSha: "sha-cat", validatedAt: "2026-09-04T05:00:00.000Z" },
 });
 const INV_HASH = "rh-inv";
-const invPtr = () => ({ scope_key: ACCT, object_path: "obj/inv.json", payload_sha: "sha-i", row_count: 1, source_request_hash: INV_HASH, validated_at: "2026-09-04T06:00:00.000Z" });
+const INV_PATH = pathFor("fba-inventory-health", "sha-i");
+// A fully-valid FBA inventory pointer (source_snapshots projection: org/conn/source_key/scope_key + real namespace path).
+const invPtr = (o = {}) => ({ organization_fingerprint: ORG, connection_id: CONN, source_key: "fba-inventory-health", scope_key: ACCT, object_path: o.object_path || INV_PATH, payload_sha: o.payload_sha || "sha-i", row_count: o.row_count == null ? 1 : o.row_count, source_request_hash: o.source_request_hash || INV_HASH, validated_at: o.validated_at || "2026-09-04T06:00:00.000Z" });
 const invRows = [{ date: ASOF, seller_or_vendor_id: SELLER, marketplace_country_code: MKT, sku: "A", child_asin: "ASIN-A", available: 30 }];
 
 function harness(over = {}) {
   const payloadByPath = {
     [pathFor("listings", "sha-l")]: { rows: [{ seller_or_vendor_id: SELLER, sku: "A" }, { seller_or_vendor_id: SELLER, sku: "B" }] },
     [pathFor("listings-raw", "sha-r")]: { rows: [{ seller_or_vendor_id: SELLER, sku: "A", issues: "[]" }, { seller_or_vendor_id: SELLER, sku: "B", issues: "[]" }] },
-    "obj/inv.json": { rows: invRows },
+    [INV_PATH]: { rows: invRows },
     ...(over.payloadByPath || {}),
   };
   const deps = {
@@ -66,11 +68,23 @@ const run = (over = {}) => { const { deps, args } = harness(over); return resolv
   const rowsB = [{ ...oliRows[0], sku: "B", sales_amount: 5 }, oliRows[0]]; // reordered
   ok("oliRowsDigest is order-independent (sorted total order)", oliRowsDigest(rowsA) === oliRowsDigest(rowsB));
   ok("oliRowsDigest changes on a sales_amount correction", oliRowsDigest(rowsA) !== oliRowsDigest([{ ...oliRows[0], sales_amount: 100.99 }, rowsA[1]]));
-  ok("oliRowsDigest float-normalizes to 4dp (100.123450001 == 100.12345)", oliRowsDigest([{ ...oliRows[0], sales_amount: 100.123450001 }]) === oliRowsDigest([{ ...oliRows[0], sales_amount: 100.12345 }]));
+  // Codex blocker 2: NO 4dp collision -- a sub-0.0001 change the fold (num=Number(v)||0) would sum differently MUST
+  // change the digest (1.00001 vs 1.00002, and even 100.123450001 vs 100.12345).
+  ok("oliRowsDigest distinguishes 1.00001 vs 1.00002 (no 4dp collision -- Codex repro)", oliRowsDigest([{ ...oliRows[0], sales_amount: 1.00001 }]) !== oliRowsDigest([{ ...oliRows[0], sales_amount: 1.00002 }]));
+  ok("oliRowsDigest distinguishes a sub-0.0001 change (100.123450001 != 100.12345)", oliRowsDigest([{ ...oliRows[0], sales_amount: 100.123450001 }]) !== oliRowsDigest([{ ...oliRows[0], sales_amount: 100.12345 }]));
+  ok("oliRowsDigest is stable for values that num()-coerce identically (0 / null / '' / 'x' -> 0)", oliRowsDigest([{ ...oliRows[0], sales_amount: 0 }]) === oliRowsDigest([{ ...oliRows[0], sales_amount: null }]) && oliRowsDigest([{ ...oliRows[0], sales_amount: "" }]) === oliRowsDigest([{ ...oliRows[0], sales_amount: "x" }]));
   ok("oliCoverageDigest changes when a covered window changes", oliCoverageDigest([{ from: "2024-01-01", to: ASOF }]) !== oliCoverageDigest([{ from: "2024-06-01", to: ASOF }]));
   ok("oliCompletenessDigest changes on a provisional->final flip", oliCompletenessDigest([{ sale_date: "2026-09-01", completeness_status: "provisional", itemization_percent: 40 }]) !== oliCompletenessDigest([{ sale_date: "2026-09-01", completeness_status: "final", itemization_percent: 100 }]));
-  ok("oliCompletenessDigest IGNORES refreshed_at (wall-clock churn excluded)", oliCompletenessDigest([{ sale_date: "2026-09-01", completeness_status: "final", refreshed_at: "T1" }]) === oliCompletenessDigest([{ sale_date: "2026-09-01", completeness_status: "final", refreshed_at: "T2" }]));
+  // Codex blocker 2: requested_as_of / proven_export_through / refreshed_at ARE in the payload's completeness object,
+  // so each MUST change the digest (folding them is correct -- the payload's freshness label genuinely changes).
+  ok("oliCompletenessDigest FOLDS refreshed_at (it appears in the payload -> a change re-promotes)", oliCompletenessDigest([{ sale_date: "2026-09-01", completeness_status: "final", refreshed_at: "T1" }]) !== oliCompletenessDigest([{ sale_date: "2026-09-01", completeness_status: "final", refreshed_at: "T2" }]));
+  ok("oliCompletenessDigest FOLDS proven_export_through", oliCompletenessDigest([{ sale_date: "2026-09-01", completeness_status: "final", proven_export_through: "2026-09-03" }]) !== oliCompletenessDigest([{ sale_date: "2026-09-01", completeness_status: "final", proven_export_through: "2026-09-04" }]));
+  ok("oliCompletenessDigest FOLDS requested_as_of", oliCompletenessDigest([{ sale_date: "2026-09-01", completeness_status: "final", requested_as_of: "2026-09-04" }]) !== oliCompletenessDigest([{ sale_date: "2026-09-01", completeness_status: "final", requested_as_of: "2026-09-05" }]));
   ok("inventoryFingerprintToken: available folds hashes; unavailable is a stable sentinel", inventoryFingerprintToken({ accountId: ACCT, connectionId: CONN, requestedAsOf: ASOF, available: true, sourceRequestHash: "h", payloadSha: "s" }).includes("|h|s") && inventoryFingerprintToken({ accountId: ACCT, connectionId: CONN, requestedAsOf: ASOF, available: false }).endsWith("UNAVAILABLE"));
+  // DEFECT-1 (final adversarial review): inventoryFetchedAt reaches payload.provenance, so the AVAILABLE token MUST fold
+  // validated_at -- a same-date, content-identical FBA re-validation that only advances validated_at re-promotes.
+  ok("inventoryFingerprintToken: available token FOLDS validated_at (same content, newer validated_at -> different token)", inventoryFingerprintToken({ accountId: ACCT, connectionId: CONN, requestedAsOf: ASOF, available: true, sourceRequestHash: "h", payloadSha: "s", validatedAt: "T1" }) !== inventoryFingerprintToken({ accountId: ACCT, connectionId: CONN, requestedAsOf: ASOF, available: true, sourceRequestHash: "h", payloadSha: "s", validatedAt: "T2" }));
+  ok("inventoryFingerprintToken: unavailable ignores validated_at (stable sentinel regardless)", inventoryFingerprintToken({ accountId: ACCT, connectionId: CONN, requestedAsOf: ASOF, available: false, validatedAt: "T1" }) === inventoryFingerprintToken({ accountId: ACCT, connectionId: CONN, requestedAsOf: ASOF, available: false, validatedAt: "T2" }));
 }
 
 // ---- (2) PURE fingerprint: folds EVERY component; determinism ----
@@ -87,6 +101,10 @@ const run = (over = {}) => { const { deps, args } = harness(over); return resolv
     ["oli coverage digest", { ...base, oliDigests: { ...base.oliDigests, coverage: "OC2" } }],
     ["oli completeness digest", { ...base, oliDigests: { ...base.oliDigests, completeness: "OM2" } }],
     ["marketplace", { ...base, marketplace: "CA" }],
+    // DEFECT-1: each dependency's validated_at is folded (it surfaces into payload.provenance.*FetchedAt).
+    ["listings validated_at", { ...base, listings: { ...base.listings, validatedAt: "2026-09-04T07:00:00.000Z" } }],
+    ["listings-raw validated_at", { ...base, listingsRaw: { ...base.listingsRaw, validatedAt: "2026-09-04T07:00:00.000Z" } }],
+    ["catalog validated_at", { ...base, catalogValidatedAt: "2026-09-04T09:00:00.000Z" }],
   ];
   for (const [label, mutated] of flips) ok("fingerprint CHANGES when the " + label + " changes", fingerprintListingHealthV3Bundle(mutated).revisionId !== fp0);
   ok("the manifest token embeds the fingerprint + identity", fingerprintListingHealthV3Bundle(base).manifestToken === "listing-health-v3-manifest|" + ORG + "|" + CONN + "|" + ACCT + "|" + ASOF + "|" + fp0);
@@ -107,8 +125,13 @@ const run = (over = {}) => { const { deps, args } = harness(over); return resolv
   ok("wrong source key -> source-key-mismatch", V({ ...good, source_key: "listings-raw" }).reason === "source-key-mismatch");
   ok("older as_of -> not-d1", V({ ...good, as_of: "2026-09-03" }).reason === "not-d1");
   ok("future as_of -> not-d1", V({ ...good, as_of: "2026-09-05" }).reason === "not-d1");
-  ok("malformed date -> not-d1", V({ ...good, as_of: "2026-9-4" }).reason === "not-d1");
-  ok("blank validated_at -> validated-at-blank", V({ ...good, validated_at: "" }).reason === "validated-at-blank");
+  ok("shape-malformed date (2026-9-4) -> not-d1", V({ ...good, as_of: "2026-9-4" }).reason === "not-d1");
+  // Blocker 4: REAL UTC calendar round-trip -- an impossible date (right shape, wrong calendar) is rejected even when
+  // it equals requestedAsOf (V here requires as_of===requestedAsOf=ASOF, so use an impossible date as BOTH).
+  ok("impossible calendar date 2026-02-30 -> not-d1 (real round-trip, not shape-only)", validateListingsPointer({ snapshot: { ...good, as_of: "2026-02-30" }, expectedOrg: ORG, durableConn: CONN, sourceKey: "listings", accountId: ACCT, marketplace: MKT, requestedAsOf: "2026-02-30", expectedObjectPath: eop }).reason === "not-d1");
+  ok("impossible calendar date 2026-99-99 -> not-d1", validateListingsPointer({ snapshot: { ...good, as_of: "2026-99-99" }, expectedOrg: ORG, durableConn: CONN, sourceKey: "listings", accountId: ACCT, marketplace: MKT, requestedAsOf: "2026-99-99", expectedObjectPath: eop }).reason === "not-d1");
+  ok("blank validated_at -> validated-at-invalid", V({ ...good, validated_at: "" }).reason === "validated-at-invalid");
+  ok("garbage validated_at (not a real timestamp) -> validated-at-invalid", V({ ...good, validated_at: "not-a-timestamp" }).reason === "validated-at-invalid");
   ok("blank request hash -> request-hash-blank", V({ ...good, source_request_hash: "" }).reason === "request-hash-blank");
   ok("blank payload sha -> payload-sha-blank", V({ ...good, payload_sha: "" }).reason === "payload-sha-blank");
   ok("negative row_count -> row-count-invalid", V({ ...good, row_count: -1 }).reason === "row-count-invalid");
@@ -134,6 +157,13 @@ const run = (over = {}) => { const { deps, args } = harness(over); return resolv
   ok("an OLI completeness provisional->final changes the revisionId", (await run({ loadDurableContext: async () => { const c = durableCtxOk(); c.listingHealthV3DurableOli.completenessRows = [{ ...durableCtxOk().listingHealthV3DurableOli.completenessRows[0], completeness_status: "provisional", itemization_percent: 20 }]; return c; } })).revisionId !== base);
   ok("a Catalog content (payload_sha) change changes the revisionId", (await run({ loadDurableContext: async () => { const c = durableCtxOk(); c.listingHealthV3DurableCatalog.payloadSha = "sha-cat-v2"; return c; } })).revisionId !== base);
   ok("FBA available->unavailable changes the revisionId", (await run({ resolveExpectedInventoryRequestHash: async () => "no-match" })).revisionId !== base);
+  // DEFECT-1 (final adversarial review): a same-date, BYTE-IDENTICAL-content re-validation that ONLY advances a
+  // dependency's validated_at surfaces into payload.provenance.*FetchedAt, so it MUST flip the revisionId (else equal
+  // fingerprint => unequal payload). payload_sha / row_count / request_hash / hydrated rows are all unchanged here.
+  ok("a Listings same-date validated_at advance (identical content) changes the revisionId", (await run({ listingsPtr: { validated_at: "2026-09-04T07:30:00.000Z" } })).revisionId !== base);
+  ok("a Listings-Raw same-date validated_at advance (identical content) changes the revisionId", (await run({ rawPtr: { validated_at: "2026-09-04T07:30:00.000Z" } })).revisionId !== base);
+  ok("a Catalog validated_at advance (identical content) changes the revisionId", (await run({ loadDurableContext: async () => { const c = durableCtxOk(); c.listingHealthV3DurableCatalog.validatedAt = "2026-09-04T09:00:00.000Z"; return c; } })).revisionId !== base);
+  ok("an FBA validated_at advance (identical content) changes the revisionId", (await run({ readInventorySnapshot: async () => ({ read: "ok", snapshot: invPtr({ validated_at: "2026-09-04T08:00:00.000Z" }) }) })).revisionId !== base);
 }
 
 // ---- (6) resolver: integrity failures -> defer (LKG, no bundle) ----
@@ -145,7 +175,8 @@ await miss("wrong-path listings pointer -> defer", { readListingsSnapshot: async
 await miss("row_count mismatch (rows.length !== row_count) -> defer", { readListingsSnapshot: async () => ({ read: "ok", snapshot: ptr("listings", { row_count: 5 }) }) }, "row-count-mismatch");
 await miss("malformed as_of -> defer", { readListingsSnapshot: async () => ({ read: "ok", snapshot: ptr("listings", { as_of: "2026-9-4" }) }) }, "not-d1");
 await miss("storage failure -> defer (NO inline fallback)", { loadSnapshotPayload: async (p) => { if (p.includes("/listings/")) throw new Error("storage down"); return { rows: [{ sku: "A" }, { sku: "B" }] }; } }, "payload-unreadable");
-await miss("schema-missing pointer -> defer", { readListingsSnapshot: async () => ({ read: "schema-missing", snapshot: null }) }, "no-durable-snapshot");
+await miss("schema-missing pointer (typed read failure) -> defer", { readListingsSnapshot: async () => ({ read: "schema-missing", snapshot: null }) }, "read-schema-missing");
+await miss("read-failed pointer (typed read failure) -> defer", { readListingsSnapshot: async () => ({ read: "read-failed", snapshot: null }) }, "read-read-failed");
 await miss("durable OLI unavailable -> defer", { loadDurableContext: async () => ({ listingHealthV3DurableOli: {}, listingHealthV3DurableCatalog: { available: true, rows: [], payloadSha: "s" } }) }, "durable-oli-unavailable");
 await miss("durable Catalog unavailable -> defer", { loadDurableContext: async () => ({ listingHealthV3DurableOli: durableCtxOk().listingHealthV3DurableOli }) }, "durable-catalog-unavailable");
 await miss("catalog sha missing -> defer", { loadDurableContext: async () => { const c = durableCtxOk(); delete c.listingHealthV3DurableCatalog.payloadSha; return c; } }, "durable-catalog-sha-missing");
