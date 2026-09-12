@@ -389,19 +389,20 @@ test("D2. workflow shape: INDEPENDENT per-region ordered pipeline -- per-region 
   assert.doesNotMatch(yml, /api\/cron\/sync/, "never drives the deprecated Vercel cron endpoint");
 });
 
-test("D3. exactly ONE scheduled EXPORT owner remains: scheduler-v2. The other scheduled workflows are ZERO-EXPORT workers (account-onboarding discovery + scheduler-recovery + oli-publication-reconcile + fba-publication-reconcile); campaign-ads-golive + returns-leakage + fba-plan-golive stay MANUAL-ONLY", () => {
+test("D3. exactly ONE scheduled EXPORT owner remains: scheduler-v2. The other scheduled workflows are ZERO-EXPORT workers (account-onboarding discovery + scheduler-recovery + oli-publication-reconcile + fba-publication-reconcile + ads-publication-reconcile + listing-health-v3-reconcile); campaign-ads-golive + returns-leakage + fba-plan-golive stay MANUAL-ONLY", () => {
   const files = readdirSync(WORKFLOWS_DIR).filter((f) => f.endsWith(".yml") || f.endsWith(".yaml"));
   const scheduled = files.filter((f) => /\n\s*schedule:\s*\n/.test(readFileSync(resolve(WORKFLOWS_DIR, f), "utf8"))).sort();
   // scheduler-v2 is the SOLE automatic owner of every PAID source. account-onboarding (discovery), scheduler-recovery
-  // (trigger backstop), oli-publication-reconcile (zero-export dashboard promotion of already-saved durable OLI) and
-  // fba-publication-reconcile (zero-export dashboard promotion of already-saved durable FBA inventory) are the other
+  // (trigger backstop), oli-publication-reconcile (zero-export dashboard promotion of already-saved durable OLI),
+  // fba-publication-reconcile (zero-export durable FBA inventory), ads-publication-reconcile (zero-export durable Ads),
+  // and listing-health-v3-reconcile (zero-export durable Listings/Listings-Raw -> listing-health-v3) are the other
   // scheduled workflows and are structurally ZERO-EXPORT: each runs ONLY its own operator (whose module graph contains
   // no export adapter/create path); none invokes an export/release/golive script that issues a paid create.
-  assert.deepEqual(scheduled, ["account-onboarding.yml", "ads-publication-reconcile.yml", "fba-publication-reconcile.yml", "oli-publication-reconcile.yml", "scheduler-recovery.yml", "scheduler-v2.yml"],
-    "exactly the scheduler + the five zero-export scheduled workers are scheduled; got " + JSON.stringify(scheduled));
-  // oli/fba/ads-publication-reconcile: exactly the reconciler entrypoint (its core module + revision/registry graph
-  // reaches no DataDoe export transport), no export/create/token/force-latest symbol anywhere in the workflow.
-  for (const [wf, op] of [["oli-publication-reconcile.yml", "node scripts/release/oli-publication-reconcile.mjs"], ["fba-publication-reconcile.yml", "node scripts/release/fba-publication-reconcile.mjs"], ["ads-publication-reconcile.yml", "node scripts/release/ads-publication-reconcile.mjs"]]) {
+  assert.deepEqual(scheduled, ["account-onboarding.yml", "ads-publication-reconcile.yml", "fba-publication-reconcile.yml", "listing-health-v3-reconcile.yml", "oli-publication-reconcile.yml", "scheduler-recovery.yml", "scheduler-v2.yml"],
+    "exactly the scheduler + the six zero-export scheduled workers are scheduled; got " + JSON.stringify(scheduled));
+  // oli/fba/ads/listing-health-v3-publication-reconcile: exactly the reconciler entrypoint (its core module +
+  // revision/registry graph reaches no DataDoe export transport), no export/create/token/force-latest symbol anywhere.
+  for (const [wf, op] of [["oli-publication-reconcile.yml", "node scripts/release/oli-publication-reconcile.mjs"], ["fba-publication-reconcile.yml", "node scripts/release/fba-publication-reconcile.mjs"], ["ads-publication-reconcile.yml", "node scripts/release/ads-publication-reconcile.mjs"], ["listing-health-v3-reconcile.yml", "node scripts/release/listing-health-v3-reconcile.mjs"]]) {
     const reconcile = readFileSync(resolve(WORKFLOWS_DIR, wf), "utf8");
     const reconcileCalls = [...reconcile.matchAll(/node scripts\/[^\s"']+/g)].map((m) => m[0]);
     assert.deepEqual([...new Set(reconcileCalls)], [op],

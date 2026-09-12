@@ -27,9 +27,14 @@ const v3Idx = wf.indexOf("\n  listing-health-v3:");
 assert.ok(v3Idx > 0, "the workflow defines a listing-health-v3 job");
 const matCommentIdx = wf.indexOf("\n  # Report materialization");
 const matIdx = wf.indexOf("\n  materialize:");
-// End the v3 block at the START of the materialize block (its leading comment precedes the job key), so the
-// materialize job's docs never leak into the v3 assertions.
-const v3End = matCommentIdx > v3Idx ? matCommentIdx : (matIdx > v3Idx ? matIdx : wf.length);
+// The SEPARATE listing_health_v3_reconcile job (WORK C immediate hook) sits between the v3 SHADOW job and the
+// materialize job; its leading comment precedes its job key. End the v3 SHADOW block at whichever of these markers
+// comes FIRST after v3Idx, so neither the reconcile job's docs (it legitimately calls the zero-export reconciler with
+// --as-of) nor the materialize job's docs leak into the v3 SHADOW export-contract assertions below.
+const reconcileCommentIdx = wf.indexOf("\n  # IMMEDIATE post-ingestion listing-health-v3 publication reconcile");
+const reconcileIdx = wf.indexOf("\n  listing_health_v3_reconcile:");
+const candidates = [matCommentIdx, matIdx, reconcileCommentIdx, reconcileIdx].filter((i) => i > v3Idx);
+const v3End = candidates.length ? Math.min(...candidates) : wf.length;
 const v3Job = wf.slice(v3Idx, v3End);
 const beforeV3 = wf.slice(0, v3Idx); // run + fba jobs
 // The zero-export per-account report materialization job, bounded at the START of the FBA-aware brand-view block.

@@ -125,6 +125,44 @@ export function buildFbaPlanControlPackage({ accounts, operator = "", controlled
   return { accounts: acct, operator, controlled, apply, rollback, post };
 }
 
+// The listing-health-v3 go-live is a SOURCE-PROMOTED report (like brand-inventory), NOT a dispatch report: it enables
+// its OWN promoted publish control (source_promoted_publish_settings.publish_enabled = 'listing-health-v3') + rollout +
+// per-account approvals, and enables NO dispatch control (it is not in CONTROLLED_REPORT_KEYS, so every controlled
+// dispatch stays paused). Same guarded transaction + COMPLETE global-set POST assertions as the priority/fba-plan
+// packages; the SAFE-CLOSE (--rollback) is the SAME discovery-independent global close (disables every promoted control
+// incl. listing-health-v3). SAFE because the whole report publish control-plane is transient (opened per bounded run,
+// always-safe-closed) and the live snapshots persist regardless of these gates.
+export const LISTING_HEALTH_V3_PROMOTED_ENABLED = "listing-health-v3";
+export function buildListingHealthV3ControlPackage({ accounts, operator = "", controlledReportKeys = CONTROLLED_REPORT_KEYS } = {}) {
+  const acct = uniqSort(accounts);
+  if (!acct.length) throw new Error("buildListingHealthV3ControlPackage requires >=1 primary account (fail closed).");
+  if (acct.some((a) => a.startsWith("dd-secondary:"))) throw new Error("buildListingHealthV3ControlPackage refuses a dd-secondary account (primary only, fail closed).");
+  if (!nb(operator)) throw new Error("buildListingHealthV3ControlPackage requires an operator id for the audited approvals (fail closed).");
+  const publishKeys = ["listing-health-v3"];
+  const controlled = uniqSort(controlledReportKeys);
+  // listing-health-v3 is source-promoted (not a dispatch report): NO controlled dispatch is enabled -- every one paused.
+  const reportSyncSettings = controlled.map((rk) => ({ report_key: rk, schedule_enabled: false }));
+  const approvals = acct.flatMap((a) => publishKeys.map((rk) => rk + "|" + a)).sort();
+  const apply = {
+    allPrimary: false,
+    rollout: acct.map((a) => ({ account_id: a, enabled: true, note: "listing-health-v3 go-live" })),
+    reportSyncSettings,
+    promoted: [{ report_key: LISTING_HEALTH_V3_PROMOTED_ENABLED, publish_enabled: true }],
+    approvals: acct.flatMap((a) => publishKeys.map((rk) => ({ report_key: rk, account_id: a, approved: true, approved_by: operator }))),
+  };
+  const rollback = { mode: "safe-close", allPrimary: false, disablesAllRollout: true, pausesAllControlledDispatch: true, disablesAllPromoted: true, revokesAllApprovals: true };
+  const post = {
+    allPrimaryFalse: true,
+    rolloutEnabled: [...acct],
+    dispatchEnabled: [], // NO dispatch control enabled (source-promoted report)
+    dispatchPaused: [...controlled].sort(),
+    promotedEnabled: LISTING_HEALTH_V3_PROMOTED_ENABLED,
+    approvals,
+    noCron: true,
+  };
+  return { accounts: acct, operator, controlled, apply, rollback, post };
+}
+
 /**
  * Build the DISCOVERY-INDEPENDENT safe-close package for --rollback. It needs NO account discovery and NO
  * DataDoe call -- the safe-close disables EVERY priority control globally -- only a validated `operator` for the

@@ -89,6 +89,11 @@ export const SCHEDULER_V2_READY_REPORT_KEYS = Object.freeze([
 //     keys (or any key); promotion is an explicit reviewed publish() call.
 export const SOURCE_PROMOTED_REPORT_KEYS = Object.freeze([
   "brand-inventory",
+  // WORK D: advanced Listing Health (v3) -- PRODUCED by the source-first durable runtime + PROMOTED through the
+  // listing-health-v3 saved-data reconciler ONLY. Like brand-inventory it is DISJOINT from CONTROLLED_REPORT_KEYS
+  // (no dispatcher can select it) and SCHEDULER_V2_READY_REPORT_KEYS; its GATE-2 durable enable is the promoted
+  // publish control (source_promoted_publish_settings.publish_enabled; default OFF, fail-closed).
+  "listing-health-v3",
 ]);
 
 // The Scheduler-v2 control catalog: SAME row shape as reportControlCatalog, but `ready` is the explicit

@@ -1251,7 +1251,7 @@ test("(EM4) least-privilege service_role ACL: proven for all 3 tables; missing-r
 // =================================================================================================
 group("F. all 13 scheduler->live mappings statically pinned against the REAL live route truths");
 
-test("(F1) exactly 14 contracts (13 dispatch + the source-promoted brand-inventory); key/version/params pinned; insight versions equal the live modules' constants", () => {
+test("(F1) exactly 15 contracts (13 dispatch + the 2 source-promoted brand-inventory + listing-health-v3); key/version/params pinned; insight versions equal the live modules' constants", () => {
   const EXPECTED_VERSIONS = {
     "brand-sales": "brand-sales-shared-v1",
     "daily-reporting": "daily-reporting-shared-v2",
@@ -1269,9 +1269,13 @@ test("(F1) exactly 14 contracts (13 dispatch + the source-promoted brand-invento
     // Round-6 fix 3: the source-promoted compact Brand View inventory -- publishable through the same
     // four gates, NEVER dispatchable (not in CONTROLLED_REPORT_KEYS; proven below).
     "brand-inventory": "brand-inventory-shared-v1",
+    // WORK D: the source-promoted advanced Listing Health (v3) -- publishable through the same four gates,
+    // NEVER dispatchable (not in CONTROLLED_REPORT_KEYS; proven below). Live version DISTINCT from the shadow
+    // snapshotVersion ("listing-health/v3-oli-window").
+    "listing-health-v3": "listing-health-v3-shared-v1",
   };
   assert.ok(Object.isFrozen(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS), "the contract table is frozen");
-  assert.deepEqual(Object.keys(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS).sort(), Object.keys(EXPECTED_VERSIONS).sort(), "exactly the 13 dispatch reports + the 1 source-promoted report");
+  assert.deepEqual(Object.keys(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS).sort(), Object.keys(EXPECTED_VERSIONS).sort(), "exactly the 13 dispatch reports + the 2 source-promoted reports");
   for (const [key, version] of Object.entries(EXPECTED_VERSIONS)) {
     const c = SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[key];
     assert.equal(c.liveReportKey, key, key + ": live key === scheduler key");
@@ -1294,6 +1298,8 @@ test("(F2) each params builder emits the EXACT live params shape and fails close
   assert.deepEqual(lp("daily-reporting", { ...P, brand: "Acme" }), { from: "2026-07-01", to: "2026-08-14", brand: "Acme" });
   assert.deepEqual(lp("keyword-rank", P), { to: "2026-08-14" });
   assert.deepEqual(lp("fba-plan", P), { to: "2026-08-14" });
+  assert.deepEqual(lp("brand-inventory", P), { to: "2026-08-14" });
+  assert.deepEqual(lp("listing-health-v3", P), { to: "2026-08-14" }, "the source-promoted listing-health-v3 live params are { to }");
   assert.deepEqual(lp("content-changes", P), { asOf: "2026-08-14" }, "the live route keys Content Changes by asOf");
   for (const k of ["sales-movers", "listing-health", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer"]) {
     assert.deepEqual(lp(k, P), { to: "2026-08-14" }, k + ": insight live params are { to }");
@@ -1307,7 +1313,7 @@ test("(F2) each params builder emits the EXACT live params shape and fails close
 test("(F2b) STRICT calendar-date validation: impossible dates and reversed from/to fail; leap-day + boundaries pass", () => {
   const lp = (k, p) => SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[k].liveParams(p);
   const RANGE = ["brand-sales", "reconciliation", "sku-pl", "daily-reporting"]; // { from, to } contracts
-  const TO = ["keyword-rank", "fba-plan", "content-changes", "sales-movers", "listing-health", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer"]; // { to } contracts
+  const TO = ["keyword-rank", "fba-plan", "content-changes", "sales-movers", "listing-health", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer", "brand-inventory", "listing-health-v3"]; // { to } contracts
   // IMPOSSIBLE dates are rejected everywhere (2026-02-30, 2026-13-01, non-leap Feb 29, 0000-00-00, bad shape).
   for (const bad of ["2026-02-30", "2026-13-01", "2026-00-10", "2026-02-29", "0000-00-00", "2026-8-14", "2026-08-1", "20260814", "2026-08-14 ", ""]) {
     for (const k of TO) assert.equal(lp(k, { to: bad }), null, k + ": impossible `to` " + JSON.stringify(bad) + " fails closed");

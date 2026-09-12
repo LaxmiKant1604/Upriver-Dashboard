@@ -4077,6 +4077,27 @@ async function handleDataDoe(req, res) {
       if (!ids) return;
       const to = reportAsOf(req, res);
       if (!to) return;
+      // WORK D live promotion -- DOUBLE-GATED (LHV3_PUBLISH_LIVE && LISTING_HEALTH_V3, both default OFF) and served
+      // ONLY for the DEFAULT (30D) window: the promoted row is the 30D-default derivation (the reconciler omits all
+      // window controls), so a request that carries NO window override -- or the explicit default preset "30D" the
+      // client sends for that view -- maps to it; any 7D/14D/MONTH/CUSTOM request re-derives via the preview below.
+      // The promoted live row is keyed by the promotion as-of (D-1), NOT the client's `to` (today), so we read it by
+      // the LATEST pointer (getLatestReportSnapshotHydrated, storage-first) exactly as the sibling promoted report
+      // brand-inventory does -- an exact {to:today} lookup would always miss. ANY miss / OFF / windowed request /
+      // read failure FALLS THROUGH to the UNCHANGED read-only preview -- never a blank / zero-filled / fabricated-fresh
+      // / partial response; flipping either flag OFF instantly reverts to the preview (the promoted row is retained
+      // but ignored; LKG preserved). NOTE: the promoted row's OLI freshness tracks the daily cycle that promoted it
+      // (see listings-revision.js: OLI advances are coupled to the same cycle that re-persists Listings); under a
+      // PARTIAL failure (OLI advances but Listings/v3 ingestion does not that cycle) the live row can lag a same-as_of
+      // OLI correction the always-fresh preview reflects -- a bounded, documented PRODUCTION-ACCEPTANCE limitation.
+      const lhv3DefaultWindow = (!req.query.windowPreset || req.query.windowPreset === "30D") && !req.query.windowFrom && !req.query.windowTo && !req.query.windowMonth;
+      if (process.env.LHV3_PUBLISH_LIVE === "true" && process.env.LISTING_HEALTH_V3 === "true" && lhv3DefaultWindow) {
+        try {
+          const live = await getLatestReportSnapshotHydrated({ reportKey: "listing-health-v3", accountId: accountScope.accountIds[0] });
+          const livePayload = live && live.payload;
+          if (livePayload && typeof livePayload === "object" && !Array.isArray(livePayload)) { res.status(200).json(livePayload); return; }
+        } catch { /* live-read failure -> fall through to the read-only preview (LKG preserved; never fabricate) */ }
+      }
       const connectionId = accountScope.connection && accountScope.connection.id === "secondary" ? "dd-secondary" : "primary";
       try {
         const payload = await serveListingHealthV3Preview({

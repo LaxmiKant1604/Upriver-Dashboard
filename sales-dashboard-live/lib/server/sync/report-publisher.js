@@ -123,6 +123,19 @@ export const SCHEDULER_LIVE_SNAPSHOT_CONTRACTS = Object.freeze({
     liveReportKey: "brand-inventory", liveReportVersion: "brand-inventory-shared-v1",
     liveParams: (p) => (isDate(p.to) ? { to: p.to } : null),
   }),
+  // WORK D: advanced Listing Health (v3), PRODUCED by the source-first durable runtime and PROMOTED (never
+  // dispatched) through the listing-health-v3 saved-data reconciler -- like brand-inventory, DELIBERATELY OUTSIDE
+  // CONTROLLED_REPORT_KEYS (structurally undispatchable) and inside SOURCE_PROMOTED_REPORT_KEYS. The live shared
+  // version is DELIBERATELY DISTINCT from the shadow snapshotVersion ("listing-health/v3-oli-window"): the promoted
+  // row is the default 30D-window view, keyed by { to } only (mirroring brand-inventory + fba-plan). The exact
+  // requested-as-of gate (evaluatePublicationBinding) then enforces liveParams.to === requestedAsOf. Gated at the
+  // serve boundary by the DOUBLE flag LHV3_PUBLISH_LIVE && LISTING_HEALTH_V3 (both default OFF), so a promoted row is
+  // invisible until deliberately enabled; the promoted publish control (source_promoted_publish_settings) defaults
+  // OFF (fail-closed), so nothing is promoted until that control is enabled either.
+  "listing-health-v3": Object.freeze({
+    liveReportKey: "listing-health-v3", liveReportVersion: "listing-health-v3-shared-v1",
+    liveParams: (p) => (isDate(p.to) ? { to: p.to } : null),
+  }),
 });
 
 // Typed safe dispositions (the ONLY values publishSchedulerV2Snapshot returns in `disposition`).

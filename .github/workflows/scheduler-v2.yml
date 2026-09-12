@@ -648,6 +648,50 @@ jobs:
       - name: Listing Health v3 shadow ingestion for this region (Listings + Listings-Raw only; inventory reuse-only)
         run: node scripts/release/listing-health-v3-ingestion.mjs --region=${{ needs.run.outputs.region }} --mode=live --cycle-date=${{ needs.run.outputs.inventory_asof }} --confirm=listing-health-v3/${{ needs.run.outputs.region }}/${{ needs.run.outputs.inventory_asof }}
 
+  # IMMEDIATE post-ingestion listing-health-v3 publication reconcile (WORK C item 6). A SEPARATE job (like ads_reconcile)
+  # that runs AFTER this region's Listing Health v3 shadow ingestion (needs: listing-health-v3), which persisted the
+  # durable Listings + Listings-Raw snapshots (source_listings_snapshot / source_listings_raw_snapshot at
+  # as_of === inventory_asof) via the LHv3 materialization hook -- so the reconciler can promote the freshly-re-derived
+  # listing-health-v3 for accounts whose durable Listings/Raw advanced. Kept SEPARATE from the v3 shadow job so that
+  # job's "ingestion-only" export contract stays pristine. It runs the SAME reconciler as the 30-min backstop
+  # (listing-health-v3-reconcile.yml) and NEVER creates a DataDoe export/token (the release reads only durable data).
+  # It runs the reconciler's OWN reviewed independent lifecycle (--mode=periodic: self-owned control-package apply ->
+  # publish -> evidence-based safe-close), and the GLOBAL control-plane lease serializes it against the scheduler + the
+  # OLI/FBA/Ads reconcilers (a contended run merely DEFERS). It passes NO --accounts: the per-account revision gate +
+  # exact publication binding are the authority. DRY-RUN unless vars.LISTINGS_RECONCILE_LIVE=='true'. --as-of is the
+  # SHARED inventory_asof (== the durable Listings/Raw as_of), so the revision's exact-D-1 gate (snapshot.as_of ===
+  # requestedAsOf) matches. execute_downstream gates OUT a delayed duplicate run (a proven already-published no-op).
+  # continue-on-error so a reconcile blip never fails the graph; residue is left for the 30-min backstop (incl. --cleanup).
+  listing_health_v3_reconcile:
+    needs: [run, fba, listing-health-v3]
+    if: always() && needs.run.outputs.region != '' && needs.run.outputs.execute_downstream == 'true' && needs.run.outputs.scope != 'bootstrap' && needs.run.outputs.inventory_asof != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+      PRIORITY_OPERATOR: laxmikant@superboring.in
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install dependencies
+        run: npm ci
+      - name: Immediate Listing Health v3 publication reconcile (listing-health-v3; zero export; self-owned lease; dry-run unless LISTINGS_RECONCILE_LIVE)
+        if: always() && needs.run.outputs.scope != 'bootstrap' && needs.run.outputs.inventory_asof != ''
+        continue-on-error: true
+        run: |
+          if [ "${{ vars.LISTINGS_RECONCILE_LIVE }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
+          node scripts/release/listing-health-v3-reconcile.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --mode=periodic --deadline-seconds=300 $LIVE
+
   # Report materialization -- scheduler-OWNED, ZERO-EXPORT derivation of the durable reports that would otherwise
   # self-heal on a browser GET (brand-view-brands, sku-movement per brand incl. ALL, returns-leakage). It depends ONLY
   # on the `run` job (the durable brand-sales / daily / OLI / catalog sources), NOT on `fba`, so an FBA failure can
