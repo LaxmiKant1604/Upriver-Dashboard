@@ -24,7 +24,7 @@ import { makeSourceTranche } from "./source-tranche.js";
 import { computeFrozenTrancheBudget } from "./source-tranche-budget.js";
 import { registryBudgetPlanner } from "./source-fixpoint.js";
 import { getDataDoeConnections } from "../datadoe-connections.js";
-import { getSourceExportCache, saveSourceExportCache, getSourceExportCacheMeta, getRecentSyncCycleIds, getSyncSourceJobsWithMeta, getSyncSourceJobOwnersForCycle } from "../supabase.js";
+import { getSourceExportCache, saveSourceExportCache, getSourceExportCacheMeta, getRecentSyncCycleIds, getSyncSourceJobsWithMeta, getSyncSourceJobOwnersForCycle, saveSourceSnapshotPayload, recordSourceListingsSnapshot, recordSourceListingsRawSnapshot, isSchemaMissingError, isFunctionSignatureMissingError } from "../supabase.js";
 import { organizationFingerprint as orgFingerprintOf } from "../source-identity.js";
 import { getDataDoeTokenBalance } from "../datadoe-usage.js";
 import { discoverPrimaryAccountIds } from "./priority-control-pg-store.js";
@@ -67,6 +67,11 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     getRecentCycleIds = getRecentSyncCycleIds,
     getSourceJobsWithMeta = getSyncSourceJobsWithMeta,
     getSourceJobOwners = getSyncSourceJobOwnersForCycle,
+    // WORK B durable-persistence writers (default: the real Supabase functions). ZERO export -- the payload object is
+    // content-addressed storage + the pointer is the as_of-dominant CAS RPC. Injectable for offline tests.
+    saveDurablePayload = saveSourceSnapshotPayload,
+    recordListingsSnapshot = recordSourceListingsSnapshot,
+    recordListingsRawSnapshot = recordSourceListingsRawSnapshot,
   } = overrides;
 
   const runtime = makeRuntime({}); // store + dataDoe + saveSnapshot + loadDerivedContext (shadow namespace)
@@ -154,6 +159,12 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     readSourceCache: getExportCache,
     writeSourceCache: saveExportCache,
     readAliasMeta: async (h) => { const e = await getExportCacheMeta(h); return e && e.request_meta ? { batchFetchedAt: e.request_meta.batchFetchedAt } : null; },
+    // WORK B: additively persist the already-validated + per-account-isolated Listings / Listings-Raw fragments to their
+    // durable pointer tables (ZERO export). Failure is isolated + typed; migration-unapplied is fail-soft.
+    saveDurablePayload,
+    recordDurableByKey: { "listing-health-v3:listings": recordListingsSnapshot, "listing-health-v3:listings-raw": recordListingsRawSnapshot },
+    isSchemaMissingError,
+    isFunctionSignatureMissingError,
   });
 
   // The frozen NEW-tranche budget (listings + listings-raw ONLY; inventory is never in it), computed WITHOUT persisting.

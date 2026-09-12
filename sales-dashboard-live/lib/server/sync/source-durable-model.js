@@ -21,6 +21,11 @@ import { classifyOliDimensionalRow, OliOrderRuleError, oliUnitClass, OLI_UNIT_CL
 export const OLI_SOURCE_KEY = "order-line-items";
 export const CATALOG_SOURCE_KEY = "product-catalog";
 export const FBA_INVENTORY_SOURCE_KEY = "fba-inventory-health";
+// Durable Listings / Listings-Raw source keys. These MUST equal the table source_key CHECK literals (migrations
+// 20260926 'listings' / 20260927 'listings-raw') AND the LISTING_HEALTH_V3_NEW_EXPORT_KEYS suffixes -- they name the
+// content-addressed payload objects (sourceSnapshotObjectPath) + the per-account durable pointer tables.
+export const LISTINGS_SOURCE_KEY = "listings";
+export const LISTINGS_RAW_SOURCE_KEY = "listings-raw";
 export const ORGANIZATION_SCOPE_KEY = "__organization";
 
 // The MAXIMUM trailing DataDoe settlement lag the publish may honestly clamp back over. A recent unsettled tail

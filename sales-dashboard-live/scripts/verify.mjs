@@ -107,6 +107,8 @@ const SUITES = [
   "test:fba-publication-revision",
   "test:ads-publication-revision",
   "test:listings-durable-migration-audit",
+  "test:listings-durable-model",
+  "test:listings-durable-prodshape",
   "test:fba-publication-reconciler",
   "test:ads-publication-reconciler",
   "test:ads-publication-reconciler-behavior",

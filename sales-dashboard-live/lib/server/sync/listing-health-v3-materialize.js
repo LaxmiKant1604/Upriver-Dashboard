@@ -26,6 +26,7 @@ import { reportSourceRequestHashes } from "./report-source-contracts.js";
 import { isolateFragmentRowsForOwner } from "./source-account-isolation.js";
 import { organizationFingerprint as orgFingerprintOf } from "../source-identity.js";
 import { MAX_ACCOUNTS_PER_BATCH } from "./source-batching.js";
+import { LISTINGS_SOURCE_KEY, LISTINGS_RAW_SOURCE_KEY } from "./source-durable-model.js";
 
 // The three v3 source families that need per-account materialization. Catalog + OLI are DURABLE, org/per-account
 // reads (never batched here), so they are deliberately absent.
@@ -106,6 +107,13 @@ export function assertNoDuplicatePerAccountReadIdentities({ v3Requests = [], con
 
 const S = (v) => (v == null ? "" : String(v));
 function approxBytes(rows) { try { return Buffer.byteLength(JSON.stringify({ rows })); } catch { return 0; } }
+const isDateStr = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+// The v3 per-account read key -> the DURABLE Listings/Raw source key (migration table source_key). ONLY the two NEW
+// export families persist a durable pointer; :inventory is fba-inventory-health (reuse-only, already durable) -> absent.
+const V3_DURABLE_SOURCE_KEY = Object.freeze({
+  "listing-health-v3:listings": LISTINGS_SOURCE_KEY,
+  "listing-health-v3:listings-raw": LISTINGS_RAW_SOURCE_KEY,
+});
 
 // ===================== DEDICATED PER-REGION EXPORT CEILING (budget safety) =====================
 // The ONLY NEW DataDoe exports v3 creates are Listings + Listings-Raw (one create per <=5-seller batch). Inventory
@@ -193,11 +201,15 @@ export function assertListingHealthV3ExportCeiling({ region, plans, accountCount
  * Returns a summary { accounts, aliasesWritten, emptyAliases, rejected, batchMissing, skippedAccounts, skippedStale,
  * aliases[], rejections[] } -- never a secret. One plan's failure never aborts the others.
  */
-export async function materializeListingHealthV3PerAccount({ plans = [], connections = [], readSourceCache, writeSourceCache, readAliasMeta = null, clock = () => Date.now() }) {
+export async function materializeListingHealthV3PerAccount({ plans = [], connections = [], readSourceCache, writeSourceCache, readAliasMeta = null, clock = () => Date.now(), saveDurablePayload = null, recordDurableByKey = null, isSchemaMissingError = null, isFunctionSignatureMissingError = null }) {
   if (typeof readSourceCache !== "function" || typeof writeSourceCache !== "function") {
     throw new Error("materializeListingHealthV3PerAccount requires readSourceCache + writeSourceCache callbacks (fail closed).");
   }
-  const summary = { accounts: 0, aliasesWritten: 0, emptyAliases: 0, rejected: 0, batchMissing: 0, skippedAccounts: 0, skippedStale: 0, aliases: [], rejections: [] };
+  // Durable persistence (WORK B) is ZERO-EXPORT + OPTIONAL: it runs ONLY when BOTH saveDurablePayload + recordDurableByKey
+  // are injected (the ingestion composition binds the real supabase writers). When absent (existing callers/tests), the
+  // per-account ALIAS behavior is byte-identical -- persistence is a strictly additive, isolated side effect.
+  const durableEnabled = typeof saveDurablePayload === "function" && recordDurableByKey && typeof recordDurableByKey === "object";
+  const summary = { accounts: 0, aliasesWritten: 0, emptyAliases: 0, rejected: 0, batchMissing: 0, skippedAccounts: 0, skippedStale: 0, aliases: [], rejections: [], durableWritten: 0, durableUnchanged: 0, durableStale: 0, durableSkippedEvidence: 0, durableSchemaMissing: 0, durableWriteFailed: 0 };
   const connById = new Map((connections || []).map((c) => [String(c.id), c]));
 
   for (const plan of plans || []) {
@@ -280,6 +292,49 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
       }
       if (rows.length === 0) summary.emptyAliases += 1; else summary.aliasesWritten += 1;
       summary.aliases.push({ accountId: owner.accountId, requestKey: src.requestKey, requestHash: ident.requestHash, rowCount: rows.length });
+
+      // 5) DURABLE PERSISTENCE (WORK B; ZERO export, ZERO tokens): the SAME already-downloaded + STEP-6-validated +
+      //    per-account-ISOLATED `rows` are also written to the durable Listings / Listings-Raw pointer tables (only the
+      //    two NEW_EXPORT families; :inventory is reuse-only fba-inventory-health, no listings table). The
+      //    content-addressed payload object is uploaded FIRST, then the as_of-dominant CAS RPC records the pointer.
+      //    Fully ISOLATED + typed-honest: a durable failure NEVER fabricates success, advances lineage, overwrites
+      //    newer evidence (the RPC's own freshness CAS decides), or damages the per-account alias (LKG) already written
+      //    above. Listings + Listings-Raw are separate `src` iterations -> independently typed. Migration-unapplied is
+      //    the expected steady state -> fail-SOFT (durableSchemaMissing), never a hard failure.
+      const durableSourceKey = durableEnabled ? V3_DURABLE_SOURCE_KEY[src.requestKey] : null;
+      if (durableSourceKey) {
+        const recordDurable = recordDurableByKey[src.requestKey];
+        const durableConn = S(owner.connectionId) === "secondary" ? "dd-secondary" : "primary"; // table CHECK: primary|dd-secondary
+        const marketplace = S(owner.marketplace).trim().toUpperCase();
+        const asOf = plan.context && plan.context.to; // report-planner.js: plan.context.to === the account's D-1 as-of
+        if (typeof recordDurable === "function" && /^[A-Z]{2}$/.test(marketplace) && isDateStr(asOf) && incomingFetchedAt) {
+          try {
+            const saved = await saveDurablePayload({
+              organizationFingerprint: owner.organizationFingerprint, connectionId: durableConn,
+              sourceKey: durableSourceKey, scopeKey: owner.accountId, rows,
+            });
+            const res = await recordDurable({
+              organizationFingerprint: owner.organizationFingerprint, connectionId: durableConn,
+              accountId: owner.accountId, marketplace, asOf,
+              objectPath: saved.objectPath, payloadSha: saved.payloadSha,
+              rowCount: rows.length, payloadBytes: saved.payloadBytes,
+              sourceRequestHash: src.requestHash, validatedAt: incomingFetchedAt,
+            });
+            const ack = res && res.ack;
+            if (ack === "replaced") summary.durableWritten += 1;
+            else if (ack === "unchanged") summary.durableUnchanged += 1;
+            else if (ack === "stale-save") summary.durableStale += 1;
+          } catch (e) {
+            const schemaMissing = (typeof isSchemaMissingError === "function" && isSchemaMissingError(e))
+              || (typeof isFunctionSignatureMissingError === "function" && isFunctionSignatureMissingError(e));
+            if (schemaMissing) summary.durableSchemaMissing += 1; // migration UNAPPLIED -> fail-soft skip (alias stands)
+            else summary.durableWriteFailed += 1; // isolated typed failure; the alias (LKG) above is untouched
+          }
+        } else {
+          // Missing/blank marketplace / as_of / validated_at -> NEVER fabricate a durable pointer (defer to next cycle).
+          summary.durableSkippedEvidence += 1;
+        }
+      }
     }
   }
   return summary;

@@ -3430,6 +3430,107 @@ export async function recordSourceSnapshot({ organizationFingerprint, connection
   return { write: "ok", ack };
 }
 
+// ===== Durable Listings / Listings-Raw snapshot pointers (migrations 20260926 / 20260927; PREPARED, UNAPPLIED until
+// sign-off). The content-addressed PAYLOAD objects reuse saveSourceSnapshotPayload / getSourceSnapshotPayload (the object
+// path already namespaces by sourceKey='listings'|'listings-raw', so listings/listings-raw/catalog/fba objects never
+// collide + are content-address validated on hydrate). ONLY the per-(org,connection,account) POINTER tables + their CAS
+// RPCs are new. Both RPCs share the 11-arg signature + the as_of-DOMINATES-validated_at freshness ladder
+// (replaced | stale-save | unchanged | conflict); marketplace is IMMUTABLE per account (a different marketplace ->
+// conflict). service_role-only EXECUTE. The JS never decides freshness -- the RPC's CAS does. =====
+
+// Read the latest-good durable Listings (or Listings-Raw) pointer for ONE isolated (org, connection, account). Returns
+// { snapshot, read, error } with read in {ok, schema-missing, read-failed}; schema-missing is the expected pre-apply
+// state (fail-soft -> the reconciler defers "LISTINGS unavailable", never a fabricated zero).
+async function getListingsSnapshotFamily({ table, schemaCode }, { organizationFingerprint, connectionId = "primary", accountId, signal = null } = {}) {
+  if (!organizationFingerprint) throw new Error(`${schemaCode}: getSourceListings*Snapshot requires the organizationFingerprint (isolated durable identity; fail closed).`);
+  if (!accountId) throw new Error(`${schemaCode}: getSourceListings*Snapshot requires the accountId (fail closed).`);
+  try {
+    const query = new URLSearchParams({
+      select: "organization_fingerprint,connection_id,account_id,marketplace,source_key,as_of,object_path,payload_sha,row_count,payload_bytes,source_request_hash,validated_at",
+      organization_fingerprint: `eq.${organizationFingerprint}`,
+      connection_id: `eq.${connectionId}`,
+      account_id: `eq.${accountId}`,
+      limit: "1",
+    });
+    const rows = await request(`/rest/v1/${table}?${query}`, { signal });
+    return { snapshot: rows && rows[0] ? rows[0] : null, read: "ok", error: null };
+  } catch (readError) {
+    if (isSchemaMissingError(readError)) return { snapshot: null, read: "schema-missing", error: `${schemaCode}_SCHEMA_MISSING` };
+    return { snapshot: null, read: "read-failed", error: `${schemaCode}_READ_FAILED` };
+  }
+}
+export const getSourceListingsSnapshot = (args) => getListingsSnapshotFamily({ table: "source_listings_snapshot", schemaCode: "SOURCE_LISTINGS_SNAPSHOT" }, args);
+export const getSourceListingsRawSnapshot = (args) => getListingsSnapshotFamily({ table: "source_listings_raw_snapshot", schemaCode: "SOURCE_LISTINGS_RAW_SNAPSHOT" }, args);
+
+// Region scan: ALL latest-good durable Listings (or Raw) pointers for (org, connection) at a specific as_of (the
+// reconciler/WORK-D scan for a requested D-1). Uses the (org, connection, as_of) index. { snapshots:[...], read, error }.
+async function getListingsSnapshotsByAsOfFamily({ table, schemaCode }, { organizationFingerprint, connectionId = "primary", asOf, signal = null } = {}) {
+  if (!organizationFingerprint) throw new Error(`${schemaCode}: getSourceListings*SnapshotsByAsOf requires the organizationFingerprint (fail closed).`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(asOf || ""))) throw new Error(`${schemaCode}: getSourceListings*SnapshotsByAsOf requires a YYYY-MM-DD asOf (fail closed).`);
+  try {
+    const query = new URLSearchParams({
+      select: "organization_fingerprint,connection_id,account_id,marketplace,source_key,as_of,object_path,payload_sha,row_count,payload_bytes,source_request_hash,validated_at",
+      organization_fingerprint: `eq.${organizationFingerprint}`,
+      connection_id: `eq.${connectionId}`,
+      as_of: `eq.${asOf}`,
+    });
+    const rows = await request(`/rest/v1/${table}?${query}`, { signal });
+    return { snapshots: Array.isArray(rows) ? rows : [], read: "ok", error: null };
+  } catch (readError) {
+    if (isSchemaMissingError(readError)) return { snapshots: [], read: "schema-missing", error: `${schemaCode}_SCHEMA_MISSING` };
+    return { snapshots: [], read: "read-failed", error: `${schemaCode}_READ_FAILED` };
+  }
+}
+export const getSourceListingsSnapshotsByAsOf = (args) => getListingsSnapshotsByAsOfFamily({ table: "source_listings_snapshot", schemaCode: "SOURCE_LISTINGS_SNAPSHOT" }, args);
+export const getSourceListingsRawSnapshotsByAsOf = (args) => getListingsSnapshotsByAsOfFamily({ table: "source_listings_raw_snapshot", schemaCode: "SOURCE_LISTINGS_RAW_SNAPSHOT" }, args);
+
+// Record the latest-good durable Listings (or Listings-Raw) pointer via the SECURITY DEFINER CAS RPC. Every evidence
+// field is REQUIRED + validated BEFORE any HTTP (a partial/failed refresh can never replace the latest-good snapshot);
+// the object path must embed the declared payloadSha (metadata + payload belong to the same save). The RPC returns
+// exactly one scalar in {replaced, unchanged, stale-save, conflict}; anything else is a typed ACK_INVALID (unacknowledged
+// -> fail closed), and 'conflict' throws a typed CONFLICT (equal-as_of/validated_at with different content, or a
+// different immutable marketplace). Freshness is the RPC's as_of-dominant CAS -- the JS never decides it.
+async function recordListingsSnapshotFamily({ rpc, code }, { organizationFingerprint, connectionId = "primary", accountId, marketplace, asOf, objectPath, payloadSha, rowCount, payloadBytes = 0, sourceRequestHash, validatedAt, signal = null } = {}) {
+  const org = String(organizationFingerprint || "").trim();
+  const acct = String(accountId || "").trim();
+  const mkt = String(marketplace || "").trim();
+  const asof = String(asOf || "").trim();
+  const path = String(objectPath || "").trim();
+  const sha = String(payloadSha || "").trim();
+  const hash = String(sourceRequestHash || "").trim();
+  if (!org || !acct || acct.includes(":") || !/^[A-Z]{2}$/.test(mkt) || !/^\d{4}-\d{2}-\d{2}$/.test(asof)
+    || !path || !sha || !hash || !validatedAt
+    || (connectionId !== "primary" && connectionId !== "dd-secondary")
+    || typeof rowCount !== "number" || !Number.isInteger(rowCount) || rowCount < 0
+    || typeof payloadBytes !== "number" || !Number.isInteger(payloadBytes) || payloadBytes < 0) {
+    throw new Error(`${code}: requires complete VALIDATED listings snapshot evidence (organizationFingerprint / connectionId in {primary,dd-secondary} / accountId[no ':'] / marketplace[^[A-Z]{2}$] / asOf[YYYY-MM-DD] / objectPath / payloadSha / rowCount>=0 / payloadBytes>=0 / sourceRequestHash / validatedAt); refusing to replace the latest-good snapshot (fail closed).`);
+  }
+  if (!path.endsWith(`/${sha}.json`)) {
+    throw new Error(`${code}: the object path does not embed the declared payloadSha; metadata and payload must belong to the same save (fail closed).`);
+  }
+  const body = await request(`/rest/v1/rpc/${rpc}`, {
+    method: "POST",
+    signal,
+    body: {
+      p_organization_fingerprint: org, p_connection_id: connectionId,
+      p_account_id: acct, p_marketplace: mkt, p_as_of: asof,
+      p_object_path: path, p_payload_sha: sha, p_row_count: rowCount,
+      p_payload_bytes: payloadBytes, p_source_request_hash: hash, p_validated_at: validatedAt,
+    },
+  });
+  let value = body;
+  if (Array.isArray(body)) {
+    if (body.length !== 1) { const err = new Error(`${code}_ACK_INVALID: ${rpc} returned ${body.length} rows; exactly one scalar acknowledgement is required (fail closed).`); err.code = `${code}_ACK_INVALID`; throw err; }
+    value = body[0];
+  }
+  const KNOWN_ACKS = ["replaced", "unchanged", "stale-save", "conflict"];
+  if (typeof value !== "string" || !KNOWN_ACKS.includes(value)) { const err = new Error(`${code}_ACK_INVALID: acknowledgement ${JSON.stringify(value)} is not one of ${KNOWN_ACKS.join("|")}; the save is unacknowledged (fail closed).`); err.code = `${code}_ACK_INVALID`; throw err; }
+  if (value === "conflict") { const err = new Error(`${code}_CONFLICT: an equal-as_of/validated_at snapshot with DIFFERENT content (or a different immutable marketplace) already exists; refusing to replace (fail closed).`); err.code = `${code}_CONFLICT`; throw err; }
+  return { write: "ok", ack: value };
+}
+export const recordSourceListingsSnapshot = (args) => recordListingsSnapshotFamily({ rpc: "record_source_listings_snapshot", code: "SOURCE_LISTINGS_SNAPSHOT" }, args);
+export const recordSourceListingsRawSnapshot = (args) => recordListingsSnapshotFamily({ rpc: "record_source_listings_raw_snapshot", code: "SOURCE_LISTINGS_RAW_SNAPSHOT" }, args);
+
 // Insert-if-absent: ignore-duplicates so a resumed invocation never resets an
 // in-progress or completed job (unique cycle_id, request_hash). connection_id must be an
 // explicit 'primary'/'dd-secondary' from the plan — there is NO silent 'primary' default.
