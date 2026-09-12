@@ -12,6 +12,7 @@ import { SOURCE_PROMOTED_REPORT_KEYS, CONTROLLED_REPORT_KEYS, SCHEDULER_V2_READY
 import { REPORT_DERIVATIONS } from "../lib/server/sync/report-derivation.js";
 import { listingsDependentLiveReportKeys, isListingsDependentLiveReport } from "../lib/server/sync/listing-health-v3-dependent-reports.js";
 import { buildListingHealthV3ControlPackage } from "../lib/server/sync/source-priority-control-package.js";
+import { envFlagOn } from "../src/lib/env-flag.js";
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; };
@@ -95,6 +96,21 @@ process.stdout.write("listing-health-v3-live-contract\n");
   const admin = readdirSync(path.join(apiDir, "admin")).filter((f) => f.endsWith(".js")).length;
   const cron = readdirSync(path.join(apiDir, "cron")).filter((f) => f.endsWith(".js")).length;
   ok(`api function count === 12 (${top} top-level + ${admin} admin + ${cron} cron)`, top + admin + cron === 12);
+}
+
+// ---- (7) FRONTEND activation flag (Blocker 1): a BUILD-TIME Vite gate, DEFAULT OFF, ON only for the exact "true" ----
+{
+  // envFlagOn is the pure predicate feature-flags.js applies to import.meta.env.VITE_LISTING_HEALTH_V3.
+  ok("envFlagOn is ON only for the exact string 'true'", envFlagOn("true") === true);
+  ok("envFlagOn is OFF for absent/blank/false/FALSE/1/yes/whitespace/boolean/number (default OFF)",
+    [undefined, null, "", "false", "FALSE", "1", "yes", " true ", "True", true, 1].every((v) => envFlagOn(v) === false));
+  const ff = read("src/lib/feature-flags.js");
+  ok("LISTING_HEALTH_V3 is the BUILD-TIME Vite gate envFlagOn(...import.meta.env.VITE_LISTING_HEALTH_V3...) -- NOT hardcoded",
+    /export const LISTING_HEALTH_V3 = envFlagOn\(/.test(ff) && /import\.meta\.env\.VITE_LISTING_HEALTH_V3/.test(ff) && !/export const LISTING_HEALTH_V3 = (?:true|false)\b/.test(ff));
+  ok("feature-flags.js documents the THREE distinct gates (frontend VITE_LISTING_HEALTH_V3 + server LISTING_HEALTH_V3 + server LHV3_PUBLISH_LIVE)",
+    /VITE_LISTING_HEALTH_V3/.test(ff) && /LISTING_HEALTH_V3\s+\(SERVER env\)/.test(ff) && /LHV3_PUBLISH_LIVE\s+\(SERVER env\)/.test(ff));
+  const ef = read("src/lib/env-flag.js");
+  ok("env-flag.js is PURE (no import.meta) so the predicate is unit-testable in Node", !/import\.meta/.test(ef) && /export function envFlagOn/.test(ef));
 }
 
 process.stdout.write(`\nlisting-health-v3-live-contract: ${passed} assertions passed\n`);

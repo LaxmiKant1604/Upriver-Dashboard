@@ -77,7 +77,7 @@ ok("B: the v3 job NEVER recomputes UTC today (no date -u inside the v3 job)", !/
 ok("C: LISTING_HEALTH_V3_INGESTION_ENABLED=true is set (ingestion gate)", /LISTING_HEALTH_V3_INGESTION_ENABLED:\s*"true"/.test(v3Job));
 ok("C: the ingestion gate appears ONLY in the v3 job (not the run/fba jobs)", !/LISTING_HEALTH_V3_INGESTION_ENABLED/.test(beforeV3));
 ok("C: the workflow NEVER sets/flips the UI flag LISTING_HEALTH_V3 (exact env, not the _INGESTION_ suffix)", !/LISTING_HEALTH_V3\s*:/.test(wf) && !/LISTING_HEALTH_V3=/.test(wf));
-ok("C: the UI flag stays OFF in source", /export const LISTING_HEALTH_V3 = false;/.test(flags));
+ok("C: the UI flag stays OFF by default in source (build-time Vite gate via envFlagOn, never hardcoded true)", /export const LISTING_HEALTH_V3 = envFlagOn\(/.test(flags) && !/export const LISTING_HEALTH_V3 = true\b/.test(flags));
 ok("C: the v3 job pins the reviewed operator identity", /PRIORITY_OPERATOR:\s*laxmikant@superboring\.in/.test(v3Job));
 ok("C: the v3 job runs mode=live for the resolved region", /--mode=live/.test(v3Job) && /--region=\$\{\{\s*needs\.run\.outputs\.region\s*\}\}/.test(v3Job));
 

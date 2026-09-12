@@ -115,6 +115,8 @@ const SUITES = [
   "test:ads-reconcile-prodshape",
   "test:fba-reconcile-prodshape",
   "test:listing-health-v3-dependency-bundle",
+  "test:listing-health-v3-durable-loader",
+  "test:listing-health-v3-live-identity",
   "test:listing-health-v3-fingerprint-invariant",
   "test:listing-health-v3-reconcile-prodshape",
   "test:listing-health-v3-live-resolver",

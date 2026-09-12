@@ -23,6 +23,9 @@ import { getSourceCoverageWindows, getOliCompleteness } from "../supabase.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const isDate = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+// A real, parseable timestamp (source_snapshots.validated_at) -- not merely nonblank (parity with the dependency-bundle
+// validator, blocker 2/4). Rejects "", non-strings, and unparseable values.
+const isRealTimestamp = (v) => { const s = S(v); return s !== "" && Number.isFinite(Date.parse(s)); };
 const OLI_SOURCE_KEY = "order-line-items";
 const CATALOG_SOURCE_KEY = "product-catalog";
 const ORGANIZATION_SCOPE_KEY = "__organization";
@@ -135,23 +138,42 @@ export function makeListingHealthV3DurableContextLoader({
     // degrade"). PREVIEW: unreadable/missing catalog -> omit (the derive blocks on the missing catalog).
     if (strict && catRead && typeof catRead === "object" && "read" in catRead && catRead.read !== "ok") return {};
     if (!catalogReadOk || !catalogSnapshot || !catalogSnapshot.object_path) return { listingHealthV3DurableOli };
-    // STRICT: full Catalog pointer integrity -- the object_path must belong to the expected org/conn/product-catalog/
-    // __organization namespace and embed the declared payload_sha (getSourceSnapshotPayload additionally recomputes the
-    // content-address sha on hydrate). A mandatory-catalog integrity failure DEFERS (return {}).
+    // STRICT: FULL Catalog pointer integrity (blockers 2 + 4) -- FAIL CLOSED (return {} -> the dependency bundle DEFERS
+    // before cycle open or any shadow/live write; LKG preserved). The snapshot must echo the EXACT expected identity
+    // (organization_fingerprint + connection_id + source_key=product-catalog + scope_key=__organization), carry a
+    // nonblank source_request_hash + payload_sha and a REAL validated_at timestamp, declare a FINITE INTEGER row_count
+    // >= 0, and its object_path must embed the declared payload_sha AND equal the recomputed content-addressed
+    // namespace path (getSourceSnapshotPayload additionally recomputes the content-address sha on hydrate). row_count
+    // is required valid FIRST -- a missing / null / malformed / negative / non-integer row_count is itself a failure,
+    // never skipped (the earlier code fail-OPEN when row_count was not an integer). A zero-row Catalog with an
+    // otherwise-valid pointer is honest evidence and passes (row_count 0 === hydrated rows.length 0).
     if (strict) {
-      const catSha = S(catalogSnapshot.payload_sha);
-      const expectedCatPath = typeof buildObjectPath === "function"
-        ? buildObjectPath({ organizationFingerprint: orgFingerprint, connectionId, sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY, payloadSha: catSha })
-        : null;
-      if (!catSha || !S(catalogSnapshot.object_path).endsWith("/" + catSha + ".json") || (expectedCatPath && S(catalogSnapshot.object_path) !== expectedCatPath)) return {};
+      const cat = catalogSnapshot;
+      const catSha = S(cat.payload_sha);
+      const catRc = Number(cat.row_count);
+      if (typeof buildObjectPath !== "function") return {}; // cannot verify the namespace path -> defer (fail closed)
+      // Cheap identity + row_count + sha + validated_at checks FIRST (this includes catSha nonblank, so the namespace
+      // recompute below never receives a blank sha -- sourceSnapshotObjectPath fails closed on a blank sha).
+      if (S(cat.organization_fingerprint) !== S(orgFingerprint)
+        || S(cat.connection_id) !== S(connectionId)
+        || S(cat.source_key) !== CATALOG_SOURCE_KEY
+        || S(cat.scope_key) !== ORGANIZATION_SCOPE_KEY
+        || S(cat.source_request_hash).trim() === ""
+        || catSha.trim() === ""
+        || !isRealTimestamp(cat.validated_at)
+        || !Number.isFinite(catRc) || !Number.isInteger(catRc) || catRc < 0
+        || !S(cat.object_path).endsWith("/" + catSha + ".json")) return {};
+      // catSha is nonblank and the path embeds it -> recompute the content-addressed namespace path and require an
+      // EXACT match (a valid-looking pointer in a DIFFERENT org/conn/source/scope namespace is rejected here).
+      if (S(cat.object_path) !== buildObjectPath({ organizationFingerprint: orgFingerprint, connectionId, sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY, payloadSha: catSha })) return {};
     }
     let catalogRows = [];
     try {
       const payload = await loadCatalogPayload(catalogSnapshot.object_path, { signal });
       catalogRows = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.rows) ? payload.rows : []);
     } catch (_e) { if (strict) return {}; return { listingHealthV3DurableOli }; }
-    // STRICT: hydrated rows.length must equal the pointer's declared row_count.
-    if (strict && Number.isInteger(Number(catalogSnapshot.row_count)) && catalogRows.length !== Number(catalogSnapshot.row_count)) return {};
+    // STRICT: hydrated rows.length must EXACTLY equal the (already-validated finite integer) declared row_count.
+    if (strict && catalogRows.length !== Number(catalogSnapshot.row_count)) return {};
 
     // Surface the catalog's content-addressed payload_sha + validated_at so the dependency-bundle fingerprint can fold
     // the exact catalog content identity (WORK C/D blocker 1); additive -- the derive ignores these extra fields.

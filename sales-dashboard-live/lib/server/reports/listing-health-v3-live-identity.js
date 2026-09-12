@@ -41,16 +41,37 @@ export function listingHealthV3SemanticIdentity(payload, { accountId, to } = {})
   if (S(w.to) !== S(to)) return { ok: false, reason: "payload-window-to" };
   if (S(w.from) !== S(addDaysStr(S(to), -(LISTING_HEALTH_DEFAULT_WINDOW_DAYS - 1)))) return { ok: false, reason: "payload-window-from" };
   if (S(w.from) > S(w.to)) return { ok: false, reason: "payload-window-reversed" };
-  // Coverage: assessOliCoverage always returns { requestedFrom, requestedTo, coveredFrom, coveredTo, complete, gaps }
-  // (listing-health-advanced.js), so a genuine promoted payload always carries it. It must be INTERNALLY CONSISTENT
-  // with the window: the requested range equals the window, `complete` is a boolean (with no gaps when complete), and
-  // any present covered endpoint is a REAL calendar date inside [from,to]. A malformed/degraded coverage can never
-  // pretend to be the account's exact-D-1 coverage.
+  // Coverage: assessOliCoverage (listing-health-advanced.js) always returns { requestedFrom, requestedTo, coveredFrom,
+  // coveredTo, complete, gaps } and enforces its OWN invariants -- complete === (gaps.length === 0); every gap is a
+  // well-formed { from, to } inside [from,to] in strictly ascending, non-overlapping order; and when complete both
+  // coveredFrom === from and coveredTo === to. We RE-PROVE all of these here so a malformed / degraded / hand-crafted
+  // coverage can never masquerade as this account's exact-D-1 coverage. None of these checks can reject a payload the
+  // real derivation produces (verified against assessOliCoverage's construction).
   const cov = payload.coverage;
   if (!cov || typeof cov !== "object" || Array.isArray(cov)) return { ok: false, reason: "payload-coverage-missing" };
   if (S(cov.requestedFrom) !== S(w.from) || S(cov.requestedTo) !== S(w.to)) return { ok: false, reason: "payload-coverage-window" };
   if (typeof cov.complete !== "boolean") return { ok: false, reason: "payload-coverage-complete" };
-  if (cov.complete === true && Array.isArray(cov.gaps) && cov.gaps.length > 0) return { ok: false, reason: "payload-coverage-gaps" };
+  // gaps MUST be an array of well-formed, in-window, strictly-ascending { from, to } intervals -- EXACTLY the shape
+  // computeCoverageGaps emits. A non-array (e.g. "corrupt"), a non-object gap, a bad/reversed date, an out-of-window
+  // endpoint, or an overlapping/unordered pair cannot be genuine coverage.
+  if (!Array.isArray(cov.gaps)) return { ok: false, reason: "payload-coverage-gaps-not-array" };
+  let prevGapTo = null;
+  for (const g of cov.gaps) {
+    if (!g || typeof g !== "object" || Array.isArray(g)) return { ok: false, reason: "payload-coverage-gap-not-object" };
+    const gf = S(g.from), gt = S(g.to);
+    if (!isRealDate(gf) || !isRealDate(gt)) return { ok: false, reason: "payload-coverage-gap-date" };
+    if (gf > gt) return { ok: false, reason: "payload-coverage-gap-reversed" };
+    if (gf < S(w.from) || gt > S(w.to)) return { ok: false, reason: "payload-coverage-gap-out-of-window" };
+    if (prevGapTo != null && gf <= prevGapTo) return { ok: false, reason: "payload-coverage-gap-unordered" };
+    prevGapTo = gt;
+  }
+  // complete === (gaps.length === 0), both directions: complete with any gap, or incomplete with none, is malformed.
+  if (cov.complete === true && cov.gaps.length > 0) return { ok: false, reason: "payload-coverage-gaps" };
+  if (cov.complete === false && cov.gaps.length === 0) return { ok: false, reason: "payload-coverage-incomplete-no-gaps" };
+  // A COMPLETE window is fully covered end to end: assessOliCoverage yields coveredFrom === from and coveredTo === to
+  // whenever there are no gaps, so a complete payload MUST carry the exact window endpoints.
+  if (cov.complete === true && (S(cov.coveredFrom) !== S(w.from) || S(cov.coveredTo) !== S(w.to))) return { ok: false, reason: "payload-coverage-covered-window" };
+  // Any present covered endpoint (partial coverage) is a REAL calendar date inside [from,to].
   for (const k of ["coveredFrom", "coveredTo"]) {
     const v = cov[k];
     if (v != null && S(v) !== "") {
