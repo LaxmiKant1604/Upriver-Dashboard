@@ -62,6 +62,7 @@ const { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } = await import("../../lib/server/syn
 const { REPORT_DERIVATIONS, deriveReportSnapshot } = await import("../../lib/server/sync/report-derivation.js");
 const { paramsHashFor } = await import("../../lib/server/report-store.js");
 const { buildListingHealthV3Release } = await import("../../lib/server/sync/listing-health-v3-release.js");
+const { resolveListingHealthV3DependencyBundle } = await import("../../lib/server/sync/listing-health-v3-dependency-bundle.js");
 const { makeListingHealthV3DurableContextLoader } = await import("../../lib/server/sync/listing-health-v3-durable-loader.js");
 const { buildSchedulerV2Publisher } = await import("../../lib/server/sync/publisher-composition.js");
 const { buildLiveReadback } = await import("../../lib/server/sync/source-priority-release-runner.js");
@@ -249,8 +250,34 @@ async function resolveAccountRawSellerId(accountId) {
 const loadDurableContext = makeListingHealthV3DurableContextLoader({
   connections,
   getCatalogSnapshot: (args) => sb.getSourceSnapshot(args),
-  loadCatalogPayload: (path) => sb.getSourceSnapshotPayload(path),
+  loadCatalogPayload: (path, opt) => sb.getSourceSnapshotPayload(path, opt),
 });
+
+// The authoritative per-account identity for the dependency bundle: marketplace = the directory country (uppercased),
+// rawSellerId = the resolved raw seller. Blank when the account is unresolvable -> the bundle resolver defers it.
+async function resolveAccountBundleIdentity(accountId) {
+  const meta = await loadDirectoryMeta();
+  const m = meta.get(String(accountId));
+  return m ? { marketplace: String(m.country).toUpperCase(), rawSellerId: String(m.rawSellerId) } : { marketplace: "", rawSellerId: "" };
+}
+
+// The ONE shared dependency-bundle resolver closure, used by BOTH the scope scan (readScopeEvidence) AND the release
+// (TOCTOU recompute + the exact evidence it derives from) -- so the revision the scan classifies is byte-identical to
+// what the release re-derives. It reads + fully integrity-validates the two durable Listings pointers, resolves the
+// reuse-only FBA inventory, loads durable OLI + Product Catalog, and returns the COMPLETE-manifest fingerprint. Every
+// read is signal-threaded; connection is 'primary' (dd-secondary/colon ids are excluded from the directory meta).
+const resolveBundle = async ({ accountId, requestedAsOf, signal = null }) => {
+  const id = await resolveAccountBundleIdentity(accountId);
+  return resolveListingHealthV3DependencyBundle({
+    readListingsSnapshot, readListingsRawSnapshot, readInventorySnapshot,
+    loadSnapshotPayload: (path, opt) => sb.getSourceSnapshotPayload(path, opt),
+    resolveExpectedInventoryRequestHash, loadDurableContext,
+    buildObjectPath: sb.sourceSnapshotObjectPath,
+  }, {
+    organizationFingerprint: orgFp, connectionId: "primary", accountId,
+    marketplace: id.marketplace, rawSellerId: id.rawSellerId, requestedAsOf, signal,
+  });
+};
 
 // PER-ACCOUNT release execution: each stale account derives + finalizes + publishes + reads back in ITS OWN dedicated
 // priority-partial cycle (deterministic 16-hex over {accountId, Listings revisionId}) with the captured fence. The
@@ -265,13 +292,10 @@ async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revis
   const publisher = buildSchedulerV2Publisher({ getControlFence: () => (aborted() ? null : leaseFence) });
   const verifyLeaseForOp = async () => (aborted() ? { ok: false, reason: "deadline-aborted" } : verifyLease());
   const release = buildListingHealthV3Release({
-    resolveOrg: async () => ({ organizationFingerprint: orgFp, connectionId: "primary" }),
+    resolveBundle,
     openCycle: (args, opt) => sb.openSyncCycle(args, opt),
     getCycleByBucketDate: (bk, date, opt) => sb.getBaseSyncCycleByBucketDate(bk, date, opt),
-    readListingsSnapshot, readListingsRawSnapshot, readInventorySnapshot,
-    loadSnapshotPayload: (path, opt) => sb.getSourceSnapshotPayload(path, opt),
-    resolveExpectedInventoryRequestHash, resolveAccountRawSellerId,
-    loadDurableContext, deriveSnapshot: deriveReportSnapshot,
+    deriveSnapshot: deriveReportSnapshot,
     reportDerivations: REPORT_DERIVATIONS,
     computeHash: paramsHashFor,
     liveContracts: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS,
@@ -283,7 +307,7 @@ async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revis
     publisher, readbackLive, verifyLease: verifyLeaseForOp,
     log: () => {},
   });
-  const result = await release.runForAccount({ accountId, requestedAsOf, cycleBucket, signal });
+  const result = await release.runForAccount({ accountId, requestedAsOf, cycleBucket, revisionId, signal });
   return { code: result.code, ok: result.ok, stage: result.stage, status: result.status || null, leaseLost: result.leaseLost === true, reason: result.reason || null, blockerCodes: result.blockerCodes || [], problems: result.problems || [] };
 }
 
@@ -308,7 +332,7 @@ const awaitSettled = (p) => {
 const reconciler = buildListingHealthV3PublicationReconciler({
   resolveOrg: async () => ({ organizationFingerprint: orgFp, connectionId: "primary" }),
   bucketAccounts,
-  readListingsSnapshot, readListingsRawSnapshot,
+  resolveBundle,
   readLatestReportJob: ({ reportKey, accountId }) => sb.getLatestReportJobLineage(reportKey, accountId),
   readShadowSnapshot: (args) => sb.getReportSnapshot(args),
   readLiveSnapshot: (args) => sb.getReportSnapshot(args),

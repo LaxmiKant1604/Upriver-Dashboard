@@ -18,6 +18,7 @@
 // It NEVER applies a migration, NEVER enables the scheduler/cron, and NEVER touches unrelated reports/snapshots.
 
 import { PRIORITY_DASHBOARDS } from "./source-priority-dashboards.js";
+import { buildLivePromotedResolver } from "./live-promoted-resolver.js";
 
 const OK_PUBLISH = new Set(["published", "already-current"]);
 const OK_FINALIZE = new Set(["finalized", "already-terminal"]);
@@ -247,38 +248,14 @@ export async function runPriorityDashboardsRelease(deps = {}) {
  * STORAGE-FIRST payload hydration; and the REAL frontend payload contract (validatePayload true + not
  * dataUnavailable). Returns { ok, reason? }.
  */
-export function buildLiveReadback({ getReportSnapshot, loadStoragePayload, liveContracts, reportDerivations, computeHash } = {}) {
-  for (const [name, fn] of [["getReportSnapshot", getReportSnapshot], ["loadStoragePayload", loadStoragePayload], ["computeHash", computeHash]]) {
-    if (typeof fn !== "function") throw new Error(`buildLiveReadback requires ${name} (fail closed).`);
-  }
-  if (!liveContracts || !reportDerivations) throw new Error("buildLiveReadback requires liveContracts + reportDerivations (fail closed).");
-  // The optional `signal` is threaded to the live read + storage hydration; callers that pass none are byte-for-byte
-  // unchanged (signal defaults null, exactly as an absent 2nd argument to the signal-aware readers).
+export function buildLiveReadback(deps = {}) {
+  // Round-WORK-C/D: the proof body is now the SHARED buildLivePromotedResolver (live-promoted-resolver.js), used
+  // ALSO by the strict serve resolver. buildLiveReadback is a thin wrapper that DROPS the hydrated payload, so the
+  // reconciler read-back's { ok, reason } shape + every check is byte-for-byte unchanged (the optional `signal` still
+  // threads to the read + hydration; callers that pass none default it to null exactly as before).
+  const resolve = buildLivePromotedResolver(deps);
   return async ({ reportKey, liveReportKey, accountId, paramsHash, signal = null }) => {
-    const contract = liveContracts[reportKey];
-    if (!contract) return { ok: false, reason: "no-live-contract" };
-    if (liveReportKey !== contract.liveReportKey) return { ok: false, reason: "live-report-key-mismatch" };
-    if (!nb(paramsHash)) return { ok: false, reason: "blank-params-hash" };
-    const snap = await getReportSnapshot({ reportKey: liveReportKey, accountId, paramsHash }, { signal });
-    if (!snap) return { ok: false, reason: "no-live-snapshot" };
-    // The ROW's own identity echoes -- the live snapshot is keyed by (report_key, account_id, params_hash); the
-    // published live params do NOT carry accountId, so identity is proven from the ROW columns, never from params.
-    if (S(snap.report_key) !== S(liveReportKey)) return { ok: false, reason: "identity-report-key" };
-    if (S(snap.account_id) !== S(accountId)) return { ok: false, reason: "identity-account" };
-    if (S(snap.params_hash) !== S(paramsHash)) return { ok: false, reason: "identity-hash" };
-    const params = snap.params && typeof snap.params === "object" && !Array.isArray(snap.params) ? snap.params : null;
-    // The stored params carry the EXACT live report version + the contract-derived live params, and RE-derive
-    // paramsHash (provenance -- a mutated-after-save row fails). accountId is NOT expected in the live params.
-    if (!params || params.reportVersion !== contract.liveReportVersion) return { ok: false, reason: "live-version" };
-    const liveParams = contract.liveParams(params);
-    if (!liveParams || computeHash(contract.liveReportVersion, liveParams) !== paramsHash) return { ok: false, reason: "params-provenance" };
-    if (!nb(snap.source_refreshed_at)) return { ok: false, reason: "blank-refresh" };
-    let payload;
-    const path = S(snap.payload_storage_path).trim();
-    if (path) { try { payload = await loadStoragePayload(path, { signal }); } catch { payload = null; } if (payload == null) return { ok: false, reason: "payload-dangling" }; }
-    else { payload = snap.payload; if (payload == null) return { ok: false, reason: "payload-unavailable" }; }
-    const entry = reportDerivations[reportKey];
-    if (!entry || typeof entry.validatePayload !== "function" || entry.validatePayload(payload) !== true || (payload && payload.dataUnavailable === true)) return { ok: false, reason: "payload-contract" };
-    return { ok: true };
+    const r = await resolve({ reportKey, liveReportKey, accountId, paramsHash, signal });
+    return r && r.ok === true ? { ok: true } : { ok: false, reason: r ? r.reason : "resolver-null" };
   };
 }

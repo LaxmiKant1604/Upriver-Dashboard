@@ -57,7 +57,7 @@ export function makeListingHealthV3DurableContextLoader({
   getCatalogSnapshot,
   loadCatalogPayload,
 } = {}) {
-  return async ({ reportKey, accountId, planned }) => {
+  return async ({ reportKey, accountId, planned, signal = null }) => {
     if (reportKey !== "listing-health-v3") return {};
     const context = (planned && planned.context) || {};
     const asOf = context.to != null ? String(context.to) : "";
@@ -84,7 +84,7 @@ export function makeListingHealthV3DurableContextLoader({
     //    empty result is honest evidence (payload reports unavailable/partial, never a fabricated proven zero).
     let rows;
     try {
-      rows = await getEnrichedOli({ organizationFingerprint: orgFingerprint, connectionId, accountIds: [S(accountId)], from: win.from, to: win.to });
+      rows = await getEnrichedOli({ organizationFingerprint: orgFingerprint, connectionId, accountIds: [S(accountId)], from: win.from, to: win.to, signal });
     } catch (_e) { return {}; }
     if (!Array.isArray(rows)) return {};
 
@@ -92,7 +92,7 @@ export function makeListingHealthV3DurableContextLoader({
     //    closed (we must not present rows as fully covered when coverage is unknown).
     let coverageWindows;
     try {
-      const cov = await getOliCoverage({ organizationFingerprint: orgFingerprint, connectionId, accountId: S(accountId), sourceKey: OLI_SOURCE_KEY });
+      const cov = await getOliCoverage({ organizationFingerprint: orgFingerprint, connectionId, accountId: S(accountId), sourceKey: OLI_SOURCE_KEY, signal });
       const raw = cov && cov.read === "ok" ? (cov.windows || []) : (Array.isArray(cov) ? cov : []);
       coverageWindows = normalizeCoverageWindows(raw);
     } catch (_e) { return {}; }
@@ -101,7 +101,7 @@ export function makeListingHealthV3DurableContextLoader({
     //    then treats completeness as provisional/unknown), never blocks.
     let completenessRows = [];
     try {
-      const comp = await getCompleteness({ organizationFingerprint: orgFingerprint, connectionId, accountIds: [S(accountId)], from: win.from, to: win.to });
+      const comp = await getCompleteness({ organizationFingerprint: orgFingerprint, connectionId, accountIds: [S(accountId)], from: win.from, to: win.to }, { signal });
       completenessRows = Array.isArray(comp) ? comp : [];
     } catch (_e) { completenessRows = []; }
 
@@ -114,17 +114,19 @@ export function makeListingHealthV3DurableContextLoader({
     }
     let catRead;
     try {
-      catRead = await getCatalogSnapshot({ organizationFingerprint: orgFingerprint, connectionId, sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY });
+      catRead = await getCatalogSnapshot({ organizationFingerprint: orgFingerprint, connectionId, sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY, signal });
     } catch (_e) { return { listingHealthV3DurableOli }; }
     const catalogSnapshot = catRead && typeof catRead === "object" && "snapshot" in catRead ? catRead.snapshot : catRead;
     const catalogReadOk = !catRead || typeof catRead !== "object" || !("read" in catRead) || catRead.read === "ok";
     if (!catalogReadOk || !catalogSnapshot || !catalogSnapshot.object_path) return { listingHealthV3DurableOli };
     let catalogRows = [];
     try {
-      const payload = await loadCatalogPayload(catalogSnapshot.object_path);
+      const payload = await loadCatalogPayload(catalogSnapshot.object_path, { signal });
       catalogRows = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.rows) ? payload.rows : []);
     } catch (_e) { return { listingHealthV3DurableOli }; }
 
-    return { listingHealthV3DurableOli, listingHealthV3DurableCatalog: { available: true, rows: catalogRows } };
+    // Surface the catalog's content-addressed payload_sha + validated_at so the dependency-bundle fingerprint can fold
+    // the exact catalog content identity (WORK C/D blocker 1); additive -- the derive ignores these extra fields.
+    return { listingHealthV3DurableOli, listingHealthV3DurableCatalog: { available: true, rows: catalogRows, payloadSha: S(catalogSnapshot.payload_sha), validatedAt: catalogSnapshot.validated_at || null } };
   };
 }

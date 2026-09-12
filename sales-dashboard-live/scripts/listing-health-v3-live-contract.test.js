@@ -52,7 +52,8 @@ process.stdout.write("listing-health-v3-live-contract\n");
   const block = src.slice(src.indexOf('if (action === "listing-health-v3")'), src.indexOf('if (action === "listing-health-v3")') + 3400);
   ok("the serve switch is DOUBLE-GATED on LHV3_PUBLISH_LIVE && LISTING_HEALTH_V3 (both === \"true\")", /process\.env\.LHV3_PUBLISH_LIVE === "true"[\s\S]{0,120}process\.env\.LISTING_HEALTH_V3 === "true"/.test(block));
   ok("the live path is DEFAULT-WINDOW only, treating the client's explicit '30D' preset as default (else a 7D request would serve the 30D live row)", /lhv3DefaultWindow/.test(block) && /!req\.query\.windowPreset \|\| req\.query\.windowPreset === "30D"/.test(block) && /!req\.query\.windowFrom/.test(block));
-  ok("the live read is a LATEST-pointer read of listing-health-v3 (getLatestReportSnapshotHydrated), NOT an exact client-today paramsHash (promotion is at D-1)", /getLatestReportSnapshotHydrated\(\{ reportKey: "listing-health-v3"/.test(block) && !/getReportSnapshot\(\{ reportKey: "listing-health-v3"/.test(block));
+  ok("the live read is the STRICT resolveListingHealthV3LivePromoted (NOT the latest-pointer getLatestReportSnapshotHydrated shortcut)", /resolveListingHealthV3LivePromoted\(\{ accountId:/.test(block) && !/getLatestReportSnapshotHydrated\(\{ reportKey: "listing-health-v3"/.test(block));
+  ok("the live payload is served ONLY on { ok:true } from the strict resolver", /live && live\.ok === true && live\.payload/.test(block));
   ok("a live miss / OFF / windowed / read failure FALLS THROUGH to the UNCHANGED serveListingHealthV3Preview", block.indexOf("serveListingHealthV3Preview") > block.indexOf("LHV3_PUBLISH_LIVE"));
 }
 
@@ -79,9 +80,10 @@ process.stdout.write("listing-health-v3-live-contract\n");
   const sched = readRepo(".github/workflows/scheduler-v2.yml");
   const jobIdx = sched.indexOf("\n  listing_health_v3_reconcile:");
   ok("scheduler-v2 has a SEPARATE listing_health_v3_reconcile job (like ads_reconcile)", jobIdx > 0);
-  const job = sched.slice(jobIdx, jobIdx + 1600);
+  const job = sched.slice(jobIdx, jobIdx + 2600);
   ok("the immediate reconcile job NEEDS the listing-health-v3 shadow job (runs after ingestion persists the pointers)", /needs: \[run, fba, listing-health-v3\]/.test(job));
   ok("the immediate reconcile job is gated on execute_downstream + non-bootstrap + inventory_asof present", /execute_downstream == 'true'/.test(job) && /scope != 'bootstrap'/.test(job) && /inventory_asof != ''/.test(job));
+  ok("the immediate reconcile job REQUIRES the LHv3 shadow ingestion succeeded (needs.listing-health-v3.result == 'success')", /needs\.listing-health-v3\.result == 'success'/.test(job));
   ok("the immediate reconcile step is continue-on-error + gated on vars.LISTINGS_RECONCILE_LIVE", /continue-on-error: true/.test(job) && /vars\.LISTINGS_RECONCILE_LIVE/.test(job));
   ok("the immediate hook uses --as-of=inventory_asof (== the durable Listings/Raw as_of)", /listing-health-v3-reconcile\.mjs --bucket=\$\{\{ needs\.run\.outputs\.region \}\} --as-of=\$\{\{ needs\.run\.outputs\.inventory_asof \}\}/.test(job));
 }

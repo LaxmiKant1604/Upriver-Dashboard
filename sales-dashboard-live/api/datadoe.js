@@ -182,6 +182,9 @@ import { buildListingHealth, LISTING_HEALTH_REPORT_KEY, LISTING_HEALTH_VERSION }
 // Advanced Listing Health v3 READ-ONLY preview serve (Phase 3): durable OLI/catalog + latest saved evidence only,
 // zero DataDoe exports, zero production writes. Additive action on THIS boundary -- no new api/*.js function.
 import { serveListingHealthV3Preview } from "../lib/server/reports/listing-health-v3-serve.js";
+// WORK D (strict live serve): the promoted live listing-health-v3 resolver -- exact D-1 params_hash + version +
+// provenance + storage-first hydration + validatePayload; { ok:false } -> fall through to the preview above.
+import { resolveListingHealthV3LivePromoted } from "../lib/server/reports/listing-health-v3-live-resolver.js";
 import { buildBuyBoxLoss, BUY_BOX_REPORT_KEY, BUY_BOX_VERSION } from "../lib/server/reports/buy-box.js";
 import { buildReturnsLeakage, RETURNS_REPORT_KEY, RETURNS_VERSION } from "../lib/server/reports/returns.js";
 import { buildPpcPerformance, PPC_REPORT_KEY, PPC_VERSION } from "../lib/server/reports/ppc.js";
@@ -4081,22 +4084,19 @@ async function handleDataDoe(req, res) {
       // ONLY for the DEFAULT (30D) window: the promoted row is the 30D-default derivation (the reconciler omits all
       // window controls), so a request that carries NO window override -- or the explicit default preset "30D" the
       // client sends for that view -- maps to it; any 7D/14D/MONTH/CUSTOM request re-derives via the preview below.
-      // The promoted live row is keyed by the promotion as-of (D-1), NOT the client's `to` (today), so we read it by
-      // the LATEST pointer (getLatestReportSnapshotHydrated, storage-first) exactly as the sibling promoted report
-      // brand-inventory does -- an exact {to:today} lookup would always miss. ANY miss / OFF / windowed request /
-      // read failure FALLS THROUGH to the UNCHANGED read-only preview -- never a blank / zero-filled / fabricated-fresh
-      // / partial response; flipping either flag OFF instantly reverts to the preview (the promoted row is retained
-      // but ignored; LKG preserved). NOTE: the promoted row's OLI freshness tracks the daily cycle that promoted it
-      // (see listings-revision.js: OLI advances are coupled to the same cycle that re-persists Listings); under a
-      // PARTIAL failure (OLI advances but Listings/v3 ingestion does not that cycle) the live row can lag a same-as_of
-      // OLI correction the always-fresh preview reflects -- a bounded, documented PRODUCTION-ACCEPTANCE limitation.
+      // A STRICT resolver (resolveListingHealthV3LivePromoted) proves the row is the genuine exact-D-1 promotion:
+      // exact params_hash at params.to === the expected D-1 (UTC yesterday, computed server-side -- NEVER the client's
+      // `to` = today, and NEVER a latest-pointer), the live report version, params provenance, STORAGE-FIRST hydration
+      // (no partial inline fallback), validatePayload, and not dataUnavailable. ANY failure (miss / wrong-D-1 / wrong
+      // version-or-hash / dangling storage / invalid payload / OFF / windowed request / throw / abort) FALLS THROUGH to
+      // the UNCHANGED read-only preview below -- never a blank / zero-filled / fabricated-fresh / partial / stale /
+      // cross-account response; flipping either flag OFF instantly reverts to the preview (LKG preserved).
       const lhv3DefaultWindow = (!req.query.windowPreset || req.query.windowPreset === "30D") && !req.query.windowFrom && !req.query.windowTo && !req.query.windowMonth;
       if (process.env.LHV3_PUBLISH_LIVE === "true" && process.env.LISTING_HEALTH_V3 === "true" && lhv3DefaultWindow) {
         try {
-          const live = await getLatestReportSnapshotHydrated({ reportKey: "listing-health-v3", accountId: accountScope.accountIds[0] });
-          const livePayload = live && live.payload;
-          if (livePayload && typeof livePayload === "object" && !Array.isArray(livePayload)) { res.status(200).json(livePayload); return; }
-        } catch { /* live-read failure -> fall through to the read-only preview (LKG preserved; never fabricate) */ }
+          const live = await resolveListingHealthV3LivePromoted({ accountId: accountScope.accountIds[0] });
+          if (live && live.ok === true && live.payload && typeof live.payload === "object" && !Array.isArray(live.payload)) { res.status(200).json(live.payload); return; }
+        } catch { /* strict-resolver failure -> fall through to the read-only preview (LKG preserved; never fabricate) */ }
       }
       const connectionId = accountScope.connection && accountScope.connection.id === "secondary" ? "dd-secondary" : "primary";
       try {

@@ -664,7 +664,11 @@ jobs:
   # continue-on-error so a reconcile blip never fails the graph; residue is left for the 30-min backstop (incl. --cleanup).
   listing_health_v3_reconcile:
     needs: [run, fba, listing-health-v3]
-    if: always() && needs.run.outputs.region != '' && needs.run.outputs.execute_downstream == 'true' && needs.run.outputs.scope != 'bootstrap' && needs.run.outputs.inventory_asof != ''
+    # REQUIRE the LHv3 shadow ingestion job to have SUCCEEDED: it is what persists this cycle's durable Listings +
+    # Listings-Raw pointers (source_listings_snapshot / source_listings_raw_snapshot at as_of === inventory_asof). If it
+    # failed/was skipped, the durable pointers were NOT advanced this cycle, so the immediate reconcile must NOT fire
+    # against stale pointers -- the 30-minute backstop (listing-health-v3-reconcile.yml) remains the recovery path.
+    if: always() && needs.run.outputs.region != '' && needs.run.outputs.execute_downstream == 'true' && needs.run.outputs.scope != 'bootstrap' && needs.run.outputs.inventory_asof != '' && needs.listing-health-v3.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
