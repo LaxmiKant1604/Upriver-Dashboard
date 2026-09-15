@@ -16690,3 +16690,46 @@ dataDoeCreates=0** (green workflow). DB: 5 daily-reporting india rows written by
 Full verify 215 steps/191 suites incl build:check. ADS_RECONCILE_LIVE re-enabled true. us-ca resolved to 11/11 D-1 by the
 NATURAL Cloudflare us-ca cycle (zero export from us); LHv3 durable Listings populated (11 us-ca, as_of D-2 -> LHv3 live
 pending Listings source reaching D-1). eu 30th (aHeal UK) source-pending.
+
+### 2026-09-15/16 - Listings/LHv3 freshness contract: date-free CONFIRMED + latent adoption-gate hardening + TIMEZONE-ARTIFACT correction - commit 9161314 on main, PUSHED; verify 216/192
+
+Task: fix the Listings/Listings-Raw freshness contract end-to-end (they are date-free, current-state sources that must
+always use the latest fetched state; freshness = validated_at, NOT a date). **Honest outcome: the code was ALREADY
+date-free, and the durable Listings are ALREADY at D-1 -- the reported "stale as_of=2026-09-13 / Listings lagging to D-2"
+was a TIMEZONE DISPLAY ARTIFACT, not a real lag.**
+
+EVIDENCE (read-only prod, root .env.local):
+- Outbound Listings/Listings-Raw/fba-plan:awd DataDoe requests are date-free (from/to null, order-by child_asin, NO date
+  in request_hash) -- confirmed 3 ways (prod request_meta, REPORT_SOURCE_CONTRACTS windowKind "none", planner windows)
+  and now locked by a new behavioral suite. NO change made to the request path.
+- Durable `source_listings_snapshot.as_of::text` = **2026-09-14** (D-1) for all 11 us-ca accounts, validated 2026-09-15
+  17:25Z; shadow LHv3 payload `asOf` (JSON string) = 2026-09-14. NOTHING is at 09-13.
+- The "09-13 / D-2" reading = node-postgres returns a Postgres `date` as a JS Date at LOCAL midnight; `.toISOString()` on
+  an IST (UTC+5:30) machine shifts it one UTC day BACK (09-14 -> 09-13). PRODUCTION reads Listings via Supabase PostgREST,
+  which returns `date` as a "YYYY-MM-DD" STRING -> no shift, so prod's gate compared 09-14 === 09-14 and ADOPTED. The
+  artifact only ever appeared in the local `pg`-client inspection scripts. See [[listings-asof-timezone-artifact]].
+- Live `report_snapshots` where report_key='listing-health-v3' = **0 rows** -> LHv3 live is EMPTY simply because no live
+  reconcile has promoted it yet (LISTINGS_RECONCILE_LIVE set true 14:39Z; the daily 21:58Z reconcile had not fired). This
+  is "not yet promoted", NOT a stale/defect.
+
+FIX (9161314, one clause in validateListingsPointer): dropped the `as_of === requestedAsOf` D-1 equality gate on the
+date-free Listings/Listings-Raw pointers (kept the calendar-shape sanity + every identity/isolation check). Rationale:
+their as_of is only the cycle publication LABEL (plan.context.to), never a source data date, so a date-EQUALITY adoption
+condition contradicts the stated date-free contract and would incorrectly DEFER LHv3 whenever the label diverges from the
+consumer's requested D-1 (a lagging/failed region, or a reconcile running on a later UTC day than the last Listings save).
+It does NOT change behavior on today's matched-label data (old & new both adopt) -- it is a LATENT contract-correctness /
+resilience hardening, not an active hotfix. requestedAsOf still folds into the fingerprint + manifestToken (D-1 stays the
+publication binding); dated evidence (FBA inventory single-day D-1 + OLI window) keeps its exact-D-1 gates unchanged.
+NOTE: commit 9161314's message frames this as fixing an active "as_of=2026-09-13" stale -- that framing rests on the
+timezone artifact and is corrected here; the fix's mechanism description is accurate.
+
+TESTS: new listings-date-free-request-contract suite (29 assertions) -- Listings/Listings-Raw/AWD requests carry no
+date range/filter/order, request_hash byte-identical across cycle dates, while the dated sibling (single-day D-1 FBA
+inventory) hash DOES change (meaningful control) and D-1 stays required for FBA Inventory Health. dependency-bundle suite
+updated (older/future/equal labels ADOPTED; only a malformed calendar label defers). Full verify 216 steps/192 suites
+incl build:check. api/*.js still 12.
+
+PRODUCTION ACCEPTANCE: NOT yet claimed -- no natural run observed on the corrected SHA. Next natural signals: the daily
+21:58Z listing-health-v3-reconcile (live, from main) and the india 03:07Z / us-ca 16:37Z scheduler cycles, each of which
+should promote LHv3 live from the already-saved durable Listings with ZERO DataDoe exports. Built on
+[[listing-health-v3-reconciler-live]] + [[listings-asof-timezone-artifact]].
