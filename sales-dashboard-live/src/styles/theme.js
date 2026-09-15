@@ -1491,6 +1491,28 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 @media(max-width:900px){ .sync-scope-panel{ grid-template-columns:1fr 1fr; }.sync-token-note{ grid-column:1/-1; } }
 @media(max-width:640px){ .sync-report-grid,.sync-scope-panel{ grid-template-columns:1fr; }.sync-token-note{ grid-column:auto; }.sync-report-actions{ justify-content:stretch; }.sync-report-actions button{ flex:1; } }
 
+/* Report Delivery Status (read-only, per account). Icon+text status; horizontal scroll on small screens. */
+.sync-scope-panel.delivery-panel{ display:block; }
+.delivery-controls{ display:flex; flex-wrap:wrap; gap:14px; align-items:end; margin:14px 0; }
+.delivery-controls label{ display:grid; gap:6px; }
+.delivery-controls label>span{ color:var(--text-muted); font-size:11px; font-weight:700; text-transform:uppercase; }
+.delivery-controls select{ min-height:38px; border:1px solid var(--border-default); border-radius:6px; background:var(--bg-surface); color:var(--text-primary); padding:0 10px; }
+.delivery-controls .delivery-toggle{ grid-auto-flow:column; align-items:center; gap:8px; }
+.delivery-controls .delivery-toggle input{ width:16px; height:16px; }
+.delivery-controls .delivery-toggle>span{ text-transform:none; font-weight:600; font-size:13px; color:var(--text-secondary); }
+.delivery-summary{ display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
+.delivery-table-wrap{ overflow-x:auto; margin-top:8px; border:1px solid var(--border-default); border-radius:10px; }
+.delivery-table{ width:100%; border-collapse:collapse; font-size:12px; min-width:840px; }
+.delivery-table th{ text-align:left; padding:8px 10px; background:var(--bg-subtle); color:var(--text-secondary); font-size:11px; text-transform:uppercase; letter-spacing:.02em; white-space:nowrap; border-bottom:1px solid var(--border-default); }
+.delivery-table td{ padding:8px 10px; border-top:1px solid var(--border-default); vertical-align:top; }
+.delivery-table tr.delivery-ineligible{ opacity:.62; }
+.delivery-acct{ display:flex; flex-direction:column; gap:2px; min-width:150px; }
+.delivery-cell{ display:flex; flex-direction:column; gap:4px; align-items:flex-start; }
+.delivery-chip{ font-size:11px; white-space:nowrap; }
+.delivery-ts{ color:var(--text-muted); font-size:10.5px; line-height:1.3; overflow-wrap:anywhere; }
+.delivery-remark{ font-weight:600; white-space:nowrap; }
+@media(max-width:640px){ .delivery-controls>label,.delivery-controls>button{ flex:1 1 auto; } }
+
 /* ======================= ROYAL VIOLET THEME =======================
    Presentation-only overrides for the shared shell and report primitives.
    Data contracts, routes, report controls and interaction semantics stay in

@@ -46,6 +46,7 @@
   "test:fba-reconcile-prodshape": "node scripts/fba-reconcile-prodshape.test.js",
   "test:listing-health-v3-dependency-bundle": "node scripts/listing-health-v3-dependency-bundle.test.js",
   "test:listings-date-free-request-contract": "node scripts/listings-date-free-request-contract.test.js",
+  "test:delivery-status": "node scripts/delivery-status.test.js",
   "test:listing-health-v3-durable-loader": "node scripts/listing-health-v3-durable-loader.test.js",
   "test:listing-health-v3-live-identity": "node scripts/listing-health-v3-live-identity.test.js",
   "test:listing-health-v3-fingerprint-invariant": "node scripts/listing-health-v3-fingerprint-invariant.test.js",

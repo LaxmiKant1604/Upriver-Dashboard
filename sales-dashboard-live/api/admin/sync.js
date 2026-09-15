@@ -1,14 +1,26 @@
 import {
   assertAdmin,
   getAccountDirectoryRows,
+  getAccountOnboardingRows,
+  getAdsSyncStates,
   getDashboardAccess,
+  getLatestReportJobLineage,
+  getRecentSyncCycleIds,
+  getReportSnapshotsMeta,
   getReportSyncSettings,
+  getSourceCoverageWindows,
+  getSourceListingsRawSnapshot,
+  getSourceListingsSnapshot,
   getSourcePromotedPublishSettings,
+  getSourceSnapshot,
+  getSyncCycle,
   getSyncTargets,
   insertAuditLog,
   setReportSyncSetting,
   setSourcePromotedPublishControl,
 } from "../../lib/server/supabase.js";
+import { primaryOrganizationFingerprint } from "../../lib/server/datadoe-connections.js";
+import { loadDeliveryStatus } from "../../lib/server/delivery-status.js";
 import { controlledReport, reportControlCatalog, SOURCE_PROMOTED_REPORT_KEYS } from "../../lib/server/sync/report-controls.js";
 import { runScheduledSync } from "../../lib/server/sync/run-sync.js";
 
@@ -71,6 +83,23 @@ export default async function handler(req, res) {
     assertAdmin(access);
 
     if (req.method === "GET") {
+      // READ-ONLY "Report Delivery Status" view. Same admin gate (already asserted above); shares this route so no
+      // new api/*.js file is added (Vercel 12-function cap). It ONLY reads durable evidence -- never writes, exports,
+      // dispatches, or spends tokens. The default GET response is unchanged for every request that is not view=delivery.
+      if (String(req.query?.view || "") === "delivery") {
+        const payload = await loadDeliveryStatus(
+          { region: req.query.region, cycleDate: req.query.cycle ?? req.query.cycleDate, failuresOnly: req.query.failuresOnly },
+          {
+            primaryOrganizationFingerprint,
+            getAccountDirectoryRows, getAccountOnboardingRows,
+            getRecentSyncCycleIds, getSyncCycle,
+            getSourceCoverageWindows, getSourceSnapshot, getSourceListingsSnapshot, getSourceListingsRawSnapshot,
+            getAdsSyncStates, getReportSnapshotsMeta, getLatestReportJobLineage,
+          },
+        );
+        res.status(200).json(payload);
+        return;
+      }
       res.status(200).json(await statusPayload());
       return;
     }

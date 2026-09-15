@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { DatabaseZap, LockKeyhole, PauseCircle, PlayCircle, RefreshCw } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Clock, DatabaseZap, LockKeyhole, MinusCircle, PauseCircle, PlayCircle, RefreshCw, XCircle } from "lucide-react";
 
 async function adminFetch(path, accessToken, options = {}) {
   const response = await fetch(path, {
@@ -18,6 +18,31 @@ async function adminFetch(path, accessToken, options = {}) {
 const fmtTs = (value) => (value ? new Date(value).toLocaleString() : "—");
 const fmtCeiling = (spent, ceiling) => (ceiling == null ? `${spent} / —` : `${spent} / ${ceiling}`);
 const DASHBOARD_LABELS = { "daily-reporting": "Daily Reporting", "brand-view": "Brand View" };
+
+// ---- Report Delivery Status (read-only) ---------------------------------------------------------------------
+const DELIVERY_REGION_OPTIONS = [
+  { value: "india", label: "India" },
+  { value: "europe-au", label: "Europe / Australia" },
+  { value: "us-ca", label: "US / Canada" },
+];
+// Status is ALWAYS icon + text (never colour alone): each state maps to a lucide icon, a tone class, and a label.
+const DELIVERY_STATUS_META = {
+  Yes: { tone: "good", Icon: CheckCircle2 },
+  No: { tone: "bad", Icon: XCircle },
+  Waiting: { tone: "neutral", Icon: Clock },
+  Unavailable: { tone: "warn", Icon: AlertTriangle },
+  "Not applicable": { tone: "neutral", Icon: MinusCircle },
+};
+function DeliveryChip({ prefix, status, suffix }) {
+  const meta = DELIVERY_STATUS_META[status] || DELIVERY_STATUS_META.Unavailable;
+  const Icon = meta.Icon;
+  return (
+    <span className={`status-badge ${meta.tone} delivery-chip`} title={`${prefix}: ${status}${suffix ? ` (${suffix})` : ""}`}>
+      <Icon size={13} aria-hidden="true" />
+      <span>{prefix}: {status}{suffix ? ` · ${suffix}` : ""}</span>
+    </span>
+  );
+}
 
 function SourceCard({ card, busyKey, onPause, onSyncMissing }) {
   const s = card.status;
@@ -64,6 +89,14 @@ export default function DataSyncCenter({ accessToken }) {
   const [notice, setNotice] = useState("");
   const [showReports, setShowReports] = useState(false);
   const [showQuality, setShowQuality] = useState(false);
+  // Report Delivery Status (read-only) local state — all hooks stay above every early return (Rules of Hooks).
+  const [showDelivery, setShowDelivery] = useState(false);
+  const [delivery, setDelivery] = useState(null);
+  const [deliveryError, setDeliveryError] = useState("");
+  const [deliveryLoading, setDeliveryLoading] = useState(false);
+  const [deliveryRegion, setDeliveryRegion] = useState("india");
+  const [deliveryCycle, setDeliveryCycle] = useState("");
+  const [deliveryFailuresOnly, setDeliveryFailuresOnly] = useState(false);
 
   const load = useCallback(async () => {
     setError("");
@@ -78,6 +111,24 @@ export default function DataSyncCenter({ accessToken }) {
   }, [accessToken]);
 
   useEffect(() => { void load(); }, [load]);
+
+  // Read-only delivery-status fetch. GET only (never POST/PATCH) — it reads durable evidence and spends zero tokens.
+  const loadDelivery = useCallback(async () => {
+    setDeliveryLoading(true);
+    setDeliveryError("");
+    try {
+      const qs = new URLSearchParams({ view: "delivery", region: deliveryRegion });
+      if (deliveryCycle) qs.set("cycle", deliveryCycle);
+      if (deliveryFailuresOnly) qs.set("failuresOnly", "true");
+      const next = await adminFetch(`/api/admin/sync?${qs.toString()}`, accessToken);
+      setDelivery(next);
+    } catch (err) { setDeliveryError(err.message); setDelivery(null); }
+    finally { setDeliveryLoading(false); }
+  }, [accessToken, deliveryRegion, deliveryCycle, deliveryFailuresOnly]);
+
+  // Load (and reload) the matrix only while the section is open and whenever a control changes. Lazy: nothing is
+  // fetched until an admin opens the section.
+  useEffect(() => { if (showDelivery) void loadDelivery(); }, [showDelivery, loadDelivery]);
 
   const bucketData = useMemo(() => data?.buckets?.[bucket] || null, [data, bucket]);
 
@@ -269,6 +320,85 @@ export default function DataSyncCenter({ accessToken }) {
               </section>
             ))}
           </div>
+        )}
+      </div>
+
+      <div className="panel sync-scope-panel delivery-panel">
+        <button type="button" className="plan-export-btn" onClick={() => setShowDelivery((v) => !v)}>
+          {showDelivery ? "Hide" : "Show"} report delivery status (read-only, per account)
+        </button>
+        {showDelivery && (
+          <>
+            <div className="delivery-controls">
+              <label><span>Region</span>
+                <select value={deliveryRegion} onChange={(e) => { setDeliveryRegion(e.target.value); setDeliveryCycle(""); }}>
+                  {DELIVERY_REGION_OPTIONS.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
+                </select>
+              </label>
+              <label><span>Scheduler cycle</span>
+                <select value={deliveryCycle} onChange={(e) => setDeliveryCycle(e.target.value)}>
+                  <option value="">Latest completed</option>
+                  {(delivery?.availableCycleDates || []).map((d) => <option key={d} value={d}>{d}</option>)}
+                </select>
+              </label>
+              <label className="delivery-toggle"><input type="checkbox" checked={deliveryFailuresOnly} onChange={(e) => setDeliveryFailuresOnly(e.target.checked)} /><span>Failures only</span></label>
+              <button type="button" className="plan-export-btn" onClick={loadDelivery} disabled={deliveryLoading}>
+                <RefreshCw size={14} aria-hidden="true" className={deliveryLoading ? "spin" : ""} /> Reload status
+              </button>
+            </div>
+
+            {deliveryError && <div className="data-alert error"><strong>Delivery status unavailable</strong><div>{deliveryError}</div></div>}
+            {(delivery?.notes || []).map((n, i) => <div key={i} className="sync-token-note">{n}</div>)}
+
+            {delivery?.summary && (
+              <div className="delivery-summary">
+                <span className="status-badge neutral">Accounts: {delivery.summary.accountCount}</span>
+                <span className="status-badge neutral">Cycle: {delivery.cycleDate || "—"}{delivery.cycleAsOf ? ` (data as-of ${delivery.cycleAsOf})` : ""}{delivery.cycleStatus ? ` · ${delivery.cycleStatus}` : ""}</span>
+                <span className={`status-badge ${delivery.summary.exportTotal > 0 && delivery.summary.exportYes === delivery.summary.exportTotal ? "good" : (delivery.summary.exportTotal === 0 ? "neutral" : "warn")}`}>Exported: {delivery.summary.exportYes} / {delivery.summary.exportTotal}</span>
+                <span className={`status-badge ${delivery.summary.publishTotal > 0 && delivery.summary.publishYes === delivery.summary.publishTotal ? "good" : (delivery.summary.publishTotal === 0 ? "neutral" : "warn")}`}>Published: {delivery.summary.publishYes} / {delivery.summary.publishTotal}</span>
+                {delivery.summary.failedCount > 0 && <span className="status-badge bad">Needs attention: {delivery.summary.failedCount}</span>}
+                {delivery.summary.waitingCount > 0 && <span className="status-badge neutral">Waiting: {delivery.summary.waitingCount}</span>}
+              </div>
+            )}
+
+            {deliveryLoading && !delivery ? <div className="sync-loading">Loading delivery status…</div> : null}
+            {delivery && delivery.accounts.length === 0 ? <div className="sync-token-note">No accounts to show for this region and filter.</div> : null}
+
+            {delivery && delivery.accounts.length > 0 && (
+              <div className="delivery-table-wrap">
+                <table className="delivery-table">
+                  <thead>
+                    <tr>
+                      <th>Account</th>
+                      {(delivery.accounts[0].reports || []).map((r) => <th key={r.sourceKey}>{r.label}</th>)}
+                      <th>Remark</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {delivery.accounts.map((a) => (
+                      <tr key={a.accountId} className={a.eligible ? "" : "delivery-ineligible"}>
+                        <td className="delivery-acct">
+                          <strong>{a.accountName || a.accountId}</strong>
+                          <span className="delivery-ts">{String(a.accountId).slice(0, 10)} · {a.marketplace || "—"}{a.eligible ? "" : " · not eligible"}</span>
+                        </td>
+                        {a.reports.map((r) => (
+                          <td key={r.sourceKey} title={r.dependentReports && r.dependentReports.length ? `Dashboards: ${r.dependentReports.join(", ")}` : undefined}>
+                            <div className="delivery-cell">
+                              <DeliveryChip prefix="Export" status={r.exportStatus} suffix={r.exportMode === "validated-reuse" ? "reuse" : null} />
+                              <DeliveryChip prefix="Publish" status={r.publishStatus} suffix={r.publicationExpected ? `${r.publicationCount}/${r.publicationExpected}` : null} />
+                              <div className="delivery-ts">{r.validatedAt ? fmtTs(r.validatedAt) : (r.sourceAsOf ? `as of ${r.sourceAsOf}` : "—")}{r.safeCode ? ` · ${r.safeCode}` : ""}</div>
+                            </div>
+                          </td>
+                        ))}
+                        <td className="delivery-remark">{a.remark}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <div className="sync-token-note">Read-only: this view only reads durable evidence. It never triggers an export, a sync, or a publication, and spends zero DataDoe tokens.</div>
+          </>
         )}
       </div>
     </main>
