@@ -123,13 +123,17 @@ const run = (over = {}) => { const { deps, args } = harness(over); return resolv
   ok("marketplace mismatch -> marketplace-mismatch (cross-marketplace fail-closed)", V({ ...good, marketplace: "CA" }).reason === "marketplace-mismatch");
   ok("bad marketplace shape -> marketplace-mismatch", V({ ...good, marketplace: "USA" }).reason === "marketplace-mismatch");
   ok("wrong source key -> source-key-mismatch", V({ ...good, source_key: "listings-raw" }).reason === "source-key-mismatch");
-  ok("older as_of -> not-d1", V({ ...good, as_of: "2026-09-03" }).reason === "not-d1");
-  ok("future as_of -> not-d1", V({ ...good, as_of: "2026-09-05" }).reason === "not-d1");
-  ok("shape-malformed date (2026-9-4) -> not-d1", V({ ...good, as_of: "2026-9-4" }).reason === "not-d1");
+  // DATE-FREE contract: Listings/Listings-Raw as_of is a CYCLE LABEL, NOT a source date -- it is NEVER gated on
+  // as_of === requestedAsOf. An older / future / different-cycle as_of is ADOPTED (freshness = validated_at + the stable
+  // date-free request hash); only a MALFORMED (non-calendar) as_of is rejected (shape sanity -> as-of-invalid).
+  ok("older as_of than the cycle -> ADOPTED (date-free; as_of is a cycle label, not a D-1 gate)", V({ ...good, as_of: "2026-09-03" }).ok === true);
+  ok("future as_of than the cycle -> ADOPTED (date-free)", V({ ...good, as_of: "2026-09-05" }).ok === true);
+  ok("as_of exactly equal to the cycle -> ADOPTED", V({ ...good, as_of: ASOF }).ok === true);
+  ok("shape-malformed date (2026-9-4) -> as-of-invalid (shape sanity, not a D-1 gate)", V({ ...good, as_of: "2026-9-4" }).reason === "as-of-invalid");
   // Blocker 4: REAL UTC calendar round-trip -- an impossible date (right shape, wrong calendar) is rejected even when
-  // it equals requestedAsOf (V here requires as_of===requestedAsOf=ASOF, so use an impossible date as BOTH).
-  ok("impossible calendar date 2026-02-30 -> not-d1 (real round-trip, not shape-only)", validateListingsPointer({ snapshot: { ...good, as_of: "2026-02-30" }, expectedOrg: ORG, durableConn: CONN, sourceKey: "listings", accountId: ACCT, marketplace: MKT, requestedAsOf: "2026-02-30", expectedObjectPath: eop }).reason === "not-d1");
-  ok("impossible calendar date 2026-99-99 -> not-d1", validateListingsPointer({ snapshot: { ...good, as_of: "2026-99-99" }, expectedOrg: ORG, durableConn: CONN, sourceKey: "listings", accountId: ACCT, marketplace: MKT, requestedAsOf: "2026-99-99", expectedObjectPath: eop }).reason === "not-d1");
+  // Impossible calendar date (right shape, wrong calendar) -> as-of-invalid via the REAL UTC round-trip (not shape-only).
+  ok("impossible calendar date 2026-02-30 -> as-of-invalid (real round-trip)", V({ ...good, as_of: "2026-02-30" }).reason === "as-of-invalid");
+  ok("impossible calendar date 2026-99-99 -> as-of-invalid", V({ ...good, as_of: "2026-99-99" }).reason === "as-of-invalid");
   ok("blank validated_at -> validated-at-invalid", V({ ...good, validated_at: "" }).reason === "validated-at-invalid");
   ok("garbage validated_at (not a real timestamp) -> validated-at-invalid", V({ ...good, validated_at: "not-a-timestamp" }).reason === "validated-at-invalid");
   // Codex round-4: the strict RFC3339 validator (not a loose Date.parse) rejects impossible/date-only/'1' validated_at.
@@ -194,7 +198,16 @@ await miss("string row_count '2' on the listings pointer -> defer (P2 parity)", 
 await miss("null row_count on the listings-raw pointer -> defer", { readListingsRawSnapshot: async () => ({ read: "ok", snapshot: { ...ptr("listings-raw"), row_count: null } }) }, "row-count-invalid");
 await miss("string row_count '1' on the FBA inventory pointer -> defer (whole bundle)", { readInventorySnapshot: async () => ({ read: "ok", snapshot: { ...invPtr(), row_count: "1" } }) }, "inventory-pointer-invalid");
 await miss("boolean row_count on the FBA inventory pointer -> defer", { readInventorySnapshot: async () => ({ read: "ok", snapshot: { ...invPtr(), row_count: true } }) }, "inventory-pointer-invalid");
-await miss("malformed as_of -> defer", { readListingsSnapshot: async () => ({ read: "ok", snapshot: ptr("listings", { as_of: "2026-9-4" }) }) }, "not-d1");
+await miss("malformed as_of -> defer (as-of-invalid shape sanity)", { readListingsSnapshot: async () => ({ read: "ok", snapshot: ptr("listings", { as_of: "2026-9-4" }) }) }, "as-of-invalid");
+// DATE-FREE adoption (the freshness-contract fix): a Listings/Listings-Raw pointer whose as_of LAGS or LEADS the cycle
+// requestedAsOf is ADOPTED (eligible) -- it is NOT deferred as "not-d1". Proves the reconciler uses the latest validated
+// date-free Listings regardless of the cycle label, so LHv3 promotes instead of serving stale.
+{
+  const bLag = await run({ listingsPtr: { as_of: "2026-09-03" }, rawPtr: { as_of: "2026-09-03" } }); // both a day behind the cycle
+  ok("Listings/Raw as_of behind the cycle D-1 -> ELIGIBLE (adopted; not a not-d1 defer)", bLag.eligible === true && /^[0-9a-f]{32}$/.test(bLag.revisionId));
+  const bLead = await run({ listingsPtr: { as_of: "2026-09-05" }, rawPtr: { as_of: "2026-09-05" } }); // ahead of the cycle
+  ok("Listings/Raw as_of ahead of the cycle D-1 -> ELIGIBLE (adopted)", bLead.eligible === true);
+}
 await miss("storage failure -> defer (NO inline fallback)", { loadSnapshotPayload: async (p) => { if (p.includes("/listings/")) throw new Error("storage down"); return { rows: [{ sku: "A" }, { sku: "B" }] }; } }, "payload-unreadable");
 await miss("schema-missing pointer (typed read failure) -> defer", { readListingsSnapshot: async () => ({ read: "schema-missing", snapshot: null }) }, "read-schema-missing");
 await miss("read-failed pointer (typed read failure) -> defer", { readListingsSnapshot: async () => ({ read: "read-failed", snapshot: null }) }, "read-read-failed");

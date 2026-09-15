@@ -141,7 +141,15 @@ export function validateListingsPointer({ snapshot, expectedOrg, durableConn, so
   if (S(snapshot.account_id) !== S(accountId)) return { ok: false, reason: "account-mismatch" };
   if (!MKT_RE.test(S(snapshot.marketplace)) || S(snapshot.marketplace) !== S(marketplace)) return { ok: false, reason: "marketplace-mismatch" };
   if (S(snapshot.source_key) !== S(sourceKey)) return { ok: false, reason: "source-key-mismatch" };
-  if (!isRealCalendarDate(S(snapshot.as_of)) || S(snapshot.as_of) !== S(requestedAsOf)) return { ok: false, reason: "not-d1" };
+  // Listings + Listings-Raw are DATE-FREE, current-state sources: the outbound DataDoe request carries windowKind "none"
+  // (from/to null, order-by child_asin only, NO date in the request hash -> stable day-to-day). Their durable as_of is
+  // the CYCLE / publication LABEL (materialize.js: plan.context.to = the cycle D-1), NOT a source data date, and their
+  // freshness is validated_at + that stable date-free request hash. So we DO NOT gate them on as_of === requestedAsOf --
+  // that exact-D-1 equality is for the DATED evidence (FBA inventory single-day D-1 + OLI window), never a date-free
+  // source; applying it here wrongly deferred LHv3 whenever the latest-good Listings label lagged the cycle D-1. We keep
+  // only a shape sanity that the label is a real calendar date and adopt the LATEST validated pointer regardless of which
+  // cycle label it carries (its strictly-newer CAS + validated_at + content-addressed namespace prove it is the freshest).
+  if (!isRealCalendarDate(S(snapshot.as_of))) return { ok: false, reason: "as-of-invalid" };
   if (!isRealTimestamp(snapshot.validated_at)) return { ok: false, reason: "validated-at-invalid" };
   if (!nb(snapshot.source_request_hash)) return { ok: false, reason: "request-hash-blank" };
   const sha256Hex = S(snapshot.payload_sha);
