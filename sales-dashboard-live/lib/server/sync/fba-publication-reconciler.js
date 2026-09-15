@@ -85,6 +85,7 @@ export function buildFbaPublicationReconciler({
     runReleaseForAccount,
     postPromotionHook: null, membershipSourceReport: null, postPromotionSummaryKey: "brandView",
     revisionChangedReason: "fba-revision-changed",
+    family: "fba",
     reportKeys,
     openControls, closeControls,
     outOfTime, deadlineRace, makeAbortController, awaitSettled,

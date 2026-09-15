@@ -89,6 +89,7 @@ export function buildOliPublicationReconciler({
     membershipSourceReport: BRAND_VIEW_MEMBERSHIP_SOURCE_REPORT,
     postPromotionSummaryKey: "brandView",
     revisionChangedReason: "oli-revision-changed",
+    family: "oli",
     reportKeys,
     openControls, closeControls,
     outOfTime, deadlineRace, makeAbortController, awaitSettled,

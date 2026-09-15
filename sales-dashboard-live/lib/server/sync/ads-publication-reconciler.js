@@ -102,6 +102,7 @@ export function buildAdsReportReconciler({
     liveContracts, computeHash, reportDerivations, shadowKeyFor,
     runReleaseForAccount,
     revisionChangedReason: "ads-revision-changed",
+    family: "ads",
     reportKeys: [reportKey],
     openControls, closeControls,
     outOfTime, deadlineRace, makeAbortController, awaitSettled,

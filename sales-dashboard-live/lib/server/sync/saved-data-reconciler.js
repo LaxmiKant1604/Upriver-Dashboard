@@ -46,6 +46,27 @@ const RETRYABLE_DERIVE_CODES = new Set(["SOURCE_UNAVAILABLE", "SOURCE_PAUSED", "
 // derive:lineage-mismatch / derive:saved-zero), an UNKNOWN code, or a MIX with any non-retryable code is a HARD failure.
 const RETRYABLE_BLOCKER_REASONS = new Set(["ads-coverage-incomplete", "ads-coverage-no-accounts", "ads-coverage-read-not-ok", "ads-coverage-window-malformed", "ads-coverage-windows-not-array", "ads-evidence-missing", "backfill-start-not-reached", "coverage-incomplete", "no-accounts", "no-validated-snapshot", "source-unavailable"]);
 const blockerReason = (code) => { const s = String(code); const i = s.indexOf(":"); return i < 0 ? s : s.slice(i + 1); };
+// SANITIZED per-account failure diagnostic. Maps the typed release result into a STABLE, non-sensitive
+// { stage, reasonCode } for the boundary log. reasonCode is the code BEFORE the first ':' -- NEVER the appended
+// err.message / disposition / outcome detail, and NEVER a payload, credential, SQL string, or Amazon/customer data.
+// The release's coarse "derive" stage actually spans derive + job-save + shadow-save, so the reason prefix disambiguates
+// into the incident stage vocabulary.
+export function diagStageFor(result) {
+  const st = S(result && result.stage);
+  const code = (S(result && result.reason).split(":")[0]) || st || "unknown"; // stable code, message stripped
+  let stage;
+  if (code.startsWith("catalog")) stage = "catalog-evidence";
+  else if (code.startsWith("ads-revision") || code === "no-revision-id") stage = "revision";
+  else if (code.startsWith("ads-") || code.startsWith("oli-history") || code.startsWith("oli-coverage") || code.startsWith("oli-") || code.startsWith("durable-")) stage = "source-evidence";
+  else if (code.startsWith("cycle-") || code.startsWith("claim") || code.startsWith("lineage-upsert") || code === "already-complete-hash-mismatch") stage = "job-save";
+  else if (code.startsWith("shadow") || code.startsWith("reconcile")) stage = "shadow-save";
+  else if (code.startsWith("finalize")) stage = "closure";
+  else if (code.startsWith("preflight") || code.startsWith("publish") || code.startsWith("lease-lost") || st === "publish-gates" || st === "publish") stage = "publish";
+  else if (code.startsWith("live-readback") || st === "readback") stage = "readback";
+  else if (code.startsWith("controls")) stage = "controls";
+  else stage = "derive"; // bad-args, daily-window-unresolved, daily-payload-malformed, daily-derive-refused, ...
+  return { stage, reasonCode: code };
+}
 function statusFromRelease(result) {
   if (result && result.ok === true && Number(result.code) === 0) return RECONCILE_STATUS.READBACK_VERIFIED;
   const stage = S(result && result.stage);
@@ -99,7 +120,7 @@ export function buildSavedDataReconciler({
   outOfTime = () => false, deadlineRace = (p) => p,
   makeAbortController = () => new AbortController(),
   awaitSettled = async (p) => { try { await p; } catch { /* a rejection is a settlement -- the op stopped */ } return { settled: true }; },
-  withTimeout = (p) => p, clock = () => new Date(), log = noop,
+  withTimeout = (p) => p, clock = () => new Date(), log = noop, family = "saved-data",
 } = {}) {
   if (!adapter || typeof adapter.readScopeEvidence !== "function" || typeof adapter.computeAccountRevision !== "function") {
     throw new Error("buildSavedDataReconciler requires an adapter with readScopeEvidence + computeAccountRevision (fail closed).");
@@ -247,6 +268,13 @@ export function buildSavedDataReconciler({
               for (const rk of staleReports) rec.reports[rk] = { state: RECONCILE_STATUS.READBACK_VERIFIED, reason: null };
               if (membershipSourceReport && staleReports.includes(membershipSourceReport)) promoted.push(accountId);
             } else {
+              // SANITIZED per-account failure diagnostic (incident visibility): ONLY {family, region, accountId,
+              // requestedAsOf, stage, reasonCode}. No payload/credential/SQL/Amazon data (reasonCode is the stable code
+              // before ':'). Emitted only for a hard FAILED_* (a DEFERRED_DEPENDENCY is expected/retryable, not logged).
+              if (execStatus === RECONCILE_STATUS.FAILED_DERIVE || execStatus === RECONCILE_STATUS.FAILED_PUBLISH || execStatus === RECONCILE_STATUS.FAILED_READBACK) {
+                const d = diagStageFor(result);
+                log("SAVED_DATA_RECONCILE_DIAG " + JSON.stringify({ family, region: S(bucket), accountId, requestedAsOf: S(requestedAsOf), stage: d.stage, reasonCode: d.reasonCode }));
+              }
               for (const rk of staleReports) rec.reports[rk] = { state: execStatus, reason: S(result && (result.reason || (result.problems && result.problems[0]))) || null, lkgPreserved: true, ...(result && (result.leaseLost || result.status === "CONTROL_LEASE_LOST") ? { leaseLost: true } : {}) };
             }
           }

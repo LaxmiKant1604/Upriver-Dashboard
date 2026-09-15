@@ -102,6 +102,7 @@ const SUITES = [
   "test:oli-dependent-reports",
   "test:oli-publication-revision",
   "test:oli-publication-reconciler",
+  "test:saved-data-reconciler-diag",
   "test:oli-reconcile-prodshape",
   "test:oli-reconcile-workflow",
   "test:fba-publication-revision",

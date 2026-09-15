@@ -79,6 +79,7 @@ export function buildListingHealthV3PublicationReconciler({
     runReleaseForAccount,
     postPromotionHook: null, membershipSourceReport: null, postPromotionSummaryKey: "listingHealthV3",
     revisionChangedReason: "listings-manifest-changed",
+    family: "listings",
     reportKeys,
     openControls, closeControls,
     outOfTime, deadlineRace, makeAbortController, awaitSettled,
