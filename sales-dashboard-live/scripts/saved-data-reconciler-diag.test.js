@@ -15,9 +15,9 @@ writeSync(1, "saved-data-reconciler-diag\n");
 const S = (v) => (v == null ? "" : String(v));
 const emit = ({ family, bucket, accountId, requestedAsOf, result }) => {
   const d = diagStageFor(result);
-  return { family, region: S(bucket), accountId, requestedAsOf: S(requestedAsOf), stage: d.stage, reasonCode: d.reasonCode };
+  return { family, region: S(bucket), accountId, requestedAsOf: S(requestedAsOf), stage: d.stage, reasonCode: d.reasonCode, errClass: d.errClass };
 };
-const ALLOWED = ["family", "region", "accountId", "requestedAsOf", "stage", "reasonCode"];
+const ALLOWED = ["family", "region", "accountId", "requestedAsOf", "stage", "reasonCode", "errClass"];
 
 // ---- (1) stage vocabulary: every release stage+reason maps to the required incident vocabulary ----
 {
@@ -72,12 +72,27 @@ const ALLOWED = ["family", "region", "accountId", "requestedAsOf", "stage", "rea
   }
 }
 
-// ---- (3) the emitted boundary object is EXACTLY the 6-key allowlist -- nothing else (no payload/params/rows) ----
+// ---- (2b) errClass: a BOUNDED status:keyword classifier of the appended error tail -- no raw message/value/UUID ----
+{
+  const cases = [
+    ["lineage-upsert-threw:Supabase request failed (400): sync cycle 00000000-0000-0000-0000-000000000000 is terminal (partial); refusing to append/alter child work", "400:terminal-cycle"],
+    ["lineage-upsert-threw:Supabase request failed (400): parent sync cycle deadbeef not found; refusing to append/alter child work", "400:not-found"],
+    ["lineage-upsert-threw:Supabase request failed (400): Could not find the 'durable_content_deps' column of 'sync_report_jobs' in the schema cache", "400:schema-cache"],
+    ["publish-threw:Supabase request failed (409): duplicate key value violates unique constraint \"x\"", "409:duplicate"],
+    ["catalog-integrity", ""], // no appended tail -> empty errClass
+  ];
+  for (const [reason, expect] of cases) ok(`diagErrClass(${expect || "empty"})`, diagStageFor({ stage: "derive", reason }).errClass === expect);
+  // errClass NEVER carries the UUID / column value / raw message.
+  const ec = diagStageFor({ stage: "derive", reason: "lineage-upsert-threw:Supabase request failed (400): sync cycle 12f3a683-2880-414e is terminal (partial)" }).errClass;
+  for (const secret of ["12f3a683", "refusing", "append", "sync cycle"]) ok(`errClass excludes '${secret}'`, !ec.includes(secret));
+}
+
+// ---- (3) the emitted boundary object is EXACTLY the 7-key allowlist -- nothing else (no payload/params/rows) ----
 {
   const obj = emit({ family: "ads", bucket: "india", accountId: "acct-00", requestedAsOf: "2026-09-14",
     result: { stage: "derive", reason: "daily-payload-malformed: payload {rows:[{customer:'X'}]} token=abc", problems: ["daily-payload-malformed: leak"], params: { secret: "no" }, payload: { rows: [] } } });
   const keys = Object.keys(obj).sort();
-  ok("emitted object has EXACTLY the 6 allowlisted keys", keys.length === 6 && keys.every((k) => ALLOWED.includes(k)) && ALLOWED.every((k) => keys.includes(k)));
+  ok("emitted object has EXACTLY the 7 allowlisted keys", keys.length === 7 && keys.every((k) => ALLOWED.includes(k)) && ALLOWED.every((k) => keys.includes(k)));
   ok("emitted object carries no params/payload/problems keys", !("params" in obj) && !("payload" in obj) && !("problems" in obj) && !("reason" in obj));
   const json = JSON.stringify(obj);
   // NOTE: "payload" legitimately appears inside the stable code "daily-payload-malformed" (a stage code, not a leak),

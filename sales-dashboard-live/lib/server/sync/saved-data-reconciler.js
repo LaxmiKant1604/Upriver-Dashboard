@@ -65,7 +65,22 @@ export function diagStageFor(result) {
   else if (code.startsWith("live-readback") || st === "readback") stage = "readback";
   else if (code.startsWith("controls")) stage = "controls";
   else stage = "derive"; // bad-args, daily-window-unresolved, daily-payload-malformed, daily-derive-refused, ...
-  return { stage, reasonCode: code };
+  return { stage, reasonCode: code, errClass: diagErrClass(S(result && (result.reason || (result.problems && result.problems[0])))) };
+}
+// A BOUNDED, SANITIZED classifier of an appended error tail (the part after the reasonCode ':'). Emits ONLY a DB
+// error CLASS -- an HTTP status number + a keyword from a fixed whitelist of schema/state descriptors -- NEVER the raw
+// message, a payload, a value, a UUID, a connection string, a token, or Amazon/customer data. "" when nothing matches.
+function diagErrClass(reason) {
+  const s = String(reason);
+  const status = (s.match(/\((\d{3})\)/) || [])[1] || "";
+  let kw = "";
+  for (const [re, label] of [
+    [/is terminal|terminal \(/i, "terminal-cycle"], [/not found|does not exist/i, "not-found"],
+    [/schema cache|PGRST20[45]/i, "schema-cache"], [/\bcolumn\b/i, "column"], [/immutable/i, "immutable"],
+    [/duplicate key|already exists/i, "duplicate"], [/violates|constraint/i, "constraint"],
+    [/permission denied|not authorized/i, "denied"], [/timeout|timed out/i, "timeout"],
+  ]) { if (re.test(s)) { kw = label; break; } }
+  return [status, kw].filter(Boolean).join(":");
 }
 function statusFromRelease(result) {
   if (result && result.ok === true && Number(result.code) === 0) return RECONCILE_STATUS.READBACK_VERIFIED;
@@ -273,7 +288,7 @@ export function buildSavedDataReconciler({
               // before ':'). Emitted only for a hard FAILED_* (a DEFERRED_DEPENDENCY is expected/retryable, not logged).
               if (execStatus === RECONCILE_STATUS.FAILED_DERIVE || execStatus === RECONCILE_STATUS.FAILED_PUBLISH || execStatus === RECONCILE_STATUS.FAILED_READBACK) {
                 const d = diagStageFor(result);
-                log("SAVED_DATA_RECONCILE_DIAG " + JSON.stringify({ family, region: S(bucket), accountId, requestedAsOf: S(requestedAsOf), stage: d.stage, reasonCode: d.reasonCode }));
+                log("SAVED_DATA_RECONCILE_DIAG " + JSON.stringify({ family, region: S(bucket), accountId, requestedAsOf: S(requestedAsOf), stage: d.stage, reasonCode: d.reasonCode, errClass: d.errClass }));
               }
               for (const rk of staleReports) rec.reports[rk] = { state: execStatus, reason: S(result && (result.reason || (result.problems && result.problems[0]))) || null, lkgPreserved: true, ...(result && (result.leaseLost || result.status === "CONTROL_LEASE_LOST") ? { leaseLost: true } : {}) };
             }
