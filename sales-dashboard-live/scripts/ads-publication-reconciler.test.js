@@ -58,7 +58,8 @@ ok("workflow: manual dispatch defaults to dry-run", /default: "dry-run"/.test(ym
 ok("workflow: cleanup gates on effective-live EXACTLY (manual dry-run never cleans even if the repo flag is set)", /github\.event\.inputs\.mode == 'live'/.test(yml) && /github\.event_name != 'workflow_dispatch' && vars\.ADS_RECONCILE_LIVE == 'true'/.test(yml));
 ok("workflow: regions processed sequentially in ONE job (for REGION in india europe-au us-ca)", /for REGION in india europe-au us-ca/.test(yml) && /timeout 420 node scripts\/release\/ads-publication-reconcile\.mjs/.test(yml) && /--deadline-seconds=330/.test(yml));
 ok("workflow: concurrency prevents overlap (no cancel) + bounded < 30 min", /group: ads-publication-reconcile/.test(yml) && /cancel-in-progress: false/.test(yml) && /timeout-minutes: 25/.test(yml));
-ok("workflow: off-boundary cron staggered from OLI (:17/:47)", /cron: "17,47 \* \* \* \*"/.test(yml));
+ok("workflow: one daily recovery cron, staggered after OLI/FBA", /cron: "23 21 \* \* \*"/.test(yml));
+ok("workflow: disabled scheduled recovery allocates no runner; manual dispatch remains available", /if: github\.event_name == 'workflow_dispatch' \|\| vars\.ADS_RECONCILE_LIVE == 'true'/.test(yml));
 ok("workflow: least-privilege (contents: read), no actions:write", /permissions:[\s\S]{0,240}contents: read/.test(yml) && !/actions: write/.test(yml));
 
 // ---- IMMEDIATE HOOK (WORK A item 6): scheduler-v2.yml runs the daily Ads reconcile in a post-run job, zero-export,

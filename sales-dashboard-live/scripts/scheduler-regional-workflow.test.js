@@ -1,9 +1,7 @@
 // Regional scheduler WORKFLOW proof suite (offline, ZERO network/DB).
 //
-// Proves the cron cutover + ownership invariants on the ACTUAL .github/workflows files + the REGION_SCHEDULE source:
-//   A. scheduler-v2 = the 3-region coordinator: EXACTLY the three GitHub primary crons (0 3 / 30 8 / 30 16), each
-//      DETERMINISTICALLY mapped to one region via a case on github.event.schedule; a region workflow_dispatch input;
-//      NO legacy us/non-us cron anywhere.
+// Proves the trigger ownership invariants on the ACTUAL .github/workflows files + the REGION_SCHEDULE source:
+//   A. scheduler-v2 = the dispatch-only 3-region coordinator with a validated region input and no native cron.
 //   B. ONE automatic Campaign owner: scheduler-v2 refreshes Campaign once; campaign-ads-golive carries no cron.
 //   C. FBA runs as an ISOLATED, needs-gated job (independent failure boundary) using regional routing;
 //      fba-plan-golive carries no cron (old 0 4 / 0 5 / 30 12 / 30 13 removed); its manual modes are preserved.
@@ -34,19 +32,16 @@ let schedulerYml, fbaYml, campaignYml, returnsYml, regionSched, cloudflarePoller
 // minutes to dodge GitHub's dropped scheduled-cron deliveries) must all be gone from scheduler-v2.
 const LEGACY_CRONS = ["0 2 * * *", "30 10 * * *", "0 4 * * *", "0 5 * * *", "30 12 * * *", "30 13 * * *", "0 3 * * *", "30 8 * * *", "30 16 * * *"];
 
-group("A. scheduler-v2 = the 3-region coordinator");
+group("A. scheduler-v2 = the dispatch-only 3-region coordinator");
 
-test("A1. EXACTLY the three GitHub primary crons: 7 3 (india), 37 8 (europe-au), 37 16 (us-ca) -- off the :00/:30 boundaries", () => {
+test("A1. no native GitHub primary cron (Cloudflare dispatch + scheduler-recovery only)", () => {
   const c = crons(schedulerYml);
-  assert.deepEqual([...c].sort(), ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort());
-  assert.equal(c.length, 3, "exactly three crons");
+  assert.deepEqual(c, []);
 });
 
-test("A2. each cron maps DETERMINISTICALLY to one region via a case on github.event.schedule (never the clock)", () => {
-  assert.match(schedulerYml, /case "\$\{\{ github\.event\.schedule \}\}" in/);
-  assert.match(schedulerYml, /"7 3 \* \* \*"\)\s*region="india"/);
-  assert.match(schedulerYml, /"37 8 \* \* \*"\)\s*region="europe-au"/);
-  assert.match(schedulerYml, /"37 16 \* \* \*"\)\s*region="us-ca"/);
+test("A2. dispatch region is explicit and validated before production work", () => {
+  assert.match(schedulerYml, /region="\$\{\{ github\.event\.inputs\.region \}\}"/);
+  assert.match(schedulerYml, /Unknown region/);
 });
 
 test("A3. a region workflow_dispatch input exists (never a browser-supplied region; validated in cfg)", () => {
@@ -60,14 +55,9 @@ test("A4. NO legacy us/non-us (or old FBA) cron remains in scheduler-v2", () => 
   for (const legacy of LEGACY_CRONS) assert.ok(!c.includes(legacy), "legacy cron must be gone: " + legacy);
 });
 
-test("A5. native primaries and Cloudflare dispatches share the same per-region concurrency key", () => {
+test("A5. Cloudflare, recovery, and manual dispatches share the same per-region concurrency key", () => {
   const groupLine = schedulerYml.split("\n").find((line) => line.trim().startsWith("group: scheduler-v2-")) || "";
-  assert.match(groupLine, /github\.event_name == 'schedule'/);
-  assert.match(groupLine, /github\.event\.schedule == '7 3 \* \* \*' && 'india'/);
-  assert.match(groupLine, /github\.event\.schedule == '37 8 \* \* \*' && 'europe-au'/);
-  assert.match(groupLine, /github\.event\.schedule == '37 16 \* \* \*' && 'us-ca'/);
-  assert.match(groupLine, /\|\| inputs\.region/);
-  assert.ok(!groupLine.includes("github.event.schedule || inputs.region"), "cron text must not become the concurrency key");
+  assert.equal(groupLine.trim(), "group: scheduler-v2-${{ inputs.region }}");
 });
 
 group("B. ONE automatic Campaign owner");
@@ -138,15 +128,15 @@ test("D1. returns-leakage carries NO cron", () => {
   assert.equal(crons(returnsYml).length, 0, "returns-leakage has no cron");
 });
 
-group("E. the whole workflow tree has no legacy schedule + one cron owner");
+group("E. the paid workflow is dispatch-only; timing is externally owned");
 
-test("E1. across the report/paid workflows, the ONLY crons are the 3 regional primaries in scheduler-v2", () => {
+test("E1. report/paid workflows carry no native cron", () => {
   // account-onboarding.yml (*/30, zero-export discovery) and scheduler-recovery.yml (*/10, zero-export trigger
   // backstop) are the two NON-report scheduled workers; they are excluded here and asserted in their own suites.
   const all = ["scheduler-v2.yml", "fba-plan-golive.yml", "campaign-ads-golive.yml", "returns-leakage.yml", "db-migrate.yml", "regional-dry-run.yml"];
   let total = [];
   for (const f of all) total = total.concat(crons(read(f)));
-  assert.deepEqual([...total].sort(), ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort(), "only the 3 regional primaries exist in the report/paid workflows");
+  assert.deepEqual(total, [], "Cloudflare dispatches scheduler-v2; report/paid workflows carry no native cron");
 });
 
 group("F. recovery model = ONE global Cloudflare poller + per-region eligibility + 3 daily GitHub backstop crons");
@@ -178,11 +168,11 @@ test("F2. Cloudflare recovery is ONE global */10 poller (not per-region crons); 
   }
 });
 
-test("F3. the GitHub primary crons in scheduler-v2 match REGION_SCHEDULE, and the recovery crons match scheduler-recovery.yml (single source of truth)", () => {
+test("F3. scheduler-v2 is dispatch-only and recovery crons match REGION_SCHEDULE", () => {
   const c = crons(schedulerYml);
   const recoveryCrons = crons(read("scheduler-recovery.yml"));
+  assert.deepEqual(c, [], "scheduler-v2 has no native GitHub primary crons");
   for (const region of ["india", "europe-au", "us-ca"]) {
-    assert.ok(c.includes(regionSched[region].primaryCron), region + " primary cron present in scheduler-v2.yml");
     assert.ok(recoveryCrons.includes(regionSched[region].githubRecoveryCron), region + " recovery cron present in scheduler-recovery.yml");
   }
   assert.equal(recoveryCrons.length, 3, "exactly three GitHub recovery crons (3 jobs/day)");

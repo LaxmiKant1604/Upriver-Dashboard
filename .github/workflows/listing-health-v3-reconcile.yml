@@ -1,6 +1,7 @@
 name: listing-health-v3-reconcile
 
-# ZERO-EXPORT listing-health-v3 publication reconciler. Every 30 minutes it re-derives + promotes the Listings-dependent
+# ZERO-EXPORT listing-health-v3 publication reconciler. The main scheduler invokes it immediately after saved-data
+# work; this workflow is a once-daily recovery pass that re-derives + promotes the Listings-dependent
 # canonical live dashboard(s) -- today EXACTLY "listing-health-v3" -- for accounts whose ALREADY-SAVED durable Listings +
 # Listings-Raw snapshots (public.source_listings_snapshot / public.source_listings_raw_snapshot) advanced past -- or were
 # never promoted to -- their live snapshot. It re-derives listing-health-v3 through its CANONICAL registry derivation +
@@ -24,10 +25,9 @@ name: listing-health-v3-reconcile
 
 on:
   schedule:
-    # Every 30 minutes, OFFSET 23 minutes away from the exact hour/half-hour (and away from the OLI reconciler's 13/43
-    # and the FBA/Ads reconcilers' 17/47 offsets) so it never lands on a scheduler boundary and never starts in
-    # lock-step with another reconciler.
-    - cron: "23,53 * * * *"
+    # Once-daily recovery, staggered after OLI, FBA, and Ads. Normal convergence happens in scheduler-v2's immediate
+    # hook, so frequent polling here only wastes Actions minutes.
+    - cron: "58 21 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -56,6 +56,7 @@ permissions:
 
 jobs:
   reconcile:
+    if: github.event_name == 'workflow_dispatch' || vars.LISTINGS_RECONCILE_LIVE == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     outputs:

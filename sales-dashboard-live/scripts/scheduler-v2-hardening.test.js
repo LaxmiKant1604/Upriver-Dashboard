@@ -29,23 +29,20 @@ test("external dispatches have a unique run title and a non-forgeable-by-schedul
   assert.match(yml, /dispatch identity:.*inputs\.dispatch_id/, "the immutable summary prints the dispatch identity");
 });
 
-/* 12/13. correct cron -> correct region; unknown cron fails BEFORE any production I/O */
-test("12/13. the three regional crons each map deterministically to one region; unknown cron fails closed; +20min Cloudflare watchdog documented", () => {
+/* 12/13. external region dispatch + recovery ownership */
+test("12/13. scheduler-v2 is dispatch-only; Cloudflare and sparse recovery ownership are documented", () => {
   const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort());
-  assert.match(yml, /"7 3 \* \* \*"\)\s*region="india"/);
-  assert.match(yml, /"37 8 \* \* \*"\)\s*region="europe-au"/);
-  assert.match(yml, /"37 16 \* \* \*"\)\s*region="us-ca"/);
+  assert.deepEqual(crons, []);
   assert.doesNotMatch(yml, /30 10 \* \* \*/, "the legacy US GitHub primary is removed");
   // Honest recovery model: ONE global Cloudflare */10 poller + per-region eligibility windows (NOT three false
   // per-region watchdog crons), plus the low-cost GitHub scheduler-recovery backstop.
   assert.match(yml, /recovery-eligible 03:27-06:07 UTC/, "india recovery eligibility window documented");
   assert.match(yml, /recovery-eligible 16:57-19:37 UTC/, "us-ca recovery eligibility window documented");
-  assert.match(yml, /Cloudflare: ONE global recovery poller \(cron \*\/10 UTC\)/, "Cloudflare is one global poller, not per-region crons");
+  assert.match(yml, /Cloudflare: ONE global poller \(cron \*\/10 UTC\)/, "Cloudflare is one global poller, not per-region crons");
   assert.match(yml, /scheduler-recovery\.yml/, "the GitHub recovery backstop is referenced");
   assert.doesNotMatch(yml, /Cloudflare watchdog \d\d:\d\d UTC/, "no false per-region Cloudflare watchdog cron times");
+  // Legacy schedule parsing remains fail-closed in cfg, but no native schedule can invoke it.
   assert.match(yml, /Unknown cron[^\n]*refusing \(fail closed\)/);
-  // the unknown-cron guard is in the SAME cfg step, before install/preflight/token/fetch.
   const cfgIdx = yml.indexOf("Resolve region + requestedAsOf");
   const npmIdx = yml.indexOf("npm ci");
   assert.ok(cfgIdx > 0 && cfgIdx < npmIdx, "region resolution + unknown-cron guard run before npm ci / any I/O");

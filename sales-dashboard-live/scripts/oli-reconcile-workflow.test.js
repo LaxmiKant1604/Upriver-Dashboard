@@ -11,14 +11,15 @@ const wf = readFileSync(new URL("../../.github/workflows/oli-publication-reconci
 const sched = readFileSync(new URL("../../.github/workflows/scheduler-v2.yml", import.meta.url), "utf8");
 
 // ---- oli-publication-reconcile.yml (WORK 7) ----
-ok("runs every 30 minutes, OFFSET off the hour/half-hour boundary (13,43)", /- cron: "13,43 \* \* \* \*"/.test(wf));
+ok("runs one daily recovery pass after all scheduler windows", /- cron: "13 20 \* \* \*"/.test(wf));
+ok("disabled scheduled recovery allocates no runner; manual dispatch remains available", /if: github\.event_name == 'workflow_dispatch' \|\| vars\.OLI_RECONCILE_LIVE == 'true'/.test(wf));
 ok("workflow_dispatch mode defaults to dry-run (live must be explicitly chosen)", /mode:[\s\S]{0,200}default: "dry-run"[\s\S]{0,120}options:[\s\S]{0,60}- dry-run[\s\S]{0,20}- live/.test(wf));
 ok("least-privilege permissions: contents: read and NO actions: write (no GitHub dispatch)", /permissions:[\s\S]{0,200}contents: read/.test(wf) && !/actions: write/.test(wf));
 // CAPACITY (blocker 6): ONE job (one checkout + one npm ci) loops the 3 regions IN ORDER, each capped, so the whole
-// pass finishes well inside the 30-minute tick. The global control lease means regions must run SEQUENTIALLY.
+// pass stays bounded. The global control lease means regions must run SEQUENTIALLY.
 ok("ONE job loops the 3 regions in order (no matrix; the global lease forbids parallel regions)", /for REGION in india europe-au us-ca/.test(wf) && !/strategy:/.test(wf) && !/matrix:/.test(wf));
 ok("each region is hard-capped (timeout 420s) so one region can never consume the whole budget", /timeout 420 node scripts\/release\/oli-publication-reconcile\.mjs --bucket="\$REGION"/.test(wf));
-ok("the job timeout (25 min) fits inside the 30-minute tick; a per-region failure is isolated (loop continues)", /timeout-minutes: 25/.test(wf) && /isolated; continuing/.test(wf));
+ok("the job timeout is bounded and a per-region failure is isolated (loop continues)", /timeout-minutes: 25/.test(wf) && /isolated; continuing/.test(wf));
 ok("single concurrency group + cancel-in-progress false (a delayed tick queues; the tight cap prevents backlog)", /group: oli-publication-reconcile\b/.test(wf) && /cancel-in-progress: false/.test(wf));
 ok("DEFAULT is dry-run: --live only on a manual live dispatch OR when vars.OLI_RECONCILE_LIVE=='true'", /vars\.OLI_RECONCILE_LIVE == 'true' && 'live' \|\| 'dry-run'/.test(wf));
 ok("periodic mode + as-of is a conservative D-1 (yesterday UTC)", /--mode=periodic\b/.test(wf) && /date -u -d 'yesterday' \+%F/.test(wf));

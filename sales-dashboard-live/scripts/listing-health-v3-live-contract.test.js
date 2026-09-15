@@ -73,8 +73,9 @@ process.stdout.write("listing-health-v3-live-contract\n");
 // ---- (5) the 30-min reconcile workflow + immediate hook gates ----
 {
   const wf = readRepo(".github/workflows/listing-health-v3-reconcile.yml");
-  ok("30-min workflow gates live on vars.LISTINGS_RECONCILE_LIVE == 'true'", /vars\.LISTINGS_RECONCILE_LIVE == 'true'/.test(wf));
-  ok("30-min workflow cron is 23,53 (distinct from OLI 13,43 / FBA-Ads 17,47)", /cron: "23,53 \* \* \* \*"/.test(wf));
+ok("daily recovery workflow gates live on vars.LISTINGS_RECONCILE_LIVE == 'true'", /vars\.LISTINGS_RECONCILE_LIVE == 'true'/.test(wf));
+ok("daily recovery workflow cron is 21:58 UTC", /cron: "58 21 \* \* \*"/.test(wf));
+ok("disabled scheduled recovery allocates no runner; manual dispatch remains available", /if: github\.event_name == 'workflow_dispatch' \|\| vars\.LISTINGS_RECONCILE_LIVE == 'true'/.test(wf));
   ok("30-min workflow calls listing-health-v3-reconcile.mjs --mode=periodic", /listing-health-v3-reconcile\.mjs --bucket=.*--mode=periodic/.test(wf));
   ok("30-min workflow has an always() cleanup job gated the same way", /needs: reconcile/.test(wf) && /--cleanup/.test(wf));
 

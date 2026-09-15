@@ -204,11 +204,9 @@ async function main() {
     assert.match(yml, /if:\s*always\(\) && steps\.guard\.outputs\.run_required == 'true' && \(steps\.full_controls\.outputs\.generation != '' \|\| steps\.bootstrap_controls\.outputs\.generation != ''\)\n\s*run:\s*node scripts\/release\/priority-control-package\.mjs --rollback/, "safe-close when a matching apply emitted a generation");
   });
 
-  test("14. schedules: the three regional primaries; each cron deterministically maps to one region; SHA/event/cron in the summary", () => {
+  test("14. scheduler-v2 is dispatch-only; SHA/event/dispatch metadata remain in the summary", () => {
     const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-    assert.deepEqual(crons, ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort());
-    assert.match(yml, /"7 3 \* \* \*"\)\s*region="india"/); assert.match(yml, /"37 8 \* \* \*"\)\s*region="europe-au"/);
-    assert.match(yml, /"37 16 \* \* \*"\)\s*region="us-ca"/); assert.doesNotMatch(yml, /30 10 \* \* \*/);
+    assert.deepEqual(crons, []);
     // the summary prints immutable metadata (SHA + event + cron) for provenance.
     assert.match(yml, /head\/workflow SHA/); assert.match(yml, /github\.sha/); assert.match(yml, /github\.event\.schedule/);
   });

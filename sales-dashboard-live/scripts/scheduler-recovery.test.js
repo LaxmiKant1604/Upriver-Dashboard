@@ -306,16 +306,11 @@ test("H2. the recovery workflow performs NO report/paid work (no DataDoe scripts
   }
 });
 
-test("H3. scheduler-v2.yml carries the NEW off-boundary primaries + matching case + concurrency (lockstep)", () => {
+test("H3. scheduler-v2.yml is dispatch-only and all dispatchers share the region concurrency key", () => {
   const crons = [...schedulerYml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["37 16 * * *", "37 8 * * *", "7 3 * * *"].sort(), "exactly the three new primaries");
-  assert.match(schedulerYml, /"7 3 \* \* \*"\)\s*region="india"/);
-  assert.match(schedulerYml, /"37 8 \* \* \*"\)\s*region="europe-au"/);
-  assert.match(schedulerYml, /"37 16 \* \* \*"\)\s*region="us-ca"/);
+  assert.deepEqual(crons, [], "no native GitHub primary crons");
   const groupLine = schedulerYml.split("\n").find((l) => l.trim().startsWith("group: scheduler-v2-")) || "";
-  assert.match(groupLine, /'7 3 \* \* \*' && 'india'/);
-  assert.match(groupLine, /'37 8 \* \* \*' && 'europe-au'/);
-  assert.match(groupLine, /'37 16 \* \* \*' && 'us-ca'/);
+  assert.equal(groupLine.trim(), "group: scheduler-v2-${{ inputs.region }}");
 });
 
 test("H4. the entrypoint fails closed, delegates to the pure module, and never logs the token", () => {

@@ -1,6 +1,7 @@
 name: ads-publication-reconcile
 
-# ZERO-EXPORT Campaign-Ads publication reconciler (WORK A). Every 30 minutes it re-derives + promotes the Ads-dependent
+# ZERO-EXPORT Campaign-Ads publication reconciler (WORK A). The main scheduler invokes it immediately after saved-data
+# work; this workflow is a once-daily recovery pass that re-derives + promotes the Ads-dependent
 # canonical live dashboards for accounts whose ALREADY-SAVED durable Campaign Ads content advanced past -- or was
 # same-date corrected relative to -- their live snapshots. It is the durable safety net for a saved-Ads correction the
 # scheduler's per-bucket publication would otherwise not re-publish until the next paid cycle. It is NOT a second
@@ -14,8 +15,8 @@ name: ads-publication-reconcile
 # publisher + content-CAS the OLI reconciler uses, so concurrent OLI/Ads reconciliation converges on the newest valid
 # content. The GLOBAL control-plane lease serializes this against the OLI + FBA reconcilers + the scheduler.
 #
-# CAPACITY: ONE job (one checkout + one `npm ci`) loops the 3 regions, each wrapped in a 7-minute hard cap, so the whole
-# pass finishes in <= ~22 min -- inside the 30-minute tick, no queued-run backlog. A per-region failure is isolated.
+# CAPACITY: ONE daily job (one checkout + one `npm ci`) loops the 3 regions, each wrapped in a 7-minute hard cap. The
+# job is not allocated while ADS_RECONCILE_LIVE is disabled. A per-region failure is isolated.
 #
 # SAFETY POSTURE (default OFF for live promotion):
 #   - MANUAL runs default to DRY-RUN (read-only plan; zero writes) and must opt in to live.
@@ -29,9 +30,8 @@ name: ads-publication-reconcile
 
 on:
   schedule:
-    # Every 30 minutes, OFFSET 17 minutes away from the exact hour/half-hour so it never lands on a scheduler boundary
-    # and is staggered from the OLI reconciler (:13/:43) so the two never contend for the global lease at the same tick.
-    - cron: "17,47 * * * *"
+    # Once-daily recovery, staggered after OLI and FBA. Normal convergence happens in scheduler-v2's immediate hook.
+    - cron: "23 21 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -61,6 +61,7 @@ permissions:
 
 jobs:
   reconcile:
+    if: github.event_name == 'workflow_dispatch' || vars.ADS_RECONCILE_LIVE == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     outputs:

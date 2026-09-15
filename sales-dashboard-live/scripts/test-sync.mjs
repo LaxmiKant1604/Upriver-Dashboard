@@ -77,16 +77,14 @@ test("schedule constants are 02:00 (non-us) and 10:30 (us) UTC", () => {
   assert.equal(SCHEDULE_CRON["non-us"], "0 2 * * *");
   assert.equal(SCHEDULE_CRON.us, "30 10 * * *");
 });
-test("automatic timing: GitHub Actions scheduler-v2 is the SINGLE scheduler (exact reviewed crons); Vercel runs no cron", () => {
+test("automatic timing: scheduler-v2 is dispatch-only; Cloudflare primary + GitHub recovery own timing; Vercel runs no cron", () => {
   const vercel = JSON.parse(readFileSync(fileURLToPath(new URL("../vercel.json", import.meta.url)), "utf8"));
   assert.equal((vercel.crons || []).length, 0, "Vercel must not invoke DataDoe automatically");
   const workflow = readFileSync(fileURLToPath(new URL("../../.github/workflows/scheduler-v2.yml", import.meta.url)), "utf8");
-  // Cron is ACTIVE + REGIONAL: india 03:07 + europe-au 08:37 + us-ca 16:37 UTC (off the congested :00/:30
-  // boundaries), one GitHub primary per region. Two independent recovery mechanisms re-dispatch a missed cron: a
-  // Cloudflare */10 global poller (20m grace, 3h window) and the GitHub-native scheduler-recovery.yml (3 crons/day,
-  // one per region at primary+40m); the exact-live duplicate guard makes repeats no-ops.
+  // Cloudflare is the normal dispatcher and scheduler-recovery.yml is the sparse GitHub fallback. scheduler-v2 has
+  // no native cron, avoiding delayed duplicate full runs; the exact-live guard still makes repeated dispatches no-ops.
   const crons = [...workflow.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-  assert.deepEqual(crons, ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort(), "the three regional primaries (india / europe-au / us-ca)");
+  assert.deepEqual(crons, [], "scheduler-v2 carries no native GitHub cron");
   assert.match(workflow, /^\s*workflow_dispatch\s*:/m, "manual dispatch remains available");
   assert.match(workflow, /^run-name:\s*scheduler-v2 .*inputs\.dispatch_id/m, "external coordinator runs are identifiable by dispatch_id");
   assert.match(workflow, /^\s{6}dispatch_id:\s*$/m, "workflow_dispatch accepts the coordinator dispatch_id");

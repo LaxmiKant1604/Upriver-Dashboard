@@ -1,6 +1,7 @@
 name: fba-publication-reconcile
 
-# ZERO-EXPORT FBA-inventory publication reconciler. Every 30 minutes it re-derives + promotes the FBA-dependent
+# ZERO-EXPORT FBA-inventory publication reconciler. The main scheduler invokes it immediately after saved-data work;
+# this workflow is a once-daily recovery pass that re-derives + promotes the FBA-dependent
 # canonical live dashboard(s) -- today EXACTLY "brand-inventory" -- for accounts whose ALREADY-SAVED durable FBA
 # inventory (public.source_snapshots, source_key='fba-inventory-health') advanced past -- or was never promoted to --
 # their live snapshot. It is the durable safety net for a stranded promotion (a fresh FBA snapshot whose brand-inventory
@@ -26,9 +27,8 @@ name: fba-publication-reconcile
 
 on:
   schedule:
-    # Every 30 minutes, OFFSET 17 minutes away from the exact hour/half-hour (and away from the OLI reconciler's 13/43
-    # offset) so it never lands on a scheduler boundary and never starts in lock-step with the OLI reconciler.
-    - cron: "17,47 * * * *"
+    # Once-daily recovery, staggered after OLI. Normal convergence happens in scheduler-v2's immediate hook.
+    - cron: "48 20 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -57,6 +57,7 @@ permissions:
 
 jobs:
   reconcile:
+    if: github.event_name == 'workflow_dispatch' || vars.FBA_RECONCILE_LIVE == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     outputs:

@@ -1,26 +1,29 @@
 name: scheduler-v2
 run-name: scheduler-v2 ${{ github.event_name == 'workflow_dispatch' && format('{0}/{1}', inputs.region, inputs.dispatch_id) || github.event.schedule }}
 
-# TRUSTED regional refresh + publish coordinator for the whole active dashboard pipeline (Scheduler v2) -- the ONLY
-# automatic scheduler (no pg_cron, no Vercel cron; the full source-refresh + derive + publish flow exceeds Vercel's
-# 60s route cap). It is ALSO the ONE automatic owner of every paid source (OLI, Product Catalog reuse, Campaign Ads):
+# TRUSTED regional refresh + publish coordinator for the whole active dashboard pipeline (Scheduler v2). It is
+# dispatched by the Cloudflare watchdog and by the lightweight scheduler-recovery.yml fallback; it deliberately has
+# NO native GitHub schedule because delayed native crons previously duplicated the Cloudflare dispatch and consumed a
+# second full set of Actions minutes. No pg_cron or Vercel cron exists (the full flow exceeds Vercel's 60s route cap).
+# It remains the ONE automatic owner of every paid source (OLI, Product Catalog reuse, Campaign Ads):
 # campaign-ads-golive.yml carries no cron, so Campaign Ads can never be refreshed by two schedulers.
 #
 # THREE REGIONS publish INDEPENDENTLY -- none waits for nor blocks another, and none ever touches another's snapshots.
-# Each cron maps DETERMINISTICALLY to exactly one region (resolved from github.event.schedule, NEVER the wall clock);
-# accounts are discovered + routed every run by trusted stored marketplace evidence, so a newly connected seller
+# Each external dispatch names exactly one region; accounts are discovered + routed every run by trusted stored
+# marketplace evidence, so a newly connected seller
 # auto-joins its region with no config change:
 #   - india     @ 03:07 UTC (08:37 IST): IN accounts.                              recovery-eligible 03:27-06:07 UTC.
 #   - europe-au @ 08:37 UTC (14:07 IST): European marketplaces incl GB/UK + AU.    recovery-eligible 08:57-11:37 UTC.
 #   - us-ca     @ 16:37 UTC (22:07 IST): US + CA accounts.                          recovery-eligible 16:57-19:37 UTC.
 #
-# The primary minutes are OFF the congested :00/:30 boundaries (moved 2026-09-10 after a :00-boundary cron was
-# never delivered by GitHub). Two INDEPENDENT recovery mechanisms re-dispatch a MISSED cron idempotently, each with
-# a 20-minute grace and a bounded 3-hour per-region window (the "recovery-eligible" range above):
-#   - Cloudflare: ONE global recovery poller (cron */10 UTC), Cloudflare-owned; dispatches cloudflare/<region>/<D-1>.
-#   - GitHub: scheduler-recovery.yml -- a LOW-COST final backstop of 3 crons/day (one per region, primary + 40m);
+# The primary times above remain the business-date and recovery-window reference. Two INDEPENDENT trigger mechanisms
+# dispatch this workflow idempotently, each with a 20-minute grace and a bounded 3-hour per-region window:
+#   - Cloudflare: ONE global poller (cron */10 UTC), the normal automatic dispatcher; dispatches
+#     cloudflare/<region>/<D-1>.
+#   - GitHub: scheduler-recovery.yml -- a LOW-COST final backstop of 3 crons/day (one per region, reference + 40m);
 #     dispatches recovery/<region>/<D-1>. (Cloudflare does the frequent polling; GitHub is the sparse safety net.)
-# Both dispatch this SAME workflow; a delayed/duplicate trigger is a zero-write no-op (region guard + durable opkey).
+# A duplicate trigger is a zero-write no-op (region guard + durable opkey). Native GitHub scheduler-v2 crons are
+# intentionally absent, avoiding a second full automatic run when GitHub delivers a cron hours late.
 #
 # Each region run: read-only duplicate guard (a delayed/repeated trigger -- e.g. the watchdog -- is a zero-write no-op
 # once the exact D-1 is already live) -> cycle preflight -> token gate -> OLI refresh to D-1 -> Campaign Ads refresh
@@ -38,12 +41,6 @@ run-name: scheduler-v2 ${{ github.event_name == 'workflow_dispatch' && format('{
 # SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if a secondary connection is configured).
 
 on:
-  schedule:
-    # Each cron maps DETERMINISTICALLY to exactly one region (resolved from github.event.schedule, never the clock).
-    # Minutes are OFF the congested :00/:30 boundaries to reduce GitHub's dropped/late scheduled-cron deliveries.
-    - cron: "7 3 * * *"    # india     PRIMARY -- 03:07 UTC / 08:37 IST
-    - cron: "37 8 * * *"   # europe-au PRIMARY -- 08:37 UTC / 14:07 IST
-    - cron: "37 16 * * *"  # us-ca     PRIMARY -- 16:37 UTC / 22:07 IST
   workflow_dispatch:
     inputs:
       region:
@@ -72,10 +69,9 @@ on:
           - bootstrap
 
 concurrency:
-  # One in-flight run PER REGION (regions are independent); a re-dispatch of the same region queues behind its own run.
-  # Resolve scheduled crons to the SAME region key used by workflow_dispatch. This prevents a delayed native cron
-  # and its Cloudflare/GitHub recovery dispatch from running concurrently under different concurrency groups.
-  group: scheduler-v2-${{ github.event_name == 'schedule' && (github.event.schedule == '7 3 * * *' && 'india' || github.event.schedule == '37 8 * * *' && 'europe-au' || github.event.schedule == '37 16 * * *' && 'us-ca' || 'unknown') || inputs.region }}
+  # One in-flight run PER REGION (regions are independent); Cloudflare, recovery, and manual dispatches for the same
+  # region share this key and queue behind one another.
+  group: scheduler-v2-${{ inputs.region }}
   cancel-in-progress: false
 
 permissions:
@@ -353,7 +349,7 @@ jobs:
       # publish AND BEFORE safe-close (so the scheduler's full_controls lease is still open), re-derive + promote any
       # OLI-dependent live dashboard the publish left stranded (a validated shadow that never reached the bare live key,
       # or a healthy account blocked by a sibling in the per-bucket all-or-nothing finalize) -- for EXACTLY the OLI-
-      # eligible accounts, using ALREADY-SAVED durable OLI. It runs the SAME reconciler as the 30-minute backstop and
+      # eligible accounts, using ALREADY-SAVED durable OLI. It runs the SAME reconciler as the daily backstop and
       # NEVER creates a DataDoe export/token (its derive adapter refuses creates). It REUSES the scheduler's EXACT fence
       # (--run-token + the full_controls --owner-generation), renewing it -- it NEVER re-acquires or steals the lease,
       # and NEVER safe-closes (the scheduler's safe-close step below owns it). Gated on full_controls having emitted a
@@ -667,7 +663,7 @@ jobs:
     # REQUIRE the LHv3 shadow ingestion job to have SUCCEEDED: it is what persists this cycle's durable Listings +
     # Listings-Raw pointers (source_listings_snapshot / source_listings_raw_snapshot at as_of === inventory_asof). If it
     # failed/was skipped, the durable pointers were NOT advanced this cycle, so the immediate reconcile must NOT fire
-    # against stale pointers -- the 30-minute backstop (listing-health-v3-reconcile.yml) remains the recovery path.
+    # against stale pointers -- the daily backstop (listing-health-v3-reconcile.yml) remains the recovery path.
     if: always() && needs.run.outputs.region != '' && needs.run.outputs.execute_downstream == 'true' && needs.run.outputs.scope != 'bootstrap' && needs.run.outputs.inventory_asof != '' && needs.listing-health-v3.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20

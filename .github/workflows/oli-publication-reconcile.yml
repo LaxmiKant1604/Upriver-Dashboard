@@ -1,6 +1,7 @@
 name: oli-publication-reconcile
 
-# ZERO-EXPORT OLI publication reconciler (WORK 7). Every 30 minutes it re-derives + promotes the OLI-dependent
+# ZERO-EXPORT OLI publication reconciler (WORK 7). The main scheduler invokes it immediately after saved-data work;
+# this workflow is a once-daily recovery pass that re-derives + promotes the OLI-dependent
 # canonical live dashboards (daily-reporting / brand-sales / brand-inventory) for accounts whose ALREADY-SAVED durable
 # OLI advanced past -- or was never promoted to -- their live snapshots. It is the durable safety net for the promotion
 # stranding the scheduler's per-bucket, operator-CLI-only publication leaves behind. It is NOT a second scheduler and
@@ -13,8 +14,8 @@ name: oli-publication-reconcile
 # owner/generation. The control-plane lease is GLOBAL, so regions run SEQUENTIALLY (never in parallel) -- each holds the
 # lease only for its own apply/publish/safe-close window, so a busy region never blocks another for long.
 #
-# CAPACITY (blocker 6): ONE job (one checkout + one `npm ci`) loops the 3 regions in order, each wrapped in a 7-minute
-# hard cap, so the whole pass finishes in <= ~22 min -- comfortably inside the 30-minute tick, no queued-run backlog.
+# CAPACITY: ONE daily job (one checkout + one `npm ci`) loops the 3 regions in order, each wrapped in a 7-minute hard
+# cap. The job is not allocated while OLI_RECONCILE_LIVE is disabled; manual dry-runs remain available.
 # A per-region failure/timeout is isolated (the loop continues); region + account isolation and zero-export are kept.
 #
 # SAFETY POSTURE (default OFF for live promotion):
@@ -29,8 +30,9 @@ name: oli-publication-reconcile
 
 on:
   schedule:
-    # Every 30 minutes, OFFSET 13 minutes away from the exact hour/half-hour so it never lands on a scheduler boundary.
-    - cron: "13,43 * * * *"
+    # Once-daily recovery after all regional scheduler windows. Normal convergence happens in scheduler-v2's
+    # immediate hook, so frequent polling here only wastes Actions minutes.
+    - cron: "13 20 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -61,8 +63,9 @@ permissions:
 
 jobs:
   reconcile:
+    if: github.event_name == 'workflow_dispatch' || vars.OLI_RECONCILE_LIVE == 'true'
     runs-on: ubuntu-latest
-    # ONE job for all regions (one checkout + one npm ci). 25 < 30-minute tick; the per-region `timeout` caps each.
+    # ONE job for all regions (one checkout + one npm ci); the per-region `timeout` caps each.
     timeout-minutes: 25
     outputs:
       asof: ${{ steps.reconcile.outputs.asof }}

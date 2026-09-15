@@ -259,6 +259,7 @@ test("entrypoint guard: fba-publication-reconcile.mjs drives the DEDICATED brand
 test("entrypoint guard: the periodic workflow is DRY-RUN unless FBA_RECONCILE_LIVE=='true'; MANUAL defaults to dry-run", () => {
   const yml = readFileSync(new URL("../../.github/workflows/fba-publication-reconcile.yml", import.meta.url), "utf8");
   ok("scheduled runs are dry-run unless vars.FBA_RECONCILE_LIVE == 'true'", /vars\.FBA_RECONCILE_LIVE == 'true' && 'live' \|\| 'dry-run'/.test(yml));
+  ok("one daily recovery pass and no runner allocation while disabled", /cron: "48 20 \* \* \*"/.test(yml) && /if: github\.event_name == 'workflow_dispatch' \|\| vars\.FBA_RECONCILE_LIVE == 'true'/.test(yml));
   ok("manual dispatch defaults to dry-run", /default: "dry-run"/.test(yml));
   ok("the cleanup gate mirrors the reconcile MODE==live decision EXACTLY (manual dry-run never cleans even if the repo flag is set)", /github\.event\.inputs\.mode == 'live'/.test(yml) && /github\.event_name != 'workflow_dispatch' && vars\.FBA_RECONCILE_LIVE == 'true'/.test(yml));
   ok("least-privilege (contents: read), no actions:write", /permissions:[\s\S]{0,120}contents: read/.test(yml) && !/actions: write/.test(yml));

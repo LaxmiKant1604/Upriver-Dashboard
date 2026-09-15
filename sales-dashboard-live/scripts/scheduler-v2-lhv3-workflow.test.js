@@ -82,8 +82,8 @@ ok("C: the v3 job pins the reviewed operator identity", /PRIORITY_OPERATOR:\s*la
 ok("C: the v3 job runs mode=live for the resolved region", /--mode=live/.test(v3Job) && /--region=\$\{\{\s*needs\.run\.outputs\.region\s*\}\}/.test(v3Job));
 
 /* ===================== D. no second cron / scheduler owner ===================== */
-ok("D: exactly ONE schedule block + exactly the three existing regional crons", (wf.match(/on:\n\s*schedule:/g) || []).length === 1 && (wf.match(/- cron:/g) || []).length === 3);
-ok("D: the three regional primaries (off-boundary: india 03:07 / europe-au 08:37 / us-ca 16:37 UTC)", wf.includes('- cron: "7 3 * * *"') && wf.includes('- cron: "37 8 * * *"') && wf.includes('- cron: "37 16 * * *"'));
+ok("D: scheduler-v2 has no native schedule or cron", (wf.match(/on:\n\s*schedule:/g) || []).length === 0 && (wf.match(/- cron:/g) || []).length === 0);
+ok("D: Cloudflare dispatch + scheduler-recovery ownership is documented", /Cloudflare: ONE global poller/.test(wf) && /scheduler-recovery\.yml/.test(wf));
 ok("D: the v3 job adds NO cron / schedule / workflow_dispatch of its own", !/cron:|schedule:|workflow_dispatch:/.test(v3Job));
 ok("D: the workflow-level per-region concurrency group is preserved (shared by all jobs incl. v3)", /concurrency:\n\s*#[\s\S]*?group:\s*scheduler-v2-/.test(wf) && /cancel-in-progress:\s*false/.test(wf));
 

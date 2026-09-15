@@ -129,7 +129,7 @@ async function main() {
     assert.match(rb, /addDays\(requestedAsOf, -20\)/, "ads window starts 20 days before D-1 (21 inclusive days)");
   });
 
-  test("18/19. force-fetch is OLI-only; the scheduler refreshes the active Campaign grain; FBA is an isolated job; the three regional crons", () => {
+  test("18/19. force-fetch is OLI-only; Campaign and FBA boundaries stay isolated; scheduler-v2 is dispatch-only", () => {
     const rt = readFileSync(resolve(HERE, "..", "lib", "server", "sync", "source-bucket-sync-runtime.js"), "utf8");
     assert.match(rt, /forceFreshOli === true && sourceKey === "order-line-items"/, "force-fresh is OLI-only");
     // Post ASIN->Campaign cutover the coordinator refreshes Campaign Ads (the active source) in the publish job; FBA
@@ -138,7 +138,7 @@ async function main() {
     assert.doesNotMatch(runJob, /fba-plan-golive\.mjs/, "the publish job never runs FBA");
     assert.match(yml, /\n\s{2}fba:\n[\s\S]*fba-plan-golive\.mjs --mode=go-live --region=/, "FBA is an isolated regional job");
     const crons = [...yml.matchAll(/- cron:\s*"([^"]+)"/g)].map((m) => m[1]).sort();
-    assert.deepEqual(crons, ["7 3 * * *", "37 16 * * *", "37 8 * * *"].sort());
+    assert.deepEqual(crons, []);
   });
 
   test("14. a successful workflow cannot report provenThrough below requestedAsOf: the strict D-1 gate publishes ONLY at status 'exact'", () => {
