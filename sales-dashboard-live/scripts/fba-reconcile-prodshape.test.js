@@ -159,12 +159,15 @@ function makeWorld(over = {}) {
     // created_at is MONOTONIC per open (production wall-clock): a later reconcile cycle (e.g. after a same-date FBA
     // correction, published into a DIFFERENT priority-partial-<revisionId> bucket) gets a strictly-newer
     // source_refreshed_at, so the live CAS REPLACES the older content instead of a false equal-freshness conflict.
-    openCycle: async ({ bucket, cycleDate }) => { writes.openCalls += 1; const k = bucket + "|" + cycleDate; if (!cycles.has(k)) cycles.set(k, { id: "cyc-" + (++seq), bucket, cycle_date: cycleDate, status: "running", trigger: "manual", created_at: new Date(Date.UTC(2026, 8, 10, 9, 30, 0) + (++seq) * 1000).toISOString() }); },
+    // FAITHFUL: a freshly-opened cycle is 'pending' (claim -> 'running' -> finalize; finalize rejects non-'running').
+    openCycle: async ({ bucket, cycleDate }) => { writes.openCalls += 1; const k = bucket + "|" + cycleDate; if (!cycles.has(k)) cycles.set(k, { id: "cyc-" + (++seq), bucket, cycle_date: cycleDate, status: "pending", trigger: "manual", created_at: new Date(Date.UTC(2026, 8, 10, 9, 30, 0) + (++seq) * 1000).toISOString() }); },
     getBaseSyncCycleByBucketDate: async (bucket, cycleDate) => cycles.get(bucket + "|" + cycleDate) || null,
+    claimCycle: async (cycleId) => { const cyc = [...cycles.values()].find((c) => c.id === cycleId); if (cyc && cyc.status === "pending") { cyc.status = "running"; return true; } return false; },
     finalizeCycle: async ({ cycleId }) => {
       writes.finalizeCalls += 1;
       const cyc = [...cycles.values()].find((c) => c.id === cycleId);
       if (!cyc) return { disposition: "not-found" };
+      if (cyc.status !== "running") return { disposition: "invalid-status" };
       const hasValidated = jobs.some((j) => j.cycle_id === cycleId && j.validated === true);
       cyc.status = hasValidated ? "succeeded" : "partial";
       return { disposition: "finalized", cycle: { status: cyc.status } };
@@ -232,7 +235,7 @@ function wireRelease(world, { leaseFence, aborted = () => false, controller = nu
   const wrapAbort = (name, fn) => (controller && abortWhen === name ? async (...a) => { const r = await fn(...a); controller.abort(); return r; } : fn);
   const release = buildFbaBrandInventoryRelease({
     resolveOrg: async () => ({ organizationFingerprint: "org-1", connectionId: "primary" }),
-    openCycle: wrapAbort("open", world.openCycle), getCycleByBucketDate: world.getBaseSyncCycleByBucketDate,
+    openCycle: wrapAbort("open", world.openCycle), getCycleByBucketDate: world.getBaseSyncCycleByBucketDate, claimCycle: (cycleId) => world.claimCycle(cycleId),
     readFbaSnapshot: world.readFbaSnapshot, loadSnapshotPayload: world.loadSnapshotPayload,
     resolveExpectedRequestHash: world.resolveExpectedRequestHash, resolveAccountCountry: world.resolveAccountCountry,
     // BLOCKER 1: the candidate readers (resolveValidatedLiveCandidate wires these) -- the entrypoint's exact wiring.

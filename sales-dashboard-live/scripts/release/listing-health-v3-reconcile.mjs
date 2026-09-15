@@ -299,6 +299,7 @@ async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revis
     resolveBundle,
     openCycle: (args, opt) => sb.openSyncCycle(args, opt),
     getCycleByBucketDate: (bk, date, opt) => sb.getBaseSyncCycleByBucketDate(bk, date, opt),
+    claimCycle: (cycleId, opt) => sb.claimSyncCycle(cycleId, opt),
     deriveSnapshot: deriveReportSnapshot,
     reportDerivations: REPORT_DERIVATIONS,
     computeHash: paramsHashFor,

@@ -206,6 +206,7 @@ async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revis
     // observed abort stops any in-flight read/write; the release rechecks abort after each phase + before each write.
     openCycle: (args, opt) => sb.openSyncCycle(args, opt),
     getCycleByBucketDate: (bk, date, opt) => sb.getBaseSyncCycleByBucketDate(bk, date, opt),
+    claimCycle: (cycleId, opt) => sb.claimSyncCycle(cycleId, opt),
     readFbaSnapshot,
     loadSnapshotPayload: (path, opt) => sb.getSourceSnapshotPayload(path, opt),
     resolveExpectedRequestHash,

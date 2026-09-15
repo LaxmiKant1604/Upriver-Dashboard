@@ -86,7 +86,7 @@ const hardFail = (stage, reason) => ({ code: 1, ok: false, stage, status: null, 
  */
 export function buildDailyReportingRelease({
   resolveOrg, resolveAccountMeta,
-  openCycle, getCycleByBucketDate, finalizeCycle,
+  openCycle, getCycleByBucketDate, claimCycle, finalizeCycle,
   readOliHistory, readOliCoverage, readOliZeroProof, readCatalogSnapshot, loadCatalogPayload,
   readActiveAdsRows, readAdsCoverage,
   readOperationalUnits, readEstimates, readSkuAsinResolution,
@@ -99,7 +99,7 @@ export function buildDailyReportingRelease({
   clock = () => Date.now(), // UTC execution-day authority for the Catalog freshness policy (never the requestedAsOf)
   log = () => {},
 } = {}) {
-  for (const [name, fn] of [["resolveOrg", resolveOrg], ["resolveAccountMeta", resolveAccountMeta], ["openCycle", openCycle], ["getCycleByBucketDate", getCycleByBucketDate], ["finalizeCycle", finalizeCycle], ["readOliHistory", readOliHistory], ["readOliCoverage", readOliCoverage], ["readOliZeroProof", readOliZeroProof], ["readCatalogSnapshot", readCatalogSnapshot], ["loadCatalogPayload", loadCatalogPayload], ["readActiveAdsRows", readActiveAdsRows], ["readAdsCoverage", readAdsCoverage], ["upsertReportJob", upsertReportJob], ["claimLease", claimLease], ["saveShadow", saveShadow], ["reconcileSuccess", reconcileSuccess], ["computeHash", computeHash], ["readbackLive", readbackLive]]) {
+  for (const [name, fn] of [["resolveOrg", resolveOrg], ["resolveAccountMeta", resolveAccountMeta], ["openCycle", openCycle], ["getCycleByBucketDate", getCycleByBucketDate], ["claimCycle", claimCycle], ["finalizeCycle", finalizeCycle], ["readOliHistory", readOliHistory], ["readOliCoverage", readOliCoverage], ["readOliZeroProof", readOliZeroProof], ["readCatalogSnapshot", readCatalogSnapshot], ["loadCatalogPayload", loadCatalogPayload], ["readActiveAdsRows", readActiveAdsRows], ["readAdsCoverage", readAdsCoverage], ["upsertReportJob", upsertReportJob], ["claimLease", claimLease], ["saveShadow", saveShadow], ["reconcileSuccess", reconcileSuccess], ["computeHash", computeHash], ["readbackLive", readbackLive]]) {
     if (typeof fn !== "function") throw new Error(`buildDailyReportingRelease requires ${name} (fail closed).`);
   }
   if (!liveContracts || !reportDerivations) throw new Error("buildDailyReportingRelease requires liveContracts + reportDerivations (fail closed).");
@@ -299,6 +299,23 @@ export function buildDailyReportingRelease({
     const cycleId = S(cycle.id);
     const sourceRefreshedAt = nb(S(cycle.created_at ?? cycle.createdAt)) ? S(cycle.created_at ?? cycle.createdAt) : null;
     if (!nb(sourceRefreshedAt)) return defer("cycle-refresh-blank");
+
+    // Transition the freshly-opened cycle pending -> running (claim_sync_cycle) BEFORE any finalize: finalize_sync_cycle
+    // requires status='running' (else 'invalid-status'). open_sync_cycle inserts status='pending'; the scheduler's
+    // priority release claims it, the dedicated releases must too. Idempotent: claimCycle returns true when THIS call won
+    // pending->running, false when the cycle was already running (a prior in-flight pass) or terminal. On false, re-read:
+    // 'running' proceeds (resume a prior unfinalized pass); anything else (terminal/pending-race) defers fail-closed --
+    // a terminal cycle means the account was already finalized (the staleness gate would not have selected it).
+    if (aborted()) return DEADLINE();
+    let claimed;
+    try { claimed = await claimCycle(cycleId, opt); }
+    catch (e) { return defer("cycle-claim-threw:" + S(e && e.message)); }
+    if (claimed !== true) {
+      let recheck;
+      try { recheck = await getCycleByBucketDate(cycleBucket, requestedAsOf, opt); }
+      catch (e) { return defer("cycle-reclaim-read-threw:" + S(e && e.message)); }
+      if (S(recheck && recheck.status) !== "running") return defer("cycle-not-running:" + S(recheck && recheck.status));
+    }
 
     if (aborted()) return DEADLINE();
     // The report JOB carries the REAL REGION bucket (india|europe-au|us-ca), NOT the priority-partial CYCLE bucket.

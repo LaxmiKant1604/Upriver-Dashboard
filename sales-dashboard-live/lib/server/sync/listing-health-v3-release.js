@@ -72,7 +72,7 @@ function noDateSource(requestKey, rows, rawSellerId) {
  */
 export function buildListingHealthV3Release({
   resolveBundle,
-  openCycle, getCycleByBucketDate,
+  openCycle, getCycleByBucketDate, claimCycle,
   deriveSnapshot,
   reportDerivations, computeHash, liveContracts,
   upsertReportJob, claimLease, saveShadow, reconcileSuccess,
@@ -83,7 +83,7 @@ export function buildListingHealthV3Release({
   leaseSeconds = 300,
   log = () => {},
 } = {}) {
-  for (const [name, fn] of [["resolveBundle", resolveBundle], ["openCycle", openCycle], ["getCycleByBucketDate", getCycleByBucketDate], ["deriveSnapshot", deriveSnapshot], ["computeHash", computeHash], ["upsertReportJob", upsertReportJob], ["claimLease", claimLease], ["saveShadow", saveShadow], ["reconcileSuccess", reconcileSuccess], ["finalizeCycle", finalizeCycle], ["readbackLive", readbackLive]]) {
+  for (const [name, fn] of [["resolveBundle", resolveBundle], ["openCycle", openCycle], ["getCycleByBucketDate", getCycleByBucketDate], ["claimCycle", claimCycle], ["deriveSnapshot", deriveSnapshot], ["computeHash", computeHash], ["upsertReportJob", upsertReportJob], ["claimLease", claimLease], ["saveShadow", saveShadow], ["reconcileSuccess", reconcileSuccess], ["finalizeCycle", finalizeCycle], ["readbackLive", readbackLive]]) {
     if (typeof fn !== "function") throw new Error(`buildListingHealthV3Release requires ${name} (fail closed).`);
   }
   if (!liveContracts || !reportDerivations) throw new Error("buildListingHealthV3Release requires liveContracts + reportDerivations (fail closed).");
@@ -170,6 +170,20 @@ export function buildListingHealthV3Release({
     const cycleId = S(cycle.id);
     const sourceRefreshedAt = nb(S(cycle.created_at ?? cycle.createdAt)) ? S(cycle.created_at ?? cycle.createdAt) : null;
     if (!nb(sourceRefreshedAt)) return defer("cycle-refresh-blank");
+
+    // Claim the freshly-opened cycle pending -> running (claim_sync_cycle) BEFORE finalize (finalize requires 'running',
+    // else 'invalid-status'). Idempotent: true = this call won pending->running; false = already running (resume a prior
+    // in-flight pass -> re-read requires 'running') or terminal (already finalized -> defer fail-closed).
+    if (aborted()) return DEADLINE();
+    let claimed;
+    try { claimed = await claimCycle(cycleId, opt); }
+    catch (e) { return defer("cycle-claim-threw:" + S(e && e.message)); }
+    if (claimed !== true) {
+      let recheck;
+      try { recheck = await getCycleByBucketDate(cycleBucket, requestedAsOf, opt); }
+      catch (e) { return defer("cycle-reclaim-read-threw:" + S(e && e.message)); }
+      if (S(recheck && recheck.status) !== "running") return defer("cycle-not-running:" + S(recheck && recheck.status));
+    }
 
     if (aborted()) return DEADLINE();
     // The report JOB carries the REAL REGION bucket, NOT the priority-partial CYCLE bucket -- sync_report_jobs_bucket_check

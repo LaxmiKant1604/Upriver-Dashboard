@@ -55,7 +55,8 @@ function harness(cfg = {}) {
   const release = buildListingHealthV3Release({
     resolveBundle,
     openCycle: async () => { calls.openCycle += 1; },
-    getCycleByBucketDate: async () => ({ id: "cyc-1", created_at: "2026-09-04T07:00:00.000Z" }),
+    getCycleByBucketDate: async () => ({ id: "cyc-1", status: "running", created_at: "2026-09-04T07:00:00.000Z" }),
+    claimCycle: async () => true, // claim_sync_cycle: pending -> running (won the transition)
     deriveSnapshot: (args) => { calls.derive += 1; return (cfg.deriveSnapshot || deriveReportSnapshot)(args); },
     reportDerivations: REPORT_DERIVATIONS,
     computeHash: paramsHashFor,
