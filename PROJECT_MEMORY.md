@@ -16636,3 +16636,34 @@ account routing/DataDoe/OLI/FBA/Listings touched. Tests: ads-reconcile-prodshape
 negative/fractional/unsafe-2^53/missing -> DEFER, zero writes + Daily LKG + siblings untouched; + valid-number/zero-row
 accept). Full verify 214 steps/190 suites incl build:check; api/*.js 12. This was the last known row_count coercion in the
 reconciler families.
+
+### 2026-09-15 - INCIDENT: reconciler live-promotion root cause fixed (report-job bucket) + sanitized diagnostics - commits 5d5c9e0 + b4e3d8b on main, PUSHED
+
+The FIRST live reconciler promotion (Ads run 34979534262) hard-failed for every stale account (india 6 / eu 29;
+published=0; LKG intact; ZERO export; controlClean=true). ROOT CAUSE: the three DEDICATED reconciler releases
+(daily-reporting-release.js / fba-brand-inventory-release.js / listing-health-v3-release.js) wrote the report JOB with
+`bucket=cycleBucket` (a `priority-partial-<region>-<hash>` value). `sync_report_jobs_bucket_check`
+(20260917_scheduler_regional_scope) permits ONLY the fixed region buckets; migration 20260924 widened
+`sync_cycles.bucket` for the priority-partial CYCLE namespace but DELIBERATELY kept the report-job identity on the real
+region bucket. So the job upsert 400-violated the CHECK -> `hardFail("derive","lineage-upsert-threw")` BEFORE any write.
+OLI never reached its lineage upsert (derive timed out first); FBA/LHv3 deferred -> Ads exposed a latent defect shared by
+ALL THREE dedicated releases (the scheduler's priority release + existing prod rows already do it right: cycle
+priority-partial, job = region).
+
+- **Diagnosis (5d5c9e0 + errClass follow-up):** added a SANITIZED per-account failure diagnostic to the shared
+  saved-data-reconciler.js (diagStageFor -> {family,region,accountId,requestedAsOf,stage,reasonCode,errClass}; reasonCode
+  = code before ':', errClass = HTTP-status + a whitelist keyword; NO payload/credential/UUID/customer data). A
+  region-restricted India-only live dispatch (workflow inputs mode=live + bucket=india) emitted
+  job-save / lineage-upsert-threw / **400:constraint**, and the live DB confirmed sync_report_jobs_bucket_check lacks the
+  priority-partial pattern. saved-data-reconciler-diag.test.js (91 assertions: mapping + no-leak).
+- **Fix (b4e3d8b):** each release derives jobBucket = region from cycleBucket
+  (/^priority-partial-(india|europe-au|us-ca)-/), hardFail("derive","job-bucket-unresolved") if unparseable (fail-closed,
+  before any write), and upserts the job with bucket=jobBucket; the CYCLE still opens with cycleBucket. Fenced publish /
+  claim / finalize(cycle_id) / abort-settlement / exact D-1 / zero export / report isolation / replay identity
+  (getLatestReportJobLineage ignores bucket) all preserved. ads-reconcile-prodshape mock now enforces the real CHECK
+  (reproduces the 400) + REQ6c (45->63); oli-reconcile-prodshape bounded-resume convergence test. 2-reviewer adversarial
+  review 0 defects; verify 215 steps/191 suites incl build:check; api/*.js 12.
+- OLI india: NOT the bucket bug -- a per-account wide-backfill derive that exceeds the ~330s region cap (deadline before
+  lineage); dashboards already 8/8 at D-1 via the scheduler. eu 30th (aHeal UK) + us-ca = source-pending. LHv3 durable
+  Listings tables empty = source-acquisition-pending (next scheduler cycle populates zero-export). ADS_RECONCILE_LIVE left
+  OFF pending a clean post-fix dry-run + region-by-region live.
