@@ -193,6 +193,31 @@ test("blocker 6: a forced timeout after controls open -> remaining accounts defe
   ok("A01 deferred (deadline-cleanup-reserved), NO release ran, but the REAL safe-close STILL released the exact fence", st(out, "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && h.calls.release.length === 0 && h.calls.closeRollback === 1 && h.store._s.lease === null && out.ok === true);
 });
 
+// WORKSTREAM 2 (bounded resumable progress): a deadline-DEFERRED account is a clean retryable partial (green, controls
+// close, ZERO writes), the SAME account RESUMES + publishes on the next pass (convergence), and a further replay is a
+// zero-write no-op (completed account is NOT rewritten -- PUBLICATION_NOT_REQUIRED). No new tables; the durable live/job
+// state is the sole continuation authority. Also proves zero DataDoe across every pass.
+test("workstream-2 bounded resume: deadline-defer -> next pass converges -> replay is a zero-write no-op; no export", async () => {
+  let deadline = true; // pass 1: out of time before A01's release
+  const h = buildProdShapeReconciler({ liveRefresh: new Map([["A01", "2026-09-08T00:00:00Z"]]), outOfTime: () => deadline });
+  // Pass 1 -- deadline: A01 is DEFERRED (retryable, honest partial), NO release runs, the REAL safe-close STILL releases
+  // the exact fence, and the run is GREEN (ok:true) -- not a hard failure. LKG (old live) is untouched.
+  const p1 = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("pass 1 (deadline): A01 DEFERRED_DEPENDENCY, zero release, safe-close ran, lease released, ok:true (honest green partial)",
+    st(p1, "daily-reporting") === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY && h.calls.release.length === 0 && h.calls.closeRollback === 1 && h.store._s.lease === null && p1.ok === true && p1.dataDoeCreates === 0);
+  // Pass 2 -- budget available: the SAME still-stale A01 RESUMES and publishes (convergence); live aligns to the shadow.
+  deadline = false;
+  const relBefore = h.calls.release.length;
+  const p2 = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("pass 2: A01 RESUMES + publishes (READBACK_VERIFIED); exactly one release ran; zero export",
+    OLI_RECONCILE_STATUS && st(p2, "daily-reporting") === OLI_RECONCILE_STATUS.READBACK_VERIFIED && h.calls.release.length === relBefore + 1 && p2.dataDoeCreates === 0 && p2.ok === true);
+  // Pass 3 -- replay: A01 is now current -> PUBLICATION_NOT_REQUIRED; NO control apply, NO release, NO rewrite.
+  const applyBefore = h.calls.openApply, relBefore3 = h.calls.release.length;
+  const p3 = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("pass 3 (replay): PUBLICATION_NOT_REQUIRED, no control apply, no release (completed account not rewritten); zero export",
+    st(p3, "daily-reporting") === "PUBLICATION_NOT_REQUIRED" && h.calls.openApply === applyBefore && h.calls.release.length === relBefore3 && p3.dataDoeCreates === 0);
+});
+
 test("blocker 6: zero DataDoe create/poll/download are impossible (the no-export adapter throws on all three)", async () => {
   const a = noExportAdapter();
   for (const op of ["create", "poll", "download"]) { let threw = false; try { await a[op]({}); } catch (e) { threw = /OLI_RECONCILER_NO_EXPORT/.test(String(e && e.message)); } ok("adapter." + op + " throws", threw); }

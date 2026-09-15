@@ -301,10 +301,17 @@ export function buildDailyReportingRelease({
     if (!nb(sourceRefreshedAt)) return defer("cycle-refresh-blank");
 
     if (aborted()) return DEADLINE();
+    // The report JOB carries the REAL REGION bucket (india|europe-au|us-ca), NOT the priority-partial CYCLE bucket.
+    // sync_report_jobs_bucket_check permits only the fixed region buckets; migration 20260924 widened sync_cycles.bucket
+    // for the priority-partial CYCLE namespace but DELIBERATELY left the report-job bucket as the real region (its own
+    // comment: "every source/report request identity stays the real region bucket") -- matching the scheduler's priority
+    // release. Writing cycleBucket here violates sync_report_jobs_bucket_check (400 constraint -> lineage-upsert-threw).
+    const jobBucket = (S(cycleBucket).match(/^priority-partial-(india|europe-au|us-ca)-/) || [])[1] || "";
+    if (!nb(jobBucket)) return hardFail("derive", "job-bucket-unresolved");
     try {
       await upsertReportJob({
         cycleId, reportKey: DAILY_REPORT_KEY, reportVersion: shadowVersion,
-        accountId, connectionId: "primary", bucket: cycleBucket,
+        accountId, connectionId: "primary", bucket: jobBucket,
         dependsOn, durableContentDeps,
       }, opt);
     } catch (e) { return hardFail("derive", "lineage-upsert-threw:" + S(e && e.message)); }

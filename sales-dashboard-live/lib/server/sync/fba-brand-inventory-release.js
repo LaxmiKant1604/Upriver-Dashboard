@@ -173,10 +173,16 @@ export function buildFbaBrandInventoryRelease({
     if (!nb(sourceRefreshedAt)) return defer("cycle-refresh-blank");
 
     if (aborted()) return DEADLINE();
+    // The report JOB carries the REAL REGION bucket, NOT the priority-partial CYCLE bucket -- sync_report_jobs_bucket_check
+    // permits only the region buckets (migration 20260924 widened only sync_cycles.bucket for the priority-partial CYCLE
+    // namespace, keeping the report-job bucket the real region, like the scheduler's priority release). cycleBucket here
+    // would violate sync_report_jobs_bucket_check (400 constraint -> lineage-upsert-threw).
+    const jobBucket = (S(cycleBucket).match(/^priority-partial-(india|europe-au|us-ca)-/) || [])[1] || "";
+    if (!nb(jobBucket)) return hardFail("derive", "job-bucket-unresolved");
     try {
       await upsertReportJob({
         cycleId, reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, reportVersion: BRAND_INVENTORY_REPORT_VERSION,
-        accountId, connectionId: "primary", bucket: cycleBucket,
+        accountId, connectionId: "primary", bucket: jobBucket,
         dependsOn: bsDeps, durableContentDeps: [contentToken],
       }, opt);
     } catch (e) { return hardFail("derive", "lineage-upsert-threw:" + S(e && e.message)); }

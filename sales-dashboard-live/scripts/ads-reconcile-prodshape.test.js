@@ -143,6 +143,11 @@ function makeWorld(over = {}) {
     },
     // --- sync_report_jobs (lineage) ---
     upsertReportJob: async (job) => {
+      // FAITHFUL to the production sync_report_jobs_bucket_check (20260917_scheduler_regional_scope; NOT widened by 20260924 for the priority-
+      // partial CYCLE namespace): a report JOB's bucket MUST be a fixed region bucket. A priority-partial CYCLE bucket
+      // here is a 400 check-constraint violation -- the exact production root cause of the Ads lineage-upsert-threw.
+      const ALLOWED_JOB_BUCKETS = new Set(["us", "non-us", "us-fba", "non-us-fba", "india", "europe-au", "us-ca", "india-fba", "europe-au-fba", "us-ca-fba"]);
+      if (!ALLOWED_JOB_BUCKETS.has(String(job.bucket))) { const e = new Error(`Supabase request failed (400): new row for relation "sync_report_jobs" violates check constraint "sync_report_jobs_bucket_check"`); e.status = 400; e.code = "23514"; throw e; }
       writes.upsertedReportKeys.push(job.reportKey);
       const existing = jobs.find((j) => j.cycle_id === job.cycleId && j.report_key === job.reportKey && j.account_id === job.accountId);
       if (existing) return;
@@ -538,6 +543,22 @@ test("REQ6b: valid ZERO-ROW catalog (row_count 0, [] payload) stays supported ->
   const world = makeWorld({ catalogRowCount: 0, catalogRows: [] });
   const res = await driveRelease(world);
   ok("zero-row catalog is NOT rejected; the cycle opens", res.reason !== "catalog-row-count-invalid" && res.reason !== "catalog-integrity" && world.writes.openCalls > 0);
+});
+
+// REQ 6c (ROOT CAUSE of the production Ads hard-failure, run 34979534262): the report JOB must carry the REGION bucket,
+// NOT the priority-partial CYCLE bucket. sync_report_jobs_bucket_check (unchanged by 20260924, which widened only the
+// CYCLE bucket) 400-rejects a priority-partial job bucket -> lineage-upsert-threw (stage job-save). The harness's
+// upsertReportJob now enforces that CHECK, so this reproduces the failure; the fix writes bucket=<region> and publishes.
+test("REQ6c (root cause): report JOB carries region bucket 'india' + CYCLE carries priority-partial; publishes daily-reporting; no lineage-upsert-threw", async () => {
+  const world = makeWorld();
+  const before = siblingFootprint(world);
+  const res = await driveRelease(world); // cycleBucket = priority-partial-india-x
+  ok("release PUBLISHED daily-reporting (past job-save; NOT lineage-upsert-threw / job-bucket-unresolved)",
+    res.ok === true && res.reason !== "lineage-upsert-threw" && res.reason !== "job-bucket-unresolved" && world.writes.publishedLiveKeys.includes("daily-reporting"));
+  const dailyJob = world.jobs.find((j) => j.report_key === "daily-reporting");
+  ok("the report JOB was written with the REGION bucket 'india' (not the priority-partial cycle bucket)", dailyJob && dailyJob.bucket === "india");
+  ok("the CYCLE still carries the priority-partial namespace", [...world.cycles.values()].some((c) => String(c.bucket).startsWith("priority-partial-india")));
+  ok("siblings untouched (brand-sales / brand-inventory byte-identical, zero sibling writes)", siblingsUnchangedAndUntouched(before, siblingFootprint(world)));
 });
 
 // REQ 7 (the confirmed HIGH defect) -- a valid live daily is published (Ads succeeded, cr-A); THEN the durable Ads sync
