@@ -16577,3 +16577,47 @@ Third corrective round on 9e1e7de/acfe76c. Full verify GREEN 214 steps/190 suite
 - **B3 SEMANTIC COVERAGE REJECTS MALFORMED STATES (listing-health-v3-live-identity.js).** listingHealthV3SemanticIdentity previously only rejected non-empty gaps when gaps was already an array, so it ACCEPTED {complete:true,gaps:"corrupt"}, {complete:true,gaps:[],coveredFrom:null}, {complete:false,gaps:[]}. Now: gaps MUST be an array of well-formed, in-window, strictly-ASCENDING {from,to} objects (reject non-array / non-object / bad-date / reversed / out-of-window / overlapping / unordered); complete === (gaps.length===0) BOTH directions; complete=true REQUIRES coveredFrom===window.from AND coveredTo===window.to. VERIFIED against the REAL assessOliCoverage (listing-health-advanced.js computeCoverageGaps): it sets complete=gaps.length===0 unconditionally, produces ascending in-window gaps, and yields covered===window when complete -- so NO genuine payload (fully-covered / partial / no-coverage / multi-gap) is rejected (proven with real-derived payloads). Runs in BOTH buildLivePromotedResolver (serve+readback) AND publishSchedulerV2Snapshot (-> disposition invalid-snapshot).
 - Tests: NEW listing-health-v3-live-identity.test.js (36: exhaustive semantic-hook repros + 3 real-derived coverage shapes pass + 5 REAL publishSchedulerV2Snapshot behavioral cases -- malformed/wrong-account/complete-gaps-mismatch -> invalid-snapshot, real-derived -> published) + NEW listing-health-v3-durable-loader.test.js (39: valid + zero-row catalog present; 17 invalid catalogs each -> loader {} AND bundle eligible:false zero-write defer; preview byte-unchanged; no-buildObjectPath fail-closed). EXTENDED live-resolver (28->37: 8 malformed-coverage resolver repros + a genuine partial passes; fixed the complete:false/gaps:[] fixture), live-contract (34->39: envFlagOn logic + build-time gate source-guard + three-gate doc), scheduler-v2-lhv3-workflow (line 80: the UI-flag-OFF assertion now matches the build-time gate). No sibling/OLI/FBA/Ads/scheduler behavior changed (semanticIdentity hook is LHv3-only; strict loader mode opt-in default OFF).
 - **REVISED PRODUCTION ACTIVATION SEQUENCE (unchanged prerequisites + the frontend flag):** (1) apply migrations 20260925/26/27 via MIGRATE_ONLY; (2) LISTINGS_RECONCILE_LIVE=true; (3) set the SERVER env LHV3_PUBLISH_LIVE=true + LISTING_HEALTH_V3=true; (4) set the BUILD-TIME Vercel var VITE_LISTING_HEALTH_V3=true and REDEPLOY (the frontend flag is compiled into the bundle -- a redeploy is required; a server-var change alone will NOT surface the view); (5) smoke-confirm the source_promoted_publish_settings row for listing-health-v3 shows publish_enabled=true on the first periodic cycle. NOT pushed; api/*.js still 12; zero exports/tokens.
+
+### 2026-09-15 - WORK C/D PRODUCTION-GATE CORRECTION ROUND 4 (shared strict RFC3339 validated_at + row_count typeof completeness across the LHv3 reconciler) - commit f5b4c98 on main, NOT pushed
+
+Fourth corrective round on 63a1f10 (round 3). Two strictness classes, now made CONSISTENT across the WHOLE
+listing-health-v3 zero-export reconciler (durable loader + dependency bundle). Full verify GREEN 214 steps/190 suites
+incl build:check (baseline 214/190 before the fix, 214/190 after -> no regression, +11 new assertions inside the
+dependency-bundle suite); node --check + git diff --check clean. An ultracode 4-slice adversarial audit (11 agents:
+find + adversarial-refute) confirmed the completeness gap; durable-loader + live-contract slices CLEAN; all gates OFF;
+migrations 20260925/26/27 UNAPPLIED; api/*.js 12; zero push/deploy/dispatch/migration/DataDoe/token/export.
+
+- **B1 SHARED STRICT RFC3339 validated_at (NEW lib/server/rfc3339-timestamp.js; dependency-bundle.js + durable-loader.js).**
+  validated_at was checked with a LOOSE `Date.parse` (nonblank + Number.isFinite(Date.parse)) which Node accepts for
+  "2026-02-30T00:00:00Z", "1", and the date-only "2026-09-04". Extracted the PROVEN isValidTimestamp from supabase.js into
+  a dependency-safe (pure, no env/supabase import) shared `isValidRfc3339Timestamp` -- string only, real leap-aware
+  calendar date + valid time + Z or numeric +-HH:MM offset + finite instant -- and swapped it into BOTH files
+  (`const isRealTimestamp = isValidRfc3339Timestamp`). BYTE-FOR-BYTE === supabase.js:isValidTimestamp (equivalence check
+  over ~30 cases: 0 mismatches / 0 expectation-failures). supabase.js keeps its own copy DELIBERATELY (already strict, a
+  disjoint sync-cycle-finalization subsystem; the audit ruled a refactor OUT of scope) -- kept in step by comment.
+- **B2 row_count STRICT TYPEOF, no Number(...) coercion (durable-loader.js Catalog + dependency-bundle.js Listings/Raw/FBA).**
+  Round 3 hardened ONLY the Catalog snapshot (durable loader) but still via `Number(row_count)` + isFinite/isInteger; this
+  upgrades it to `typeof === "number" && Number.isSafeInteger && >= 0` AND completes the SAME P2 class across the sibling
+  dependency bundle's FOUR coercion sites: validateListingsPointer (mandatory Listings/Listings-Raw pointer), the OPTIONAL
+  FBA inventory pointer, the hydrate-count check, and the PROVEN_EMPTY status. A Number(...) coercion FAIL-OPENS on
+  "0"/null/false/""/"2"/[] whenever Number() maps them to a value that MATCHES the hydrated rows.length; typeof +
+  Number.isSafeInteger reject every non-number. Because row_count is now proven a real number, the downstream count checks
+  and PROVEN_EMPTY compare DIRECTLY (rows.length !== snapshot.row_count; l/r.snapshot.row_count === 0) with no re-coercion.
+  ANY non-number row_count DEFERS the whole bundle (eligible:false, revisionId null, contentDeps []) -> LKG preserved, zero
+  cycle/job/shadow/live writes. Reachability: source_snapshots.row_count is int4-not-null today (string form not live via
+  the standard reader) BUT the durable family already uses BIGINT row-count columns elsewhere (node-postgres returns int8
+  as a STRING) and the readers are INJECTED deps the reconciler does not trust to pre-type -- the same defense-in-depth
+  premise under which round 3 hardened the equally int4-defended Catalog.
+- **B3 rows-array masquerade guard (durable-loader.js, from the pre-existing round-4 working tree).** STRICT Catalog
+  hydration now requires an ACTUAL rows array (an array payload, or {rows:[...]}); a missing/non-array rows property
+  DEFERS even when row_count is 0, so a malformed payload ({} / {rows:"bad"}) can never masquerade as a valid zero-row
+  Catalog. Non-strict PREVIEW path byte-for-byte UNCHANGED (a non-array payload still degrades to []).
+- Tests: dependency-bundle 78->89 (+11: string/'0'/null/bool/array/unsafe-2^53 row_count -> row-count-invalid at the
+  Listings pointer unit-level + genuine 0 passes; strict RFC3339 validated_at repros; e2e string/null row_count on
+  Listings/Raw -> defer + string/bool row_count on the FBA pointer -> whole-bundle defer). durable-loader 80 (round-2/3
+  coercion + RFC3339 + rows-masquerade cases). Adversarial audit surfaced 3 survived + 4 refuted findings, ALL converging
+  on the SAME bundle row_count gap (unanimous in_round4_scope); supabase.js drift out of scope.
+- SCOPE: CODE-COMPLETE; PRODUCTION-ACCEPTANCE prerequisites UNCHANGED (apply 20260925/26/27 via MIGRATE_ONLY, then
+  LISTINGS_RECONCILE_LIVE, then LHV3_PUBLISH_LIVE + LISTING_HEALTH_V3 + build-time VITE_LISTING_HEALTH_V3 + redeploy -- see
+  round 3). OUT-OF-ROUND follow-up candidate (DIFFERENT reconciler family, NOT touched): daily-reporting-release.js:194
+  `Number(catalogSnapshot.row_count ?? rowCount)` carries the same coercion -- a separate Ads-reconciler round.
