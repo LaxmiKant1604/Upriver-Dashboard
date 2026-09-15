@@ -16621,3 +16621,18 @@ migrations 20260925/26/27 UNAPPLIED; api/*.js 12; zero push/deploy/dispatch/migr
   LISTINGS_RECONCILE_LIVE, then LHV3_PUBLISH_LIVE + LISTING_HEALTH_V3 + build-time VITE_LISTING_HEALTH_V3 + redeploy -- see
   round 3). OUT-OF-ROUND follow-up candidate (DIFFERENT reconciler family, NOT touched): daily-reporting-release.js:194
   `Number(catalogSnapshot.row_count ?? rowCount)` carries the same coercion -- a separate Ads-reconciler round.
+
+### 2026-09-15 - DAILY-REPORTING RECONCILER: strict Catalog row_count typeof (last Number(...) coercion fail-open) - commit 77c6dc5 on main
+
+Closes the out-of-round follow-up flagged at round 4 (f5b4c98): the Ads/daily-reporting dedicated release
+(daily-reporting-release.js) validated the Catalog snapshot row_count via `catalogRows.length !==
+Number(catalogSnapshot.row_count ?? catalogSnapshot.rowCount)` -- the SAME P2 fail-open (Number("0")/Number(null)/
+Number(false)/Number("2") pass whenever the coerced value matches the hydrated rows.length). Smallest fix, mirroring the
+round-4 discipline: row_count MUST be an ACTUAL number (typeof === "number" && Number.isSafeInteger && >= 0); a malformed/
+missing value DEFERS with `catalog-row-count-invalid` BEFORE opening a cycle / any job/shadow/live write (live LKG
+preserved). The `??` still bridges the snake/camel projection first; a valid zero-row Catalog (real 0 === 0 hydrated) stays
+supported; the existing `catalog-integrity` count-mismatch reason unchanged. NO scheduler timing/formulas/report keys/
+account routing/DataDoe/OLI/FBA/Listings touched. Tests: ads-reconcile-prodshape 45->59 (REQ6b: string/'0'/null/boolean/
+negative/fractional/unsafe-2^53/missing -> DEFER, zero writes + Daily LKG + siblings untouched; + valid-number/zero-row
+accept). Full verify 214 steps/190 suites incl build:check; api/*.js 12. This was the last known row_count coercion in the
+reconciler families.
