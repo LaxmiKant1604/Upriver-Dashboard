@@ -16733,3 +16733,54 @@ PRODUCTION ACCEPTANCE: NOT yet claimed -- no natural run observed on the correct
 21:58Z listing-health-v3-reconcile (live, from main) and the india 03:07Z / us-ca 16:37Z scheduler cycles, each of which
 should promote LHv3 live from the already-saved durable Listings with ZERO DataDoe exports. Built on
 [[listing-health-v3-reconciler-live]] + [[listings-asof-timezone-artifact]].
+
+### 2026-09-16 - Report Delivery Status (admin-only, READ-ONLY per-account Export+Publish matrix) - commit cb41875 on main, PUSHED; verify 217/193; adversarial review 7 findings all fixed
+
+New admin-only view under Data Sync Center answering, per account per source, after each cycle: was each source
+exported/validated, was its dependent live dashboard published + read back, latest validated timestamp, and (if not) the
+SAFE stage/code. READS ONLY existing durable evidence -- NEVER writes/exports/dispatches/retries/spends a token.
+
+ARCHITECTURE (no new api/*.js -- Vercel 12-fn cap held): `GET /api/admin/sync?view=delivery` branch behind the SAME
+assertAdmin already at the top of the handler; the default GET response + ALL POST/PATCH behavior are byte-unchanged. New
+pure `lib/server/delivery-status.js` = an injected-reader LOADER + PURE classifiers/shaper (offline-testable; imports NO
+transport -- the endpoint injects the read-only supabase getters). Section added to `src/views/DataSyncCenter.jsx` (region
++ cycle dropdowns, failures-only toggle, reload, summary tiles, horizontally-scrolling account matrix; icon+text status
+chips, never colour alone); CSS in `src/styles/theme.js`. Fail-closed everywhere: a read failure / unapplied schema /
+unresolved cycle / null org identity => "Unavailable", never a fabricated Yes/No/zero.
+
+STATUS SEMANTICS. Export: DATED sources prove the selected cycle's D-1 -- OLI via getSourceCoverageWindows, Campaign Ads
+via ads_sync_state.latest_metric_date (worker key campaign-performance-v1), FBA Inventory via the fba-plan report JOB
+(getLatestReportJobLineage: validated + latest_data_date, because FBA has NO standalone durable pointer -- source_snapshots
+holds ONLY product-catalog/__organization; source_coverage holds ONLY order-line-items). DATE-FREE sources (Catalog org
+snapshot, Listings/Listings-Raw per-account snapshots) require a present pointer + a REAL validated_at; their as_of cycle
+LABEL is never treated as a data date (see [[listings-asof-timezone-artifact]]); adopted-not-purchased evidence is
+Export:Yes + a "validated reuse" detail. Publish: proven ONLY by a BARE live report_key snapshot whose
+params.reportVersion === contract.liveReportVersion -- a scheduler-v2/<key> shadow row or a report JOB row NEVER counts --
+aggregated K/N across the source's dependent live dashboards.
+
+MAPPING (registry-derived, drift-guarded): reconciler LINEAGE inverse (oli/ads/fba/listings *_LINEAGE_DEPENDS_ON) UNION
+fba-plan for exactly the FBA-inventory/Listings exports it OWNS (REPORT_SOURCE_REQUIREMENTS minus REPORT_DERIVED_SOURCE_KEYS).
+Exact operator families: OLI->[brand-inventory,brand-sales,daily-reporting]; Catalog->same 3; Ads->[daily-reporting,
+ppc-performance]; FBA->[brand-inventory,fba-plan]; Listings->[fba-plan,listing-health-v3]; Listings-Raw->[listing-health-v3].
+Derived-only readers (lhv3 reads OLI/Catalog from durable history) are EXCLUDED so they never drag an unrelated aggregate.
+listing-health-v3 is excluded from the Publish universe while its double gate (LHV3_PUBLISH_LIVE && LISTING_HEALTH_V3,
+both default OFF) is off -> Listings-Raw shows Not-applicable, never a false No.
+
+ADVERSARIAL REVIEW (8 dimensions, 25 agents) surfaced + I FIXED 7: (BLOCKER) the live-meta read was one unbounded all-keys
+GET -- report_snapshots had 2403 rows for the 15 live keys, over PostgREST's ~1000 cap, so it would SILENTLY truncate into
+a fabricated No; now read PER live key (each << cap) with a 950-row safety that marks a key Unavailable rather than
+fabricate. (HIGH x2 + MEDIUM) the dated coversCycle and the publish freshness gate FAILED OPEN when cycleAsOf was null
+(no cycle resolved) -> could show Yes off stale/unverifiable evidence; now require a real cycle as-of (else Waiting/
+Unavailable). (LOW x3) gated-off lhv3 -> Not-applicable not No; version-preferred dedup (a newer wrong-version/off-window
+row never masks the correct live row); summary green tone gated on a positive total.
+
+TESTS: scripts/delivery-status.test.js (74 assertions) -- admin gate + 403, GET no writes/DataDoe/dispatch, default GET +
+POST/PATCH unchanged, canonical region routing (one region per account, UK/GB), dated-D-1 vs date-free, cycle-mismatch
+never marks a date-free payload stale, missing/malformed never Yes, shadow != published, exact live readback = published,
+partial K/N, LKG honest, truncation fail-closed, failures-only + dropdowns, mobile scroll, hooks-before-return, api/*.js=12,
+read path imports no scheduler/reconciler/migration. Full verify 217/193 incl build:check.
+
+PROD READ-ONLY SMOKE (real supabase readers wired to the loader, offline, ZERO writes): us-ca cycle 2026-09-15 (as-of
+09-14), 17 accounts, exported 63/102, published 44/85; healthy accounts show Order/Product/FBA/Listings Export+Publish Yes,
+Campaign Ads No 1/2 (ppc-performance not broadly live), Listings-Raw Not-applicable (lhv3 gated). Region routing correct
+across us-ca/europe-au/india. Full browser admin UI smoke pending an admin login. See [[report-delivery-status-view]].
