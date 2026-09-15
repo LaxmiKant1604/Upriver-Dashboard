@@ -16667,3 +16667,26 @@ priority-partial, job = region).
   lineage); dashboards already 8/8 at D-1 via the scheduler. eu 30th (aHeal UK) + us-ca = source-pending. LHv3 durable
   Listings tables empty = source-acquisition-pending (next scheduler cycle populates zero-export). ADS_RECONCILE_LIVE left
   OFF pending a clean post-fix dry-run + region-by-region live.
+
+### 2026-09-15 - INCIDENT (cont.): 2nd dedicated-release defect fixed (cycle claim pending->running) - commit a4746cd on main, PUSHED; Ads live PROVEN
+
+After the report-job bucket fix (b4e3d8b) let the Ads release reach finalize, a SECOND latent defect surfaced (caught
+immediately by the errClass diagnostic): stage=closure, reasonCode=**finalize-invalid-status**. finalize_sync_cycle
+(20260815_sync_cycle_finalize:54) requires the cycle status='running' else returns 'invalid-status'; open_sync_cycle
+inserts 'pending'; the scheduler's priority release claims it (pending->running via claim_sync_cycle) but the three
+DEDICATED releases (daily-reporting / fba-brand-inventory / listing-health-v3) never did (prod priority-partial india
+cycles were 'pending' with 0 report jobs). Both defects are the SAME class: the dedicated releases were built with mocks
+that created a cycle already 'running' and never enforced the real cycle lifecycle, so they had never been exercised
+end-to-end.
+
+FIX (a4746cd): each release, after openCycle + getCycleByBucketDate, calls claimCycle (claim_sync_cycle) pending->running
+BEFORE finalize; idempotent (true=won; false=re-read requires 'running' to resume a prior in-flight pass, else defer
+fail-closed). claimCycle=sb.claimSyncCycle threaded into all 3 entrypoints. The 3 prodshape harnesses made FAITHFUL
+(openCycle->'pending', claimCycle mock, finalize requires 'running') -- reproducing the failure.
+
+PROVEN END-TO-END: India Ads live (post-both-fixes, run 35004284991) = **ok:true, published=5, failed=0, controlClean=true,
+dataDoeCreates=0** (green workflow). DB: 5 daily-reporting india rows written by the reconciler; india STILL 8/8 at D-1
+(LKG maintained); ZERO brand-sales/brand-inventory writes (report isolation PROVEN -- Ads writes ONLY daily-reporting).
+Full verify 215 steps/191 suites incl build:check. ADS_RECONCILE_LIVE re-enabled true. us-ca resolved to 11/11 D-1 by the
+NATURAL Cloudflare us-ca cycle (zero export from us); LHv3 durable Listings populated (11 us-ca, as_of D-2 -> LHv3 live
+pending Listings source reaching D-1). eu 30th (aHeal UK) source-pending.
