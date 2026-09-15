@@ -132,10 +132,24 @@ const run = (over = {}) => { const { deps, args } = harness(over); return resolv
   ok("impossible calendar date 2026-99-99 -> not-d1", validateListingsPointer({ snapshot: { ...good, as_of: "2026-99-99" }, expectedOrg: ORG, durableConn: CONN, sourceKey: "listings", accountId: ACCT, marketplace: MKT, requestedAsOf: "2026-99-99", expectedObjectPath: eop }).reason === "not-d1");
   ok("blank validated_at -> validated-at-invalid", V({ ...good, validated_at: "" }).reason === "validated-at-invalid");
   ok("garbage validated_at (not a real timestamp) -> validated-at-invalid", V({ ...good, validated_at: "not-a-timestamp" }).reason === "validated-at-invalid");
+  // Codex round-4: the strict RFC3339 validator (not a loose Date.parse) rejects impossible/date-only/'1' validated_at.
+  ok("impossible validated_at 2026-02-30T00:00:00Z -> validated-at-invalid (strict RFC3339)", V({ ...good, validated_at: "2026-02-30T00:00:00Z" }).reason === "validated-at-invalid");
+  ok("date-only validated_at 2026-09-04 (no time) -> validated-at-invalid", V({ ...good, validated_at: "2026-09-04" }).reason === "validated-at-invalid");
+  ok("validated_at '1' -> validated-at-invalid", V({ ...good, validated_at: "1" }).reason === "validated-at-invalid");
+  ok("genuine validated_at with a numeric +05:30 offset passes", V({ ...good, validated_at: "2026-09-04T06:00:00+05:30" }).ok === true);
   ok("blank request hash -> request-hash-blank", V({ ...good, source_request_hash: "" }).reason === "request-hash-blank");
   ok("blank payload sha -> payload-sha-blank", V({ ...good, payload_sha: "" }).reason === "payload-sha-blank");
   ok("negative row_count -> row-count-invalid", V({ ...good, row_count: -1 }).reason === "row-count-invalid");
   ok("non-integer row_count -> row-count-invalid", V({ ...good, row_count: 2.5 }).reason === "row-count-invalid");
+  // Codex round-4 completeness (P2 parity with the Catalog strictness): row_count MUST be an ACTUAL number -- a coerced
+  // string/null/bool/array that Number(...) maps to a matching integer is a fail-open and is now rejected here too.
+  ok("string row_count '2' -> row-count-invalid (no Number() coercion)", V({ ...good, row_count: "2" }).reason === "row-count-invalid");
+  ok("string row_count '0' -> row-count-invalid", V({ ...good, row_count: "0" }).reason === "row-count-invalid");
+  ok("null row_count -> row-count-invalid (Number(null)=0 no longer fail-opens)", V({ ...good, row_count: null }).reason === "row-count-invalid");
+  ok("boolean row_count true -> row-count-invalid (Number(true)=1)", V({ ...good, row_count: true }).reason === "row-count-invalid");
+  ok("array row_count [] -> row-count-invalid (Number([])=0)", V({ ...good, row_count: [] }).reason === "row-count-invalid");
+  ok("unsafe-integer row_count 2^53 -> row-count-invalid (Number.isSafeInteger)", V({ ...good, row_count: 2 ** 53 }).reason === "row-count-invalid");
+  ok("genuine numeric row_count 0 passes", V({ ...good, row_count: 0, object_path: pathFor("listings", good.payload_sha) }).ok === true);
   ok("path does not embed the declared sha -> path-sha-mismatch", V({ ...good, object_path: pathFor("listings", "OTHERSHA"), payload_sha: good.payload_sha }, { expectedObjectPath: pathFor("listings", good.payload_sha) }).reason === "path-sha-mismatch");
   ok("path outside the expected namespace -> path-namespace-mismatch", V({ ...good, object_path: "source-snapshots/v2/OTHERORG/primary/listings/" + ACCT + "/" + good.payload_sha + ".json" }).reason === "path-namespace-mismatch");
 }
@@ -173,6 +187,13 @@ await miss("cross-marketplace listings pointer -> defer", { readListingsSnapshot
 await miss("wrong-source listings pointer -> defer", { readListingsSnapshot: async () => ({ read: "ok", snapshot: { ...ptr("listings"), source_key: "listings-raw" } }) }, "source-key-mismatch");
 await miss("wrong-path listings pointer -> defer", { readListingsSnapshot: async () => ({ read: "ok", snapshot: { ...ptr("listings"), object_path: "source-snapshots/v2/OTHER/primary/listings/" + ACCT + "/sha-l.json" } }) }, "path-namespace-mismatch");
 await miss("row_count mismatch (rows.length !== row_count) -> defer", { readListingsSnapshot: async () => ({ read: "ok", snapshot: ptr("listings", { row_count: 5 }) }) }, "row-count-mismatch");
+// Codex round-4 completeness: a NON-NUMBER row_count (which Number(...) would have coerced to a value MATCHING the
+// hydrated rows.length) DEFERS the whole bundle instead of fail-opening -- on the mandatory Listings/Raw pointers AND on
+// the optional FBA inventory pointer (spread over the fixtures to bypass their own `== null ? default` coercion).
+await miss("string row_count '2' on the listings pointer -> defer (P2 parity)", { readListingsSnapshot: async () => ({ read: "ok", snapshot: { ...ptr("listings"), row_count: "2" } }) }, "row-count-invalid");
+await miss("null row_count on the listings-raw pointer -> defer", { readListingsRawSnapshot: async () => ({ read: "ok", snapshot: { ...ptr("listings-raw"), row_count: null } }) }, "row-count-invalid");
+await miss("string row_count '1' on the FBA inventory pointer -> defer (whole bundle)", { readInventorySnapshot: async () => ({ read: "ok", snapshot: { ...invPtr(), row_count: "1" } }) }, "inventory-pointer-invalid");
+await miss("boolean row_count on the FBA inventory pointer -> defer", { readInventorySnapshot: async () => ({ read: "ok", snapshot: { ...invPtr(), row_count: true } }) }, "inventory-pointer-invalid");
 await miss("malformed as_of -> defer", { readListingsSnapshot: async () => ({ read: "ok", snapshot: ptr("listings", { as_of: "2026-9-4" }) }) }, "not-d1");
 await miss("storage failure -> defer (NO inline fallback)", { loadSnapshotPayload: async (p) => { if (p.includes("/listings/")) throw new Error("storage down"); return { rows: [{ sku: "A" }, { sku: "B" }] }; } }, "payload-unreadable");
 await miss("schema-missing pointer (typed read failure) -> defer", { readListingsSnapshot: async () => ({ read: "schema-missing", snapshot: null }) }, "read-schema-missing");

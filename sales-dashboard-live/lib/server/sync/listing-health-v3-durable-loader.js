@@ -20,12 +20,10 @@ import { organizationFingerprint as organizationFingerprintOf } from "../source-
 import { resolveListingHealthWindow } from "../reports/listing-health-advanced.js";
 import { getEnrichedOliHistoryRows } from "./oli-enriched-history.js";
 import { getSourceCoverageWindows, getOliCompleteness } from "../supabase.js";
+import { isValidRfc3339Timestamp } from "../rfc3339-timestamp.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const isDate = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
-// A real, parseable timestamp (source_snapshots.validated_at) -- not merely nonblank (parity with the dependency-bundle
-// validator, blocker 2/4). Rejects "", non-strings, and unparseable values.
-const isRealTimestamp = (v) => { const s = S(v); return s !== "" && Number.isFinite(Date.parse(s)); };
 const OLI_SOURCE_KEY = "order-line-items";
 const CATALOG_SOURCE_KEY = "product-catalog";
 const ORGANIZATION_SCOPE_KEY = "__organization";
@@ -150,30 +148,45 @@ export function makeListingHealthV3DurableContextLoader({
     if (strict) {
       const cat = catalogSnapshot;
       const catSha = S(cat.payload_sha);
-      const catRc = Number(cat.row_count);
       if (typeof buildObjectPath !== "function") return {}; // cannot verify the namespace path -> defer (fail closed)
       // Cheap identity + row_count + sha + validated_at checks FIRST (this includes catSha nonblank, so the namespace
-      // recompute below never receives a blank sha -- sourceSnapshotObjectPath fails closed on a blank sha).
+      // recompute below never receives a blank sha -- sourceSnapshotObjectPath fails closed on a blank sha). row_count
+      // MUST be an ACTUAL JavaScript number (a SAFE non-negative integer) -- NEVER a coerced string/null/boolean/array/
+      // object. Number(null)=0, Number("")=0, Number(false)=0, Number("0")=0, Number(true)=1, Number("2")=2 previously
+      // FAIL-OPEN whenever the hydrated count happened to match the coerced value; typeof + Number.isSafeInteger reject
+      // every non-number. validated_at is validated by the strict RFC3339 validator (not a loose Date.parse).
       if (S(cat.organization_fingerprint) !== S(orgFingerprint)
         || S(cat.connection_id) !== S(connectionId)
         || S(cat.source_key) !== CATALOG_SOURCE_KEY
         || S(cat.scope_key) !== ORGANIZATION_SCOPE_KEY
         || S(cat.source_request_hash).trim() === ""
         || catSha.trim() === ""
-        || !isRealTimestamp(cat.validated_at)
-        || !Number.isFinite(catRc) || !Number.isInteger(catRc) || catRc < 0
+        || !isValidRfc3339Timestamp(cat.validated_at)
+        || typeof cat.row_count !== "number" || !Number.isSafeInteger(cat.row_count) || cat.row_count < 0
         || !S(cat.object_path).endsWith("/" + catSha + ".json")) return {};
       // catSha is nonblank and the path embeds it -> recompute the content-addressed namespace path and require an
       // EXACT match (a valid-looking pointer in a DIFFERENT org/conn/source/scope namespace is rejected here).
       if (S(cat.object_path) !== buildObjectPath({ organizationFingerprint: orgFingerprint, connectionId, sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY, payloadSha: catSha })) return {};
     }
     let catalogRows = [];
-    try {
-      const payload = await loadCatalogPayload(catalogSnapshot.object_path, { signal });
-      catalogRows = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.rows) ? payload.rows : []);
-    } catch (_e) { if (strict) return {}; return { listingHealthV3DurableOli }; }
-    // STRICT: hydrated rows.length must EXACTLY equal the (already-validated finite integer) declared row_count.
-    if (strict && catalogRows.length !== Number(catalogSnapshot.row_count)) return {};
+    {
+      let hydrated;
+      try {
+        hydrated = await loadCatalogPayload(catalogSnapshot.object_path, { signal });
+      } catch (_e) { if (strict) return {}; return { listingHealthV3DurableOli }; }
+      if (strict) {
+        // STRICT: the hydrated payload MUST contain an ACTUAL rows array (an array payload, or { rows: [...] }). A
+        // missing / non-array rows property DEFERS -- INCLUDING when row_count is 0 -- so a malformed payload ({},
+        // { rows: "bad" }) can never masquerade as a valid zero-row Catalog. Then rows.length must EXACTLY equal the
+        // (already-validated real-number) declared row_count.
+        const rows = Array.isArray(hydrated) ? hydrated : (hydrated && typeof hydrated === "object" && Array.isArray(hydrated.rows) ? hydrated.rows : null);
+        if (rows === null || rows.length !== catalogSnapshot.row_count) return {};
+        catalogRows = rows;
+      } else {
+        // PREVIEW (non-strict): byte-for-byte UNCHANGED -- a non-array payload degrades to [].
+        catalogRows = Array.isArray(hydrated) ? hydrated : (hydrated && Array.isArray(hydrated.rows) ? hydrated.rows : []);
+      }
+    }
 
     // Surface the catalog's content-addressed payload_sha + validated_at so the dependency-bundle fingerprint can fold
     // the exact catalog content identity (WORK C/D blocker 1); additive -- the derive ignores these extra fields.

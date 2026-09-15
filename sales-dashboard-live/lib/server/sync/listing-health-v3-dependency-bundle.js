@@ -21,6 +21,7 @@
 
 import { createHash } from "node:crypto";
 import { LISTINGS_SOURCE_KEY, LISTINGS_RAW_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY } from "./source-durable-model.js";
+import { isValidRfc3339Timestamp } from "../rfc3339-timestamp.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
@@ -38,11 +39,10 @@ export function isRealCalendarDate(s) {
   const d = new Date(s + "T00:00:00.000Z");
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
 }
-// A real, parseable timestamp (validated_at) -- not merely nonblank.
-function isRealTimestamp(v) {
-  const s = S(v);
-  return s !== "" && Number.isFinite(Date.parse(s));
-}
+// validated_at is validated by the SHARED strict RFC3339/timestamptz validator (string only, real calendar date + valid
+// time + Z/numeric offset + finite instant) -- NOT a loose Date.parse, which Node accepts for "2026-02-30T00:00:00Z",
+// "1", and the date-only "2026-09-04".
+const isRealTimestamp = isValidRfc3339Timestamp;
 // Canonical numeric normalization -- FULL precision, matching the derivation's exact coercion (derivation-core
 // num = Number(v) || 0, applied by foldOliWindowSales + summarizeCompleteness). NO rounding: a 4dp round COLLIDED
 // 1.00001 vs 1.00002 (Codex repro) while the fold sums them to different dashboard sales. So equal token <=> equal
@@ -146,8 +146,13 @@ export function validateListingsPointer({ snapshot, expectedOrg, durableConn, so
   if (!nb(snapshot.source_request_hash)) return { ok: false, reason: "request-hash-blank" };
   const sha256Hex = S(snapshot.payload_sha);
   if (!nb(sha256Hex)) return { ok: false, reason: "payload-sha-blank" };
-  const rc = Number(snapshot.row_count);
-  if (!Number.isFinite(rc) || !Number.isInteger(rc) || rc < 0) return { ok: false, reason: "row-count-invalid" };
+  // row_count MUST be an ACTUAL number (a SAFE non-negative integer), NOT a Number(...) coercion. Number(null)=0,
+  // Number("")=0, Number(false)=0, Number("0")=0, Number(true)=1, Number("2")=2 FAIL-OPEN whenever the hydrated
+  // rows.length happens to match the coerced value; typeof + Number.isSafeInteger reject every non-number. This is the
+  // SAME P2 strictness round-4 applied to the Catalog snapshot in listing-health-v3-durable-loader.js -- applied here to
+  // the mandatory Listings/Listings-Raw pointer for internal consistency (an int8/bigint row_count that node-postgres
+  // returns as a STRING is a genuine masquerade this rejects; a legitimate int4 arrives as a real number).
+  if (typeof snapshot.row_count !== "number" || !Number.isSafeInteger(snapshot.row_count) || snapshot.row_count < 0) return { ok: false, reason: "row-count-invalid" };
   const path = S(snapshot.object_path);
   if (!path.endsWith("/" + sha256Hex + ".json")) return { ok: false, reason: "path-sha-mismatch" };
   if (S(expectedObjectPath) !== path) return { ok: false, reason: "path-namespace-mismatch" };
@@ -193,7 +198,9 @@ export async function resolveListingHealthV3DependencyBundle(deps = {}, args = {
     catch (e) { return { reason: sourceKey + "-payload-unreadable:" + S(e && e.message) }; }
     if (aborted()) return { reason: "aborted" };
     if (!Array.isArray(rows)) return { reason: sourceKey + "-payload-dangling" };
-    if (rows.length !== Number(snapshot.row_count)) return { reason: sourceKey + "-row-count-mismatch" };
+    // row_count was already proven an actual safe non-negative integer by validateListingsPointer -> compare DIRECTLY
+    // (no re-coercion, which would re-open the P2 fail-open).
+    if (rows.length !== snapshot.row_count) return { reason: sourceKey + "-row-count-mismatch" };
     return { snapshot, rows };
   }
   const l = await proveAndHydrate(readListingsSnapshot, LISTINGS_SOURCE_KEY);
@@ -225,13 +232,15 @@ export async function resolveListingHealthV3DependencyBundle(deps = {}, args = {
         if (S(snap.organization_fingerprint) !== S(organizationFingerprint) || S(snap.connection_id) !== S(connectionId)
           || S(snap.source_key) !== S(FBA_INVENTORY_SOURCE_KEY) || S(snap.scope_key) !== S(accountId)
           || !nb(invSha) || !S(snap.object_path).endsWith("/" + invSha + ".json") || S(snap.object_path) !== expectedInvPath) return miss("inventory-pointer-corrupt");
-        const invRc = Number(snap.row_count);
-        if (!Number.isFinite(invRc) || !Number.isInteger(invRc) || invRc < 0 || !isRealTimestamp(snap.validated_at)) return miss("inventory-pointer-invalid");
+        // row_count strictness parity with validateListingsPointer / the round-4 Catalog check: an ACTUAL safe
+        // non-negative integer, never a Number(...) coercion of a string/null/bool that fail-opens when it matches
+        // invRows.length.
+        if (typeof snap.row_count !== "number" || !Number.isSafeInteger(snap.row_count) || snap.row_count < 0 || !isRealTimestamp(snap.validated_at)) return miss("inventory-pointer-invalid");
         let invRows;
         try { invRows = rowsOf(await loadSnapshotPayload(S(snap.object_path), { signal })); }
         catch (e) { return miss("inventory-payload-unreadable:" + S(e && e.message)); }
         if (aborted()) return miss("aborted");
-        if (!Array.isArray(invRows) || invRows.length !== invRc) return miss("inventory-row-count-mismatch");
+        if (!Array.isArray(invRows) || invRows.length !== snap.row_count) return miss("inventory-row-count-mismatch");
         const d1Rows = invRows.filter((row) => row && S(row.date) === S(requestedAsOf));
         if (d1Rows.length > 0) {
           inventorySource = { available: true, rows: d1Rows, fragments: [{ requestKey: "listing-health-v3:inventory", from: requestedAsOf, to: requestedAsOf, sellerOrVendorIds: [rawSellerId], rows: d1Rows }], disabled: false, disabledPolicy: null, reason: null };
@@ -264,7 +273,9 @@ export async function resolveListingHealthV3DependencyBundle(deps = {}, args = {
     coverage: oliCoverageDigest(durableOli.coverageWindows),
     completeness: oliCompletenessDigest(durableOli.completenessRows),
   };
-  const status = Number(l.snapshot.row_count) === 0 && Number(r.snapshot.row_count) === 0 ? LISTING_HEALTH_V3_BUNDLE_STATUS.PROVEN_EMPTY : LISTING_HEALTH_V3_BUNDLE_STATUS.AVAILABLE;
+  // Both row_counts are proven ACTUAL numbers (=== their hydrated rows.length) by proveAndHydrate above -> compare
+  // DIRECTLY (no Number(...) re-coercion).
+  const status = l.snapshot.row_count === 0 && r.snapshot.row_count === 0 ? LISTING_HEALTH_V3_BUNDLE_STATUS.PROVEN_EMPTY : LISTING_HEALTH_V3_BUNDLE_STATUS.AVAILABLE;
   const fp = fingerprintListingHealthV3Bundle({
     organizationFingerprint, connectionId, accountId, marketplace, requestedAsOf,
     listings: { sourceRequestHash: l.snapshot.source_request_hash, payloadSha: l.snapshot.payload_sha, asOf: l.snapshot.as_of, validatedAt: l.snapshot.validated_at },

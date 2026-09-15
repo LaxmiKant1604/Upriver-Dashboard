@@ -17,6 +17,7 @@ import { makeListingHealthV3DurableContextLoader } from "../lib/server/sync/list
 import { resolveListingHealthV3DependencyBundle, LISTING_HEALTH_V3_BUNDLE_STATUS } from "../lib/server/sync/listing-health-v3-dependency-bundle.js";
 import { organizationFingerprint as organizationFingerprintOf } from "../lib/server/source-identity.js";
 import { sourceSnapshotObjectPath } from "../lib/server/supabase.js";
+import { isValidRfc3339Timestamp } from "../lib/server/rfc3339-timestamp.js";
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -124,6 +125,74 @@ for (const [label, mk] of badCases) {
   const payload = label.startsWith("hydrated rows.length") ? { rows: [catRows2[0]] } : { rows: catRows2 };
   const b = await bundleWith(mk(), payload);
   ok("BUNDLE DEFERS (zero writes, LKG) on invalid catalog: " + label, b.eligible === false && b.status === LISTING_HEALTH_V3_BUNDLE_STATUS.MISSING && b.revisionId === null && b.contentDeps.length === 0);
+}
+
+// ---- (5) row_count COERCION fail-open (Codex round-4): row_count MUST be an actual number. A coerced null / "" /
+//         false / true / "0" / "2" that MATCHES the hydrated count previously fail-OPEN; each must DEFER now. And a
+//         malformed hydrated payload ({}, {rows:"bad"}) must DEFER even when row_count is a valid 0. Each proves BOTH
+//         the strict loader {} AND the dependency bundle ineligible (zero cycle/job/shadow/live writes, LKG). ----
+const ZERO_SHA = "sha-cat0", ONE_SHA = "sha-cat1";
+const zeroCat = () => ({ ...validCat(), payload_sha: ZERO_SHA, object_path: pathFor("product-catalog", "__organization", ZERO_SHA), row_count: 0 });
+const oneCat = () => ({ ...validCat(), payload_sha: ONE_SHA, object_path: pathFor("product-catalog", "__organization", ONE_SHA), row_count: 1 });
+// [label, catMutator, payload, expectDefer]
+const coercionCases = [
+  ["row_count=null + rows=[] (Number(null)=0 fail-open)", () => ({ ...zeroCat(), row_count: null }), { rows: [] }, true],
+  ["row_count='' + rows=[] (Number('')=0)", () => ({ ...zeroCat(), row_count: "" }), { rows: [] }, true],
+  ["row_count=false + rows=[] (Number(false)=0)", () => ({ ...zeroCat(), row_count: false }), { rows: [] }, true],
+  ["row_count=true + 1 row (Number(true)=1)", () => ({ ...oneCat(), row_count: true }), { rows: [catRows2[0]] }, true],
+  ["row_count='0' + rows=[] (Number('0')=0)", () => ({ ...zeroCat(), row_count: "0" }), { rows: [] }, true],
+  ["row_count='2' + 2 rows (Number('2')=2)", () => ({ ...validCat(), row_count: "2" }), { rows: catRows2 }, true],
+  ["row_count=[] + rows=[] (Number([])=0)", () => ({ ...zeroCat(), row_count: [] }), { rows: [] }, true],
+  ["row_count=0 + payload {} (no rows array)", () => zeroCat(), {}, true],
+  ["row_count=0 + payload {rows:'bad'} (rows not array)", () => zeroCat(), { rows: "bad" }, true],
+  ["valid numeric row_count=0 + payload {rows:[]} -> ACCEPTED", () => zeroCat(), { rows: [] }, false],
+];
+for (const [label, mk, payload, expectDefer] of coercionCases) {
+  const c = await runLoader(mk(), payload);
+  const b = await bundleWith(mk(), payload);
+  if (expectDefer) {
+    ok("strict loader defers ({}) on: " + label, Object.keys(c).length === 0);
+    ok("bundle ineligible (zero writes, LKG) on: " + label, b.eligible === false && b.revisionId === null && b.contentDeps.length === 0);
+  } else {
+    ok("strict loader ACCEPTS: " + label, c.listingHealthV3DurableCatalog && c.listingHealthV3DurableCatalog.available === true && c.listingHealthV3DurableCatalog.rows.length === 0);
+    ok("bundle ELIGIBLE on: " + label, b.eligible === true && /^[0-9a-f]{32}$/.test(b.revisionId));
+  }
+}
+
+// ---- (6) validated_at strict RFC3339 (Codex round-4): a loose Date.parse accepted impossible/date-only/'1'. Each
+//         invalid validated_at DEFERS (loader {} + bundle ineligible); genuine RFC3339 (Z + numeric +-offsets) accepts. ----
+const tsCases = [
+  ["impossible validated_at 2026-02-30T00:00:00Z", "2026-02-30T00:00:00Z", true],
+  ["date-only validated_at 2026-09-04 (no time)", "2026-09-04", true],
+  ["validated_at '1'", "1", true],
+  ["validated_at Feb-29 non-leap 2026-02-29T00:00:00Z", "2026-02-29T00:00:00Z", true],
+  ["validated_at bad offset +30:00", "2026-09-04T05:00:00+30:00", true],
+  ["genuine validated_at Z", "2026-09-04T05:00:00Z", false],
+  ["genuine validated_at fractional + Z", "2026-09-04T05:00:00.123456Z", false],
+  ["genuine validated_at numeric +05:30", "2026-09-04T05:00:00+05:30", false],
+  ["genuine validated_at numeric -08:00", "2026-09-04T05:00:00-08:00", false],
+];
+for (const [label, ts, expectDefer] of tsCases) {
+  const snap = { ...validCat(), validated_at: ts };
+  const c = await runLoader(snap, { rows: catRows2 });
+  const b = await bundleWith(snap, { rows: catRows2 });
+  if (expectDefer) {
+    ok("strict loader defers ({}) on: " + label, Object.keys(c).length === 0);
+    ok("bundle ineligible (zero writes, LKG) on: " + label, b.eligible === false && b.revisionId === null && b.contentDeps.length === 0);
+  } else {
+    ok("strict loader ACCEPTS + bundle ELIGIBLE on: " + label, c.listingHealthV3DurableCatalog && c.listingHealthV3DurableCatalog.available === true && b.eligible === true);
+  }
+}
+
+// ---- (7) the shared strict validator itself (byte-equivalent to supabase.js:isValidTimestamp) ----
+{
+  ok("validator rejects impossible calendar date", isValidRfc3339Timestamp("2026-02-30T00:00:00Z") === false);
+  ok("validator rejects date-only (no time)", isValidRfc3339Timestamp("2026-09-04") === false);
+  ok("validator rejects '1' + bare integers", isValidRfc3339Timestamp("1") === false && isValidRfc3339Timestamp("2026") === false);
+  ok("validator rejects a non-string (number/null/Date)", isValidRfc3339Timestamp(1758000000000) === false && isValidRfc3339Timestamp(null) === false);
+  ok("validator rejects Feb-29 in a non-leap year, accepts it in a leap year", isValidRfc3339Timestamp("2026-02-29T00:00:00Z") === false && isValidRfc3339Timestamp("2028-02-29T00:00:00Z") === true);
+  ok("validator rejects an out-of-range offset / time", isValidRfc3339Timestamp("2026-09-04T05:00:00+30:00") === false && isValidRfc3339Timestamp("2026-09-04T25:00:00Z") === false);
+  ok("validator accepts Z, fractional+Z, and numeric +-offsets", isValidRfc3339Timestamp("2026-09-04T05:00:00Z") === true && isValidRfc3339Timestamp("2026-09-04T05:00:00.123Z") === true && isValidRfc3339Timestamp("2026-09-04T05:00:00+05:30") === true && isValidRfc3339Timestamp("2026-09-04T05:00:00-08:00") === true);
 }
 
 writeSync(1, `\nlisting-health-v3-durable-loader: ${passed} assertions passed\n`);
