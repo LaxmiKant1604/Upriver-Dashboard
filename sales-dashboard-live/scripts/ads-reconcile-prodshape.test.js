@@ -494,6 +494,52 @@ test("REQ6: Catalog row_count mismatch -> DEFER before cycle open; zero writes; 
   ok("ZERO writes; no live daily row; siblings untouched", zeroWrites(world) && !liveRow(world) && siblingsUnchangedAndUntouched(before, siblingFootprint(world)));
 });
 
+// REQ 6b (Codex round-4 parity) -- a NON-NUMBER Catalog row_count must DEFER before opening a cycle (row_count MUST be an
+// ACTUAL safe non-negative integer, NOT a Number(...) coercion that fail-opens whenever the coerced value matches the
+// hydrated rows.length). Each proves the exact reason (catalog-row-count-invalid), ZERO writes, no live daily row, the
+// Daily LKG preserved, and both siblings byte-for-byte untouched.
+const invalidCatalogRowCountCases = [
+  ["string '2' matching 2 hydrated rows (Number('2')=2 fail-open)", { catalogRowCount: "2" }],
+  ["string '0' with a zero-row payload (Number('0')=0 fail-open)", { catalogRowCount: "0", catalogRows: [] }],
+  ["boolean true matching 1 hydrated row (Number(true)=1 fail-open)", { catalogRowCount: true, catalogRows: [{ child_asin: "B0A", sku: "SKU-A", parent_asin: "P", product_name: "A", product_brand: "Acme" }] }],
+  ["negative -1 (real number, < 0)", { catalogRowCount: -1 }],
+  ["fractional 2.5 (not a safe integer)", { catalogRowCount: 2.5 }],
+  ["unsafe integer 2^53 (Number.isSafeInteger false)", { catalogRowCount: 2 ** 53 }],
+];
+for (const [label, over] of invalidCatalogRowCountCases) {
+  test("REQ6b: invalid Catalog row_count (" + label + ") -> DEFER (catalog-row-count-invalid) before cycle open; zero writes; LKG; siblings untouched", async () => {
+    const world = makeWorld(over);
+    const before = siblingFootprint(world);
+    const res = await driveRelease(world);
+    ok("release DEFERS with catalog-row-count-invalid BEFORE any cycle open", res.ok !== true && res.reason === "catalog-row-count-invalid" && world.writes.openCalls === 0);
+    ok("ZERO writes; no live daily row; siblings untouched (LKG preserved)", zeroWrites(world) && !liveRow(world) && siblingsUnchangedAndUntouched(before, siblingFootprint(world)));
+  });
+}
+// null and MISSING row_count cannot be injected via `over.catalogRowCount` (the harness `!= null` defaults them), so
+// override the catalog reader directly with a zero-row payload the old Number(null|undefined)=0 === 0 would have ACCEPTED.
+for (const [label, rowCountField] of [["null (Number(null)=0 fail-open)", { row_count: null }], ["missing entirely (undefined)", {}]]) {
+  test("REQ6b: Catalog row_count " + label + " with a zero-row payload -> DEFER (catalog-row-count-invalid); zero writes; LKG; siblings untouched", async () => {
+    const world = makeWorld({ catalogRows: [] });
+    world.readCatalogSnapshot = async () => ({ read: "ok", snapshot: { object_path: "obj/cat", source_request_hash: "catalog", validated_at: "2026-09-10T06:00:00Z", ...rowCountField } });
+    const before = siblingFootprint(world);
+    const res = await driveRelease(world);
+    ok("release DEFERS with catalog-row-count-invalid on a non-number/absent row_count", res.ok !== true && res.reason === "catalog-row-count-invalid" && world.writes.openCalls === 0);
+    ok("ZERO writes; no live daily row; siblings untouched (LKG preserved)", zeroWrites(world) && !liveRow(world) && siblingsUnchangedAndUntouched(before, siblingFootprint(world)));
+  });
+}
+// ACCEPT: a genuine numeric row_count clears the catalog gate (cycle opens); a VALID ZERO-ROW catalog (real 0 === 0
+// hydrated) stays supported -- neither is rejected as catalog-row-count-invalid or catalog-integrity.
+test("REQ6b: valid numeric row_count 2 -> clears the catalog gate (cycle opens)", async () => {
+  const world = makeWorld({ catalogRowCount: 2 });
+  const res = await driveRelease(world);
+  ok("no catalog-row-count-invalid defer; the cycle opens", res.reason !== "catalog-row-count-invalid" && world.writes.openCalls > 0);
+});
+test("REQ6b: valid ZERO-ROW catalog (row_count 0, [] payload) stays supported -> clears the catalog gate (cycle opens)", async () => {
+  const world = makeWorld({ catalogRowCount: 0, catalogRows: [] });
+  const res = await driveRelease(world);
+  ok("zero-row catalog is NOT rejected; the cycle opens", res.reason !== "catalog-row-count-invalid" && res.reason !== "catalog-integrity" && world.writes.openCalls > 0);
+});
+
 // REQ 7 (the confirmed HIGH defect) -- a valid live daily is published (Ads succeeded, cr-A); THEN the durable Ads sync
 // enters a `failed`-after-succeeded state (content_rev + succeeded coverage intact, last_status='failed'). The reconciler
 // must DEFER (revision ineligible on the sync status) and RETAIN the valid live daily byte-for-byte -- NEVER replace it

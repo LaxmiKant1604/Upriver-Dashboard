@@ -191,7 +191,14 @@ export function buildDailyReportingRelease({
     catch (e) { return defer("catalog-dangling:" + S(e && e.message)); } // content-address mismatch / unreadable object
     if (aborted()) return DEADLINE();
     if (!Array.isArray(catalogRows)) return defer("catalog-rows-unavailable");
-    if (catalogRows.length !== Number(catalogSnapshot.row_count ?? catalogSnapshot.rowCount)) return defer("catalog-integrity"); // hydrated rows must match the snapshot row_count
+    // row_count MUST be an ACTUAL number (a SAFE non-negative integer), NOT a Number(...) coercion -- Number("0")/
+    // Number(null)/Number(false)/Number("2") FAIL-OPEN whenever the coerced value happens to match the hydrated
+    // rows.length (parity with the listing-health-v3 reconciler row_count strictness). A malformed / missing row_count
+    // DEFERS here with ZERO writes (LKG preserved); a valid zero-row catalog (row_count 0 === 0 hydrated rows) stays
+    // supported. The `??` still bridges the snake/camel projection before the strict type check.
+    const catalogRowCount = catalogSnapshot.row_count ?? catalogSnapshot.rowCount;
+    if (typeof catalogRowCount !== "number" || !Number.isSafeInteger(catalogRowCount) || catalogRowCount < 0) return defer("catalog-row-count-invalid");
+    if (catalogRows.length !== catalogRowCount) return defer("catalog-integrity"); // hydrated rows must match the snapshot row_count
 
     // (3) EXACT D-1 proof (byte-identical to runtime :972-982): the account must prove gapless durable OLI coverage
     // through EXACTLY requestedAsOf. A tail lag / interior gap clamps the effective as-of below requestedAsOf -> DEFER
