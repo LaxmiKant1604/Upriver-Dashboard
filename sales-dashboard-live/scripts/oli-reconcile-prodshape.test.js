@@ -69,21 +69,22 @@ function buildProdShapeReconciler(over = {}) {
   const calls = { openApply: 0, closeRollback: 0, release: [], noExportCreateThrew: 0, writesAfterDeadline: 0, abortObservedBeforeWrite: 0, opSettledSeq: 0, closeSeq: 0 };
   const seqRef = { n: 0 };
   const store = over.store || inMemoryControlStore(over.storeOpts || {});
+  const accounts = over.accounts || [{ accountId: "A01" }]; // multi-account harness (default single A01 -> backward-compatible)
   const shadowRefresh = over.shadowRefresh || new Map([["A01", "2026-09-09T09:00:00Z"]]);
   const liveRefresh = over.liveRefresh || new Map(); // absent -> live missing (unpromoted)
   const OPERATOR = "oli-reconcile:india:test";
   let leaseFence = null;
   const reconciler = buildOliPublicationReconciler({
     resolveOrg: async () => ({ organizationFingerprint: "org-1", connectionId: "primary" }),
-    bucketAccounts: async () => [{ accountId: "A01" }],
+    bucketAccounts: async () => accounts,
     oliStart: "2025-01-01",
-    readPositiveHistory: async () => [{ account_id: "A01", source_request_hash: "h1" }],
+    readPositiveHistory: async () => accounts.map((a) => ({ account_id: a.accountId, source_request_hash: "h1-" + a.accountId })),
     readZeroRowProof: async () => ({ read: "ok", byAccount: new Map() }),
-    readLatestReportJob: async ({ reportKey }) => ({ deriveStatus: "succeeded", saveStatus: "succeeded", validated: true, cycleStatus: "succeeded", snapshotParamsHash: shHashFor(reportKey, "A01"), dependsOn: ["h1", "catalog"] }),
-    readShadowSnapshot: async ({ reportKey, accountId, paramsHash }) => { const rk = reportKey.replace("scheduler-v2/", ""); return { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params: shParamsFor(rk, accountId), payload: PAY, payload_storage_path: null, source_refreshed_at: shadowRefresh.get("A01") }; },
-    readLiveSnapshot: async ({ reportKey, accountId, paramsHash }) => (liveRefresh.has("A01") ? { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params: { reportVersion: CONTRACTS[reportKey].liveReportVersion, to: ASOF }, payload: PAY, payload_storage_path: null, source_refreshed_at: liveRefresh.get("A01") } : null),
+    readLatestReportJob: async ({ reportKey, accountId }) => ({ deriveStatus: "succeeded", saveStatus: "succeeded", validated: true, cycleStatus: "succeeded", snapshotParamsHash: shHashFor(reportKey, accountId), dependsOn: ["h1-" + accountId, "catalog"] }),
+    readShadowSnapshot: async ({ reportKey, accountId, paramsHash }) => { const rk = reportKey.replace("scheduler-v2/", ""); return { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params: shParamsFor(rk, accountId), payload: PAY, payload_storage_path: null, source_refreshed_at: shadowRefresh.get(accountId) }; },
+    readLiveSnapshot: async ({ reportKey, accountId, paramsHash }) => (liveRefresh.has(accountId) ? { report_key: reportKey, account_id: accountId, params_hash: paramsHash, params: { reportVersion: CONTRACTS[reportKey].liveReportVersion, to: ASOF }, payload: PAY, payload_storage_path: null, source_refreshed_at: liveRefresh.get(accountId) } : null),
     loadStoragePayload: async () => null,
-    verifyLiveReadback: async () => ({ ok: liveRefresh.has("A01") }),
+    verifyLiveReadback: async ({ accountId }) => ({ ok: liveRefresh.has(accountId) }),
     liveContracts: CONTRACTS, computeHash: HASH, reportDerivations: RD,
     deadlineRace: over.deadlineRace || ((p) => p),
     // REAL control-package apply/safe-close over the in-memory store; capture the fence generation.
@@ -138,7 +139,7 @@ function buildProdShapeReconciler(over = {}) {
         return { code: result.code, ok: result.ok, stage: result.stage, status: result.status || null, leaseLost: result.leaseLost === true, reason: result.reason || null, blockerCodes: result.blockerCodes || [] };
       }
       const r = over.releaseFor ? over.releaseFor(accountId) : { ok: true, code: 0 };
-      if (r.ok) liveRefresh.set("A01", shadowRefresh.get("A01")); // a successful promote aligns the live to the job's shadow
+      if (r.ok) liveRefresh.set(accountId, shadowRefresh.get(accountId)); // a successful promote aligns the live to the job's shadow
       return r;
     },
     rebuildBrandViewMembership: async () => ({ ok: true, rebuilt: false, mode: "self_heal_pending" }),
@@ -297,6 +298,62 @@ test("defect 1: an op that will NOT stop -> NO safe-close, lease + controls rema
   // operator) and safe-closes it; the evidence read proves rollout closed + the lease released.
   const reclaim = await runControlPackageCli({ mode: "reclaim", operator: "oli-reconcile:cleanup", connectStore: async () => store, ownerToken: "oli-reconcile:cleanup", operationKey: "oli-reconcile/india/" + ASOF });
   ok("the separate cleanup RECLAIM committed + PROVED the plane closed (rollout disabled) + released the lease", reclaim.committed === true && rolloutOpen(store).length === 0 && store._s.lease === null);
+});
+
+// ---- CARRIER-NOT-MATERIALIZED regression (the run-35033008718 incident): the zero-export reconciler's forced org
+// Product Catalog carrier is not adoptable this pass (no-export refusal -> classifyFetchError SOURCE_READINESS_PENDING
+// -> source-bucket-sync stops the family SOURCE_READINESS_PENDING). The reconciler must DEFER (retryable, LKG preserved,
+// green partial, zero export) -- NOT hard-FAIL and strand the lease. ----
+const CARRIER_DEFER = () => ({ ok: false, code: 1, stage: "derive:india", status: null, reason: "SOURCE_READINESS_PENDING", blockerCodes: [] });
+test("carrier-not-materialized: a SOURCE_READINESS_PENDING derive stop DEFERS (not FAILED), safe-closes the lease, ok:true (green partial), zero export", async () => {
+  const h = buildProdShapeReconciler({ liveRefresh: new Map([["A01", "2026-09-08T00:00:00Z"]]), releaseFor: () => CARRIER_DEFER() });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("A01 DEFERRED_DEPENDENCY (not FAILED_DERIVE); the REAL safe-close released the exact fence; ok:true; zero DataDoe create",
+    REPORTS.every((rk) => st(out, rk) === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY) && h.calls.closeRollback === 1 && h.store._s.lease === null && out.ok === true && out.controlCleanupUnresolved !== true && out.dataDoeCreates === 0);
+});
+
+test("carrier-not-materialized (multi-account): EVERY account runs its own release + DEFERS independently (per-account isolation; no wrongful skip), safe-close releases the lease; ok:true; zero export", async () => {
+  // Layer-1-only fix (no region short-circuit): each stale account runs + defers on the cold org Catalog. This preserves
+  // per-account isolation -- crucially it never skips an account that would publish WITHOUT the Catalog (e.g. an
+  // already-complete-cycle account) on the false assumption that "all accounts need the Catalog".
+  const accts = [{ accountId: "A01" }, { accountId: "A02" }, { accountId: "A03" }];
+  const older = new Map(accts.map((a) => [a.accountId, "2026-09-08T00:00:00Z"]));
+  const shadows = new Map(accts.map((a) => [a.accountId, "2026-09-09T09:00:00Z"]));
+  const h = buildProdShapeReconciler({ accounts: accts, liveRefresh: older, shadowRefresh: shadows, releaseFor: () => CARRIER_DEFER() });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("EVERY account ran a release (per-account isolation; the region is NOT short-circuited -- no account is wrongly skipped)", h.calls.release.length === 3);
+  ok("all 3 accounts resolved DEFERRED_DEPENDENCY (not FAILED); safe-close released the lease; ok:true; zero export",
+    out.perAccount.length === 3 && out.perAccount.every((a) => REPORTS.every((rk) => a.reports[rk].state === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY)) && h.calls.closeRollback === 1 && h.store._s.lease === null && out.ok === true && out.dataDoeCreates === 0);
+});
+
+test("no wrongful skip: a carrier-DEFERRING account and a Catalog-INDEPENDENT publishing account in the SAME run -> the publisher STILL publishes (the defer never suppresses a healthy account)", async () => {
+  // Directly guards the regression the removed region-short-circuit would have caused: A01 defers on the cold carrier,
+  // A02 publishes (it did not need the org Catalog this pass). BOTH must run; A02 must NOT be skipped.
+  const accts = [{ accountId: "A01" }, { accountId: "A02" }];
+  const older = new Map(accts.map((a) => [a.accountId, "2026-09-08T00:00:00Z"]));
+  const shadows = new Map(accts.map((a) => [a.accountId, "2026-09-09T09:00:00Z"]));
+  const h = buildProdShapeReconciler({ accounts: accts, liveRefresh: older, shadowRefresh: shadows,
+    releaseFor: (accountId) => (accountId === "A01" ? CARRIER_DEFER() : { ok: true, code: 0 }) });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("BOTH accounts ran (the carrier defer did NOT short-circuit the healthy publisher)", h.calls.release.length === 2);
+  const a01 = out.perAccount.find((a) => a.accountId === "A01"); const a02 = out.perAccount.find((a) => a.accountId === "A02");
+  ok("A01 DEFERRED_DEPENDENCY; A02 STILL published (READBACK_VERIFIED); safe-close ran; lease released; ok:true",
+    a01 && REPORTS.every((rk) => a01.reports[rk].state === OLI_RECONCILE_STATUS.DEFERRED_DEPENDENCY) && a02 && REPORTS.every((rk) => a02.reports[rk].state === OLI_RECONCILE_STATUS.READBACK_VERIFIED) && h.calls.closeRollback === 1 && h.store._s.lease === null && out.ok === true);
+});
+
+test("isolation preserved: a GENUINE per-account failure does NOT short-circuit -- the healthy account still runs + publishes", async () => {
+  const accts = [{ accountId: "A01" }, { accountId: "A02" }];
+  const older = new Map(accts.map((a) => [a.accountId, "2026-09-08T00:00:00Z"]));
+  const shadows = new Map(accts.map((a) => [a.accountId, "2026-09-09T09:00:00Z"]));
+  // A01 hard-fails with a genuine (NON-readiness) reason; A02 publishes. A genuine failure must NEVER trigger the
+  // org-carrier short-circuit (that fires ONLY for SOURCE_READINESS_PENDING), so BOTH accounts run.
+  const h = buildProdShapeReconciler({ accounts: accts, liveRefresh: older, shadowRefresh: shadows,
+    releaseFor: (accountId) => (accountId === "A01" ? { ok: false, code: 1, stage: "finalize:india", reason: "catalog-not-org-scope" } : { ok: true, code: 0 }) });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("BOTH accounts ran a release (a genuine failure does NOT short-circuit the region)", h.calls.release.length === 2);
+  const a01 = out.perAccount.find((a) => a.accountId === "A01"); const a02 = out.perAccount.find((a) => a.accountId === "A02");
+  ok("A01 FAILED_PUBLISH (genuine, isolated); A02 healthy -> READBACK_VERIFIED (published); safe-close ran",
+    a01 && REPORTS.every((rk) => a01.reports[rk].state === OLI_RECONCILE_STATUS.FAILED_PUBLISH) && a02 && REPORTS.every((rk) => a02.reports[rk].state === OLI_RECONCILE_STATUS.READBACK_VERIFIED) && h.calls.closeRollback === 1);
 });
 
 async function main() {

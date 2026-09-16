@@ -386,7 +386,7 @@ const stat = (r) => r.fetch_status ?? r.fetchStatus ?? "pending";
 const skey = (r) => r.source_key ?? r.sourceKey ?? "";
 
 async function familyState(store, cycleId, sourceKey) {
-  const state = { total: 0, open: 0, succeeded: 0, failed: 0, readinessWaiting: 0 };
+  const state = { total: 0, open: 0, succeeded: 0, failed: 0, readinessWaiting: 0, deferredPending: 0 };
   if (!cycleId) return state;
   for (const r of await store.listSourceJobs(cycleId)) {
     if (skey(r) !== sourceKey) continue;
@@ -396,12 +396,18 @@ async function familyState(store, cycleId, sourceKey) {
     else if (s === "succeeded") state.succeeded += 1;
     else if (s === "failed") {
       state.failed += 1;
+      const ec = String(r.error_code ?? r.errorCode ?? "");
       // A terminal DATADOE_INITIAL_LOAD_INCOMPLETE is a typed "waiting"/"Setting up" deferral (the seller's Seller
       // Central initial load is incomplete), NOT a required-source failure: it must NOT stop the bucket and block the
       // HEALTHY accounts from deriving/publishing. It self-heals via the next fresh cycle's single-seller isolation
       // (multi-member) then exclusion (single-member). The cycle still finalizes honestly PARTIAL (a failed job
       // exists), so the region is never reported all-fresh (no false-green).
-      if ((r.terminal ?? false) === true && String(r.error_code ?? r.errorCode ?? "") === READINESS_INCOMPLETE_CODE) state.readinessWaiting += 1;
+      if ((r.terminal ?? false) === true && ec === READINESS_INCOMPLETE_CODE) state.readinessWaiting += 1;
+      // A SOURCE_READINESS_PENDING job is the ZERO-EXPORT reconciler's no-export refusal (the durable source is not
+      // adoptable this pass; source-worker classifyFetchError). Like readinessWaiting it is a RETRYABLE deferral, not a
+      // required-source failure -- it must not hard-stop the bucket. Emitted ONLY on the reconciler path (the real
+      // DataDoe adapter never produces it), so this counter is always 0 for the scheduled full-region cycle.
+      else if (ec === "SOURCE_READINESS_PENDING") state.deferredPending += 1;
     }
   }
   return state;
@@ -1135,11 +1141,23 @@ export async function runBucketSourceSync({
     // EXCEPTION: a failure that is ONLY the typed readiness deferral (DATADOE_INITIAL_LOAD_INCOMPLETE) does NOT
     // block -- the healthy sellers that succeeded still derive/publish, and the unready seller stays "waiting"
     // (self-healing via next fresh cycle's isolation/exclusion). Any NON-readiness failure still stops the bucket.
-    const realFailed = (state ? state.failed : 0) - (state ? (state.readinessWaiting || 0) : 0);
+    const realFailed = (state ? state.failed : 0) - (state ? (state.readinessWaiting || 0) : 0) - (state ? (state.deferredPending || 0) : 0);
     if (state && realFailed > 0 && sourceRegistryEntry(family.sourceKey).usedByReports.length > 0
       && family.sourceKey !== FBA_INVENTORY_SOURCE_KEY) {
       rollup.stopped = true;
       rollup.stopReason = Object.freeze({ code: "REQUIRED_SOURCE_FAILED", family: family.sourceKey, state });
+      break;
+    }
+    // A completed required family whose ONLY failures are the zero-export reconciler's no-export deferrals (the durable
+    // source is not adoptable THIS pass) stops the bucket RETRYABLY -- SOURCE_READINESS_PENDING threads through the
+    // release runner as the derive reason, which statusFromRelease maps to a retryable DEFERRED_DEPENDENCY (LKG
+    // preserved; the source materializes on the next natural cycle), never a hard REQUIRED_SOURCE_FAILED. deferredPending
+    // is 0 on the scheduled full-region path (its real adapter never emits SOURCE_READINESS_PENDING), so that path is
+    // byte-identical; a real terminal failure mixed in keeps realFailed>0 and hard-stops above (a defect is never masked).
+    if (state && realFailed <= 0 && (state.deferredPending || 0) > 0 && sourceRegistryEntry(family.sourceKey).usedByReports.length > 0
+      && family.sourceKey !== FBA_INVENTORY_SOURCE_KEY) {
+      rollup.stopped = true;
+      rollup.stopReason = Object.freeze({ code: "SOURCE_READINESS_PENDING", family: family.sourceKey, state });
       break;
     }
   }

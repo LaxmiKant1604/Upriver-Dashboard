@@ -91,6 +91,14 @@ export function classifyFetchError(error, stage = "create-export") {
   if (isSourceDisabledError(error)) {
     return { stage, code: "SOURCE_DISABLED", message: "Source is disabled for this organization.", terminal: true, transient: false };
   }
+  // The ZERO-EXPORT reconciler's no-export inner adapter refused a create/poll/download (error.code NO_EXPORT_REQUIRED):
+  // the durable source it needs is not adoptable THIS pass. That is a routine, next-cycle-resolvable readiness gap, NOT a
+  // required-source FAILURE -- classify it as the retryable SOURCE_READINESS_PENDING so the family stop defers
+  // (DEFERRED_DEPENDENCY, LKG preserved) instead of hard-failing. This code is emitted ONLY on the reconciler path (the
+  // real DataDoe adapter never throws NO_EXPORT_REQUIRED), so the scheduled full-region behavior is byte-identical.
+  if (error && error.code === "NO_EXPORT_REQUIRED") {
+    return { stage, code: "SOURCE_READINESS_PENDING", message: "The zero-export reconciler will not create/poll/download a DataDoe export; the durable source is not adoptable this pass, so it is deferred (never a create).", terminal: false, transient: true };
+  }
   const raw = error instanceof Error ? error.message : String(error);
   const detail = sanitizeErrorDetail(raw);
   const matched = raw.match(/\((\d{3})\)/);

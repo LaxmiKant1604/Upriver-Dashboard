@@ -193,6 +193,9 @@ function makeDataDoe(opts = {}) {
     createSeq,
     async create(job) {
       if (opts.failKey && (job.requestKey || "").includes(opts.failKey)) throw new Error("DataDoe create-export failed (500) here.");
+      // ZERO-EXPORT reconciler no-export refusal (the makeNoExportInnerAdapter behavior): create is refused with the
+      // stable NO_EXPORT_REQUIRED code -> source-worker classifyFetchError maps it to the retryable SOURCE_READINESS_PENDING.
+      if (opts.noExportKey && (job.requestKey || "").includes(opts.noExportKey)) { const e = new Error("OLI_RECONCILER_NO_EXPORT: the reconciler never creates a DataDoe export (fail closed)."); e.code = "NO_EXPORT_REQUIRED"; throw e; }
       // PROVIDER READINESS REJECTION (DATADOE_INITIAL_LOAD_INCOMPLETE): DataDoe hard-rejects a seller-batched export
       // with HTTP 400 when even ONE selected seller's Seller Central initial data load is incomplete. Simulated for a
       // create whose batch includes any raw seller id in `readinessRejectSellers` -- the message matches the exact
@@ -562,6 +565,28 @@ test("E2. an OLI failure STOPS the bucket typed BEFORE catalog/FBA launch; a fre
   const other = runHarness({ catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" }, fbaSnapshotsByAccount: Object.fromEntries(FIVE.map((a) => [a.accountId, { validated_at: TODAY + "T01:00:00Z" }])) });
   const r2 = await other.run();
   assert.equal(r2.stopped, false);
+});
+
+test("E2b. the ZERO-EXPORT reconciler's no-export refusal on the forced Catalog carrier STOPS RETRYABLY (SOURCE_READINESS_PENDING), never a hard REQUIRED_SOURCE_FAILED", async () => {
+  // Mimic the OLI reconciler: OLI + FBA paused (priority-mode), a FORCED Catalog carrier whose create is refused with
+  // the NO_EXPORT_REQUIRED code. The completed Catalog family's ONLY failure is the deferred-pending refusal -> the
+  // bucket stops SOURCE_READINESS_PENDING (which the release runner threads as a retryable derive DEFERRAL), NOT a hard
+  // REQUIRED_SOURCE_FAILED that would strand the reconciler's lease.
+  const h = runHarness({ pausedSources: new Set(["order-line-items", "fba-inventory-health"]), forceCatalogRefresh: true, dd: makeDataDoe({ noExportKey: "catalog" }) });
+  const rollup = await h.run();
+  assert.equal(rollup.stopped, true, JSON.stringify(rollup.stopReason));
+  assert.equal(rollup.stopReason.code, "SOURCE_READINESS_PENDING", JSON.stringify(rollup.stopReason));
+  assert.equal(rollup.stopReason.family, "product-catalog");
+  assert.equal(rollup.stopReason.state.deferredPending, 1, "the refusal counted as a deferred-pending, not a real failure");
+  assert.equal(rollup.stopReason.state.readinessWaiting, 0);
+});
+
+test("E2c. a GENUINE Catalog failure (a real DataDoe error, NOT the no-export refusal) STILL hard-stops REQUIRED_SOURCE_FAILED -- scheduler byte-identical; a real defect is never masked", async () => {
+  const h = runHarness({ pausedSources: new Set(["order-line-items", "fba-inventory-health"]), forceCatalogRefresh: true, dd: makeDataDoe({ failKey: "catalog" }) });
+  const rollup = await h.run();
+  assert.equal(rollup.stopped, true, JSON.stringify(rollup.stopReason));
+  assert.equal(rollup.stopReason.code, "REQUIRED_SOURCE_FAILED", JSON.stringify(rollup.stopReason));
+  assert.equal(rollup.stopReason.state.deferredPending || 0, 0, "a real DataDoe failure is NEVER counted as deferred-pending");
 });
 
 test("E3. >=60s completion-anchored cooldown between families on the FAKE clock (never sleeps)", async () => {

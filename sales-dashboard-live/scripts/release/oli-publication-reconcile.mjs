@@ -105,11 +105,17 @@ const readbackLive = buildLiveReadback({
 
 // NO-EXPORT inner adapter: the reconciler derives ONLY from already-saved durable OLI. Any create/poll/download from
 // inside the derive fails closed here, so the reconciler can never touch a DataDoe export transport -- a genuinely
-// missing durable dependency becomes a typed derive failure (DEFERRED_DEPENDENCY), never a create.
+// missing/not-yet-materialized durable dependency becomes a typed RETRYABLE derive DEFERRAL, never a create.
+// The refusal carries a STABLE code (NO_EXPORT_REQUIRED) so the source worker classifies it as the retryable
+// SOURCE_READINESS_PENDING (the durable source is not adoptable THIS pass -> defer to the next natural cycle) instead
+// of a generic EXPORT_ERROR that would collapse into a HARD REQUIRED_SOURCE_FAILED. It is set ONLY here (the reconciler
+// path); the scheduled full-region path uses the real DataDoe adapter and never emits this code, so its behavior is
+// byte-identical. This is why a routine "the org Product Catalog carrier is not warm this pass" defers instead of
+// hard-failing every account and stranding the global lease (the incident this fixes).
 const makeNoExportInnerAdapter = () => ({
-  create: async () => { throw new Error("OLI_RECONCILER_NO_EXPORT: the reconciler never creates a DataDoe export (fail closed)."); },
-  poll: async () => { throw new Error("OLI_RECONCILER_NO_EXPORT: the reconciler never polls a DataDoe export (fail closed)."); },
-  download: async () => { throw new Error("OLI_RECONCILER_NO_EXPORT: the reconciler never downloads a DataDoe export (fail closed)."); },
+  create: async () => { const e = new Error("OLI_RECONCILER_NO_EXPORT: the reconciler never creates a DataDoe export (fail closed)."); e.code = "NO_EXPORT_REQUIRED"; throw e; },
+  poll: async () => { const e = new Error("OLI_RECONCILER_NO_EXPORT: the reconciler never polls a DataDoe export (fail closed)."); e.code = "NO_EXPORT_REQUIRED"; throw e; },
+  download: async () => { const e = new Error("OLI_RECONCILER_NO_EXPORT: the reconciler never downloads a DataDoe export (fail closed)."); e.code = "NO_EXPORT_REQUIRED"; throw e; },
 });
 
 async function assertNoCron() {
