@@ -58,6 +58,7 @@ const { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } = await import("../../lib/server/syn
 const { REPORT_DERIVATIONS } = await import("../../lib/server/sync/report-derivation.js");
 const { paramsHashFor } = await import("../../lib/server/report-store.js");
 const { buildPriorityDashboardsRelease } = await import("../../lib/server/sync/source-priority-dashboards.js");
+const { isSharedCatalogColdDefer, buildCatalogColdFastDefer } = await import("../../lib/server/sync/oli-catalog-cold-latch.js");
 const { runPriorityDashboardsRelease, buildLiveReadback } = await import("../../lib/server/sync/source-priority-release-runner.js");
 const { readPartialCycleCapability } = await import("../../lib/server/sync/priority-partial-capability.js");
 const { runControlPackageCli } = await import("../../lib/server/sync/source-priority-control-package.js");
@@ -211,6 +212,13 @@ const verifyLease = async () => {
   catch (e) { return { ok: false, reason: "renew-error:" + (e && e.message ? e.message : e) }; }
 };
 
+// SHARED-CATALOG COLD-CACHE LATCH (throughput / lease-strand fix): the Catalog carrier is org-scoped + date-independent,
+// so once ANY account this pass proves it not adoptable (SOURCE_READINESS_PENDING), every remaining account WILL defer
+// identically. Fast-defer them with the byte-identical typed outcome instead of paying a full per-account preflight +
+// derive each -- which, across N accounts, crosses the cooperative deadline and strands the global lease so the other
+// regions defer on CONTROL_LEASE_HELD. Reset per process (each workflow run is one region). See oli-catalog-cold-latch.js.
+let sharedCatalogColdThisRun = false;
+
 // PER-ACCOUNT release execution: each stale account derives + finalizes + publishes + reads back in ITS OWN dedicated
 // priority-partial cycle (deterministic 16-hex over {accountId, revisionId}) with the no-export adapter + the captured
 // fence. strictD1 keeps a lagged account on its LKG. The three OLI-dependent dashboards publish account-atomically.
@@ -223,6 +231,13 @@ async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revis
   // view of it is revoked -- so the safe-close still releases the exact fence.
   const aborted = () => !!(signal && signal.aborted);
   if (aborted()) return { code: 1, ok: false, stage: "reconcile", status: "DEADLINE_ABORTED", leaseLost: false, reason: "deadline-aborted", aborted: true, blockerCodes: [], problems: ["deadline-aborted before start (no work performed)"] };
+  // FAST-DEFER: a peer account already proved the SHARED org Catalog carrier not adoptable this pass -> this account
+  // would defer identically. Skip its full preflight+derive and return the byte-identical typed deferral (zero data
+  // risk; keeps the pass inside the deadline so the lease safe-closes and the next region proceeds).
+  if (sharedCatalogColdThisRun) {
+    console.log("oli-reconcile: fast-defer " + String(accountId).slice(0, 8) + " (shared Catalog carrier cold this pass; a peer account already deferred SOURCE_READINESS_PENDING)");
+    return buildCatalogColdFastDefer(b);
+  }
   const cycleBucket = "priority-partial-" + b + "-" + sha256(JSON.stringify([accountId, revisionId || ""])).slice(0, 16);
   const fetchOne = async (apiKey) => ((await fetchDirectory(apiKey)) || []).filter((r) => String((r && (r.accountId ?? r.account_id ?? r.id)) || "").trim() === accountId);
   const release = buildPriorityDashboardsRelease({
@@ -235,7 +250,10 @@ async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revis
   const result = await runPriorityDashboardsRelease({ release, reconcile, readbackLive, assertNoCron, bucket: b, strictD1: true, verifyLease: verifyLeaseForOp, log: () => {} });
   // Preserve the runner's TYPED classification fields (status, leaseLost, stage, reason, blockerCodes) so the reconciler
   // classifies retryable-vs-integrity WITHOUT text matching (blocker 3).
-  return { code: result.code, ok: result.ok, stage: result.stage, status: result.status || null, leaseLost: result.leaseLost === true, reason: result.reason || null, blockerCodes: result.blockerCodes || [], problems: result.problems || [] };
+  const mapped = { code: result.code, ok: result.ok, stage: result.stage, status: result.status || null, leaseLost: result.leaseLost === true, reason: result.reason || null, blockerCodes: result.blockerCodes || [], problems: result.problems || [] };
+  // Latch the shared-Catalog cold-cache signal so the remaining accounts fast-defer (see the top-of-function guard).
+  if (isSharedCatalogColdDefer(mapped)) sharedCatalogColdThisRun = true;
+  return mapped;
 }
 
 // Brand View membership: the directory self-heals from the promoted bare brand-sales at read time

@@ -34,6 +34,7 @@
     "test:oli-publication-reconciler": "node scripts/oli-publication-reconciler.test.js",
     "test:saved-data-reconciler-diag": "node scripts/saved-data-reconciler-diag.test.js",
     "test:oli-reconcile-prodshape": "node scripts/oli-reconcile-prodshape.test.js",
+    "test:oli-catalog-cold-latch": "node scripts/oli-catalog-cold-latch.test.js",
     "test:oli-reconcile-workflow": "node scripts/oli-reconcile-workflow.test.js",
   "test:fba-publication-revision": "node scripts/fba-publication-revision.test.js",
   "test:ads-publication-revision": "node scripts/ads-publication-revision.test.js",
