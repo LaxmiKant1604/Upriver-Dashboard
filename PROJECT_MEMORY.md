@@ -1,5 +1,44 @@
 # Project Memory
 
+## europe-au scheduler STALL — PHASE B: adaptive OLI-backfill row-cap self-heal (2026-09-16, on main; verify 217→194-suite green; read-only prod-validated; NOT yet pushed at time of writing this line — see commit note)
+
+ROOT CAUSE (read-only proven): europe-au cycles START, publish healthy accounts via the partial path, then NEVER finalize
+(status stuck "running" 9+ days, finished_at NULL). Because ONE onboarding account (REELLEO Express DE / 9675c625, ~28
+aggregated OLI rows/day) can never fill its OLI history: the durable OLI backfill fetches missing history in day-bounded
+chunks (<=441 solo / <=221 multi-seller via splitWindowToMaxSpan), but those bounds are DAYS, not the 5,000-row DataDoe
+CREATE cap. Its 441-day solo backfill chunk (leading gap 2025-01-01..2026-03-17) returns exactly 5,000 rows = TRUNCATED
+terminal EVERY cycle; the same missing window re-plans the same chunk forever. So the account stays deferred (leading OLI
+gap -> non-contiguous coverage over the Brand Sales window), oli-refresh-d1 full_complete != 'true', and the workflow takes
+the PARTIAL publish path that DELIBERATELY does not finalize the daily cycle (scheduler-v2.yml) -> the region never reaches
+terminal. Proven via: sync_source_jobs TRUNCATED order-line-items (request_meta from=2025-01-01 to=2026-03-17, row_count
+=5000, owner 9675c625 source-oli:slice-v1); source_coverage gap; oli-refresh full_complete path. (Non-truncating stalled
+cycles 09-06..09-09 = the same non-finalization while an onboarding account backfills.)
+
+FIX (evidence-gated + per-seller, mirrors the FBA overflow self-heal; SMALLEST correct change; NO schedule/concurrency/
+ceiling/cap/formula change; api=12): NEW pure lib/server/sync/oli-backfill-overflow.js (readRecentTruncatedOliBackfill
+Ownership + oliBackfillWeeklySellersFrom) reads recent PRIOR-cycle terminal TRUNCATED source-oli:slice-v1 evidence with a
+SINGLE owner (a seller proven to truncate ALONE), scoped org/connection/region/recency, EXCLUDING the current cycle;
+resolves date-independently by account_scope_hash to raw seller ids. planOliSliceExports (source-durable-model.js) then
+splits ONLY those flagged sellers OFF into their OWN single-seller exports sliced by the canonical report-aligned WEEKLY
+bins (canonicalOliSlices, <=7 days -> fits the 5,000-row cap), while co-grouped unflagged sellers keep the efficient shared
+<=cap chunking. Threaded through planBucketSourceSync + runBucketSourceSync + the runtime (resolveOliBackfillWeeklySellers),
+mirroring readinessIsolateSellers. EVIDENCE-GATED: empty set => BYTE-IDENTICAL historical plan (source-bucket-sync B5/B6
+still 21 exports/42 tokens). Current-cycle EXCLUSION keeps the set stable across a continuation (re-derive == same plan, no
+frozen state). PER-SELLER + SINGLE-OWNER-only: a sparse account co-grouped with or batch-mate of a dense one is NEVER
+weekly-sliced (no ~28x go-live regression). ADVERSARIAL REVIEW (5 lenses, 8 findings): addressed the 2 medium + latent
+findings (per-seller split; single-owner-only evidence; excludeCycleId keyed cycleBucket||bucket; honest ~714-order-line/day
+weekly ceiling); residual LOW self-healing continuation-drift under DB flakiness documented (fail-SAFE: defers one
+invocation, LKG preserved, zero duplicate exports). RESIDUAL (rare, not a regression): an account >~714 order-lines/day
+would still truncate a weekly bin (no sub-week fallback).
+
+VALIDATION: real prod reader surfaces EXACTLY f9daed1c (REELLEO DE) for europe-au with the current cycle excluded -> the
+next europe-au cycle weekly-slices its backfill -> it fills -> eligible -> full_complete -> the cycle finalizes. Tests:
+NEW oli-backfill-overflow 14 + source-durable-model 23 (per-member split, co-grouping, REELLEO repro) + source-bucket-sync
+49 (B5/B6 byte-identical) + sync-runtime-composition/source-tranche/readiness-isolation/account-isolation all green; full
+verify green (new suite registered in verify.mjs + package.json). PENDING: push + deploy + observe the next europe-au cycle
+reach terminal. Then PHASE B step 8: Listings/Raw persistence/publication (already date-free; largely unblocked once EU
+finalizes). See [[europe-au-scheduler-stall]].
+
 ## FBA Inventory Health — PHASE A: stop spurious single-seller overflow splits (window-shape-scoped evidence) (2026-09-16, commit e2061a9 on main, PUSHED; verify 217/217; read-only prod-validated all 3 regions)
 
 The screenshot's 4 India FBA Inventory Health exports/cycle (8 tokens) vs the canonical ceil(8/5)=2 (4 tokens) were NOT
