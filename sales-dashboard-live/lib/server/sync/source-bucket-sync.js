@@ -263,6 +263,14 @@ export function planBucketSourceSync({
   // into single-seller jobs so the healthy members succeed independently and the unready one 400s alone (a typed
   // waiting no-op that self-clears on its next success). Empty set => byte-identical to the prior plan.
   readinessIsolateSellers = new Set(),
+  // ADAPTIVE ROW-CAP SELF-HEAL. A Set of RAW seller ids PROVEN to truncate their day-bounded OLI backfill chunk at the
+  // 5,000-row create cap (prior-cycle terminal TRUNCATED source-oli:slice-v1 evidence, resolved to raw ids by the
+  // runtime). planOliSliceExports re-slices ONLY these sellers' missing windows by the canonical weekly bins (row-cap
+  // safe) so a dense account's history fills instead of truncating forever; every other seller keeps the efficient
+  // <=cap chunking. The evidence is prior-cycle + terminal (stable across a cycle), so re-deriving it on a continuation
+  // reproduces the same plan -- NO frozen state (unlike readinessIsolateSellers, whose events can drift mid-cycle).
+  // Empty set => byte-identical to the historical OLI plan.
+  oliBackfillWeeklySellers = new Set(),
 } = {}) {
   if (!isRoutingScope(bucket)) throw new Error(`planBucketSourceSync requires a routing scope (india|europe-au|us-ca|us|non-us; got "${bucket}").`);
   if (!Array.isArray(accounts) || accounts.length === 0) throw new Error("planBucketSourceSync requires this bucket's non-empty account list (fail closed).");
@@ -310,7 +318,7 @@ export function planBucketSourceSync({
         const clippedCoverage = Object.fromEntries(members.map((a) => [
           a.accountId, clipCoverageForRefresh(coverageByAccountId[a.accountId] || [], refresh.from),
         ]));
-        const units = planOliSliceExports({ batchAccounts: members, coverageByAccountId: clippedCoverage, from: backfill.from, to: backfill.to });
+        const units = planOliSliceExports({ batchAccounts: members, coverageByAccountId: clippedCoverage, from: backfill.from, to: backfill.to, weeklySliceSellers: oliBackfillWeeklySellers });
         for (const unit of units) {
           const resolved = resolvedOliSliceBatch({ apiKey, unit, bucket });
           oliJobs.push(...plannedBatchSourceJobs(SOURCE_SYNC_OWNER_REPORT_KEY, resolved, bucket, "primary", unit.accounts, null));
@@ -459,6 +467,12 @@ export async function runBucketSourceSync({
   // caller composition resolves it; it is threaded into planBucketSourceSync ONLY on a FRESH cycle (a frozen
   // continuation must reproduce its frozen plan verbatim, so the set is dropped there). Empty => byte-identical.
   readinessIsolateSellers = new Set(),
+  // ADAPTIVE ROW-CAP SELF-HEAL: RAW seller ids whose OLI backfill chunk PROVED to truncate the 5,000-row create cap
+  // (prior-cycle terminal TRUNCATED source-oli:slice-v1 evidence, resolved to raw ids by the runtime). Threaded into
+  // planBucketSourceSync on BOTH fresh + continuation: the evidence is prior-cycle + terminal (stable across the cycle),
+  // so re-deriving it reproduces the same weekly-sliced plan on a continuation with NO frozen state -- unlike
+  // readinessIsolateSellers. Empty => byte-identical to the historical plan (efficient <=cap chunking for every seller).
+  oliBackfillWeeklySellers = new Set(),
   // EXECUTION-READINESS DEFER (all-region scheduler repair): primary account ids proven DataDoe-NOT-READY by the
   // export-eligibility gate (initialLoadComplete=false / not onboarded). On a FRESH cycle they are DEFERRED from the
   // plan ENTIRELY (no create -- a multi-seller OLI export containing an unloaded seller is 400'd by the provider,
@@ -669,6 +683,8 @@ export async function runBucketSourceSync({
     // mid-cycle -> a divergent plan / PLAN_BUDGET_MISMATCH). This lets a split recovery spanning multiple invocations
     // resume instead of deferring, while a never-split cycle stays byte-identical.
     readinessIsolateSellers: isContinuation ? (continuation ? continuation.frozenReadinessIsolateSellers : new Set()) : readinessIsolateSellers,
+    // Threaded on BOTH fresh + continuation (stable prior-cycle evidence -> reproducible plan, no frozen state needed).
+    oliBackfillWeeklySellers,
   });
   // Honest accounting (req 7): accounts DEFERRED from the fresh plan for execution-readiness (known-unready; no
   // create, they wait as "Setting up", LKG preserved) and accounts EXCLUDED because they are not in the authorized

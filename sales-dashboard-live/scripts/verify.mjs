@@ -131,6 +131,7 @@ const SUITES = [
   "test:source-registry",
   "test:source-fixpoint",
   "test:source-durable-model",
+  "test:oli-backfill-overflow",
   "test:oli-dimensional",
   "test:oli-itemization",
   "test:oli-completeness-serve",

@@ -60,6 +60,7 @@
     "test:source-registry": "node scripts/source-registry.test.js",
     "test:source-fixpoint": "node scripts/source-fixpoint.test.js",
     "test:source-durable-model": "node scripts/source-durable-model.test.js",
+    "test:oli-backfill-overflow": "node scripts/oli-backfill-overflow.test.js",
     "test:oli-dimensional": "node scripts/oli-dimensional.test.js",
     "test:oli-itemization": "node scripts/oli-itemization.test.js",
     "test:oli-completeness-serve": "node scripts/oli-completeness-serve.test.js",

@@ -66,6 +66,7 @@ import {
   getRecentSyncCycleIds, getSyncSourceJobsWithMeta, getSyncSourceJobOwnersForCycle,
 } from "../supabase.js";
 import { readRecentReadinessRejectionOwnership, readinessIsolationFrom } from "./source-readiness-isolation.js";
+import { readRecentTruncatedOliBackfillOwnership, oliBackfillWeeklySellersFrom } from "./oli-backfill-overflow.js";
 import { recomputeOliSalesEstimatesWindow } from "./oli-sales-estimate-recompute.js";
 import {
   enrichOliHistoryRowsWithEstimates,
@@ -493,6 +494,25 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     } catch (_e) { return empty; }
   };
 
+  // ADAPTIVE ROW-CAP SELF-HEAL: resolve the RAW seller ids whose OLI backfill chunk proved to truncate the 5,000-row
+  // create cap (recent PRIOR-cycle terminal TRUNCATED source-oli:slice-v1 evidence). The CURRENT cycle is EXCLUDED so
+  // the set is stable across this cycle's continuations (a continuation re-derives the SAME set -> the SAME weekly plan,
+  // no frozen state, no PLAN_BUDGET_MISMATCH). Fail-soft to empty (byte-identical efficient chunking). Threaded into
+  // runBucketSourceSync on BOTH fresh + continuation.
+  const resolveOliBackfillWeeklySellers = async ({ bucket, cycleBucket, accounts, orgFingerprint, excludeCycleId = null }) => {
+    if (!Array.isArray(accounts) || accounts.length === 0) return new Set();
+    try {
+      const truncatedScopeHashes = await readRecentTruncatedOliBackfillOwnership({
+        cycleBucket: cycleBucket || bucket, now: readinessNow, connectionId: "primary", organizationFingerprint: orgFingerprint, excludeCycleId,
+        readRecentCycleIds: (cb, since) => readRecentSyncCycleIds(cb, since),
+        readSourceJobs: (cid) => readSyncSourceJobsWithMeta(cid),
+        readOwners: (cid) => readSyncSourceJobOwnersForCycle(cid),
+      });
+      const sellerIds = accounts.map((a) => String(a && a.rawSellerId)).filter(Boolean);
+      return oliBackfillWeeklySellersFrom({ truncatedScopeHashes, sellerIds });
+    } catch (_e) { return new Set(); }
+  };
+
   const discoverBucketAccounts = async ({ connections, bucket }) => {
     const byConnection = [];
     for (const connection of connections) {
@@ -855,6 +875,14 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     // Batch-poisoning self-heal: resolve the OLI readiness-isolation set from durable evidence. Fail-soft to empty
     // (default plan). runBucketSourceSync applies it ONLY on a FRESH cycle (a frozen continuation is untouched).
     const { readinessIsolateSellers } = await resolveReadinessSellers({ bucket, cycleBucket, accounts, orgFingerprint });
+    // ADAPTIVE ROW-CAP SELF-HEAL: the current cycle is EXCLUDED (stable across continuations); fail-soft to empty. The
+    // exclude id is resolved under the SAME cycle namespace the evidence reader keys off (cycleBucket || bucket) so it
+    // is always present in the reader's recent-cycle list (for OLI backfill cycleBucket is null => the region bucket).
+    let excludeCycleIdForOli = null;
+    if (typeof store.getCycleByBucketDate === "function") {
+      try { const cur = await dl.bound("oli-selfheal-cycle-read", (signal) => store.getCycleByBucketDate(cycleBucket || bucket, cycleDate || todayStr, { signal })); excludeCycleIdForOli = cur ? cur.id : null; } catch (_e) { excludeCycleIdForOli = null; }
+    }
+    const oliBackfillWeeklySellers = await resolveOliBackfillWeeklySellers({ bucket, cycleBucket, accounts, orgFingerprint, excludeCycleId: excludeCycleIdForOli });
 
     let rollup;
     try {
@@ -868,6 +896,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         asOf: asOfStr, today: todayStr,
         store, dataDoe,
         readinessIsolateSellers,
+        oliBackfillWeeklySellers,
         preemptiveUnreadyAccountIds,
         freshPlanAccountIds,
         replaceHistoryWindow: trackedReplaceHistory, persistSnapshot: trackedPersistSnapshot, updateRunStatus: boundedUpdateRunStatus,

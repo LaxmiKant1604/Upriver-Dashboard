@@ -161,7 +161,8 @@ test("C5. a missing window longer than the proven single-export cap SPLITS into 
   for (let i = 1; i < chunks.length; i += 1) assert.equal(chunks[i].from, dates.addDaysStr(chunks[i - 1].to, 1), "chunks are contiguous (no gap/overlap)");
   assert.throws(() => model.splitWindowToMaxSpan({ from: "2026-02-01", to: "2026-01-01" }), /fail closed/);
   // planOliSliceExports applies the cap: a new account's full >cap window becomes multiple <=cap exports, all
-  // carrying the SAME single-seller batch scope, together covering the whole window.
+  // carrying the SAME single-seller batch scope, together covering the whole window. WITHOUT proven-truncated evidence
+  // (weeklySliceSellers) this is BYTE-IDENTICAL to the historical plan (efficient <=441/<=221-day chunking).
   const units = model.planOliSliceExports({ batchAccounts: [{ accountId: "A1", rawSellerId: "S1" }], coverageByAccountId: {}, from: over.from, to: over.to });
   assert.equal(units.length, chunks.length, "one export per capped chunk");
   for (const u of units) assert.deepEqual(u.sellerOrVendorIds, ["S1"], "every chunk carries the same batch scope");
@@ -175,6 +176,39 @@ test("C5. a missing window longer than the proven single-export cap SPLITS into 
     { from: "2025-08-10", to: "2026-03-17" },
     { from: "2026-03-18", to: "2026-08-21" },
   ], "multi-seller 441-day chunks split at 221 days while the short remainder identity stays stable");
+
+  // ADAPTIVE ROW-CAP SELF-HEAL (evidence-gated): a PROVEN-TRUNCATED seller (weeklySliceSellers) has its group's missing
+  // windows re-sliced by the canonical report-aligned WEEKLY bins (each <=7 days -> fits the 5000-row create cap), so a
+  // dense account's history fills instead of truncating a 441-day chunk forever (the reproduced europe-au stall).
+  const span = (s) => Math.round((Date.parse(s.to) - Date.parse(s.from)) / 86400000) + 1;
+  const healed = model.planOliSliceExports({ batchAccounts: [{ accountId: "A1", rawSellerId: "S1" }], coverageByAccountId: {}, from: over.from, to: over.to, weeklySliceSellers: new Set(["S1"]) });
+  assert.deepEqual(healed.map((u) => u.slice), dates.canonicalOliSlices(over.from, over.to), "a proven-truncated seller's backfill is sliced by the canonical weekly bins");
+  for (const u of healed) assert.ok(span(u.slice) <= 7, "every weekly self-heal slice is <= 7 days (fits the 5000-row create cap)");
+  for (const u of healed) assert.deepEqual(u.sellerOrVendorIds, ["S1"], "self-heal slices keep the same single-seller scope");
+  assert.equal(healed[0].slice.from, over.from); assert.equal(healed[healed.length - 1].slice.to, over.to);
+  for (let i = 1; i < healed.length; i += 1) assert.equal(healed[i].slice.from, dates.addDaysStr(healed[i - 1].slice.to, 1), "self-heal slices are contiguous");
+  // A seller NOT in the proven-truncated set keeps the efficient chunking even when the set is non-empty.
+  const untouched = model.planOliSliceExports({ batchAccounts: [{ accountId: "A2", rawSellerId: "S2" }], coverageByAccountId: {}, from: over.from, to: over.to, weeklySliceSellers: new Set(["S1"]) });
+  assert.deepEqual(untouched.map((u) => u.slice), chunks, "a seller NOT proven-truncated keeps the efficient <=cap chunking (no blanket re-slice)");
+  // PER-SELLER (NOT per-group): a dense flagged seller CO-GROUPED with a sparse unflagged seller (same empty-coverage
+  // full window) splits into ITS OWN single-seller weekly exports, while the sparse seller keeps the efficient shared
+  // chunk -- so a sparse account is never weekly-sliced by a dense batch-mate (the ~28x go-live regression is avoided).
+  const cog = model.planOliSliceExports({
+    batchAccounts: [{ accountId: "A1", rawSellerId: "S1" }, { accountId: "A3", rawSellerId: "S3" }],
+    coverageByAccountId: {}, from: over.from, to: over.to, weeklySliceSellers: new Set(["S1"]),
+  });
+  const cogWeekly = cog.filter((u) => u.sellerOrVendorIds.length === 1 && u.sellerOrVendorIds[0] === "S1");
+  const cogChunk = cog.filter((u) => u.sellerOrVendorIds.includes("S3"));
+  assert.deepEqual(cogChunk.map((u) => u.slice), chunks, "the SPARSE co-grouped seller (S3) keeps the efficient <=cap chunking (NOT weekly)");
+  assert.ok(cogChunk.every((u) => JSON.stringify(u.sellerOrVendorIds) === JSON.stringify(["S3"])), "S3's chunk no longer shares the export with the flagged S1");
+  assert.deepEqual(cogWeekly.map((u) => u.slice), dates.canonicalOliSlices(over.from, over.to), "the DENSE flagged seller (S1) is split off into its own single-seller weekly exports");
+  // REELLEO reproduction: its leading gap (2025-01-01..2026-03-17) fills as <=7-day slices ONLY once proven-truncated.
+  const de = [{ accountId: "DE1", rawSellerId: "SDE" }];
+  const deCov = { DE1: [{ from: "2026-03-18", to: "2026-09-14" }] };
+  const deStuck = model.planOliSliceExports({ batchAccounts: de, coverageByAccountId: deCov, from: "2025-01-01", to: "2026-09-14" });
+  assert.ok(deStuck.some((u) => span(u.slice) > 90), "before evidence: the REELLEO leading gap is a big (truncating) chunk");
+  const deHealed = model.planOliSliceExports({ batchAccounts: de, coverageByAccountId: deCov, from: "2025-01-01", to: "2026-09-14", weeklySliceSellers: new Set(["SDE"]) });
+  assert.ok(deHealed.length > 1 && deHealed.every((u) => span(u.slice) <= 7), "after evidence: the REELLEO leading gap fills as <=7-day slices (row-cap-safe, region can finalize)");
 });
 
 test("C4. successful slices roll up into minimal coverage windows", () => {

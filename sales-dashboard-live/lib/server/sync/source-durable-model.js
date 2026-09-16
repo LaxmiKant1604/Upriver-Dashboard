@@ -59,6 +59,27 @@ export const MAX_OLI_EXPORT_WINDOW_DAYS = 441;
 // the truncated 441-day identity is never retried.
 export const MAX_MULTI_SELLER_OLI_EXPORT_WINDOW_DAYS = 221;
 
+// ADAPTIVE ROW-CAP SELF-HEAL for the OLI backfill. The <=441/<=221-day chunking is bounded by DAYS, not by the 5,000-row
+// create cap. A DENSE account's day-bounded backfill chunk therefore truncates at the cap and is rejected forever -- its
+// history never fills, it is permanently deferred (a leading/interior OLI gap), and the region's daily cycle never
+// finalizes (proven: REELLEO Express DE, ~28 aggregated OLI rows/day, a 441-day solo backfill chunk 2025-01-01..2026-03-17
+// truncated every europe-au cycle, stalling the region). A seller PROVEN to truncate its backfill ALONE (a prior-cycle
+// terminal TRUNCATED source-oli:slice-v1 export with a SINGLE owner, resolved to the seller's raw id by the runtime) is
+// split OFF into its OWN single-seller exports sliced by the CANONICAL report-aligned WEEKLY bins (canonicalOliSlices) --
+// the same granularity every OLI report already fetches. This is EVIDENCE-GATED + PER-SELLER, never blanket: with no
+// proven-truncated seller (a fresh go-live) every group keeps the efficient <=441/<=221-day shared chunking, byte-
+// identical export count; and a sparse account co-grouped with a dense one keeps its efficient chunk (only the flagged
+// seller re-slices). Only a SINGLE-owner truncation is trusted -- a multi-seller export truncated on COMBINED rows never
+// proves any member truncates solo, so a sparse batch-mate never inherits weekly slicing.
+//   Row-cap reality: a weekly bin is <=7 days; the OLI slice grain is per order-line, so a week fits the 5,000-row cap
+//   for any account up to ~714 order-lines/day (REELLEO ~196/week, ample). An account sustaining MORE than that over its
+//   gap would still truncate a weekly bin -- this is NOT a regression (strictly better than the 441-day chunk) but such
+//   an extreme account would need a sub-week fallback (not implemented; tracked as a residual, exceedingly rare).
+//   Continuation: the evidence is prior-cycle + terminal (the CURRENT cycle is excluded by the runtime), so re-deriving
+//   it reproduces the same plan across a continuation without frozen state. A transient durable-read failure ON a
+//   continuation can re-derive an empty set and defer that one invocation (frozen-plan-not-reproducible) -- fail-SAFE
+//   (LKG preserved, zero duplicate exports), self-healing on the next successful invocation.
+
 // Split an inclusive [from, to] window into contiguous chunks of at most `maxDays` inclusive days each (the
 // last chunk holds the remainder). from/to must be valid YYYY-MM-DD with from <= to.
 export function splitWindowToMaxSpan({ from, to }, maxDays = MAX_OLI_EXPORT_WINDOW_DAYS) {
@@ -337,7 +358,8 @@ export function resolveEffectivePublishAsOf({ coverageByAccountId = {}, accountI
  * bounded by MAX_MULTI_SELLER_OLI_EXPORT_WINDOW_DAYS after live row-cap evidence proved 441 days can truncate;
  * single-seller chunks retain the empirically proven 441-day cap and short remainder identities stay stable.
  */
-export function planOliSliceExports({ batchAccounts, coverageByAccountId, from, to }) {
+export function planOliSliceExports({ batchAccounts, coverageByAccountId, from, to, weeklySliceSellers = null }) {
+  const weeklySet = weeklySliceSellers instanceof Set ? weeklySliceSellers : (weeklySliceSellers ? new Set(weeklySliceSellers) : null);
   const accounts = Array.isArray(batchAccounts) ? batchAccounts : [];
   if (accounts.length === 0 || accounts.length > 5) {
     throw new Error("planOliSliceExports requires a 1..5 account stable batch (fail closed).");
@@ -359,18 +381,29 @@ export function planOliSliceExports({ batchAccounts, coverageByAccountId, from, 
     groups.get(sig).accounts.push(a);
   }
   const units = [];
+  // A missing window longer than DataDoe's proven single-export range is SPLIT into contiguous <=cap chunks; a
+  // within-range window stays ONE export. The chunks' coverage merges back into the one contiguous window.
+  const emitChunked = (members, w) => {
+    if (!members.length) return;
+    const ids = members.map((a) => String(a.rawSellerId));
+    for (const chunk of splitWindowToMaxSpan(w)) {
+      const safeChunks = ids.length > 1 ? splitWindowToMaxSpan(chunk, MAX_MULTI_SELLER_OLI_EXPORT_WINDOW_DAYS) : [chunk];
+      for (const safeChunk of safeChunks) units.push({ slice: { from: safeChunk.from, to: safeChunk.to }, accounts: members, sellerOrVendorIds: ids });
+    }
+  };
   for (const g of groups.values()) {
-    const sorted = [...g.accounts].sort((x, y) => (x.rawSellerId < y.rawSellerId ? -1 : 1));
-    const ids = sorted.map((a) => String(a.rawSellerId));
+    const sorted = [...g.accounts].sort((x, y) => (String(x.rawSellerId) < String(y.rawSellerId) ? -1 : 1));
+    // PER-SELLER self-heal (never the whole group): a PROVEN-TRUNCATED seller is split OFF into its OWN single-seller
+    // weekly-sliced exports (row-cap-safe so its dense backfill fills), while the group's other (unflagged) members keep
+    // the efficient shared <=cap chunking -- so a sparse account co-grouped with a dense one is NOT weekly-sliced. When
+    // no member is flagged (weeklySet empty/absent) this is BYTE-IDENTICAL to the historical shared-chunk plan.
+    const flagged = weeklySet ? sorted.filter((a) => weeklySet.has(String(a.rawSellerId))) : [];
+    const unflagged = flagged.length ? sorted.filter((a) => !weeklySet.has(String(a.rawSellerId))) : sorted;
     for (const w of g.windows) {
-      // A missing window longer than DataDoe's proven single-export range is SPLIT into contiguous <=cap chunks;
-      // a within-range window stays ONE export. The chunks' coverage merges back into the one contiguous window.
-      for (const chunk of splitWindowToMaxSpan(w)) {
-        const safeChunks = ids.length > 1
-          ? splitWindowToMaxSpan(chunk, MAX_MULTI_SELLER_OLI_EXPORT_WINDOW_DAYS)
-          : [chunk];
-        for (const safeChunk of safeChunks) {
-          units.push({ slice: { from: safeChunk.from, to: safeChunk.to }, accounts: sorted, sellerOrVendorIds: ids });
+      emitChunked(unflagged, w);
+      for (const m of flagged) {
+        for (const s of canonicalOliSlices(w.from, w.to)) {
+          units.push({ slice: { from: s.from, to: s.to }, accounts: [m], sellerOrVendorIds: [String(m.rawSellerId)] });
         }
       }
     }
