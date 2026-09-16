@@ -1,5 +1,48 @@
 # Project Memory
 
+## Report Delivery Status — global dd-secondary exclusion + superseded-ppc denominator + specific remarks (2026-09-16, commit 70a849d on main, PUSHED; verify 217/217; read-only, prod-smoked all 3 regions)
+
+Root cause of secondary-account visibility: the admin Report Delivery Status view (lib/server/delivery-status.js) was the ONE
+active operational surface that skipped the CANONICAL active-connection predicate `classifyDirectoryAccounts` that every
+scheduler/reconciler/publisher path already applies (report-planner:924, sync-dispatch:286, source-bucket-sync-runtime:504,
+publisher-composition:72, priority-control-pg-store:40, all four reconcilers, every per-report cycle, both ads runners). So the
+DECOMMISSIONED secondary DataDoe connection's historical `dd-secondary:`-prefixed account_directory rows (DATADOE_API_KEY_SECONDARY
+UNSET) leaked into EVERY region's response + inflated its account/failure/success totals. SCHEDULER SCOPE WAS ALREADY CORRECT
+(proven) -> READ-SIDE-ONLY fix. Three registry-derived corrections, confined to the pure read-only module (NO api/*.js added; api=12;
+api/admin/sync.js + POST/PATCH + the React view byte-unchanged; still zero writes/exports/dispatches):
+
+1. **Canonical active-connection filter.** loadDeliveryStatus now imports + runs `classifyDirectoryAccounts` (from datadoe-connections.js,
+   a pure registry) over the region-mapped accounts and keeps only `active`; decommissioned dd-secondary accounts are excluded from the
+   response, summary totals, and failures filter, while their durable directory/evidence rows are RETAINED (this view never deletes).
+   Fail-closed to a primary-only set `[{id:"primary"}]` if getDataDoeConnections() throws (still excludes secondary, never drops primary).
+   NO hardcoded IDs/names/marketplaces; re-enabling DATADOE_API_KEY_SECONDARY makes valid accounts eligible again automatically. A safe
+   count-only note reports how many were hidden.
+2. **Truthful Publish denominator (registry-derived).** New `reportHasActiveLivePublisher(reportKey)` reads the canonical
+   report-materialization-registry: a live-publishable report counts as an expected publication ONLY when regionalScheduling ===
+   "per-region-daily". `NO_LIVE_PUBLISHER_REPORT_KEYS` (superseded/shadow) is excluded. ppc-performance is SUPERSEDED (registry "no live
+   publisher"; superseded by the durable Campaign Ads workspace) -> Campaign Ads is now daily-reporting-only (Yes 1/1), no more permanent
+   K/2. listing-health-v3 stays the env-gated exception (re-included only when LHV3_PUBLISH_LIVE && LISTING_HEALTH_V3). Raw
+   ADS_LINEAGE_DEPENDS_ON is UNCHANGED (still [daily-reporting, ppc-performance]); only the loader's Publish universe filters ppc.
+3. **Source-specific safe remarks.** accountRemark names the exact failing source + typed safe code (e.g. "FBA Inventory export failed
+   (SOURCE_EVIDENCE_MISSING)") instead of the generic "Source export failed"; admin-safe fragments only (label + typed code + integer
+   fraction). FBA Export-No / Publish-Yes (retained-current) is shown + explained honestly, not hidden.
+
+READ-ONLY prod smoke (GET-only; zero DataDoe creates/tokens, zero DB writes, zero dispatches), all three regions: ZERO dd-secondary leak;
+26 dd-secondary rows excluded (india 11->8 [-3], europe-au 49->32 [-17], us-ca 17->11 [-6]); Campaign Ads denominator 1 everywhere. Tests:
+delivery-status 91/91 (was 74) incl. the mandated secondary(x3 regions)/totals/re-enable/no-hardcode/denominator/remark/FBA-contradiction
+cases; full `npm run verify` 217/217 across 193 suites (incl. build:check, 618s); adversarial review (6 lenses: secondary leakage, primary
+exclusion, false Yes, LKG, denominator, read-only, bounded reads, scheduler isolation) 0 findings; node --check + git diff --check clean.
+
+GENUINE operational states the now-truthful view SURFACES (NOT delivery-status defects; NOT fixed here -- separate scope):
+- **europe-au SCHEDULER STALL**: no COMPLETED cycle since 2026-09-06; every cycle 09-07..09-15 is stuck status "running" (never
+  terminalized). The loader correctly shows the latest COMPLETED cycle (09-06). HIGH-priority; needs its own root-cause (do NOT bundle).
+- **india/EU Listings + Listings-Raw absent** (Export No SOURCE_EVIDENCE_MISSING for all; us-ca fully present): durable listings snapshot
+  not persisted for india/EU yet -> genuine source/persistence gap, awaiting a natural cycle.
+- **india FBA D-1 mostly missing** (7/8 D1_COVERAGE_MISSING on the fresh 09-16 cycle; publish retained LKG) + **scattered Campaign Ads D-1
+  gaps** (2-3/region): consistent with real Amazon FBA/Ads D-1 itemization lag, not a code defect.
+Built on [[report-delivery-status-view]] (the original SHIPPED view). Superseded connection detail lives in datadoe-connections.js
+classifyDirectoryAccounts (the canonical predicate). NEXT (separate): europe-au scheduler-stall root cause.
+
 ## OLI reconciler — Codex termination-boundary HARDENING: no close while op alive, fail-closed settlement, required (ref'd) timers (2026-09-11, commit 4e45c53 on main, NOT pushed; verify 196/196; code-complete, NOT production acceptance)
 
 Follow-up to 9c3ce28 (preserved; parent 2ffbc76). Codex re-review confirmed the previous round's defects 2/3/4 fixed;
