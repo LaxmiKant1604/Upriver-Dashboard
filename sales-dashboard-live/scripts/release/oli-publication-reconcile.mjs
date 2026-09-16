@@ -113,6 +113,10 @@ const readbackLive = buildLiveReadback({
 // byte-identical. This is why a routine "the org Product Catalog carrier is not warm this pass" defers instead of
 // hard-failing every account and stranding the global lease (the incident this fixes).
 const makeNoExportInnerAdapter = () => ({
+  // The `noExport` flag lets makeDurableCatalogGuard refuse a Catalog create BEFORE it reserves (see below): a reserve
+  // followed by this refusal would leave an orphaned "reserved"/no-export-id reservation that EVERY subsequent account
+  // in the operation reads as AMBIGUOUS and HARD-fails on. Refusing pre-reserve makes the whole operation defer cleanly.
+  noExport: true,
   create: async () => { const e = new Error("OLI_RECONCILER_NO_EXPORT: the reconciler never creates a DataDoe export (fail closed)."); e.code = "NO_EXPORT_REQUIRED"; throw e; },
   poll: async () => { const e = new Error("OLI_RECONCILER_NO_EXPORT: the reconciler never polls a DataDoe export (fail closed)."); e.code = "NO_EXPORT_REQUIRED"; throw e; },
   download: async () => { const e = new Error("OLI_RECONCILER_NO_EXPORT: the reconciler never downloads a DataDoe export (fail closed)."); e.code = "NO_EXPORT_REQUIRED"; throw e; },

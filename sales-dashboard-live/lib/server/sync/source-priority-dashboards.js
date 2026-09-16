@@ -135,6 +135,18 @@ export function makeDurableCatalogGuard({ inner, reservation, operationKey }) {
       }
       const hash = S(job && (job.requestHash ?? job.request_hash));
       if (!nb(hash)) throw new Error("PRIORITY_CATALOG_HASH_MISSING: the Catalog job carries no canonical request hash; refusing (fail closed).");
+      // ZERO-EXPORT reconciler (inner.noExport): the inner adapter refuses every create, so a durable-cache MISS this
+      // pass can NEVER be satisfied. Refuse BEFORE touching the reservation. Two reasons this MUST precede reserve:
+      //   (1) a reserve+refuse would leave an orphaned "reserved"/no-export-id row (there is no reset route) that every
+      //       SUBSEQUENT account in the operation reads as AMBIGUOUS and HARD-fails on; and
+      //   (2) reserve would otherwise read an EXISTING orphaned reservation (e.g. a scheduled cycle that reserved the
+      //       Catalog then failed to record its create) as AMBIGUOUS -> a hard REQUIRED_SOURCE_FAILED that strands the
+      //       reconciler's global lease.
+      // Refusing pre-reserve makes the reconciler NEVER read or write a reservation -> the whole operation defers
+      // cleanly (NO_EXPORT_REQUIRED -> SOURCE_READINESS_PENDING -> DEFERRED_DEPENDENCY; LKG preserved; it publishes once
+      // a natural cycle warms the durable Catalog cache and it can adopt instead of create). The scheduled full-region
+      // adapter has NO `noExport` flag, so this branch never fires for it -> its reserve/create path is byte-identical.
+      if (inner.noExport === true) { const e = new Error("OLI_RECONCILER_NO_EXPORT: the reconciler never creates a DataDoe export (fail closed)."); e.code = "NO_EXPORT_REQUIRED"; throw e; }
       const res = await reservation.reserve({ operationKey, catalogRequestHash: hash });
       if (res.disposition === "reserved") {
         // This caller WON the one create. POST once, then record the export id + tokens.

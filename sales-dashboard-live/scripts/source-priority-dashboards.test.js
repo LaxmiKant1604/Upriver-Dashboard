@@ -129,6 +129,20 @@ test("P1f. poll + download pass through; a hash-less Catalog job fails closed", 
   assert.equal(created.length, 0);
 });
 
+test("P1g. a NO-EXPORT inner (inner.noExport) refuses the Catalog create BEFORE touching the reservation -> retryable NO_EXPORT_REQUIRED, never AMBIGUOUS, never poisons/reads a reservation (the zero-export OLI reconciler defer, not a lease-stranding hard fail)", async () => {
+  // A reservation that FAILS LOUDLY if reserve/recordExport is ever called -- proving the no-export guard refuses
+  // pre-reserve, so it can neither leave an orphaned "reserved"/no-export-id row nor read an existing one as AMBIGUOUS.
+  const mustNotTouch = { reserve: async () => { throw new Error("RESERVE_MUST_NOT_BE_CALLED"); }, recordExport: async () => { throw new Error("RECORD_MUST_NOT_BE_CALLED"); } };
+  const noExportInner = { noExport: true, create: async () => { const e = new Error("inner refused"); e.code = "NO_EXPORT_REQUIRED"; throw e; }, poll: async () => {}, download: async () => {} };
+  const g = priorityMod.makeDurableCatalogGuard({ inner: noExportInner, reservation: mustNotTouch, operationKey: OP() });
+  let err = null; try { await g.create(catJob()); } catch (e) { err = e; }
+  assert.ok(err && err.code === "NO_EXPORT_REQUIRED" && !/AMBIGUOUS|RESERVE_MUST_NOT/.test(String(err && err.message)), "no-export refuses pre-reserve with NO_EXPORT_REQUIRED (never AMBIGUOUS, never calls reserve): " + String(err && err.message));
+  // A real (non-noExport) inner still reserves + creates normally -> the noExport branch is inert for the scheduler.
+  const created = []; const g2 = priorityMod.makeDurableCatalogGuard({ inner: makeInner(created), reservation: makeFakeReservation(), operationKey: OP() });
+  const r = await g2.create(catJob());
+  assert.ok(created.length === 1 && r && r.exportId, "a real inner reserves + creates normally (byte-identical scheduler path)");
+});
+
 /* ============================= P2. the frozen publication set (three reports) ============================= */
 group("P2. publish allowlist + order: daily-reporting, brand-sales BEFORE brand-inventory");
 
