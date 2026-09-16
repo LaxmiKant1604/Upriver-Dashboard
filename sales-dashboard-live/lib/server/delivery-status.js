@@ -27,6 +27,15 @@ import { ADS_LINEAGE_DEPENDS_ON, ADS_CAMPAIGN_SOURCE_KEY, adsWorkerKeyForGrain }
 import { FBA_LINEAGE_DEPENDS_ON } from "./sync/fba-dependent-reports.js";
 import { LISTINGS_LINEAGE_DEPENDS_ON } from "./sync/listing-health-v3-dependent-reports.js";
 import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "./sync/report-publisher.js";
+// The CANONICAL active-connection predicate every scheduler/reconciler/publisher path already applies (report-planner,
+// sync-dispatch, source-bucket-sync-runtime, publisher-composition, all four reconcilers). The admin view MUST apply
+// the SAME one so it can never show an account the pipeline will not operate. datadoe-connections.js is a pure registry
+// (imports only source-identity crypto) -- no transport, no writes.
+import { classifyDirectoryAccounts, getDataDoeConnections } from "./datadoe-connections.js";
+// The CANONICAL report-materialization registry -- the ONE place each report declares whether it has an ACTIVE
+// per-region live publisher. Registry-derived (never hardcoded) so a superseded/shadow report drops out of the Publish
+// universe automatically. Pure + offline (report-derivation.js it transitively reaches declares "NO transport/supabase").
+import { REPORT_MATERIALIZATION } from "./reports/report-materialization-registry.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const isDate = (v) => isValidCalendarDate(S(v));
@@ -79,6 +88,26 @@ export const DELIVERY_SOURCES = Object.freeze([
 // ---- Registry-derived source -> dependent live-report mapping (drift-proof). ----
 const LINEAGE_MAPS = [OLI_LINEAGE_DEPENDS_ON, ADS_LINEAGE_DEPENDS_ON, FBA_LINEAGE_DEPENDS_ON, LISTINGS_LINEAGE_DEPENDS_ON];
 export const LIVE_PUBLISHABLE_REPORT_KEYS = Object.freeze(Object.keys(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS).slice().sort());
+
+// ---- Registry-derived "has an ACTIVE per-region live publisher" predicate (drift-proof; never hardcoded). ----
+// A live-publishable report is a REAL current publication target ONLY when the canonical materialization registry says
+// it is published per region daily. A report the registry marks otherwise has NO live publisher today and must NOT be
+// counted as an expected publication -- otherwise it fabricates a permanent partial fraction. The two cases that matter
+// for the six-source matrix:
+//   - ppc-performance: SUPERSEDED by the durable Campaign Ads workspace (materialization registry: regionalScheduling
+//     "shadow", "the ppc-performance snapshot itself has no live publisher"). It stays in ADS_LINEAGE_DEPENDS_ON (the
+//     durable-lineage inverse) but has no live promotion, so counting it inflated Campaign Ads to a permanent K/2.
+//   - listing-health-v3: regionalScheduling "shadow" until its DOUBLE serve gate flips on (handled separately below).
+// Every other live-publishable key here is either per-region-daily (kept) or not a dependent of any of the six sources
+// (irrelevant to the matrix). A future report flips automatically when its registry owner changes -- no edit here.
+const MATERIALIZATION_BY_REPORT_KEY = new Map(Object.values(REPORT_MATERIALIZATION).map((e) => [S(e.reportKey), e]));
+export function reportHasActiveLivePublisher(reportKey) {
+  const entry = MATERIALIZATION_BY_REPORT_KEY.get(S(reportKey));
+  return entry ? entry.regionalScheduling === "per-region-daily" : true; // absent from the registry => fail toward showing
+}
+// The live-publishable keys with NO active live publisher today (superseded/shadow/on-demand). Excluded from every
+// source's Publish universe. listing-health-v3 is re-included by the loader when its double serve gate is enabled.
+export const NO_LIVE_PUBLISHER_REPORT_KEYS = Object.freeze(LIVE_PUBLISHABLE_REPORT_KEYS.filter((rk) => !reportHasActiveLivePublisher(rk)));
 
 // FBA Shipment Plan is the ONE scheduler-published (non-reconciler) dashboard built DIRECTLY on the sources it OWNS
 // as fetched exports -- FBA Inventory Health + Listings (AWD). It has a live publication contract but no saved-data
@@ -191,20 +220,34 @@ export function aggregatePublish({ dependentReports, perReport, metaOk = true } 
   return { status: waiting > 0 ? "Waiting" : "No", count: yes, expected, lkg };
 }
 
-// ---- Per-account remark: the single most actionable safe result. Priority: eligibility, then export failures, then
-// publish failures, then in-progress, then healthy. ----
+// ---- Per-account remark: the single most actionable safe result, naming the SPECIFIC source + safe code (never a
+// generic "Source export failed" bucket). Priority: eligibility, then export failures, then publish failures, then
+// LKG-retained, then in-progress, then healthy. Every fragment is admin-safe (a typed safeCode + the source label --
+// no raw provider error, object path, or credential). "Healthy" is returned verbatim (the failures-only filter and
+// the summary key off it). ----
 export function accountRemark({ eligible, reports }) {
   if (eligible === false) return "Account not eligible";
-  const ex = (s) => reports.some((r) => r.exportStatus === s);
-  const pubIs = (s) => reports.some((r) => r.publishStatus === s);
-  // Actionable failures first (a proven miss outranks a not-yet-readable source), then unavailability, then in-flight.
-  if (ex("No")) return "Source export failed";
-  if (pubIs("No")) return "Dashboard publication failed";
-  if (ex("Unavailable")) return "Source evidence unavailable";
-  if (pubIs("Unavailable")) return "Dashboard evidence unavailable";
-  if (reports.some((r) => r.publishStatus === "Waiting" && r.publishLkg)) return "Last-known-good retained";
-  if (ex("Waiting")) return "Cycle in progress";
-  if (pubIs("Waiting")) return "Dashboard publication pending";
+  const rows = Array.isArray(reports) ? reports : [];
+  const firstExport = (s) => rows.find((r) => r.exportStatus === s);
+  const firstPublish = (s) => rows.find((r) => r.publishStatus === s);
+  const code = (c) => (c ? " (" + S(c) + ")" : "");
+  const frac = (r) => S(r.publicationCount) + "/" + S(r.publicationExpected);
+  // Actionable failures first (a proven miss outranks a not-yet-readable source), then unavailability, then LKG, then
+  // in-flight. Each names the exact source so an admin never has to guess WHICH of the six failed.
+  const exNo = firstExport("No");
+  if (exNo) return exNo.label + " export failed" + code(exNo.safeCode);
+  const pubNo = firstPublish("No");
+  if (pubNo) return pubNo.label + " publication failed " + frac(pubNo);
+  const exUn = firstExport("Unavailable");
+  if (exUn) return exUn.label + " evidence unavailable" + code(exUn.safeCode);
+  const pubUn = firstPublish("Unavailable");
+  if (pubUn) return pubUn.label + " publication evidence unavailable";
+  const lkg = rows.find((r) => r.publishStatus === "Waiting" && r.publishLkg);
+  if (lkg) return lkg.label + " last-known-good retained";
+  const exW = firstExport("Waiting");
+  if (exW) return exW.label + " cycle in progress";
+  const pubW = firstPublish("Waiting");
+  if (pubW) return pubW.label + " publication pending";
   return "Healthy";
 }
 
@@ -389,6 +432,20 @@ export async function loadDeliveryStatus({ region, cycleDate, failuresOnly } = {
       eligible: accountEligible(onboardingById.get(String(r.account_id))),
     }))
     .sort((a, b) => a.accountId.localeCompare(b.accountId));
+
+  // ---- Canonical active-connection filter -- the SAME predicate every scheduler/reconciler/publisher path applies
+  // (classifyDirectoryAccounts). When the secondary DataDoe organization is decommissioned (DATADOE_API_KEY_SECONDARY
+  // unset), its historical `dd-secondary:`-prefixed directory rows are RETAINED for audit but are STALE: excluded here
+  // from the response, the summary totals, and the failures filter -- while staying in the durable directory (this view
+  // never deletes). If an admin later re-enables the connection, getDataDoeConnections() returns it again and its
+  // accounts become eligible automatically (no code change, no hardcoded IDs/marketplaces). Fail-closed: if the
+  // connection registry cannot be read, fall back to a primary-only set so a stale secondary account is STILL excluded
+  // WITHOUT dropping primary accounts. Keyed on the canonical account-id prefix (never a frontend string match). ----
+  const connections = (() => { try { return getDataDoeConnections(); } catch { return null; } })();
+  const { active, unavailable } = classifyDirectoryAccounts(accounts, connections || [{ id: "primary" }]);
+  accounts = active;
+  if (unavailable.length > 0) notes.push(unavailable.length + " account(s) from a decommissioned DataDoe connection are excluded (retained read-only).");
+
   if (accounts.length > MAX_ACCOUNTS) {
     notes.push("Showing the first " + MAX_ACCOUNTS + " of " + accounts.length + " accounts in this region.");
     accounts = accounts.slice(0, MAX_ACCOUNTS);
@@ -506,11 +563,16 @@ export async function loadDeliveryStatus({ region, cycleDate, failuresOnly } = {
     if (Object.values(readOkByReport).some((v) => v === false)) notes.push("Some live dashboard snapshot reads could not be completed or were too large to read safely; those cells show Unavailable.");
   }
 
-  // listing-health-v3 serves live only behind its DOUBLE publish gate (LHV3_PUBLISH_LIVE && LISTING_HEALTH_V3, both
-  // default OFF). While the gate is off it emits no live row, so counting it as a per-account publication FAILURE would
-  // mislead -- exclude it from the Publish universe (its Listings/Raw dependents then reflect only their live targets).
+  // Exclude from the Publish universe every live-publishable report the canonical registry says has NO active live
+  // publisher today -- a superseded/shadow/on-demand report -- so a retired target never inflates a denominator (e.g.
+  // Campaign Ads' ppc-performance, superseded by the durable workspace, no longer forces a permanent K/2). This is
+  // registry-DERIVED (NO_LIVE_PUBLISHER_REPORT_KEYS), not a hardcoded list. listing-health-v3 is the one env-gated
+  // exception: it serves live only behind its DOUBLE gate (LHV3_PUBLISH_LIVE && LISTING_HEALTH_V3, both default OFF) --
+  // when that gate is ON its reconciler DOES promote it per region, so it is re-included; while OFF it stays excluded
+  // (its Listings/Raw dependents show Not-applicable, never a fabricated publication failure).
   const lhv3LiveEnabled = String(process.env.LHV3_PUBLISH_LIVE) === "true" && String(process.env.LISTING_HEALTH_V3) === "true";
-  const disabledReports = new Set(lhv3LiveEnabled ? [] : ["listing-health-v3"]);
+  const disabledReports = new Set(NO_LIVE_PUBLISHER_REPORT_KEYS);
+  if (lhv3LiveEnabled) disabledReports.delete("listing-health-v3");
 
   return shapeDeliveryPayload({
     region: rgn, cycle, generatedAt, accounts,

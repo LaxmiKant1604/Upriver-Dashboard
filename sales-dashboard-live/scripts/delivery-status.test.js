@@ -22,6 +22,7 @@ import {
   classifyExport, classifyReportPublish, aggregatePublish, accountRemark,
   dependentLiveReportsForSource, shapeDeliveryPayload, loadDeliveryStatus,
   normalizeDeliveryRegion, addDaysStr, DELIVERY_SOURCES, DELIVERY_REGIONS, LIVE_PUBLISHABLE_REPORT_KEYS,
+  reportHasActiveLivePublisher, NO_LIVE_PUBLISHER_REPORT_KEYS,
 } from "../lib/server/delivery-status.js";
 import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "../lib/server/sync/report-publisher.js";
 
@@ -264,9 +265,92 @@ function baseDeps(over = {}) {
   const p = await loadDeliveryStatus({ region: "us-ca" }, baseDeps().deps);
   const us1 = p.accounts.find((a) => a.accountId === "US1");
   const ads = us1.reports.find((r) => r.sourceKey === "ads-campaign-date");
-  // daily-reporting is the only mocked correct-version live row; ads depends on daily-reporting + ppc-performance.
-  ok("[#15] Publish counts an exact-version live row (daily-reporting) toward the source aggregate", ads.publicationCount >= 1 && ads.publicationExpected === 2);
+  // Campaign Ads' live universe is daily-reporting ONLY: ppc-performance is SUPERSEDED (no live publisher) and is
+  // excluded from the denominator, so a published daily-reporting yields Publish Yes 1/1 -- never a permanent 1/2.
+  ok("[#19] Campaign Ads excludes superseded ppc-performance -> denominator is 1 (daily-reporting only)", ads.publicationExpected === 1 && !ads.dependentReports.includes("ppc-performance") && ads.dependentReports.join(",") === "daily-reporting");
+  ok("[#15] a published daily-reporting -> Campaign Ads Publish Yes 1/1 (not a false partial)", ads.publishStatus === "Yes" && ads.publicationCount === 1);
   ok("[#11] Listings uses date-free freshness (present pointer + validated_at) -> Export Yes", us1.reports.find((r) => r.sourceKey === "listings").exportStatus === "Yes");
+}
+
+// ============================ (E2) canonical active-connection filter: decommissioned dd-secondary excluded ============================
+// The secondary DataDoe connection is decommissioned iff DATADOE_API_KEY_SECONDARY is unset (getDataDoeConnections then
+// returns only the primary connection). Its historical `dd-secondary:`-prefixed directory rows must be excluded from
+// EVERY region's response + totals, without deleting anything and without a hardcoded id/name/marketplace. The mock
+// directory carries one active primary AND one stale dd-secondary account per region.
+function secondaryDeps() {
+  return baseDeps({
+    getAccountDirectoryRows: async () => [
+      // Active PRIMARY accounts (one per region).
+      { account_id: "US1", name: "US One", marketplace_country_code: "US", connection_id: "primary" },
+      { account_id: "IN1", name: "India One", marketplace_country_code: "IN", connection_id: "primary" },
+      { account_id: "DE1", name: "DE One", marketplace_country_code: "DE", connection_id: "primary" },
+      // Stale dd-secondary accounts (one per region) from the decommissioned connection -- prefix intact, connection "secondary".
+      { account_id: "dd-secondary:US9", name: "US Nine (Secondary DataDoe)", marketplace_country_code: "US", connection_id: "secondary" },
+      { account_id: "dd-secondary:IN9", name: "India Nine (Secondary DataDoe)", marketplace_country_code: "IN", connection_id: "secondary" },
+      { account_id: "dd-secondary:DE9", name: "DE Nine (Secondary DataDoe)", marketplace_country_code: "DE", connection_id: "secondary" },
+    ],
+  }).deps;
+}
+{
+  const savedSecondary = process.env.DATADOE_API_KEY_SECONDARY;
+  delete process.env.DATADOE_API_KEY_SECONDARY; // connection decommissioned
+  const us = await loadDeliveryStatus({ region: "us-ca" }, secondaryDeps());
+  const inR = await loadDeliveryStatus({ region: "india" }, secondaryDeps());
+  const eu = await loadDeliveryStatus({ region: "europe-au" }, secondaryDeps());
+  const idsOf = (p) => p.accounts.map((a) => a.accountId).sort();
+  const noSecondary = (p) => p.accounts.every((a) => !String(a.accountId).startsWith("dd-secondary:"));
+  ok("[#1] US/Canada: decommissioned dd-secondary excluded (only the primary account remains)", idsOf(us).join(",") === "US1" && noSecondary(us));
+  ok("[#1] India: decommissioned dd-secondary excluded", idsOf(inR).join(",") === "IN1" && noSecondary(inR));
+  ok("[#2] Europe/Australia: decommissioned dd-secondary excluded", idsOf(eu).join(",") === "DE1" && noSecondary(eu));
+  ok("[#4] secondary accounts do not affect regional totals (accountCount counts only the active primary)", us.summary.accountCount === 1 && inR.summary.accountCount === 1 && eu.summary.accountCount === 1);
+  ok("[#4] a safe note reports the count excluded (no id/name/marketplace leaked)", us.notes.some((n) => /decommissioned DataDoe connection are excluded/.test(n) && !/dd-secondary|US9|Secondary DataDoe/.test(n)));
+  ok("[#8] no hardcoded account id/name/marketplace anywhere in the exclusion path (module source)", (() => { const mod = readFileSync(path.join(root, "lib", "server", "delivery-status.js"), "utf8"); return !/US9|IN9|DE9|dd-secondary:US|Secondary DataDoe/.test(mod); })());
+
+  // [#7] Re-enabling the canonical connection (a DIFFERENT secondary key) makes its valid accounts eligible again.
+  process.env.DATADOE_API_KEY_SECONDARY = "test-secondary-key-distinct";
+  const usReenabled = await loadDeliveryStatus({ region: "us-ca" }, secondaryDeps());
+  ok("[#7] re-enabling DATADOE_API_KEY_SECONDARY makes the dd-secondary account eligible again (registry-driven)", idsOf(usReenabled).join(",") === "US1,dd-secondary:US9");
+  if (savedSecondary === undefined) delete process.env.DATADOE_API_KEY_SECONDARY; else process.env.DATADOE_API_KEY_SECONDARY = savedSecondary;
+}
+
+// ============================ (E3) source-specific safe remarks + honest FBA Export-No / Publish-Yes ============================
+{
+  // OLI coverage fails to reach D-1 for US1 (terminal cycle) -> a SPECIFIC "Order Line Items export failed (code)"
+  // remark, never the generic "Source export failed".
+  const oliMissDeps = baseDeps({
+    getSourceCoverageWindows: async ({ accountId }) => (accountId === "US1"
+      ? { windows: [{ from: "2026-08-01", to: "2026-09-12" }], read: "ok", error: null }   // stops at D-3, misses D-1
+      : { windows: [{ from: "2026-08-01", to: "2026-09-14" }], read: "ok", error: null }),
+  }).deps;
+  const p = await loadDeliveryStatus({ region: "us-ca" }, oliMissDeps);
+  const us1 = p.accounts.find((a) => a.accountId === "US1");
+  const oli = us1.reports.find((r) => r.sourceKey === "order-line-items");
+  ok("[#7-fail] OLI D-1 miss -> Export No with a specific safe code (D1_COVERAGE_MISSING)", oli.exportStatus === "No" && oli.safeCode === "D1_COVERAGE_MISSING");
+  ok("[#7-fail] remark names the SPECIFIC source + code, never the generic 'Source export failed'", us1.remark === "Order Line Items export failed (D1_COVERAGE_MISSING)" && us1.remark !== "Source export failed");
+
+  // [#20] FBA contradictory Export No / Publish Yes: this cycle's fba-plan job did not validate (Export No), yet the
+  // brand-inventory/fba-plan live snapshots are current (Publish Yes -- retained/current from an earlier attempt). Both
+  // are classified honestly and independently, and the account remark surfaces the actionable FBA export failure.
+  const fbaContradictionDeps = baseDeps({
+    getLatestReportJobLineage: async (rk, accountId) => (accountId === "US1"
+      ? { reportKey: rk, accountId, validated: false, latestDataDate: null }   // FBA export did NOT validate this cycle
+      : { reportKey: rk, accountId, validated: true, latestDataDate: "2026-09-14" }),
+    // brand-inventory + fba-plan live snapshots are still CURRENT (as_of == cycle as-of) for US1 -> Publish Yes.
+  }).deps;
+  const q = await loadDeliveryStatus({ region: "us-ca" }, fbaContradictionDeps);
+  const us1b = q.accounts.find((a) => a.accountId === "US1");
+  const fba = us1b.reports.find((r) => r.sourceKey === "fba-inventory-health");
+  ok("[#20] FBA Export No is classified (job not validated) with a safe code, never a fabricated Yes", fba.exportStatus === "No" && fba.safeCode === "SOURCE_EVIDENCE_MISSING");
+  ok("[#20] FBA Publish stays Yes independently (retained/current live snapshot) -- the contradiction is shown, not hidden", fba.publishStatus === "Yes" && fba.publicationExpected === 2);
+  ok("[#20] the account remark honestly surfaces the FBA export failure (specific, not generic)", us1b.remark === "FBA Inventory export failed (SOURCE_EVIDENCE_MISSING)");
+}
+
+// ============================ (E4) reportHasActiveLivePublisher: registry-derived, superseded ppc excluded ============================
+{
+  ok("[#19] reportHasActiveLivePublisher(daily-reporting) === true (per-region-daily live publisher)", reportHasActiveLivePublisher("daily-reporting") === true);
+  ok("[#19] reportHasActiveLivePublisher(brand-inventory/brand-sales/fba-plan) === true", ["brand-inventory", "brand-sales", "fba-plan"].every((k) => reportHasActiveLivePublisher(k) === true));
+  ok("[#19] reportHasActiveLivePublisher(ppc-performance) === false (superseded; no live publisher)", reportHasActiveLivePublisher("ppc-performance") === false);
+  ok("[#19] NO_LIVE_PUBLISHER_REPORT_KEYS includes ppc-performance + listing-health-v3, excludes the live 4", NO_LIVE_PUBLISHER_REPORT_KEYS.includes("ppc-performance") && NO_LIVE_PUBLISHER_REPORT_KEYS.includes("listing-health-v3") && ["brand-inventory", "brand-sales", "daily-reporting", "fba-plan"].every((k) => !NO_LIVE_PUBLISHER_REPORT_KEYS.includes(k)));
 }
 
 // ============================ (F) endpoint source guards: admin gate, GET-only, no writes on the delivery path ============================
