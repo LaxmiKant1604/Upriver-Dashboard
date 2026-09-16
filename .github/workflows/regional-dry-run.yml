@@ -1,32 +1,43 @@
-name: regional-dry-run
+name: manual-lhv3-paid-acceptance
+run-name: manual-lhv3-paid-acceptance ${{ inputs.region }}/${{ inputs.cycle_date }}
 
-# READ-ONLY, MANUAL-ONLY regional scheduler dry-run. Discovers accounts from the DataDoe directory (ZERO tokens),
-# routes them into india / europe-au / us-ca, forms deterministic <=5-seller batches, and prints the per-region
-# OLI + Campaign + shared-Catalog export/token plan against the live balance. It NEVER creates an export, opens a
-# control, or writes a cycle. Use it to prove the plan + balance before the cron cutover (and any time thereafter).
-#
-# Required repository secrets (never printed): DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if configured),
-# SUPABASE_URL (or VITE_SUPABASE_URL), SUPABASE_SERVICE_ROLE_KEY, POSTGRES_URL.
+# TEMPORARY BRANCH-ONLY acceptance operator. This runs only the existing Listing
+# Health v3 ingestion composition: paid Listings + Listings Raw exports, with
+# inventory reuse-only. It does not run the regional scheduler or another source
+# family. The release script retains its authorization, balance-reserve, frozen-
+# budget, idempotency, and exact-confirmation gates.
 
 on:
   workflow_dispatch:
     inputs:
       region:
-        description: "all | india | europe-au | us-ca"
-        required: false
-        default: "all"
+        description: "One region only"
+        required: true
+        type: choice
+        options:
+          - india
+          - europe-au
+          - us-ca
+      cycle_date:
+        description: "Exact UTC cycle date (YYYY-MM-DD)"
+        required: true
+        type: string
+      confirm:
+        description: "Must equal listing-health-v3/<region>/<cycle_date>"
+        required: true
+        type: string
 
 concurrency:
-  group: regional-dry-run
+  group: manual-lhv3-paid-acceptance-${{ inputs.region }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  dry-run:
+  ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 120
     defaults:
       run:
         working-directory: sales-dashboard-live
@@ -37,24 +48,30 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
       DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+      PRIORITY_OPERATOR: laxmikant@superboring.in
+      LISTING_HEALTH_V3_INGESTION_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-
-      - name: Verify required secrets present (fail fast, never print values)
+      - name: Validate exact paid-operation confirmation
+        shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          REGION='${{ inputs.region }}'
+          CYCLE='${{ inputs.cycle_date }}'
+          CONFIRM='${{ inputs.confirm }}'
+          [[ "$CYCLE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "Invalid cycle_date" >&2; exit 1; }
+          EXPECTED="listing-health-v3/$REGION/$CYCLE"
+          [ "$CONFIRM" = "$EXPECTED" ] || { echo "Confirmation mismatch" >&2; exit 1; }
           missing=""
-          for v in DATADOE_API_KEY; do
+          for v in POSTGRES_URL SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY; do
             if [ -z "${!v:-}" ]; then missing="$missing $v"; fi
           done
-          if [ -n "$missing" ]; then echo "STOP missing required repository secret(s):$missing" >&2; exit 1; fi
-          echo "Required secrets present."
-
+          if [ -z "${SUPABASE_URL:-}" ] && [ -z "${VITE_SUPABASE_URL:-}" ]; then missing="$missing SUPABASE_URL|VITE_SUPABASE_URL"; fi
+          [ -z "$missing" ] || { echo "Missing required secret(s):$missing" >&2; exit 1; }
       - name: Install dependencies
         run: npm ci
-
-      - name: Regional dry-run (ZERO creates, ZERO writes)
-        run: node scripts/release/regional-scheduler-dry-run.mjs --region=${{ github.event.inputs.region }}
+      - name: Run paid Listings and Listings Raw ingestion only
+        run: node scripts/release/listing-health-v3-ingestion.mjs --region=${{ inputs.region }} --mode=live --cycle-date=${{ inputs.cycle_date }} --confirm=${{ inputs.confirm }}
