@@ -1,5 +1,38 @@
 # Project Memory
 
+## FBA Inventory Health — PHASE A: stop spurious single-seller overflow splits (window-shape-scoped evidence) (2026-09-16, commit e2061a9 on main, PUSHED; verify 217/217; read-only prod-validated all 3 regions)
+
+The screenshot's 4 India FBA Inventory Health exports/cycle (8 tokens) vs the canonical ceil(8/5)=2 (4 tokens) were NOT
+duplicate purchases of the same batch and NOT a stale cross-region membership (the request_hash dedup + LHv3 identity-reuse
+both work). ROOT CAUSE (proven with read-only prod evidence): the adaptive FBA-inventory overflow self-heal
+(fba-inventory-overflow.js) isolates a seller into a single-seller inventory export when it was a member of a recent
+(<=14 day) terminal TRUNCATED multi-member export. The recent India truncations (2026-09-05/06/07) were LEGACY MULTI-DAY-
+WINDOW requests (from=2026-08-26..to=2026-09-05, row_count=50000) that hit the cap by ACCUMULATING ~10 days of rows -- the
+current contract is SINGLE-DAY (from==to==inventoryAsOf, latestSnapshot). So three fully-onboarded SMALL India sellers
+(e5ce6ade/fd7653e8/d658442d, max 936/2772/9191 single-day rows, all << 50000) were isolated for 14 days off window-shape-
+incompatible evidence, turning the canonical [5,3]=2 batches into [5,1,1,1]=4 exports. account_scope_hash matching proved
+the exact 09-16 batching; onboarding shows all 3 datadoe_ready (NOT readiness-isolation); the truncated jobs' request_meta
+proved from<to (10-day windows), row_count=50000.
+
+FIX (pure, minimal, confined to the overflow EVIDENCE layer -- no scheduler/schedule/ceiling/cap/formula change):
+`isSingleDayOverflowEvidence(job)` -- a truncated job is trusted as single-day-overflow evidence ONLY when its own
+request_meta window is a single calendar day (from===to, both valid ISO). A PROVEN multi-day window (from<to) is excluded.
+FAIL-SAFE: no/malformed window metadata PRESERVES the old behaviour (trusts it), so genuine single-day overflow isolation
+is never weakened. Self-healing preserved (a genuine single-day >50000 batch truncates once, LKG kept, isolates next cycle).
+Unchanged: 50000 cap, date-independent scope-hash matching, single-seller HARD STOPS, readiness isolation, fail-soft reads.
+
+FRESHNESS (proven, NO code change needed): FBA inventory has MULTIPLE historical dates (a 10-day window returned 50000
+rows) -> a naive date-free request would MIX dates + truncate; contract B (dated single-day) is correct + already truthful
+(single-day from=to=D-1 + latestSnapshot; delivery-status shows actual source as-of, never labels older as current D-1;
+0-row D-1 -> D1_COVERAGE_MISSING + LKG retained). The task's "do not assume removing the date is safe" warning holds.
+
+VALIDATION: read-only prod reproduction with the real readers + fixed code -> 0 trusted single-day truncations in ALL 3
+regions -> 0 isolated sellers -> canonical batching (india 8->2, europe-au 32->7, us-ca 11->3); single-day [5,3] India
+batches ~1614/8626 rows (no truncation). Tests: report-fba-inventory-overflow 34/34 (+7 window-shape/repro) + fba-plan 64
++ planner 30 + readiness-isolation 37 + truncated 14 + fba-plan-operation 18; full verify 217/217; adversarial review
+(predicate/no-regression/truncation-safety/scope-purity) 0 findings. PENDING: natural india cycle (03:07 UTC) to confirm
+2 exports live. PHASE B (Listings/Raw + [[europe-au-scheduler-stall]]) NOT yet started -- gated on this.
+
 ## Report Delivery Status — global dd-secondary exclusion + superseded-ppc denominator + specific remarks (2026-09-16, commit 70a849d on main, PUSHED; verify 217/217; read-only, prod-smoked all 3 regions)
 
 Root cause of secondary-account visibility: the admin Report Delivery Status view (lib/server/delivery-status.js) was the ONE
