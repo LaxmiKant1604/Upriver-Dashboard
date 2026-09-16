@@ -2,6 +2,7 @@ import React, { useState, useMemo, useEffect, useCallback, useRef } from "react"
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, ComposedChart, Line, PieChart, Pie, Cell, Legend } from "recharts";
 import { TrendingUp, Info, RefreshCw, AlertTriangle, X, Search, Boxes, ArrowUpDown, ArrowUp, ArrowDown, Download, ReceiptText, Copy, Check, Wallet, BellRing, Pencil, RotateCcw, UsersRound, UserPlus, LogOut, ShieldCheck, CalendarRange, BarChart3, Inbox, DatabaseZap, Upload, SlidersHorizontal } from "lucide-react";
 import { supabase } from "./lib/supabase.js";
+import { requestPasswordReset, resolveRecoveryRedirect, validateNewPassword, classifyRecoveryUpdateError } from "./lib/password-recovery.js";
 // The whole workspace is styled from one token-based stylesheet. Every current
 // and future report must build on these tokens and shared patterns rather than
 // introducing its own colours, spacing or radii.
@@ -1183,6 +1184,7 @@ function LoginScreen({ passwordSetup = false }) {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [createAdmin, setCreateAdmin] = useState(false);
+  const [forgotMode, setForgotMode] = useState(false);
   const [bootstrapStatus, setBootstrapStatus] = useState(null);
 
   useEffect(() => {
@@ -1205,13 +1207,26 @@ function LoginScreen({ passwordSetup = false }) {
   const submit = async (event) => {
     event.preventDefault();
     if (!supabase) return;
+    if (busy) return; // prevent double submission (a second submit while a request is in flight)
     setBusy(true); setError(""); setMessage("");
     try {
+      if (forgotMode) {
+        // Anti-enumeration: requestPasswordReset ALWAYS returns the same neutral outcome for a known or unknown
+        // account (and never throws / never logs the email or any token). Only a client-side invalid email or an
+        // unconfigured client is surfaced distinctly -- neither reveals whether an account exists.
+        const outcome = await requestPasswordReset({
+          supabase, email,
+          redirectTo: resolveRecoveryRedirect(typeof window !== "undefined" ? window.location.origin : ""),
+        });
+        if (outcome.ok) setMessage(outcome.message); else setError(outcome.message);
+        return; // stay on the reset screen; the neutral message tells the user to check their email
+      }
       if (passwordSetup) {
-        if (password.length < 8) throw new Error("Use at least 8 characters for your password.");
-        if (password !== confirmPassword) throw new Error("Passwords do not match.");
+        const check = validateNewPassword(password, confirmPassword);
+        if (!check.valid) throw new Error(check.message);
         const { error: updateError } = await supabase.auth.updateUser({ password });
-        if (updateError) throw updateError;
+        // An expired/invalid recovery link (or any updateUser failure) is mapped to a SAFE, non-leaking message.
+        if (updateError) throw new Error(classifyRecoveryUpdateError(updateError).message);
         setMessage("Password saved. Opening your dashboard…");
       } else if (createAdmin) {
         if (email.trim().toLowerCase() !== INITIAL_ADMIN_EMAIL) throw new Error("Only the configured dashboard owner can create the initial administrator login.");
@@ -1238,15 +1253,18 @@ function LoginScreen({ passwordSetup = false }) {
       <style>{STYLE}</style>
       <form className="auth-panel" onSubmit={submit}>
         <div className="auth-logo">UR</div>
-        <div className="auth-title">{passwordSetup ? "Set your password" : createAdmin ? "Create administrator login" : "Upriver Dashboard"}</div>
-        <div className="auth-sub">{passwordSetup ? "Choose a password to activate your invited account." : createAdmin ? "Create the one initial administrator identity for this dashboard." : "Sign in to your Amazon reporting workspace."}</div>
+        <div className="auth-title">{passwordSetup ? "Set your password" : forgotMode ? "Reset your password" : createAdmin ? "Create administrator login" : "Upriver Dashboard"}</div>
+        <div className="auth-sub">{passwordSetup ? "Choose a password to activate your invited account." : forgotMode ? "Enter your account email and we’ll send a password recovery link." : createAdmin ? "Create the one initial administrator identity for this dashboard." : "Sign in to your Amazon reporting workspace."}</div>
         {!passwordSetup && <label className="auth-field"><span>Email</span><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required /></label>}
-        <label className="auth-field"><span>{passwordSetup ? "New password" : "Password"}</span><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete={passwordSetup ? "new-password" : "current-password"} required minLength="8" /></label>
+        {!passwordSetup && !forgotMode && <label className="auth-field"><span>Password</span><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" required minLength="8" /></label>}
+        {passwordSetup && <label className="auth-field"><span>New password</span><input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" required minLength="8" /></label>}
         {passwordSetup && <label className="auth-field"><span>Confirm password</span><input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} autoComplete="new-password" required minLength="8" /></label>}
         {error && <div className="auth-error"><AlertTriangle size={15} />{error}</div>}
         {message && <div className="auth-success">{message}</div>}
-        <button className="auth-submit" disabled={busy}>{busy ? "Please wait…" : passwordSetup ? "Save password" : createAdmin ? "Create administrator" : "Sign in"}</button>
-        {!passwordSetup && <><div className="auth-note">New users are added by an administrator and receive an email invitation.</div>{canCreateInitialAdmin && <button type="button" className="auth-link" onClick={() => { setCreateAdmin((value) => !value); setError(""); setMessage(""); }}>{createAdmin ? "Back to sign in" : "Create initial administrator login"}</button>}</>}
+        <button className="auth-submit" disabled={busy}>{busy ? "Please wait…" : passwordSetup ? "Save password" : forgotMode ? "Send recovery link" : createAdmin ? "Create administrator" : "Sign in"}</button>
+        {!passwordSetup && !forgotMode && !createAdmin && <button type="button" className="auth-link" onClick={() => { setForgotMode(true); setError(""); setMessage(""); }}>Forgot password?</button>}
+        {forgotMode && <button type="button" className="auth-link" onClick={() => { setForgotMode(false); setError(""); setMessage(""); }}>Back to sign in</button>}
+        {!passwordSetup && !forgotMode && <><div className="auth-note">New users are added by an administrator and receive an email invitation.</div>{canCreateInitialAdmin && <button type="button" className="auth-link" onClick={() => { setCreateAdmin((value) => !value); setError(""); setMessage(""); }}>{createAdmin ? "Back to sign in" : "Create initial administrator login"}</button>}</>}
       </form>
     </div>
   );

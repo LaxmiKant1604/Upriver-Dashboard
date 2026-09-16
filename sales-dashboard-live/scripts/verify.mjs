@@ -33,6 +33,7 @@ const SUITES = [
   "test:water-capability",
   "test:dashboard-transition",
   "test:session-stability",
+  "test:password-recovery",
   "test:boot-recovery",
   "test:boot-guard-behavior",
   "test:boundary-behavior",

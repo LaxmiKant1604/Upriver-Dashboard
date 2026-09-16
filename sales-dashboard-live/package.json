@@ -12,6 +12,7 @@
     "test:water-capability": "node scripts/water-capability.test.mjs",
     "test:dashboard-transition": "node scripts/dashboard-transition.test.mjs",
     "test:session-stability": "node scripts/session-stability.test.js",
+    "test:password-recovery": "node scripts/password-recovery.test.js",
     "test:boot-recovery": "node scripts/boot-recovery.test.js",
     "test:boot-guard-behavior": "node scripts/boot-guard-behavior.test.js",
     "test:boundary-behavior": "node scripts/boundary-behavior.test.js",
