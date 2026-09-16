@@ -14,6 +14,7 @@ import { advanceFbaPlanBucket } from "../lib/server/sync/fba-plan-operation.js";
 import { accountScopeHash } from "../lib/server/source-identity.js";
 import {
   defaultInventoryBatchesOf, overflowSellersFromTruncated, readRecentTruncatedInventoryOwnership, DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS,
+  isSingleDayOverflowEvidence,
 } from "../lib/server/sync/fba-inventory-overflow.js";
 
 let passed = 0;
@@ -141,6 +142,43 @@ await (async () => {
   ok("G: a read failure fails soft to empty (never blocks planning)", failSoft.length === 0);
   const ownerFail = await readRecentTruncatedInventoryOwnership({ cycleBucket: "india-fba", now: () => Date.parse("2026-09-05T00:00:00Z"), readRecentCycleIds, readSourceJobs: async () => jobs, readOwners: async () => { throw new Error("owner read boom"); } });
   ok("G: an OWNER read failure fails soft (that cycle yields no ownership, never throws)", ownerFail.length === 0);
+})();
+
+/* ===== G2. WINDOW-SHAPE COMPATIBILITY: a multi-day-window truncation is NOT single-day-overflow evidence ========= */
+await (async () => {
+  // Pure predicate.
+  ok("G2: single-day truncation (from==to) IS trusted", isSingleDayOverflowEvidence({ request_meta: { from: "2026-09-05", to: "2026-09-05" } }) === true);
+  ok("G2: multi-day-window truncation (from<to) is EXCLUDED", isSingleDayOverflowEvidence({ request_meta: { from: "2026-08-26", to: "2026-09-05" } }) === false);
+  ok("G2: missing window metadata preserves old behaviour (trusted)", isSingleDayOverflowEvidence({ request_hash: "H" }) === true);
+  ok("G2: malformed window dates preserve old behaviour (trusted)", isSingleDayOverflowEvidence({ request_meta: { from: "nope", to: "2026-09-05" } }) === true);
+
+  // Reader integration: the SAME truncated hash, once with a legacy 10-day window and once single-day.
+  const sh = (s) => accountScopeHash([s]);
+  const readRecentCycleIds = async () => ["cyc-1"];
+  const owners = [
+    { request_hash: "HW", request_key: "fba-plan:inventory-health", account_id: "a1", account_scope_hash: sh("s1"), connection_id: "primary", organization_fingerprint: "ORG", owner_status: "active" },
+    { request_hash: "HW", request_key: "fba-plan:inventory-health", account_id: "a2", account_scope_hash: sh("s2"), connection_id: "primary", organization_fingerprint: "ORG", owner_status: "active" },
+    { request_hash: "HD", request_key: "fba-plan:inventory-health", account_id: "a3", account_scope_hash: sh("s3"), connection_id: "primary", organization_fingerprint: "ORG", owner_status: "active" },
+    { request_hash: "HD", request_key: "fba-plan:inventory-health", account_id: "a4", account_scope_hash: sh("s4"), connection_id: "primary", organization_fingerprint: "ORG", owner_status: "active" },
+  ];
+  const base = { source_key: "fba-inventory-health", fetch_status: "failed", error_code: "TRUNCATED", terminal: true };
+  const jobs = [
+    { ...base, request_hash: "HW", request_meta: { from: "2026-08-26", to: "2026-09-05" } }, // 10-day WINDOW -> excluded
+    { ...base, request_hash: "HD", request_meta: { from: "2026-09-05", to: "2026-09-05" } }, // SINGLE-DAY -> trusted
+  ];
+  const own = await readRecentTruncatedInventoryOwnership({ cycleBucket: "india-fba", now: () => Date.parse("2026-09-06T00:00:00Z"), connectionId: "primary", organizationFingerprint: "ORG", readRecentCycleIds, readSourceJobs: async () => jobs, readOwners: async () => owners });
+  ok("G2: only the SINGLE-DAY truncated export (HD) is trusted evidence; the window one (HW) is excluded", own.length === 1 && own[0].requestHash === "HD");
+  ok("G2: the window-truncation members (s1,s2) are NOT isolated; only the single-day members (s3,s4) are", JSON.stringify([...own[0].scopeHashes].sort()) === JSON.stringify([sh("s3"), sh("s4")].sort()));
+
+  // India reproduction: the three real single-day sellers, isolated ONLY because a 10-day-window export truncated,
+  // are freed once window truncations are excluded -> the canonical [5,3] plan (no single-seller split).
+  const three = ["seller-e5ce", "seller-fd76", "seller-d658"];
+  const windowTruncOwners = three.map((s, i) => ({ request_hash: "HWIN", request_key: "fba-plan:inventory-health", account_id: `ia${i}`, account_scope_hash: sh(s), connection_id: "primary", organization_fingerprint: "ORG", owner_status: "active" }));
+  const windowTruncJobs = [{ ...base, request_hash: "HWIN", request_meta: { from: "2026-08-26", to: "2026-09-05" } }];
+  const repro = await readRecentTruncatedInventoryOwnership({ cycleBucket: "india-fba", now: () => Date.parse("2026-09-16T00:00:00Z"), connectionId: "primary", organizationFingerprint: "ORG", readRecentCycleIds, readSourceJobs: async () => windowTruncJobs, readOwners: async () => windowTruncOwners });
+  const reproBatches = defaultInventoryBatchesOf([{ sources: [{ requestKey: "fba-plan:inventory-health", requestHash: "cur", sellerOrVendorIds: three }] }]);
+  const reproOverflow = overflowSellersFromTruncated({ defaultInventoryBatches: reproBatches, truncatedOwnership: repro });
+  ok("G2: India repro -> a legacy 10-day-window truncation isolates ZERO single-day sellers (4->2 exports fixed)", repro.length === 0 && reproOverflow.overflowSellers.size === 0);
 })();
 
 /* ===================== H. threading: buildShadowReportPlan + advanceFbaPlanBucket forward overflowSellers ========= */

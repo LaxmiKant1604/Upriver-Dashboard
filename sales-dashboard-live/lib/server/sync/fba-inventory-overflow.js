@@ -24,6 +24,27 @@ const TRUNCATED = "TRUNCATED";
 const INVENTORY_SOURCE_KEY = "fba-inventory-health";
 const INVENTORY_REQUEST_KEY = "fba-plan:inventory-health"; // the owner memberships to trust (source compatibility)
 export const DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS = 14; // recency window (expiry/reset): older evidence is ignored
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * WINDOW-SHAPE COMPATIBILITY (2026-09-16 fix). The canonical FBA Inventory Health contract is a SINGLE-DAY snapshot
+ * request (`from === to === inventoryAsOf`, windowKind "single-day:inventoryAsOf (D-1)"). A truncation under a MULTI-DAY
+ * WINDOW request (`from < to`) accumulated many days of inventory rows -- it proves the WINDOW was too large, NOT that
+ * the seller overflows a SINGLE-DAY snapshot. Trusting such a window truncation as single-day-overflow evidence
+ * spuriously isolates small single-day sellers into wasteful single-seller exports (the reproduced India defect: three
+ * ~1-9k-row/day sellers isolated for 14 days off a legacy 10-day-window truncation, turning the canonical [5,3]=2
+ * batches into [5,1,1,1]=4). So a truncated job is valid single-day-overflow evidence ONLY when its own request window
+ * is a single calendar day. Fail SAFE: when the job carries no readable window metadata we PRESERVE the pre-existing
+ * protective behaviour (trust it) -- only a PROVEN multi-day window is excluded, so genuine single-day overflow
+ * isolation is never weakened.
+ */
+export function isSingleDayOverflowEvidence(job) {
+  const m = job && (job.request_meta ?? job.requestMeta);
+  if (!m || m.from == null || m.to == null) return true;      // no window metadata -> preserve old behaviour (trust)
+  const from = S(m.from), to = S(m.to);
+  if (!ISO_DATE.test(from) || !ISO_DATE.test(to)) return true; // malformed dates -> preserve old behaviour (trust)
+  return from === to;                                          // single-day => trusted; multi-day window => excluded
+}
 
 /**
  * The inventory batches (requestHash -> its exact seller ids) of a DEFAULT (no-override) FBA plan, from the current
@@ -110,7 +131,9 @@ export async function readRecentTruncatedInventoryOwnership({
       const failed = (j.fetch_status ?? j.fetchStatus) === "failed";
       const truncated = (j.error_code ?? j.errorCode) === TRUNCATED;
       const terminal = (j.terminal ?? false) === true;
-      if (failed && truncated && terminal) truncatedHashes.add(S(j.request_hash ?? j.requestHash));
+      // Only a SINGLE-DAY truncation proves single-day overflow; a multi-day-window truncation is excluded (see
+      // isSingleDayOverflowEvidence). This keeps the overflow self-heal robust across a request-window-shape change.
+      if (failed && truncated && terminal && isSingleDayOverflowEvidence(j)) truncatedHashes.add(S(j.request_hash ?? j.requestHash));
     }
     if (truncatedHashes.size === 0) continue;
     let owners = [];
