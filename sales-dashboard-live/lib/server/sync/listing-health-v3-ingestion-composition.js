@@ -40,11 +40,12 @@ const V3_INVENTORY_SOURCE_KEY = "fba-inventory-health";
 
 // The dedicated per-region cycle namespace -- NEVER collides with the scheduler-v2 daily (region, cycle_date) cycle.
 // `suffix` is an operator-only build seam used by isolated acceptance runs. Production omits it and therefore keeps
-// the byte-identical canonical bucket. A strict suffix prevents arbitrary bucket injection.
+// the byte-identical canonical bucket. Acceptance uses the already schema-approved priority-partial namespace; an
+// exact 16-hex suffix prevents arbitrary bucket injection and avoids changing the database constraint.
 export function listingHealthV3CycleBucket(region, suffix = "") {
   const extra = String(suffix || "").trim();
-  if (extra && !/^[a-z0-9][a-z0-9-]{0,47}$/.test(extra)) throw new Error("Invalid listing-health-v3 cycle bucket suffix");
-  return `listing-health-v3-${String(region)}${extra ? `-${extra}` : ""}`;
+  if (extra && !/^[0-9a-f]{16}$/.test(extra)) throw new Error("Invalid listing-health-v3 acceptance bucket suffix");
+  return extra ? `priority-partial-${String(region)}-${extra}` : `listing-health-v3-${String(region)}`;
 }
 
 /**

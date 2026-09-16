@@ -91,7 +91,7 @@ await (async () => {
 })();
 
 await (async () => {
-  const suffix = "acceptance-35087744631";
+  const suffix = "000000082b488777";
   const plan = await makeFakeRelease().release.buildPlan({ accounts: IN8, connections, cycleDate, region: "india" });
   const jobsAfter = [...new Set(plan.reportRequests.flatMap((r) => r.sources).map((s) => s.requestHash))]
     .map((request_hash) => ({ request_hash, source_key: "listings", create_export_count: 0 }));

@@ -38,7 +38,7 @@ const cycleDate = argOf("cycle-date") || serverD1();
 
 if (!["india", "europe-au", "us-ca"].includes(region)) { console.error("STOP --region must be india | europe-au | us-ca"); process.exit(2); }
 if (mode !== "dry-run" && mode !== "live") { console.error("STOP --mode must be dry-run | live"); process.exit(2); }
-if (cycleBucketSuffix && !/^[a-z0-9][a-z0-9-]{0,47}$/.test(cycleBucketSuffix)) { console.error("STOP --cycle-bucket-suffix is invalid"); process.exit(2); }
+if (cycleBucketSuffix && !/^[0-9a-f]{16}$/.test(cycleBucketSuffix)) { console.error("STOP --cycle-bucket-suffix must be exactly 16 lowercase hex characters"); process.exit(2); }
 const log = (m) => console.log(`lhv3-ingest[${mode}/${region}]: ${m}`);
 
 const { buildListingHealthV3IngestionRelease } = await import("../../lib/server/sync/listing-health-v3-ingestion-composition.js");

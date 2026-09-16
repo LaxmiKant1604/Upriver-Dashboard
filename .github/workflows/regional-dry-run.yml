@@ -76,4 +76,7 @@ jobs:
       - name: Verify isolated acceptance-cycle wiring
         run: npm run test:listing-health-v3-ingestion
       - name: Run paid Listings and Listings Raw ingestion only
-        run: node scripts/release/listing-health-v3-ingestion.mjs --region=${{ inputs.region }} --mode=live --cycle-date=${{ inputs.cycle_date }} --confirm=${{ inputs.confirm }} --cycle-bucket-suffix=acceptance-${{ github.run_id }}
+        shell: bash
+        run: |
+          ACCEPTANCE_SUFFIX="$(printf '%016x' "$GITHUB_RUN_ID")"
+          node scripts/release/listing-health-v3-ingestion.mjs --region=${{ inputs.region }} --mode=live --cycle-date=${{ inputs.cycle_date }} --confirm=${{ inputs.confirm }} --cycle-bucket-suffix="$ACCEPTANCE_SUFFIX"
