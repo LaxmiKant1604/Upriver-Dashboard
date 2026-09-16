@@ -1,5 +1,36 @@
 # Project Memory
 
+## Listing Health V3 ACTIVATED (serve gates ON) + secure Forgot Password flow (2026-09-16; commits e60dbc4 forgot-password + docs; verify 219/195 green incl. build:check; adversarial review clean)
+
+PHASE 1 — LHv3 GO-LIVE (production). Preconditions re-confirmed: durable Listings=11, Listings-Raw=11, live
+report_snapshots(listing-health-v3)=11 (US 10 + CA 1, to=2026-09-14, params_hash 63d87889d0), LISTINGS_RECONCILE_LIVE
+=true, India/EU fail-closed (0 durable -> deferred). ACTIVATION: the three Vercel PRODUCTION env vars were flipped from
+empty("") to "true" -- LHV3_PUBLISH_LIVE, LISTING_HEALTH_V3, VITE_LISTING_HEALTH_V3 (via `vercel env add <V> production
+--value true --force --no-sensitive`; the CLI auto-detects an agent and defaults to --non-interactive, so stdin piping
+set EMPTY -- MUST use --value). Production REDEPLOYED fresh (build-time VITE gate) via `vercel --prod --yes` FROM THE
+REPO ROOT (the nested sales-dashboard-live/.vercel has rootDirectory=sales-dashboard-live -> running there double-nests
+the path and fails; the repo-root .vercel is the correct link). New deployment aliased to https://upriverdashboard.vercel.app,
+HTTP 200. Serve double-gate is process.env.LHV3_PUBLISH_LIVE==="true" && LISTING_HEALTH_V3==="true" (api/datadoe.js:4095)
++ VITE build-time tab gate; these gate ONLY the live-promoted serve, NOT the read-only preview route (that is authorized
+independently by the account+brand chain) -- feature-flags.js comment corrected accordingly (the one LOW confirmed review
+finding). Adversarial review (3 dims, each finding verified): no accidental publication / fabrication / staleness / cross-
+account leakage; India/EU with no live snapshot serve honest Unavailable. Full authenticated browser render (11 us-ca
+snapshots visible, isolation) needs a human check; env=true + fresh build + 200 confirm the gate at the infra level.
+
+PHASE 5 — FORGOT PASSWORD (commit e60dbc4). New PURE src/lib/password-recovery.js wired into App.jsx LoginScreen (mirrors
+session-lifecycle.js). requestPasswordReset ALWAYS returns the SAME neutral outcome for known/unknown accounts and whether
+Supabase resolves/errors/throws (no enumeration); resolveRecoveryRedirect returns only an absolute http(s) origin (no open
+redirect); never logs email/token/password (module has no console.*); double-submit guarded. Completion reuses the existing
+PASSWORD_RECOVERY -> updateUser({password}) path, now guarded by validateNewPassword + classifyRecoveryUpdateError (safe
+expired-link message). Existing sign-in/sign-up/invite byte-unchanged; new hook before early returns (React #310). +20 tests
+(scripts/password-recovery.test.js: behavioural + static wiring). Redirect origin (upriverdashboard.vercel.app) is already
+Supabase-allowlisted (the working sign-up emailRedirectTo uses the same origin). api/*.js still 12.
+
+PENDING (natural cycles, cannot force -- no paid exports): PHASE 2 India Listings/Raw persistence+publication (next India
+cycle ~09-17 03:07 UTC, first to run the d0f8c25 fix), PHASE 3 EU Listings/Raw (next EU cycle ~09-17 08:37 UTC; today's
+08:30 EU run started 09:00 on OLD code), PHASE 4 India FBA exact-export acceptance (ceil(8/5)=2 exports / 4 tokens, same
+India cycle). Monitoring set for those. See [[listing-health-v3-reconciler-live]], [[listings-durable-persistence]].
+
 ## Listing Health V3 — Listings/Raw durable persistence decoupled from the alias-write guard + us-ca taken live (2026-09-16, commit d0f8c25 on main, PUSHED; verify 218/194 green incl. build:check; adversarial review 2 lenses clean)
 
 ROOT CAUSE (read-only prod-proven). India (8/8) + Europe-AU (32/32) had per-account Listings/Raw ALIASES with real rows in

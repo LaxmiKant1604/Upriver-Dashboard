@@ -14,12 +14,17 @@ export const CAMPAIGN_ADS_TAB = true;
 // never affect the compiled browser bundle, so WITHOUT this build-time flag the tab is hidden and the view is
 // unreachable no matter what the server is configured to serve. The three gates that gate the v3 activation:
 //   VITE_LISTING_HEALTH_V3 (this; BUILD-TIME, compiled into the bundle) -> frontend navigation / view activation.
-//   LISTING_HEALTH_V3      (SERVER env)                                 -> the server route / live-serve AUTHORIZATION
-//                                                                          gate (api action "listing-health-v3":
-//                                                                          401/403, account + marketplace pinned).
-//   LHV3_PUBLISH_LIVE      (SERVER env)                                 -> the server PROMOTED-snapshot serve gate
-//                                                                          (serves the reconciler's promoted live row
-//                                                                          only when this AND the authz gate are on).
+//   LISTING_HEALTH_V3 + LHV3_PUBLISH_LIVE (SERVER env; BOTH required)   -> the LIVE-PROMOTED serve double gate: the
+//                                                                          server serves the reconciler's promoted live
+//                                                                          listing-health-v3 row ONLY when BOTH are the
+//                                                                          exact string "true" (api/datadoe.js). Note:
+//                                                                          these flags do NOT gate the read-only PREVIEW
+//                                                                          serve nor produce its 401/403 -- that request
+//                                                                          is authorized independently by the account +
+//                                                                          brand-scope chain (ACCOUNT_SCOPED_ACTIONS ->
+//                                                                          assertAccountAccess); with the flags OFF an
+//                                                                          authorized caller still gets the honest
+//                                                                          preview, but the VITE gate above hides the tab.
 // All three default OFF; flip each ON only as part of the authorized go-live. The v1 Listing Health page stays the
 // production default. When ON, the preview reads only durable OLI/Catalog + latest saved source evidence (zero DataDoe
 // exports, zero production writes); a date change only re-aggregates stored OLI.
