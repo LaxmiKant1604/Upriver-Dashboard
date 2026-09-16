@@ -39,7 +39,13 @@ const V3_NEW_SOURCE_KEYS = Object.freeze(["listings", "listings-raw"]);
 const V3_INVENTORY_SOURCE_KEY = "fba-inventory-health";
 
 // The dedicated per-region cycle namespace -- NEVER collides with the scheduler-v2 daily (region, cycle_date) cycle.
-export function listingHealthV3CycleBucket(region) { return `listing-health-v3-${String(region)}`; }
+// `suffix` is an operator-only build seam used by isolated acceptance runs. Production omits it and therefore keeps
+// the byte-identical canonical bucket. A strict suffix prevents arbitrary bucket injection.
+export function listingHealthV3CycleBucket(region, suffix = "") {
+  const extra = String(suffix || "").trim();
+  if (extra && !/^[a-z0-9][a-z0-9-]{0,47}$/.test(extra)) throw new Error("Invalid listing-health-v3 cycle bucket suffix");
+  return `listing-health-v3-${String(region)}${extra ? `-${extra}` : ""}`;
+}
 
 /**
  * Build the trusted v3 ingestion collaborators the operator core consumes. `overrides` is a BUILD-TIME test seam
@@ -72,7 +78,10 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     saveDurablePayload = saveSourceSnapshotPayload,
     recordListingsSnapshot = recordSourceListingsSnapshot,
     recordListingsRawSnapshot = recordSourceListingsRawSnapshot,
+    cycleBucketSuffix = "",
   } = overrides;
+
+  const cycleBucketFor = (region) => listingHealthV3CycleBucket(region, cycleBucketSuffix);
 
   const runtime = makeRuntime({}); // store + dataDoe + saveSnapshot + loadDerivedContext (shadow namespace)
   const connections = getConnections();
@@ -177,7 +186,7 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
   // The DURABLE frozen budget already on this region's v3 cycle for the tranche (null = no cycle/budget yet = a NEW
   // frozen cycle). Read-only; a read failure propagates so the operation defers typed (frozen-budget-unreadable).
   const readFrozenBudget = async ({ region, cycleDate, trancheKey }) => {
-    const cyc = await runtime.store.getCycleByBucketDate(listingHealthV3CycleBucket(region), cycleDate);
+    const cyc = await runtime.store.getCycleByBucketDate(cycleBucketFor(region), cycleDate);
     if (!cyc || !cyc.id) return null;
     if (typeof runtime.store.getBudget !== "function" || typeof runtime.store.getBudgetHashes !== "function") throw new Error("frozen-budget readers unavailable on the store");
     const row = await runtime.store.getBudget({ cycleId: cyc.id, trancheKey });
@@ -187,7 +196,7 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
   };
 
   const runSources = async ({ plan, region, cycleDate, authorizationBinding = null }) => {
-    const cycleBucket = listingHealthV3CycleBucket(region);
+    const cycleBucket = cycleBucketFor(region);
     const NEW = newTranche(region);
     const INV = makeSourceTranche({ sourceKeys: [V3_INVENTORY_SOURCE_KEY], name: `lhv3-inv#${region}` });
     // Freeze the create budget for the NEW tranche ONLY (listings + listings-raw). Inventory is never in it.
@@ -276,7 +285,7 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
   };
 
   const runReports = async ({ plan, region, cycleDate }) => {
-    const cycleBucket = listingHealthV3CycleBucket(region);
+    const cycleBucket = cycleBucketFor(region);
     const cyc = await runtime.store.getCycleByBucketDate(cycleBucket, cycleDate);
     const cycleId = cyc && cyc.id;
     if (!cycleId) return { succeeded: 0, note: "no-cycle" };
@@ -297,7 +306,7 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
   // are honest non-successes. An already-terminal succeeded cycle (a watchdog replay) returns disposition
   // 'already-terminal' + status 'succeeded' -- a zero-create idempotent success.
   const finalizeCycle = async ({ region, cycleDate }) => {
-    const cycleBucket = listingHealthV3CycleBucket(region);
+    const cycleBucket = cycleBucketFor(region);
     const cyc = await runtime.store.getCycleByBucketDate(cycleBucket, cycleDate);
     const cycleId = cyc && cyc.id;
     if (!cycleId) return { disposition: "not-found", status: null, cycleId: null };

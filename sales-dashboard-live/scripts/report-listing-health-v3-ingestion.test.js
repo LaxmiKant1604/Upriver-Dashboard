@@ -25,7 +25,7 @@ const IN8 = Array.from({ length: 8 }, (_, i) => ({ accountId: `in-${String(i).pa
 
 // A fake runtime whose store records the budget + returns fabricated post-run job rows so runSources can count
 // "actual creates" without any real I/O. runSourceCycle / runReportsFn / materializeFn are spies.
-function makeFakeRelease({ ceiling = 4, jobsAfter = null, recentCycleIds = [], truncatedJobs = [], owners = [] } = {}) {
+function makeFakeRelease({ ceiling = 4, jobsAfter = null, recentCycleIds = [], truncatedJobs = [], owners = [], cycleBucketSuffix = "" } = {}) {
   const calls = { openCycle: 0, persistBudget: [], sourceCycle: [], reports: 0, materialize: 0, saveSnapshot: 0 };
   const store = {
     openCycle: async ({ bucket }) => { calls.openCycle += 1; calls.lastCycleBucket = bucket; return "cyc-1"; },
@@ -54,6 +54,7 @@ function makeFakeRelease({ ceiling = 4, jobsAfter = null, recentCycleIds = [], t
     getRecentCycleIds: async () => recentCycleIds,
     getSourceJobsWithMeta: async () => truncatedJobs,
     getSourceJobOwners: async () => owners,
+    cycleBucketSuffix,
   });
   return { release, calls };
 }
@@ -87,6 +88,18 @@ await (async () => {
   ok("A: both passes scope the account bucket to the real region (india), not the namespaced cycle key", calls.sourceCycle.every((c) => c.bucket === "india" && c.cycleBucket === "listing-health-v3-india"));
   ok("A: actual creates counted honestly = 4; inventory never created", res.creates === 4 && res.inventoryCreated === false && res.maxCreates === 4);
   ok("A: observed token estimate = 4 creates x 2 (an estimate, not a guaranteed max)", res.tokens === 8);
+})();
+
+await (async () => {
+  const suffix = "acceptance-35087744631";
+  const plan = await makeFakeRelease().release.buildPlan({ accounts: IN8, connections, cycleDate, region: "india" });
+  const jobsAfter = [...new Set(plan.reportRequests.flatMap((r) => r.sources).map((s) => s.requestHash))]
+    .map((request_hash) => ({ request_hash, source_key: "listings", create_export_count: 0 }));
+  const { release, calls } = makeFakeRelease({ jobsAfter, cycleBucketSuffix: suffix });
+  await release.runSources({ plan, region: "india", cycleDate, authorizationBinding: bindFor(release, plan, "india") });
+  ok("A: an acceptance suffix isolates the cycle while the production default stays byte-identical",
+    calls.lastCycleBucket === listingHealthV3CycleBucket("india", suffix)
+      && listingHealthV3CycleBucket("india") === "listing-health-v3-india");
 })();
 
 /* ===================== B. P1: obsolete fixed 4/8/4 removed; authorization = frozen budget + structural drift guard ===================== */

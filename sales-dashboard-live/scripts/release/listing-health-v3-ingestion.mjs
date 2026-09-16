@@ -29,6 +29,7 @@ const confirm = argOf("confirm");
 const AUTHORIZED_OPERATOR = "laxmikant@superboring.in";
 const operator = process.env.PRIORITY_OPERATOR || argOf("operator") || AUTHORIZED_OPERATOR;
 const emergencyReserveTokens = Number(argOf("reserve") || 200); // meaningful emergency reserve (>> the ~8-token canary)
+const cycleBucketSuffix = argOf("cycle-bucket-suffix") || "";
 
 // Default cycle date = the previous UTC date (D-1): the canonical shared inventory snapshot day
 // (fbaInventoryAsOf parity), so an omitted --cycle-date still matches the FBA inventory cache identity.
@@ -37,6 +38,7 @@ const cycleDate = argOf("cycle-date") || serverD1();
 
 if (!["india", "europe-au", "us-ca"].includes(region)) { console.error("STOP --region must be india | europe-au | us-ca"); process.exit(2); }
 if (mode !== "dry-run" && mode !== "live") { console.error("STOP --mode must be dry-run | live"); process.exit(2); }
+if (cycleBucketSuffix && !/^[a-z0-9][a-z0-9-]{0,47}$/.test(cycleBucketSuffix)) { console.error("STOP --cycle-bucket-suffix is invalid"); process.exit(2); }
 const log = (m) => console.log(`lhv3-ingest[${mode}/${region}]: ${m}`);
 
 const { buildListingHealthV3IngestionRelease } = await import("../../lib/server/sync/listing-health-v3-ingestion-composition.js");
@@ -55,7 +57,7 @@ if (mode === "live") {
 
 log(`operation ${operationId}; operator ${authorized ? "AUTHORIZED" : "unauthorized"}; env-gate ${gateEnabled ? "ENABLED" : "disabled"}`);
 
-const release = buildListingHealthV3IngestionRelease({ operator });
+const release = buildListingHealthV3IngestionRelease({ operator, cycleBucketSuffix });
 
 const evidence = await runListingHealthV3Ingestion({
   region, cycleDate, mode,
