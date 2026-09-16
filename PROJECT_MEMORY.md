@@ -1,5 +1,51 @@
 # Project Memory
 
+## Listing Health V3 — Listings/Raw durable persistence decoupled from the alias-write guard + us-ca taken live (2026-09-16, commit d0f8c25 on main, PUSHED; verify 218/194 green incl. build:check; adversarial review 2 lenses clean)
+
+ROOT CAUSE (read-only prod-proven). India (8/8) + Europe-AU (32/32) had per-account Listings/Raw ALIASES with real rows in
+source_export_cache but ZERO durable source_listings_snapshot / source_listings_raw_snapshot; only us-ca (11/11) had durable
+snapshots. The durable write (materializeListingHealthV3PerAccount "step 5") sat AFTER the alias-write FRESHNESS GUARD's
+`continue`, so it fired ONLY when a strictly-newer batch was (re)materialized into the alias. Listings/Raw are date-free +
+content-addressed, so their batches are re-adopted from the 26h cache every cycle -> the guard trips (skippedStale) -> the
+durable step never runs. The ONLY variable separating durable-present from durable-absent was batchFetched time: us-ca
+(re)fetched at 2026-09-15T17:25 AFTER the WORK-B durable wiring (commit 3376b14) went live midday 09-15, so its alias-write
+path ran step 5 once; India/EU aliases were written 08:59-09:41 (before the wiring) and their date-free batches have not been
+re-fetched since -> never re-entered step 5. (India's transient run-35052061781 `written=1/empty=7` was a partial-batch
+artifact, NOT a zero-row partition: all 8 India aliases carry 105-3489 rows. The only GENUINE-zero accounts are 3 in EU:
+1788ae27 IT / 572a7b1b IE / 9c9203af SE.)
+
+FIX (minimal, additive, ZERO export; listing-health-v3-materialize.js only). Extract the durable persistence into
+`persistDurable(src, rows, incomingFetchedAt)` and call it on BOTH the alias-write path AND the freshness-skip (skippedStale)
+path, so a MISSING/stale durable pointer is BACKFILLED from the already-saved, validated, per-account-isolated fragment
+regardless of whether the alias itself needed rewriting. Idempotent + regression-safe via the record RPC's own as_of-dominant
++ strictly-newer CAS (already-current -> "unchanged" zero writes; late/older batch -> "stale-save"). Added a MEMBERSHIP PROOF
+("missing membership != empty"): a durable proven-empty (row_count=0) is written ONLY when owner.rawSellerId is a canonical
+member of src.sellerOrVendorIds; a non-member's isolate-to-empty is NEVER fabricated as a genuine zero. persistDurable is
+unreachable after the batchMissing/rejected `continue`s (fail-closed). Persistence stays in the v3 materialize step (reads
+ONLY listings/raw/inventory) -> decoupled from OLI/Catalog/regional-cycle finalization, while LHv3 PUBLICATION still fails
+closed until the complete dependency bundle is ready (reconciler + dependency-bundle untouched). Backward compatible: with no
+durable writers injected, alias behavior is byte-identical.
+
+TESTS: +3 production-shape cases (listings-durable-model.test.js) -- (9) India/EU backfill (skippedStale=6, aliasesWritten=0,
+durableWritten=4; replay durableUnchanged=4, ZERO writes), (10) missing-membership != empty (non-member 0 pointers;
+genuine member persists row_count=0), (11) Listings/Raw persist with no inventory/OLI/Catalog present (source-decoupled).
+17/17 durable-model + full verify 218/194 incl. build:check. Adversarial review (durable-persist correctness + decoupling/
+no-regression) clean: no blocker/high/medium; reconciler/bundle/siblings untouched.
+
+ACTIVATION STATE (staged, per the authorized go-live). LISTINGS_RECONCILE_LIVE=true (repo var, since 09-15). The scheduled
+reconciler ALREADY promoted us-ca ZERO-export on 2026-09-15T23:56: examined=11 stale=11 PUBLISHED=11 failed=0 deferred=0
+controlClean=true, dataDoeCreates=0. Canonical readback PROVEN: 11 us-ca listing-health-v3 LIVE rows in report_snapshots,
+all to=2026-09-14 (D-1), one shared params_hash 63d87889d0 (30D canonical identity). India(8)/EU(32) correctly DEFERRED (no
+durable Listings) -> they will persist durable on their next natural cycle (the fix runs step 5 on adopt/skippedStale) then
+promote when the bundle is complete -- ZERO new export (their cached artifacts are expired; PHASE 4 "leave pending for next
+natural cycle"). REMAINING (BLOCKED, needs the owner): the SERVE double-gate is still OFF -- Vercel PROD env LHV3_PUBLISH_LIVE
+/ LISTING_HEALTH_V3 / VITE_LISTING_HEALTH_V3 are all empty("") = OFF; flipping them to "true" + a prod redeploy is the one
+user-facing launch switch, and the Claude Code permission classifier BLOCKS `vercel env` writes from the agent. publish_enabled
+(source_promoted_publish_settings) is TRANSIENT/self-managed by the reconciler control package (opens on promote, closes on
+safe-close) -- NOT a persistent switch to set by hand. Delivery-status view already honest: while the double gate is OFF
+listing-health-v3 is excluded from the Publish universe (dependents Not-applicable, never a fabricated failure); when ON it is
+re-included and us-ca's live rows surface as Publish Yes. See [[listings-durable-persistence]], [[listing-health-v3-reconciler-live]].
+
 ## europe-au scheduler STALL — PHASE B: adaptive OLI-backfill row-cap self-heal (2026-09-16, on main; verify 217→194-suite green; read-only prod-validated; NOT yet pushed at time of writing this line — see commit note)
 
 ROOT CAUSE (read-only proven): europe-au cycles START, publish healthy accounts via the partial path, then NEVER finalize
