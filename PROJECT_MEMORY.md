@@ -1,5 +1,48 @@
 # Project Memory
 
+## OLI reconciler cold-pass deadline/lease strand FIXED — learn-once shared-Catalog fast-defer (2026-09-16, commit 7b180f4 on main, PUSHED; verify 220/196 green incl. build:check; live run 35138216996 = SUCCESS, all 3 regions clean)
+
+ROOT CAUSE (read-only prod-proven end to end). The zero-export OLI publication reconciler's Catalog carrier is ORG-SCOPED
++ DATE-INDEPENDENT (one canonical request hash, e.g. 69c1badc, for every account in a pass; ONE product-catalog
+source_snapshots row, scope=__organization). On a cold durable-export-cache pass (the 24h source_export_cache has no fresh
+Catalog for the reconciler to ADOPT), EVERY account's derive defers identically with SOURCE_READINESS_PENDING — by design:
+makeDurableCatalogGuard (source-priority-dashboards.js:149, the aca978e fix) refuses `create` BEFORE it reserves when the
+adapter is `noExport`, so a cache MISS can never be satisfied (LKG preserved; it publishes only once a natural scheduler
+cycle re-warms the cache and it can adopt instead of create — proven: as-of-09-15 accounts PUBLISHED at 11:13 UTC when the
+cache was warm from the 09:13-09:28 batch, and DEFER at 18:31 when cold). The DEFECT: the operator ran a FULL per-account
+preflight+derive for all N accounts (~15-41s each; measured india=94.8s for 8, dominated by gatherEvidence/ads-metrics/
+discovery + network jitter, NOT the OLI history read) only to hit the SAME shared refusal, crossing the 330s cooperative
+deadline. India's termination then came back UNCONFIRMED (awaitSettled grace exceeded) -> the GLOBAL control lease stayed
+held -> europe-au/us-ca deferred on CONTROL_LEASE_HELD. This is the observed recurring failure (runs 35033008718 /
+35121943419 / 35125396656 / 35129552768). It loses NO data (correct deferrals) but strands the whole reconcile pass.
+
+FIX (commit 7b180f4). Learn-once latch in the operator's per-account loop (scripts/release/oli-publication-reconcile.mjs):
+once ANY account proves the shared carrier cold (result.reason === SOURCE_READINESS_PENDING), the remaining accounts
+FAST-DEFER with the BYTE-IDENTICAL typed deferral (new pure module lib/server/sync/oli-catalog-cold-latch.js:
+isSharedCatalogColdDefer + buildCatalogColdFastDefer) instead of each paying a full preflight+derive. Zero data risk — the
+carrier is shared, so cold-for-one is cold-for-all; they would defer regardless. A WARM pass publishes its first account
+(reason != SOURCE_READINESS_PENDING) so the latch never engages -> byte-identical to today. Signal is precise: OLI/Ads/FBA
+are paused in priorityMode, and account-specific lags carry distinct codes (DATADOE_D1_NOT_READY), so SOURCE_READINESS_PENDING
+uniquely means the org Catalog carrier. +26-assertion unit test (byte-identical shape + cold/warm/mixed convergence).
+
+REFUTED FIRST ATTEMPT (do NOT re-try): operator-side BATCH of the per-account OLI-history read (inject loadHistoryRows via
+the buildRuntime seam, serve byte-identical slices from one region read). MEASURED -8% (india 94.8s -> 102.3s): the OLI read
+is only ~12s of a heavy account and the per-account cost is broadly distributed + jitter-dominated. Reverted; not the bottleneck.
+
+PROD VERIFICATION (live workflow 35138216996, all 3 regions sequential, SUCCESS): india examined=8 stale=8 published=0
+failed=0 controlClean=true (1 real defer + 7 fast-defers, ~59s local repro); europe-au examined=32 stale=30 published=0
+failed=0 controlClean=true (30 stale accounts that WITHOUT the latch would blow the 7-min cap catastrophically -> done in
+~3min); us-ca examined=11 stale=11 published=0 failed=0 controlClean=true. CONTROL_LEASE_HELD occurrences=0 (the strand is
+gone; every region acquired+released the global lease), dataDoeCreates=0 dataDoeTokens=0 everywhere, cleanup pass
+already-closed. The poisoned scheduled/2026-09-15 catalog reservation (reserved/no-export-id, 03:48) is INERT under aca978e
+(the guard refuses before touching the reservation table) — confirmed by the clean defer, not a hard AMBIGUOUS.
+
+RESIDUAL (documented, NOT fixed — separate, rarer, self-healing): a WARM pass with MANY heavy PUBLISHING stale accounts
+(derive not skipped, ~40-90s each) could still cross the deadline and re-strand via unconfirmed settlement. Low frequency
+(the scheduler keeps accounts current, so warm passes usually have FEW stale; the current 8/30/11 backlog drains at the next
+scheduler cycle), self-healing (partial publish + converge), and a fix would touch the constrained deadline-settlement core.
+See [[oli-publication-reconciler]], [[saved-data-reconciler-shared-core]].
+
 ## Listing Health V3 ACTIVATED (serve gates ON) + secure Forgot Password flow (2026-09-16; commits e60dbc4 forgot-password + docs; verify 219/195 green incl. build:check; adversarial review clean)
 
 PHASE 1 — LHv3 GO-LIVE (production). Preconditions re-confirmed: durable Listings=11, Listings-Raw=11, live
