@@ -232,6 +232,57 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
     catch (_e) { summary.skippedAccounts += 1; continue; }
     summary.accounts += 1;
 
+    // DURABLE PERSISTENCE (WORK B; ZERO export, ZERO tokens), extracted so it runs on BOTH the fresh alias-write path
+    // AND the freshness-SKIP (already-current alias) path. The durable Listings / Listings-Raw pointer must be
+    // (re)persisted from the already-saved batch whenever it is MISSING or stale -- DECOUPLED from whether the alias
+    // itself needed rewriting. Coupling durable persistence to the alias-write freshness guard is exactly what left
+    // India + Europe/AU with per-account aliases (rows) but NO durable snapshot: their date-free, content-addressed
+    // batches are re-adopted from cache each cycle, so every pass hits the guard (skippedStale) and the durable step,
+    // sitting AFTER that `continue`, never ran. The RPC's own as_of-dominant + strictly-newer CAS keeps this
+    // idempotent: an already-current pointer returns "unchanged" (zero writes) and a late/older batch "stale-save".
+    const persistDurable = async (src, rows, incomingFetchedAt) => {
+      const durableSourceKey = durableEnabled ? V3_DURABLE_SOURCE_KEY[src.requestKey] : null;
+      if (!durableSourceKey) return; // durable not injected (existing callers/tests) or a reuse-only key -> no-op
+      const recordDurable = recordDurableByKey[src.requestKey];
+      const durableConn = S(owner.connectionId) === "secondary" ? "dd-secondary" : "primary"; // table CHECK: primary|dd-secondary
+      const marketplace = S(owner.marketplace).trim().toUpperCase();
+      const asOf = plan.context && plan.context.to; // report-planner.js: plan.context.to === the account's D-1 as-of
+      // MEMBERSHIP PROOF ("missing membership != empty"): a durable snapshot -- above all a proven-EMPTY one -- may be
+      // written ONLY when this owner's seller is a canonical MEMBER of the batch that was fetched (terminal validated
+      // batch membership proves inclusion). A non-member reading a batch it does not belong to isolates to rows:[] with
+      // rejected:false, which must NEVER be persisted as a genuine zero. A non-empty fragment proves its own membership
+      // (every row carries the owner's seller id, already validated at save + isolate time).
+      const isMember = Array.isArray(src.sellerOrVendorIds) && src.sellerOrVendorIds.map(String).includes(S(owner.rawSellerId));
+      const genuine = rows.length > 0 || isMember;
+      if (typeof recordDurable === "function" && /^[A-Z]{2}$/.test(marketplace) && isDateStr(asOf) && incomingFetchedAt && genuine) {
+        try {
+          const saved = await saveDurablePayload({
+            organizationFingerprint: owner.organizationFingerprint, connectionId: durableConn,
+            sourceKey: durableSourceKey, scopeKey: owner.accountId, rows,
+          });
+          const res = await recordDurable({
+            organizationFingerprint: owner.organizationFingerprint, connectionId: durableConn,
+            accountId: owner.accountId, marketplace, asOf,
+            objectPath: saved.objectPath, payloadSha: saved.payloadSha,
+            rowCount: rows.length, payloadBytes: saved.payloadBytes,
+            sourceRequestHash: src.requestHash, validatedAt: incomingFetchedAt,
+          });
+          const ack = res && res.ack;
+          if (ack === "replaced") summary.durableWritten += 1;
+          else if (ack === "unchanged") summary.durableUnchanged += 1;
+          else if (ack === "stale-save") summary.durableStale += 1;
+        } catch (e) {
+          const schemaMissing = (typeof isSchemaMissingError === "function" && isSchemaMissingError(e))
+            || (typeof isFunctionSignatureMissingError === "function" && isFunctionSignatureMissingError(e));
+          if (schemaMissing) summary.durableSchemaMissing += 1; // migration UNAPPLIED -> fail-soft skip (alias stands)
+          else summary.durableWriteFailed += 1; // isolated typed failure; the alias (LKG) is untouched
+        }
+      } else {
+        // Missing/blank marketplace / as_of / validated_at, or an UNPROVEN empty -> NEVER fabricate a durable pointer.
+        summary.durableSkippedEvidence += 1;
+      }
+    };
+
     for (const src of plan.sources || []) {
       if (!LISTING_HEALTH_V3_READ_KEYS.includes(src.requestKey)) continue;
       const ident = identities[src.requestKey];
@@ -266,6 +317,10 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
         const existingFetchedAt = existingMeta && (existingMeta.batchFetchedAt || existingMeta.batch_fetched_at) || null;
         if (existingFetchedAt && Date.parse(String(existingFetchedAt)) >= Date.parse(String(incomingFetchedAt))) {
           summary.skippedStale += 1; // an equal-or-newer alias already exists -> preserve it (LKG / idempotent replay)
+          // The alias is untouched, but the DURABLE pointer must still be (re)persisted from this already-saved,
+          // validated, per-account-isolated fragment when it is missing/stale -- persistence is decoupled from the
+          // alias-write guard. Idempotent via the RPC's CAS (already-current -> "unchanged", zero writes).
+          await persistDurable(src, iso.rows, incomingFetchedAt);
           continue;
         }
       }
@@ -295,46 +350,10 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
 
       // 5) DURABLE PERSISTENCE (WORK B; ZERO export, ZERO tokens): the SAME already-downloaded + STEP-6-validated +
       //    per-account-ISOLATED `rows` are also written to the durable Listings / Listings-Raw pointer tables (only the
-      //    two NEW_EXPORT families; :inventory is reuse-only fba-inventory-health, no listings table). The
-      //    content-addressed payload object is uploaded FIRST, then the as_of-dominant CAS RPC records the pointer.
-      //    Fully ISOLATED + typed-honest: a durable failure NEVER fabricates success, advances lineage, overwrites
-      //    newer evidence (the RPC's own freshness CAS decides), or damages the per-account alias (LKG) already written
-      //    above. Listings + Listings-Raw are separate `src` iterations -> independently typed. Migration-unapplied is
-      //    the expected steady state -> fail-SOFT (durableSchemaMissing), never a hard failure.
-      const durableSourceKey = durableEnabled ? V3_DURABLE_SOURCE_KEY[src.requestKey] : null;
-      if (durableSourceKey) {
-        const recordDurable = recordDurableByKey[src.requestKey];
-        const durableConn = S(owner.connectionId) === "secondary" ? "dd-secondary" : "primary"; // table CHECK: primary|dd-secondary
-        const marketplace = S(owner.marketplace).trim().toUpperCase();
-        const asOf = plan.context && plan.context.to; // report-planner.js: plan.context.to === the account's D-1 as-of
-        if (typeof recordDurable === "function" && /^[A-Z]{2}$/.test(marketplace) && isDateStr(asOf) && incomingFetchedAt) {
-          try {
-            const saved = await saveDurablePayload({
-              organizationFingerprint: owner.organizationFingerprint, connectionId: durableConn,
-              sourceKey: durableSourceKey, scopeKey: owner.accountId, rows,
-            });
-            const res = await recordDurable({
-              organizationFingerprint: owner.organizationFingerprint, connectionId: durableConn,
-              accountId: owner.accountId, marketplace, asOf,
-              objectPath: saved.objectPath, payloadSha: saved.payloadSha,
-              rowCount: rows.length, payloadBytes: saved.payloadBytes,
-              sourceRequestHash: src.requestHash, validatedAt: incomingFetchedAt,
-            });
-            const ack = res && res.ack;
-            if (ack === "replaced") summary.durableWritten += 1;
-            else if (ack === "unchanged") summary.durableUnchanged += 1;
-            else if (ack === "stale-save") summary.durableStale += 1;
-          } catch (e) {
-            const schemaMissing = (typeof isSchemaMissingError === "function" && isSchemaMissingError(e))
-              || (typeof isFunctionSignatureMissingError === "function" && isFunctionSignatureMissingError(e));
-            if (schemaMissing) summary.durableSchemaMissing += 1; // migration UNAPPLIED -> fail-soft skip (alias stands)
-            else summary.durableWriteFailed += 1; // isolated typed failure; the alias (LKG) above is untouched
-          }
-        } else {
-          // Missing/blank marketplace / as_of / validated_at -> NEVER fabricate a durable pointer (defer to next cycle).
-          summary.durableSkippedEvidence += 1;
-        }
-      }
+      //    two NEW_EXPORT families; :inventory is reuse-only fba-inventory-health, no listings table). Fully ISOLATED +
+      //    typed-honest via the extracted `persistDurable` helper (defined above) -- the SAME path the freshness-skip
+      //    branch uses, so a durable pointer is (re)persisted whether or not the alias itself was rewritten.
+      await persistDurable(src, rows, incomingFetchedAt);
     }
   }
   return summary;

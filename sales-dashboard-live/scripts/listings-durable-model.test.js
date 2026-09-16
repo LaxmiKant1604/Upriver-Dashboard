@@ -181,4 +181,51 @@ ok("LISTINGS_SOURCE_KEY / LISTINGS_RAW_SOURCE_KEY match the migration table sour
   ok("no durable writers injected -> aliases written as before, no durable counters advanced (backward compatible)", sum.aliasesWritten === 4 && sum.durableWritten === 0 && sum.durableSchemaMissing === 0 && sum.durableSkippedEvidence === 0);
 }
 
+// ---- (9) THE INDIA/EU ROOT-CAUSE FIX: durable pointer is BACKFILLED on the freshness-SKIP path (alias already ----
+//         current from a prior pre-wiring materialization) -- persistence is DECOUPLED from the alias-write guard. ----
+{
+  const cache = makeCache(); const d = makeDurable(); const p = plans();
+  seedBatch(cache, p, { listings: SELLERS.map((s) => listingRow(s, "K1")), raw: SELLERS.map((s) => rawRow(s, "K1")), inventory: [] });
+  // Pass 1 = the pre-wiring world: aliases are written (batchFetchedAt stamped) but NO durable writers are injected,
+  // so ZERO durable pointers exist -- exactly India's + Europe/AU's steady state.
+  const sum1 = await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache });
+  ok("9: pre-wiring pass writes aliases but NO durable pointers (reproduces the India/EU gap)", sum1.aliasesWritten === 4 && d.count(LISTINGS_SOURCE_KEY) === 0 && d.count(LISTINGS_RAW_SOURCE_KEY) === 0);
+  // Pass 2 = wiring now deployed. The SAME cached batch is re-adopted; the alias's stored batchFetchedAt EQUALS the
+  // batch fetched_at, so the freshness guard trips (skippedStale) and the alias is NOT rewritten. BEFORE the fix the
+  // durable step (after the `continue`) never ran; AFTER the fix persistDurable backfills the missing pointer.
+  const readAliasMeta = async (h) => { const e = cache.map.get(h); return e && e.request_meta ? { batchFetchedAt: e.request_meta.batchFetchedAt } : null; };
+  const sum2 = await run(cache, d, { readAliasMeta });
+  // skippedStale = 6 (2 accounts x 3 read keys: listings + listings-raw + inventory alias); durable backfills the two
+  // NEW-export families only (inventory has no durable source key -> persistDurable no-ops without counting).
+  ok("9: freshness guard trips (skippedStale=6, aliasesWritten=0) yet durable pointers are BACKFILLED (durableWritten=4)", sum2.skippedStale === 6 && sum2.aliasesWritten === 0 && sum2.durableWritten === 4 && d.count(LISTINGS_SOURCE_KEY) === 2 && d.count(LISTINGS_RAW_SOURCE_KEY) === 2);
+  // Pass 3 = replay after backfill: the alias is still current AND the durable pointer now exists -> zero writes.
+  const sum3 = await run(cache, d, { readAliasMeta });
+  ok("9: replay after backfill -> skippedStale=6, durableUnchanged=4, ZERO new writes (idempotent)", sum3.skippedStale === 6 && sum3.durableUnchanged === 4 && sum3.durableWritten === 0);
+}
+
+// ---- (10) MISSING MEMBERSHIP != EMPTY: an owner whose seller is NOT a canonical member of the batch isolates to ----
+//          rows:[] (rejected:false) but must NEVER be persisted as a genuine zero (fail closed, defer to evidence). ----
+{
+  const cache = makeCache(); const d = makeDurable(); const p = plans();
+  seedBatch(cache, p, { listings: [listingRow("acct-00", "K1")], raw: [rawRow("acct-00", "K1")], inventory: [] }); // batch carries ONLY acct-00's rows
+  // Keep ONLY acct-01's plan, and DROP acct-01 from every source's canonical member set -> acct-01 is a non-member.
+  const nonMemberPlan = p.filter((pl) => pl.owner.accountId === "acct-01").map((pl) => ({ ...pl, sources: pl.sources.map((s) => ({ ...s, sellerOrVendorIds: (s.sellerOrVendorIds || []).filter((id) => String(id) !== "acct-01") })) }));
+  const sum = await materializeListingHealthV3PerAccount({ plans: nonMemberPlan, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache, saveDurablePayload: d.saveDurablePayload, recordDurableByKey: d.recordDurableByKey, isSchemaMissingError: d.isSchemaMissingError, isFunctionSignatureMissingError: d.isFunctionSignatureMissingError });
+  ok("10: a non-member's empty fragment is NEVER a durable proven-empty (0 pointers, durableSkippedEvidence>0)", d.count(LISTINGS_SOURCE_KEY) === 0 && d.count(LISTINGS_RAW_SOURCE_KEY) === 0 && sum.durableSkippedEvidence >= 2);
+  // Contrast: a genuine MEMBER with an empty fragment DOES persist a valid-empty (proves the gate keys on membership).
+  const cache2 = makeCache(); const d2 = makeDurable(); const p2 = plans();
+  seedBatch(cache2, p2, { listings: [], raw: [], inventory: [] });
+  await run(cache2, d2);
+  ok("10: a genuine member with an empty fragment DOES persist a row_count=0 pointer (membership proven)", d2.count(LISTINGS_SOURCE_KEY) === 2 && [...d2.pointers.values()].every((r) => r.row_count === 0));
+}
+
+// ---- (11) Listings/Raw persistence is INDEPENDENT of each other and of OLI/Catalog/inventory: with ONLY the two ----
+//          NEW-export batches present (no inventory/OLI/Catalog seeded), both still persist (source-decoupled). ----
+{
+  const cache = makeCache(); const d = makeDurable(); const p = plans();
+  seedBatch(cache, p, { listings: SELLERS.map((s) => listingRow(s, "K1")), raw: SELLERS.map((s) => rawRow(s, "K1")) }); // inventory intentionally ABSENT
+  const sum = await run(cache, d);
+  ok("11: Listings + Listings-Raw both persist with NO inventory/OLI/Catalog present (persistence is source-decoupled)", d.count(LISTINGS_SOURCE_KEY) === 2 && d.count(LISTINGS_RAW_SOURCE_KEY) === 2 && sum.durableWritten === 4 && sum.batchMissing === 2);
+}
+
 writeSync(1, `\nlistings-durable-model: ${passed} assertions passed\n`);
