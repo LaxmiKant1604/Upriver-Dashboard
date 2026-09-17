@@ -27,13 +27,27 @@ export function portfolioKpis(tables) {
   const groups = tables?.dailyGroups || [];
   const single = groups.length === 1 ? groups[0] : null;
   const daily = tables?.daily || null;
-  const fba = daily && daily.inventoryScope === "country"
-    ? groups.reduce((acc, group) => (group.fbaAvailable === null || group.fbaAvailable === undefined)
-      ? acc
-      : (acc === null ? 0 : acc) + Number(group.fbaAvailable), null)
-    : (daily && daily.inventoryAccountTotal !== null && daily.inventoryAccountTotal !== undefined
-      ? Number(daily.inventoryAccountTotal)
-      : null);
+  // FBA inventory is a unit count (never currency-specific). Evidence policy, FAIL CLOSED:
+  //   1. Prefer the authoritative overall account total when it is a finite, non-negative
+  //      NUMBER (explicit 0 is valid evidence); it is not currency-specific.
+  //   2. Otherwise, for country-dimension inventory, sum group totals ONLY when EVERY
+  //      relevant group is a finite, non-negative number. Any missing, undefined,
+  //      malformed, non-finite, negative or non-number group returns null -- a partial
+  //      sum of only the known groups is never exposed as a complete total.
+  //   3. Otherwise unavailable (null). Inventory is never currency converted.
+  const fbaOk = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+  let fba = null;
+  if (daily && fbaOk(daily.inventoryAccountTotal)) {
+    fba = daily.inventoryAccountTotal;
+  } else if (daily && daily.inventoryScope === "country" && groups.length) {
+    let sum = 0;
+    let complete = true;
+    for (const group of groups) {
+      if (!fbaOk(group.fbaAvailable)) { complete = false; break; }
+      sum += group.fbaAvailable;
+    }
+    fba = complete ? sum : null;
+  }
   const rangeUnits = groups.reduce((sum, group) => sum + group.rows.reduce((inner, row) => inner + (Number(row.coverUnits) || 0), 0), 0);
   const cover = daily?.selectedRangeDays ? inventoryCoverDays(fba, rangeUnits, daily.selectedRangeDays) : null;
   const sales = single ? single.totals.sales : null;
@@ -50,7 +64,7 @@ export function portfolioKpis(tables) {
 // The sort is explicitly stable (an index tiebreak) so nothing is dropped and the
 // order within a severity tier is exactly the order the page appended it -- the
 // highest-severity current condition is always first (the panel's compact head).
-const STATUS_RANK = { error: 0, warning: 1, success: 2, info: 3 };
+const STATUS_RANK = { error: 0, warning: 1, success: 2, final: 2, info: 3 };
 export function orderStatusItems(items) {
   return (Array.isArray(items) ? items : [])
     .map((item, index) => ({ item, index }))

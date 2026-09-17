@@ -118,6 +118,65 @@ test("inventory is never currency-converted (raw unit counts sum directly)", () 
   assert.equal(k.fba, 12000 + 3852);
 });
 
+test("FAIL CLOSED: known group + missing group + no overall total -> FBA null, Cover null", () => {
+  const t = multiCountry();
+  t.dailyGroups[1].fbaAvailable = null; // one group unknown; no account total
+  const k = VIEW.portfolioKpis(t);
+  assert.equal(k.fba, null, "the partial sum of only the known groups is never exposed");
+  assert.equal(k.cover, null);
+  assert.equal(k.units, 210, "units stay available");
+});
+
+test("partial groups but an authoritative overall total present -> use the overall total", () => {
+  const t = multiCountry();
+  t.dailyGroups[1].fbaAvailable = null;
+  t.daily.inventoryAccountTotal = 15852; // authoritative overall, even in country scope
+  const k = VIEW.portfolioKpis(t);
+  assert.equal(k.fba, 15852);
+  assert.equal(Math.round(k.cover), 2265);
+});
+
+test("every group known -> sum correctly", () => {
+  assert.equal(VIEW.portfolioKpis(multiCountry()).fba, 12000 + 3852);
+});
+
+test("explicit zero inventory is retained as valid evidence, not null", () => {
+  const zeroGroups = multiCountry();
+  zeroGroups.dailyGroups.forEach((g) => { g.fbaAvailable = 0; });
+  assert.equal(VIEW.portfolioKpis(zeroGroups).fba, 0);
+  const zeroTotal = multiCountry();
+  zeroTotal.dailyGroups.forEach((g) => { g.fbaAvailable = null; });
+  zeroTotal.daily = { inventoryScope: "account", inventoryAccountTotal: 0, selectedRangeDays: 30 };
+  assert.equal(VIEW.portfolioKpis(zeroTotal).fba, 0);
+});
+
+test("NaN / Infinity / numeric string / negative / non-number group inventory fails closed", () => {
+  for (const bad of [NaN, Infinity, -Infinity, "12000", "0", -5, {}, true, null, undefined]) {
+    const t = multiCountry();
+    t.dailyGroups[1].fbaAvailable = bad; // one malformed group; no overall total
+    const k = VIEW.portfolioKpis(t);
+    assert.equal(k.fba, null, `group fbaAvailable=${String(bad)} must fail closed`);
+    assert.equal(k.cover, null);
+  }
+});
+
+test("a valid authoritative overall total overrides a malformed group", () => {
+  const t = multiCountry();
+  t.dailyGroups[1].fbaAvailable = NaN;
+  t.daily.inventoryAccountTotal = 15852;
+  assert.equal(VIEW.portfolioKpis(t).fba, 15852);
+});
+
+test("a malformed authoritative total is ignored; complete country groups still sum", () => {
+  const strTotal = multiCountry(); // both groups valid
+  strTotal.daily.inventoryAccountTotal = "15852"; // numeric string -> not authoritative
+  assert.equal(VIEW.portfolioKpis(strTotal).fba, 12000 + 3852, "falls back to the complete country sum");
+  const negTotalPartial = multiCountry();
+  negTotalPartial.dailyGroups[1].fbaAvailable = null; // partial groups
+  negTotalPartial.daily.inventoryAccountTotal = -1; // negative -> not authoritative
+  assert.equal(VIEW.portfolioKpis(negTotalPartial).fba, null, "invalid total + partial groups -> null");
+});
+
 /* -------------------------------------------------------------- orderStatusItems */
 group("orderStatusItems: deterministic severity, stable, nothing dropped");
 
@@ -159,6 +218,18 @@ test("full severity order with stable within-tier order; no message dropped", ()
   ]);
   assert.deepEqual(ordered.map((i) => i.title), ["err1", "warn1", "warn2", "ok1", "note1", "busy1"]);
   assert.equal(ordered.length, 6);
+});
+
+test("'final' sorts in the success tier: before info/busy, stable relative to success", () => {
+  const ordered = VIEW.orderStatusItems([
+    { tone: "info", title: "note" },
+    { tone: "final", title: "fin1" },
+    { tone: "success", title: "ok1" },
+    { tone: "info", busy: true, title: "busy" },
+    { tone: "final", title: "fin2" },
+  ]);
+  // success + final share rank 2 (before the info tier); within the tier, insertion order.
+  assert.deepEqual(ordered.map((i) => i.title), ["fin1", "ok1", "fin2", "note", "busy"]);
 });
 
 test("empty / non-array input is safe", () => {
