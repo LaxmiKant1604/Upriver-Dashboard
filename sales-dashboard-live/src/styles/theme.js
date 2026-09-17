@@ -2381,6 +2381,13 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .bv-portfolio .bv-table .bv-col-latest{ background:rgba(255,153,0,.09); color:var(--op-ink); }
 .bv-portfolio .bv-table th.bv-col-latest{ color:var(--op-orange-strong); background:rgba(255,153,0,.12); box-shadow:inset 0 -2px 0 var(--op-orange); }
 .bv-portfolio .bv-table tbody tr:hover td.bv-col-latest{ background:rgba(255,153,0,.15); }
+/* Typography hierarchy: genuine headings stay bold (table headers 750-800, All Markets and
+   the "Units by country" section 800 -- all unchanged). Plain DATA-row labels + values are
+   medium (600) instead of semibold, so the heading hierarchy is clearly scannable and the
+   table is not "all bold". Scoped to .bv-portfolio data rows only; the current-month column
+   keeps a restrained emphasis. No heading, header, total, section or supporting weight is reduced. */
+.bv-portfolio .bv-table tbody tr:not(.bv-total):not(.bv-section) td{ font-weight:600; }
+.bv-portfolio .bv-table tbody tr:not(.bv-total):not(.bv-section) td.bv-col-key-actual{ font-weight:700; }
 
 /* Methodology disclosure (portfolio scope). */
 .bv-portfolio .methodology-disclosure{ margin-top:18px; border-top:1px solid var(--op-border-2); padding-top:12px; }
