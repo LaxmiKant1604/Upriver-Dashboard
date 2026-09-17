@@ -1767,14 +1767,14 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .dashboard-page .page-title{ color:var(--op-ink); font-size:23px; font-weight:800; letter-spacing:0; }
 .dashboard-page .page-sub{ color:var(--op-ink-2); font-size:12.5px; }
 
-/* Water/ripple background layer — unframed, behind the content, pointer-safe.
-   The approved flat redesign paints a FLAT #F3F4F5 workspace wash (no atmospheric
-   gradient); the low-alpha WebGL canvas, when present, draws faintly over it and
-   self-disables under reduced motion / low power, so the workspace reads flat. */
-.water-bg{
-  position:absolute; inset:0; z-index:0; pointer-events:none; overflow:hidden;
-  background:#F3F4F5;
-}
+/* Water/ripple background layer — DISABLED for the approved flat redesign. The
+   Sales Dashboard workspace is genuinely flat #F3F4F5 (set on .main-area.dash-workspace);
+   this hides the decorative layer AND its WebGL canvas so no ripple, radial gradient,
+   blue haze or atmospheric wash is painted. The WaterBackground component stays mounted
+   (transition-stability regressions hold) but, being display:none, its intersection
+   observer keeps the render loop paused, so no GL frame is ever drawn. .water-bg is only
+   rendered on the account Sales Dashboard, so this is scoped to that page. */
+.water-bg{ display:none; }
 .water-bg-canvas{ position:absolute; inset:0; width:100%; height:100%; display:block; }
 
 /* Date range bar + segmented (dashboard scope only). */
@@ -2358,21 +2358,28 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .bv-portfolio [id^="bv-"]:focus{ outline:none; }
 .bv-portfolio [id^="bv-"]{ scroll-margin-top:112px; }
 
-/* Tables: sticky header + sticky first column within a bounded scroll box. */
+/* Tables: LIGHT neutral headers (Stitch) -- no dark navy band; #D5D9D9-family borders;
+   sticky header + sticky first column within a bounded scroll box. */
 .bv-portfolio .bv-panel{ border-radius:6px; }
 .bv-portfolio .bv-scroll{ max-height:78vh; overflow:auto; }
+.bv-portfolio .bv-table th{
+  background:#F3F4F5; color:var(--op-ink-3); border-bottom:1px solid var(--op-border);
+  box-shadow:inset 0 -1px 0 var(--op-border);
+}
 .bv-portfolio .bv-table thead th{ position:sticky; top:0; z-index:2; }
-.bv-portfolio .bv-table td.bv-first,.bv-portfolio .bv-table th.bv-first{ position:sticky; left:0; z-index:1; background:var(--op-card); }
+.bv-portfolio .bv-table td.bv-first{ position:sticky; left:0; z-index:1; background:var(--op-card); }
+.bv-portfolio .bv-table th.bv-first{ position:sticky; left:0; background:#F3F4F5; color:var(--op-ink); }
 .bv-portfolio .bv-table thead th.bv-first{ z-index:3; }
 .bv-portfolio .bv-table tbody tr.bv-total td.bv-first{ background:#EAF1F8; }
-/* Restrained column tones (design): no green columns, current month in blue, latest 7-day
-   date in amber. No conditional row/value colouring is introduced. */
+/* Restrained column tones on the LIGHT header (design): no green columns; current month
+   in blue, latest 7-day date in amber. No conditional row/value colouring is introduced. */
 .bv-portfolio .bv-table .bv-col-positive,.bv-portfolio .bv-table .bv-col-accent{ color:var(--op-ink); }
-.bv-portfolio .bv-table th.bv-col-positive,.bv-portfolio .bv-table th.bv-col-accent{ color:rgba(226,233,240,.82); }
+.bv-portfolio .bv-table th.bv-col-positive,.bv-portfolio .bv-table th.bv-col-accent,.bv-portfolio .bv-table th.bv-col-total{ color:var(--op-ink-3); }
+.bv-portfolio .bv-table th.bv-col-total{ box-shadow:inset 0 -1px 0 var(--op-border); }
 .bv-portfolio .bv-table .bv-col-key-actual{ color:var(--op-blue); font-weight:750; background:rgba(20,110,180,.05); }
-.bv-portfolio .bv-table th.bv-col-key-actual{ color:#BBD6EE; }
+.bv-portfolio .bv-table th.bv-col-key-actual{ color:var(--op-blue); background:rgba(20,110,180,.08); box-shadow:inset 0 -2px 0 var(--op-blue); }
 .bv-portfolio .bv-table .bv-col-latest{ background:rgba(255,153,0,.09); color:var(--op-ink); }
-.bv-portfolio .bv-table th.bv-col-latest{ color:#FFD9A6; box-shadow:inset 0 -2px 0 var(--op-orange); }
+.bv-portfolio .bv-table th.bv-col-latest{ color:var(--op-orange-strong); background:rgba(255,153,0,.12); box-shadow:inset 0 -2px 0 var(--op-orange); }
 .bv-portfolio .bv-table tbody tr:hover td.bv-col-latest{ background:rgba(255,153,0,.15); }
 
 /* Methodology disclosure (portfolio scope). */
