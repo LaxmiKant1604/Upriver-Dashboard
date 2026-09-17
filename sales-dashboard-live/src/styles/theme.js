@@ -2240,7 +2240,7 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 /* ===== FBA SHIPMENT PLAN -- flat Amazon operational workspace (.plan-page) =====
    Approved Stitch redesign. White panels on the neutral workspace, #D5D9D9 hairlines, <=6px radii, semantic
    accents (blue #146EB4, orange #FF9900, green #067D62), tabular numerals -- no gradients, no violet, no glass.
-   Every selector is scoped under .plan-page so the SHARED .plan-*/.pt-* classes (SKU P&L, SKU Movement,
+   Every selector is scoped under .plan-page so the SHARED plan and pt class families (SKU P&L, SKU Movement,
    Reconciliation) stay untouched; these rules follow the .op-report layer above and win at equal specificity
    by source order. */
 /* Header + right-side scope metadata panel (real account / marketplace / sales-date / inventory-state only). */
@@ -2339,6 +2339,29 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .plan-page .plan-methodology > summary::before{ content:"\\25B8"; color:#565959; font-size:10px; transition:transform .15s ease; }
 .plan-page .plan-methodology[open] > summary::before{ transform:rotate(90deg); }
 .plan-page .plan-methodology .footer-note{ margin-top:10px; border-top:1px solid #E7E9EC; padding-top:10px; border-radius:0; background:none; }
+
+/* FBA modals (warehouse import / lead-time preview / SKU horizon) -> flat Amazon: <=6px radius, a functional
+   Level-3 shadow (not the atmospheric 24px/70px blur), square 3px status badges (never pill), neutral chrome. */
+.plan-page .plan-modal-backdrop{ background:rgba(19,26,34,.60); }
+.plan-page .plan-modal{ border:1px solid #D5D9D9; border-radius:6px; box-shadow:0 4px 16px rgba(19,26,34,.20); }
+.plan-page .plan-modal-head{ border-bottom:1px solid #D5D9D9; }
+.plan-page .plan-modal-title{ color:#0F1111; }
+.plan-page .plan-modal-sub, .plan-page .plan-modal-note, .plan-page .plan-modal-foot-note{ color:#565959; }
+.plan-page .plan-modal-foot{ border-top:1px solid #D5D9D9; }
+.plan-page .plan-icon-btn{ border:1px solid #D5D9D9; border-radius:4px; color:#565959; }
+.plan-page .plan-icon-btn:hover{ border-color:#146EB4; color:#146EB4; background:#F7FAFD; }
+.plan-page .plan-import-file{ border:1px dashed #D5D9D9; border-radius:4px; color:#565959; }
+.plan-page .plan-import-file:hover{ border-color:#146EB4; color:#146EB4; }
+.plan-page .plan-modal .plan-mini-btn{ border:1px solid #D5D9D9; border-radius:4px; color:#0F1111; }
+.plan-page .plan-modal .plan-mini-btn:hover:not(:disabled){ border-color:#146EB4; color:#146EB4; }
+.plan-page .plan-import-pill{ border-radius:3px; border:1px solid #D5D9D9; background:#F3F4F5; color:#565959; }
+.plan-page .plan-import-pill.ok{ background:#F3F9F6; border-color:#CDE5D8; color:#067D62; }
+.plan-page .plan-import-pill.bad{ background:#FDF4F4; border-color:#F5C2C7; color:#B12704; }
+.plan-page .plan-import-table-wrap{ border:1px solid #D5D9D9; border-radius:6px; }
+.plan-page .plan-import-table th{ background:#F8F9FA; color:#565959; border-bottom:1px solid #D5D9D9; }
+.plan-page .plan-import-table td{ border-top:1px solid #E7E9EC; color:#0F1111; }
+.plan-page .plan-import-table tr.bad td{ color:#B12704; }
+.plan-page .plan-import-paste textarea{ border:1px solid #D5D9D9; border-radius:4px; }
 
 /* Responsive: KPIs 6 -> 3 -> 2; the matrix always scrolls; the meta panel wraps full-width. */
 @media (max-width:1280px){ .plan-page .plan-stat-row{ grid-template-columns:repeat(3,minmax(0,1fr)); } }
