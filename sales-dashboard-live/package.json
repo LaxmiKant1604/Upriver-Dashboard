@@ -140,7 +140,7 @@
     "test:source-download-recovery": "node scripts/source-download-recovery.test.js",
     "test:source-create-reconcile": "node scripts/source-create-reconcile.test.js",
     "test:daily-roi-format": "node scripts/daily-roi-format.test.js",
-    "test:daily-view-model": "node scripts/daily-view-model.test.js",
+    "test:daily-view-model": "node scripts/daily-view-model.test.js && node scripts/daily-reporting-render.test.js",
     "test:brand-sales-backfill": "node scripts/brand-sales-backfill.test.js",
     "test:brand-membership-scope": "node scripts/brand-membership-scope.test.js",
     "test:brand-view-freshness": "node scripts/brand-view-freshness.test.js",

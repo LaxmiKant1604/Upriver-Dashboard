@@ -916,33 +916,93 @@ body{ overflow-x:hidden; }
 .daily-table tr.dt-row-highlight td.dt-mtd{ background:#F7E9D2; }
 .daily-table tr.dt-row-highlight td.dt-metric{ background:var(--accent-soft); }
 
-/* ===================== DAILY REPORTING (redesigned content area) =====================
-   Scoped entirely under .dr-* so no other view is affected. Built on the design tokens;
-   the KPI gradients and the deep-violet table header are the design's own accents. */
-.dr-page{ padding-bottom:var(--space-5); }
+/* ===================== DAILY REPORTING (.dr-page) =====================
+   Flat Amazon operational system (approved Stitch redesign). White cards on a neutral
+   workspace, #D5D9D9 hairlines, <=6px radii, semantic accents (blue #146EB4, orange
+   #FF9900, green #067D62, red #B12704), tabular numerals -- no gradients, no violet
+   theme. Every selector is DR-exclusive under .dr-page; the SHARED .obs-units / .dr-dash
+   rules further down are deliberately left untouched for the other reports. */
+.dr-page{ padding-bottom:var(--space-5); color:#0F1111; }
 
-/* Provisional D-1 -- the full-width violet information band */
-.dr-band{ display:flex; align-items:flex-start; gap:12px; margin-top:var(--space-4); padding:14px 16px; border-radius:var(--radius-md); background:rgba(99,102,241,0.08); border:1px solid rgba(99,102,241,0.22); }
-.dr-band-icon{ color:#6366F1; flex-shrink:0; margin-top:1px; display:inline-flex; }
-.dr-band-title{ font-family:'Outfit',sans-serif; font-size:13.5px; font-weight:700; color:#4338CA; letter-spacing:0; }
-.dr-band-text{ font-size:12px; color:#4F46E5; opacity:.82; line-height:1.55; margin-top:2px; }
+/* Consolidated data-status panel (provisional=amber / final=green / source issue=red /
+   advertising coverage=info). The error tone stays the most prominent. */
+.dr-page .dr-status{ margin-top:var(--space-4); background:#FFFFFF; border:1px solid #D5D9D9; border-radius:6px; overflow:hidden; }
+.dr-page .dr-status-row{ display:flex; align-items:flex-start; gap:10px; padding:12px 14px; border-left:4px solid transparent; }
+.dr-page .dr-status--warning .dr-status-row{ background:#FFF8E7; border-left-color:#B75D00; }
+.dr-page .dr-status--final .dr-status-row{ background:#F3F9F6; border-left-color:#067D62; }
+.dr-page .dr-status--error .dr-status-row{ background:#FDF4F4; border-left-color:#B12704; }
+.dr-page .dr-status--info .dr-status-row{ background:#EFF6FB; border-left-color:#146EB4; }
+.dr-page .dr-status-icon{ flex-shrink:0; margin-top:1px; display:inline-flex; }
+.dr-page .dr-status--warning .dr-status-icon{ color:#B75D00; }
+.dr-page .dr-status--final .dr-status-icon{ color:#067D62; }
+.dr-page .dr-status--error .dr-status-icon{ color:#B12704; }
+.dr-page .dr-status--info .dr-status-icon{ color:#146EB4; }
+.dr-page .dr-status-main{ min-width:0; flex:1; }
+.dr-page .dr-status-line{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.dr-page .dr-status-badge{ font-size:10.5px; font-weight:750; letter-spacing:.04em; text-transform:uppercase; padding:2px 7px; border-radius:3px; }
+.dr-page .dr-status-badge--provisional{ background:#FFEBB7; color:#944D00; }
+.dr-page .dr-status-badge--final{ background:#DBF0E8; color:#067D62; }
+.dr-page .dr-status-badge--defect{ background:#F8D7DA; color:#B12704; }
+.dr-page .dr-status-title{ font-size:12.5px; font-weight:700; color:#0F1111; }
+.dr-page .dr-status-detail{ font-size:12px; color:#565959; line-height:1.55; margin-top:3px; }
+.dr-page .dr-status-toggle{ flex-shrink:0; display:inline-flex; align-items:center; gap:5px; background:none; border:none; padding:2px 0; cursor:pointer; color:#146EB4; font-size:12px; font-weight:600; white-space:nowrap; }
+.dr-page .dr-status-toggle:hover{ color:#0C4A7A; }
+.dr-page .dr-status-toggle:focus-visible{ outline:2px solid #146EB4; outline-offset:2px; border-radius:3px; }
+.dr-page .dr-status-chevron{ transition:transform .15s ease; }
+.dr-page .dr-status-chevron.is-open{ transform:rotate(180deg); }
 
-/* Six MTD KPI cards */
-.dr-kpis{ display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:12px; margin-top:var(--space-4); }
-.dr-kpi{ border-radius:var(--radius-sm); padding:13px 15px; color:#fff; box-shadow:var(--shadow-sm); min-width:0; }
-.dr-kpi-label{ font-size:9.5px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:rgba(255,255,255,.82); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.dr-kpi-value{ font-family:'Outfit',sans-serif; font-variant-numeric:tabular-nums; font-size:20px; font-weight:800; line-height:1.15; margin-top:6px; letter-spacing:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+/* Observed Units Breakdown -- five compact cells (DR-scoped; distinct from the shared .obs-units below). */
+.dr-page .dr-obs{ padding:12px 14px; border-top:1px solid #F2C265; background:#FFFFFF; }
+.dr-page .dr-status--final .dr-obs{ border-top-color:#CDE5D8; }
+.dr-page .dr-status--info .dr-obs{ border-top-color:#D2E4F2; }
+.dr-page .dr-obs-head{ display:flex; align-items:baseline; justify-content:space-between; gap:10px; flex-wrap:wrap; padding-bottom:10px; border-bottom:1px solid #E7E9EC; }
+.dr-page .dr-obs-title{ font-size:12.5px; font-weight:750; color:#0F1111; }
+.dr-page .dr-obs-total{ font-size:11.5px; color:#565959; }
+.dr-page .dr-obs-total strong{ color:#0F1111; font-weight:700; font-variant-numeric:tabular-nums; }
+.dr-page .dr-obs-grid{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; margin-top:12px; }
+.dr-page .dr-obs-cell{ padding:9px 10px; border:1px solid #D5D9D9; border-radius:4px; background:#F8F9FA; min-width:0; }
+.dr-page .dr-obs-cell--pos{ background:#F3F9F6; border-color:#CDE5D8; }
+.dr-page .dr-obs-cell--warn{ background:#FFF8E7; border-color:#F2C265; }
+.dr-page .dr-obs-cell--neg{ background:#FDF4F4; border-color:#F5C2C7; }
+.dr-page .dr-obs-cell-label{ font-size:11px; font-weight:600; color:#565959; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dr-page .dr-obs-cell--pos .dr-obs-cell-label{ color:#067D62; }
+.dr-page .dr-obs-cell--warn .dr-obs-cell-label{ color:#944D00; }
+.dr-page .dr-obs-cell--neg .dr-obs-cell-label{ color:#B12704; }
+.dr-page .dr-obs-cell-value{ font-size:15px; font-weight:800; color:#0F1111; font-variant-numeric:tabular-nums; margin-top:2px; }
+.dr-page .dr-obs-cell--pos .dr-obs-cell-value{ color:#067D62; }
+.dr-page .dr-obs-cell--warn .dr-obs-cell-value{ color:#B75D00; }
+.dr-page .dr-obs-cell--neg .dr-obs-cell-value{ color:#B12704; }
+.dr-page .dr-obs-cell-sub{ font-size:10.5px; color:#565959; margin-top:2px; }
+.dr-page .dr-obs-cell--pos .dr-obs-cell-sub{ color:#067D62; }
+.dr-page .dr-obs-cell--warn .dr-obs-cell-sub{ color:#944D00; }
+.dr-page .dr-obs-cell--neg .dr-obs-cell-sub{ color:#B12704; }
+.dr-page .dr-obs-note{ font-size:11.5px; line-height:1.55; color:#565959; margin-top:12px; }
 
-/* Main reporting table card */
-.dr-card{ margin-top:var(--space-5); background:var(--bg-surface); border:1px solid var(--border-default); border-radius:var(--radius-md); box-shadow:var(--shadow-sm); overflow:hidden; }
-.dr-card-head{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:15px 18px 13px; border-bottom:1px solid var(--border-default); background:linear-gradient(135deg,rgba(139,92,246,.05),rgba(99,102,241,.03)); }
-.dr-card-head-main{ min-width:0; }
-.dr-card-title{ font-family:'Outfit',sans-serif; font-size:14px; font-weight:800; color:var(--text-primary); letter-spacing:0; }
-.dr-card-meta{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:6px; font-size:11px; color:var(--text-muted); }
-.dr-badge{ padding:2px 9px; border-radius:var(--radius-pill); font-size:10.5px; font-weight:700; letter-spacing:.2px; }
-.dr-badge-provisional{ background:var(--warning-soft); color:var(--warning); }
-.dr-badge-final{ background:var(--positive-soft); color:var(--positive); }
-.dr-badge-defect{ background:var(--negative-soft); color:var(--negative); }
+/* Six MTD KPI cards -- white, hairline border, 2px semantic top accent (no gradients). */
+.dr-page .dr-kpis{ display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:12px; margin-top:var(--space-4); }
+.dr-page .dr-kpi{ background:#FFFFFF; border:1px solid #D5D9D9; border-top:2px solid #D5D9D9; border-radius:6px; padding:12px 14px; min-width:0; display:flex; flex-direction:column; justify-content:space-between; }
+.dr-page .dr-kpi--blue{ border-top-color:#146EB4; }
+.dr-page .dr-kpi--orange{ border-top-color:#FF9900; }
+.dr-page .dr-kpi--green{ border-top-color:#067D62; }
+.dr-page .dr-kpi-label{ font-size:10.5px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:#565959; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dr-page .dr-kpi-value{ font-size:21px; font-weight:800; line-height:1.15; color:#0F1111; font-variant-numeric:tabular-nums; margin-top:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dr-page .dr-kpi-value--roi{ color:#067D62; }
+.dr-page .dr-kpi-foot{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:10px; padding-top:8px; border-top:1px solid #F0F2F2; font-size:11px; }
+.dr-page .dr-kpi-cap{ color:#565959; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.dr-page .dr-kpi-subval{ color:#565959; font-weight:600; font-variant-numeric:tabular-nums; white-space:nowrap; }
+
+/* Main reporting matrix card + head (flat, no gradient). */
+.dr-page .dr-card{ margin-top:var(--space-5); background:#FFFFFF; border:1px solid #D5D9D9; border-radius:6px; overflow:hidden; }
+.dr-page .dr-card-head{ display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:14px 16px; border-bottom:1px solid #D5D9D9; background:#FFFFFF; }
+.dr-page .dr-card-head-main{ min-width:0; }
+.dr-page .dr-card-titlerow{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.dr-page .dr-card-title{ font-size:16px; font-weight:800; color:#0F1111; letter-spacing:0; margin:0; }
+.dr-page .dr-card-badge{ font-size:11px; font-weight:600; padding:2px 8px; border-radius:4px; }
+.dr-page .dr-card-badge--provisional{ background:#FFF8E7; border:1px solid #F2C265; color:#944D00; }
+.dr-page .dr-card-badge--final{ background:#F3F9F6; border:1px solid #CDE5D8; color:#067D62; }
+.dr-page .dr-card-badge--defect{ background:#FDF4F4; border:1px solid #F5C2C7; color:#B12704; }
+.dr-page .dr-card-meta{ display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:5px; font-size:11px; color:#565959; }
+.dr-page .dr-card-meta strong{ color:#0F1111; font-weight:600; }
 /* Observed-unit breakdown (transparent per-class units beside the completeness line). Responsive: chips wrap, never overflow. */
 .obs-units{ margin:8px 0 4px; padding:10px 12px; border:1px solid var(--border-default); border-radius:var(--radius-md,10px); background:var(--bg-elevated); max-width:100%; }
 .obs-units-head{ display:flex; align-items:baseline; justify-content:space-between; gap:10px; flex-wrap:wrap; }
@@ -956,56 +1016,81 @@ body{ overflow-x:hidden; }
 .obs-chip-pending{ background:var(--warning-soft); color:var(--warning); }
 .obs-chip-cancelled{ background:var(--negative-soft); color:var(--negative); }
 .obs-units-note{ font-size:10.5px; line-height:1.5; color:var(--text-muted); }
-.dr-refresh{ flex-shrink:0; width:32px; height:32px; border-radius:var(--radius-sm); border:1px solid var(--border-default); background:var(--bg-elevated); color:var(--text-muted); display:inline-flex; align-items:center; justify-content:center; cursor:pointer; }
-.dr-refresh:hover{ color:var(--accent); border-color:var(--border-hover); }
-.dr-refresh:disabled{ opacity:.6; cursor:default; }
-.dr-card-body{ padding:10px 14px 14px; }
+.dr-page .dr-refresh{ flex-shrink:0; display:inline-flex; align-items:center; gap:7px; padding:7px 12px; border:1px solid #D5D9D9; border-radius:4px; background:#FFFFFF; color:#0F1111; font-size:12px; font-weight:600; cursor:pointer; }
+.dr-page .dr-refresh:hover:not(:disabled){ background:#F7FAFA; border-color:#146EB4; color:#146EB4; }
+.dr-page .dr-refresh:focus-visible{ outline:2px solid #146EB4; outline-offset:1px; }
+.dr-page .dr-refresh:disabled{ opacity:.6; cursor:default; }
+.dr-page .dr-card-body{ padding:8px 12px 12px; }
 
-/* Table -- deep-violet header, coral MTD emphasis, sticky metric column */
-.dr-scroll{ overflow-x:auto; overflow-y:hidden; }
-.dr-scroll::-webkit-scrollbar{ height:10px; }
-.dr-scroll::-webkit-scrollbar-thumb{ background:var(--border-strong); border-radius:var(--radius-pill); border:3px solid var(--bg-surface); }
-.dr-table{ width:100%; min-width:920px; border-collapse:collapse; font-size:12px; }
-.dr-table .dr-th{ padding:11px 14px; text-align:right; white-space:nowrap; font-family:'Outfit',sans-serif; font-size:10px; font-weight:800; letter-spacing:.07em; text-transform:uppercase; color:rgba(196,181,253,.6); background:linear-gradient(90deg,#1E1245,#2d1b69); position:sticky; top:0; z-index:2; }
-.dr-table .dr-th-metric{ text-align:left; color:#C4B5FD; position:sticky; left:0; z-index:3; background:#1E1245; }
-.dr-table .dr-th-mtd{ color:#FF9482; box-shadow:inset 0 -2px 0 #FF6B6B; }
-.dr-table tbody tr{ background:var(--bg-surface); transition:background var(--t-fast) var(--ease); }
-.dr-table tbody tr:nth-child(even){ background:var(--bg-subtle); }
-.dr-table tbody tr:hover{ background:#ECE7FF; }
-.dr-table tbody tr.dr-row-highlight{ background:var(--accent-soft); }
-.dr-table .dr-td{ padding:11px 14px; text-align:right; white-space:nowrap; background:transparent; font-variant-numeric:tabular-nums; border-bottom:1px solid var(--border-default); color:var(--text-secondary); }
-.dr-table .dr-td-metric{ text-align:left; position:sticky; left:0; z-index:1; background:inherit; border-right:1px solid var(--border-default); color:var(--text-primary); }
-.dr-table .dr-td-mtd{ background:var(--brand-soft); font-weight:800; border-left:1px solid rgba(255,107,107,.22); border-right:1px solid rgba(255,107,107,.22); }
-.dr-table tbody tr:hover .dr-td-mtd{ background:#FFE1DC; }
-.dr-table tbody tr.dr-row-highlight .dr-td-mtd{ background:#F7E9D2; }
-.dr-table tbody tr.dr-row-highlight .dr-td{ font-weight:750; }
-.dr-ic{ display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; border-radius:7px; margin-right:9px; vertical-align:middle; }
-.dr-metric-label{ font-weight:700; color:var(--text-primary); vertical-align:middle; }
+/* Reporting matrix table -- light neutral sticky header, sticky first column, blue MTD
+   emphasis, amber latest-day emphasis, per-metric row bullets, neutral ratio section. */
+.dr-page .dr-scroll{ overflow-x:auto; overflow-y:visible; }
+.dr-page .dr-scroll::-webkit-scrollbar{ height:8px; }
+.dr-page .dr-scroll::-webkit-scrollbar-track{ background:#F3F4F5; }
+.dr-page .dr-scroll::-webkit-scrollbar-thumb{ background:#D5D9D9; border-radius:4px; }
+.dr-page .dr-table{ width:100%; min-width:1000px; border-collapse:collapse; font-size:12.5px; }
+.dr-page .dr-table .dr-th{ padding:11px 14px; text-align:right; white-space:nowrap; font-size:11px; font-weight:800; letter-spacing:.05em; text-transform:uppercase; color:#565959; background:#F8F9FA; border-bottom:1px solid #D5D9D9; position:sticky; top:0; z-index:2; }
+.dr-page .dr-table .dr-th-metric{ text-align:left; color:#0F1111; position:sticky; left:0; z-index:3; min-width:180px; border-right:1px solid #E7E9EC; }
+.dr-page .dr-table .dr-th-mtd{ color:#146EB4; background:#EFF6FB; border-left:1px solid #D2E4F2; border-right:1px solid #D2E4F2; box-shadow:inset 0 2px 0 #146EB4; }
+.dr-page .dr-table .dr-th-latest{ color:#944D00; background:#FFF8E7; border-left:1px solid #F2C265; box-shadow:inset 0 2px 0 #FF9900; }
+.dr-page .dr-th-tag{ display:block; font-size:10px; font-weight:600; letter-spacing:.02em; text-transform:uppercase; color:#B75D00; margin-top:1px; }
+.dr-page .dr-table tbody tr{ background:#FFFFFF; }
+.dr-page .dr-table tbody tr:hover{ background:#F9FAFA; }
+.dr-page .dr-table tbody tr.dr-tr-ratio{ background:#FAFAFA; }
+.dr-page .dr-table tbody tr.dr-tr-ratio:hover{ background:#F5F6F7; }
+.dr-page .dr-table .dr-td{ padding:10px 14px; text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; font-weight:600; color:#0F1111; border-bottom:1px solid #E7E9EC; }
+.dr-page .dr-table .dr-td-metric{ text-align:left; font-weight:750; color:#0F1111; position:sticky; left:0; z-index:1; background:#FFFFFF; border-right:1px solid #E7E9EC; }
+.dr-page .dr-table tbody tr:hover .dr-td-metric{ background:#F9FAFA; }
+.dr-page .dr-table tbody tr.dr-tr-ratio .dr-td-metric{ background:#FAFAFA; }
+.dr-page .dr-table tbody tr.dr-tr-ratio:hover .dr-td-metric{ background:#F5F6F7; }
+.dr-page .dr-table .dr-td-mtd{ background:#EFF6FB; color:#146EB4; font-weight:700; border-left:1px solid #D2E4F2; border-right:1px solid #D2E4F2; }
+.dr-page .dr-table .dr-td-latest{ background:#FFF8E7; color:#0F1111; font-weight:700; border-left:1px solid #F2C265; }
+.dr-page .dr-table tbody tr:hover .dr-td-mtd{ background:#E6F0F9; }
+.dr-page .dr-table tbody tr:hover .dr-td-latest{ background:#FBF1D9; }
+.dr-page .dr-section-row td{ padding:6px 14px; font-size:11px; font-weight:800; letter-spacing:.05em; text-transform:uppercase; color:#565959; background:#F8F9FA; border-top:1px solid #D5D9D9; border-bottom:1px solid #D5D9D9; }
+.dr-page .dr-bullet{ display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:9px; vertical-align:middle; flex-shrink:0; }
+.dr-page .dr-metric-label{ font-weight:750; color:#0F1111; vertical-align:middle; }
 .dr-dash{ color:var(--text-muted); opacity:.55; }
 
-/* Four 5-day trend cards */
-.dr-trends{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:var(--space-4); }
-.dr-trend{ background:var(--bg-surface); border:1px solid var(--border-default); border-radius:var(--radius-sm); padding:14px 16px; box-shadow:var(--shadow-xs); min-width:0; }
-.dr-trend-label{ font-size:10px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.dr-trend-row{ display:flex; align-items:flex-end; justify-content:space-between; gap:10px; margin-top:10px; }
-.dr-trend-value{ font-family:'Outfit',sans-serif; font-variant-numeric:tabular-nums; font-size:17px; font-weight:800; letter-spacing:0; white-space:nowrap; }
-.dr-trend-spark{ width:110px; max-width:56%; flex-shrink:0; }
+/* Four 5-day trend cards -- white, hairline, restrained per-metric colour. */
+.dr-page .dr-trends{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:var(--space-4); }
+.dr-page .dr-trend{ background:#FFFFFF; border:1px solid #D5D9D9; border-radius:6px; padding:13px 15px; min-width:0; }
+.dr-page .dr-trend-head{ display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.dr-page .dr-trend-label{ font-size:11.5px; font-weight:750; letter-spacing:.03em; text-transform:uppercase; color:#0F1111; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dr-page .dr-trend-range{ font-size:11px; color:#565959; font-variant-numeric:tabular-nums; white-space:nowrap; flex-shrink:0; }
+.dr-page .dr-trend-body{ display:flex; align-items:flex-end; justify-content:space-between; gap:10px; margin-top:10px; }
+.dr-page .dr-trend-figs{ min-width:0; }
+.dr-page .dr-trend-value{ font-size:18px; font-weight:800; font-variant-numeric:tabular-nums; line-height:1.1; white-space:nowrap; }
+.dr-page .dr-trend-sub{ font-size:11px; color:#565959; margin-top:3px; }
+.dr-page .dr-trend-spark{ width:120px; max-width:52%; flex-shrink:0; }
 
-/* Formula / source note panel */
-.dr-note{ margin-top:var(--space-4); padding:14px 16px; border-radius:var(--radius-md); background:var(--accent-soft); border:1px solid var(--accent-border); font-size:11px; color:var(--text-secondary); line-height:1.65; }
-.dr-note strong{ color:var(--text-secondary); }
-.dr-note code{ font-family:'Outfit',sans-serif; font-size:10.5px; background:rgba(255,255,255,.6); padding:1px 5px; border-radius:5px; color:var(--accent-strong); }
+/* Methodology & metric definitions -- accessible disclosure with a 3-column grid. */
+.dr-page .dr-methodology{ margin-top:var(--space-4); }
+.dr-page .dr-methodology summary{ font-weight:750; color:#0F1111; }
+.dr-page .dr-method-grid{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; margin-top:10px; }
+.dr-page .dr-method-col{ min-width:0; }
+.dr-page .dr-method-h{ font-size:11.5px; font-weight:750; color:#0F1111; margin-bottom:5px; }
+.dr-page .dr-method-col p{ font-size:11.5px; line-height:1.6; color:#565959; margin:0; }
+.dr-page .dr-method-col ul{ list-style:disc; margin:0; padding-left:16px; }
+.dr-page .dr-method-col li{ font-size:11.5px; line-height:1.7; color:#565959; }
+.dr-page .dr-method-col strong{ color:#0F1111; font-weight:700; }
+.dr-page .dr-method-col code{ font-size:11px; background:#F3F4F5; color:#0F1111; padding:1px 5px; border-radius:4px; }
 
-/* Responsive: KPI + trend grids reflow; the table always scrolls horizontally */
+/* Responsive: KPIs 6->3->2, trends 4->2->1, observed cells wrap; the matrix always scrolls horizontally. */
 @media (max-width:1180px){
-  .dr-kpis{ grid-template-columns:repeat(3,minmax(0,1fr)); }
-  .dr-trends{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .dr-page .dr-kpis{ grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .dr-page .dr-trends{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .dr-page .dr-method-grid{ grid-template-columns:1fr; }
 }
-@media (max-width:640px){
-  .dr-kpis{ grid-template-columns:repeat(2,minmax(0,1fr)); }
-  .dr-trends{ grid-template-columns:1fr; }
-  .dr-trend-spark{ width:88px; }
-  .dr-kpi-value{ font-size:18px; }
+@media (max-width:760px){
+  .dr-page .dr-obs-grid{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .dr-page .dr-kpis{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .dr-page .dr-trends{ grid-template-columns:1fr; }
+  .dr-page .dr-trend-spark{ width:96px; }
+  .dr-page .dr-kpi-value{ font-size:19px; }
+}
+@media (prefers-reduced-motion: reduce){
+  .dr-page .dr-status-chevron{ transition:none; }
 }
 
 /* Report-specific table widths (unchanged behaviour, new palette) */
@@ -2086,49 +2171,11 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .op-report .bv-table .bv-section td{ color:var(--op-ink-3); }
 
 /* ---- DAILY REPORTING (.dr-page) ---------------------------------------- */
-.op-report .dr-band{ background:#EFF5FA; border:1px solid #CFE0EE; border-radius:9px; }
-.op-report .dr-band-icon{ color:var(--op-steel); }
-.op-report .dr-band-title{ color:#1B4E76; }
-.op-report .dr-band-text{ color:#1B4E76; opacity:.8; }
-/* KPI tiles: neutralise inline gradients -> pearl + restrained top keyline. */
-.op-report .dr-kpi{ background:var(--op-card)!important; color:var(--op-ink)!important; border:1px solid var(--op-border); border-radius:8px; box-shadow:0 1px 2px rgba(15,17,17,.05); }
-.op-report .dr-kpi-label{ color:var(--op-ink-3)!important; }
-.op-report .dr-kpi-value{ color:var(--op-ink)!important; }
-.op-report .dr-kpis .dr-kpi:nth-child(1){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--dash-primary); }
-.op-report .dr-kpis .dr-kpi:nth-child(2){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-steel-2); }
-.op-report .dr-kpis .dr-kpi:nth-child(3){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-orange-dark); }
-.op-report .dr-kpis .dr-kpi:nth-child(4){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-green); }
-.op-report .dr-kpis .dr-kpi:nth-child(5){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-orange); }
-.op-report .dr-kpis .dr-kpi:nth-child(6){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--op-red); }
-.op-report .dr-card{ background:var(--op-card); border:1px solid var(--op-border); border-radius:8px; box-shadow:0 1px 2px rgba(15,17,17,.05), 0 12px 30px -22px rgba(15,23,32,.30); }
-.op-report .dr-card-head{ background:none; border-bottom-color:var(--op-hair); }
-.op-report .dr-card-title{ color:var(--op-ink); }
-.op-report .dr-card-meta{ color:var(--op-ink-3); }
-.op-report .dr-badge-provisional{ background:var(--op-warn-soft); color:var(--op-warn-ink); }
-.op-report .dr-badge-final{ background:var(--op-green-soft); color:var(--op-green); }
-.op-report .dr-badge-defect{ background:var(--op-red-soft); color:var(--op-red); }
-.op-report .dr-refresh{ border-color:var(--op-border); background:#fff; color:var(--op-ink-2); border-radius:8px; }
-.op-report .dr-refresh:hover{ color:var(--op-orange-dark); border-color:var(--op-orange); background:var(--op-orange-soft); }
-/* Table: deep-navy sticky header, amber MTD accent, op body + sticky metric col. */
-.op-report .dr-table .dr-th{ background:var(--op-navy); color:rgba(233,238,242,.78); }
-.op-report .dr-table .dr-th-metric{ background:var(--op-navy); color:#FFFFFF; }
-.op-report .dr-table .dr-th-mtd{ color:#FFD9A6; box-shadow:inset 0 -2px 0 var(--op-orange); }
-.op-report .dr-table tbody tr{ background:var(--op-card); }
-.op-report .dr-table tbody tr:nth-child(even){ background:#FAFBFC; }
-.op-report .dr-table tbody tr:hover{ background:#F3F6F8; }
-.op-report .dr-table tbody tr.dr-row-highlight{ background:#EAF1F8; }
-.op-report .dr-table .dr-td{ border-bottom-color:var(--op-hair); color:var(--op-ink-2); }
-.op-report .dr-table .dr-td-metric{ border-right-color:var(--op-hair); color:var(--op-ink); }
-.op-report .dr-table .dr-td-mtd{ background:#EAF1F8; border-left-color:#CFE0EE; border-right-color:#CFE0EE; }
-.op-report .dr-table tbody tr:hover .dr-td-mtd{ background:#DEEAF5; }
-.op-report .dr-table tbody tr.dr-row-highlight .dr-td-mtd{ background:#E1EBF4; }
-.op-report .dr-metric-label{ color:var(--op-ink); }
+/* Daily Reporting is fully styled by the flat Amazon .dr-page block above. The former
+   .op-report .dr-* overrides (deep-navy table header, pearl KPI keylines, gradient card
+   head) are intentionally removed. Only the SHARED .dr-dash em-dash colour is kept here
+   -- it is reused by the FBA Plan and SKU Movement tables. */
 .op-report .dr-dash{ color:var(--op-ink-4); }
-.op-report .dr-trend{ background:var(--op-card); border:1px solid var(--op-border); border-radius:8px; box-shadow:0 1px 2px rgba(15,17,17,.05); }
-.op-report .dr-trend-label{ color:var(--op-ink-3); }
-.op-report .dr-note{ background:#FBFCFD; border:1px solid var(--op-border-2); border-radius:9px; color:var(--op-ink-2); }
-.op-report .dr-note strong{ color:var(--op-ink); }
-.op-report .dr-note code{ background:#EEF1F3; color:var(--op-steel); }
 
 /* ---- RETURNS & REFUND LEAKAGE (.rl-page) ------------------------------- */
 .op-report .recon-notice{ background:#EFF5FA; border:1px solid #CFE0EE; color:#1B4E76; border-radius:9px; padding:10px 13px; }

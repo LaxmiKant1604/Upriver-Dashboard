@@ -5539,7 +5539,7 @@ function ReconTh({ label, col, sort, setSort, align = "right" }) {
 const DAILY_METRICS = [
   { key: "sales", label: "Total Sales", fmt: (c, cur) => fmtMoney(c.sales, cur) },
   { key: "adSales", label: "Ad Sales", fmt: (c, cur) => (c.hasAd ? fmtMoney(c.adSales, cur) : "—") },
-  { key: "adSpend", label: "Ad Spends", fmt: (c, cur) => (c.hasAd ? fmtMoney(c.adSpend, cur) : "—") },
+  { key: "adSpend", label: "Ad Spend", fmt: (c, cur) => (c.hasAd ? fmtMoney(c.adSpend, cur) : "—") },
   { key: "clicks", label: "Clicks", fmt: (c) => (c.hasAd ? c.clicks.toLocaleString("en-US") : "—") },
   { key: "units", label: "Units", fmt: (c) => c.units.toLocaleString("en-US") },
   // ROI is the BUSINESS return on ad spend: Total Sales / Ad Spend (NOT Ad Sales / Ad Spend). The cell already
