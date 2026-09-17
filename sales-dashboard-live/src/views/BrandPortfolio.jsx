@@ -25,8 +25,9 @@ import { DataQualityAlert, EmptyState, ErrorState, SkeletonMetricGrid, SkeletonT
 import { fmtRangeLabel, monthKeyLabel, nInt } from "../lib/format.js";
 import { partitionBrandSourceAccounts, refreshBrandSourceAccounts } from "../lib/brand-source-refresh.js";
 import { marketplaceToday } from "../../lib/marketplaces.js";
-import { CURRENCY_OPTIONS, brandViewModel, inventoryCoverDays, isConvertedMode, shareOf, tacos } from "../lib/brand-view.js";
+import { CURRENCY_OPTIONS, brandViewModel, isConvertedMode, shareOf } from "../lib/brand-view.js";
 import { DASH, buildBrandTables, countryTitle, coverLabel, money, ratePct } from "../lib/brand-view-tables.js";
+import { orderStatusItems, portfolioKpis } from "../lib/brand-portfolio-view.js";
 import { regionLabel } from "../lib/region-view.js";
 import { ReportPanel, buildExportModel, freshnessSummaryLine, fxSummaryLine } from "./BrandReports.jsx";
 import {
@@ -40,28 +41,6 @@ const PORTFOLIO_VERSION = "brand-view-portfolio-v1";
    All of these are presentation-only: they read the SAME model + built tables the page
    already computes and reuse the existing formatters and cover/TACoS helpers. No new
    business metric, aggregation or currency rule is introduced here. */
-
-// The six headline KPI values, derived from the built tables. Money values are only
-// defined for a SINGLE currency group (converted mode, or a single-currency brand);
-// with several currency groups they stay null (an em dash) because money is never
-// summed across currencies. Units and FBA units are counts and always sum.
-function portfolioKpis(tables) {
-  const groups = tables?.dailyGroups || [];
-  const single = groups.length === 1 ? groups[0] : null;
-  const daily = tables?.daily || null;
-  const unattributedFba = daily && daily.inventoryScope !== "country" && groups.length === 1 ? daily.inventoryAccountTotal : null;
-  const fba = single ? (single.fbaAvailable === null ? unattributedFba : single.fbaAvailable) : null;
-  const rangeUnits = single ? single.rows.reduce((sum, row) => sum + (Number(row.coverUnits) || 0), 0) : null;
-  const cover = single && daily?.selectedRangeDays ? inventoryCoverDays(fba, rangeUnits, daily.selectedRangeDays) : null;
-  const sales = single ? single.totals.sales : null;
-  const ly = single ? single.totals.lySales : null;
-  const adSpend = single ? single.totals.adSpend : null;
-  const lyDelta = sales != null && Number.isFinite(ly) && ly > 0 ? (sales - ly) / ly : null;
-  return {
-    single: Boolean(single), currency: single?.currency || null,
-    sales, ly, lyDelta, units: tables?.totalUnits ?? null, fba, cover, adSpend, tacos: tacos(adSpend, sales),
-  };
-}
 
 function BvKpi({ label, value, sub, badge, hint, icon }) {
   return (
@@ -202,8 +181,13 @@ function BvJumpNav({ brandNote }) {
   const jump = (event, id) => {
     event.preventDefault();
     const el = typeof document !== "undefined" ? document.getElementById(id) : null;
-    if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" });
-    if (el && el.focus) { try { el.setAttribute("tabindex", "-1"); el.focus({ preventScroll: true }); } catch (_e) { /* ignore */ } }
+    if (!el) return;
+    // Smooth scroll only when motion is allowed; jump immediately under reduced motion.
+    const reduceMotion = typeof window !== "undefined" && window.matchMedia
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (el.scrollIntoView) el.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "start" });
+    // Focus transfer is preserved regardless of motion so keyboard users land on the section.
+    if (el.focus) { try { el.setAttribute("tabindex", "-1"); el.focus({ preventScroll: true }); } catch (_e) { /* ignore */ } }
   };
   return (
     <nav className="bv-jump" aria-label="Jump to section">
@@ -628,8 +612,10 @@ export default function BrandPortfolio({
         </div>
       )}
 
-      {/* ONE consolidated status panel: highest-priority message compact, the rest under View details. */}
-      <BvStatusPanel items={statusItems} />
+      {/* ONE consolidated status panel: the highest-SEVERITY current condition is shown
+          compact (error > warning > success > info/busy), the rest under View details.
+          orderStatusItems is a stable severity sort, so no message is dropped. */}
+      <BvStatusPanel items={orderStatusItems(statusItems)} />
 
       {!brand ? (
         <div className="panel">
@@ -696,7 +682,7 @@ export default function BrandPortfolio({
           <div className="bv-kpi-strip">
             <BvKpi label="Total Sales" badge={rangeBadge} value={kpis.single ? money(kpis.sales, kpis.currency) : DASH} sub={totalSalesSub} />
             <BvKpi label="Units Sold" icon={<Boxes size={12} aria-hidden="true" />} badge={rangeBadge} value={nInt(kpis.units)} sub={`Across ${marketplaceCount} marketplace${marketplaceCount === 1 ? "" : "s"}`} hint="Ordered units summed across every marketplace. Unit counts are never currency converted." />
-            <BvKpi label="FBA Inventory" value={kpis.fba === null ? DASH : nInt(kpis.fba)} sub={`Available FBA units${coverage.inventoryDate ? ` · as of ${coverage.inventoryDate}` : ""}`} hint={kpis.fba === null ? "A single FBA total is shown when one reporting currency is selected." : undefined} />
+            <BvKpi label="FBA Inventory" value={kpis.fba === null ? DASH : nInt(kpis.fba)} sub={`Available FBA units${coverage.inventoryDate ? ` · as of ${coverage.inventoryDate}` : ""}`} hint={kpis.fba === null ? "No overall FBA inventory total is available for this scope." : "Available FBA units for this brand's ASINs; unit counts are never currency converted."} />
             <BvKpi label="FBA Cover" value={kpis.cover === null ? DASH : coverLabel(kpis.cover)} sub="Based on selected-range unit velocity" hint="Available FBA units divided by this brand's average daily unit sales in the selected range." />
             <BvKpi label="Ad Spend" badge={adPartial ? "Partial" : null} value={kpis.adSpend === null ? DASH : money(kpis.adSpend, kpis.currency, 2)} sub={kpis.adSpend === null ? "No saved Ads history for this window" : (adPartial ? "Some marketplaces have no saved Ads" : "Same-ASIN brand ad spend")} />
             <BvKpi label="TACoS" badge="Overall" value={kpis.tacos === null ? DASH : ratePct(kpis.tacos)} sub="Brand ad spend ÷ brand sales" />
