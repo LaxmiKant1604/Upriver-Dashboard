@@ -2457,6 +2457,9 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .sku-mv-page .sku-mv-move-pos{ background:#EAF6F1; color:#067D62; }
 .sku-mv-page .sku-mv-move-neg{ background:#FBEDEC; color:#B12704; }
 .sku-mv-page .sku-mv-move-flat{ color:#8D9096; }
+/* Totals row -> light blue-gray fill, bold values, clear top border; blue MTD + Last-N (kept inside the scroll area). */
+.sku-mv-page .sku-mv tfoot td{ background:#EEF2F7; color:#0F1111; font-weight:800; border-top:2px solid #D5D9D9; border-bottom:none; }
+.sku-mv-page .sku-mv tfoot td.sku-mv-mtd, .sku-mv-page .sku-mv tfoot td.sku-mv-last5{ background:#DEEAF5; color:#146EB4; }
 
 /* Methodology disclosure. */
 .sku-mv-page .sku-mv-methodology{ margin-top:var(--space-4); background:#FFFFFF; border:1px solid #D5D9D9; border-radius:6px; padding:12px 14px; }

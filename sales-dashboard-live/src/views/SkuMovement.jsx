@@ -42,6 +42,10 @@ const stickyHead = (left, w) => ({ ...sticky(left, w), top: GROUP_H, zIndex: 5, 
 const col1Td = sticky(0, C1), col1Th = stickyHead(0, C1);
 const col2Td = sticky(C1, C2), col2Th = stickyHead(C1, C2);
 const col3Td = { ...sticky(C1 + C2, 150), maxWidth: 190 }, col3Th = { ...stickyHead(C1 + C2, 150), maxWidth: 190 };
+// Totals row: the identity cells stay sticky-left, on the footer's light blue-gray fill (bottom-sticky comes from the base .plan-table tfoot rule).
+const FOOT_BG = "#EEF2F7";
+const footSticky = (left, w) => ({ ...sticky(left, w), zIndex: 2, background: FOOT_BG });
+const footCol1 = footSticky(0, C1), footCol2 = footSticky(C1, C2), footCol3 = { ...footSticky(C1 + C2, 150), maxWidth: 190 };
 
 const num = (v) => (Number(v) || 0);
 
@@ -316,6 +320,9 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
 
   // Scope metadata + KPI / group date ranges -- presentation only, from the loaded rows and the account's proven date.
   const brandsInScope = useMemo(() => new Set(rawRows.map((r) => r.brand).filter(Boolean)).size, [rawRows]);
+  // Filter-aware brand count for the totals row -- consistent with filtered.length + totals.* (the header scope chip
+  // stays full-scope, paired with rawRows.length). Not a new formula: a distinct-brand count of the shown rows.
+  const filteredBrandCount = useMemo(() => new Set(filtered.map((r) => r.brand).filter(Boolean)).size, [filtered]);
   const scopeCurrency = useMemo(() => { const c = new Set(rawRows.map((r) => r.currency).filter(Boolean)); return c.size === 1 ? [...c][0] : null; }, [rawRows]);
   const prevCols = useMemo(() => recentPrevDates(dailyDates, N).prevDates, [dailyDates, N]);
   const mtdRange = useMemo(() => {
@@ -479,6 +486,24 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
                   </tr>
                 ))}
               </tbody>
+              <tfoot>
+                <tr className="sku-mv-foot">
+                  <td style={footCol1}>Totals &middot; {filtered.length} ASIN{filtered.length === 1 ? "" : "s"}</td>
+                  {shown("identifier") && <td style={footCol2}>&mdash;</td>}
+                  {shown("sku") && <td style={shown("identifier") ? footCol3 : footCol2}>All mapped SKUs</td>}
+                  {shown("brand") && <td style={{ textAlign: "left" }}>{filteredBrandCount} brand{filteredBrandCount === 1 ? "" : "s"}</td>}
+                  {shown("months") && totals.months.map((m, i) => <td key={i} className="mono">{m == null ? "—" : nInt(m)}</td>)}
+                  {shown("mtd") && <td className="mono pt-strong sku-mv-mtd">{nInt(totals.mtd)}</td>}
+                  {shown("daily") && recentCols.map((d, i) => <td key={d} className="mono">{nInt(totals.byDate[i])}</td>)}
+                  <td className="mono pt-strong sku-mv-last5">{nInt(totals.recent)}</td>
+                  {shown("prev") && <td className="mono">{nInt(totals.prev)}</td>}
+                  {shown("move") && <td className="mono">{totals.movementPercent == null ? <span className="sku-mv-move-flat">—</span> : <MoveBadge value={totals.movementPercent} />}</td>}
+                  {shown("avg") && <td className="mono">—</td>}
+                  {shown("runRate") && <td className="mono">—</td>}
+                  {shown("projected") && <td className="mono">—</td>}
+                  {shown("status") && <td>—</td>}
+                </tr>
+              </tfoot>
             </table>
           </div>
           {!sorted.length && <div className="empty-note" style={{ padding: "14px 16px" }}>{rawRows.length ? "No ASINs match this search or movement filter." : "No ASINs found for this scope."}</div>}

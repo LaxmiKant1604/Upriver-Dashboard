@@ -26,6 +26,10 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 const textOf = (html) => String(html).replace(/<[^>]*>/g, " ").replace(/&#x27;|&#39;/g, "'").replace(/&amp;/g, "&").replace(/&[a-z]+;/g, " ");
+const theadHtml = (h) => (String(h).split("</thead>")[0].split("<thead>")[1] || "");
+const tfootHtml = (h) => (String(h).split("</tfoot>")[0].split("<tfoot>")[1] || "");
+const headerThCount = (h) => { const trs = theadHtml(h).match(/<tr[\s\S]*?<\/tr>/g) || []; return ((trs[trs.length - 1] || "").match(/<th/g) || []).length; };
+const footTdCount = (h) => (tfootHtml(h).match(/<td/g) || []).length;
 
 const RENDER_ENTRY = `
 import React from "react";
@@ -55,6 +59,7 @@ const R={
   final: renderToStaticMarkup(el(SkuMovement,{...base,data:makeData(false),updating:false})),
   prov: renderToStaticMarkup(el(SkuMovement,{...base,data:makeData(true),updating:false})),
   reloading: renderToStaticMarkup(el(SkuMovement,{...base,data:makeData(false),updating:true})),
+  hidden: renderToStaticMarkup(el(SkuMovement,{...base,data:makeData(false),updating:false,hiddenColumns:["months","prev","avg","runRate","projected","status"]})),
 };
 process.stdout.write(JSON.stringify(R));
 `;
@@ -137,6 +142,37 @@ test("methodology is a collapsible disclosure that preserves its policy copy", a
   assert.ok(/<details class="sku-mv-methodology">/.test(r.final), "methodology is a disclosure");
   assert.ok(/SKU Movement methodology, coverage, and identifier policy/.test(textOf(r.final)), "the summary label matches the approved");
   assert.ok(/No action here ever creates a DataDoe export/.test(textOf(r.final)), "the zero-export policy copy is preserved");
+});
+
+test("the totals row (tfoot) renders with the dynamic filtered ASIN count + representative existing aggregates", async () => {
+  const r = await rendered();
+  assert.ok(/<tfoot>/.test(r.final), "a semantic <tfoot> renders");
+  const f = tfootHtml(r.final), ft = textOf(f);
+  assert.ok(ft.includes("Totals") && ft.includes("4 ASINs"), "the footer shows Totals + the dynamic filtered ASIN count (4)");
+  assert.ok(ft.includes("All mapped SKUs"), "the SKU total cell reads 'All mapped SKUs'");
+  assert.ok(/2 brands/.test(ft), "the Brand total cell shows the dynamic brand count (2)");
+  // Existing totals only (no new formula): MTD = 90+40+20+7 = 157; months = 300 / 350 / 365.
+  assert.ok(ft.includes("157"), "totals.mtd (157) renders");
+  assert.ok(ft.includes("300") && ft.includes("350") && ft.includes("365"), "totals.months (300 / 350 / 365) render");
+  assert.ok(/sku-mv-mtd/.test(f) && /sku-mv-last5/.test(f), "the MTD + Last-N footer cells carry the blue-emphasis classes");
+  // Last-N + Prev-N + movement totals are present (recentTotal/prevTotal sums + movementPercent).
+  assert.ok(/sku-mv-foot/.test(r.final), "the totals row carries its footer class");
+});
+
+test("the footer respects shown() -- hidden columns drop from the footer too, and it stays aligned with the header", async () => {
+  const r = await rendered();
+  assert.equal(headerThCount(r.final), footTdCount(r.final), "default: footer cell count == header column count");
+  assert.equal(headerThCount(r.hidden), footTdCount(r.hidden), "hidden config: footer cell count == header column count (no misalignment)");
+  const ft = textOf(tfootHtml(r.hidden));
+  // With months hidden, the month totals (300/365) are removed from the footer; Last-N (always shown) stays.
+  assert.ok(!ft.includes("300") && !ft.includes("365"), "hidden month totals are removed from the footer");
+});
+
+test("non-additive columns without an authoritative aggregate stay em dashes in the totals row (no invented averages/projections/status)", async () => {
+  const r = await rendered();
+  const dashes = (textOf(tfootHtml(r.final)).match(/—/g) || []).length;
+  // identifier + avg + run-rate + projected + status = at least five em dashes; no fabricated aggregate.
+  assert.ok(dashes >= 5, `the footer keeps em dashes for the identifier + the four non-additive aggregates (found ${dashes})`);
 });
 
 test("the retired deep-navy header + coral/violet accents are gone from the rendered output", async () => {
