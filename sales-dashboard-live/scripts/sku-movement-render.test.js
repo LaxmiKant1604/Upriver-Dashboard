@@ -155,8 +155,15 @@ test("the totals row (tfoot) renders with the dynamic filtered ASIN count + repr
   assert.ok(ft.includes("157"), "totals.mtd (157) renders");
   assert.ok(ft.includes("300") && ft.includes("350") && ft.includes("365"), "totals.months (300 / 350 / 365) render");
   assert.ok(/sku-mv-mtd/.test(f) && /sku-mv-last5/.test(f), "the MTD + Last-N footer cells carry the blue-emphasis classes");
-  // Last-N + Prev-N + movement totals are present (recentTotal/prevTotal sums + movementPercent).
   assert.ok(/sku-mv-foot/.test(r.final), "the totals row carries its footer class");
+  // EXACT footer aggregates, scoped to <tfoot> and anchored by class/count so an unrelated value cannot pass them.
+  // Fixture (four rows): daily byDate = 10+2+1+1 = 14 each of 7 days; Last 7 = 70+14+7+7 = 98; Prev 7 = 21+63+7+0 = 91;
+  // Movement = round((98-91)/91*1000)/10 = +7.7%; MTD = 90+40+20+7 = 157.
+  assert.equal((f.match(/<td class="mono">14<\/td>/g) || []).length, 7, "exactly seven daily-total cells (totals.byDate) render 14");
+  assert.ok(/<td class="mono pt-strong sku-mv-mtd">157<\/td>/.test(f), "the MTD total cell (sku-mv-mtd) renders exactly 157");
+  assert.ok(/<td class="mono pt-strong sku-mv-last5">98<\/td>/.test(f), "the Last-7 total cell (sku-mv-last5) renders exactly 98");
+  assert.equal((f.match(/<td class="mono">91<\/td>/g) || []).length, 1, "exactly one footer cell (the Previous-7 total) renders 91");
+  assert.ok(/<span class="sku-mv-move sku-mv-move-pos">\+7\.7%<\/span>/.test(f), "the movement total renders exactly +7.7% as a positive (green) badge");
 });
 
 test("the footer respects shown() -- hidden columns drop from the footer too, and it stays aligned with the header", async () => {
