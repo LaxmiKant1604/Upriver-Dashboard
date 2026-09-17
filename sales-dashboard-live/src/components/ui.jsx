@@ -117,11 +117,14 @@ export function Sparkline({ values, color = "#8B5CF6", height = 26, ariaLabel })
  * omitted entirely when the underlying comparison or history does not exist,
  * rather than passed as zero.
  */
-export function MetricCard({ label, value, hint, period, trend, spark, tone, variant, icon }) {
+export function MetricCard({ label, value, hint, period, trend, spark, tone, variant, icon, badge }) {
   return (
     <div className={"metric-card" + (variant ? ` ${variant}` : "")}>
       <div className="metric-top">
-        <div className="metric-label">{label}</div>
+        <div className="metric-label-row">
+          <div className="metric-label">{label}</div>
+          {badge}
+        </div>
         <span className="metric-actions">
           {icon ? <span className="metric-icon" aria-hidden="true">{icon}</span> : null}
           <MetricTooltip text={hint} />
@@ -182,7 +185,7 @@ export function MoneyShare({ amount, share }) {
  * so period-over-period logic stays where it already lives and is not
  * duplicated here.
  */
-export function ComparisonMetric({ label, basis, data, format }) {
+export function ComparisonMetric({ label, basis, data, format, provisional }) {
   if (!data) {
     return (
       <div className="cmp-card">
@@ -208,7 +211,10 @@ export function ComparisonMetric({ label, basis, data, format }) {
   const Icon = dir === "up" ? ArrowUpRight : dir === "down" ? ArrowDownRight : Minus;
   return (
     <div className="cmp-card">
-      <div className="cmp-label">{label}</div>
+      <div className="cmp-label-row">
+        <span className="cmp-label">{label}</span>
+        {provisional ? <span className="prov-badge" title="Provisional — this comparison includes an un-itemized D-1 whose value may change on the next order refresh">Provisional</span> : null}
+      </div>
       <div className={"cmp-value " + dir}>
         <Icon size={15} aria-hidden="true" />
         {text}
@@ -393,6 +399,86 @@ export function ObservedUnitsBreakdown({ completeness }) {
         Revenue counts priced units only — explicit zero-price and pending-price units add no sales. Explicit-zero and
         SKU-identifiable pending units are included in unit movement; unallocated pending units (no SKU/ASIN yet) are not.
         {completeness.finalizedThrough ? ` Fully finalized through ${completeness.finalizedThrough}.` : ""} Values reconcile automatically on later order refreshes.
+      </div>
+    </div>
+  );
+}
+
+/* --------------------------------------------------- data-status banner */
+
+/**
+ * DataStatusBanner -- ONE compact completeness banner for the Sales Dashboard.
+ *
+ * It replaces the former duplicated "Provisional D-1" summary line + the info /
+ * error DataQualityAlert pair with a single banner that clearly distinguishes
+ * the four completeness facts the source already computes -- source itemization,
+ * pending orders/items, price coverage, and the finalized-through date -- and
+ * keeps a "View details" affordance that reveals the existing ObservedUnitsBreakdown.
+ *
+ * It creates no data and reinterprets nothing: every value is read straight from
+ * the `completeness` object (the same fields the old banner used) and the price
+ * coverage is a plain restatement of the existing unit breakdown (priced of
+ * observed). `formatDate` is the caller's date formatter so this stays presentation-only.
+ */
+export function DataStatusBanner({ completeness, formatDate }) {
+  const [showDetails, setShowDetails] = React.useState(false);
+  if (!completeness) return null;
+  const c = completeness;
+  const fmt = typeof formatDate === "function" ? formatDate : (value) => value;
+  const num = (value) => (Number(value) || 0).toLocaleString("en-US");
+  const tone = c.sourceDefect ? "error" : c.provisional ? "warning" : "final";
+  const Icon = c.sourceDefect ? AlertTriangle : Info;
+  const statusLabel = c.sourceDefect ? "Source issue" : c.provisional ? "Provisional" : "Final";
+  const headline = c.sourceDefect
+    ? `Data status: source-data issue for D-1${c.latestDate ? ` (${fmt(c.latestDate)})` : ""}`
+    : c.provisional
+      ? `Data status: provisional D-1${c.latestDate ? ` (${fmt(c.latestDate)})` : ""}`
+      : `Data status: final${c.latestDate ? ` through ${fmt(c.latestDate)}` : ""}`;
+  const b = c.unitBreakdown;
+  const priced = b ? Number(b.pricedUnits) || 0 : null;
+  const observed = b ? Number(b.observedUnits) || 0 : null;
+  const pendingSku = b ? Number(b.pendingWithSkuUnits) || 0 : null;
+  const coverage = priced != null && observed ? (priced / observed) * 100 : null;
+  const facts = [];
+  if (c.itemizationPercent !== undefined && c.itemizationPercent !== null) {
+    facts.push({ k: "itemization", label: "Source itemization", value: `${c.itemizationPercent}% of orders itemized` });
+  }
+  if (c.pendingOrderCount != null || c.pendingUnitCount != null) {
+    facts.push({ k: "pending", label: "Pending", value: `${num(c.pendingOrderCount)} order${Number(c.pendingOrderCount) === 1 ? "" : "s"} · ${num(c.pendingUnitCount)} unit${Number(c.pendingUnitCount) === 1 ? "" : "s"} awaiting item prices` });
+  }
+  if (coverage != null) {
+    facts.push({ k: "coverage", label: "Price coverage", value: `${num(priced)} of ${num(observed)} units priced (${coverage.toFixed(1)}%${pendingSku ? `, ${num(pendingSku)} pending SKU` : ""})` });
+  }
+  if (c.finalizedThrough) {
+    facts.push({ k: "finalized", label: "Finalized through", value: fmt(c.finalizedThrough) });
+  }
+  const hasDetails = Boolean(b) || Boolean(c.notice);
+  return (
+    <div className={"data-status " + tone} role={c.sourceDefect ? "alert" : "status"}>
+      <Icon size={16} className="ds-icon" aria-hidden="true" />
+      <div className="ds-body">
+        <div className="ds-head">
+          <span className="ds-title">{headline}</span>
+          <span className="ds-badge">{statusLabel}</span>
+          {hasDetails ? (
+            <button type="button" className="ds-toggle" aria-expanded={showDetails} onClick={() => setShowDetails((value) => !value)}>
+              {showDetails ? "Hide details" : "View details"}
+            </button>
+          ) : null}
+        </div>
+        {facts.length ? (
+          <div className="ds-facts">
+            {facts.map((fact) => (
+              <span className="ds-fact" key={fact.k}><span className="ds-fact-label">{fact.label}:</span> {fact.value}</span>
+            ))}
+          </div>
+        ) : null}
+        {showDetails ? (
+          <div className="ds-details">
+            {c.notice ? <div className="ds-notice">{c.notice}</div> : null}
+            {b ? <ObservedUnitsBreakdown completeness={c} /> : null}
+          </div>
+        ) : null}
       </div>
     </div>
   );

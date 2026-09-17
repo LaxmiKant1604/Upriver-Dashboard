@@ -8,14 +8,16 @@ import { requestPasswordReset, resolveRecoveryRedirect, validateNewPassword, cla
 // introducing its own colours, spacing or radii.
 import { STYLE, CHART, DASH_CHART } from "./styles/theme.js";
 import {
-  BreakdownCard, ChartCard, ChartTooltip, ComparisonMetric, DataQualityAlert,
-  EmptyState, ErrorState, MetricCard, ObservedUnitsBreakdown, SegmentedControl, SkeletonChart,
+  BreakdownCard, ChartCard, ChartTooltip, ComparisonMetric, DataQualityAlert, DataStatusBanner,
+  EmptyState, ErrorState, MetricCard, SegmentedControl, SkeletonChart,
   SkeletonMetricGrid, SkeletonTable, Sparkline, TrendIndicator,
 } from "./components/ui.jsx";
 import { DateRangeSelector, Sidebar, TopBar, VIEW_TITLES } from "./components/shell.jsx";
 // The fluid-motion water/ripple background is an isolated, lazily code-split
 // layer (it dynamic-imports Three.js on mount). It carries no report state and
-// never re-renders React, so it cannot affect a value, formula or request.
+// never re-renders React, so it cannot affect a value, formula or request. The
+// approved flat redesign tones its wash down to a near-flat #F3F4F5 in theme.js
+// (it stays mounted so the existing transition-stability regressions hold).
 import WaterBackground from "./components/WaterBackground.jsx";
 // Display and CSV helpers are shared with the insight report views so both
 // render money, dates and units identically. Nothing here converts currency.
@@ -4111,6 +4113,16 @@ function DashboardApp({ session, access, onSignOut }) {
   // which are two different states and get two different screens.
   const hasDashboardData = scopedRows.length > 0;
 
+  // Whether the DISPLAYED figures include an un-itemized provisional D-1: the
+  // completeness state is provisional AND the selected range ends on that latest
+  // date. Presentation-only -- it drives the small "Provisional" badges on the
+  // KPI cards and comparison strip and never changes any value or calculation.
+  const provisionalActive = Boolean(salesCompleteness && salesCompleteness.provisional && rangeTo === latest);
+  // The comparison strip (DoD/WoW/MTD/YoY) is ALWAYS anchored on the latest date
+  // regardless of the selected range, so it is provisional whenever the latest
+  // date is provisional -- otherwise an incomplete comparison would appear final.
+  const comparisonsProvisional = Boolean(salesCompleteness && salesCompleteness.provisional);
+
   // GLOBAL Account/Brand view switch (available on every scoped report page). Switching to Brand View remembers the
   // account-context report to return to and opens the portfolio workspace (view "dashboard", mode "brand") with the
   // remembered valid region/brand; switching back to Account View restores that report and its filters. Idempotent:
@@ -4258,8 +4270,8 @@ function DashboardApp({ session, access, onSignOut }) {
           + ((view === "brandview" || view === "daily" || view === "returns" || view === "fbaplan" || view === "skumovement" || view === "campaign-ads" || (view === "ppc" && CAMPAIGN_ADS_TAB) || (view === "dashboard" && dashboardMode === "brand")) ? " op-workspace" : "")}>
           {/* Isolated fluid-motion background, only behind the account Dashboard.
               It self-disables under reduced motion / low-power / no-WebGL and
-              falls back to the static CSS wash, so nothing here can block or
-              alter the data render. */}
+              falls back to the static CSS wash (toned to a near-flat workspace by
+              the approved redesign), so nothing here can block or alter the data render. */}
           {view === "dashboard" && dashboardMode === "account" && <WaterBackground />}
           <TopBar
             viewTitle={VIEW_TITLES[view] || (view === "ppc" && CAMPAIGN_ADS_TAB ? VIEW_TITLES["campaign-ads"] : "Dashboard")}
@@ -4343,29 +4355,12 @@ function DashboardApp({ session, access, onSignOut }) {
           </div>
         </div>
 
-        {/* Two-layer PROVISIONAL/FINAL D-1 on the Sales Dashboard: covered-through vs latest-itemized are distinct.
-            The real itemized sales are shown; pending is counted separately; a 0%-itemized D-1 shows no fabricated
-            zero row -- the sales simply end at the latest itemized date while the badge says the D-1 is provisional. */}
-        {salesCompleteness && (
-          <div className="page-sub" style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
-            <span style={{ padding: "1px 8px", borderRadius: 10, fontSize: 11, fontWeight: 700,
-              background: salesCompleteness.provisional ? "rgba(210,140,0,0.14)" : (salesCompleteness.sourceDefect ? "rgba(200,50,50,0.14)" : "rgba(30,150,80,0.14)"),
-              color: salesCompleteness.provisional ? "#a86a00" : (salesCompleteness.sourceDefect ? "#b32424" : "#1a7f45") }}>
-              {salesCompleteness.provisional ? "Provisional D-1" : (salesCompleteness.sourceDefect ? "Source issue" : "Final D-1")}
-            </span>
-            <span>Covered through {fmtDateHuman(salesCompleteness.latestDate)}
-              {salesCompleteness.provisional ? ` · ${salesCompleteness.itemizationPercent}% itemized · ${salesCompleteness.pendingOrderCount} orders pending` : ""}
-              {salesCompleteness.finalizedThrough ? ` · finalized through ${fmtDateHuman(salesCompleteness.finalizedThrough)}` : ""}</span>
-          </div>
-        )}
-        {salesCompleteness && salesCompleteness.provisional && (
-          <DataQualityAlert tone="info" title={`Provisional D-1 (${fmtDateHuman(salesCompleteness.latestDate)}) — ${salesCompleteness.itemizationPercent}% of orders itemized`}
-            detail={`${salesCompleteness.notice} (${salesCompleteness.pendingOrderCount} order(s), ${salesCompleteness.pendingUnitCount} unit(s) pending item-level prices; sales shown are through the latest itemized date.)`} />
-        )}
-        {salesCompleteness && salesCompleteness.sourceDefect && (
-          <DataQualityAlert tone="error" title="Source-data issue for D-1" detail={salesCompleteness.notice} />
-        )}
-        {salesCompleteness && salesCompleteness.unitBreakdown && <ObservedUnitsBreakdown completeness={salesCompleteness} />}
+        {/* ONE compact data-status banner. It replaces the former duplicated Provisional D-1 summary line and the
+            info/error DataQualityAlert pair with a single banner that distinguishes source itemization, pending
+            orders/items, price coverage and the finalized-through date, and keeps a "View details" affordance that
+            reveals the existing ObservedUnitsBreakdown. Every value is read straight from the SAME completeness object
+            -- no completeness calculation, source state, or D-1 semantics is changed; only the presentation is. */}
+        <DataStatusBanner completeness={salesCompleteness} formatDate={fmtDateHuman} />
 
         {/* Global date filter. Presets, the custom range and its clamping are
             the app's existing logic; only the control's presentation changed. */}
@@ -4530,6 +4525,7 @@ function DashboardApp({ session, access, onSignOut }) {
               variant="hero"
               value={fmtMoney(kpi.sales, displayCurrency)}
               hint={`Order value in ${displayCurrency}. Currencies are never converted or combined.`}
+              badge={provisionalActive ? <span className="prov-badge" title="Provisional — includes an un-itemized D-1 whose value may change on the next order refresh">Provisional</span> : null}
               period={fmtRangeLabel(rangeFrom, rangeTo)}
               trend={kpiDeltas ? <TrendIndicator value={kpiDeltas.sales} text={fmtPct(kpiDeltas.sales)} title={`vs ${kpiDeltas.label}`} /> : null}
               spark={<Sparkline values={kpiSpark.sales} color={DASH_CHART.primary} ariaLabel="Daily sales for the selected range" />}
@@ -4538,6 +4534,8 @@ function DashboardApp({ session, access, onSignOut }) {
               label="Units Sold"
               icon={<Boxes size={15} />}
               value={kpi.units.toLocaleString("en-US")}
+              hint="Ordered units observed for this range: priced, explicit zero-price and identifiable pending units. Sales count priced units only; source itemization and price coverage are shown in the data-status banner above."
+              badge={provisionalActive ? <span className="prov-badge" title="Provisional — includes an un-itemized D-1 whose units may change on the next order refresh">Provisional</span> : null}
               period={fmtRangeLabel(rangeFrom, rangeTo)}
               trend={kpiDeltas ? <TrendIndicator value={kpiDeltas.units} text={fmtPct(kpiDeltas.units)} title={`vs ${kpiDeltas.label}`} /> : null}
               spark={<Sparkline values={kpiSpark.units} color={DASH_CHART.teal} ariaLabel="Daily units for the selected range" />}
@@ -4567,10 +4565,10 @@ function DashboardApp({ session, access, onSignOut }) {
               identity (no scope/date key) so the row updates in place without a
               remount or entrance-animation replay on a filter change. */}
           <div className="cmp-grid">
-            <ComparisonMetric label="Day over Day" basis="vs previous day" data={comparisons?.dod} format={fmtPct} />
-            <ComparisonMetric label="Week over Week" basis="vs prior 7 days" data={comparisons?.wow} format={fmtPct} />
-            <ComparisonMetric label="Month to Date" basis="vs last month, same days" data={comparisons?.mtd} format={fmtPct} />
-            <ComparisonMetric label="Year over Year" basis="vs same period last year" data={comparisons?.yoy} format={fmtPct} />
+            <ComparisonMetric label="Day over Day" basis="vs previous day" data={comparisons?.dod} format={fmtPct} provisional={comparisonsProvisional} />
+            <ComparisonMetric label="Week over Week" basis="vs prior 7 days" data={comparisons?.wow} format={fmtPct} provisional={comparisonsProvisional} />
+            <ComparisonMetric label="Month to Date" basis="vs last month, same days" data={comparisons?.mtd} format={fmtPct} provisional={comparisonsProvisional} />
+            <ComparisonMetric label="Year over Year" basis="vs same period last year" data={comparisons?.yoy} format={fmtPct} provisional={comparisonsProvisional} />
           </div>
 
           <ChartCard
@@ -4663,9 +4661,12 @@ function DashboardApp({ session, access, onSignOut }) {
         </>
         )}
 
-        <div className="footer-note">
+        <details className="methodology-disclosure">
+          <summary>Data methodology &amp; currency policy</summary>
+          <div className="footer-note">
           Total Sales is DataDoe Order Line Items <code>item_price_value</code>, the documented order-value field. Brand filtering uses DataDoe's Product Catalog by ASIN (<code>product_brand</code>) for the selected account. Money is shown in the selected marketplace's currency and is never converted or combined with another currency. Changing account, brand, date range or granularity reads saved data only; <strong>opening or reloading this report never calls DataDoe</strong> — refreshes run automatically on schedule or from the Data Sync Center. Comparisons and sparklines are computed from the same saved rows and are withheld — shown as an em dash or omitted — whenever this account lacks the earlier period they would need. If the warning above appears, DataDoe returned units without an order value; the next scheduled refresh corrects it once its upstream order data is complete.
-        </div>
+          </div>
+        </details>
       </div>
       ))}
 

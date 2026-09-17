@@ -1640,10 +1640,14 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
    ======================================================================== */
 :root{
   /* Deep graphite/navy with tonal layers for a premium rail. */
+  /* --op-rail: the sidebar rail (Stitch #131A22). --op-navy: the top command bar (#232F3E). */
+  --op-rail:#131A22; --op-rail-2:#1B242E;
   --op-navy:#232F3E; --op-navy-2:#1C2530; --op-navy-3:#2E3B49; --op-navy-hover:#37475A;
   --op-orange:#FF9900; --op-orange-dark:#E47911; --op-orange-strong:#C45500; --op-orange-soft:#FFF3E0;
   --op-amber:#F5A623;
-  --op-blue:#1E6FE0; --op-blue-link:#0066C0; --op-blue-soft:#EAF4FB; --op-blue-border:#BDD8EE;
+  /* --op-blue: the exact interactive blue (Stitch #146EB4). Used ONLY by the shell chrome and the .dashboard-page
+     scope -- the .op-report pages keep --op-steel, so they are untouched. */
+  --op-blue:#146EB4; --op-blue-link:#146EB4; --op-blue-soft:#E7F1F9; --op-blue-border:#B7D5EC;
   --op-steel:#2F6FB0; --op-steel-2:#5B8DB8;
   /* Cool-neutral surfaces + pearl-white cards. */
   --op-bg:#EEF1F4; --op-bg-2:#F4F6F8; --op-card:#FFFFFF;
@@ -1659,16 +1663,16 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 
 /* ---------------- SHARED CHROME · SIDEBAR (deep graphite rail) ---------------- */
 .sidebar{
-  background:linear-gradient(178deg,#26333F 0%, var(--op-navy) 46%, #1E2933 100%);
-  border-right:1px solid rgba(0,0,0,.34);
-  box-shadow:inset -1px 0 0 rgba(255,255,255,.03), 2px 0 16px rgba(12,20,28,.16);
+  background:var(--op-rail);
+  border-right:1px solid rgba(0,0,0,.5);
+  box-shadow:inset -1px 0 0 rgba(255,255,255,.04);
   color:#F4F6F8;
 }
-.sb-brand{ min-height:64px; border-bottom:1px solid rgba(255,255,255,.08); box-shadow:0 1px 0 rgba(0,0,0,.18); }
+.sb-brand{ min-height:64px; border-bottom:1px solid rgba(255,255,255,.07); box-shadow:none; }
 .sb-logo{
-  border-radius:10px; color:#241500; font-weight:800; letter-spacing:.03em;
-  background:linear-gradient(150deg,#FFC24D 0%, var(--op-orange) 48%, #E47911 100%);
-  box-shadow:inset 0 0 0 1px rgba(255,255,255,.30), 0 3px 10px rgba(228,121,17,.34);
+  border-radius:6px; color:#1A1000; font-weight:800; letter-spacing:.03em;
+  background:var(--op-orange);
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.25);
 }
 .sb-ws-name{ color:#FFFFFF; font-weight:800; letter-spacing:.01em; }
 .sb-ws-sub{ color:rgba(226,233,240,.52); }
@@ -1678,7 +1682,7 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .sb-group-label{ color:rgba(213,224,234,.40); font-size:9.5px; letter-spacing:.12em; padding:0 12px 6px; }
 .sb-nav::-webkit-scrollbar-thumb{ background:rgba(255,255,255,.16); border-color:transparent; }
 .sb-nav-item{
-  color:rgba(224,231,238,.78); font-weight:600; border-radius:8px; padding:8px 11px;
+  color:rgba(224,231,238,.78); font-weight:600; border-radius:6px; padding:8px 11px;
   transition:background var(--t-fast) var(--ease), color var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease);
 }
 .sb-nav-item svg{ color:rgba(210,220,230,.72); opacity:1; }
@@ -1688,8 +1692,8 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
    with a crisp amber route indicator + amber icon carrying the accent. */
 .sb-nav-item.active{
   color:#FFFFFF; font-weight:750;
-  background:linear-gradient(90deg, rgba(255,255,255,.11), rgba(255,255,255,.05));
-  box-shadow:inset 0 0 0 1px rgba(255,255,255,.06), 0 1px 2px rgba(0,0,0,.14);
+  background:rgba(255,255,255,.09);
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.06);
 }
 .sb-nav-item.active svg{ color:var(--op-amber); }
 .sb-nav-item.active::before{
@@ -1699,90 +1703,92 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .sb-nav-item.active::after{ display:none; }
 .sidebar.collapsed .sb-nav-item.active::before{ left:0; }
 .sb-footer{ border-top-color:rgba(255,255,255,.09); background:linear-gradient(180deg, transparent, rgba(0,0,0,.10)); }
-.sb-collapse,.sb-close{ color:rgba(220,228,236,.66); border-radius:8px; }
+.sb-collapse,.sb-close{ color:rgba(220,228,236,.66); border-radius:6px; }
 .sb-collapse:hover,.sb-close:hover{ color:#FFFFFF; background:rgba(255,255,255,.07); }
 .sb-collapse.signout:hover{ background:rgba(255,86,74,.16); color:#FFB9AE; }
 /* Keyboard focus is always visible on the graphite rail (amber ring). */
 .sb-nav-item:focus-visible,.sb-collapse:focus-visible,.sb-close:focus-visible{
-  outline:2px solid var(--op-amber); outline-offset:-2px; border-radius:8px;
+  outline:2px solid var(--op-amber); outline-offset:-2px; border-radius:6px;
 }
 
-/* ---------------- SHARED CHROME · TOP COMMAND BAR (pearl white) ---------------- */
+/* ---------------- SHARED CHROME · TOP COMMAND BAR (deep navy #232F3E) ---------------- */
 .topbar{
-  background:#FFFFFF; border-bottom:1px solid var(--op-border);
-  box-shadow:0 1px 0 rgba(15,17,17,.02), 0 2px 10px -6px rgba(15,17,17,.10);
+  background:var(--op-navy); border-bottom:1px solid rgba(0,0,0,.4);
+  box-shadow:0 1px 0 rgba(0,0,0,.18);
   backdrop-filter:none; -webkit-backdrop-filter:none;
-  padding:11px 26px; gap:18px; min-height:64px;
+  padding:11px 24px; gap:16px; min-height:60px;
 }
 .tb-right{ gap:10px; }
-.crumb-root{ color:var(--op-ink-2); }
+.crumb-root{ color:rgba(240,243,245,.72); }
 .crumb-root .crumb-mark{
-  color:var(--op-orange-strong); background:var(--op-orange-soft);
-  border:1px solid var(--op-warn-border); box-shadow:none; border-radius:6px;
+  color:#1A1000; background:var(--op-orange);
+  border:1px solid var(--op-orange-dark); box-shadow:none; border-radius:5px;
   font-weight:800; letter-spacing:.09em;
 }
-.crumb-root-text{ color:var(--op-ink-3); }
-.crumb-current{ color:var(--op-ink); font-weight:800; }
-.crumb-sep{ color:var(--op-ink-4); }
-.tb-select,.refresh-cluster{ border-color:var(--op-border); background:#FFFFFF; box-shadow:0 1px 2px rgba(15,17,17,.04); border-radius:9px; }
+.crumb-root-text{ color:rgba(240,243,245,.58); }
+.crumb-current{ color:#FFFFFF; font-weight:800; }
+.crumb-sep{ color:rgba(240,243,245,.42); }
+/* Command-bar scope controls: dark chips on the navy bar, light text, orange focus ring. */
+.tb-select,.refresh-cluster{ border-color:rgba(255,255,255,.16); background:var(--op-navy-3); box-shadow:none; border-radius:6px; }
 .tb-select{ padding:5px 11px; }
-.tb-select:hover,.refresh-cluster:hover{ border-color:#B9C0C5; box-shadow:0 2px 6px rgba(15,17,17,.07); }
-.tb-select:focus-within{ border-color:var(--op-orange); box-shadow:0 0 0 3px rgba(255,153,0,.16); }
-.tb-select-label,.refresh-status-label{ color:var(--op-ink-4); font-weight:800; }
-.tb-select select{ color:var(--op-ink); }
-.tb-select-value > svg,.tb-select > svg:first-child{ color:var(--op-ink-4); }
+.tb-select:hover,.refresh-cluster:hover{ border-color:rgba(255,255,255,.30); background:#354453; box-shadow:none; }
+.tb-select:focus-within{ border-color:var(--op-orange); box-shadow:0 0 0 3px rgba(255,153,0,.30); }
+.tb-select-label,.refresh-status-label{ color:rgba(226,233,240,.62); font-weight:800; }
+.tb-select select,.tb-select .tb-combo-trigger,.tb-select .tb-combo-text{ color:#F3F4F5; }
+.tb-select .tb-combo-text.placeholder{ color:rgba(226,233,240,.6); }
+.tb-select-value > svg,.tb-select > svg:first-child{ color:rgba(226,233,240,.6); }
 .tb-select-value select:focus-visible{ outline:none; }
 .refresh-cluster{ padding:5px 7px 5px 11px; }
-.refresh-status-value{ color:var(--op-ink); }
-.account-sync-btn,.refresh-btn,.menu-btn{ border-color:var(--op-border); background:#FFFFFF; color:var(--op-ink-2); border-radius:8px; }
+.refresh-status-value{ color:#F3F4F5; }
+.account-sync-btn,.refresh-btn,.menu-btn{ border-color:rgba(255,255,255,.18); background:var(--op-navy-3); color:rgba(226,233,240,.82); border-radius:6px; }
 .account-sync-btn:hover:not(:disabled),.refresh-btn:hover:not(:disabled){
-  border-color:var(--op-orange); color:var(--op-orange-dark); background:var(--op-orange-soft);
+  border-color:var(--op-orange); color:var(--op-orange); background:rgba(255,153,0,.14);
 }
-.menu-btn:hover{ border-color:#B9C0C5; }
+.menu-btn:hover{ border-color:rgba(255,255,255,.32); }
 .account-sync-btn:focus-visible,.refresh-btn:focus-visible,.menu-btn:focus-visible{ outline:2px solid var(--op-orange); outline-offset:1px; }
-.live-dot{ background:var(--op-green); box-shadow:0 0 0 3px var(--op-green-soft); }
-.live-dot.idle{ background:var(--op-ink-4); box-shadow:0 0 0 3px #E7E9EC; }
-/* Account view / Brand view segmented control (top bar chrome only). */
-.topbar .segmented{ background:#EEF1F3; border:1px solid var(--op-border); box-shadow:inset 0 1px 2px rgba(15,17,17,.03); border-radius:9px; }
-.topbar .segmented button{ color:var(--op-ink-2); font-weight:750; }
-.topbar .segmented button:hover:not(.active){ color:var(--op-ink); background:rgba(255,255,255,.75); }
-.topbar .segmented button.active{ color:var(--op-steel); background:#FFFFFF; box-shadow:0 1px 3px rgba(15,17,17,.12); }
+.live-dot{ background:var(--op-green); box-shadow:0 0 0 3px rgba(11,125,90,.4); }
+.live-dot.idle{ background:rgba(226,233,240,.5); box-shadow:0 0 0 3px rgba(255,255,255,.08); }
+/* Account view / Brand view segmented control on the navy bar: white active button, light idle. */
+.topbar .segmented{ background:rgba(0,0,0,.28); border:1px solid rgba(255,255,255,.14); box-shadow:none; border-radius:6px; }
+.topbar .segmented button{ color:rgba(226,233,240,.74); font-weight:750; }
+.topbar .segmented button:hover:not(.active){ color:#FFFFFF; background:rgba(255,255,255,.08); }
+.topbar .segmented button.active{ color:var(--op-navy); background:#FFFFFF; box-shadow:none; }
 .topbar .segmented button:focus-visible{ outline:2px solid var(--op-orange); outline-offset:1px; }
 
 /* ---------------- DASHBOARD WORKSPACE (scoped, premium neutral ground) ------- */
-.main-area.dash-workspace{ position:relative; background:var(--op-bg); }
+/* Flat cool-neutral workspace (Stitch #F3F4F5); the decorative water layer is
+   not rendered on the Sales Dashboard, per the approved flat design. */
+.main-area.dash-workspace{ position:relative; background:#F3F4F5; }
 .container.dashboard-page{
   position:relative; z-index:1; max-width:1760px;
-  padding:26px clamp(24px, 3.2vw, 60px) 0;
+  padding:24px clamp(24px, 3.2vw, 56px) 0;
 }
 .dashboard-page .page-head{ align-items:flex-end; }
-.dashboard-page .page-title{ color:var(--op-ink); font-size:23px; font-weight:800; letter-spacing:-.01em; }
+.dashboard-page .page-title{ color:var(--op-ink); font-size:23px; font-weight:800; letter-spacing:0; }
 .dashboard-page .page-sub{ color:var(--op-ink-2); font-size:12.5px; }
 
-/* Water/ripple background — unframed, behind the content, pointer-safe. A rich
-   (not grey) light-water wash is painted immediately; the WebGL canvas draws
-   over it. Both stay low-contrast so the workspace is readable if WebGL is off. */
+/* Water/ripple background layer — unframed, behind the content, pointer-safe.
+   The approved flat redesign paints a FLAT #F3F4F5 workspace wash (no atmospheric
+   gradient); the low-alpha WebGL canvas, when present, draws faintly over it and
+   self-disables under reduced motion / low power, so the workspace reads flat. */
 .water-bg{
   position:absolute; inset:0; z-index:0; pointer-events:none; overflow:hidden;
-  background:
-    radial-gradient(1200px 640px at 82% -8%, rgba(94,156,214,.22), transparent 62%),
-    radial-gradient(960px 560px at 2% 108%, rgba(28,84,146,.14), transparent 60%),
-    linear-gradient(180deg,#EAEFF4 0%, #EFF2F5 52%, #F1F4F6 100%);
+  background:#F3F4F5;
 }
 .water-bg-canvas{ position:absolute; inset:0; width:100%; height:100%; display:block; }
 
 /* Date range bar + segmented (dashboard scope only). */
-.dashboard-page .segmented{ background:#EEF1F3; border:1px solid var(--op-border); box-shadow:inset 0 1px 2px rgba(15,17,17,.03); border-radius:9px; }
-.dashboard-page .segmented button{ color:var(--op-ink-2); font-weight:750; }
-.dashboard-page .segmented button:hover:not(.active){ color:var(--op-ink); background:rgba(255,255,255,.75); }
-.dashboard-page .segmented button.active{ color:var(--op-steel); background:#FFFFFF; box-shadow:0 1px 3px rgba(15,17,17,.12); }
+.dashboard-page .segmented{ background:#EDEEF0; border:1px solid var(--op-border); box-shadow:none; border-radius:6px; padding:3px; }
+.dashboard-page .segmented button{ color:var(--op-ink-2); font-weight:750; border-radius:4px; }
+.dashboard-page .segmented button:hover:not(.active){ color:var(--op-ink); background:rgba(255,255,255,.8); }
+.dashboard-page .segmented button.active{ color:#FFFFFF; background:var(--op-navy); box-shadow:none; }
 .dashboard-page .segmented button:focus-visible{ outline:2px solid var(--op-orange); outline-offset:1px; }
-.dashboard-page .range-readout{ color:var(--op-ink-2); font-weight:700; }
+.dashboard-page .range-readout{ color:var(--op-ink-2); font-weight:700; border:1px solid var(--op-border); border-radius:6px; background:#FFFFFF; }
 .dashboard-page .range-readout svg{ color:var(--op-ink-4); }
-.dashboard-page .custom-range input[type=date]{ border:1px solid var(--op-border); border-radius:7px; color:var(--op-ink); background:#FFFFFF; }
+.dashboard-page .custom-range input[type=date]{ border:1px solid var(--op-border); border-radius:6px; color:var(--op-ink); background:#FFFFFF; }
 
 /* Data-quality alerts — quiet, compact, strong-then-soft (nothing dominates). */
-.dashboard-page .alert{ margin-top:12px; padding:9px 13px; gap:10px; border-radius:9px; align-items:flex-start; font-size:12px; }
+.dashboard-page .alert{ margin-top:12px; padding:9px 13px; gap:10px; border-radius:6px; align-items:flex-start; font-size:12px; }
 .dashboard-page .alert-icon{ margin-top:1px; opacity:.85; }
 .dashboard-page .alert-title{ font-size:12.5px; font-weight:750; letter-spacing:0; }
 .dashboard-page .alert-detail{ margin-top:2px; font-size:11.5px; line-height:1.55; opacity:.82; }
@@ -1792,44 +1798,46 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .dashboard-page .alert a,.dashboard-page .alert button{ font-weight:700; }
 
 /* Observed-unit breakdown — quiet premium surface. */
-.dashboard-page .obs-units{ border:1px solid var(--op-border-2); border-radius:10px; background:#FBFCFD; box-shadow:0 1px 2px rgba(15,17,17,.03); }
+.dashboard-page .obs-units{ border:1px solid var(--op-border-2); border-radius:6px; background:#FBFCFD; box-shadow:none; margin-top:0; }
 .dashboard-page .obs-units-title{ color:var(--op-ink); }
 .dashboard-page .obs-units-total,.dashboard-page .obs-units-note{ color:var(--op-ink-3); }
 
 /* KPI + comparison cards — pearl white, thin border, 8px radius, controlled depth. */
 .dashboard-page .metric-grid{ gap:16px; margin-top:18px; }
 .dashboard-page .cmp-grid{ gap:14px; margin-top:14px; }
+/* Flat white cards, 1px #D5D9D9-family border, 6px radius, NO atmospheric shadow.
+   Elevation is functional only: a hairline lift on hover, never a drop shadow. */
 .dashboard-page .metric-card,
 .dashboard-page .cmp-card{
-  background:var(--op-card); border:1px solid var(--op-border); border-radius:8px;
-  box-shadow:0 1px 2px rgba(15,17,17,.05);
-  transition:transform var(--t) var(--ease), box-shadow var(--t) var(--ease), border-color var(--t) var(--ease);
+  background:var(--op-card); border:1px solid var(--op-border); border-radius:6px;
+  box-shadow:none;
+  transition:box-shadow var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
 }
-.dashboard-page .metric-card{ padding:16px 18px 15px; }
-.dashboard-page .metric-card:hover{ transform:translateY(-2px); border-color:#C3CACE; box-shadow:0 10px 26px -12px rgba(15,23,32,.28); }
-.dashboard-page .cmp-card{ padding:12px 15px; }
-.dashboard-page .cmp-card:hover{ border-color:#C3CACE; box-shadow:0 6px 16px -10px rgba(15,23,32,.20); }
+.dashboard-page .metric-card{ padding:15px 16px 14px; }
+.dashboard-page .metric-card:hover{ border-color:#C3CACE; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+.dashboard-page .cmp-card{ padding:12px 14px; }
+.dashboard-page .cmp-card:hover{ border-color:#C3CACE; box-shadow:0 1px 3px rgba(0,0,0,.08); }
 .dashboard-page .metric-label,.dashboard-page .cmp-label{ color:var(--op-ink-2); font-size:10.5px; font-weight:800; letter-spacing:.05em; }
-.dashboard-page .metric-value{ color:var(--op-ink); font-size:25px; letter-spacing:-.01em; margin-top:11px; }
+.dashboard-page .metric-value{ color:var(--op-ink); font-size:25px; letter-spacing:0; margin-top:11px; }
 .dashboard-page .metric-period,.dashboard-page .cmp-basis{ color:var(--op-ink-4); }
-.dashboard-page .metric-icon{ width:30px; height:30px; border-radius:9px; color:var(--op-ink-2); background:#EEF1F3; }
+.dashboard-page .metric-icon{ width:30px; height:30px; border-radius:6px; color:var(--op-ink-2); background:#EEF1F3; }
 .dashboard-page .metric-card:nth-child(2) .metric-icon{ color:var(--op-green); background:#E9F6EF; }
-.dashboard-page .metric-card:nth-child(3) .metric-icon{ color:var(--op-steel); background:#E9F1F8; }
+.dashboard-page .metric-card:nth-child(3) .metric-icon{ color:var(--op-blue); background:var(--op-blue-soft); }
 .dashboard-page .metric-card:nth-child(4) .metric-icon{ color:var(--op-orange-dark); background:#FDF1DE; }
-/* Total Sales HERO — the primary KPI: pearl card, larger figure, fine steel keyline. */
+/* Total Sales HERO — the primary KPI: flat white card, larger figure, a fine blue top keyline. */
 .dashboard-page .metric-card.hero{
-  background:linear-gradient(180deg,#FFFFFF 0%, #FBFCFE 100%); border:1px solid var(--op-border);
-  color:var(--op-ink); box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 var(--dash-primary);
+  background:var(--op-card); border:1px solid var(--op-border);
+  color:var(--op-ink); box-shadow:inset 0 2px 0 0 var(--op-blue);
 }
-.dashboard-page .metric-card.hero:hover{ box-shadow:0 10px 26px -12px rgba(15,23,32,.30), inset 0 2px 0 0 var(--dash-primary); }
+.dashboard-page .metric-card.hero:hover{ border-color:#C3CACE; box-shadow:0 1px 3px rgba(0,0,0,.08), inset 0 2px 0 0 var(--op-blue); }
 .dashboard-page .metric-card.hero::after{ display:none; }
-.dashboard-page .metric-card.hero .metric-label{ color:var(--dash-primary); }
+.dashboard-page .metric-card.hero .metric-label{ color:var(--op-blue); }
 .dashboard-page .metric-card.hero .metric-period,
 .dashboard-page .metric-card.hero .metric-hint{ color:var(--op-ink-4); }
 .dashboard-page .metric-card.hero .metric-value{ color:var(--op-ink); font-size:31px; }
-.dashboard-page .metric-card.hero .metric-spark path:first-child{ fill:var(--dash-primary); fill-opacity:.14; stroke:none; }
-.dashboard-page .metric-card.hero .metric-spark path:nth-child(2){ fill:none; stroke:var(--dash-primary); }
-.dashboard-page .metric-card.hero .metric-spark circle{ fill:var(--dash-primary); }
+.dashboard-page .metric-card.hero .metric-spark path:first-child{ fill:var(--op-blue); fill-opacity:.14; stroke:none; }
+.dashboard-page .metric-card.hero .metric-spark path:nth-child(2){ fill:none; stroke:var(--op-blue); }
+.dashboard-page .metric-card.hero .metric-spark circle{ fill:var(--op-blue); }
 /* Trend pills + comparison values: emerald up / coral down (icon always present). */
 .dashboard-page .trend{ font-weight:750; }
 .dashboard-page .trend.up,.dashboard-page .metric-card.hero .trend.up{ color:var(--op-green); background:var(--op-green-soft); border-color:var(--op-green-border); }
@@ -1839,17 +1847,18 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 
 /* Chart + breakdown surfaces — controlled depth. */
 .dashboard-page .chart-card,
-.dashboard-page .panel{ background:var(--op-card); border:1px solid var(--op-border); border-radius:8px; box-shadow:0 1px 2px rgba(15,17,17,.05), 0 12px 30px -22px rgba(15,23,32,.30); }
+.dashboard-page .panel{ background:var(--op-card); border:1px solid var(--op-border); border-radius:6px; box-shadow:none; }
 .dashboard-page .chart-card{ margin-top:18px; }
-.dashboard-page .chart-card-head{ border-bottom-color:var(--op-hair); padding:16px 20px 13px; }
+.dashboard-page .chart-card-head{ border-bottom-color:var(--op-hair); padding:15px 18px 12px; }
 .dashboard-page .chart-card-title,.dashboard-page .panel-title{ color:var(--op-ink); font-size:14.5px; font-weight:800; }
 .dashboard-page .chart-card-sub{ color:var(--op-ink-3); }
-.dashboard-page .chart-tip{ border:1px solid var(--op-border); border-radius:10px; box-shadow:0 14px 34px -12px rgba(15,23,32,.32); }
+.dashboard-page .chart-tip{ border:1px solid var(--op-border); border-radius:6px; box-shadow:0 2px 5px rgba(15,23,32,.15); }
 .dashboard-page .chart-tip-label{ color:var(--op-ink); }
 .dashboard-page .chart-tip-row{ color:var(--op-ink-2); }
 .dashboard-page .bd-bar{ background:#EDF0F2; }
 .dashboard-page .bd-fill{ background:#C7D6E4; }
-.dashboard-page .bd-row.active .bd-fill{ background:var(--dash-primary); box-shadow:0 0 8px rgba(47,111,176,.28); }
+.dashboard-page .bd-row.active .bd-fill{ background:var(--op-blue); box-shadow:none; }
+.dashboard-page .bd-row.active .bd-name{ color:var(--op-blue-link); }
 .dashboard-page .bd-value{ color:var(--op-ink); }
 .dashboard-page .bd-share{ color:var(--op-ink-4); }
 .dashboard-page .breakdown-grid{ gap:16px; margin-top:16px; }
@@ -1858,6 +1867,53 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .dashboard-page .footer-note{ margin-top:28px; padding:16px 2px 8px; font-size:11.5px; line-height:1.7; color:var(--op-ink-2); border-top:1px solid var(--op-border-2); }
 .dashboard-page .footer-note code{ color:var(--op-ink); background:#EEF1F3; border-radius:5px; }
 .dashboard-page .footer-note strong{ color:var(--op-ink); }
+
+/* ---- Consolidated data-status banner: ONE compact banner with a 4px left accent.
+   Facts wrap (never truncate); a View details toggle reveals the unit breakdown. ---- */
+.dashboard-page .data-status{
+  display:flex; align-items:flex-start; gap:10px; margin-top:12px;
+  border:1px solid var(--op-border); border-left-width:4px; border-radius:6px;
+  padding:9px 13px; background:var(--op-card); font-size:12px; line-height:1.5;
+}
+.dashboard-page .data-status.warning{ background:#FBF5E7; border-color:#E7D19A; border-left-color:var(--op-orange-dark); color:var(--op-warn-ink); }
+.dashboard-page .data-status.error{ background:var(--op-red-soft); border-color:var(--op-red-border); border-left-color:var(--op-red); color:#8A2D17; }
+.dashboard-page .data-status.final{ background:#F1F7F4; border-color:var(--op-green-border); border-left-color:var(--op-green); color:var(--op-green); }
+.dashboard-page .ds-icon{ flex:none; margin-top:1px; opacity:.9; }
+.dashboard-page .ds-body{ min-width:0; flex:1; }
+.dashboard-page .ds-head{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.dashboard-page .ds-title{ font-weight:750; color:var(--op-ink); }
+.dashboard-page .ds-badge{ font-size:10px; font-weight:800; letter-spacing:.02em; padding:2px 7px; border-radius:3px; border:1px solid currentColor; background:rgba(255,255,255,.55); }
+.dashboard-page .ds-toggle{ margin-left:auto; border:none; background:none; padding:0; font:700 12px inherit; color:var(--op-blue-link); cursor:pointer; }
+.dashboard-page .ds-toggle:hover{ text-decoration:underline; }
+.dashboard-page .ds-toggle:focus-visible{ outline:2px solid var(--op-blue); outline-offset:2px; border-radius:3px; }
+.dashboard-page .ds-facts{ display:flex; flex-wrap:wrap; gap:3px 16px; margin-top:5px; color:var(--op-ink-2); }
+.dashboard-page .ds-fact{ min-width:0; }
+.dashboard-page .ds-fact-label{ font-weight:700; color:var(--op-ink); }
+.dashboard-page .ds-details{ margin-top:8px; }
+.dashboard-page .ds-notice{ font-size:11.5px; color:var(--op-ink-3); line-height:1.55; margin-bottom:6px; }
+
+/* ---- Small "Provisional" indicator on KPI + comparison cards (amber, functional). ---- */
+.dashboard-page .prov-badge{
+  display:inline-flex; align-items:center; font-size:9.5px; font-weight:800; letter-spacing:.02em;
+  padding:2px 6px; border-radius:3px; white-space:nowrap;
+  color:var(--op-warn-ink); background:#FBF3E2; border:1px solid var(--op-warn-border);
+}
+.dashboard-page .metric-label-row{ display:flex; align-items:center; gap:7px; min-width:0; }
+.dashboard-page .cmp-label-row{ display:flex; align-items:center; gap:7px; min-width:0; }
+.dashboard-page .cmp-label-row .cmp-label{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+/* ---- Data methodology & currency policy — compact expandable disclosure. ---- */
+.dashboard-page .methodology-disclosure{ margin-top:24px; border-top:1px solid var(--op-border-2); padding-top:12px; }
+.dashboard-page .methodology-disclosure > summary{
+  cursor:pointer; list-style:none; font-size:12px; font-weight:750; color:var(--op-ink-2);
+  display:inline-flex; align-items:center; gap:7px; padding:2px 0;
+}
+.dashboard-page .methodology-disclosure > summary::-webkit-details-marker{ display:none; }
+.dashboard-page .methodology-disclosure > summary::before{ content:'\\25B8'; color:var(--op-ink-4); font-size:11px; transition:transform var(--t-fast) var(--ease); }
+.dashboard-page .methodology-disclosure[open] > summary::before{ transform:rotate(90deg); }
+.dashboard-page .methodology-disclosure > summary:hover{ color:var(--op-ink); }
+.dashboard-page .methodology-disclosure > summary:focus-visible{ outline:2px solid var(--op-blue); outline-offset:2px; border-radius:3px; }
+.dashboard-page .methodology-disclosure .footer-note{ margin-top:0; padding-top:8px; border-top:none; }
 
 /* Ultra-wide: keep the workspace generous, never a narrow island; single-account
    "Sales by Account" yields width to "Sales by Brand" instead of an empty card. */
@@ -1899,9 +1955,7 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 @keyframes dashRise{ from{ opacity:0; transform:translateY(9px); } to{ opacity:1; transform:none; } }
 @keyframes kpiReveal{ from{ opacity:0; transform:translateY(4px); } to{ opacity:1; transform:none; } }
 @media (prefers-reduced-motion: reduce){
-  .water-bg{ background:
-      radial-gradient(1100px 560px at 84% -8%, rgba(94,156,214,.14), transparent 60%),
-      linear-gradient(180deg,#EDF1F5,#F1F4F6); }
+  .water-bg{ background:#F3F4F5; }
 }
 
 /* ========================================================================
