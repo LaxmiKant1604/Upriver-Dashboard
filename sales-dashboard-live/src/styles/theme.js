@@ -2237,6 +2237,114 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .op-report .pt-brand{ color:var(--op-steel); }
 .op-report .plan-table td.pt-strong{ color:var(--op-ink); }
 
+/* ===== FBA SHIPMENT PLAN -- flat Amazon operational workspace (.plan-page) =====
+   Approved Stitch redesign. White panels on the neutral workspace, #D5D9D9 hairlines, <=6px radii, semantic
+   accents (blue #146EB4, orange #FF9900, green #067D62), tabular numerals -- no gradients, no violet, no glass.
+   Every selector is scoped under .plan-page so the SHARED .plan-*/.pt-* classes (SKU P&L, SKU Movement,
+   Reconciliation) stay untouched; these rules follow the .op-report layer above and win at equal specificity
+   by source order. */
+/* Header + right-side scope metadata panel (real account / marketplace / sales-date / inventory-state only). */
+.plan-page .plan-head{ display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+.plan-page .plan-head-main{ min-width:0; }
+.plan-page .plan-meta{ display:flex; flex-wrap:wrap; align-items:stretch; background:#FFFFFF; border:1px solid #D5D9D9; border-radius:6px; overflow:hidden; }
+.plan-page .plan-meta-item{ display:flex; flex-direction:column; gap:2px; padding:8px 14px; border-left:1px solid #E7E9EC; min-width:0; }
+.plan-page .plan-meta-item:first-child{ border-left:0; }
+.plan-page .plan-meta-k{ font-size:10px; font-weight:750; letter-spacing:.04em; text-transform:uppercase; color:#565959; }
+.plan-page .plan-meta-v{ font-size:12.5px; font-weight:700; color:#0F1111; white-space:nowrap; font-variant-numeric:tabular-nums; }
+.plan-page .plan-meta-badge{ align-self:flex-start; font-size:11px; font-weight:700; padding:1px 8px; border-radius:3px; }
+.plan-page .plan-meta-badge.is-ok{ background:#F3F9F6; border:1px solid #CDE5D8; color:#067D62; }
+.plan-page .plan-meta-badge.is-warn{ background:#FFF8E7; border:1px solid #F2C265; color:#B75D00; }
+
+/* Planning parameters panel (wraps the existing settings bar + collapsible demand weighting). */
+.plan-page .plan-params{ margin-top:var(--space-4); background:#FFFFFF; border:1px solid #D5D9D9; border-radius:6px; padding:12px 14px; }
+.plan-page .plan-params-head{ margin-bottom:10px; }
+.plan-page .plan-params-title{ font-size:11px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:#565959; }
+.plan-page .plan-params .plan-settings{ margin-top:0; padding:0; border:0; background:none; border-radius:0; }
+.plan-page .plan-wdd-disclosure{ margin-top:10px; border-top:1px solid #E7E9EC; padding-top:10px; }
+.plan-page .plan-wdd-disclosure > summary{ cursor:pointer; font-size:12px; font-weight:700; color:#0F1111; list-style:none; display:inline-flex; align-items:center; gap:6px; }
+.plan-page .plan-wdd-disclosure > summary::-webkit-details-marker{ display:none; }
+.plan-page .plan-wdd-disclosure > summary::before{ content:"\\25B8"; color:#565959; font-size:10px; transition:transform .15s ease; }
+.plan-page .plan-wdd-disclosure[open] > summary::before{ transform:rotate(90deg); }
+.plan-page .plan-wdd-disclosure .plan-settings{ margin-top:10px; }
+.plan-page .plan-field-label{ color:#565959; }
+.plan-page .plan-seg-btn{ border:1px solid #D5D9D9; background:#FFFFFF; color:#565959; border-radius:4px; font-weight:700; }
+.plan-page .plan-seg-btn.active{ background:#146EB4; border-color:#146EB4; color:#FFFFFF; }
+.plan-page .plan-seg-custom.active{ border-color:#146EB4; box-shadow:inset 0 0 0 1px #D2E4F2; }
+.plan-page .plan-set-group select, .plan-page .plan-set-group input[type=number]{ border:1px solid #D5D9D9; border-radius:4px; color:#0F1111; }
+
+/* Freshness row. */
+.plan-page .plan-freshness{ background:#FFFFFF; border:1px solid #D5D9D9; border-radius:6px; color:#565959; }
+.plan-page .plan-freshness strong{ color:#0F1111; }
+/* Inventory-unavailable warning (amber, left accent) -- scoped so the shared .alert is untouched elsewhere. */
+.plan-page .alert.warning{ background:#FFF8E7; border:1px solid #F2C265; border-left:4px solid #B75D00; color:#5F4300; border-radius:6px; }
+.plan-page .alert.warning svg{ color:#B75D00; }
+
+/* Six KPI cells -> flat white cards, 2px semantic top accent, supporting sub-text. */
+.plan-page .plan-stat-row{ grid-template-columns:repeat(6,minmax(0,1fr)); }
+.plan-page .plan-stat{ background:#FFFFFF; border:1px solid #D5D9D9; border-top:2px solid #C3CACE; border-radius:6px; box-shadow:none; padding:11px 13px; }
+.plan-page .plan-stat:hover{ transform:none; box-shadow:0 1px 3px rgba(0,0,0,.08); border-color:#D5D9D9; }
+.plan-page .plan-stat--blue{ border-top-color:#146EB4; }
+.plan-page .plan-stat--amber{ border-top-color:#FF9900; }
+.plan-page .plan-stat--neutral{ border-top-color:#C3CACE; }
+.plan-page .plan-stat-label{ font-size:10.5px; font-weight:800; letter-spacing:.05em; text-transform:uppercase; color:#565959; }
+.plan-page .plan-stat-value{ font-size:20px; font-weight:800; color:#0F1111; margin-top:4px; }
+.plan-page .plan-stat-value.plan-stat-accent{ color:#146EB4; }
+.plan-page .plan-stat-sub{ font-size:11px; color:#565959; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
+/* Toolbar -> flat; search grows, actions wrap to the right. */
+.plan-page .plan-controls{ align-items:center; }
+.plan-page .plan-search{ flex:1 1 240px; min-width:200px; }
+.plan-page .plan-tool-btn{ height:36px; border:1px solid #D5D9D9; background:#FFFFFF; color:#0F1111; border-radius:4px; font-weight:600; }
+.plan-page .plan-tool-btn:hover:not(:disabled){ border-color:#146EB4; color:#146EB4; background:#F7FAFD; }
+.plan-page .plan-export-btn{ height:36px; }
+
+/* The matrix: light neutral headers, semantic group bands, sticky headers + first column. */
+.plan-page .panel{ box-shadow:none; }
+.plan-page .plan-table{ min-width:1720px; }
+.plan-page .plan-table .plan-group-row th{ background:#F3F4F5; color:#565959; font-size:10px; font-weight:800; letter-spacing:.04em; text-transform:uppercase; text-align:center; padding:6px 10px; border-bottom:1px solid #D5D9D9; border-right:1px solid #E7E9EC; position:sticky; top:0; z-index:4; box-shadow:none; }
+.plan-page .plan-table .plan-group-th.plan-group-id{ position:sticky; left:0; z-index:6; background:#F3F4F5; text-align:left; color:#0F1111; }
+/* Semantic group bands -- specificity raised (.plan-group-th.plan-group-*) so they win over .plan-group-row th. */
+.plan-page .plan-table .plan-group-th.plan-group-sales{ background:#EAF2FB; color:#146EB4; box-shadow:inset 0 2px 0 #146EB4; }
+.plan-page .plan-table .plan-group-th.plan-group-planning{ background:#FEF6E7; color:#B75D00; box-shadow:inset 0 2px 0 #FF9900; }
+.plan-page .plan-table thead tr:last-child th{ background:#FAFAFA; color:#565959; font-size:11px; font-weight:800; letter-spacing:.03em; border-bottom:1px solid #D5D9D9; top:27px; z-index:3; }
+.plan-page .plan-table thead tr:last-child th.pt-id{ background:#FAFAFA; color:#0F1111; z-index:5; }
+.plan-page .plan-table thead tr:last-child th.pt-sorted{ color:#146EB4; }
+.plan-page .plan-table th.pt-id, .plan-page .plan-table td.pt-id{ min-width:280px; max-width:300px; background:#FFFFFF; border-right:1px solid #D5D9D9; }
+.plan-page .pt-name{ color:#0F1111; max-width:264px; }
+.plan-page .pt-meta{ color:#565959; max-width:264px; }
+.plan-page .pt-brand{ color:#146EB4; max-width:264px; }
+.plan-page .plan-table td{ color:#0F1111; border-bottom:1px solid #E7E9EC; font-weight:500; }
+.plan-page .plan-table tbody tr:hover td{ background:#F5F9FD; }
+.plan-page .plan-table tbody tr:hover td.pt-id{ background:#F5F9FD; }
+.plan-page .plan-table td.pt-strong{ color:#0F1111; font-weight:700; }
+/* Current MTD + Target Units -> restrained blue; Recommended -> amber ONLY when a recommendation exists. */
+.plan-page .plan-table td.pt-mtd{ background:#EFF6FB; font-weight:700; border-left:1px solid #D2E4F2; border-right:1px solid #D2E4F2; }
+.plan-page .plan-table thead tr:last-child th.pt-mtd{ background:#EFF6FB; color:#0F1111; box-shadow:inset 0 2px 0 #146EB4; }
+.plan-page .plan-table td.pt-target{ color:#146EB4; background:#EFF6FB; border-left:1px solid #D2E4F2; border-right:1px solid #D2E4F2; }
+.plan-page .plan-table thead tr:last-child th.pt-target{ background:#EFF6FB; color:#146EB4; box-shadow:inset 0 2px 0 #146EB4; }
+.plan-page .plan-table td.pt-reco{ color:#B75D00; }
+.plan-page .plan-table tbody tr:hover td.pt-mtd,.plan-page .plan-table tbody tr:hover td.pt-target{ background:#E6F0F9; }
+.plan-page .plan-table tr.plan-restock td{ background:#FFF8E7; }
+.plan-page .plan-table tr.plan-restock td.pt-id{ background:#FDF3DE; box-shadow:inset 3px 0 0 #FF9900; }
+.plan-page .plan-table tr.plan-restock:hover td{ background:#FBF1D9; }
+/* Totals -> bold with a light blue-gray fill; MTD/Target totals blue. */
+.plan-page .plan-table tfoot td{ background:#EEF1F3; color:#0F1111; font-weight:800; border-top:2px solid #D5D9D9; }
+.plan-page .plan-table tfoot td.pt-id{ background:#EEF1F3; }
+.plan-page .plan-table tfoot td.pt-mtd,.plan-page .plan-table tfoot td.pt-target{ background:#DEEAF5; color:#146EB4; font-weight:800; }
+
+/* Methodology disclosure. */
+.plan-page .plan-methodology{ margin-top:var(--space-4); background:#FFFFFF; border:1px solid #D5D9D9; border-radius:6px; padding:12px 14px; }
+.plan-page .plan-methodology > summary{ cursor:pointer; font-size:12.5px; font-weight:750; color:#0F1111; list-style:none; display:inline-flex; align-items:center; gap:8px; }
+.plan-page .plan-methodology > summary::-webkit-details-marker{ display:none; }
+.plan-page .plan-methodology > summary::before{ content:"\\25B8"; color:#565959; font-size:10px; transition:transform .15s ease; }
+.plan-page .plan-methodology[open] > summary::before{ transform:rotate(90deg); }
+.plan-page .plan-methodology .footer-note{ margin-top:10px; border-top:1px solid #E7E9EC; padding-top:10px; border-radius:0; background:none; }
+
+/* Responsive: KPIs 6 -> 3 -> 2; the matrix always scrolls; the meta panel wraps full-width. */
+@media (max-width:1280px){ .plan-page .plan-stat-row{ grid-template-columns:repeat(3,minmax(0,1fr)); } }
+@media (max-width:820px){ .plan-page .plan-stat-row{ grid-template-columns:repeat(2,minmax(0,1fr)); } .plan-page .plan-meta{ width:100%; } }
+@media (prefers-reduced-motion: reduce){ .plan-page .plan-methodology > summary::before,.plan-page .plan-wdd-disclosure > summary::before{ transition:none; } }
+
 /* ---- SKU MOVEMENT (.sku-mv-page) --------------------------------------- */
 /* Explicit deep-navy header for the sku-mv table (its own .sku-mv thead th
    gradient otherwise fights the shared plan-table rule at this grain). */

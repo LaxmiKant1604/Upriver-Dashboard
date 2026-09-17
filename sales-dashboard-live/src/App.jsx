@@ -403,6 +403,24 @@ function downloadPlanSpreadsheet(visibleColumns, rows, meta) {
 // Durable, per-seller Planning Settings: horizon (1/2/3-month preset or 1-365 custom days) + forecast method
 // (+ weights, which must total 100) + safety days. Every change persists server-side (onSave) and the plan
 // recomputes locally with ZERO DataDoe. `settings` = the resolved account defaults.
+// Presentation-only labels for the table's grouped header band. The column `.group` keys stay Identity/Sales/
+// Forecast/Inventory/Planning (they drive the column logic + the .plan-group-* CSS classes); only the DISPLAYED
+// band text is enriched to the operational names, so no grouping, column, total or export behaviour changes.
+const PLAN_GROUP_BAND_LABEL = {
+  Identity: "Product / Identifiers",
+  Sales: "Historical Sales Velocity",
+  Forecast: "Forecast Models",
+  Inventory: "Available Inventory (Amazon FCs)",
+  Planning: "Restock Decision Plan",
+};
+// The Planning Horizon KPI is a presentation of the existing selected account setting -- never a new calculation.
+const PLAN_FORECAST_LABEL = { "three-month": "3-month average", mtd: "MTD projected", higher: "Higher of the two", weighted: "Weighted blend" };
+function planHorizonKpiValue(h) {
+  if (!h) return "—";
+  if (h.kind === "days") return `${h.days} Days`;
+  return `${h.months} Month${h.months === 1 ? "" : "s"}`;
+}
+
 function PlanningSettingsBar({ settings, onSave, busy }) {
   const isDays = settings.horizon.kind === "days";
   const [customDays, setCustomDays] = useState(isDays ? String(settings.horizon.days) : "45");
@@ -3380,10 +3398,10 @@ function DashboardApp({ session, access, onSignOut }) {
       { id: "m1", group: "Sales", label: mLabel(0), chooserLabel: "Month 1 units", sortKey: "m1", cell: (r) => td("m1", r.monthsDisplay?.[0]), foot: (t) => td("m1", t.m1) },
       { id: "m2", group: "Sales", label: mLabel(1), chooserLabel: "Month 2 units", sortKey: "m2", cell: (r) => td("m2", r.monthsDisplay?.[1]), foot: (t) => td("m2", t.m2) },
       { id: "m3", group: "Sales", label: mLabel(2), chooserLabel: "Month 3 units", sortKey: "m3", cell: (r) => td("m3", r.monthsDisplay?.[2]), foot: (t) => td("m3", t.m3) },
-      { id: "mtdUnits", group: "Sales", label: "MTD", chooserLabel: "MTD units", sortKey: "mtdUnits", cell: (r) => td("mtdUnits", r.mtdUnits), foot: (t) => td("mtdUnits", t.mtdUnits) },
+      { id: "mtdUnits", group: "Sales", label: "MTD", chooserLabel: "MTD units", sortKey: "mtdUnits", cell: (r) => td("mtdUnits", r.mtdUnits, "mono pt-mtd"), foot: (t) => td("mtdUnits", t.mtdUnits, "mono pt-mtd") },
       { id: "threeMoAvg", group: "Forecast", label: "3M Avg", chooserLabel: "3-month average", sortKey: "threeMoAvg", cell: (r) => td("threeMoAvg", r.planning?.threeMonthAverage), foot: () => <td key="threeMoAvg" className="mono">—</td> },
       { id: "mtdProjected", group: "Forecast", label: "MTD Proj.", chooserLabel: "MTD projected", sortKey: "mtdProjected", cell: (r) => td("mtdProjected", r.planning?.mtdProjectedUnits), foot: () => <td key="mtdProjected" className="mono">—</td> },
-      { id: "targetUnits", group: "Forecast", label: `Target Units (${targetDays || 0}d)`, chooserLabel: "Target units (target-days)", sortKey: "targetUnits", thTitle: "Corrected daily run rate (the account forecast method) × the target-days input. Unavailable (em dash) when the forecast can't be derived.", cell: (r) => td("targetUnits", r.targetUnits, "mono pt-strong"), foot: (t) => td("targetUnits", t.targetUnits, "mono pt-strong") },
+      { id: "targetUnits", group: "Forecast", label: `Target Units (${targetDays || 0}d)`, chooserLabel: "Target units (target-days)", sortKey: "targetUnits", thTitle: "Corrected daily run rate (the account forecast method) × the target-days input. Unavailable (em dash) when the forecast can't be derived.", cell: (r) => td("targetUnits", r.targetUnits, "mono pt-strong pt-target"), foot: (t) => td("targetUnits", t.targetUnits, "mono pt-strong pt-target") },
       { id: "fbaAvailable", group: "Inventory", label: "FBA Avail", chooserLabel: "FBA available", sortKey: "fbaAvailable", cell: (r) => td("fbaAvailable", r.fbaAvailable), foot: (t) => <td key="fbaAvailable" className="mono">{t.anyInv ? nInt(t.fbaAvailable) : "—"}</td> },
       { id: "fbaDaysCover", group: "Inventory", label: "FBA Days (MTD DRR)", chooserLabel: "FBA days cover", sortKey: "fbaDaysCover", cell: (r) => td("fbaDaysCover", r.fbaDaysCover), foot: (t) => <td key="fbaDaysCover" className="mono">{t.anyInv ? nInt(t.fbaDaysCover) : "—"}</td> },
       { id: "custReserved", group: "Inventory", label: "Cust. Reserved", chooserLabel: "Customer reserved", thTitle: "reserved_customer_order — units already allocated to placed customer orders. DISPLAY ONLY: already sold, never counted as usable/planning stock.", cell: (r) => td("custReserved", r.planning?.customerOrderReserved), foot: (t) => <td key="custReserved" className="mono">{t.anyInv ? nInt(t.custReserved) : "—"}</td> },
@@ -3398,7 +3416,7 @@ function DashboardApp({ session, access, onSignOut }) {
       { id: "awdInbound", group: "Inventory", label: "AWD Inbound", chooserLabel: "AWD inbound (not yet distributable)", awd: true, thTitle: "awd_total_inbound_quantity — inbound TO the AWD warehouse, NOT yet distributable. DISPLAY ONLY: excluded from usable supply. US only.", cell: (r) => td("awdInbound", r.awdInbound), foot: (t) => <td key="awdInbound" className="mono">{t.anyAwdInbound ? nInt(t.awdInbound) : "—"}</td> },
       { id: "totalFbaInv", group: "Inventory", label: "Total FBA Inv.", chooserLabel: "Total FBA inventory (FBA only)", sortKey: "totalFbaInv", thTitle: "Sellable Now + Reserved (FC) + Inbound Pipeline. FBA network only — excludes AWD, seller warehouse and customer-order reserve.", cell: (r) => td("totalFbaInv", r.totalFbaInv), foot: (t) => <td key="totalFbaInv" className="mono">{t.anyInv ? nInt(t.totalFbaInv) : "—"}</td> },
       { id: "amazonNetwork", group: "Inventory", label: "Amazon Network Pos.", chooserLabel: "Amazon network position (FBA + AWD avail)", sortKey: "amazonNetwork", thTitle: "Total FBA Inv. + AWD Available — all Amazon-held stock that is or will become sellable. This is the planning supply.", cell: (r) => td("amazonNetwork", r.amazonNetwork), foot: (t) => <td key="amazonNetwork" className="mono">{t.anyInv ? nInt(t.amazonNetwork) : "—"}</td> },
-      { id: "recommended", group: "Inventory", label: "Recommend", chooserLabel: "Recommend (target-days)", sortKey: "recommended", thTitle: "ceil(Target Units − Amazon Network Position), floored at 0.", cell: (r) => td("recommended", r.recommended, "mono pt-strong"), foot: (t) => <td key="recommended" className="mono pt-strong">{t.anyInv ? nInt(t.recommended) : "—"}</td> },
+      { id: "recommended", group: "Inventory", label: "Recommend", chooserLabel: "Recommend (target-days)", sortKey: "recommended", thTitle: "ceil(Target Units − Amazon Network Position), floored at 0.", cell: (r) => td("recommended", r.recommended, "mono pt-strong" + (Number(r.recommended) > 0 ? " pt-reco" : "")), foot: (t) => <td key="recommended" className={"mono pt-strong" + (t.anyInv && Number(t.recommended) > 0 ? " pt-reco" : "")}>{t.anyInv ? nInt(t.recommended) : "—"}</td> },
       { id: "pipeline", group: "Planning", label: "Pipeline", chooserLabel: "Pipeline", thTitle: "In-network stock not yet sellable: inbound working + shipped + received + FC processing + FC transfer (customer-order-reserved excluded)", cell: (r) => td("pipeline", r.planning?.amazonPipeline), foot: (t) => <td key="pipeline" className="mono">{t.anyInv ? nInt(t.pipeline) : "—"}</td> },
       { id: "horizon", group: "Planning", label: "Horizon", chooserLabel: "Planning horizon", thTitle: "Effective planning horizon (per-SKU override or account default). Click a SKU's value to override.", cell: (r) => <SkuHorizonCell key="horizon" row={r} onOpen={(row) => setSkuHorizonEdit({ sku: row.sku, asin: row.asin, effective: row.effectiveHorizon, source: row.horizonSource, hasOverride: row.skuHasOverride })} />, foot: () => <td key="horizon" className="mono">—</td> },
       { id: "horizonDemand", group: "Planning", label: "Horizon Demand", chooserLabel: "Horizon demand", thTitle: "Daily run rate × effective horizon days (calendar-aware from the effective-through date)", cell: (r) => td("horizonDemand", r.planning?.horizonDemand), foot: (t) => td("horizonDemand", t.horizonDemand) },
@@ -4824,18 +4842,46 @@ function DashboardApp({ session, access, onSignOut }) {
 
       {view === "fbaplan" && (
       <div className="container plan-page op-report">
-        <div className="controls-bar">
-          <div>
+        <div className="controls-bar plan-head">
+          <div className="plan-head-main">
             <div className="page-title">FBA Shipment Plan</div>
             <div className="page-sub">Per-ASIN restock recommendation for {refreshScopeAccount?.name || "the selected account"}{selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`} from sales velocity and live FBA{planAwdEligible ? " + AWD" : ""} inventory</div>
           </div>
+          {planData && (
+            <div className="plan-meta" aria-label="Report scope">
+              <div className="plan-meta-item">
+                <span className="plan-meta-k">Account</span>
+                <span className="plan-meta-v">{refreshScopeAccount?.name || "—"}{refreshScopeAccount?.currency ? ` · ${refreshScopeAccount.currency}` : ""}</span>
+              </div>
+              <div className="plan-meta-item">
+                <span className="plan-meta-k">Inventory</span>
+                <span className={"plan-meta-badge " + (planData.inventoryAvailable ? "is-ok" : "is-warn")}>{planData.inventoryAvailable ? "Available" : "Unavailable"}</span>
+              </div>
+              {planData.marketCountry && (
+                <div className="plan-meta-item">
+                  <span className="plan-meta-k">Marketplace</span>
+                  <span className="plan-meta-v">Amazon {String(planData.marketCountry).toUpperCase()}</span>
+                </div>
+              )}
+              <div className="plan-meta-item">
+                <span className="plan-meta-k">Sales through</span>
+                <span className="plan-meta-v">{planData.salesLatestDate ? fmtDateHuman(planData.salesLatestDate) : "—"}</span>
+              </div>
+            </div>
+          )}
         </div>
 
-        <PlanningSettingsBar settings={planAccountSettings} onSave={savePlanSettings} busy={planActionsBusy} />
+        <div className="plan-params">
+          <div className="plan-params-head"><span className="plan-params-title">Planning parameters</span></div>
+          <PlanningSettingsBar settings={planAccountSettings} onSave={savePlanSettings} busy={planActionsBusy} />
 
-        {/* ADDITIVE: WDD blend weights for the selected brand (or the account default). Sits beside the existing
-            Planning Horizon / Forecast Method controls; never alters them. */}
-        <WddSettingsBar brandLabel={wddEditKey ? selectedBrand : "All brands / unmapped"} brandKey={wddEditKey} saved={wddWeightsByKey.get(wddEditKey)} onSave={saveWddWeights} busy={planActionsBusy} />
+          {/* ADDITIVE: WDD blend weights for the selected brand (or the account default). Collapsible; never alters
+              the Planning Horizon / Forecast Method controls above. */}
+          <details className="plan-wdd-disclosure">
+            <summary>Demand weighting (WDD % &middot; {wddEditKey ? selectedBrand : "Account default"})</summary>
+            <WddSettingsBar brandLabel={wddEditKey ? selectedBrand : "All brands / unmapped"} brandKey={wddEditKey} saved={wddWeightsByKey.get(wddEditKey)} onSave={saveWddWeights} busy={planActionsBusy} />
+          </details>
+        </div>
 
         <div className="plan-controls">
           <label className="plan-field plan-search">
@@ -4905,11 +4951,36 @@ function DashboardApp({ session, access, onSignOut }) {
             )}
 
             <div className="plan-stat-row">
-              <div className="plan-stat"><div className="plan-stat-label">ASINs</div><div className="plan-stat-value mono">{planRows.length.toLocaleString("en-US")}</div></div>
-              <div className="plan-stat"><div className="plan-stat-label">Needs Restock</div><div className="plan-stat-value mono">{planTotals.evaluatedCount > 0 ? planTotals.restockCount.toLocaleString("en-US") : "—"}</div></div>
-              <div className="plan-stat"><div className="plan-stat-label">Recommended Units</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.recommended) : "—"}</div></div>
-              <div className="plan-stat"><div className="plan-stat-label">FBA Available</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.fbaAvailable) : "—"}</div></div>
-              <div className="plan-stat"><div className="plan-stat-label">Total FBA Inv.</div><div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.totalFbaInv) : "—"}</div></div>
+              <div className="plan-stat plan-stat--neutral">
+                <div className="plan-stat-label">ASINs</div>
+                <div className="plan-stat-value mono">{planRows.length.toLocaleString("en-US")}</div>
+                <div className="plan-stat-sub">Active in scope</div>
+              </div>
+              <div className="plan-stat plan-stat--amber">
+                <div className="plan-stat-label">Needs Restock</div>
+                <div className="plan-stat-value mono">{planTotals.evaluatedCount > 0 ? planTotals.restockCount.toLocaleString("en-US") : "—"}</div>
+                <div className="plan-stat-sub">{planData.inventoryAvailable ? "SKUs to reorder" : "Requires live inventory"}</div>
+              </div>
+              <div className="plan-stat plan-stat--amber">
+                <div className="plan-stat-label">Recommended Units</div>
+                <div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.recommended) : "—"}</div>
+                <div className="plan-stat-sub">{planData.inventoryAvailable ? "Units to ship" : "Inventory required"}</div>
+              </div>
+              <div className="plan-stat plan-stat--blue">
+                <div className="plan-stat-label">FBA Available</div>
+                <div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.fbaAvailable) : "—"}</div>
+                <div className="plan-stat-sub">{planData.inventoryAvailable ? "Sellable now" : "Inventory unavailable"}</div>
+              </div>
+              <div className="plan-stat plan-stat--neutral">
+                <div className="plan-stat-label">Total FBA Inv.</div>
+                <div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.totalFbaInv) : "—"}</div>
+                <div className="plan-stat-sub">{planData.inventoryAvailable ? "FBA network total" : "FBA + AWD unavailable"}</div>
+              </div>
+              <div className="plan-stat plan-stat--blue">
+                <div className="plan-stat-label">Planning Horizon</div>
+                <div className="plan-stat-value mono plan-stat-accent">{planHorizonKpiValue(planAccountSettings.horizon)}</div>
+                <div className="plan-stat-sub">Target: {PLAN_FORECAST_LABEL[planAccountSettings.forecastMethod] || "velocity"}</div>
+              </div>
             </div>
           </>
         )}
@@ -4924,14 +4995,14 @@ function DashboardApp({ session, access, onSignOut }) {
                     {planGroupSpans.map((g, i) => (
                       <th key={g.group + i} colSpan={g.span}
                         className={"plan-group-th plan-group-" + g.group.toLowerCase().replace(/[^a-z]+/g, "-") + (i === 0 ? " plan-group-id" : "")}>
-                        {g.group === "Identity" ? "" : g.group}
+                        {PLAN_GROUP_BAND_LABEL[g.group] || g.group}
                       </th>
                     ))}
                   </tr>
                   <tr>
                     {planVisibleColumns.map((c) => (
                       c.sortKey
-                        ? <PlanTh key={c.id} className={c.id === "asin" ? "pt-id" : ""} label={c.label} col={c.sortKey} sort={planSort} onSort={setPlanSortKey} align={c.align || "right"} title={c.thTitle} />
+                        ? <PlanTh key={c.id} className={c.id === "asin" ? "pt-id" : c.id === "mtdUnits" ? "pt-mtd" : c.id === "targetUnits" ? "pt-target" : c.id === "recommended" ? "pt-reco-th" : ""} label={c.label} col={c.sortKey} sort={planSort} onSort={setPlanSortKey} align={c.align || "right"} title={c.thTitle} />
                         : <th key={c.id} title={c.thTitle || undefined} style={c.align === "left" ? { textAlign: "left" } : undefined}>{c.label}</th>
                     ))}
                   </tr>
@@ -4967,12 +5038,15 @@ function DashboardApp({ session, access, onSignOut }) {
           />
         )}
 
+        <details className="plan-methodology">
+        <summary>Restock logic, inventory attribution, and lead-time calculations</summary>
         <div className="footer-note">
           Unit sales come from DataDoe <code>Sales &amp; Traffic by ASIN &amp; Date</code> (total_units), summed per ASIN for the 3 completed months and the current month to date. A genuinely missing month shows an em dash — never a fabricated 0 — so the 3-month average is only shown when all three completed months have proven data.
           One canonical, non-overlapping inventory model drives every number here (table, totals, export and planning agree). From <code>FBA Inventory Health</code>, each unit is in exactly one bucket: <strong>FBA Available</strong> = <code>available</code> (sellable now); <strong>Reserved (FC)</strong> = <code>reserved_fc_transfer</code> + <code>reserved_fc_processing</code> shown RAW (no subtraction — the reserved FC states and the inbound states are distinct buckets, proven by the source metadata); <strong>Inbound Pipeline</strong> = <code>inbound_working</code> + <code>inbound_shipped</code> + <code>inbound_received</code>. <strong>Cust. Reserved</strong> = <code>reserved_customer_order</code> is already-sold stock, shown for reference and never counted as usable supply.
           {planData?.isUS ? <> <strong>AWD Available</strong> = <code>awd_available_distributable_quantity</code> is distributable and counts as usable supply; <strong>AWD Inbound</strong> = <code>awd_total_inbound_quantity</code> is inbound to the AWD warehouse, not yet distributable, so it is display-only (US only).</> : <> AWD does not apply to non-US accounts and its columns are hidden (never shown as 0).</>}
           {" "}<strong>Total FBA Inv.</strong> = FBA Available + Reserved (FC) + Inbound Pipeline (FBA network only — no AWD, no seller warehouse). <strong>Amazon Network Pos.</strong> = Total FBA Inv.{planData?.isUS ? " + AWD Available" : ""} and is the planning supply. <strong>Seller WH</strong> holds your OWN uncommitted warehouse units (edit inline or bulk-import); never Amazon inventory and never units already in inbound working. Target Units = the corrected daily run rate × the entered coverage days; Recommend = ceil(Target Units − Amazon Network Pos.), floored at 0. FBA Days (MTD DRR) = FBA Available ÷ MTD daily run rate (excludes reserved, inbound and AWD). Planning columns (Pipeline, Horizon Demand, Safety, Target Inv, Ship WH, Produce, Est. Stockout, Priority) come from the per-account/per-SKU planning settings. Live inventory freshness is independent of sales-report freshness; both dates are shown above. Settings, warehouse edits, the column chooser, filters, sorting, and the target-days input recompute locally without new DataDoe requests.
         </div>
+        </details>
         {skuHorizonEdit && (
           <SkuHorizonEditor target={skuHorizonEdit} accountDefault={planAccountSettings.horizon} busy={planActionsBusy}
             onSave={saveSkuHorizon} onClose={() => setSkuHorizonEdit(null)} />
