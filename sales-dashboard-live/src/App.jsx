@@ -4534,7 +4534,7 @@ function DashboardApp({ session, access, onSignOut }) {
               label="Units Sold"
               icon={<Boxes size={15} />}
               value={kpi.units.toLocaleString("en-US")}
-              hint="Ordered units observed for this range: priced, explicit zero-price and identifiable pending units. Sales count priced units only; source itemization and price coverage are shown in the data-status banner above."
+              hint="Units counted by the saved sales report for the selected range. The observed-unit status above is a separate completeness breakdown and may include pending-price, explicit-zero or cancelled units."
               badge={provisionalActive ? <span className="prov-badge" title="Provisional — includes an un-itemized D-1 whose units may change on the next order refresh">Provisional</span> : null}
               period={fmtRangeLabel(rangeFrom, rangeTo)}
               trend={kpiDeltas ? <TrendIndicator value={kpiDeltas.units} text={fmtPct(kpiDeltas.units)} title={`vs ${kpiDeltas.label}`} /> : null}
