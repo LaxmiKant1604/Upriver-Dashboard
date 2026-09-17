@@ -1,5 +1,48 @@
 # Project Memory
 
+## OLI sales-estimate historical-price fallback look-back extended 7 -> 30 days (2026-09-17, commit 09c400c on main, PUSHED; verify 220/196 green incl. build:check; backfill APPLIED + reconcilers all 3 regions clean; acceptance proven)
+
+WHAT. Extended the OLI pending/zero-price sales-estimate historical-price fallback from a 7-day to a 30-day calendar
+look-back. ONE-line production change: OLI_ESTIMATE_LOOKBACK_DAYS 7 -> 30 (lib/server/sync/oli-sales-estimate.js). This is
+the SINGLE canonical horizon — the pure engine's reference-search loop AND the recompute's reference-fetch window
+(readDimensionalRows from = minTarget - lookback, oli-sales-estimate-recompute.js:58) both derive from it, so DB-read span ==
+in-memory loop span == 30, and no second module hardcodes a horizon. Both production callers inherit with NO override:
+source-bucket-sync-runtime.js:1038 (runtime, after each OLI persist) and scripts/release/oli-sales-estimate-backfill.mjs
+(the trusted zero-export backfill). Everything else preserved exactly: same-day/D-1/.../D-30 order, nearest eligible day
+wins, never a future date, median across multiple same-date prices, ALL identity boundaries (org/connection/account/seller/
+authoritative-marketplace/currency, exact SKU+ASIN when SKU present, ASIN-only fallback only when target SKU blank), and
+fail-closed asin-unresolved/ambiguous/conflict/no-identity. The wider horizon only lengthens the search over EXISTING
+eligible priced references for the SAME identity — it cannot fabricate an ASIN/mapping/price/revenue/estimate, and actual
+itemization still supersedes with no double count. Affects ONLY source_oli_sales_estimates; no unrelated behavior, no
+api/*.js added (stays 12), no migration.
+
+VERIFICATION. Focused OLI estimator + integration suites 76 + 25 assertions (new boundary set pins D-7/D-8/D-30 inside,
+D-31 outside; + D-1-over-D-2, nearest-wins-across-span, a constant-value assertion, and an end-to-end proof the reference
+DB-read window extends to minTarget-30 not just the engine loop; corrected 3 tests that were coupled to the old 7-day
+boundary). Full npm run verify 220/196 green (incl build:check). node --check 5/5, git diff --check clean, api/*.js == 12.
+A 4-agent adversarial audit (single-source, blast-radius, coverage, correctness) returned ZERO findings — proving single
+source of truth, DO-NOT-TOUCH boundary intact, all 20 required regressions mapped to concrete tests, and search/identity/
+median/anti-fabrication/month-chunk/addDaysStr-UTC invariants unchanged.
+
+PRODUCTION (read-only DRY-RUN reviewed -> explicit write approval -> applied). Backfill APPLIED for the latest 31 days
+[2026-08-17..2026-09-16], all accounts (BACKFILL_APPLY=1 ESTIMATE_BACKFILL_DAYS=31): 33 accounts, marketplace authority
+unique=51/missing=0/ambiguous=0, 647 estimate grains, byte-identical to the DRY-RUN, ZERO DataDoe creates / ZERO tokens
+(structural — no adapter in the recompute/backfill path), write-only source_oli_sales_estimates. OLI publication reconciler
+rerun sequentially india -> europe-au -> us-ca (--mode=periodic --live): every region ok=true, dataDoeCreates=0,
+dataDoeTokens=0, controlClean=true, CONTROL_LEASE_HELD=0, 0 failed; all targets DEFERRED because the shared Catalog carrier
+was cold this pass (the designed learn-once zero-export fast-defer — see below entry; live promotion converges on the next
+warm scheduler pass; the durable 30-day estimates are already persisted). India replay byte-identical -> zero-write
+convergence proven.
+
+ACCEPTANCE (AAKRITI ART CREATIONS IN, account fd7653e8, on 2026-09-16). @7 baseline reproduced the pre-change evidence
+exactly (15 observed unpriced units = 4 estimated + 9 no-reference + 2 asin-unresolved). Under 30 days: 5 of the 9
+no-reference units gained a valid D-8..D-30 SKU-exact estimate (AAC-40-02-39-J D-14 @289, AAC-40-02-40-D D-23 @469,
+AAC-41-13-05-N2 D-19 @2169, AAC-41-58-25-C2_FBA D-22 @2139, AAC-41-76-16_FBA D-11 @339); 4 remain no-reference (no eligible
+reference within 30 days); the 2 asin-unresolved stay pending unchanged (a price look-back never resolves an ASIN). Serve
+breakdown priced 0 -> 9, pending 15 -> 6; TOTAL observed units = 15 in both @7 and @30 (only coverage moved). Durable
+persistence confirmed: 9 stored estimate grains / 9 covered units for that date (4 within D-7 + 5 beyond D-7). Only the 5
+units backed by valid durable evidence resolved — NOT all 11. See [[oli-sales-estimates]], [[oli-publication-reconciler]].
+
 ## OLI reconciler cold-pass deadline/lease strand FIXED — learn-once shared-Catalog fast-defer (2026-09-16, commit 7b180f4 on main, PUSHED; verify 220/196 green incl. build:check; live run 35138216996 = SUCCESS, all 3 regions clean)
 
 ROOT CAUSE (read-only prod-proven end to end). The zero-export OLI publication reconciler's Catalog carrier is ORG-SCOPED
