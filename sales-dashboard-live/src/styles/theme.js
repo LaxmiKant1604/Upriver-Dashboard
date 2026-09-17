@@ -2392,6 +2392,84 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .op-report .sku-mv-ident-view{ color:var(--op-ink); }
 .op-report .sku-mv-ident-view:hover{ color:var(--op-steel); }
 
+/* ===== SKU MOVEMENT -- flat Amazon operational workspace (.sku-mv-page) =====
+   Approved Stitch redesign. Light grouped table headers, restrained blue MTD/Last-N column emphasis, green/red
+   movement, flat KPI + observed-unit cells -- all scoped under .sku-mv-page so the SHARED plan and pt class families
+   and the .rvkpi / .skupl primitives (SKU P&L, Reconciliation, Brand View) stay untouched. Follows the .op-report
+   layer above and wins at equal specificity by source order. */
+/* Header scope metadata + completeness status badge. */
+.sku-mv-page .sku-mv-meta{ display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
+.sku-mv-page .sku-mv-meta-item{ display:flex; flex-direction:column; gap:1px; padding:6px 12px; background:#FFFFFF; border:1px solid #D5D9D9; border-radius:6px; min-width:0; }
+.sku-mv-page .sku-mv-meta-k{ font-size:10px; font-weight:750; letter-spacing:.04em; text-transform:uppercase; color:#565959; }
+.sku-mv-page .sku-mv-meta-v{ font-size:12.5px; font-weight:700; color:#0F1111; white-space:nowrap; }
+.sku-mv-page .sku-mv-status{ font-size:11.5px; font-weight:700; padding:3px 9px; border-radius:3px; display:inline-flex; align-items:center; gap:6px; }
+.sku-mv-page .sku-mv-status::before{ content:""; width:7px; height:7px; border-radius:50%; background:currentColor; flex:none; }
+.sku-mv-page .sku-mv-status--good{ background:#F3F9F6; border:1px solid #CDE5D8; color:#067D62; }
+.sku-mv-page .sku-mv-status--warn{ background:#FFF8E7; border:1px solid #F2C265; color:#B75D00; }
+.sku-mv-page .sku-mv-status--bad{ background:#FDF4F4; border:1px solid #F5C2C7; color:#B12704; }
+
+/* Observed Units -- five flat cells (SKU scope; distinct from the shared .obs-units). */
+.sku-mv-page .sku-mv-obs{ margin-top:var(--space-4); background:#FFFFFF; border:1px solid #D5D9D9; border-radius:6px; padding:12px 14px; }
+.sku-mv-page .sku-mv-obs-head{ display:flex; align-items:baseline; justify-content:space-between; gap:10px; flex-wrap:wrap; padding-bottom:10px; border-bottom:1px solid #E7E9EC; }
+.sku-mv-page .sku-mv-obs-title{ font-size:11px; font-weight:800; letter-spacing:.05em; text-transform:uppercase; color:#565959; }
+.sku-mv-page .sku-mv-obs-total{ font-size:11.5px; color:#565959; }
+.sku-mv-page .sku-mv-obs-grid{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; margin-top:12px; }
+.sku-mv-page .sku-mv-obs-cell{ padding:9px 11px; border:1px solid #D5D9D9; border-radius:4px; background:#F8F9FA; min-width:0; }
+.sku-mv-page .sku-mv-obs-cell--pos{ background:#F3F9F6; border-color:#CDE5D8; }
+.sku-mv-page .sku-mv-obs-cell--warn{ background:#FFF8E7; border-color:#F2C265; }
+.sku-mv-page .sku-mv-obs-cell--neg{ background:#FDF4F4; border-color:#F5C2C7; }
+.sku-mv-page .sku-mv-obs-cell-value{ font-size:16px; font-weight:800; color:#0F1111; font-variant-numeric:tabular-nums; }
+.sku-mv-page .sku-mv-obs-cell--pos .sku-mv-obs-cell-value{ color:#067D62; }
+.sku-mv-page .sku-mv-obs-cell--warn .sku-mv-obs-cell-value{ color:#B75D00; }
+.sku-mv-page .sku-mv-obs-cell--neg .sku-mv-obs-cell-value{ color:#B12704; }
+.sku-mv-page .sku-mv-obs-cell-label{ font-size:11px; font-weight:600; color:#565959; margin-top:2px; }
+.sku-mv-page .sku-mv-obs-cell--pos .sku-mv-obs-cell-label{ color:#067D62; }
+.sku-mv-page .sku-mv-obs-cell--warn .sku-mv-obs-cell-label{ color:#944D00; }
+.sku-mv-page .sku-mv-obs-cell--neg .sku-mv-obs-cell-label{ color:#B12704; }
+.sku-mv-page .sku-mv-obs-note{ font-size:11.5px; line-height:1.55; color:#565959; margin-top:12px; }
+
+/* Five KPI accents -> neutral ASINs, blue MTD + Last-N, neutral Prev, green Movement (its value uses rvkpi-pos/neg). */
+.sku-mv-page .rvkpi-grid-5 .rvkpi:nth-child(1){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 #C3CACE; }
+.sku-mv-page .rvkpi-grid-5 .rvkpi:nth-child(2){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 #146EB4; }
+.sku-mv-page .rvkpi-grid-5 .rvkpi:nth-child(3){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 #146EB4; }
+.sku-mv-page .rvkpi-grid-5 .rvkpi:nth-child(4){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 #C3CACE; }
+.sku-mv-page .rvkpi-grid-5 .rvkpi:nth-child(5){ box-shadow:0 1px 2px rgba(15,17,17,.05), inset 0 2px 0 0 #067D62; }
+
+/* Toolbar + table panel. */
+.sku-mv-page .skupl-toolbar{ border-bottom:1px solid #D5D9D9; }
+.sku-mv-page .panel.skupl-table-panel{ box-shadow:none; border:1px solid #D5D9D9; }
+
+/* Matrix -- light grouped headers (neutral bands), sticky group band + normal header + identity columns. The
+   group-band selectors carry .sku-mv so they out-specify the op-report navy sku-mv thead rule. */
+.sku-mv-page .sku-mv .sku-mv-group-row th{ position:sticky; top:0; z-index:4; background:#F3F4F5; color:#565959; font-size:10px; font-weight:800; letter-spacing:.04em; text-transform:uppercase; text-align:center; padding:6px 10px; border-bottom:1px solid #D5D9D9; border-right:1px solid #E7E9EC; white-space:nowrap; }
+/* Normal (column-name) header row -> light, sticky just beneath the group band. */
+.sku-mv-page .sku-mv thead tr:last-child th{ background:#FAFAFA; color:#565959; font-size:11px; font-weight:800; letter-spacing:.03em; border-bottom:1px solid #D5D9D9; top:27px; z-index:2; }
+.sku-mv-page .sku-mv thead tr:last-child th.pt-sorted{ color:#146EB4; }
+/* Current MTD + Last-N -> restrained blue (header out-specifies the neutral header rule; body out-specifies td). */
+.sku-mv-page .sku-mv thead tr:last-child th.sku-mv-mtd, .sku-mv-page .sku-mv thead tr:last-child th.sku-mv-last5{ background:#EFF6FB; color:#146EB4; box-shadow:inset 0 2px 0 #146EB4; }
+.sku-mv-page .sku-mv td.sku-mv-mtd, .sku-mv-page .sku-mv td.sku-mv-last5{ background:#EFF6FB; color:#146EB4; font-weight:700; border-left:1px solid #D2E4F2; border-right:1px solid #D2E4F2; }
+.sku-mv-page .sku-mv tbody tr:hover td.sku-mv-mtd, .sku-mv-page .sku-mv tbody tr:hover td.sku-mv-last5{ background:#E6F0F9; }
+/* Body -> medium weight, hairline rows. */
+.sku-mv-page .sku-mv tbody td{ color:#0F1111; border-bottom:1px solid #E7E9EC; font-weight:500; }
+.sku-mv-page .sku-mv tbody tr:hover td{ background:#F5F9FD; }
+/* Movement badge -> 3px (never pill), green positive / red negative / neutral em dash. */
+.sku-mv-page .sku-mv-move{ border-radius:3px; }
+.sku-mv-page .sku-mv-move-pos{ background:#EAF6F1; color:#067D62; }
+.sku-mv-page .sku-mv-move-neg{ background:#FBEDEC; color:#B12704; }
+.sku-mv-page .sku-mv-move-flat{ color:#8D9096; }
+
+/* Methodology disclosure. */
+.sku-mv-page .sku-mv-methodology{ margin-top:var(--space-4); background:#FFFFFF; border:1px solid #D5D9D9; border-radius:6px; padding:12px 14px; }
+.sku-mv-page .sku-mv-methodology > summary{ cursor:pointer; font-size:12.5px; font-weight:750; color:#0F1111; list-style:none; display:inline-flex; align-items:center; gap:8px; }
+.sku-mv-page .sku-mv-methodology > summary::-webkit-details-marker{ display:none; }
+.sku-mv-page .sku-mv-methodology > summary::before{ content:"\\25B8"; color:#565959; font-size:10px; transition:transform .15s ease; }
+.sku-mv-page .sku-mv-methodology[open] > summary::before{ transform:rotate(90deg); }
+.sku-mv-page .sku-mv-methodology .footer-note{ margin-top:10px; border-top:1px solid #E7E9EC; padding-top:10px; background:none; }
+
+@media (max-width:1180px){ .sku-mv-page .sku-mv-obs-grid{ grid-template-columns:repeat(3,minmax(0,1fr)); } }
+@media (max-width:760px){ .sku-mv-page .sku-mv-obs-grid{ grid-template-columns:repeat(2,minmax(0,1fr)); } .sku-mv-page .sku-mv-meta{ width:100%; } }
+@media (prefers-reduced-motion: reduce){ .sku-mv-page .sku-mv-methodology > summary::before{ transition:none; } }
+
 /* ---- AD PERFORMANCE BY CAMPAIGN (.campaign-ads-page) ------------------- */
 .op-report .ca-kpis{ grid-template-columns:repeat(auto-fit, minmax(128px, 1fr)); }
 .op-report .ca-kpis .metric-value{ font-size:20px; margin-top:8px; }

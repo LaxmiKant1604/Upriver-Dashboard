@@ -15,7 +15,7 @@ import {
   ExportButton, FreshnessBar, Notice, Pagination, ReportHeader, SearchField, SelectField,
   SnapshotState, SortTh, snapshotFreshnessLabel, sortRows, useSortState,
 } from "./shared.jsx";
-import { GradientKpi, ObservedUnitsBreakdown } from "../components/ui.jsx";
+import { GradientKpi } from "../components/ui.jsx";
 import {
   computeRowWindow, recentPrevDates, clampRecentDays, DEFAULT_RECENT_DAYS, MAX_RECENT_DAYS, MIN_RECENT_DAYS,
 } from "../../lib/sku-movement-window.js";
@@ -33,11 +33,12 @@ const STATUS_STYLE = {
 };
 
 // Sticky first THREE columns (ASIN/product, Identifier, SKU): opaque so scrolling numeric columns never show through.
-const STICKY_BG = "var(--bg-elevated)";
-const STICKY_HEAD_BG = "var(--op-navy)"; // premium deep-navy sticky identity header (matches the op-report theme)
+const STICKY_BG = "#FFFFFF";
+const STICKY_HEAD_BG = "#FAFAFA"; // light neutral sticky identity header (flat Amazon operational system)
+const GROUP_H = 27; // grouped-header band height, so the normal header row sticks just beneath it
 const C1 = 210, C2 = 140; // ASIN/product column, Identifier column
 const sticky = (left, w) => ({ position: "sticky", left, zIndex: 1, background: STICKY_BG, minWidth: w, maxWidth: w, textAlign: "left" });
-const stickyHead = (left, w) => ({ ...sticky(left, w), top: 0, zIndex: 3, background: STICKY_HEAD_BG });
+const stickyHead = (left, w) => ({ ...sticky(left, w), top: GROUP_H, zIndex: 5, background: STICKY_HEAD_BG });
 const col1Td = sticky(0, C1), col1Th = stickyHead(0, C1);
 const col2Td = sticky(C1, C2), col2Th = stickyHead(C1, C2);
 const col3Td = { ...sticky(C1 + C2, 150), maxWidth: 190 }, col3Th = { ...stickyHead(C1 + C2, 150), maxWidth: 190 };
@@ -63,7 +64,44 @@ const GROUPS = ["Identity", "Completed Months", "MTD", "Recent Daily", "Comparis
 
 function StatusBadge({ status }) {
   const s = STATUS_STYLE[status] || STATUS_STYLE["No Data"];
-  return <span style={{ padding: "1px 9px", borderRadius: 10, fontSize: 11, fontWeight: 700, background: s.bg, color: s.fg, whiteSpace: "nowrap" }}>{status}</span>;
+  return <span style={{ padding: "1px 8px", borderRadius: 3, fontSize: 11, fontWeight: 700, background: s.bg, color: s.fg, whiteSpace: "nowrap" }}>{status}</span>;
+}
+
+// Observed Units breakdown -- five flat cells (SKU-Movement-scoped). Values, labels and the inclusion/exclusion note
+// read straight from `completeness.unitBreakdown`; nothing is recomputed and no classification is invented.
+function SkuObservedUnits({ completeness }) {
+  const b = completeness && completeness.unitBreakdown;
+  if (!b) return null;
+  const nf = (v) => (Number(v) || 0).toLocaleString("en-US");
+  const status = completeness.provisional ? "Provisional" : (completeness.sourceDefect ? "Source issue" : "Final");
+  const cells = [
+    { key: "priced", tone: "pos", label: "Priced", value: b.pricedUnits },
+    { key: "zero", tone: "mute", label: "Explicit zero-price", value: b.explicitZeroUnits },
+    { key: "psku", tone: "warn", label: "Pending – has SKU", value: b.pendingWithSkuUnits },
+    { key: "pnosku", tone: "mute", label: "Pending – no SKU", value: b.pendingWithoutSkuUnits },
+    { key: "canc", tone: "neg", label: "Cancelled", value: b.cancelledUnits },
+  ];
+  return (
+    <div className="sku-mv-obs" role="group" aria-label="Observed unit breakdown">
+      <div className="sku-mv-obs-head">
+        <span className="sku-mv-obs-title">Observed units{b.onDate ? ` — ${b.onDate}` : ""}</span>
+        <span className="sku-mv-obs-total">{nf(b.observedUnits)} total &middot; {nf(b.skuMovementUnits)} in SKU Movement &middot; {status}</span>
+      </div>
+      <div className="sku-mv-obs-grid">
+        {cells.map((c) => (
+          <div key={c.key} className={"sku-mv-obs-cell sku-mv-obs-cell--" + c.tone}>
+            <div className="sku-mv-obs-cell-value">{nf(c.value)}</div>
+            <div className="sku-mv-obs-cell-label">{c.label}</div>
+          </div>
+        ))}
+      </div>
+      <div className="sku-mv-obs-note">
+        Revenue counts priced units only &mdash; explicit zero-price and pending-price units add no sales. Explicit-zero and
+        SKU-identifiable pending units are included in unit movement; unallocated pending units (no SKU/ASIN yet) are not.
+        {completeness.finalizedThrough ? ` Fully finalized through ${completeness.finalizedThrough}.` : ""} Values reconcile automatically on later order refreshes.
+      </div>
+    </div>
+  );
 }
 function MoveBadge({ value }) {
   if (value == null) return <span className="sku-mv-move-flat">{fmtPct(value)}</span>;
@@ -276,7 +314,41 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
     return t;
   }, [filtered, recentCols]);
 
+  // Scope metadata + KPI / group date ranges -- presentation only, from the loaded rows and the account's proven date.
+  const brandsInScope = useMemo(() => new Set(rawRows.map((r) => r.brand).filter(Boolean)).size, [rawRows]);
+  const scopeCurrency = useMemo(() => { const c = new Set(rawRows.map((r) => r.currency).filter(Boolean)); return c.size === 1 ? [...c][0] : null; }, [rawRows]);
+  const prevCols = useMemo(() => recentPrevDates(dailyDates, N).prevDates, [dailyDates, N]);
+  const mtdRange = useMemo(() => {
+    const a = data && data.effectiveAsOf;
+    if (!a || a.length < 10) return null;
+    return { from: a.slice(0, 8) + "01", to: a, days: Number(a.slice(8, 10)) || null };
+  }, [data]);
+  const rangeLabel = (arr) => (arr.length ? `${fmtDateHuman(arr[0])} – ${fmtDateHuman(arr[arr.length - 1])}` : "");
+  const statusBadge = completeness
+    ? (completeness.provisional
+        ? { label: `Provisional D-1 · ${fmtDateHuman(completeness.latestDate || data?.effectiveAsOf)}`, tone: "warn" }
+        : completeness.sourceDefect
+          ? { label: "Source issue · D-1", tone: "bad" }
+          : { label: `Final D-1 · ${fmtDateHuman(data?.effectiveAsOf)}`, tone: "good" })
+    : null;
+  // Grouped-header band plan (Identity & Catalog / Monthly Unit History / Daily Observed Movement / Window Comparison
+  // / Forecast / Status). Spans come from the SAME shown() visibility, so no column is ever dropped or double-counted.
+  const groupPlan = useMemo(() => {
+    const p = [];
+    const add = (label, span, cls) => { if (span > 0) p.push({ label, span, cls }); };
+    add("Identity & Catalog", 1 + (shown("identifier") ? 1 : 0) + (shown("sku") ? 1 : 0) + (shown("brand") ? 1 : 0), "identity");
+    add("Monthly Unit History", (shown("months") ? monthLabels.length : 0) + (shown("mtd") ? 1 : 0), "monthly");
+    add(`Daily Observed Movement${shown("daily") && recentCols.length ? ` (${rangeLabel(recentCols)})` : ""}`, shown("daily") ? recentCols.length : 0, "daily");
+    add("Window Comparison", 1 + (shown("prev") ? 1 : 0) + (shown("move") ? 1 : 0), "window");
+    add("Forecast", (shown("avg") ? 1 : 0) + (shown("runRate") ? 1 : 0) + (shown("projected") ? 1 : 0), "forecast");
+    add("Status", shown("status") ? 1 : 0, "status");
+    return p;
+  }, [hiddenSet, monthLabels, recentCols]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const scopeLabel = `${accountName || "the selected account"}${selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`}`;
+  const scopeChip = selectedBrand === "ALL"
+    ? `${brandsInScope} brand${brandsInScope === 1 ? "" : "s"} (${rawRows.length} ASIN${rawRows.length === 1 ? "" : "s"})`
+    : `${selectedBrand} (${rawRows.length} ASIN${rawRows.length === 1 ? "" : "s"})`;
   const state = <SnapshotState data={data} loading={loading} error={error} label="SKU Movement report" icon={<Activity size={22} />} />;
   const dailyUnitAt = (r, d) => { const c = dailyDates.length && data && data.coverageFrom && d < data.coverageFrom ? null : num((r.dailyUnits || {})[d]); return c; };
 
@@ -307,7 +379,15 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
 
   return (
     <div className="container skupl-page sku-mv-page op-report">
-      <ReportHeader title="SKU Movement" subtitle={`Per-ASIN units, momentum and month projection for ${scopeLabel} — built from saved order data only, no export`} />
+      <ReportHeader title="SKU Movement" subtitle={`Per-ASIN units, momentum and month projection for ${scopeLabel} — built from saved order data only, no export`}>
+        {data && !data.snapshotMissing && rawRows.length > 0 && (
+          <div className="sku-mv-meta" aria-label="Report scope">
+            <div className="sku-mv-meta-item"><span className="sku-mv-meta-k">Account</span><span className="sku-mv-meta-v">{accountName || "—"}{scopeCurrency ? ` · ${scopeCurrency}` : ""}</span></div>
+            <div className="sku-mv-meta-item"><span className="sku-mv-meta-k">Scope</span><span className="sku-mv-meta-v">{scopeChip}</span></div>
+            {statusBadge && <span className={"sku-mv-status sku-mv-status--" + statusBadge.tone}>{statusBadge.label}</span>}
+          </div>
+        )}
+      </ReportHeader>
       {state}
 
       {data && !data.snapshotMissing && (
@@ -320,7 +400,7 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
         ]} />
       )}
 
-      {completeness && completeness.unitBreakdown && <ObservedUnitsBreakdown completeness={completeness} />}
+      {completeness && completeness.unitBreakdown && <SkuObservedUnits completeness={completeness} />}
       {completeness && completeness.provisional && (
         <Notice tone="warn">The most recent day ({fmtDateHuman(completeness.latestDate || data?.effectiveAsOf)}) is <strong>provisional</strong>: {completeness.itemizationPercent}% of its orders are itemized and {completeness.pendingOrderCount} are still pending. Units may rise as Amazon settles them; nothing is fabricated.</Notice>
       )}
@@ -333,10 +413,10 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
 
       {data && !data.snapshotMissing && rawRows.length > 0 && <>
         <div className="rvkpi-grid rvkpi-grid-5">
-          <GradientKpi label="ASINs in scope" value={nInt(rawRows.length)} />
-          <GradientKpi label={`${mtdLabel} units`} value={nInt(totals.mtd)} gradient="linear-gradient(135deg,#FF6B6B,#FF8E53)" />
-          <GradientKpi label={`Last ${N}-day units`} value={nInt(totals.recent)} gradient="linear-gradient(135deg,#A78BFA,#7C3AED)" />
-          <GradientKpi label={`Previous ${N}-day units`} value={nInt(totals.prev)} />
+          <GradientKpi label="ASINs in scope" value={nInt(rawRows.length)} sub="Active in movement analysis" />
+          <GradientKpi label={`${mtdLabel} units`} value={nInt(totals.mtd)} sub={mtdRange ? `${fmtDateHuman(mtdRange.from)} – ${fmtDateHuman(mtdRange.to)}${mtdRange.days ? ` (${mtdRange.days} days)` : ""}` : undefined} />
+          <GradientKpi label={`Last ${N}-day units`} value={nInt(totals.recent)} sub={recentCols.length ? rangeLabel(recentCols) : undefined} />
+          <GradientKpi label={`Previous ${N}-day units`} value={nInt(totals.prev)} sub={prevCols.length ? rangeLabel(prevCols) : undefined} />
           <GradientKpi label="Movement" value={fmtPct(totals.movementPercent)} sub={`vs previous ${N} days`} tone={totals.movementPercent == null ? undefined : (totals.movementPercent > 0 ? "good" : totals.movementPercent < 0 ? "bad" : undefined)} />
         </div>
 
@@ -348,12 +428,17 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
             <div className="skupl-toolbar-spacer" />
             {onColumnsChange && <ColumnChooser hidden={hiddenColumns} onChange={onColumnsChange} />}
             {canEdit && onBulkIdentifiers && <button type="button" className="cache-refresh-btn" onClick={() => setBulkOpen(true)} title="Download / upload identifiers"><Upload size={14} />Identifiers</button>}
-            {onReload && <button type="button" className="cache-refresh-btn" onClick={onReload} disabled={updating} title="Re-read the latest saved data. This never creates an export."><RefreshCw size={14} />{updating ? "Reloading…" : "Reload"}</button>}
+            {onReload && <button type="button" className="cache-refresh-btn" onClick={onReload} disabled={updating} title="Re-read the latest saved data. This never creates an export."><RefreshCw size={14} />{updating ? "Reloading…" : "Refresh"}</button>}
             <ExportButton onClick={exportTable} disabled={!sorted.length} />
           </div>
           <div className="plan-scroll">
             <table className="plan-table sku-mv" style={{ minWidth: 900 + recentCols.length * 52 }}>
               <thead>
+                <tr className="sku-mv-group-row" aria-hidden="true">
+                  {groupPlan.map((g) => (
+                    <th key={g.cls} colSpan={g.span} className={"sku-mv-group-th sku-mv-group-" + g.cls}>{g.label}</th>
+                  ))}
+                </tr>
                 <tr>
                   <SortTh style={col1Th} label="Product / ASIN" col="productName" sort={sort} onSort={onSort} align="left" />
                   {shown("identifier") && <SortTh style={col2Th} label="Identifier" col="identifier" sort={sort} onSort={onSort} align="left" hint="Your manual per-ASIN label (editable)" />}
@@ -400,9 +485,12 @@ export default function SkuMovement({ data, loading, updating, error, accountNam
           {pageCount > 1 && <div style={{ padding: "10px 14px", borderTop: "1px solid var(--border-default)" }}><Pagination page={page} pageCount={pageCount} onChange={setPage} /></div>}
         </div>
 
+        <details className="sku-mv-methodology">
+        <summary>SKU Movement methodology, coverage, and identifier policy</summary>
         <div className="footer-note">
           One row per account + marketplace + currency + ASIN; every legitimate SKU mapped to an ASIN is combined once (the representative SKU excludes Amazon <code>amzn…</code> return SKUs). Units come from the durable enriched Order Line Items history — priced + explicit-zero + SKU-identifiable pending units count; cancelled units never count; unresolved pending units without a usable ASIN stay honestly Unmapped. The three completed months, the {mtdLabel} window, and the Last {N} / Previous {N} windows are all computed from this account's latest proven order date ({fmtDateHuman(data.effectiveAsOf)}), never your browser's clock. A month or date before this account's coverage shows an em dash (unavailable); a covered date with no units is an honest 0. Changing the window (N) recomputes Last {N} / Previous {N} locally from the saved daily history — no export. Identifiers are your own per-ASIN labels; the column chooser, the window and identifiers all save automatically. No action here ever creates a DataDoe export.
         </div>
+        </details>
       </>}
 
       {bulkOpen && <BulkIdentifierModal rows={sorted} accountName={accountName} onClose={() => setBulkOpen(false)} onApply={onBulkIdentifiers} />}
