@@ -78,13 +78,56 @@ test("nearest PRIOR date precedence (no same-day -> D-1 before D-3)", () => {
   assert.equal(r.estimates[0].estimatedSales, 100); // 50 x 2
 });
 
-test("maximum SEVEN-day lookback: D-7 is used; D-8 is NOT", () => {
-  const found = ENG.computeOliSalesEstimates({ accountId: ACC, accountMarketplace: "IN", operationalRows: [target("2026-08-29", 1)], referenceRows: [ref("2026-08-22", 70)], calculatedAt: "T" });
-  assert.equal(found.estimates.length, 1);
-  assert.equal(found.estimates[0].referenceDate, "2026-08-22"); // exactly 7 days back
-  const tooOld = ENG.computeOliSalesEstimates({ accountId: ACC, accountMarketplace: "IN", operationalRows: [target("2026-08-29", 1)], referenceRows: [ref("2026-08-21", 70)], calculatedAt: "T" });
-  assert.equal(tooOld.estimates.length, 0, "D-8 is beyond the 7-day horizon");
-  assert.equal(tooOld.unresolved.length, 1);
+test("the canonical look-back horizon is 30 calendar days (single source of truth)", () => {
+  assert.equal(ENG.OLI_ESTIMATE_LOOKBACK_DAYS, 30);
+});
+
+test("D-1 is preferred over D-2 (nearest prior wins)", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [target("2026-08-29", 2)],
+    referenceRows: [ref("2026-08-28", 50), ref("2026-08-27", 999)], // D-1 and D-2
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates[0].referenceDate, "2026-08-28", "the D-1 reference is chosen, never the D-2");
+  assert.equal(r.estimates[0].estimatedSales, 100); // 50 x 2
+});
+
+test("D-7 still resolves within the 30-day horizon", () => {
+  const r = ENG.computeOliSalesEstimates({ accountId: ACC, accountMarketplace: "IN", operationalRows: [target("2026-08-29", 1)], referenceRows: [ref("2026-08-22", 70)], calculatedAt: "T" });
+  assert.equal(r.estimates.length, 1);
+  assert.equal(r.estimates[0].referenceDate, "2026-08-22"); // exactly 7 days back
+  assert.equal(r.estimates[0].estimatedSales, 70);
+});
+
+test("D-8 now resolves (the 30-day extension; was beyond the old 7-day horizon)", () => {
+  const r = ENG.computeOliSalesEstimates({ accountId: ACC, accountMarketplace: "IN", operationalRows: [target("2026-08-29", 1)], referenceRows: [ref("2026-08-21", 70)], calculatedAt: "T" });
+  assert.equal(r.estimates.length, 1, "D-8 is now within the 30-day horizon");
+  assert.equal(r.estimates[0].referenceDate, "2026-08-21"); // exactly 8 days back
+});
+
+test("D-30 resolves (the far inclusive edge of the horizon, across a month boundary)", () => {
+  const r = ENG.computeOliSalesEstimates({ accountId: ACC, accountMarketplace: "IN", operationalRows: [target("2026-08-29", 1)], referenceRows: [ref("2026-07-30", 70)], calculatedAt: "T" });
+  assert.equal(r.estimates.length, 1, "D-30 is the last day inside the horizon");
+  assert.equal(r.estimates[0].referenceDate, "2026-07-30"); // exactly 30 days back
+});
+
+test("D-31 is rejected (one day beyond the 30-day horizon -> no-reference)", () => {
+  const r = ENG.computeOliSalesEstimates({ accountId: ACC, accountMarketplace: "IN", operationalRows: [target("2026-08-29", 1)], referenceRows: [ref("2026-07-29", 70)], calculatedAt: "T" });
+  assert.equal(r.estimates.length, 0, "D-31 is beyond the 30-day horizon");
+  assert.equal(r.unresolved.length, 1);
+  assert.equal(r.unresolved[0].reason, "no-reference");
+});
+
+test("nearest eligible day wins across the FULL 30-day span (D-8 chosen over D-30)", () => {
+  const r = ENG.computeOliSalesEstimates({
+    accountId: ACC, accountMarketplace: "IN",
+    operationalRows: [target("2026-08-29", 1)],
+    referenceRows: [ref("2026-08-21", 55), ref("2026-07-30", 999)], // both eligible; D-8 nearer than D-30
+    calculatedAt: "T",
+  });
+  assert.equal(r.estimates[0].referenceDate, "2026-08-21", "the nearer D-8 wins over the far D-30");
+  assert.equal(r.estimates[0].referenceUnitPrice, 55);
 });
 
 test("NEVER a future-date reference (a later-dated priced row is ignored)", () => {
@@ -211,7 +254,7 @@ for (const [label, over] of [
   });
 }
 
-test("unresolved row is retained when NO trustworthy reference exists within 7 days", () => {
+test("unresolved row is retained when NO trustworthy reference exists within the look-back window", () => {
   const r = ENG.computeOliSalesEstimates({ accountId: ACC, accountMarketplace: "IN", operationalRows: [target("2026-08-29", 5)], referenceRows: [], calculatedAt: "T" });
   assert.equal(r.estimates.length, 0);
   assert.equal(r.unresolved.length, 1);
@@ -624,7 +667,7 @@ test("resolved ASIN but NO in-window priced reference -> no-reference (counted, 
   const r = ENG.computeOliSalesEstimates({
     accountId: ACC, accountMarketplace: "IN",
     operationalRows: [blankAsinTarget("2026-08-30", 3)],
-    referenceRows: [ref("2026-08-20", 100)], // 10 days before -> beyond the 7-day look-back
+    referenceRows: [ref("2026-07-25", 100)], // 36 days before -> beyond the 30-day look-back
     skuAsinResolver: mkResolver({ history: [histRow()] }),
     calculatedAt: "T",
   });

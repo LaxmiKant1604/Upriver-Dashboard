@@ -22,7 +22,7 @@ const isDateStr = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v ?? ""));
  * @param {function} args.readOperationalUnits - ({organizationFingerprint,connectionId,accountIds,from,to,additiveOnly,signal}) => rows[]
  * @param {function} args.readDimensionalRows  - ({organizationFingerprint,connectionId,accountId,from,to,signal}) => rows[]
  * @param {function} args.writeEstimates        - ({organizationFingerprint,connectionId,accountId,coveredFrom,coveredTo,estimateRows,signal}) => {write,...}
- * @param {number} [args.lookbackDays=7]
+ * @param {number} [args.lookbackDays=OLI_ESTIMATE_LOOKBACK_DAYS] - 30; also sets the reference-fetch window start.
  * @param {number} [args.precision=2]
  * @param {string} [args.calculatedAt]
  * @returns {Promise<{estimates:object[], unresolved:object[], write:object}>}

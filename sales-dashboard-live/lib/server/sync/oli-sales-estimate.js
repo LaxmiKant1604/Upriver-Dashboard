@@ -26,7 +26,12 @@ const N = (v) => (v == null || v === "" ? NaN : Number(v));
 const isDateStr = (v) => /^\d{4}-\d{2}-\d{2}$/.test(S(v));
 
 // The default look-back horizon (calendar days, inclusive of the target date). Never searches a FUTURE date.
-export const OLI_ESTIMATE_LOOKBACK_DAYS = 7;
+// This is the ONE canonical horizon: the pure engine's search loop AND the recompute's reference-fetch window
+// (readDimensionalRows from = minTarget - OLI_ESTIMATE_LOOKBACK_DAYS) both derive from it, so no second module
+// hardcodes a horizon. Extended 7 -> 30 so a still-unpriced (pending/zero) unit can bind a same-product reference
+// price up to 30 calendar days prior when no closer one exists; the nearest eligible day still wins, identity
+// isolation is unchanged, and actual itemization still supersedes the estimate on the next refresh (no double count).
+export const OLI_ESTIMATE_LOOKBACK_DAYS = 30;
 export const MATCH_SKU_EXACT = "sku-exact";
 export const MATCH_ASIN_FALLBACK = "asin-fallback";
 
@@ -273,7 +278,7 @@ export function emptySkuAsinResolver(accountMarketplace) {
  *                                            blank/absent => every grain is unresolved (fail closed; never guessed).
  * @param {object[]} args.operationalRows  - source_oli_operational_units rows (targets carry explicit_zero/pending).
  * @param {object[]} args.referenceRows     - source_oli_dimensional_history rows within [minDate-lookback, maxDate].
- * @param {number} [args.maxLookbackDays=7] - inclusive calendar-day look-back (never a future date).
+ * @param {number} [args.maxLookbackDays=OLI_ESTIMATE_LOOKBACK_DAYS] - inclusive calendar-day look-back (30; never a future date).
  * @param {number} [args.precision=2]       - currency minor units for the final line amount.
  * @param {string} [args.calculatedAt]      - ISO stamp for provenance (defaults to now); pin it for byte-identical tests.
  * @returns {{estimates: object[], unresolved: object[]}}

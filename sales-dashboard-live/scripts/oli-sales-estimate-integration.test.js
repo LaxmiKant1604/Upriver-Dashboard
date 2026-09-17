@@ -75,6 +75,21 @@ test("recompute writes an estimate for a missing-price grain from a dimensional 
   assert.equal(h.writes[0][0].estimatedSales, 300);
 });
 
+test("reference-fetch window start = minTarget - 30 days (the horizon drives the DB read window, not just the engine loop)", async () => {
+  let capturedFrom = null; let capturedTo = null;
+  const r = await RECOMP.recomputeOliSalesEstimatesWindow({
+    organizationFingerprint: ORG, accountId: ACC, accountMarketplace: "IN", from: "2026-08-01", to: "2026-08-31", calculatedAt: "T",
+    readOperationalUnits: async () => [opRow("2026-08-29", { pending: 3 })],
+    readDimensionalRows: async ({ from, to }) => { capturedFrom = from; capturedTo = to; return [dimRow("2026-08-01", 100)]; }, // 2026-08-01 = 28 days before the target
+    writeEstimates: async () => ({ write: "ok" }),
+  });
+  // minTarget = 2026-08-29; the reference read must reach back a FULL 30 calendar days (2026-08-29 - 30 = 2026-07-30).
+  assert.equal(capturedFrom, "2026-07-30", "readDimensionalRows.from = minTarget - 30 days (was minTarget - 7)");
+  assert.equal(capturedTo, "2026-08-29", "readDimensionalRows.to = maxTarget");
+  assert.equal(r.estimates.length, 1, "a 28-day-prior reference now resolves through the recompute under the 30-day window");
+  assert.equal(r.estimates[0].estimatedSales, 300);
+});
+
 test("recompute is IDEMPOTENT: same durable evidence -> byte-identical estimate rows", async () => {
   const args = { organizationFingerprint: ORG, accountId: ACC, accountMarketplace: "IN", from: "2026-08-01", to: "2026-08-31", calculatedAt: "T" };
   const a = await RECOMP.recomputeOliSalesEstimatesWindow({ ...args, ...harness({ operationalRows: [opRow("2026-08-29", { pending: 3 })], referenceRows: [dimRow("2026-08-29", 100)] }) });
@@ -90,8 +105,8 @@ test("ACTUAL supersedes: once itemized (no missing units) the estimate window is
   assert.deepEqual(h.writes[0], [], "the window is cleared so a resolved grain leaves no estimate (no double-count)");
 });
 
-test("no reference within 7 days -> unresolved, empty estimate write (grain stays in the breakdown)", async () => {
-  const h = harness({ operationalRows: [opRow("2026-08-29", { pending: 2 })], referenceRows: [dimRow("2026-08-10", 100)] });
+test("no reference within the 30-day look-back window -> unresolved, empty estimate write (grain stays in the breakdown)", async () => {
+  const h = harness({ operationalRows: [opRow("2026-08-29", { pending: 2 })], referenceRows: [dimRow("2026-07-20", 100)] }); // 40 days before -> beyond the 30-day horizon
   const r = await RECOMP.recomputeOliSalesEstimatesWindow({ organizationFingerprint: ORG, accountId: ACC, accountMarketplace: "IN", from: "2026-08-01", to: "2026-08-31", ...h, calculatedAt: "T" });
   assert.equal(r.estimates.length, 0);
   assert.equal(r.unresolved.length, 1);

@@ -9,7 +9,8 @@
 //
 // Idempotent: each account's estimate window is atomically REPLACED (delete + insert) chunked by CALENDAR MONTH, so
 // a re-run writes byte-identical rows and a grain that has resolved (actual data arrived) leaves NO estimate. The
-// reference look-back (7 days) reads across the month boundary, so month chunking never loses a nearest-prior match.
+// reference look-back (OLI_ESTIMATE_LOOKBACK_DAYS = 30 days) reads across the month boundary (the recompute fetches
+// references from minTarget - lookback), so month chunking never loses a nearest-prior match within the horizon.
 import { readFileSync } from "node:fs";
 
 // Flexible env: prefer already-set process.env (GitHub Actions); else load .vercel/.env.production.local or .env.local.
