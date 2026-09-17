@@ -2245,6 +2245,154 @@ button:focus-visible, select:focus-visible, input:focus-visible, a:focus-visible
 .op-report .ca-warn-ink{ color:var(--op-warn-ink); }
 .op-report .ca-reasons{ display:flex; flex-wrap:wrap; gap:4px; }
 .op-report .ca-reason{ display:inline-block; font:700 10.5px inherit; color:var(--op-ink-2); background:var(--op-hair); border:1px solid var(--op-border-2); border-radius:5px; padding:1px 7px; white-space:nowrap; }
+
+/* ============================================================================
+   BRAND PORTFOLIO (.bv-portfolio) — the approved cross-account redesign, scoped
+   ENTIRELY under .bv-portfolio so the account-scoped Brand View and every other
+   .op-report page are byte-identical. Presentation only; no data/formula change.
+   ============================================================================ */
+/* Flat workspace ONLY while the portfolio is shown (never the other op-report pages). */
+.main-area.op-workspace:has(.bv-portfolio){ background:#F3F4F5; }
+
+/* Brand context header — metadata, not KPI cards. */
+.bv-portfolio.bv-page{ max-width:1760px; }
+.bv-portfolio .bv-head{ display:flex; align-items:flex-start; justify-content:space-between; gap:16px 24px; flex-wrap:wrap; border:1px solid var(--op-border); background:var(--op-card); border-radius:6px; padding:12px 16px; margin-bottom:0; }
+.bv-portfolio .bv-head-main{ min-width:0; }
+.bv-portfolio .bv-head-titlerow{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.bv-portfolio .bv-head .page-title{ font-size:18px; letter-spacing:0; }
+.bv-portfolio .bv-brand-chip{ display:inline-flex; align-items:center; gap:5px; font-size:12.5px; font-weight:800; color:var(--op-blue); background:var(--op-blue-soft); border:1px solid var(--op-blue-border); border-radius:5px; padding:2px 9px; }
+.bv-portfolio .bv-head-counts{ display:inline-flex; align-items:center; gap:6px; font-size:12px; font-weight:600; color:var(--op-ink-3); }
+.bv-portfolio .bv-head-counts svg{ color:var(--op-ink-4); }
+.bv-portfolio .bv-head-desc{ margin-top:4px; }
+.bv-portfolio .bv-head-meta{ display:flex; gap:24px; flex-wrap:wrap; }
+.bv-portfolio .bv-meta-item{ display:flex; flex-direction:column; gap:2px; }
+.bv-portfolio .bv-meta-label{ font-size:9.5px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--op-ink-4); }
+.bv-portfolio .bv-meta-value{ font-size:13px; font-weight:700; color:var(--op-ink); }
+
+/* Control bar container. */
+.bv-portfolio .bv-controls{ border:1px solid var(--op-border); background:var(--op-card); border-radius:6px; padding:10px 14px; margin-top:12px; align-items:flex-end; gap:12px 14px; }
+.bv-portfolio .bv-field-label{ color:var(--op-ink-4); }
+.bv-portfolio .bv-select,.bv-portfolio .bv-custom-inputs input{ border-color:var(--op-border); border-radius:6px; color:var(--op-ink); background:#fff; }
+.bv-portfolio .bv-select:hover{ border-color:#B9C0C5; }
+.bv-portfolio .plan-export-btn{ border-radius:6px; }
+/* Admin source action: distinct amber accent + an ADMIN tag; never the default/primary. */
+.bv-portfolio .bv-admin-btn{ border-color:var(--op-warn-border); color:var(--op-orange-strong); background:var(--op-orange-soft); }
+.bv-portfolio .bv-admin-btn:hover:not(:disabled){ border-color:var(--op-orange-dark); background:#FDECCE; }
+.bv-portfolio .bv-admin-tag{ font-size:8.5px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:#fff; background:var(--op-orange-dark); border-radius:3px; padding:1px 5px; margin-left:2px; }
+
+/* Freshness row — wraps; never truncates. */
+.bv-portfolio .bv-freshness{ display:flex; flex-wrap:wrap; align-items:center; gap:5px 16px; margin-top:10px; font-size:11.5px; color:var(--op-ink-3); }
+.bv-portfolio .bv-fresh-item{ display:inline-flex; align-items:center; gap:6px; white-space:normal; }
+.bv-portfolio .bv-fresh-item .live-dot{ position:static; }
+
+/* Consolidated status panel: one compact panel, a 4px left accent, View details for the rest. */
+.bv-portfolio .bv-status{ display:flex; align-items:flex-start; gap:10px; margin-top:12px; border:1px solid var(--op-border); border-left-width:4px; border-radius:6px; padding:9px 13px; background:var(--op-card); font-size:12px; line-height:1.5; }
+.bv-portfolio .bv-status-warning{ background:var(--op-warn-soft); border-color:var(--op-warn-border); border-left-color:var(--op-orange-dark); color:var(--op-warn-ink); }
+.bv-portfolio .bv-status-error{ background:var(--op-red-soft); border-color:var(--op-red-border); border-left-color:var(--op-red); color:#8A2D17; }
+.bv-portfolio .bv-status-info{ background:#EFF5FA; border-color:#CFE0EE; border-left-color:var(--op-blue); color:#1B4E76; }
+.bv-portfolio .bv-status-success{ background:#F1F7F4; border-color:var(--op-green-border); border-left-color:var(--op-green); color:var(--op-green); }
+.bv-portfolio .bv-status-icon{ flex:none; margin-top:1px; opacity:.9; }
+.bv-portfolio .bv-status-body{ min-width:0; flex:1; }
+.bv-portfolio .bv-status-head{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.bv-portfolio .bv-status-title{ font-weight:750; color:var(--op-ink); }
+.bv-portfolio .bv-status-badge{ font-size:9.5px; font-weight:800; text-transform:uppercase; letter-spacing:.03em; padding:2px 7px; border-radius:3px; border:1px solid currentColor; background:rgba(255,255,255,.55); }
+.bv-portfolio .bv-status-toggle{ margin-left:auto; border:none; background:none; padding:0; font:700 12px inherit; color:var(--op-blue); cursor:pointer; }
+.bv-portfolio .bv-status-toggle:hover{ text-decoration:underline; }
+.bv-portfolio .bv-status-toggle:focus-visible{ outline:2px solid var(--op-blue); outline-offset:2px; border-radius:3px; }
+.bv-portfolio .bv-status-detail{ margin-top:3px; color:var(--op-ink-2); }
+.bv-portfolio .bv-status-list{ margin:8px 0 0; padding:0; list-style:none; display:flex; flex-direction:column; gap:5px; }
+.bv-portfolio .bv-status-item{ font-size:11.5px; color:var(--op-ink-2); padding-left:10px; border-left:3px solid var(--op-border); }
+.bv-portfolio .bv-status-item-warning{ border-left-color:var(--op-orange-dark); }
+.bv-portfolio .bv-status-item-error{ border-left-color:var(--op-red); }
+.bv-portfolio .bv-status-item-info{ border-left-color:var(--op-blue); }
+.bv-portfolio .bv-status-item-success{ border-left-color:var(--op-green); }
+.bv-portfolio .bv-status-item-title{ font-weight:750; color:var(--op-ink); }
+
+/* Six-cell KPI strip. Tabular figures; unavailable is an em dash, never zero. */
+.bv-portfolio .bv-kpi-strip{ display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:10px; margin-top:14px; }
+.bv-portfolio .bv-kpi{ background:var(--op-card); border:1px solid var(--op-border); border-radius:6px; padding:11px 13px; min-width:0; }
+.bv-portfolio .bv-kpi-top{ display:flex; align-items:center; gap:6px; }
+.bv-portfolio .bv-kpi-label{ display:inline-flex; align-items:center; gap:5px; font-size:9.5px; font-weight:800; letter-spacing:.05em; text-transform:uppercase; color:var(--op-ink-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.bv-portfolio .bv-kpi-label svg{ color:var(--op-ink-4); flex:none; }
+.bv-portfolio .bv-kpi-badge{ font-size:9px; font-weight:800; text-transform:uppercase; letter-spacing:.03em; color:var(--op-ink-3); background:var(--op-hair); border:1px solid var(--op-border-2); border-radius:3px; padding:1px 5px; white-space:nowrap; }
+.bv-portfolio .bv-kpi-hint{ margin-left:auto; display:inline-grid; place-items:center; color:var(--op-ink-4); cursor:help; }
+.bv-portfolio .bv-kpi-value{ font-family:'Outfit',sans-serif; font-variant-numeric:tabular-nums; font-size:22px; font-weight:700; color:var(--op-ink); margin-top:8px; line-height:1.15; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.bv-portfolio .bv-kpi-sub{ font-size:10.5px; color:var(--op-ink-4); margin-top:5px; line-height:1.45; }
+.bv-portfolio .bv-delta{ font-weight:800; }
+.bv-portfolio .bv-pos{ color:var(--op-green); }
+.bv-portfolio .bv-neg{ color:var(--op-red); }
+
+/* Performance summary overview. */
+.bv-portfolio .bv-overview{ margin-top:14px; }
+.bv-portfolio .bv-overview-head{ display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:4px; }
+.bv-portfolio .bv-overview-note{ font-size:11px; color:var(--op-ink-4); }
+.bv-portfolio .bv-overview-grid{ display:grid; grid-template-columns:1fr 1fr; gap:24px; margin-top:6px; }
+.bv-portfolio .bv-overview-subtitle{ font-size:12px; font-weight:750; color:var(--op-ink-2); margin-bottom:9px; }
+.bv-portfolio .bv-overview-dim{ color:var(--op-ink-4); font-weight:600; }
+.bv-portfolio .bv-cadence,.bv-portfolio .bv-contrib{ display:flex; flex-direction:column; gap:7px; }
+.bv-portfolio .bv-cadence-row{ display:grid; grid-template-columns:66px 1fr auto; align-items:center; gap:10px; font-size:11.5px; }
+.bv-portfolio .bv-cadence-label{ color:var(--op-ink-3); font-weight:700; white-space:nowrap; }
+.bv-portfolio .bv-cadence-track,.bv-portfolio .bv-contrib-track{ position:relative; height:12px; background:#EDF0F2; border-radius:3px; overflow:hidden; }
+.bv-portfolio .bv-cadence-fill{ position:absolute; left:0; top:0; height:100%; background:#9CC3E6; border-radius:3px; }
+.bv-portfolio .bv-cadence-fill-rr{ background:#CADEF0; }
+.bv-portfolio .bv-cadence-fill-actual{ background:var(--op-blue); }
+.bv-portfolio .bv-cadence-current .bv-cadence-label{ color:var(--op-blue); font-weight:800; }
+.bv-portfolio .bv-cadence-val{ color:var(--op-ink); font-weight:700; white-space:nowrap; text-align:right; }
+.bv-portfolio .bv-cadence-rr{ color:var(--op-ink-4); font-weight:600; }
+.bv-portfolio .bv-contrib-row{ display:grid; grid-template-columns:104px 1fr auto 46px; align-items:center; gap:10px; font-size:11.5px; }
+.bv-portfolio .bv-contrib-label{ color:var(--op-ink-2); font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.bv-portfolio .bv-contrib-fill{ position:absolute; left:0; top:0; height:100%; background:var(--op-blue); border-radius:3px; }
+.bv-portfolio .bv-contrib-val{ color:var(--op-ink); font-weight:700; white-space:nowrap; text-align:right; }
+.bv-portfolio .bv-contrib-share{ color:var(--op-ink-4); white-space:nowrap; text-align:right; }
+.bv-portfolio .bv-contrib-total{ border-top:1px solid var(--op-border-2); margin-top:2px; padding-top:7px; }
+.bv-portfolio .bv-contrib-total .bv-contrib-label,.bv-portfolio .bv-contrib-total .bv-contrib-val,.bv-portfolio .bv-contrib-total .bv-contrib-share{ font-weight:800; color:var(--op-ink); }
+
+/* Page jump navigation — sticky within the workspace, below the global 60px bar. */
+.bv-portfolio .bv-jump{ position:sticky; top:60px; z-index:6; display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-top:16px; padding:7px 14px; background:rgba(243,244,245,.94); border:1px solid var(--op-border); border-radius:6px; }
+.bv-portfolio .bv-jump-label{ font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.06em; color:var(--op-ink-4); }
+.bv-portfolio .bv-jump-links{ display:flex; flex-wrap:wrap; gap:4px; }
+.bv-portfolio .bv-jump-link{ font-size:12px; font-weight:700; color:var(--op-blue); text-decoration:none; padding:3px 9px; border-radius:5px; }
+.bv-portfolio .bv-jump-link:hover{ background:var(--op-blue-soft); }
+.bv-portfolio .bv-jump-link:focus-visible{ outline:2px solid var(--op-blue); outline-offset:1px; }
+.bv-portfolio .bv-jump-note{ margin-left:auto; font-size:11px; color:var(--op-ink-4); }
+.bv-portfolio [id^="bv-"]:focus{ outline:none; }
+.bv-portfolio [id^="bv-"]{ scroll-margin-top:112px; }
+
+/* Tables: sticky header + sticky first column within a bounded scroll box. */
+.bv-portfolio .bv-panel{ border-radius:6px; }
+.bv-portfolio .bv-scroll{ max-height:78vh; overflow:auto; }
+.bv-portfolio .bv-table thead th{ position:sticky; top:0; z-index:2; }
+.bv-portfolio .bv-table td.bv-first,.bv-portfolio .bv-table th.bv-first{ position:sticky; left:0; z-index:1; background:var(--op-card); }
+.bv-portfolio .bv-table thead th.bv-first{ z-index:3; }
+.bv-portfolio .bv-table tbody tr.bv-total td.bv-first{ background:#EAF1F8; }
+/* Restrained column tones (design): no green columns, current month in blue, latest 7-day
+   date in amber. No conditional row/value colouring is introduced. */
+.bv-portfolio .bv-table .bv-col-positive,.bv-portfolio .bv-table .bv-col-accent{ color:var(--op-ink); }
+.bv-portfolio .bv-table th.bv-col-positive,.bv-portfolio .bv-table th.bv-col-accent{ color:rgba(226,233,240,.82); }
+.bv-portfolio .bv-table .bv-col-key-actual{ color:var(--op-blue); font-weight:750; background:rgba(20,110,180,.05); }
+.bv-portfolio .bv-table th.bv-col-key-actual{ color:#BBD6EE; }
+.bv-portfolio .bv-table .bv-col-latest{ background:rgba(255,153,0,.09); color:var(--op-ink); }
+.bv-portfolio .bv-table th.bv-col-latest{ color:#FFD9A6; box-shadow:inset 0 -2px 0 var(--op-orange); }
+.bv-portfolio .bv-table tbody tr:hover td.bv-col-latest{ background:rgba(255,153,0,.15); }
+
+/* Methodology disclosure (portfolio scope). */
+.bv-portfolio .methodology-disclosure{ margin-top:18px; border-top:1px solid var(--op-border-2); padding-top:12px; }
+.bv-portfolio .methodology-disclosure > summary{ cursor:pointer; list-style:none; font-size:12px; font-weight:750; color:var(--op-ink-2); display:inline-flex; align-items:center; gap:7px; }
+.bv-portfolio .methodology-disclosure > summary::-webkit-details-marker{ display:none; }
+.bv-portfolio .methodology-disclosure > summary::before{ content:'\\25B8'; color:var(--op-ink-4); font-size:11px; transition:transform var(--t-fast) var(--ease); }
+.bv-portfolio .methodology-disclosure[open] > summary::before{ transform:rotate(90deg); }
+.bv-portfolio .methodology-disclosure > summary:hover{ color:var(--op-ink); }
+.bv-portfolio .methodology-disclosure > summary:focus-visible{ outline:2px solid var(--op-blue); outline-offset:2px; border-radius:3px; }
+.bv-portfolio .methodology-disclosure .footer-note{ margin-top:0; padding-top:8px; border-top:none; }
+
+/* Responsive reflow. */
+@media (max-width:1280px){ .bv-portfolio .bv-kpi-strip{ grid-template-columns:repeat(3,minmax(0,1fr)); } }
+@media (max-width:900px){
+  .bv-portfolio .bv-kpi-strip{ grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .bv-portfolio .bv-overview-grid{ grid-template-columns:1fr; gap:16px; }
+  .bv-portfolio .bv-head-meta{ gap:16px; }
+}
+@media (max-width:560px){ .bv-portfolio .bv-kpi-strip{ grid-template-columns:1fr 1fr; } }
 `;
 
 /* Chart colours, exported so recharts series stay in step with the CSS tokens

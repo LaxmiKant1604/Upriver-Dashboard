@@ -19,21 +19,204 @@
      snapshots from DataDoe before rebuilding this shared Brand View.         */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CalendarRange, Coins, DatabaseZap, Inbox, RefreshCw, Tag } from "lucide-react";
+import { AlertTriangle, Boxes, CalendarRange, Coins, DatabaseZap, Inbox, Info, Layers, RefreshCw, Tag } from "lucide-react";
 
 import { DataQualityAlert, EmptyState, ErrorState, SkeletonMetricGrid, SkeletonTable } from "../components/ui.jsx";
-import { fmtRangeLabel } from "../lib/format.js";
+import { fmtRangeLabel, monthKeyLabel, nInt } from "../lib/format.js";
 import { partitionBrandSourceAccounts, refreshBrandSourceAccounts } from "../lib/brand-source-refresh.js";
 import { marketplaceToday } from "../../lib/marketplaces.js";
-import { CURRENCY_OPTIONS, brandViewModel, isConvertedMode } from "../lib/brand-view.js";
-import { DASH } from "../lib/brand-view-tables.js";
-import BrandReports, { buildExportModel, freshnessSummaryLine, fxSummaryLine } from "./BrandReports.jsx";
+import { CURRENCY_OPTIONS, brandViewModel, inventoryCoverDays, isConvertedMode, shareOf, tacos } from "../lib/brand-view.js";
+import { DASH, buildBrandTables, countryTitle, coverLabel, money, ratePct } from "../lib/brand-view-tables.js";
+import { regionLabel } from "../lib/region-view.js";
+import { ReportPanel, buildExportModel, freshnessSummaryLine, fxSummaryLine } from "./BrandReports.jsx";
 import {
   BvSelect, CustomRangeInputs, ExportMenu, RANGE_PRESETS,
   useBrandCurrency, useBrandExport, useBrandRange, useFxRates,
 } from "./brand-controls.jsx";
 
 const PORTFOLIO_VERSION = "brand-view-portfolio-v1";
+
+/* ------------------------------------------------------------------ presentation helpers
+   All of these are presentation-only: they read the SAME model + built tables the page
+   already computes and reuse the existing formatters and cover/TACoS helpers. No new
+   business metric, aggregation or currency rule is introduced here. */
+
+// The six headline KPI values, derived from the built tables. Money values are only
+// defined for a SINGLE currency group (converted mode, or a single-currency brand);
+// with several currency groups they stay null (an em dash) because money is never
+// summed across currencies. Units and FBA units are counts and always sum.
+function portfolioKpis(tables) {
+  const groups = tables?.dailyGroups || [];
+  const single = groups.length === 1 ? groups[0] : null;
+  const daily = tables?.daily || null;
+  const unattributedFba = daily && daily.inventoryScope !== "country" && groups.length === 1 ? daily.inventoryAccountTotal : null;
+  const fba = single ? (single.fbaAvailable === null ? unattributedFba : single.fbaAvailable) : null;
+  const rangeUnits = single ? single.rows.reduce((sum, row) => sum + (Number(row.coverUnits) || 0), 0) : null;
+  const cover = single && daily?.selectedRangeDays ? inventoryCoverDays(fba, rangeUnits, daily.selectedRangeDays) : null;
+  const sales = single ? single.totals.sales : null;
+  const ly = single ? single.totals.lySales : null;
+  const adSpend = single ? single.totals.adSpend : null;
+  const lyDelta = sales != null && Number.isFinite(ly) && ly > 0 ? (sales - ly) / ly : null;
+  return {
+    single: Boolean(single), currency: single?.currency || null,
+    sales, ly, lyDelta, units: tables?.totalUnits ?? null, fba, cover, adSpend, tacos: tacos(adSpend, sales),
+  };
+}
+
+function BvKpi({ label, value, sub, badge, hint, icon }) {
+  return (
+    <div className="bv-kpi">
+      <div className="bv-kpi-top">
+        <span className="bv-kpi-label">{icon}{label}</span>
+        {badge ? <span className="bv-kpi-badge">{badge}</span> : null}
+        {hint ? <span className="bv-kpi-hint" tabIndex={0} role="note" aria-label={hint} title={hint}><Info size={12} aria-hidden="true" /></span> : null}
+      </div>
+      <div className="bv-kpi-value">{value}</div>
+      {sub ? <div className="bv-kpi-sub">{sub}</div> : null}
+    </div>
+  );
+}
+
+// ONE consolidated status panel: the highest-priority live message is shown compactly,
+// with every remaining real message behind "View details". Every item is passed in from
+// the page's existing evidence; nothing is invented and no warning is suppressed.
+function BvStatusPanel({ items }) {
+  const [open, setOpen] = useState(false);
+  if (!items || !items.length) return null;
+  const [head, ...rest] = items;
+  const Icon = head.tone === "error" ? AlertTriangle : head.busy ? RefreshCw : Info;
+  return (
+    <div className={"bv-status bv-status-" + head.tone} role={head.tone === "error" ? "alert" : "status"}>
+      <Icon size={15} className={"bv-status-icon" + (head.busy ? " spin" : "")} aria-hidden="true" />
+      <div className="bv-status-body">
+        <div className="bv-status-head">
+          <span className="bv-status-title">{head.title}</span>
+          {head.badge ? <span className="bv-status-badge">{head.badge}</span> : null}
+          {rest.length ? (
+            <button type="button" className="bv-status-toggle" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+              {open ? "Hide details" : `View details (${rest.length})`}
+            </button>
+          ) : null}
+        </div>
+        {head.detail ? <div className="bv-status-detail">{head.detail}</div> : null}
+        {open && rest.length ? (
+          <ul className="bv-status-list">
+            {rest.map((item, index) => (
+              <li key={index} className={"bv-status-item bv-status-item-" + item.tone}>
+                <span className="bv-status-item-title">{item.title}</span>
+                {item.detail ? <span className="bv-status-item-detail"> — {item.detail}</span> : null}
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+// The compact two-column Performance Summary Overview. Populated only when there is a
+// SINGLE currency group (so the money bars and the "All Markets" total are real); with
+// several currencies the money view is not a single number, so the panel is omitted.
+function BvOverview({ tables, currencyLabelNote }) {
+  const dGroups = tables?.dailyGroups || [];
+  const mGroups = tables?.monthlyGroups || [];
+  if (dGroups.length !== 1 || mGroups.length !== 1 || !tables?.monthly?.columns?.current) return null;
+  const dGroup = dGroups[0];
+  const mGroup = mGroups[0];
+  const currency = dGroup.currency;
+  const monthly = tables.monthly;
+  const completed = monthly.columns.completed || [];
+  const current = monthly.columns.current;
+  const currentLabel = monthKeyLabel(current.key).replace(/ '\d\d$/, "");
+  const cadence = completed.map((month) => ({ key: month.key, label: monthKeyLabel(month.key), value: mGroup.totals[`m_${month.key}`] }));
+  const actual = mGroup.totals.currentActual;
+  const runRate = mGroup.totals.runRate;
+  const cadenceMax = Math.max(1, ...cadence.map((c) => Math.abs(Number(c.value) || 0)), Math.abs(Number(actual) || 0), Math.abs(Number(runRate) || 0));
+  const total = dGroup.totals.sales;
+  const contrib = dGroup.rows
+    .filter((row) => Number.isFinite(row.sales))
+    .map((row) => ({ country: row.country, sales: row.sales, share: shareOf(row.sales, total) }))
+    .sort((a, b) => (Number(b.sales) || 0) - (Number(a.sales) || 0));
+  const contribMax = Math.max(1, ...contrib.map((row) => Math.abs(Number(row.sales) || 0)));
+  const pctWidth = (value, max) => `${Math.max(0, Math.min(100, (Math.abs(Number(value) || 0) / max) * 100))}%`;
+
+  return (
+    <section className="panel bv-overview">
+      <div className="panel-head bv-overview-head">
+        <div className="panel-title">Performance summary overview</div>
+        <div className="bv-overview-note">Based on monthly and daily saved snapshots</div>
+      </div>
+      <div className="bv-overview-grid">
+        <div className="bv-overview-col">
+          <div className="bv-overview-subtitle">Monthly sales cadence <span className="bv-overview-dim">({currency})</span></div>
+          <div className="bv-cadence">
+            {cadence.map((row) => (
+              <div className="bv-cadence-row" key={row.key}>
+                <span className="bv-cadence-label">{row.label}</span>
+                <span className="bv-cadence-track"><span className="bv-cadence-fill" style={{ width: pctWidth(row.value, cadenceMax) }} /></span>
+                <span className="bv-cadence-val num">{money(row.value, currency)}</span>
+              </div>
+            ))}
+            <div className="bv-cadence-row bv-cadence-current">
+              <span className="bv-cadence-label">{currentLabel} act.</span>
+              <span className="bv-cadence-track">
+                <span className="bv-cadence-fill bv-cadence-fill-rr" style={{ width: pctWidth(runRate, cadenceMax) }} />
+                <span className="bv-cadence-fill bv-cadence-fill-actual" style={{ width: pctWidth(actual, cadenceMax) }} />
+              </span>
+              <span className="bv-cadence-val num">{money(actual, currency)} <span className="bv-cadence-rr">({money(runRate, currency)} RR)</span></span>
+            </div>
+          </div>
+        </div>
+        <div className="bv-overview-col">
+          <div className="bv-overview-subtitle">Marketplace contribution <span className="bv-overview-dim">({currencyLabelNote})</span></div>
+          <div className="bv-contrib">
+            {contrib.map((row) => (
+              <div className="bv-contrib-row" key={row.country}>
+                <span className="bv-contrib-label" title={countryTitle(row.country)}>{countryTitle(row.country)}</span>
+                <span className="bv-contrib-track"><span className="bv-contrib-fill" style={{ width: pctWidth(row.sales, contribMax) }} /></span>
+                <span className="bv-contrib-val num">{money(row.sales, currency)}</span>
+                <span className="bv-contrib-share num">{row.share === null ? DASH : `${(row.share * 100).toFixed(1)}%`}</span>
+              </div>
+            ))}
+            <div className="bv-contrib-row bv-contrib-total">
+              <span className="bv-contrib-label">All markets</span>
+              <span className="bv-contrib-track" aria-hidden="true" />
+              <span className="bv-contrib-val num">{money(total, currency)}</span>
+              <span className="bv-contrib-share num">100.0%</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+const JUMP_TARGETS = [
+  { id: "bv-daily", label: "Daily Snapshot" },
+  { id: "bv-monthly", label: "Monthly Snapshot" },
+  { id: "bv-weekly", label: "7-Day Performance" },
+  { id: "bv-methodology", label: "Methodology" },
+];
+
+function BvJumpNav({ brandNote }) {
+  const jump = (event, id) => {
+    event.preventDefault();
+    const el = typeof document !== "undefined" ? document.getElementById(id) : null;
+    if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" });
+    if (el && el.focus) { try { el.setAttribute("tabindex", "-1"); el.focus({ preventScroll: true }); } catch (_e) { /* ignore */ } }
+  };
+  return (
+    <nav className="bv-jump" aria-label="Jump to section">
+      <span className="bv-jump-label">Jump to</span>
+      <span className="bv-jump-links">
+        {JUMP_TARGETS.map((target) => (
+          <a key={target.id} href={`#${target.id}`} className="bv-jump-link" onClick={(event) => jump(event, target.id)}>{target.label}</a>
+        ))}
+      </span>
+      {brandNote ? <span className="bv-jump-note">{brandNote}</span> : null}
+    </nav>
+  );
+}
 
 export default function BrandPortfolio({
   brand, region = "", accountIds, accountsKnown, loadReport, refreshReport,
@@ -51,7 +234,6 @@ export default function BrandPortfolio({
   // on a 504) and auto-converges by triggering the rebuild + polling until the fresh snapshot lands.
   const [updating, setUpdating] = useState(false);
   const rebuildAttempts = useRef(0);
-  const [tables, setTables] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [sourceRefreshing, setSourceRefreshing] = useState(false);
   const [sourceProgress, setSourceProgress] = useState(null);
@@ -141,7 +323,6 @@ export default function BrandPortfolio({
     setStaleScope(null);
     setUpdating(false);
     rebuildAttempts.current = 0;
-    setTables(null);
     setSourceProgress(null);
     setSourceOutcome(null);
     resetRange();
@@ -261,6 +442,15 @@ export default function BrandPortfolio({
   const converted = isConvertedMode(displayCurrency);
   const currencyLabel = converted ? `Converted to ${displayCurrency}` : "Original marketplace currency";
 
+  // The three tables + their currency groups, built from the SAME model + FX rates the
+  // account-scoped page uses (identical numbers, formulas and export). Computed here so
+  // the portfolio renders its own layout while the export still consumes this exact output.
+  const rates = fx?.rates || null;
+  const tables = useMemo(
+    () => (model ? buildBrandTables(model, { rangeFrom: range.rangeFrom, rangeTo: range.rangeTo, displayCurrency, rates }) : null),
+    [model, range.rangeFrom, range.rangeTo, displayCurrency, rates]
+  );
+
   const exportModel = useMemo(() => {
     if (!model || !tables) return null;
     const accountNames = (model.accounts || []).map((entry) => entry.name || entry.id);
@@ -294,18 +484,73 @@ export default function BrandPortfolio({
 
   /* ------------------------------- render ------------------------------- */
   const accountCount = model?.accounts?.length || 0;
+  const coverage = model?.coverage || {};
+  const marketplaceCount = tables?.marketplaceCount || 0;
+  const kpis = tables ? portfolioKpis(tables) : null;
+  const rangeLabel = range.rangeFrom && range.rangeTo ? fmtRangeLabel(range.rangeFrom, range.rangeTo) : "";
+  const RANGE_BADGE = { "7D": "7D", "30D": "30D", MTD: "MTD", LASTMONTH: "Last month", LATEST: "Latest day", CUSTOM: "Custom" };
+  const rangeBadge = RANGE_BADGE[range.preset] || null;
+  const adPartial = Boolean(model) && model.countries.some((entry) => entry.adsAvailable) && model.countries.some((entry) => !entry.adsAvailable);
+  const lastYear = tables?.daily?.lastYearWindow;
+  const weekDates = tables?.weekly?.dates || [];
+  const weekLabel = weekDates.length ? fmtRangeLabel(weekDates[0], weekDates[weekDates.length - 1]) : "";
+  const monthlyCols = tables?.monthly?.columns;
+  const monthlySub = monthlyCols?.current
+    ? [
+      monthlyCols.completed.length
+        ? `${monthKeyLabel(monthlyCols.completed[0].key)} – ${monthKeyLabel(monthlyCols.current.key)}`
+        : monthKeyLabel(monthlyCols.current.key),
+      `${monthKeyLabel(monthlyCols.current.key)} MTD (${monthlyCols.current.elapsedDays} days)`,
+      `RR = (Act ÷ ${monthlyCols.current.elapsedDays}) × ${monthlyCols.current.daysInMonth}`,
+      currencyLabel,
+    ].join(" · ")
+    : currencyLabel;
+  const totalSalesSub = kpis && kpis.single
+    ? (kpis.ly === null
+      ? "LY unavailable for this window"
+      : <span>LY {money(kpis.ly, kpis.currency)}{kpis.lyDelta !== null ? <span className={"bv-delta " + (kpis.lyDelta < 0 ? "bv-neg" : "bv-pos")}> {kpis.lyDelta >= 0 ? "+" : ""}{(kpis.lyDelta * 100).toFixed(1)}%</span> : null}</span>)
+    : "Shown per currency in the tables";
+
+  // ONE consolidated status list: every real message the page can raise, ordered by
+  // priority. The panel shows the top one and exposes the rest through "View details".
+  // Nothing is invented or suppressed; each item is an existing page message.
+  const statusItems = [];
+  if (sourceProgress) statusItems.push({ tone: "info", busy: true, title: `Fetching latest account data (${Math.min(sourceProgress.completed + 1, sourceProgress.total)} of ${sourceProgress.total})`, detail: sourceProgress.account?.name || sourceProgress.account?.id || "Saving refreshed account snapshots" });
+  if (converted && fxError) statusItems.push({ tone: "error", title: "Currency conversion is unavailable", detail: fxError });
+  if (updating && model) statusItems.push({ tone: "warning", badge: "Rebuild in progress", title: "Updating to the newest saved data", detail: "The figures shown are the last complete Brand View. A newer account snapshot arrived, so it is being rebuilt from saved data (no export) and refreshes here automatically." });
+  if (sourceOutcome) statusItems.push({ tone: sourceOutcome.tone, title: sourceOutcome.title, detail: sourceOutcome.detail });
+  if (staleScope) statusItems.push({ tone: "info", title: "Showing the most recent saved report for this brand", detail: `It was saved for ${staleScope.asOf || "an earlier date"}. Refresh rebuilds it from the newest saved account snapshots.` });
+  if (directoryError) statusItems.push({ tone: "warning", title: "Some portfolio brands could not be loaded", detail: directoryError });
+  if (converted && fx?.fallback) statusItems.push({ tone: "warning", title: "Using cached exchange rates", detail: fx.message || "The exchange-rate provider was unreachable, so the last rates saved in Supabase are being used." });
+  if (converted && !fxError && tables?.missingRates?.length) statusItems.push({ tone: "warning", title: `No exchange rate for ${tables.missingRates.join(", ")}`, detail: `Those marketplaces cannot be converted to ${displayCurrency} and are shown as unavailable rather than with a substituted rate. Switch to Original marketplace currency to see their real figures.` });
+  (model?.notes || []).forEach((note) => statusItems.push({ tone: "info", title: "Partial source coverage", detail: note }));
+  if (directoryLoading) statusItems.push({ tone: "info", busy: true, title: "Updating brand coverage…", detail: "Re-checking every account you can access against the latest saved brand sales (saved data only; no export)." });
 
   return (
-    <div className="container bv-page op-report">
-      <div className="page-head">
-        <div>
-          <div className="page-title">Brand View</div>
-          <div className="page-sub">
+    <div className="container bv-page op-report bv-portfolio">
+      {/* BRAND CONTEXT HEADER — brand, dynamic account + marketplace counts, currency and
+          regional scope are metadata (not KPI cards); every value comes from the live model. */}
+      <div className="page-head bv-head">
+        <div className="bv-head-main">
+          <div className="bv-head-titlerow">
+            <span className="page-title">Brand View</span>
+            {brand ? <span className="bv-brand-chip"><Tag size={12} aria-hidden="true" />{brand}</span> : null}
+            {model ? (
+              <span className="bv-head-counts"><Layers size={13} aria-hidden="true" />{accountCount} account{accountCount === 1 ? "" : "s"} · {marketplaceCount} marketplace{marketplaceCount === 1 ? "" : "s"}</span>
+            ) : null}
+          </div>
+          <div className="page-sub bv-head-desc">
             {brand
-              ? `${brand} across every account and marketplace that sells it. Refresh rebuilds from saved data; admins can temporarily fetch latest account data from DataDoe.`
+              ? "Cross-account, marketplace-aggregated commercial performance from saved snapshot data."
               : "Choose a brand in the header to compare it across every account and marketplace that sells it."}
           </div>
         </div>
+        {model ? (
+          <div className="bv-head-meta">
+            <div className="bv-meta-item"><span className="bv-meta-label">Currency</span><span className="bv-meta-value">{converted ? displayCurrency : "Original"}</span></div>
+            {region ? <div className="bv-meta-item"><span className="bv-meta-label">Scope</span><span className="bv-meta-value">{regionLabel(region)}</span></div> : null}
+          </div>
+        ) : null}
       </div>
 
       <div className="bv-controls" role="group" aria-label="Brand View scope">
@@ -339,18 +584,6 @@ export default function BrandPortfolio({
           hint="Original keeps every marketplace in its own currency and never sums across currencies."
         />
         <div className="bv-actions">
-          {isAdmin && (
-            <button
-              type="button"
-              className="plan-export-btn"
-              onClick={onFetchLatestData}
-              disabled={!reportParams || sourceRefreshing || refreshing}
-              title="Temporary admin action: refresh the mapped primary accounts from DataDoe, then rebuild this Brand View from their saved snapshots."
-            >
-              <DatabaseZap size={14} className={sourceRefreshing ? "spin" : ""} aria-hidden="true" />
-              Fetch latest data
-            </button>
-          )}
           <button
             type="button"
             className="plan-export-btn"
@@ -364,50 +597,39 @@ export default function BrandPortfolio({
             Refresh
           </button>
           <ExportMenu disabled={!exportModel} busy={exportBusy} error={exportError} onExport={runExport} />
+          {/* Admin-only source action — kept distinct and secondary (not the default action),
+              flagged ADMIN, with its exact existing handler and availability preserved. */}
+          {isAdmin && (
+            <button
+              type="button"
+              className="plan-export-btn bv-admin-btn"
+              onClick={onFetchLatestData}
+              disabled={!reportParams || sourceRefreshing || refreshing}
+              title="Temporary admin action: refresh the mapped primary accounts from DataDoe, then rebuild this Brand View from their saved snapshots."
+            >
+              <DatabaseZap size={14} className={sourceRefreshing ? "spin" : ""} aria-hidden="true" />
+              Fetch latest data
+              <span className="bv-admin-tag">Admin</span>
+            </button>
+          )}
         </div>
       </div>
 
+      {/* Compact dynamic freshness row from existing evidence only. Wraps; never truncates. */}
       {model && (
         <div className="recon-freshness bv-freshness">
-          <span className="live-dot" style={{ position: "relative", top: 1 }} aria-hidden="true" />
-          <span>{savedAt ? `Shared snapshot saved ${savedAt.toLocaleString()}` : "Shared snapshot"}</span>
-          <span className="plan-fresh-sep">·</span>
-          <span>{freshnessSummaryLine(model)}</span>
-          {converted && <><span className="plan-fresh-sep">·</span><span>{fxSummaryLine(fx, converted)}</span></>}
+          <span className="bv-fresh-item"><span className="live-dot" aria-hidden="true" />{savedAt ? `Shared snapshot ${savedAt.toLocaleString()}` : "Shared snapshot"}</span>
+          <span className="bv-fresh-item">{coverage.accountCount || accountCount} account{(coverage.accountCount || accountCount) === 1 ? "" : "s"} covered</span>
+          {coverage.salesSavedAt ? <span className="bv-fresh-item">Oldest {new Date(coverage.salesSavedAt).toLocaleString()}</span> : null}
+          {coverage.salesFrom && coverage.salesTo ? <span className="bv-fresh-item">Sales {coverage.salesFrom} → {coverage.salesTo}</span> : null}
+          <span className="bv-fresh-item">FBA {coverage.inventoryDate ? `as of ${coverage.inventoryDate}` : "unavailable"}</span>
+          {converted ? <span className="bv-fresh-item">{fxSummaryLine(fx, converted)}</span> : null}
+          <span className="bv-fresh-item">{converted ? `Display ${displayCurrency}` : "Original currency"}</span>
         </div>
       )}
 
-      {/* Compact, non-blocking "Updating brand coverage" indicator: the account set is being re-checked against
-          the latest saved brand-sales (self-healing, Supabase-only). Previous content stays on screen. */}
-      {directoryLoading && (
-        <div className="plan-fresh" style={{ opacity: 0.85 }}>
-          <RefreshCw size={13} className="spin" aria-hidden="true" />
-          <span>Updating brand coverage…</span>
-        </div>
-      )}
-      {directoryError && <DataQualityAlert tone="warning" title="Some portfolio brands could not be loaded" detail={directoryError} />}
-      {sourceProgress && (
-        <DataQualityAlert
-          tone="info"
-          title={`Fetching latest account data (${Math.min(sourceProgress.completed + 1, sourceProgress.total)} of ${sourceProgress.total})`}
-          detail={sourceProgress.account?.name || sourceProgress.account?.id || "Saving refreshed account snapshots"}
-        />
-      )}
-      {sourceOutcome && <DataQualityAlert tone={sourceOutcome.tone} title={sourceOutcome.title} detail={sourceOutcome.detail} />}
-      {staleScope && (
-        <DataQualityAlert
-          tone="info"
-          title="Showing the most recent saved report for this brand"
-          detail={`It was saved for ${staleScope.asOf || "an earlier date"}. Click Refresh to rebuild it from the newest saved account snapshots.`}
-        />
-      )}
-      {updating && model && (
-        <DataQualityAlert
-          tone="info"
-          title="Updating to the newest saved data…"
-          detail="The figures below are the last complete Brand View. A newer account snapshot arrived, so it is being rebuilt from saved data (no export) and will refresh here automatically."
-        />
-      )}
+      {/* ONE consolidated status panel: highest-priority message compact, the rest under View details. */}
+      <BvStatusPanel items={statusItems} />
 
       {!brand ? (
         <div className="panel">
@@ -469,22 +691,63 @@ export default function BrandPortfolio({
         </div>
       ) : model ? (
         <>
-          <BrandReports
-            model={model}
-            rangeFrom={range.rangeFrom}
-            rangeTo={range.rangeTo}
-            displayCurrency={displayCurrency}
-            fx={fx}
-            fxError={fxError}
-            scopeLabel={`${accountCount} account${accountCount === 1 ? "" : "s"}`}
-            onTables={setTables}
-          />
-          <div className="footer-note">
-            Portfolio Brand View is a shared Supabase snapshot for this brand and its accounts. A marketplace sold by more
-            than one account is one row: their sales and units are added together, and the contributing accounts are named
-            under the country. FBA cover is calculated from available FBA units and average daily unit sales in the selected
-            report range. A blank cell means the source cannot answer, never zero.{converted ? ` Converted figures use server-side cached rates. ${fx?.attribution || ""}` : ""}
+          {/* Six commercial KPI cells from the existing model/formatter. Money is only a single
+              number in one currency group; otherwise it is an em dash, never a zero. */}
+          <div className="bv-kpi-strip">
+            <BvKpi label="Total Sales" badge={rangeBadge} value={kpis.single ? money(kpis.sales, kpis.currency) : DASH} sub={totalSalesSub} />
+            <BvKpi label="Units Sold" icon={<Boxes size={12} aria-hidden="true" />} badge={rangeBadge} value={nInt(kpis.units)} sub={`Across ${marketplaceCount} marketplace${marketplaceCount === 1 ? "" : "s"}`} hint="Ordered units summed across every marketplace. Unit counts are never currency converted." />
+            <BvKpi label="FBA Inventory" value={kpis.fba === null ? DASH : nInt(kpis.fba)} sub={`Available FBA units${coverage.inventoryDate ? ` · as of ${coverage.inventoryDate}` : ""}`} hint={kpis.fba === null ? "A single FBA total is shown when one reporting currency is selected." : undefined} />
+            <BvKpi label="FBA Cover" value={kpis.cover === null ? DASH : coverLabel(kpis.cover)} sub="Based on selected-range unit velocity" hint="Available FBA units divided by this brand's average daily unit sales in the selected range." />
+            <BvKpi label="Ad Spend" badge={adPartial ? "Partial" : null} value={kpis.adSpend === null ? DASH : money(kpis.adSpend, kpis.currency, 2)} sub={kpis.adSpend === null ? "No saved Ads history for this window" : (adPartial ? "Some marketplaces have no saved Ads" : "Same-ASIN brand ad spend")} />
+            <BvKpi label="TACoS" badge="Overall" value={kpis.tacos === null ? DASH : ratePct(kpis.tacos)} sub="Brand ad spend ÷ brand sales" />
           </div>
+
+          <BvOverview tables={tables} currencyLabelNote={rangeLabel || "selected range"} />
+
+          <BvJumpNav brandNote={`Brand: ${model.brand} · ${converted ? `Converted to ${displayCurrency}` : "Original currency"}`} />
+
+          {tables.dailyTable && (
+            <div id="bv-daily">
+              <ReportPanel
+                title={`${model.brand} — Daily Snapshot`}
+                subtitle={[
+                  rangeLabel,
+                  lastYear ? `LY compares ${fmtRangeLabel(lastYear.from, lastYear.to)}` : "LY unavailable for this window",
+                  coverage.inventoryDate ? `FBA Inv. as of ${coverage.inventoryDate}` : "FBA Inv. unavailable",
+                  currencyLabel,
+                ].filter(Boolean).join(" · ")}
+                headers={tables.dailyTable.headers}
+                rows={tables.dailyTable.rows}
+                minWidth={900}
+              />
+            </div>
+          )}
+          {tables.monthlyTable && (
+            <div id="bv-monthly">
+              <ReportPanel title={`${model.brand} — Monthly Snapshot`} subtitle={monthlySub} headers={tables.monthlyTable.headers} rows={tables.monthlyTable.rows} minWidth={1040} />
+            </div>
+          )}
+          {tables.weeklyTable && (
+            <div id="bv-weekly">
+              <ReportPanel
+                title={`${model.brand} — 7-Day Performance`}
+                subtitle={[weekLabel, `${marketplaceCount} marketplace${marketplaceCount === 1 ? "" : "s"}`, currencyLabel].filter(Boolean).join(" · ")}
+                headers={tables.weeklyTable.headers}
+                rows={tables.weeklyTable.rows}
+                minWidth={1000}
+              />
+            </div>
+          )}
+
+          <details id="bv-methodology" className="methodology-disclosure bv-methodology">
+            <summary>Data methodology, currency and coverage policy</summary>
+            <div className="footer-note">
+              Portfolio Brand View is a shared Supabase snapshot for this brand and its accounts. A marketplace sold by more
+              than one account is one row: their sales and units are added together, and the contributing accounts are named
+              under the country. FBA cover is calculated from available FBA units and average daily unit sales in the selected
+              report range. A blank cell means the source cannot answer, never zero.{converted ? ` Converted figures use server-side cached rates. ${fx?.attribution || ""}` : ""}
+            </div>
+          </details>
         </>
       ) : null}
     </div>

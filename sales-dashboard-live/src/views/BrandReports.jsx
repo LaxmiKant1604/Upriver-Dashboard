@@ -32,8 +32,12 @@ import { DASH, buildBrandTables } from "../lib/brand-view-tables.js";
 export function ReportPanel({ title, subtitle, headers, rows, minWidth }) {
   const columnClass = (index) => {
     if (index === 0) return "bv-first";
-    const tone = headers[index]?.tone;
-    return tone ? `bv-num bv-col-${tone}` : "bv-num";
+    const header = headers[index];
+    const tone = header?.tone;
+    // A per-key class (backward-compatible: existing pages do not style it) lets a
+    // scoped skin tint one specific column, e.g. the current-month "actual" column.
+    const keyClass = header?.key ? ` bv-col-key-${header.key}` : "";
+    return (tone ? `bv-num bv-col-${tone}` : "bv-num") + keyClass;
   };
 
   return (
