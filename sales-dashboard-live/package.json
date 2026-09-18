@@ -160,6 +160,7 @@
     "test:permission-cache-window": "node scripts/permission-cache-window.test.js",
     "test:permission-cache-scope": "node scripts/permission-cache-scope.test.js",
     "test:report-cache-io": "node scripts/report-cache-io.test.js",
+    "test:shared-report-projection": "node scripts/shared-report-projection.test.js",
     "test:listing-health-advanced": "node scripts/report-listing-health-advanced.test.js",
     "test:listing-health-advanced-regressions": "node scripts/report-listing-health-advanced-regressions.test.js",
     "test:listing-health-v3-integration": "node scripts/report-listing-health-v3-integration.test.js",

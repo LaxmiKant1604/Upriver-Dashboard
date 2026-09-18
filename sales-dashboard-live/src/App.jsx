@@ -67,6 +67,11 @@ import {
 // generation) so a late storage failure or a mid-flight scope change can never write an obsolete-scope body under the
 // current scope's key, nor return a revoked payload. The genuine async writer lives here so it is unit-testable.
 import { scopedLargeRead, runCachedLargeGet, runSharedLoad } from "./lib/report-cache-io.js";
+// Identity-gated presentation for the shared report hook: a held payload is tagged with the exact params identity
+// (apiCacheKey) that produced it and is exposed ONLY while that identity is current, so an account/brand/marketplace/
+// date-window/auth-scope change hides the previous payload SYNCHRONOUSLY (no cross-account stale flash). The reducer
+// models the load lifecycle so a late response from a superseded identity can never overwrite the current one.
+import { sharedReportInitialState, sharedReportReducer, projectSharedReport } from "./lib/shared-report-projection.js";
 import SalesMovers from "./views/SalesMovers.jsx";
 import SkuMovement from "./views/SkuMovement.jsx";
 import DailyReporting from "./views/DailyReporting.jsx";
@@ -1774,41 +1779,46 @@ function useAutoRevalidate(reload, { active, intervalMs = AUTO_REVALIDATE_MS } =
  * guard means repeated clicks cannot launch duplicate exports.
  */
 function useSharedReport({ params, active }) {
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(false);   // first paint (no cache yet)
-  const [updating, setUpdating] = useState(false);  // revalidating while a last-known-good is shown
-  const [error, setError] = useState(null);
-  const [cachedAt, setCachedAt] = useState(null);
+  // The held payload + in-flight flags live in a reducer whose EVERY payload is TAGGED with the exact params identity
+  // (apiCacheKey) that produced it, and whose late-response guard is a monotonic request id. The render output is the
+  // pure identity-gated projection: a payload is exposed ONLY while its tag equals the CURRENT params identity, so an
+  // account/brand/marketplace/date-window/authorization-scope change hides the previous payload SYNCHRONOUSLY -- in this
+  // same render, before any effect or network -- and the view falls to loading/snapshot state until a payload tagged
+  // with the new identity lands. Last-known-good is kept ONLY for same-identity revalidation. (see shared-report-projection.js)
+  const [state, dispatch] = React.useReducer(sharedReportReducer, undefined, sharedReportInitialState);
   const refreshing = React.useRef(false);
-  // Monotonic request id: only the newest scope's response is allowed to land, so a slow answer for a previous
-  // account/brand/date can never overwrite the current one (no cross-account leak, no stale flash).
+  // Monotonic request id: the newest load/refresh becomes authoritative; a slow answer for a previous account/brand/
+  // date/scope can never overwrite the current one (belt-and-suspenders with the reducer's own myId guard).
   const reqId = React.useRef(0);
+  // The CURRENT params identity (null when there are no params). apiCacheKey folds account/brand/marketplace/window/
+  // action AND the authorization fingerprint, so it changes on every ownership boundary the guard must respect.
+  const currentKey = params ? apiCacheKey(params) : null;
 
   const load = useCallback(async () => {
-    if (!params) { setData(null); setCachedAt(null); setError(null); setLoading(false); setUpdating(false); return; }
+    if (!params) { dispatch({ type: "clear" }); return; }
     const myId = ++reqId.current;
-    setError(null);
+    const myKey = apiCacheKey(params);
+    dispatch({ type: "load-start", myId, key: myKey });
     let cached = null;
     try { cached = await readSharedReportCache(params); } catch (e) { cached = null; }
     if (myId !== reqId.current) return; // scope changed while reading the browser cache
-    if (cached) { setData(cached.body); setCachedAt(new Date(cached.cachedAt)); setUpdating(true); }
-    else setLoading(true);
+    if (cached) dispatch({ type: "cache", myId, key: myKey, body: cached.body, cachedAt: new Date(cached.cachedAt) });
+    else dispatch({ type: "cache-miss", myId, key: myKey });
     try {
       const result = await loadSharedReport(params);
       if (myId !== reqId.current) return; // a newer scope superseded this read -> ignore its response
-      setData(result.body);
-      setCachedAt(new Date(result.cachedAt));
+      dispatch({ type: "network", myId, key: myKey, body: result.body, cachedAt: new Date(result.cachedAt) });
     } catch (loadError) {
       if (myId !== reqId.current) return;
       // The authorization scope changed while this read was in flight: the fingerprint remount is already replacing this
       // subtree, so drop the response SILENTLY -- never show an error and never fall back to the (now previous-scope)
       // browser copy. This is a scope transition, not a storage failure.
       if (isAuthScopeChangedError(loadError)) return;
-      setError(cached
+      dispatch({ type: "error", myId, key: myKey, message: cached
         ? `Showing the last copy saved in this browser. The shared snapshot could not be read: ${loadError.message}`
-        : loadError.message);
+        : loadError.message });
     } finally {
-      if (myId === reqId.current) { setLoading(false); setUpdating(false); }
+      if (myId === reqId.current) dispatch({ type: "settle", myId });
     }
   }, [params]);
 
@@ -1818,21 +1828,26 @@ function useSharedReport({ params, active }) {
   const refresh = useCallback(async () => {
     if (!params || refreshing.current) return;
     refreshing.current = true;
-    setLoading(true);
-    setError(null);
+    const myId = ++reqId.current;
+    const myKey = apiCacheKey(params);
+    // A manual refresh is a SAME-identity re-derive: mark it loading (the view keeps the current identity's payload if
+    // any while it re-derives), and land the result ONLY under that identity.
+    dispatch({ type: "load-start", myId, key: myKey });
+    dispatch({ type: "loading", myId, key: myKey });
     try {
       const result = await refreshSharedReport(params);
-      setData(result.body);
-      setCachedAt(new Date(result.cachedAt));
+      if (myId === reqId.current) dispatch({ type: "network", myId, key: myKey, body: result.body, cachedAt: new Date(result.cachedAt) });
     } catch (refreshError) {
       // Scope changed mid-refresh -> the remount supersedes this; drop it silently rather than surfacing an error.
-      if (!isAuthScopeChangedError(refreshError)) setError(refreshError.message);
+      if (myId === reqId.current && !isAuthScopeChangedError(refreshError)) dispatch({ type: "error", myId, key: myKey, message: refreshError.message });
     } finally {
       refreshing.current = false;
-      setLoading(false);
+      if (myId === reqId.current) dispatch({ type: "settle", myId });
     }
   }, [params]);
 
+  // SYNCHRONOUS identity gate -- expose the payload/flags ONLY for the current params identity.
+  const { data, loading, updating, error, cachedAt } = projectSharedReport({ currentKey, active, state });
   return { data, loading, updating, error, cachedAt, refresh, reload: load };
 }
 
