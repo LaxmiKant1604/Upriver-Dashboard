@@ -4,7 +4,10 @@
 // re-derives sales/units (those are the server's durable-OLI numbers) and never invents a cause: every recommendation
 // is deterministic from the evidence the server already validated. Pure + framework-free (unit-testable).
 
-// Visual health gate (ordered: most severe first). Derived from the row's evidence, NOT stored server-side.
+// Visual HEALTH FINDING (ordered: most severe first). DERIVED from the row's evidence -- it is NOT the Amazon source
+// status (that is `listingStatus`, shown separately). `needs_verification` is an honest "we cannot confirm health"
+// state used when the confirming evidence (Buyable/Discoverable/Live offer) is absent -- NEVER a fabricated OK, and
+// NEVER a negative finding. Only explicit evidence produces a negative finding.
 export const V3_GATES = Object.freeze({
   error: { label: "Amazon error", tone: "bad" },
   suppressed: { label: "Suppressed", tone: "bad" },
@@ -13,15 +16,23 @@ export const V3_GATES = Object.freeze({
   inactive: { label: "Inactive", tone: "warn" },
   incomplete: { label: "Incomplete", tone: "warn" },
   stranded: { label: "Stranded stock", tone: "warn" },
+  needs_verification: { label: "Needs verification", tone: "warn" },
   ok: { label: "OK", tone: "ok" },
 });
-const GATE_ORDER = ["error", "suppressed", "no_live_offer", "no_price", "inactive", "incomplete", "stranded", "ok"];
+const GATE_ORDER = ["error", "suppressed", "no_live_offer", "no_price", "inactive", "incomplete", "stranded", "needs_verification", "ok"];
 export const GATE_RANK = Object.freeze(Object.fromEntries(GATE_ORDER.map((g, i) => [g, i])));
 
 const has = (reasons, code) => Array.isArray(reasons) && reasons.some((r) => r && r.code === code);
+// A row carries a CONFIRMED positive health signal when Amazon explicitly reports it Buyable, Discoverable, or with a
+// live offer (all tri-state; only an explicit `true` counts -- null/undefined is UNKNOWN, never a positive).
+function hasPositiveHealthSignal(row) {
+  return row.buyable === true || row.discoverable === true || row.liveOffer === true;
+}
 
-// The visual gate for a row, from the server-validated evidence (flagReasons + status/price). Confirmed Amazon facts
-// outrank heuristic/possible states. An unflagged row is "ok".
+// The HEALTH FINDING for a row, from the server-validated evidence (flagReasons + status/price). Confirmed Amazon facts
+// outrank heuristic/possible states. An UNFLAGGED row is "ok" ONLY when it carries a confirmed positive health signal;
+// with NO confirming evidence (Buyable/Discoverable/Live offer all unknown) the finding is "needs_verification" -- we
+// never fabricate a healthy state from missing evidence.
 export function v3GateForRow(row) {
   const reasons = row.flagReasons || [];
   const status = String(row.listingStatus || "").trim();
@@ -35,7 +46,28 @@ export function v3GateForRow(row) {
   // Any other non-Active status the server flagged (e.g. "Deleted") -> treat as inactive so a flagged row is never
   // shown as OK. Falls AFTER the specific gates so a precise cause always wins.
   if (has(reasons, "status_not_active")) return "inactive";
-  return "ok";
+  // Unflagged: confirmed-healthy ONLY with an explicit positive signal; otherwise honestly "needs verification".
+  return hasPositiveHealthSignal(row) ? "ok" : "needs_verification";
+}
+
+// Per-row CONFIDENCE for the Health Finding: "confirmed" (an Amazon-confirmed flag, or a confirmed positive OK),
+// "possible" (only heuristic/possible flags), or "unavailable" (no confirming evidence -> the needs_verification row).
+export function v3Confidence(row) {
+  const reasons = row.flagReasons || [];
+  if (reasons.length) return reasons.some((r) => r && r.confidence === "confirmed") ? "confirmed" : "possible";
+  return hasPositiveHealthSignal(row) ? "confirmed" : "unavailable";
+}
+
+// The evidence backing a row's finding, for the "Evidence source" column. Never claims evidence it does not have:
+// Listings status/price always present when the row exists; Raw JSON (Buyable/Discoverable/Live offer/issues) only
+// when saved. When neither health signal is present it is honestly "Unavailable".
+export function v3EvidenceSource(row) {
+  const hasRaw = row.buyable != null || row.discoverable != null || row.liveOffer != null || (Array.isArray(row.issues) && row.issues.length > 0);
+  const hasListing = row.listingStatus != null || row.price != null || row.channel != null;
+  if (hasListing && hasRaw) return "Listings + Raw JSON";
+  if (hasRaw) return "Raw JSON";
+  if (hasListing) return "Listings";
+  return "Unavailable";
 }
 
 // Why Flagged: the human evidence string, each reason tagged confirmed/possible (never an invented cause).
@@ -61,11 +93,20 @@ export function v3RecommendedAction(row) {
   if (has(reasons, "no_price_while_active")) return "Set a valid price: the listing is Active but carries no price.";
   if (has(reasons, "status_not_active")) return "Investigate why the listing is not Active and reactivate/complete it (status alone does not prove the cause).";
   if (has(reasons, "stranded_stock")) return "Investigate stranded stock: on-hand inventory exists while the listing is not Active.";
+  // Unflagged: a confirmed-healthy OK needs nothing; a needs-verification row (no confirming evidence) is flagged for
+  // manual verification, NOT asserted as a problem.
+  if (!hasPositiveHealthSignal(row)) return "Verify this listing in Seller Central — Amazon Buyable/Discoverable/live-offer evidence is not available, so health cannot be confirmed.";
   return "No action needed.";
 }
 
 // Brand-key normaliser mirroring the app's canonical key (trim, collapse whitespace, lowercase).
 const brandKey = (v) => String(v || "").trim().replace(/\s+/g, " ").toLowerCase();
+
+// Evidence as-of helpers (pure): extract the YYYY-MM-DD date from an ISO timestamp; mark evidence STALE when its
+// as-of is more than 2 calendar days older than the report as-of (visibly labelled in the UI, never hidden).
+const dateOnly = (v) => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v || "")); return m ? m[1] : null; };
+const daysBetween = (a, b) => { if (!/^\d{4}-\d{2}-\d{2}$/.test(a || "") || !/^\d{4}-\d{2}-\d{2}$/.test(b || "")) return null; return Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000); };
+export const isEvidenceStale = (asOf, reportAsOf) => { const d = daysBetween(asOf, reportAsOf); return d !== null && d > 2; };
 
 /**
  * Build the 16-column presentation rows from the server v3 payload. Optionally filter to a selected brand (client
@@ -75,6 +116,12 @@ const brandKey = (v) => String(v || "").trim().replace(/\s+/g, " ").toLowerCase(
 export function buildV3Rows(payload, selectedBrand = null) {
   const rows = payload && Array.isArray(payload.rows) ? payload.rows : [];
   const wantBrand = selectedBrand && brandKey(selectedBrand) !== "all" ? brandKey(selectedBrand) : null;
+  const prov = (payload && payload.provenance) || {};
+  const reportAsOf = (payload && payload.asOf) || null;
+  // The evidence as-of for a row's HEALTH finding: the saved Listings/Raw snapshot's fetched_at (falling back to the
+  // inventory snapshot date, then the report as-of). Never a fabricated date -- null when nothing is available.
+  const evidenceAsOf = dateOnly(prov.rawFetchedAt) || dateOnly(prov.listingsFetchedAt) || dateOnly(prov.inventorySnapshotDate) || reportAsOf || null;
+  const evidenceStale = isEvidenceStale(evidenceAsOf, reportAsOf);
   const out = [];
   for (const r of rows) {
     if (wantBrand && brandKey(r.brand) !== wantBrand) continue;
@@ -83,6 +130,10 @@ export function buildV3Rows(payload, selectedBrand = null) {
       ...r,
       gate,
       gateMeta: V3_GATES[gate],
+      confidence: v3Confidence(r),
+      evidenceSource: v3EvidenceSource(r),
+      evidenceAsOf,
+      evidenceStale,
       whyFlagged: v3WhyFlagged(r),
       recommendedAction: v3RecommendedAction(r),
       // salesCovered comes from the server (window coverage); used to mark a 0 that is not a proven zero.
@@ -135,15 +186,18 @@ export const fmtIssue = (issues) => {
   return `${first.severity || ""}${first.code ? " " + first.code : ""}${first.message ? ": " + first.message : ""}`.trim();
 };
 
-// The exact flat export rows for the Excel download -- MUST mirror the authorized, filtered UI rows (same 16 columns).
+// The exact flat export rows for the Excel download -- MUST mirror the authorized, filtered UI rows. "Amazon Listing
+// Status" is the Amazon SOURCE status (Unavailable when absent -- never a derived value); "Health Finding" is the
+// DERIVED finding. Sales/Units/at-Risk carry the SAME truthful durable values as before.
 export function v3ExportRows(rows) {
   return (rows || []).map((r) => ({
     "Product Name": r.productName || "",
     SKU: r.sku || "",
     ASIN: r.asin || "",
     Brand: r.brand || "",
-    Gate: (r.gateMeta && r.gateMeta.label) || r.gate,
-    Status: r.listingStatus || "",
+    "Amazon Listing Status": r.listingStatus || "Unavailable",
+    "Health Finding": (r.gateMeta && r.gateMeta.label) || r.gate,
+    Confidence: r.confidence || "",
     Fulfilment: r.channel || "",
     Price: r.price === null || r.price === undefined ? "" : r.price,
     Currency: r.currency || "",
@@ -156,6 +210,8 @@ export function v3ExportRows(rows) {
     Discoverable: fmtBool(r.discoverable),
     "Live Offer": fmtBool(r.liveOffer),
     "Amazon Issue": fmtIssue(r.issues),
+    "Evidence Source": r.evidenceSource || "Unavailable",
+    "Evidence As Of": r.evidenceAsOf ? (r.evidenceStale ? `${r.evidenceAsOf} (stale)` : r.evidenceAsOf) : "Unavailable",
     "Why Flagged": r.whyFlagged || "",
     "Recommended Action": r.recommendedAction || "",
   }));

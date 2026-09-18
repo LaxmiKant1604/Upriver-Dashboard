@@ -157,6 +157,30 @@ const byId = new Map(payload.rows.map((r) => [r.sku, r]));
     degraded.rows.find((r) => r.sku === "SKU-B").flagReasons.every((r) => r.code !== "not_buyable"));
 })();
 
+/* ===================== ACCURACY: "No price" only from a CONFIRMED invalid price, never from unavailable price ===================== */
+(() => {
+  const priceRows = [
+    { sku: "P-NULL", child_asin: "AP1", listing_status: "Active", listing_price_value: null, listing_price_currency: "USD", listing_fulfillment_channel: "AMAZON_NA" },   // price UNAVAILABLE (absent)
+    { sku: "P-BLANK", child_asin: "AP2", listing_status: "Active", listing_price_value: "", listing_price_currency: "USD", listing_fulfillment_channel: "AMAZON_NA" },     // price BLANK -> unavailable (numOrNull, not 0)
+    { sku: "P-ZERO", child_asin: "AP3", listing_status: "Active", listing_price_value: 0, listing_price_currency: "USD", listing_fulfillment_channel: "AMAZON_NA" },       // explicit invalid price (0)
+    { sku: "P-VALID", child_asin: "AP4", listing_status: "Active", listing_price_value: 12.5, listing_price_currency: "USD", listing_fulfillment_channel: "AMAZON_NA" },   // valid price
+    { sku: "P-INACT0", child_asin: "AP5", listing_status: "Inactive", listing_price_value: 0, listing_price_currency: "USD", listing_fulfillment_channel: "AMAZON_NA" },   // 0 but NOT Active -> no No-price
+  ];
+  const p = buildAdvancedListingHealth({
+    owner: { accountId: "acct-1", rawSellerId: "SELLER-1" }, asOf, window: resolveListingHealthWindow({ preset: "30D", asOf }),
+    enrichedOliRows: [], oliCoverageWindows: [], completenessRows: [], listingRows: priceRows, inventoryRows: [], catalogRows: [],
+    rawRows: [], issuesAvailable: false, provenance,
+  });
+  const b = new Map(p.rows.map((r) => [r.sku, r]));
+  const noPrice = (sku) => b.get(sku).flagReasons.some((r) => r.code === "no_price_while_active");
+  ok("PRICE: Active + UNAVAILABLE (null) price is NOT flagged 'No price' (missing evidence != negative finding)", !noPrice("P-NULL") && b.get("P-NULL").price === null);
+  ok("PRICE: Active + BLANK price becomes UNAVAILABLE (numOrNull), NOT 'No price'", !noPrice("P-BLANK") && b.get("P-BLANK").price === null);
+  ok("PRICE: Active + explicit 0 price IS a CONFIRMED 'No price'", noPrice("P-ZERO") && b.get("P-ZERO").flagReasons.find((r) => r.code === "no_price_while_active").confidence === "confirmed");
+  ok("PRICE: Active + valid price is not flagged and preserves the genuine value", !noPrice("P-VALID") && b.get("P-VALID").price === 12.5);
+  ok("PRICE: a 0 price on a NON-Active listing is not 'No price' (only checked while Active)", !noPrice("P-INACT0"));
+  ok("PRICE: an unavailable-price Active listing gains NO negative flag at all from the missing price", b.get("P-NULL").flagged === false && b.get("P-BLANK").flagged === false);
+})();
+
 /* ===================== currency + account isolation ===================== */
 throws("a SKU split across two sales currencies fails closed (currency isolation)", () => buildAdvancedListingHealth({
   owner: { accountId: "acct-1", rawSellerId: "SELLER-1" }, asOf, window: resolveListingHealthWindow({ preset: "30D", asOf }),

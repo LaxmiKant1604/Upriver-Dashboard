@@ -76,7 +76,7 @@ import BuyBoxLoss from "./views/BuyBoxLoss.jsx";
 import ReturnsLeakage from "./views/ReturnsLeakage.jsx";
 import PpcPerformance from "./views/PpcPerformance.jsx";
 import CampaignAds from "./views/CampaignAds.jsx";
-import { CAMPAIGN_ADS_TAB, LISTING_HEALTH_V3 } from "./lib/feature-flags.js";
+import { CAMPAIGN_ADS_TAB } from "./lib/feature-flags.js";
 import ListingOptimizer from "./views/ListingOptimizer.jsx";
 import PriorityFeed from "./views/PriorityFeed.jsx";
 // Account-scoped Brand View (Account -> Brand -> Brand Reports). Deliberately a
@@ -3103,9 +3103,8 @@ function DashboardApp({ session, access, onSignOut }) {
     () => (selectedAccountId ? { ids: selectedAccountId, to: TODAY } : null),
     [selectedAccountId, TODAY]
   );
-  // Listing Health v3 preview (default-OFF LISTING_HEALTH_V3): the selected durable-OLI sales window. Unconditional
-  // state + hook below (stable hook order regardless of the flag); only sales/units re-aggregate on change -- reading
-  // this page or moving its date NEVER calls DataDoe. Default is the trailing 30 days.
+  // Listing Health v3 (the sole, consolidated Listing Health page): the selected durable-OLI sales window. Only
+  // sales/units re-aggregate on change -- reading this page or moving its date NEVER calls DataDoe. Default trailing 30d.
   const [listingHealthV3Window, setListingHealthV3Window] = useState({ preset: "30D" });
   const salesMoversParams = useMemo(
     () => (insightScope ? { action: "sales-movers", ...insightScope } : null),
@@ -3154,9 +3153,11 @@ function DashboardApp({ session, access, onSignOut }) {
   // call, so opening the feed still costs no export.
   const onFeed = view === "priority";
   const salesMovers = useSharedReport({ params: salesMoversParams, active: view === "salesmovers" || onFeed });
-  const listingHealth = useSharedReport({ params: listingHealthParams, active: view === "listinghealth" || onFeed });
-  // v3 preview: unconditional hook (stable order); only ever active on its own flagged view, never on the Priority Feed.
-  const listingHealthV3 = useSharedReport({ params: listingHealthV3Params, active: LISTING_HEALTH_V3 && view === "listinghealth-v3" });
+  // Legacy v1 Listing Health: RETAINED for rollback only -- no longer mounted in normal navigation and no longer fed
+  // to the Priority Feed (its `active` gate can never be true now that the v1 view key redirects to v3). Never fetched.
+  const listingHealth = useSharedReport({ params: listingHealthParams, active: false });
+  // v3 preview is now the SOLE, unconditional Listing Health page; it also resolves the legacy "listinghealth" key.
+  const listingHealthV3 = useSharedReport({ params: listingHealthV3Params, active: view === "listinghealth-v3" || view === "listinghealth" });
   const buyBox = useSharedReport({ params: buyBoxParams, active: view === "buybox" || onFeed });
   const returns = useSharedReport({ params: returnsParams, active: view === "returns" || onFeed });
   const ppc = useSharedReport({ params: ppcParams, active: view === "ppc" || onFeed });
@@ -4324,7 +4325,7 @@ function DashboardApp({ session, access, onSignOut }) {
       <div className="app-shell">
         <Sidebar
           view={view}
-          onNavigate={(next) => { setView(next === "ppc" && CAMPAIGN_ADS_TAB ? "campaign-ads" : next); setDashboardMode("account"); setMobileOpen(false); }}
+          onNavigate={(next) => { const target = next === "ppc" && CAMPAIGN_ADS_TAB ? "campaign-ads" : next === "listinghealth" ? "listinghealth-v3" : next; setView(target); setDashboardMode("account"); setMobileOpen(false); }}
           isAdmin={isAdmin}
           email={access.email}
           collapsed={collapsed}
@@ -5543,19 +5544,10 @@ function DashboardApp({ session, access, onSignOut }) {
         />
       )}
 
-      {view === "listinghealth" && (
-        <ListingHealth
-          data={listingHealth.data}
-          loading={listingHealth.loading}
-          error={listingHealth.error}
-          accountName={refreshScopeAccount?.name}
-          selectedBrand={selectedBrand}
-          currency={displayCurrency}
-        />
-      )}
-
-      {/* Additive READ-ONLY v3 preview -- rendered ONLY behind the default-OFF flag; v1 above stays the default. */}
-      {view === "listinghealth-v3" && LISTING_HEALTH_V3 && (
+      {/* Listing Health is CONSOLIDATED to the single read-only v3 page. The legacy "listinghealth" view key resolves
+          HERE (redirect with no broken route); the v1 <ListingHealth> component + its backend are retained for rollback
+          but are no longer mounted in normal navigation. v3 is now the unconditional production default (no flag gate). */}
+      {(view === "listinghealth-v3" || view === "listinghealth") && (
         <ListingHealthV3
           data={listingHealthV3.data}
           loading={listingHealthV3.loading}

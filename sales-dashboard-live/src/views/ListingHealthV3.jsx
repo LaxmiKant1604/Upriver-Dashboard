@@ -32,6 +32,8 @@ const ACCESSORS = {
   salesAtRisk: (r) => Number(r.salesAtRisk) || 0,
 };
 
+const CONFIDENCE_LABEL = { confirmed: "Confirmed", possible: "Possible", unavailable: "Unavailable" };
+
 const WINDOW_PRESETS = [
   { value: "7D", label: "Last 7 days" },
   { value: "14D", label: "Last 14 days" },
@@ -198,8 +200,9 @@ export default function ListingHealthV3({ data, loading, error, accountName, sel
                 <thead>
                   <tr>
                     <SortTh className="pt-id" label="Product / SKU" col="productName" sort={sort} onSort={onSort} align="left" />
-                    <SortTh label="Gate" col="gate" sort={sort} onSort={onSort} align="left" />
-                    <SortTh label="Status" col="status" sort={sort} onSort={onSort} align="left" />
+                    <SortTh label="Amazon Listing Status" col="status" sort={sort} onSort={onSort} align="left" hint="Amazon's own source listing status — never a derived value" />
+                    <SortTh label="Health Finding" col="gate" sort={sort} onSort={onSort} align="left" hint="A derived health condition from explicit evidence — not the Amazon status" />
+                    <th className="pt-left">Confidence</th>
                     <SortTh label="Fulfilment" col="channel" sort={sort} onSort={onSort} align="left" />
                     <SortTh label="Price" col="price" sort={sort} onSort={onSort} />
                     <SortTh label="On Hand FBA" col="onHandFba" sort={sort} onSort={onSort} />
@@ -211,6 +214,8 @@ export default function ListingHealthV3({ data, loading, error, accountName, sel
                     <th className="pt-left">Discoverable</th>
                     <th className="pt-left">Live Offer</th>
                     <th className="pt-left">Amazon Issue</th>
+                    <th className="pt-left">Evidence source</th>
+                    <th className="pt-left">As of</th>
                     <th className="pt-left">Why Flagged</th>
                     <th className="pt-left">Recommended Action</th>
                   </tr>
@@ -219,10 +224,11 @@ export default function ListingHealthV3({ data, loading, error, accountName, sel
                   {pageRows.map((r) => (
                     <tr key={(r.sku || "") + "|" + (r.asin || "")} className={r.gateMeta && r.gateMeta.tone === "bad" ? "skupl-row-loss" : (r.flagged ? "plan-restock" : "")}>
                       <IdentityCell name={r.productName} primary={r.sku || "—"} secondary={r.asin} brand={r.brand} />
+                      <td className="pt-left">{r.listingStatus || "Unavailable"}</td>
                       <td className="pt-left"><span className={`pt-badge sku-badge-${r.gateMeta ? r.gateMeta.tone : "ok"}`}>{r.gateMeta ? r.gateMeta.label : r.gate}</span></td>
-                      <td className="pt-left">{r.listingStatus || "—"}</td>
-                      <td className="pt-left">{r.channel || "—"}</td>
-                      <td className="mono">{r.price === null || r.price === undefined ? "—" : money(r.price)}</td>
+                      <td className="pt-left">{CONFIDENCE_LABEL[r.confidence] || "Unavailable"}</td>
+                      <td className="pt-left">{r.channel || "Unavailable"}</td>
+                      <td className="mono">{r.price === null || r.price === undefined ? "Unavailable" : money(r.price)}</td>
                       <td className="mono">{fmtOnHand(r.onHandFba, r.onHandFbaApplicable)}</td>
                       <td className="mono">{fmtOnHand(r.onHandFbm, r.onHandFbmApplicable)}</td>
                       <td className="mono">{money(r.sales)}</td>
@@ -232,6 +238,8 @@ export default function ListingHealthV3({ data, loading, error, accountName, sel
                       <td className="pt-left">{fmtBool(r.discoverable)}</td>
                       <td className="pt-left">{fmtBool(r.liveOffer)}</td>
                       <td className="pt-left">{fmtIssue(r.issues) || "—"}</td>
+                      <td className="pt-left">{r.evidenceSource || "Unavailable"}</td>
+                      <td className="pt-left">{r.evidenceAsOf ? (r.evidenceStale ? `${r.evidenceAsOf} · stale` : r.evidenceAsOf) : "Unavailable"}</td>
                       <td className="pt-left">{r.whyFlagged || "—"}</td>
                       <td className="pt-left">{r.recommendedAction || "—"}</td>
                     </tr>

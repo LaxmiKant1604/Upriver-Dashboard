@@ -29,8 +29,9 @@ const defaultCatalogReader = async ({ organizationFingerprint, connectionId }) =
   return Array.isArray(payload && payload.rows) ? payload.rows : [];
 };
 // Cache-ONLY read (getSourceExportCache returns only UNEXPIRED entries and hydrates rows); a miss returns null and is
-// NEVER answered by creating an export.
-const defaultSavedSourceReader = async (requestHash) => { const e = await getSourceExportCache(requestHash); return e && Array.isArray(e.rows) ? e.rows : null; };
+// NEVER answered by creating an export. Returns { rows, fetchedAt } so the caller can surface the snapshot's honest
+// as-of date (the UI shows it per row and can label stale evidence). Never triggers a fetch.
+const defaultSavedSourceReader = async (requestHash) => { const e = await getSourceExportCache(requestHash); return e && Array.isArray(e.rows) ? { rows: e.rows, fetchedAt: e.fetched_at || null } : null; };
 
 /**
  * Serve the v3 preview payload for ONE pinned account + window from durable/saved evidence. Pure orchestration over
@@ -81,7 +82,18 @@ export async function serveListingHealthV3Preview({ owner, identity, windowContr
   //    means that per-account fragment has not been materialized yet -> the dimension is honestly Unavailable.
   const readHashes = listingHealthV3PerAccountReadHashes({ apiKey: identity && identity.apiKey, rawSellerId, marketplaceCountry: owner.marketplace || null });
   const hashOf = (rk) => readHashes[rk] || null;
-  const readSaved = async (rk) => { const h = hashOf(rk); if (!h || typeof getSavedSourceRows !== "function") return null; try { const rows = await getSavedSourceRows(h); return Array.isArray(rows) ? rows : (rows && Array.isArray(rows.rows) ? rows.rows : null); } catch (_e) { return null; } };
+  // Capture each saved snapshot's honest as-of (fetched_at) alongside its rows. Accepts BOTH an injected reader that
+  // returns a plain array (no as-of) and the production { rows, fetchedAt } shape -- never fabricates a date.
+  const savedAsOf = {};
+  const readSaved = async (rk) => {
+    const h = hashOf(rk); if (!h || typeof getSavedSourceRows !== "function") return null;
+    try {
+      const res = await getSavedSourceRows(h);
+      if (Array.isArray(res)) return res;
+      if (res && Array.isArray(res.rows)) { savedAsOf[rk] = res.fetchedAt || res.fetched_at || null; return res.rows; }
+      return null;
+    } catch (_e) { return null; }
+  };
   const listingRows = await readSaved("listing-health-v3:listings");
   const inventoryRows = await readSaved("listing-health-v3:inventory");
   const rawRows = await readSaved("listing-health-v3:listings-raw");
@@ -97,6 +109,13 @@ export async function serveListingHealthV3Preview({ owner, identity, windowContr
     rawRows: Array.isArray(rawRows) ? rawRows : [],
     issuesAvailable,
     issuesUnavailableReason: issuesAvailable ? null : "Listings (Raw JSON) evidence is not yet saved for this account (populated when v3 ingestion is scheduled).",
+    // Honest saved-snapshot as-of dates (fetched_at) so the read-only UI can show each row's evidence source + as-of
+    // and visibly label stale evidence. Null when the dimension is unavailable -- never a fabricated date.
+    provenance: {
+      listingsFetchedAt: savedAsOf["listing-health-v3:listings"] || null,
+      inventoryFetchedAt: savedAsOf["listing-health-v3:inventory"] || null,
+      rawFetchedAt: savedAsOf["listing-health-v3:listings-raw"] || null,
+    },
   });
 
   // Preview provenance so the read-only UI can render honest Available/Unavailable states for each dimension.

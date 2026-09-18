@@ -333,7 +333,9 @@ export function buildAdvancedListingHealth({
 
     const statusRaw = S(listing.listing_status).trim();
     const statusActive = statusRaw.toUpperCase() === "ACTIVE";
-    const priceVal = listing.listing_price_value === null || listing.listing_price_value === undefined ? null : num(listing.listing_price_value);
+    // Price is UNKNOWN-preserving: null/blank/malformed -> null (UNAVAILABLE), a finite number (incl. a genuine 0) ->
+    // that number. numOrNull (not num) so a BLANK price is never coerced to 0 and mistaken for a confirmed zero price.
+    const priceVal = numOrNull(listing.listing_price_value);
     const buyable = raw && raw.summary ? raw.summary.buyable : null;
     const discoverable = raw && raw.summary ? raw.summary.discoverable : null;
     const liveOffer = raw ? raw.hasLiveOffer : null;
@@ -345,7 +347,10 @@ export function buildAdvancedListingHealth({
     const flagReasons = flagEvidence({
       statusActive: statusActive || statusRaw === "", // an unknown status is not itself a flag
       buyable, discoverable, liveOffer,
-      priceMissingWhileActive: statusActive && (priceVal === null || priceVal === 0),
+      // "No price" is a CONFIRMED finding ONLY from explicit evidence: an Active listing whose price is an explicit
+      // invalid value (0). A null/blank/unavailable price is UNKNOWN evidence -> NEVER a negative finding (the row's
+      // price simply shows Unavailable). This distinguishes "confirmed missing/invalid price" from "price unavailable".
+      priceMissingWhileActive: statusActive && priceVal === 0,
       errorIssue, strandedStock,
     });
     const flagged = flagReasons.length > 0;
