@@ -165,6 +165,11 @@ export async function runListingHealthV3Ingestion({
   const dryRun = mode !== "live";
   const ev = { region: S(region), cycleDate: S(cycleDate), mode: dryRun ? "dry-run" : "live", operationId: listingHealthV3OperationId(region, cycleDate), phase: "auth", ok: false, creates: 0, tokens: 0, accounts: 0, newExports: 0, ceiling: null, estimatedTokens: 0, snapshots: 0, problems: [] };
   const fail = (phase, problem) => ({ ...ev, phase, ok: false, problems: [...ev.problems, problem] });
+  // Structured observability sink: route SAFE, structured events (an UPPERCASE_SNAKE tag + a JSON body of primitive,
+  // non-secret fields) into the operator's EXISTING log sink -- reuse, no new vendor. This is the established operator
+  // log convention. Callers that don't inject `log` get the no-op default. It NEVER throws and NEVER carries a
+  // credential/token/cookie, a raw seller id, the org fingerprint, a signed URL, row content, or PII.
+  const emit = (tag, obj) => { try { log(S(tag) + " " + JSON.stringify(obj)); } catch (_e) { /* observability must never affect the operation */ } };
 
   // 1) explicit operator authorization.
   if (authorized !== true) return fail("auth", "operator invocation is not explicitly authorized (fail closed)");
@@ -334,11 +339,48 @@ export async function runListingHealthV3Ingestion({
   // (finalize counts inventory jobs as "succeeded" and would not distinguish create from reuse -- only this catches it).
   if (ev.inventoryCreated) return fail("source", "inventory export was CREATED but v3 inventory must be reuse-only; fail closed (last-known-good preserved)");
 
-  // 9) materialize validated batch results into isolated per-account aliases (newer-only overwrite).
+  // 9) materialize validated batch results into isolated per-account aliases (newer-only overwrite). Per-fragment
+  //    structured events flow to `emit` (the operator log sink), correlated by this run's operationId.
   let matSummary = null;
-  try { matSummary = await materialize({ plans: v3Requests, connections }); }
+  try { matSummary = await materialize({ plans: v3Requests, connections, emit, runId: ev.operationId }); }
   catch (e) { return fail("materialize", "per-account materialization failed (last-known-good preserved): " + safe(e)); }
   ev.aliases = matSummary;
+  // RUN SUMMARY (materialization observability): per-account discovery/eligibility/exclusion, the planned new-vs-reused
+  // export split, the region create-ceiling, and the aggregate per-result materialization + durable counts. SAFE
+  // metadata only (counts / dates / region / ceiling) -- emitted here so it is recorded even if the rejected-fragment
+  // guard below then fails the run closed.
+  emit("LHV3_RUN_SUMMARY", {
+    runId: ev.operationId, region: ev.region, cycleDate: ev.cycleDate, mode: ev.mode,
+    accountsDiscovered: accounts.length,
+    accountsEligible: regionAccounts.length,
+    accountsExcludedPreplan: accounts.length - regionAccounts.length,
+    accountsMaterialized: Number((matSummary && matSummary.accounts) || 0),
+    accountsSkippedAtMaterialize: Number((matSummary && matSummary.skippedAccounts) || 0),
+    newExportsPlanned: Number((cost && cost.newExports) || 0),
+    newExportsCreated: Number(ev.creates || 0),
+    reusedExports: Number((cost && cost.reusedExports) || 0),
+    inventoryCreated: !!ev.inventoryCreated,
+    tokens: Number(ev.tokens || 0),
+    ceiling: ev.ceiling == null ? null : Number(ev.ceiling),
+    // Reaching materialize means the frozen create-ceiling gate already PASSED (a breach defers the whole run before
+    // any create); no account/export was excluded by the ceiling on this path.
+    ceilingExclusions: 0,
+    fragments: {
+      materialized: Number(((matSummary && matSummary.aliasesWritten) || 0)) + Number(((matSummary && matSummary.emptyAliases) || 0)),
+      emptyAliases: Number((matSummary && matSummary.emptyAliases) || 0),
+      reusedOrStale: Number((matSummary && matSummary.skippedStale) || 0),
+      missing: Number((matSummary && matSummary.batchMissing) || 0),
+      rejected: Number((matSummary && matSummary.rejected) || 0),
+    },
+    durable: {
+      written: Number((matSummary && matSummary.durableWritten) || 0),
+      unchanged: Number((matSummary && matSummary.durableUnchanged) || 0),
+      stale: Number((matSummary && matSummary.durableStale) || 0),
+      skippedEvidence: Number((matSummary && matSummary.durableSkippedEvidence) || 0),
+      schemaMissing: Number((matSummary && matSummary.durableSchemaMissing) || 0),
+      writeFailed: Number((matSummary && matSummary.durableWriteFailed) || 0),
+    },
+  });
   // A REJECTED (unattributable / cross-account) fragment is never reflected in the cycle job counters, so guard it here.
   const matRejected = Number((matSummary && matSummary.rejected) || 0);
   if (matRejected > 0) return fail("materialize", `materialization rejected ${matRejected} unattributable fragment(s); fail closed (last-known-good preserved)`);

@@ -38,7 +38,9 @@ function makeBundle() {
     bundle: {
       listingsRows, rawRows,
       inventorySource: { available: true, rows: invRows, fragments: [{ requestKey: "listing-health-v3:inventory", from: ASOF, to: ASOF, sellerOrVendorIds: [SELLER], rows: invRows }], disabled: false, disabledPolicy: null, reason: null },
-      context: { to: ASOF, inventoryAsOf: ASOF, accountId: ACCT, rawSellerId: SELLER, listingHealthV3DurableOli: { available: true, rows: [oliRow("2026-09-01", "A", 100, 10), oliRow("2026-08-20", "A", 50, 5)], coverageWindows: [{ from: "2024-01-01", to: ASOF }], completenessRows: [] }, listingHealthV3DurableCatalog: { available: true, rows: [catRow("A", "BrandX"), catRow("B", "BrandY")], payloadSha: "sha-cat" } },
+      // marketCountry = the trusted account-directory marketplace the real resolveListingHealthV3DependencyBundle now
+      // threads into the derive context (matches these US rows); the derive requires it to validate row ownership.
+      context: { to: ASOF, inventoryAsOf: ASOF, accountId: ACCT, rawSellerId: SELLER, marketCountry: "US", listingHealthV3DurableOli: { available: true, rows: [oliRow("2026-09-01", "A", 100, 10), oliRow("2026-08-20", "A", 50, 5)], coverageWindows: [{ from: "2024-01-01", to: ASOF }], completenessRows: [] }, listingHealthV3DurableCatalog: { available: true, rows: [catRow("A", "BrandX"), catRow("B", "BrandY")], payloadSha: "sha-cat" } },
       listingsSnapshot: { source_request_hash: "rh-l", payload_sha: "sha-l" }, rawSnapshot: { source_request_hash: "rh-r", payload_sha: "sha-r" }, inventorySnapshot: { source_request_hash: "rh-inv", payload_sha: "sha-i" },
     },
   };
@@ -122,6 +124,18 @@ const run = (h, over = {}) => h.release.runForAccount({ accountId: ACCT, request
   const h = harness({ bundles: [{ eligible: false, reason: "cross-account", status: "missing", revisionId: null, deps: [], contentDeps: [] }] });
   const res = await run(h);
   ok("bundle not eligible -> defer, zero writes", res.ok === false && res.stage === "reconcile" && /bundle-cross-account/.test(res.reason) && h.calls.openCycle === 0 && h.calls.publish.length === 0);
+}
+
+// ---- (5b) MARKETPLACE FAIL-CLOSED: an eligible bundle whose context lacks the trusted marketplace -> the REAL derive
+//      fails closed (unavailable) -> the live-promote path DEFERS with ZERO publish/shadow writes (LKG preserved). This
+//      is the exact scheduler live-promote gap: a marketplace-unvalidated snapshot is NEVER promoted. ----
+{
+  const noMkt = makeBundle();
+  delete noMkt.bundle.context.marketCountry;
+  const h = harness({ bundles: [noMkt] });
+  const res = await run(h);
+  ok("bundle missing trusted marketplace -> REAL derive unavailable -> defer, ZERO publish/shadow writes (live-promote fails closed)",
+    res.ok === false && res.stage === "reconcile" && /derive-unavailable/.test(res.reason) && h.calls.derive === 1 && h.calls.publish.length === 0 && h.calls.saveShadow.length === 0);
 }
 
 // ---- (6) ABORT before start -> DEADLINE, zero writes ----

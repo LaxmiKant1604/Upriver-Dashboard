@@ -80,7 +80,9 @@ const SOURCES = {
 };
 function derive(coverageWindows) {
   const context = {
-    to: ASOF, inventoryAsOf: ASOF, accountId: ACCT, rawSellerId: SELLER,
+    // marketCountry = the trusted account-directory marketplace the derive requires to validate row ownership (matches
+    // these US rows); the real planner + live-promote bundle always supply it.
+    to: ASOF, inventoryAsOf: ASOF, accountId: ACCT, rawSellerId: SELLER, marketCountry: "US",
     listingHealthV3DurableOli: { available: true, rows: [oliRow("2026-08-10", "A", 10, 1)], coverageWindows, completenessRows: [] },
     listingHealthV3DurableCatalog: { available: true, rows: [{ child_asin: "ASIN-A", product_name: "P A", product_brand: "BrandX" }] },
   };

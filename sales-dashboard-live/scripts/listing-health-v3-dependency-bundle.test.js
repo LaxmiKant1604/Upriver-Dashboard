@@ -163,6 +163,11 @@ const run = (over = {}) => { const { deps, args } = harness(over); return resolv
   const b = await run();
   ok("happy path: eligible with a 32-hex revisionId + one manifest contentDep + deps=[]", b.eligible === true && /^[0-9a-f]{32}$/.test(b.revisionId) && b.contentDeps.length === 1 && b.contentDeps[0].startsWith("listing-health-v3-manifest|") && b.deps.length === 0);
   ok("bundle carries listings/raw rows + inventorySource(available) + context(OLI+catalog+rawSellerId)", b.bundle.listingsRows.length === 2 && b.bundle.rawRows.length === 2 && b.bundle.inventorySource.available === true && b.bundle.context.listingHealthV3DurableOli.available === true && b.bundle.context.listingHealthV3DurableCatalog.payloadSha === "sha-cat" && b.bundle.context.rawSellerId === SELLER);
+  // The live-promote / durable-rederive derive validates row ownership against context.marketCountry; the bundle MUST
+  // carry the SAME trusted marketplace it proved every durable pointer against, or the derive would fail closed for a
+  // legitimate account. This is the provenance thread that keeps the marketplace guard enforced (not fail-open) yet
+  // does not reject a complete, valid bundle.
+  ok("bundle context carries the trusted marketplace as marketCountry (feeds the derive's owner-marketplace guard)", b.bundle.context.marketCountry === MKT);
   ok("resolver is deterministic (same evidence -> same revisionId)", (await run()).revisionId === b.revisionId);
 }
 

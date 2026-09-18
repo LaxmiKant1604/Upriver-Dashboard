@@ -201,10 +201,18 @@ export function assertListingHealthV3ExportCeiling({ region, plans, accountCount
  * Returns a summary { accounts, aliasesWritten, emptyAliases, rejected, batchMissing, skippedAccounts, skippedStale,
  * aliases[], rejections[] } -- never a secret. One plan's failure never aborts the others.
  */
-export async function materializeListingHealthV3PerAccount({ plans = [], connections = [], readSourceCache, writeSourceCache, readAliasMeta = null, clock = () => Date.now(), saveDurablePayload = null, recordDurableByKey = null, isSchemaMissingError = null, isFunctionSignatureMissingError = null }) {
+export async function materializeListingHealthV3PerAccount({ plans = [], connections = [], readSourceCache, writeSourceCache, readAliasMeta = null, clock = () => Date.now(), saveDurablePayload = null, recordDurableByKey = null, isSchemaMissingError = null, isFunctionSignatureMissingError = null, emit = () => {}, runId = null }) {
   if (typeof readSourceCache !== "function" || typeof writeSourceCache !== "function") {
     throw new Error("materializeListingHealthV3PerAccount requires readSourceCache + writeSourceCache callbacks (fail closed).");
   }
+  // SECURITY: structured per-fragment observability to the injected operator log sink. It carries ONLY safe metadata --
+  // the PUBLIC account id, canonical marketplace, fragment type, the six-value result, effective/saved dates, the batch
+  // + per-account read hashes, row count, and duration. It NEVER carries a credential/token/cookie, the raw seller id,
+  // the org fingerprint, a signed/object URL, any row content, or customer PII. A throwing sink is swallowed --
+  // observability must NEVER affect materialization or its outcome.
+  const emitFragment = (fields) => {
+    try { emit("LHV3_MATERIALIZE_FRAGMENT", { runId: runId == null ? null : String(runId), ...fields }); } catch (_e) { /* observability must never affect materialization */ }
+  };
   // Durable persistence (WORK B) is ZERO-EXPORT + OPTIONAL: it runs ONLY when BOTH saveDurablePayload + recordDurableByKey
   // are injected (the ingestion composition binds the real supabase writers). When absent (existing callers/tests), the
   // per-account ALIAS behavior is byte-identical -- persistence is a strictly additive, isolated side effect.
@@ -287,12 +295,29 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
       if (!LISTING_HEALTH_V3_READ_KEYS.includes(src.requestKey)) continue;
       const ident = identities[src.requestKey];
       if (!ident || !ident.requestHash) continue;
+      const t0 = clock();
+      // Per-fragment identity fields shared by every outcome event (all safe -- see emitFragment's SECURITY note). The
+      // effective date is the account's D-1 as-of; the source export hash is the REUSED batch export (materialize never
+      // creates a paid export -- it reads an already-saved batch, so paidExportCreated is ALWAYS false here).
+      const evBase = {
+        account: owner.accountId,
+        marketplace: S(owner.marketplace).trim().toUpperCase() || null,
+        fragmentType: src.requestKey,
+        effectiveDate: (plan.context && isDateStr(plan.context.to)) ? plan.context.to : null,
+        sourceExportHash: src.requestHash || null,
+        correlationId: ident.requestHash || null,
+        paidExportCreated: false,
+      };
 
       // 1) Read the ALREADY-SAVED batch payload (cache-only; never an export). A miss/malformed batch means the
       //    batch has not (yet) succeeded this cycle -> leave the per-account alias UNTOUCHED (previous LKG survives).
       let batch = null;
       try { batch = await readSourceCache(src.requestHash); } catch (_e) { batch = null; }
-      if (!batch || !Array.isArray(batch.rows)) { summary.batchMissing += 1; continue; }
+      if (!batch || !Array.isArray(batch.rows)) {
+        summary.batchMissing += 1;
+        emitFragment({ ...evBase, result: "missing", savedAt: null, rowCount: null, reason: "batch-not-yet-saved", durationMs: clock() - t0 });
+        continue;
+      }
 
       // 2) Isolate ONLY this owner's rows (by trusted rawSellerId + marketplace + org + connection). A rejected
       //    fragment (blank owner / cross-org / cross-connection) is NEVER written -- fail closed.
@@ -303,6 +328,7 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
       if (iso.rejected || !Array.isArray(iso.rows)) {
         summary.rejected += 1;
         summary.rejections.push({ accountId: owner.accountId, requestKey: src.requestKey });
+        emitFragment({ ...evBase, result: "rejected", savedAt: (batch.fetched_at || batch.fetchedAt || null), rowCount: null, reason: "isolation-rejected", durationMs: clock() - t0 });
         continue;
       }
 
@@ -317,10 +343,15 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
         const existingFetchedAt = existingMeta && (existingMeta.batchFetchedAt || existingMeta.batch_fetched_at) || null;
         if (existingFetchedAt && Date.parse(String(existingFetchedAt)) >= Date.parse(String(incomingFetchedAt))) {
           summary.skippedStale += 1; // an equal-or-newer alias already exists -> preserve it (LKG / idempotent replay)
+          // Distinguish the two skip reasons for observability: a STRICTLY-older incoming batch is a late/stale
+          // completion the newer alias correctly outranks ("stale"); an equal fetched_at is a same-cycle idempotent
+          // replay that reuses the current alias ("reused"). Both preserve the existing alias (no write).
+          const olderIncoming = Date.parse(String(existingFetchedAt)) > Date.parse(String(incomingFetchedAt));
           // The alias is untouched, but the DURABLE pointer must still be (re)persisted from this already-saved,
           // validated, per-account-isolated fragment when it is missing/stale -- persistence is decoupled from the
           // alias-write guard. Idempotent via the RPC's CAS (already-current -> "unchanged", zero writes).
           await persistDurable(src, iso.rows, incomingFetchedAt);
+          emitFragment({ ...evBase, result: olderIncoming ? "stale" : "reused", savedAt: incomingFetchedAt, rowCount: iso.rows.length, reason: olderIncoming ? "older-batch-preserved-lkg" : "already-current-idempotent", durationMs: clock() - t0 });
           continue;
         }
       }
@@ -343,10 +374,13 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
       } catch (_e) {
         // A write failure for one account/source is isolated (previous alias preserved); record nothing fabricated.
         summary.rejections.push({ accountId: owner.accountId, requestKey: src.requestKey, error: "write-failed" });
+        emitFragment({ ...evBase, result: "failed", savedAt: (incomingFetchedAt || null), rowCount: null, reason: "alias-write-failed", durationMs: clock() - t0 });
         continue;
       }
       if (rows.length === 0) summary.emptyAliases += 1; else summary.aliasesWritten += 1;
       summary.aliases.push({ accountId: owner.accountId, requestKey: src.requestKey, requestHash: ident.requestHash, rowCount: rows.length });
+      // A valid-empty alias ([]) is still a materialized result (distinct from a missing batch) -- rowCount 0 is honest.
+      emitFragment({ ...evBase, result: "materialized", savedAt: (incomingFetchedAt || null), rowCount: rows.length, reason: rows.length === 0 ? "valid-empty" : "written", durationMs: clock() - t0 });
 
       // 5) DURABLE PERSISTENCE (WORK B; ZERO export, ZERO tokens): the SAME already-downloaded + STEP-6-validated +
       //    per-account-ISOLATED `rows` are also written to the durable Listings / Listings-Raw pointer tables (only the

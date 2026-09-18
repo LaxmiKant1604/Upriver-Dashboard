@@ -135,6 +135,26 @@ await (async () => {
   ok("F: it saves the v3 shadow snapshot(s) and reports complete ONLY on a terminal succeeded finalize", r.ok === true && r.phase === "complete" && r.snapshots === 2 && r.dryRun === false && r.cycleStatus === "succeeded");
 })();
 
+/* ===================== F(obs). materialization RUN SUMMARY on the operator log sink ===================== */
+await (async () => {
+  const s = spies();
+  const logs = [];
+  const r = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, log: (m) => logs.push(String(m)), ...s }));
+  ok("F(obs): a completed live run emits exactly one LHV3_RUN_SUMMARY line to the operator log sink", r.ok === true && logs.filter((m) => m.startsWith("LHV3_RUN_SUMMARY ")).length === 1);
+  const summary = JSON.parse(logs.find((m) => m.startsWith("LHV3_RUN_SUMMARY ")).slice("LHV3_RUN_SUMMARY ".length));
+  ok("F(obs): the run summary carries runId + region + per-account discovery/eligibility/exclusion",
+    summary.runId === "listing-health-v3/us-ca/2026-09-04" && summary.region === "us-ca" && summary.cycleDate === cycleDate
+    && summary.accountsDiscovered === usAccounts.length && summary.accountsEligible === usAccounts.length && summary.accountsExcludedPreplan === 0);
+  ok("F(obs): the run summary carries the new-vs-reused export split, the create ceiling, and inventoryCreated=false",
+    summary.newExportsPlanned === 2 && summary.reusedExports === 1 && summary.newExportsCreated === 2
+    && typeof summary.ceiling === "number" && summary.ceilingExclusions === 0 && summary.inventoryCreated === false);
+  ok("F(obs): the run summary carries the aggregate per-result materialization counts",
+    summary.fragments && summary.fragments.materialized === 2 && summary.fragments.rejected === 0 && summary.fragments.missing === 0 && summary.durable && typeof summary.durable.written === "number");
+  // SECURITY: the run summary is safe metadata only -- no credential, raw seller id, org fingerprint, or URL.
+  const FORBIDDEN = ["apiKey", "api_key", "rawSellerId", "raw_seller_id", "seller_or_vendor_id", "organizationFingerprint", "organization_fingerprint", "url", "signedUrl", "objectPath", "object_path"];
+  ok("F(obs security): the run summary contains no credential/raw-seller/org-fingerprint/url key", FORBIDDEN.every((k) => !(k in summary)));
+})();
+
 /* ===================== G. OPTIONAL-INVENTORY: NO adoptable inventory no longer defers -- the run PROCEEDS ===================== */
 await (async () => {
   const s = spies({ cost: { newExports: 2, reusedExports: 1, creates: 2, estimatedTokens: 4, inventoryAdoptable: false, anyInventoryAdoptable: false, inventoryAdoptableCount: 0, inventoryAdoptableByHash: { invA: false } } });

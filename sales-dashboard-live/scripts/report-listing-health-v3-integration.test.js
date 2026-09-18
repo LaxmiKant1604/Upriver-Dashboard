@@ -132,7 +132,10 @@ const baseListings = [listingRow(SELLER, "US", "A", { status: "Active", price: 2
 const baseInv = [invRow(inv, SELLER, "US", "A", 30)];
 const baseCat = [catRow("A", "BrandX"), catRow("B", "BrandY")];
 const baseOli = [oliRow("2026-09-01", "A", 100, 10), oliRow("2026-08-20", "A", 50, 5), oliRow("2026-09-02", "B", 200, 20), oliRow("2026-06-01", "A", 999, 99)];
-const ctx = (over = {}) => ({ to: asOf, inventoryAsOf: inv, rawSellerId: SELLER, accountId: SELLER, listingHealthV3DurableOli: durableOli({ rows: baseOli, coverageWindows: fullCoverage }), listingHealthV3DurableCatalog: durableCat(baseCat), ...over });
+// marketCountry is the TRUSTED account-directory marketplace the real planner ALWAYS supplies (report-planner.js) and
+// the live-promote bundle now threads (dependency-bundle context). The derive requires it to validate row ownership and
+// stamps it (canonical) onto the payload; a context that lacks it fails closed (proved in section J).
+const ctx = (over = {}) => ({ to: asOf, inventoryAsOf: inv, rawSellerId: SELLER, accountId: SELLER, marketCountry: "US", listingHealthV3DurableOli: durableOli({ rows: baseOli, coverageWindows: fullCoverage }), listingHealthV3DurableCatalog: durableCat(baseCat), ...over });
 const deriveV3 = (sources, context) => deriveReportSnapshot({ reportKey: "listing-health-v3", sources, context });
 
 (() => {
@@ -186,6 +189,30 @@ const deriveV3 = (sources, context) => deriveReportSnapshot({ reportKey: "listin
   ok("E: a missing REQUIRED source (listings) => unavailable (LKG preserved, no snapshot)", deriveV3(missListings.sources, ctx()).status === "unavailable");
   // Missing durable OLI => unavailable.
   ok("E: missing durable OLI => unavailable (LKG preserved)", deriveV3(sources, ctx({ listingHealthV3DurableOli: null })).status === "unavailable");
+})();
+
+/* ===================== J. trusted marketplace ownership on EVERY derive path (scheduler + live-promote) ===================== */
+// The derive resolves the row-ownership marketplace from the TRUSTED account-directory provenance (context.marketCountry
+// -- what the planner buckets on and the live-promote bundle now threads), canonicalizes it (UK->GB, uppercase), threads
+// it into owner.marketplace so buildAdvancedListingHealth's assertRowsOwnedBy enforces cross-marketplace isolation, and
+// FAILS CLOSED (unavailable, LKG preserved) when it is missing -- closing the gap where the scheduler live-promote path
+// reached the builder with no owner marketplace and fell open on the marketplace axis. The builder-level accept/reject/
+// UK->GB/fail-open matrix is proved directly in report-listing-health-advanced.test.js; here we prove the DERIVE wires
+// the trusted marketplace through and gates on it.
+(() => {
+  const { sources } = v3Sources({ listings: baseListings, raw: [{ seller_or_vendor_id: SELLER, marketplace_country_code: "US", sku: "A", child_asin: "ASIN-A", summaries: JSON.stringify({ status: ["BUYABLE"] }), issues: JSON.stringify([]), offers: JSON.stringify([{ price: { amount: 25 } }]) }], inventory: baseInv });
+  // A present, trusted marketplace derives AND stamps the canonical owner marketplace on the payload (this is the SAME
+  // owner.marketplace the direct read-only serve resolves from the account directory -> scheduler/serve are equivalent).
+  const rOk = deriveV3(sources, ctx({ windowPreset: "30D" }));
+  ok("J: a trusted marketplace derives and stamps the canonical owner marketplace onto the payload", rOk.status === "derived" && rOk.payload.marketplace === "US");
+  // A lowercase directory marketplace is canonicalized (never a false reject) and still stamps the canonical form.
+  const rLower = deriveV3(sources, ctx({ windowPreset: "30D", marketCountry: "us" }));
+  ok("J: a lowercase directory marketplace is canonicalized to US (no false reject)", rLower.status === "derived" && rLower.payload.marketplace === "US");
+  // FAIL CLOSED: a missing / blank / whitespace-only trusted marketplace preserves last-known-good (never a marketplace-
+  // unvalidated snapshot). This is the exact scheduler live-promote gap now closed.
+  ok("J: a MISSING trusted marketplace (null) => unavailable (fail closed, LKG preserved)", deriveV3(sources, ctx({ windowPreset: "30D", marketCountry: null })).status === "unavailable");
+  ok("J: a BLANK trusted marketplace ('') => unavailable (fail closed)", deriveV3(sources, ctx({ windowPreset: "30D", marketCountry: "" })).status === "unavailable");
+  ok("J: a WHITESPACE-only trusted marketplace => unavailable (fail closed)", deriveV3(sources, ctx({ windowPreset: "30D", marketCountry: "   " })).status === "unavailable");
 })();
 
 /* ===================== F. save one account-scoped shadow snapshot via the REAL worker + idempotent ===================== */

@@ -355,4 +355,84 @@ await (async () => {
   ok("K: a strictly newer batch DOES overwrite the alias", afterNext.length === 1 && afterNext[0].sku === "S02-NEXT");
 })();
 
+/* ===================== L. materialization OBSERVABILITY: per-fragment structured events (safe metadata only) ========== */
+// The emit callback receives a LHV3_MATERIALIZE_FRAGMENT event for EVERY attempted (account, fragment): one of the six
+// results (materialized | reused | missing | stale | rejected | failed), with the run id, PUBLIC account id, canonical
+// marketplace, fragment type, effective/saved dates, the batch + per-account read hashes, a row count, a reason, and a
+// duration. SECURITY: an event NEVER carries a credential, the raw seller id, the org fingerprint, row content, or a URL.
+await (async () => {
+  const cache = makeCache();
+  const p = plans();
+  // Seed listings + raw but NOT inventory -> inventory fragments emit "missing"; listings/raw emit "materialized".
+  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch });
+  const events = [];
+  const emit = (tag, obj) => events.push({ tag, obj });
+  await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache, emit, runId: "op-us-ca-2026-09-02" });
+
+  const frag = events.filter((e) => e.tag === "LHV3_MATERIALIZE_FRAGMENT").map((e) => e.obj);
+  ok("L: emits a LHV3_MATERIALIZE_FRAGMENT event per attempted fragment, each with the run id + safe identity fields",
+    frag.length >= 1 && frag.every((o) => o.runId === "op-us-ca-2026-09-02" && typeof o.account === "string" && !!o.fragmentType && !!o.result && typeof o.durationMs === "number" && o.paidExportCreated === false));
+  const byResult = (r) => frag.filter((o) => o.result === r);
+  ok("L: a present batch yields 'materialized' events (incl a valid-empty rowCount 0 for the empty seller acct-04)",
+    byResult("materialized").some((o) => o.fragmentType === "listing-health-v3:listings") && byResult("materialized").some((o) => o.rowCount === 0));
+  ok("L: 'materialized' carries the canonical marketplace, effective date, source-export + correlation hashes, and a numeric row count",
+    byResult("materialized").every((o) => o.marketplace === "US" && o.effectiveDate === asOf && typeof o.sourceExportHash === "string" && o.sourceExportHash && typeof o.correlationId === "string" && o.correlationId && typeof o.rowCount === "number"));
+  ok("L: the absent inventory batch yields 'missing' events (rowCount null, savedAt null)",
+    byResult("missing").length >= 1 && byResult("missing").every((o) => o.fragmentType === "listing-health-v3:inventory" && o.rowCount === null && o.savedAt === null));
+
+  // SECURITY: no forbidden KEY on any event, and no credential / org fingerprint VALUE anywhere in the serialized bodies.
+  const FORBIDDEN = ["apiKey", "api_key", "rawSellerId", "raw_seller_id", "sellerOrVendorId", "seller_or_vendor_id", "organizationFingerprint", "organization_fingerprint", "listing_name", "rows", "url", "signedUrl", "objectPath", "object_path"];
+  ok("L(security): no emitted event contains a credential/raw-seller/org-fingerprint/row/url KEY", FORBIDDEN.every((k) => !frag.some((o) => Object.prototype.hasOwnProperty.call(o, k))));
+  const flat = JSON.stringify(events);
+  ok("L(security): the api key value never appears in any event body", !flat.includes(API_KEY));
+  ok("L(security): the org fingerprint value never appears in any event body", !flat.includes(organizationFingerprint(API_KEY)));
+})();
+
+/* ===================== L2. observability: 'rejected' + 'failed' events ===================== */
+await (async () => {
+  const cache = makeCache();
+  const p = plans();
+  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch, inventory: inventoryBatch });
+  // Cross-org for acct-01 -> its fragments are isolation-rejected. A throwing writer for acct-00's listings -> failed.
+  const crossOrg = p.map((r) => (r.owner.accountId === "acct-01" ? { ...r, sources: r.sources.map((s) => ({ ...s, organizationFingerprint: "different-org-fingerprint" })) } : r));
+  const failHash = listingHealthV3PerAccountReadHashes({ apiKey: API_KEY, rawSellerId: "acct-00", marketplaceCountry: "US" })["listing-health-v3:listings"];
+  const writeSourceCache = async (args) => { if (args.requestHash === failHash) throw new Error("boom"); return cache.writeSourceCache(args); };
+  const events = [];
+  await materializeListingHealthV3PerAccount({ plans: crossOrg, connections, readSourceCache: cache.readSourceCache, writeSourceCache, emit: (t, o) => events.push(o), runId: "op-x" });
+  ok("L2: a cross-org fragment emits a 'rejected' event (reason isolation-rejected, rowCount null)",
+    events.some((o) => o.result === "rejected" && o.reason === "isolation-rejected" && o.rowCount === null));
+  ok("L2: an isolated alias write failure emits a 'failed' event (reason alias-write-failed) for that fragment only",
+    events.some((o) => o.result === "failed" && o.reason === "alias-write-failed" && o.fragmentType === "listing-health-v3:listings"));
+})();
+
+/* ===================== L3. observability: 'reused' (equal freshness) vs 'stale' (late older) ===================== */
+await (async () => {
+  const cache = makeCache();
+  const p = plans();
+  const NEWER = "2026-09-04T06:00:00.000Z";
+  const OLDER = "2026-09-03T06:00:00.000Z";
+  const seedFetched = (fetchedAt, listings) => {
+    const seen = new Set();
+    for (const src of p[0].sources) {
+      if (seen.has(src.requestHash)) continue; seen.add(src.requestHash);
+      const rows = src.requestKey === "listing-health-v3:listings" ? listings : (src.requestKey === "listing-health-v3:listings-raw" ? rawBatch : inventoryBatch);
+      cache.map.set(src.requestHash, { rows: [...rows], fetched_at: fetchedAt, expires_at: "2999-01-01T00:00:00.000Z", source_id: src.sourceId, organization_fingerprint: src.organizationFingerprint, account_scope_hash: src.accountScopeHash });
+    }
+  };
+  seedFetched(NEWER, listingsBatch);
+  await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache, readAliasMeta: cache.readAliasMeta });
+  // Equal-freshness replay -> "reused".
+  const reuse = [];
+  seedFetched(NEWER, listingsBatch);
+  await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache, readAliasMeta: cache.readAliasMeta, emit: (t, o) => reuse.push(o), runId: "op-reuse" });
+  ok("L3: an equal-freshness replay emits 'reused' events (already-current-idempotent) and writes nothing",
+    reuse.some((o) => o.result === "reused" && o.reason === "already-current-idempotent"));
+  // A late, strictly-OLDER batch -> "stale".
+  const stale = [];
+  seedFetched(OLDER, [listingRow("acct-02", "US", "OLD")]);
+  await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache, readAliasMeta: cache.readAliasMeta, emit: (t, o) => stale.push(o), runId: "op-stale" });
+  ok("L3: a late older batch emits 'stale' events (older-batch-preserved-lkg), never replacing the newer alias",
+    stale.some((o) => o.result === "stale" && o.reason === "older-batch-preserved-lkg"));
+})();
+
 writeSync(1, `\nreport-listing-health-v3-materialize: ${passed} assertions passed\n`);

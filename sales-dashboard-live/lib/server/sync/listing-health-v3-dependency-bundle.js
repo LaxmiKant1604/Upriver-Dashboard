@@ -293,6 +293,13 @@ export async function resolveListingHealthV3DependencyBundle(deps = {}, args = {
 
   const context = {
     to: requestedAsOf, inventoryAsOf: requestedAsOf, accountId, rawSellerId,
+    // TRUSTED canonical marketplace provenance for the derive's row-ownership boundary. This is the SAME account-directory
+    // marketplace (2-letter, uppercased) that was already proven against EVERY durable pointer above (validateListingsPointer
+    // marketplace-mismatch + the FBA pointer namespace) and folded into the revision fingerprint -- never inferred from row
+    // text. Threading it as marketCountry lets the live-promote / durable-rederive derive validate that each hydrated row
+    // belongs to this account's marketplace (assertRowsOwnedBy) instead of falling open on the marketplace axis. The derive
+    // canonicalizes UK->GB exactly as the row compare does, so an account directory that labels GB as "UK" still matches.
+    marketCountry: marketplace,
     listingsFetchedAt: S(l.snapshot.validated_at) || null,
     rawFetchedAt: S(r.snapshot.validated_at) || null,
     inventoryFetchedAt: inventorySnapshot ? (S(inventorySnapshot.validated_at) || null) : null,

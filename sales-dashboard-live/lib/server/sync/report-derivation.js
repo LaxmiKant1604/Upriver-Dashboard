@@ -1109,6 +1109,21 @@ const REGISTRY = {
       }
       const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
       const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
+      // TRUSTED canonical marketplace for the row-ownership boundary. It is the account-directory market country
+      // (context.marketCountry -- the SAME provenance the planner uses to bucket/batch this account, NEVER inferred
+      // from listing text), canonicalized to match row marketplace_country_code: uppercase-trimmed with the one known
+      // directory-vs-row divergence folded (UK -> GB). This is threaded into owner.marketplace so assertRowsOwnedBy
+      // (buildAdvancedListingHealth) enforces cross-marketplace isolation on EVERY derivation path -- including the
+      // scheduler live-promote / durable-rederive path, which previously reached the builder with no owner marketplace
+      // and therefore fell open on the marketplace axis. FAIL CLOSED: without a trusted marketplace we cannot validate
+      // that these rows belong to this account's marketplace, so we preserve last-known-good and promote nothing rather
+      // than a marketplace-unvalidated snapshot. (The real planner always supplies marketCountry for every eligible
+      // account; a context that lacks it is not a trusted derivation input.)
+      const _mc = String(context.marketCountry != null ? context.marketCountry : "").trim().toUpperCase();
+      const ownerMarketplace = _mc === "UK" ? "GB" : _mc;
+      if (!ownerMarketplace) {
+        throw deriveError("listing-health-v3 requires a trusted canonical marketplace (account directory) to validate row ownership; it is missing; last-known-good preserved.", "unavailable");
+      }
       // The ONE hard-required owned export is LISTINGS (Raw + inventory are optional/degradable; OLI + catalog are
       // derived durable deps below). A missing/failed/unreadable LISTINGS cache still blocks (LKG preserved).
       {
@@ -1173,7 +1188,7 @@ const REGISTRY = {
         preset: context.windowPreset, from: context.windowFrom, to: context.windowTo, month: context.windowMonth, asOf,
       });
       return buildAdvancedListingHealth({
-        owner: { accountId: publicAccountId, rawSellerId },
+        owner: { accountId: publicAccountId, rawSellerId, marketplace: ownerMarketplace },
         asOf, window,
         enrichedOliRows: durableOli.rows,
         oliCoverageWindows: Array.isArray(durableOli.coverageWindows) ? durableOli.coverageWindows : [],

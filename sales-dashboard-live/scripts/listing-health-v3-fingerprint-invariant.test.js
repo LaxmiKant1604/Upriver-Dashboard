@@ -38,7 +38,9 @@ function derive({ oliRows = baseOliRows, completenessRows = baseCompleteness, co
     "listing-health-v3:inventory": { available: false },
   };
   const context = {
-    to: ASOF, inventoryAsOf: ASOF, accountId: ACCT, rawSellerId: SELLER,
+    // marketCountry = the trusted account-directory marketplace the derive requires to validate row ownership (matches
+    // these US rows); the planner + live-promote bundle always supply it.
+    to: ASOF, inventoryAsOf: ASOF, accountId: ACCT, rawSellerId: SELLER, marketCountry: "US",
     listingHealthV3DurableOli: { available: true, rows: oliRows, coverageWindows: [{ from: "2024-01-01", to: ASOF }], completenessRows },
     listingHealthV3DurableCatalog: { available: true, rows: [catRow("A", "BrandX")] },
     ...contextExtra,

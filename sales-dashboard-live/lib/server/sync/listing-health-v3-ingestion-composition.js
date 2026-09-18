@@ -154,7 +154,7 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     return { usable: bal && bal.read === "ok" ? bal.usable : null };
   };
 
-  const materialize = ({ plans, connections: conns }) => materializeFn({
+  const materialize = ({ plans, connections: conns, emit = () => {}, runId = null }) => materializeFn({
     plans, connections: conns || connections,
     readSourceCache: getExportCache,
     writeSourceCache: saveExportCache,
@@ -165,6 +165,8 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     recordDurableByKey: { "listing-health-v3:listings": recordListingsSnapshot, "listing-health-v3:listings-raw": recordListingsRawSnapshot },
     isSchemaMissingError,
     isFunctionSignatureMissingError,
+    // Structured per-fragment observability -> the operator's log sink (safe metadata only; see materialize.js).
+    emit, runId,
   });
 
   // The frozen NEW-tranche budget (listings + listings-raw ONLY; inventory is never in it), computed WITHOUT persisting.
