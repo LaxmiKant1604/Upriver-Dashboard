@@ -99,6 +99,35 @@ export function accessFingerprint(access) {
   return createHash("sha256").update(canonical).digest("hex").slice(0, 24);
 }
 
+// ---- Derived account-scoped edit capabilities ---------------------------------------------------------------------
+// ACCOUNT ACCESS IS THE SOURCE OF TRUTH. The account-scoped editing capabilities are DERIVED from account access at
+// authorization time -- there is no separate stored capability flag to grant, and none to backfill. `account_permissions`
+// (surfaced as access.accountIds / access.accountGrants) is the canonical record: granting an account confers the
+// capability, and revoking it removes the capability immediately, because these helpers read only the live grant.
+
+// True when the authenticated user may access ONE account: an admin (org-wide), or a user holding a membership grant
+// for that exact account (of ANY brand scope). `access` is the server-derived object from getDashboardAccess -- the
+// account/role are NEVER trusted from the browser. Mirrors assertAccountAccess (which throws) as a boolean.
+export function hasAccountAccess(access, accountId) {
+  if (!access) return false;
+  if (access.role === "admin") return true;
+  const id = String(accountId == null ? "" : accountId).trim();
+  if (!id) return false;
+  if (access.accountGrants && Object.prototype.hasOwnProperty.call(access.accountGrants, id)) return true;
+  return Array.isArray(access.accountIds) && access.accountIds.includes(id);
+}
+
+// The effective per-account CAMPAIGN -> BRAND MAPPING management capability -- the create/edit/upload path for the
+// account's campaign->brand mappings (this project's only user-facing "brand names/mappings" write; brand NAMES
+// themselves are read-only discovered facts). It is DERIVED from account access: any user with access to the account
+// may manage that account's mappings. A brand-limited (SELECTED_BRANDS) user still holds the capability but the caller
+// additionally constrains WHICH brands they may assign to their permitted set (never a brand they cannot see). Admin
+// -> always true. This is the ONE capability the "Campaign mapping" + brand-mapping controls correspond to; there is
+// no parallel permission flag, so there is nothing to duplicate or keep in sync.
+export function canManageCampaignMapping(access, accountId) {
+  return hasAccountAccess(access, accountId);
+}
+
 /**
  * Resolve the trusted report scope for ONE report request. Throws BrandAccessError (403) for any unauthorized
  * account/brand or a denied report, WITHOUT revealing whether an inaccessible account/brand exists.

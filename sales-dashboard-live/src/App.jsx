@@ -43,6 +43,7 @@ import { useFbaPlanConfig } from "./lib/use-fba-plan-config.js";
 import { useFbaPlanColumns } from "./lib/use-fba-plan-columns.js";
 import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
 import { canonicalBrandKey, permittedBrandKeySetForAccount, filterBrandNamesToPermitted } from "./lib/brand-scope-filter.js";
+import { filterAccounts, accountSelectionCounts } from "./lib/account-access-select.js";
 // Regional Brand View: Region -> Brand selection, using the SINGLE canonical marketplace->region mapping the
 // scheduler owns (never a second mapping). Region membership is derived from each authorized account's trusted
 // marketplace metadata; the server re-enforces it on the portfolio data request.
@@ -1290,9 +1291,60 @@ function LoginScreen({ passwordSetup = false }) {
   );
 }
 
+// Searchable, accessible ACCOUNT multi-select for the admin "User Access" panel (invite + edit). Search matches an
+// account's name, marketplace/country (code + name), currency and stable id, case-insensitively and live, with a
+// clear button. It shows a selected/total count, an optional "Selected only" filter, and a clear empty state. The
+// SELECTION lives in the parent (selectedIds); this component only changes which rows are VISIBLE -- so a selection is
+// NEVER lost when the search changes or clears, and a Save persists the COMPLETE selection, not just the visible rows.
+function AccountAccessSelector({ accounts, selectedIds, onToggle, disabled = false, idPrefix = "acct" }) {
+  const [query, setQuery] = useState("");
+  const [selectedOnly, setSelectedOnly] = useState(false);
+  // Enrich each account with its human marketplace/country name so search also matches e.g. "united states"/"india".
+  const enriched = useMemo(
+    () => (Array.isArray(accounts) ? accounts : []).map((a) => ({ ...a, countryName: marketplaceProfile(a.country).name })),
+    [accounts],
+  );
+  const selected = useMemo(() => new Set((selectedIds || []).map((id) => String(id))), [selectedIds]);
+  const visible = useMemo(
+    () => filterAccounts(enriched, { query, selectedOnly, selectedIds: selected }),
+    [enriched, query, selectedOnly, selected],
+  );
+  const counts = accountSelectionCounts(enriched, selected);
+  // Never trap the admin in an empty "Selected only" view: if the selection empties (e.g. they uncheck the last
+  // account to reassign), drop back to showing all accounts so they can select again.
+  useEffect(() => { if (selectedOnly && counts.selected === 0) setSelectedOnly(false); }, [selectedOnly, counts.selected]);
+  const searchId = `${idPrefix}-account-search`;
+  return <div className="access-account-selector">
+    <div className="access-selector-search" style={{ position: "relative", marginBottom: 6 }}>
+      <Search size={14} aria-hidden="true" style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--text-secondary)", pointerEvents: "none" }} />
+      <input id={searchId} type="search" value={query} onChange={(e) => setQuery(e.target.value)} disabled={disabled}
+        placeholder="Search accounts by name, country, currency or ID…" aria-label="Search accounts by name, country, currency or ID"
+        style={{ width: "100%", padding: "6px 32px", borderRadius: 6, border: "1px solid var(--border-strong)" }} />
+      {query && <button type="button" className="icon-action" onClick={() => setQuery("")} title="Clear search" aria-label="Clear search"
+        style={{ position: "absolute", right: 4, top: "50%", transform: "translateY(-50%)" }}><X size={14} /></button>}
+    </div>
+    <div className="access-selector-meta" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 6, fontSize: 12, color: "var(--text-secondary)", flexWrap: "wrap" }}>
+      <span aria-live="polite">{counts.selected} of {counts.total} account{counts.total === 1 ? "" : "s"} selected</span>
+      <label style={{ display: "inline-flex", gap: 6, alignItems: "center", cursor: counts.selected ? "pointer" : "default", opacity: counts.selected ? 1 : 0.5 }} title="Show only the accounts already selected">
+        <input type="checkbox" checked={selectedOnly} disabled={disabled || !counts.selected} onChange={(e) => setSelectedOnly(e.target.checked)} /><span>Selected only</span>
+      </label>
+    </div>
+    <div className="access-account-list" role="group" aria-label="Allowed Amazon accounts" style={{ maxHeight: 240, overflowY: "auto" }}>
+      {visible.length === 0
+        ? <div className="empty-note">{(query || selectedOnly) ? "No accounts match your search." : "No accounts to show — load the account directory first."}</div>
+        : visible.map((account) => <label className="access-account-check" key={account.id} title={`${account.countryName}${account.currency ? ` · ${account.currency}` : ""} · ${account.id}`}>
+            <input type="checkbox" checked={selected.has(String(account.id))} disabled={disabled} onChange={() => onToggle(account.id)} />
+            <span>{FLAGS[account.country] || ""} {account.name}<small style={{ color: "var(--text-secondary)", marginLeft: 6 }}>{account.country}{account.currency ? ` · ${account.currency}` : ""}</small></span>
+          </label>)}
+    </div>
+  </div>;
+}
+
 // Per-account BRAND SCOPE manager (admin). For each account a user is granted, choose "All brands" or "Selected
 // brands"; in Selected mode a searchable checklist offers ONLY the account's TRUSTED membership (fetched from the
 // server, never fabricated). Saving is atomic + validated server-side; narrowing from All -> Selected warns first.
+// Campaign mapping + brand editing are DERIVED from account access (shown as "Included with account access"), so there
+// is no separate per-account campaign-mapping grant to toggle here.
 function BrandScopeManager({ accessToken, userId, grantedAccountIds, accounts }) {
   const [scopes, setScopes] = useState({});     // accountId -> { mode, brandKeys, brandDisplays }
   const [trusted, setTrusted] = useState({});   // accountId -> [{ key, display }]
@@ -1305,27 +1357,13 @@ function BrandScopeManager({ accessToken, userId, grantedAccountIds, accounts })
   const [err, setErr] = useState("");
   const nameOf = (id) => { const a = accounts.find((x) => String(x.id) === String(id)); return a ? `${FLAGS[a.country] || ""} ${a.name}` : id; };
 
-  const [caps, setCaps] = useState(() => new Set()); // accounts where this user may manage campaign->brand mapping
+  const [rowQuery, setRowQuery] = useState(""); // filters the granted-account rows so the list stays usable at scale
   const loadScopes = useCallback(async () => {
     if (!userId) return;
     try { const r = await authFetch(`/api/access?action=user-scopes&userId=${encodeURIComponent(userId)}`, accessToken); const map = {}; for (const s of r.scopes || []) map[s.accountId] = s; setScopes(map); }
     catch (e) { setErr(e.message); }
-    try { const c = await authFetch(`/api/access?action=campaign-map-caps&userId=${encodeURIComponent(userId)}`, accessToken); setCaps(new Set((c.capabilities || []).map((x) => x.accountId))); }
-    catch { /* capability listing is best-effort; a failure just hides the toggle state */ }
   }, [accessToken, userId]);
   useEffect(() => { loadScopes(); setOpenAccount(""); }, [loadScopes]);
-
-  // Grant/revoke the campaign-brand-mapping capability for ONE account. A grant requires the user to already have
-  // account access (enforced server-side); it never widens account/report/brand access.
-  const toggleCap = async (accountId) => {
-    const grant = !caps.has(accountId);
-    setErr(""); setMsg("");
-    try {
-      await authFetch(`/api/access?action=${grant ? "campaign-map-grant" : "campaign-map-revoke"}`, accessToken, { method: "POST", body: JSON.stringify({ userId, accountId }) });
-      setCaps((cur) => { const n = new Set(cur); if (grant) n.add(accountId); else n.delete(accountId); return n; });
-      setMsg(grant ? "Campaign-mapping capability granted." : "Campaign-mapping capability revoked.");
-    } catch (e) { setErr(e.message || "Could not update the campaign-mapping capability."); }
-  };
 
   const openEditor = async (accountId) => {
     setOpenAccount(accountId); setErr(""); setMsg(""); setSearch("");
@@ -1358,21 +1396,37 @@ function BrandScopeManager({ accessToken, userId, grantedAccountIds, accounts })
   const list = trusted[openAccount] || [];
   const q = search.trim().toLowerCase();
   const shown = q ? list.filter((b) => String(b.display).toLowerCase().includes(q)) : list;
+  // The granted-account rows, enriched with the marketplace/country name for search and filtered live (name, country
+  // code + name, currency, id). A missing directory entry still renders (falls back to the id).
+  const rowAccounts = ids.map((id) => {
+    const a = accounts.find((x) => String(x.id) === String(id));
+    return a ? { ...a, countryName: marketplaceProfile(a.country).name } : { id, name: String(id), country: "", currency: "" };
+  });
+  const shownRows = filterAccounts(rowAccounts, { query: rowQuery });
 
   return <div className="access-brandscope" style={{ marginTop: 12 }}>
     <div className="access-field-label">Brand access per account</div>
+    <div style={{ fontSize: 12, color: "var(--text-secondary)", margin: "2px 0 8px" }}>Campaign mapping and brand editing are included automatically with account access.</div>
     {err && <div className="error-banner"><AlertTriangle size={14} />{err}</div>}
     {msg && <div className="access-notice">{msg}</div>}
+    {ids.length > 6 && <div style={{ position: "relative", marginBottom: 6 }}>
+      <Search size={14} aria-hidden="true" style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--text-secondary)", pointerEvents: "none" }} />
+      <input type="search" value={rowQuery} onChange={(e) => setRowQuery(e.target.value)} placeholder="Search these accounts…" aria-label="Search brand-access accounts by name, country, currency or ID" style={{ width: "100%", padding: "6px 32px", borderRadius: 6, border: "1px solid var(--border-strong)" }} />
+      {rowQuery && <button type="button" className="icon-action" onClick={() => setRowQuery("")} title="Clear search" aria-label="Clear search" style={{ position: "absolute", right: 4, top: "50%", transform: "translateY(-50%)" }}><X size={14} /></button>}
+    </div>}
     <div className="access-account-list">
-      {ids.map((id) => {
+      {shownRows.length === 0
+        ? <div className="empty-note">No accounts match your search.</div>
+        : shownRows.map((acct) => {
+        const id = acct.id;
         const s = scopes[id] || { mode: "ALL_BRANDS", brandKeys: [] };
         const isSel = s.mode === "SELECTED_BRANDS";
         return <div key={id} className="access-scope-row" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "6px 0", borderBottom: "1px solid var(--border-default)", flexWrap: "wrap" }}>
           <span style={{ minWidth: 140, flex: "1 1 160px" }}>{nameOf(id)}</span>
           <span className={"access-role " + (isSel ? "role-viewer" : "role-editor")} style={{ whiteSpace: "nowrap" }}>{isSel ? `${(s.brandDisplays || s.brandKeys || []).length} brand${(s.brandDisplays || s.brandKeys || []).length === 1 ? "" : "s"}` : "All brands"}</span>
-          <label className="access-account-check" style={{ display: "inline-flex", gap: 6, whiteSpace: "nowrap", fontSize: 12 }} title="Allow this user to map campaigns to brands for this account. Never grants any account, report or brand access.">
-            <input type="checkbox" checked={caps.has(id)} onChange={() => toggleCap(id)} /><span>Campaign mapping</span>
-          </label>
+          <span className="access-included-cap" title="Anyone with access to this account can create, edit and upload its campaign and brand mappings. This is included automatically with account access -- no separate permission is needed, and it is removed if account access is removed." style={{ display: "inline-flex", gap: 6, alignItems: "center", whiteSpace: "nowrap", fontSize: 12, color: "var(--text-secondary)" }}>
+            <input type="checkbox" checked readOnly disabled aria-label="Campaign and brand mapping included with account access" style={{ accentColor: "#1a7f4b" }} /><span>Campaign &amp; brand mapping · <strong>Included with access</strong></span>
+          </span>
           <button type="button" className="secondary-action" onClick={() => openEditor(id)} style={{ padding: "3px 10px" }}>Edit brands</button>
         </div>;
       })}
@@ -1469,7 +1523,7 @@ function AccessPanel({ accessToken, accounts, onLoadAccounts }) {
         <label className="auth-field"><span>Email address</span><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required placeholder="user@company.com" /></label>
         <label className="auth-field"><span>Name (optional)</span><input value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="Team member" /></label>
         <div className="access-field-label">Allowed Amazon accounts</div>
-        <div className="access-account-list">{accounts.map((account) => <label className="access-account-check" key={account.id}><input type="checkbox" checked={inviteAccountIds.includes(account.id)} onChange={() => toggle(account.id, setInviteAccountIds)} /><span>{FLAGS[account.country] || ""} {account.name}</span></label>)}</div>
+        <AccountAccessSelector accounts={accounts} selectedIds={inviteAccountIds} onToggle={(id) => toggle(id, setInviteAccountIds)} disabled={loading} idPrefix="invite" />
         <button className="auth-submit" disabled={loading || !accounts.length}>Send invitation</button>
       </form>
       <div className="panel access-users">
@@ -1480,7 +1534,7 @@ function AccessPanel({ accessToken, accounts, onLoadAccounts }) {
     {editingUserId && (() => {
       const user = users.find((candidate) => candidate.id === editingUserId);
       if (!user) return null;
-      return <div className="panel access-editor"><div className="panel-head"><div><div className="panel-title">Edit access</div><div className="page-sub">{user.email}</div></div><button className="icon-action" type="button" onClick={() => setEditingUserId("")} title="Close"><X size={15} /></button></div>{user.role === "admin" ? <div className="empty-note">The initial administrator remains protected in this panel.</div> : <><label className="auth-field"><span>Role</span><select value={editRole} onChange={(e) => setEditRole(e.target.value)}><option value="viewer">Viewer</option><option value="editor">Editor</option></select></label><div className="access-field-label">Allowed Amazon accounts</div><div className="access-account-list">{accounts.map((account) => <label className="access-account-check" key={account.id}><input type="checkbox" checked={editAccountIds.includes(account.id)} onChange={() => toggle(account.id, setEditAccountIds)} /><span>{FLAGS[account.country] || ""} {account.name}</span></label>)}</div><button className="auth-submit" type="button" onClick={saveEdit} disabled={loading}>Save access</button><BrandScopeManager accessToken={accessToken} userId={user.id} grantedAccountIds={user.accountIds} accounts={accounts} /></>}</div>;
+      return <div className="panel access-editor"><div className="panel-head"><div><div className="panel-title">Edit access</div><div className="page-sub">{user.email}</div></div><button className="icon-action" type="button" onClick={() => setEditingUserId("")} title="Close"><X size={15} /></button></div>{user.role === "admin" ? <div className="empty-note">The initial administrator remains protected in this panel.</div> : <><label className="auth-field"><span>Role</span><select value={editRole} onChange={(e) => setEditRole(e.target.value)}><option value="viewer">Viewer</option><option value="editor">Editor</option></select></label><div className="access-field-label">Allowed Amazon accounts</div><AccountAccessSelector accounts={accounts} selectedIds={editAccountIds} onToggle={(id) => toggle(id, setEditAccountIds)} disabled={loading} idPrefix="edit" /><button className="auth-submit" type="button" onClick={saveEdit} disabled={loading}>Save access</button><BrandScopeManager accessToken={accessToken} userId={user.id} grantedAccountIds={user.accountIds} accounts={accounts} /></>}</div>;
     })()}
   </div>;
 }

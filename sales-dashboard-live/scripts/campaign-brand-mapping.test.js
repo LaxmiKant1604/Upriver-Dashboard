@@ -4,9 +4,12 @@
 //  (1) PURE directory/authority/brand-resolution (campaign-directory.js): identity is stable across name/status
 //      changes; a nullable Ads profile cannot duplicate an identity; marketplace/profile isolation; UK<->GB canonical;
 //      newly observed campaign is Unmapped; empty history -> []; rename preserves the mapping; unknown brand fails closed.
-//  (2) API-BOUNDARY (api/campaign-brand-mapping.js) with mocked deps: capability gate (admin bypass), cross-account
-//      isolation, unknown-campaign / unknown-brand / conflicting-duplicate rejected BEFORE any write, bulk atomicity,
-//      correct single assign/change/clear write + audit, and NO DataDoe/permission-mutation path.
+//  (2) API-BOUNDARY (api/campaign-brand-mapping.js) with mocked deps: DERIVED-capability gate (account access is the
+//      source of truth -- holding account access is BOTH required and sufficient to manage mappings; admin bypass;
+//      revoking account access removes the derived capability), cross-account isolation, brand-scope-limited assign
+//      (a SELECTED_BRANDS mapper can only assign their permitted brands), unknown-campaign / unknown-brand /
+//      conflicting-duplicate rejected BEFORE any write, bulk atomicity, correct single assign/change/clear write +
+//      audit, and NO DataDoe/permission-mutation path.
 //  (3) MIGRATION static invariants (20260915): RLS on, service-role-only writes, no direct authenticated table access,
 //      capability default false, RPC security-definer + service-role-only execute, constraints + control-char guards,
 //      and it touches NO existing table / scheduler / report.
@@ -147,44 +150,46 @@ test("R-BRAND. resolveTrustedBrand: valid (case-insensitive) / unknown -> null /
 
 /* ================= (2) API-BOUNDARY ================= */
 
-test("R6. a member WITHOUT the capability gets 403 + zero writes (assign)", async () => {
-  const { deps, calls } = makeDeps({ caps: {} });
-  const res = fakeRes();
-  await handler({ method: "POST", body: { accountId: "A", kind: "assign", marketplace: "US", campaignId: "C1", brand: "Acme" } }, res, deps);
-  assert.equal(res.statusCode, 403); noWrites(calls, "no-capability");
-  passed += 1;
-});
-
-test("R7. a brand-restricted viewer without the capability CANNOT list campaigns (403)", async () => {
-  const { deps } = makeDeps({ caps: {} });
-  const res = fakeRes();
-  await handler({ method: "GET", query: { action: "campaigns", accountId: "A" } }, res, deps);
-  assert.equal(res.statusCode, 403, "campaign listing is capability-gated");
-  passed += 1;
-});
-
-test("R11a. account access WITHOUT the capability -> 403 + zero writes", async () => {
-  const { deps, calls } = makeDeps({ caps: {}, accountIds: ["A"] }); // has account access, no capability
+test("R6. DERIVED: a member with ACCOUNT ACCESS (no separate grant) CAN assign -> 200 + one write", async () => {
+  // Account access is the source of truth: no `campaign-map` capability row exists, yet account access alone suffices.
+  const { deps, calls } = makeDeps({ caps: {}, accountIds: ["A"] });
   const res = fakeRes();
   await handler({ method: "POST", body: { accountId: "A", kind: "assign", marketplace: "US", adsProfileId: "P1", campaignId: "C1", brand: "Acme" } }, res, deps);
-  assert.equal(res.statusCode, 403); noWrites(calls, "access-without-capability");
+  assert.equal(res.statusCode, 200, "account access derives campaign-mapping write"); assert.equal(calls.record.length, 1);
   passed += 1;
 });
 
-test("R12/R13. a STALE capability WITHOUT current account access -> 403 (list AND assign)", async () => {
-  // The user still has a capability row for A but their canonical account access to A was revoked (accountIds omits A).
+test("R7. DERIVED: a member with account access CAN list campaigns (no separate grant needed)", async () => {
+  const { deps } = makeDeps({ caps: {}, accountIds: ["A"] });
+  const res = fakeRes();
+  await handler({ method: "GET", query: { action: "campaigns", accountId: "A" } }, res, deps);
+  assert.equal(res.statusCode, 200, "campaign listing is derived from account access"); assert.equal(res.body.campaigns.length, 3);
+  passed += 1;
+});
+
+test("R11a. DERIVED: account access is SUFFICIENT -> assign succeeds with NO post-invitation grant (200 + one write)", async () => {
+  const { deps, calls } = makeDeps({ caps: {}, accountIds: ["A"] }); // account access, and DELIBERATELY no capability row
+  const res = fakeRes();
+  await handler({ method: "POST", body: { accountId: "A", kind: "assign", marketplace: "US", adsProfileId: "P1", campaignId: "C1", brand: "Acme" } }, res, deps);
+  assert.equal(res.statusCode, 200); assert.equal(calls.record.length, 1);
+  passed += 1;
+});
+
+test("R12/R13. REVOCATION: removing account access removes the derived capability -> 403 (list AND assign)", async () => {
+  // The user has NO account access to A (accountIds omits A) even though a LEGACY capability row would linger; the
+  // derived model reads only live account access, so both listing and mapping are denied.
   const capOnly = () => makeDeps({ caps: { u1: new Set(["A"]) }, accountIds: [] });
   let m = capOnly(); let res = fakeRes();
   await handler({ method: "GET", query: { action: "campaigns", accountId: "A" } }, res, m.deps);
-  assert.equal(res.statusCode, 403, "revoked account access blocks campaign LISTING even with a stale capability");
+  assert.equal(res.statusCode, 403, "revoked account access blocks campaign LISTING (legacy capability row is inert)");
   m = capOnly(); res = fakeRes();
   await handler({ method: "POST", body: { accountId: "A", kind: "assign", marketplace: "US", adsProfileId: "P1", campaignId: "C1", brand: "Acme" } }, res, m.deps);
-  assert.equal(res.statusCode, 403, "revoked account access blocks MAPPING even with a stale capability");
-  noWrites(m.calls, "stale-capability");
+  assert.equal(res.statusCode, 403, "revoked account access blocks MAPPING (legacy capability row is inert)");
+  noWrites(m.calls, "revoked-account-access");
   passed += 1;
 });
 
-test("R11. BOTH account access AND capability are required (both present -> 200)", async () => {
+test("R11. account access ALONE is sufficient (a legacy capability row is neither required nor consulted) -> 200", async () => {
   const { deps, calls } = makeDeps({ caps: { u1: new Set(["A"]) }, accountIds: ["A"] });
   const res = fakeRes();
   await handler({ method: "POST", body: { accountId: "A", kind: "assign", marketplace: "US", adsProfileId: "P1", campaignId: "C1", brand: "Acme" } }, res, deps);
@@ -210,7 +215,8 @@ test("R5/R21. an authorized mapper (and an admin) can list + assign for the acco
   passed += 1;
 });
 
-test("R8/R11. capability is PER-ACCOUNT: capable for A is 403 (zero writes) for B", async () => {
+test("R8/R11. ISOLATION: access is PER-ACCOUNT -- access to A is 403 (zero writes) for B", async () => {
+  // The user has account access to A only (default accountIds ["A"]); mapping for B is denied even though B has history.
   const { deps, calls } = makeDeps({ caps: { u1: new Set(["A"]) }, durable: { A: rowsA(), B: rowsA() } });
   const res = fakeRes();
   await handler({ method: "POST", body: { accountId: "B", kind: "assign", marketplace: "US", campaignId: "C1", brand: "Acme" } }, res, deps);
@@ -286,12 +292,13 @@ test("R-EMPTY. empty durable history -> assign is rejected as unknown campaign (
   passed += 1;
 });
 
-test("R-BRANDS. the available-brands endpoint returns trusted brands ONLY to an authorized mapper", async () => {
-  const denied = makeDeps({ caps: {} });
+test("R-BRANDS. the available-brands endpoint returns trusted brands ONLY to a user with account access", async () => {
+  // Denied case is now NO ACCOUNT ACCESS (accountIds []), not a missing capability row -- access is the source of truth.
+  const denied = makeDeps({ caps: {}, accountIds: [] });
   let res = fakeRes();
   await handler({ method: "GET", query: { action: "brands", accountId: "A" } }, res, denied.deps);
-  assert.equal(res.statusCode, 403, "no capability -> no brand disclosure");
-  const ok = makeDeps({ caps: { u1: new Set(["A"]) } });
+  assert.equal(res.statusCode, 403, "no account access -> no brand disclosure");
+  const ok = makeDeps({ caps: {}, accountIds: ["A"] });
   res = fakeRes();
   await handler({ method: "GET", query: { action: "brands", accountId: "A" } }, res, ok.deps);
   assert.equal(res.statusCode, 200); assert.deepEqual(res.body.brands.map((b) => b.key), ["acme", "bravo"]);

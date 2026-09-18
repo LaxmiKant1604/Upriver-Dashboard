@@ -19,7 +19,7 @@
 // POST { accountId, kind:'assign'|'clear'|'bulk', ... } -> assign/change one, clear one, or apply many atomically.
 import {
   DashboardAccessError, getDashboardAccess, assertAccountAccess,
-  getCampaignPerformanceRows, getCampaignBrandMappings, getCampaignMappingCapability,
+  getCampaignPerformanceRows, getCampaignBrandMappings,
   recordCampaignBrandMapping, recordCampaignBrandMappingBulk, getTrustedAccountBrands, insertAuditLog,
 } from "../lib/server/supabase.js";
 import { getDataDoeConnections } from "../lib/server/datadoe-connections.js";
@@ -30,6 +30,7 @@ import {
 } from "../lib/server/reports/campaign-directory.js";
 import { buildCampaignAdsView, summarizeCampaignAds, projectCampaignsForScope } from "../lib/server/reports/campaign-ads.js";
 import { brandKey } from "../lib/server/reports/brand-membership.js";
+import { canManageCampaignMapping } from "../lib/server/report-authorization.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const MAX_NOTE = 500;
@@ -57,22 +58,70 @@ function cleanNote(v) {
 
 const DEFAULT_DEPS = {
   getDashboardAccess, assertAccountAccess,
-  getCampaignPerformanceRows, getCampaignBrandMappings, getCampaignMappingCapability,
+  getCampaignPerformanceRows, getCampaignBrandMappings,
   recordCampaignBrandMapping, recordCampaignBrandMappingBulk, getTrustedAccountBrands, insertAuditLog, orgFingerprint,
 };
 
-// The single authorization gate for EVERY action. A capability NEVER replaces normal account access: a non-admin must
-// hold BOTH (1) canonical account access via getDashboardAccess (assertAccountAccess), so revoking a user's account
-// access immediately blocks campaign access even if a stale capability row lingers, AND (2) an explicit active
-// can_manage_campaign_brand_mapping grant for that SAME account. Admins bypass, per the project's admin pattern.
-// Fails closed with a 403 that never reveals whether the account exists.
-async function assertCampaignCapability(deps, access, { organization_fingerprint, connectionId, accountId }) {
+// The single authorization gate for EVERY managing action. ACCOUNT ACCESS IS THE SOURCE OF TRUTH: it is BOTH required
+// and sufficient. `assertAccountAccess` enforces the per-account membership -- so revoking a user's account access
+// immediately blocks campaign/brand mapping (even against a legacy `account_campaign_map_grant` row that lingers) --
+// and, per `canManageCampaignMapping`, that same live membership DERIVES the mapping-management capability, so no
+// separate stored grant is consulted (the old default-false capability is not required, and needs no backfill). A
+// brand-limited (SELECTED_BRANDS) user passes this gate but is additionally constrained to their permitted brands by
+// `assignableBrands` at assign/bulk time. Admins bypass, per the project's admin pattern. Fails closed with a 403
+// that never reveals whether the account exists.
+function assertCampaignCapability(deps, access, accountId) {
   if (access && access.role === "admin") return;
-  // (1) canonical account access is REQUIRED first (defence: a capability alone can never grant campaign access).
-  deps.assertAccountAccess(access, [accountId]);
-  // (2) the explicit per-account capability for the same account.
-  const ok = await deps.getCampaignMappingCapability({ organizationFingerprint: organization_fingerprint, connectionId, accountId, userId: access.userId });
-  if (!ok) throw new DashboardAccessError("You do not have permission to manage campaign brand mappings for this account.", 403);
+  deps.assertAccountAccess(access, [accountId]); // required; also the auto-revocation gate
+  if (!canManageCampaignMapping(access, accountId)) {
+    // Defence in depth: after assertAccountAccess this is always true for a non-admin, but it documents and pins the
+    // "account access derives the capability" contract at the enforcement point (a future access-shape change fails closed).
+    throw new DashboardAccessError("You do not have permission to manage campaign brand mappings for this account.", 403);
+  }
+}
+
+// The caller's permitted canonical brand-key SET for this account, or null when UNRESTRICTED (admin, or an ALL_BRANDS /
+// no explicit grant). SELECTED_BRANDS -> the granted keys. Since account access now DERIVES the mapping capability
+// (any account-access user reaches this API), this is the SINGLE source for brand-scoping EVERY management read and
+// write -- so a brand-limited mapper can neither SEE nor ALTER another brand's campaign mapping, exactly as the
+// `brands` and `view` actions already scope. Never trusts a browser-supplied brand/grant (from getDashboardAccess).
+function permittedBrandKeySet(access, accountId) {
+  if (!access || access.role === "admin") return null;
+  const grant = access.accountGrants ? access.accountGrants[accountId] : null;
+  if (!grant || grant.mode !== "SELECTED_BRANDS") return null;
+  return new Set((grant.brandKeys || []).map((k) => brandKey(k)).filter(Boolean));
+}
+
+// A canonical brand key is visible/editable to the caller when they are UNRESTRICTED (permitted == null) or it is in
+// their permitted set. A blank key (an UNMAPPED campaign) is always allowed (it belongs to no brand yet, so a
+// brand-limited caller may still map it to one of THEIR brands).
+function brandKeyAllowed(permitted, canonicalKey) {
+  if (!permitted) return true;
+  const k = brandKey(canonicalKey);
+  return !k || permitted.has(k);
+}
+
+// The brands a caller may ASSIGN a campaign to: admin / ALL_BRANDS -> the full trusted set; SELECTED_BRANDS -> trusted
+// INTERSECTED with their permitted keys, so a brand-limited mapper can never map a campaign to a brand they cannot see.
+function assignableBrands(access, accountId, trusted) {
+  const list = Array.isArray(trusted) ? trusted : [];
+  const permitted = permittedBrandKeySet(access, accountId);
+  if (!permitted) return list;
+  return list.filter((b) => permitted.has(brandKey(b.key)));
+}
+
+// Map of campaign identity -> its CURRENT canonical brand key, from the account's stored mapping rows. Used to answer
+// "may this caller modify this campaign?" -- a brand-limited caller may only touch a campaign that is unmapped or
+// currently mapped to one of their permitted brands (never overwrite or clear a mapping owned by another brand).
+// LOAD-BEARING: `mappingRows` MUST be the FULL, brand-UNSCOPED set for the account (exactly what accountCampaignContext
+// / getCampaignBrandMappings returns). Passing a brand-FILTERED list here would blind the guard to another brand's
+// mapping and silently reopen the overwrite/clear cross-brand hole (covered by tests SB6/SB8/SB9). Do not narrow it.
+function currentBrandByIdentity(mappingRows) {
+  const byId = new Map();
+  for (const r of Array.isArray(mappingRows) ? mappingRows : []) {
+    byId.set(campaignIdentityKey({ marketplace: r.marketplace, adsProfileId: r.ads_profile_id, campaignId: r.ad_campaign_id }), r.canonical_brand_key || "");
+  }
+  return byId;
 }
 
 // ---- VIEWING (Ad Performance by Campaign) -------------------------------------------------------------------------
@@ -180,7 +229,7 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
 
     const organization_fingerprint = deps.orgFingerprint();
     const connectionId = "primary";
-    await assertCampaignCapability(deps, access, { organization_fingerprint, connectionId, accountId });
+    assertCampaignCapability(deps, access, accountId);
 
     if (req.method === "GET") {
       const action = S(req.query.action).trim() || "campaigns";
@@ -191,28 +240,30 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
         // resolveScope -- a SELECTED_BRANDS user (even one holding the mapping capability) may only see brands they
         // are granted, intersected with the account's trusted membership. Admin / ALL_BRANDS -> full trusted set.
         // This closes a forbidden-brand-name disclosure via the mapping endpoint (never trust a browser-supplied brand).
-        let visible = list;
-        if (access.role !== "admin") {
-          const grant = access.accountGrants ? access.accountGrants[accountId] : null;
-          if (grant && grant.mode === "SELECTED_BRANDS") {
-            const permitted = new Set((grant.brandKeys || []).map((k) => brandKey(k)).filter(Boolean));
-            visible = list.filter((b) => permitted.has(brandKey(b.key)));
-          }
-        }
+        const visible = assignableBrands(access, accountId, list);
         res.status(200).json({ brands: visible.map((b) => ({ key: b.key, display: b.display || b.key })) });
         return;
       }
       if (action === "mappings") {
         const { mappingRows } = await accountCampaignContext(deps, { organization_fingerprint, connectionId, accountId });
-        res.status(200).json({ mappings: mappingRows.map((m) => ({
+        // BRAND-SCOPE: a brand-limited caller only sees mappings for brands they are permitted -- never another brand's
+        // campaign->brand assignments (the same rule the `brands` and `view` actions enforce).
+        const permitted = permittedBrandKeySet(access, accountId);
+        const visible = mappingRows.filter((m) => brandKeyAllowed(permitted, m.canonical_brand_key));
+        res.status(200).json({ mappings: visible.map((m) => ({
           campaignId: m.ad_campaign_id, marketplace: m.marketplace, adsProfileId: m.ads_profile_id,
           brandKey: m.canonical_brand_key, brandDisplay: m.brand_display_name, mappingSource: m.mapping_source, mappingUpdatedAt: m.updated_at,
         })) });
         return;
       }
-      // action === "campaigns" (default): the full directory (durable info only) joined to current mappings.
+      // action === "campaigns" (default): the directory (durable info only) joined to current mappings.
       const { durableRows, mappingRows } = await accountCampaignContext(deps, { organization_fingerprint, connectionId, accountId });
-      res.status(200).json({ campaigns: buildCampaignDirectory({ durableRows, mappingRows }) });
+      let campaigns = buildCampaignDirectory({ durableRows, mappingRows });
+      // BRAND-SCOPE: hide campaigns mapped to a brand the caller may not manage (no forbidden-brand-name disclosure and
+      // no stealth re-map); unmapped + permitted-brand campaigns remain so the caller can still map their own brands.
+      const permitted = permittedBrandKeySet(access, accountId);
+      if (permitted) campaigns = campaigns.filter((c) => !c.mapped || brandKeyAllowed(permitted, c.brandKey));
+      res.status(200).json({ campaigns });
       return;
     }
 
@@ -230,13 +281,20 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
         const note = cleanNote(body.note);
         if (!note.ok) { res.status(400).json({ error: note.reason }); return; }
         const identity = campaignIdentityKey({ marketplace, adsProfileId, campaignId });
+        // BRAND-SCOPE: a brand-limited caller may only ASSIGN-to or CLEAR a campaign that is UNMAPPED or currently
+        // mapped to one of THEIR permitted brands -- never overwrite or clear a mapping owned by a brand they can't see.
+        const permitted = permittedBrandKeySet(access, accountId);
+        if (permitted && !brandKeyAllowed(permitted, currentBrandByIdentity(ctx.mappingRows).get(identity) || "")) {
+          res.status(400).json({ error: "This campaign is mapped to a brand outside your access." }); return;
+        }
 
         let brandKey = "";
         let brandDisplay = "";
         if (kind === "assign") {
-          // An ASSIGN must prove the campaign belongs to this account's durable history AND the brand is trusted.
+          // An ASSIGN must prove the campaign belongs to this account's durable history AND the brand is trusted AND
+          // (for a brand-limited mapper) within the caller's permitted brand scope -- never a brand they cannot see.
           if (!authority.has(identity)) { res.status(400).json({ error: "This campaign is not in the account's campaign history." }); return; }
-          const brand = resolveTrustedBrand(body.brand, ctx.trusted);
+          const brand = resolveTrustedBrand(body.brand, assignableBrands(access, accountId, ctx.trusted));
           if (!brand || brand.clear) { res.status(400).json({ error: "A valid trusted brand is required to assign a mapping." }); return; }
           brandKey = brand.key; brandDisplay = brand.display;
         }
@@ -255,7 +313,11 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
         const rawRows = Array.isArray(body.rows) ? body.rows : null;
         if (!rawRows || rawRows.length === 0) { res.status(400).json({ error: "rows must be a non-empty array." }); return; }
         if (rawRows.length > MAX_BULK) { res.status(400).json({ error: `too many rows (max ${MAX_BULK} per import).` }); return; }
-        const trustedList = ctx.trusted;
+        // Brand-scope the bulk upload the same way as a single assign: a SELECTED_BRANDS mapper can only assign brands
+        // within their permitted set (CLEAR rows, blank brand, are always allowed).
+        const trustedList = assignableBrands(access, accountId, ctx.trusted);
+        const permitted = permittedBrandKeySet(access, accountId);
+        const currentByIdentity = currentBrandByIdentity(ctx.mappingRows);
         const norm = [];
         const seen = new Map(); // identityKey -> brandKey (catch same-file conflicts before the RPC too)
         const errors = [];
@@ -265,6 +327,8 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
           const campaignId = S(raw.campaignId ?? raw.ad_campaign_id).trim();
           if (!marketplace || !campaignId) { errors.push("a row has a blank marketplace or campaignId"); continue; }
           const identity = campaignIdentityKey({ marketplace, adsProfileId, campaignId });
+          // BRAND-SCOPE: never let a brand-limited caller overwrite or clear a campaign owned by a brand they can't see.
+          if (permitted && !brandKeyAllowed(permitted, currentByIdentity.get(identity) || "")) { errors.push(`campaign ${campaignId} is mapped to a brand outside your access`); continue; }
           const note = cleanNote(raw.note);
           if (!note.ok) { errors.push(`campaign ${campaignId}: ${note.reason}`); continue; }
           const brand = resolveTrustedBrand(raw.brand, trustedList);

@@ -213,7 +213,9 @@ test("FE3. the VIEW action is dispatched BEFORE (and independent of) the mapping
   // is absent we assert the VIEW branch runs BEFORE the capability gate -- structurally proving viewing never depends
   // on it (API2/API4 also prove this behaviourally, with deps that omit getCampaignMappingCapability entirely).
   const viewAt = APIVIEW.indexOf('=== "view"');
-  const gateAt = APIVIEW.indexOf("await assertCampaignCapability");
+  // The gate is now a synchronous derived check (no DB call, hence no await). Match the CALL site (semicolon), never
+  // the function definition (brace), so this still structurally proves the view branch runs before the gate.
+  const gateAt = APIVIEW.indexOf("assertCampaignCapability(deps, access, accountId);");
   assert.ok(viewAt > 0 && gateAt > 0 && viewAt < gateAt, "view branch runs before the capability gate");
   assert.ok(/deps\.assertAccountAccess\(access, \[accountId\]\)/.test(APIVIEW), "viewing requires account access");
   const code = APIVIEW.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");

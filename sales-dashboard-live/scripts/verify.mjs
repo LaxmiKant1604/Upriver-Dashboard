@@ -145,6 +145,7 @@ const SUITES = [
   "test:campaign-brand-mapping",
   "test:campaign-mapping-import",
   "test:campaign-map-capability-admin",
+  "test:user-access-derived-capability",
   "test:campaign-ads",
   "test:campaign-ads-view",
   "test:campaign-ads-golive",

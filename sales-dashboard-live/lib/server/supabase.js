@@ -290,18 +290,29 @@ function normalizeAccountIds(accountIds) {
   return [...new Set(accountIds.map((accountId) => String(accountId).trim()).filter(Boolean))];
 }
 
+// PURE surgical diff (no I/O): given a user's CURRENT account ids and the WANTED set, compute exactly which to add and
+// which to remove. `normalized` is the de-duplicated/trimmed wanted set. IDEMPOTENT: wanted == current -> both lists
+// empty (a re-invite/re-save is a no-op, so no duplicate membership rows can be created). Accounts that STAY are in
+// neither list, so their brand_scope_mode + selected-brand rows are preserved and removing one account never disturbs
+// the others. Extracted so these invitation-idempotency + account-isolation guarantees are unit-testable offline.
+export function computeAccountPermissionDiff(currentIds, wantedIds) {
+  const normalized = normalizeAccountIds(wantedIds);
+  const wanted = new Set(normalized);
+  const current = new Set((Array.isArray(currentIds) ? currentIds : []).map((id) => String(id)));
+  const toRemove = [...current].filter((id) => !wanted.has(id));
+  const toAdd = normalized.filter((id) => !current.has(id));
+  return { normalized, toAdd, toRemove };
+}
+
 // Set a user's ACCOUNT grants to exactly `accountIds`, as a SURGICAL DIFF so a brand-scope narrowing survives an
 // account-list edit: accounts removed from the set are deleted (which CASCADE-removes their selected-brand grants),
 // newly added accounts are inserted as ALL_BRANDS (the safe default), and accounts that remain keep their existing
 // brand_scope_mode + selected-brand rows untouched. (The old delete-all-then-insert would have silently reset every
 // account back to ALL_BRANDS on any edit.)
 export async function replaceAccountPermissions(userId, accountIds, { grantedBy = null } = {}) {
-  const normalized = normalizeAccountIds(accountIds);
-  const wanted = new Set(normalized);
   const currentRows = await request(`/rest/v1/account_permissions?${new URLSearchParams({ select: "account_id", user_id: `eq.${userId}` })}`).catch(() => []);
-  const current = new Set((Array.isArray(currentRows) ? currentRows : []).map((r) => r.account_id));
-  const toRemove = [...current].filter((id) => !wanted.has(id));
-  const toAdd = normalized.filter((id) => !current.has(id));
+  const currentIds = (Array.isArray(currentRows) ? currentRows : []).map((r) => r.account_id);
+  const { normalized, toAdd, toRemove } = computeAccountPermissionDiff(currentIds, accountIds);
   for (const accountId of toRemove) {
     // Delete one account at a time so the FK cascade removes exactly that account's brand grants.
     await request(`/rest/v1/account_permissions?${new URLSearchParams({ user_id: `eq.${userId}`, account_id: `eq.${accountId}` })}`, {

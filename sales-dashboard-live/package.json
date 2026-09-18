@@ -93,6 +93,7 @@
     "test:campaign-brand-mapping": "node scripts/campaign-brand-mapping.test.js",
     "test:campaign-mapping-import": "node scripts/campaign-mapping-import.test.js",
     "test:campaign-map-capability-admin": "node scripts/campaign-map-capability-admin.test.js",
+    "test:user-access-derived-capability": "node scripts/user-access-derived-capability.test.js",
     "test:campaign-ads": "node scripts/campaign-ads.test.js",
     "test:campaign-ads-view": "node scripts/campaign-ads-view.test.js",
     "test:campaign-ads-golive": "node scripts/campaign-ads-golive.test.js",
