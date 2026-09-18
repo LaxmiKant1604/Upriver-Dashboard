@@ -12,6 +12,8 @@ import assert from "node:assert/strict";
 import {
   buildBuyBoxRows,
   buildListingHealthRows,
+  buildListingHealthV3Insights,
+  LHV3_ACTIONABLE_GATES,
   buildSalesMoversRows,
   buildSalesMoversInsights,
   buildBuyBoxInsights,
@@ -985,6 +987,70 @@ test("unknown numbers render as an em dash, never as zero", () => {
   assert.equal(ratio(1, 0), null);
   assert.equal(nInt(0), "0");
   assert.equal(fmtMoney(0, "INR"), "₹0");
+});
+
+/* ===================== v3 Listing Health -> Priority Feed adapter (verified findings only; NO v1 reuse) ===================== */
+// A v3 server-payload row builder. buildV3Rows (inside the adapter) derives gate/confidence/evidence/stale from these.
+const lhv3Row = (o = {}) => ({ sku: "S", asin: "A", productName: "P", brand: "B", listingStatus: "Active", channel: "FBA", price: 10, currency: "USD", onHandFba: 1, onHandFbaApplicable: true, onHandFbm: null, onHandFbmApplicable: false, sales: 0, units: 0, salesAtRisk: 0, buyable: null, discoverable: null, liveOffer: null, issues: [], flagged: false, flagReasons: [], ...o });
+const lhv3Payload = (rows, over = {}) => ({ accountId: "ACC-1", marketplace: "US", asOf: "2026-09-18", issuesAvailable: true, provenance: { listingsFetchedAt: "2026-09-17T00:00:00Z" }, rows, ...over });
+const conf = (code) => [{ code, confidence: "confirmed", detail: "x" }];
+const poss = (code) => [{ code, confidence: "possible", detail: "y" }];
+
+test("lhv3 adapter: emits ONLY confirmed-actionable findings; excludes needs_verification + ok", () => {
+  const ins = buildListingHealthV3Insights(lhv3Payload([
+    lhv3Row({ sku: "SUP", asin: "A1", buyable: false, discoverable: false, liveOffer: false, salesAtRisk: 100, flagged: true, flagReasons: conf("not_buyable") }),
+    lhv3Row({ sku: "NV", asin: "A2", buyable: null, discoverable: null, liveOffer: null, salesAtRisk: 50 }),   // needs_verification
+    lhv3Row({ sku: "OKAY", asin: "A3", buyable: true, discoverable: true, liveOffer: true, salesAtRisk: 0 }),  // ok
+    lhv3Row({ sku: "INA", asin: "A4", listingStatus: "Inactive", salesAtRisk: 30, flagged: true, flagReasons: poss("status_not_active") }),
+  ]));
+  assert.deepEqual(ins.map((i) => i.category).sort(), ["inactive", "suppressed"]); // NV + OKAY excluded
+  const sup = ins.find((i) => i.category === "suppressed");
+  assert.equal(sup.reportKey, "listing-health-v3");
+  assert.equal(sup.confidence, "high");     // a confirmed flag
+  assert.equal(sup.moneyAtRisk, 100);
+  assert.equal(sup.currency, "USD");
+  assert.ok(sup.evidence.some((e) => e.label === "Amazon Listing Status" && e.value === "Active"));
+  assert.ok(sup.evidence.some((e) => e.label === "Marketplace" && e.value === "US"));
+  assert.ok(sup.evidence.some((e) => e.label === "Account" && e.value === "ACC-1"));
+  assert.equal(ins.find((i) => i.category === "inactive").confidence, "medium"); // a possible flag
+});
+
+test("lhv3 adapter: severity share uses TOTAL window sales (a tiny exposure among big sales is not HIGH)", () => {
+  const ins = buildListingHealthV3Insights(lhv3Payload([
+    lhv3Row({ sku: "SUP", asin: "A1", buyable: false, sales: 200, salesAtRisk: 200, flagged: true, flagReasons: conf("not_buyable") }),
+    lhv3Row({ sku: "BIG", asin: "A2", buyable: true, discoverable: true, liveOffer: true, sales: 500000, salesAtRisk: 0 }), // healthy, huge sales
+  ]));
+  // share = 200 / 500200 ~ 0.0004 -> 'low', bumped to 'medium' for a bad-tone gate -- NEVER 'high' off a trivial exposure.
+  assert.notEqual(ins.find((i) => i.category === "suppressed").severity, "high");
+});
+
+test("lhv3 adapter: EXCLUDES all findings when evidence is stale (>2 days older than as-of)", () => {
+  const ins = buildListingHealthV3Insights(lhv3Payload(
+    [lhv3Row({ sku: "SUP", buyable: false, salesAtRisk: 100, flagged: true, flagReasons: conf("not_buyable") })],
+    { provenance: { listingsFetchedAt: "2026-09-10T00:00:00Z" } }, // 8 days -> stale
+  ));
+  assert.equal(ins.length, 0);
+});
+
+test("lhv3 adapter: snapshotMissing / null / empty -> zero insights (never throws, never fabricates)", () => {
+  assert.deepEqual(buildListingHealthV3Insights(null), []);
+  assert.deepEqual(buildListingHealthV3Insights({ snapshotMissing: true }), []);
+  assert.deepEqual(buildListingHealthV3Insights(lhv3Payload([])), []);
+});
+
+test("lhv3 adapter: the actionable gate set is exactly the 7 confirmed-actionable findings", () => {
+  assert.deepEqual([...LHV3_ACTIONABLE_GATES].sort(), ["error", "inactive", "incomplete", "no_live_offer", "no_price", "stranded", "suppressed"]);
+});
+
+test("lhv3 adapter: dedupe key is reportKey|finding|asin|sku (owner+marketplace fixed by the single-account feed)", () => {
+  const dup = lhv3Payload([
+    lhv3Row({ sku: "S", asin: "A", buyable: false, salesAtRisk: 100, flagged: true, flagReasons: conf("not_buyable") }),
+  ]);
+  const one = buildListingHealthV3Insights(dup)[0];
+  assert.equal([one.reportKey, one.category, one.asin, one.sku].join("|"), "listing-health-v3|suppressed|A|S");
+  // Two identical findings collapse to one under the shared dedupe (resolution/merge semantics).
+  const merged = dedupeInsights([...buildListingHealthV3Insights(dup), ...buildListingHealthV3Insights(dup)]);
+  assert.equal(merged.filter((i) => i.reportKey === "listing-health-v3").length, 1);
 });
 
 console.log(`\n${passed} assertions passed${process.exitCode ? " (with failures above)" : ""}`);

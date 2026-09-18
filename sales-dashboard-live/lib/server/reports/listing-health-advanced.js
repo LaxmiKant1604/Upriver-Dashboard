@@ -216,13 +216,30 @@ function flagEvidence({ statusActive, buyable, discoverable, liveOffer, priceMis
 // NOTE: this is a same-account row guard only -- brand-scope and capability AUTHORIZATION are enforced by the
 // api/report-authorization integration layer, which this dormant module does not replace.
 function assertRowsOwnedBy(rows, owner, label) {
+  // Canonical owner marketplace (mirrors source-account-isolation MARKETPLACE_COLUMN = "marketplace_country_code",
+  // uppercase-trim compare). Enforced ONLY when the owner carries a nonblank marketplace (fail-open otherwise, exactly
+  // like the account/seller axes -- a row without ownership evidence is assumed already projected by the ingestion
+  // isolate boundary). Currency is deliberately NOT an ownership axis here: listing_price_currency is legitimately
+  // blank on many rows and cross-currency merges are already fail-closed by assertListingHealthCurrencyIsolation.
+  const ownerMkt = canonMarketplace(owner.marketplace);
   for (const r of Array.isArray(rows) ? rows : []) {
     if (!r || typeof r !== "object" || Array.isArray(r)) continue;
     const acct = S(r.account_id ?? r.accountId);
     if (acct && acct !== S(owner.accountId)) throw new Error(`Listing Health ${label}: row account_id "${acct}" != trusted owner "${owner.accountId}" (cross-account; fail closed).`);
     const seller = S(r.seller_or_vendor_id ?? r.sellerOrVendorId);
     if (seller && seller !== S(owner.rawSellerId)) throw new Error(`Listing Health ${label}: row seller "${seller}" != trusted owner "${owner.rawSellerId}" (cross-account; fail closed).`);
+    // Marketplace isolation (defence-in-depth): never silently merge rows from different marketplaces.
+    const rowMkt = canonMarketplace(r.marketplace_country_code ?? r.marketplaceCountryCode);
+    if (rowMkt && ownerMkt && rowMkt !== ownerMkt) throw new Error(`Listing Health ${label}: row marketplace "${rowMkt}" != trusted owner marketplace "${ownerMkt}" (cross-marketplace; fail closed).`);
   }
+}
+
+// Canonical marketplace for the ownership compare: uppercase-trimmed, with the ONLY known account-directory-vs-row
+// divergence folded (the account directory may call the UK marketplace "UK" while row marketplace_country_code uses
+// "GB"). Folding UK->GB prevents a legitimate GB/UK account from being wrongly rejected. Blank stays blank (fail-open).
+function canonMarketplace(v) {
+  const s = S(v).trim().toUpperCase();
+  return s === "UK" ? "GB" : s;
 }
 
 // Window-SCOPED completeness: filter completeness evidence to the requested [from,to] and mark the window
@@ -392,6 +409,9 @@ export function buildAdvancedListingHealth({
 
   return {
     accountId: S(owner.accountId),
+    // The trusted owner marketplace (CANONICAL: uppercase + UK->GB, matching row marketplace_country_code) so
+    // consumers (the page, the Priority Feed alert) can show it and never merge marketplaces. Null when unresolved.
+    marketplace: canonMarketplace(owner.marketplace) || null,
     asOf,
     salesSource: LISTING_HEALTH_ADVANCED_SALES_SOURCE,
     window: { kind: win.kind, from: win.from, to: win.to, days: win.days, ...(win.month ? { month: win.month } : {}) },
@@ -403,10 +423,19 @@ export function buildAdvancedListingHealth({
     issuesAvailable,
     issuesUnavailableReason,
     provenance: {
+      // *FetchedAt = the truer EFFECTIVE/as-of date (the source batch's real download time); *SavedAt = the
+      // materialization time; *SourceType = the fragment's source id -- so every fragment records source type, saved
+      // time, effective date, and (via the client stale marker) freshness. Null when the dimension is Unavailable.
       listingsFetchedAt: provenance.listingsFetchedAt || null,
       inventoryFetchedAt: provenance.inventoryFetchedAt || null,
       rawFetchedAt: provenance.rawFetchedAt || null,
       catalogFetchedAt: provenance.catalogFetchedAt || null,
+      listingsSavedAt: provenance.listingsSavedAt || null,
+      inventorySavedAt: provenance.inventorySavedAt || null,
+      rawSavedAt: provenance.rawSavedAt || null,
+      listingsSourceType: provenance.listingsSourceType || null,
+      inventorySourceType: provenance.inventorySourceType || null,
+      rawSourceType: provenance.rawSourceType || null,
       inventorySnapshotDate: inventory.snapshotDate,
       oliCoveredTo: coverage.coveredTo,
     },

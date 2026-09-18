@@ -177,9 +177,10 @@ const row = (o = {}) => ({ sku: o.sku ?? "S", asin: o.asin ?? "ASIN-S", brand: o
   // (loader) The v1 report is never fetched (rollback-only) and never fed to the Priority Feed.
   ok("K: the v1 listing-health loader is inactive (retained for rollback only)", app.includes('const listingHealth = useSharedReport({ params: listingHealthParams, active: false })'));
 
-  // (feed) Priority Feed omits the v1 listing-health classification entirely (no stale v1 gate leaks).
-  ok("K: Priority Feed emits an EMPTY listing-health contribution (verified-v3-only; no stale v1)", pf.includes('out.push({ key: "listing-health", label: "Listing Health", insights: [] })'));
-  ok("K: Priority Feed never invokes the v1 listing-health builders", !/buildListingHealthInsights|buildListingHealthRows/.test(pf));
+  // (feed) Priority Feed builds Listing Health alerts from the VERIFIED v3 adapter only; never the legacy v1 builders.
+  ok("K: Priority Feed builds Listing Health alerts from the verified v3 adapter (buildListingHealthV3Insights)", pf.includes("buildListingHealthV3Insights(lhv3"));
+  ok("K: Priority Feed never invokes the legacy v1 listing-health builders", !/buildListingHealthInsights\b|buildListingHealthRows\b/.test(pf));
+  ok("K: the v3 report is loaded on the feed (read-only) and passed to Priority Feed", app.includes('view === "listinghealth-v3" || view === "listinghealth" || onFeed') && /reports=\{\{[^}]*listingHealthV3/.test(app));
 
   // The build-time flag constant still resolves OFF in Node (it no longer gates the page, but its default is unchanged).
   ok("K: LISTING_HEALTH_V3 build flag still resolves OFF in a non-Vite context", LISTING_HEALTH_V3 === false);

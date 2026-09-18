@@ -114,7 +114,7 @@ export default function ListingHealthV3({ data, loading, error, accountName, sel
     { value: "FBM", label: "FBM" },
   ];
 
-  const state = <SnapshotState data={data} loading={loading} error={error} label="Listing Health (v3 preview)" icon={<ShieldAlert size={22} />} />;
+  const state = <SnapshotState data={data} loading={loading} error={error} label="Listing Health — v3 preview (read-only)" icon={<ShieldAlert size={22} />} />;
 
   return (
     <div className="container skupl-page">

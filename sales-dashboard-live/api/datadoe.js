@@ -4099,9 +4099,18 @@ async function handleDataDoe(req, res) {
         } catch { /* strict-resolver failure -> fall through to the read-only preview (LKG preserved; never fabricate) */ }
       }
       const connectionId = accountScope.connection && accountScope.connection.id === "secondary" ? "dd-secondary" : "primary";
+      // Resolve the account's canonical marketplace from the durable account directory (a single small snapshot row;
+      // ZERO DataDoe). Passed to the serve so buildAdvancedListingHealth rejects any cross-marketplace row (defence in
+      // depth). Best-effort + fail-open: an unresolved marketplace leaves the ownership assert fail-open, never blocks.
+      let lhv3Marketplace = null;
+      try {
+        const dirAccounts = await getAccountDirectorySnapshotAccounts();
+        const dirMatch = (Array.isArray(dirAccounts) ? dirAccounts : []).find((a) => String(a.accountId) === String(accountScope.accountIds[0]));
+        lhv3Marketplace = (dirMatch && dirMatch.country) || null;
+      } catch { lhv3Marketplace = null; }
       try {
         const payload = await serveListingHealthV3Preview({
-          owner: { accountId: accountScope.accountIds[0], rawSellerId: ids[0] },
+          owner: { accountId: accountScope.accountIds[0], rawSellerId: ids[0], marketplace: lhv3Marketplace },
           identity: { apiKey, connectionId },
           windowControls: { preset: req.query.windowPreset, from: req.query.windowFrom, to: req.query.windowTo, month: req.query.windowMonth },
           asOf: to,

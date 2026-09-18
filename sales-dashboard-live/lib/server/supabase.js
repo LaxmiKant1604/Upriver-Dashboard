@@ -635,7 +635,9 @@ export async function getSourceExportCache(requestHash, { signal = null } = {}) 
   const query = new URLSearchParams({
     // organization_fingerprint + account_scope_hash are returned so a confirmed-exact-match cache reuse
     // can belt-and-suspenders assert scope identity (request_hash already folds them in; kept strict).
-    select: "request_hash,source_id,organization_fingerprint,account_scope_hash,object_path,row_count,payload_bytes,fetched_at,expires_at",
+    // request_meta is returned so a consumer can surface the TRUE data as-of (request_meta.batchFetchedAt, the batch's
+    // real download time) + provenance, distinct from fetched_at (the materialization wall-clock). source_id = source type.
+    select: "request_hash,source_id,organization_fingerprint,account_scope_hash,object_path,row_count,payload_bytes,fetched_at,expires_at,request_meta",
     request_hash: `eq.${requestHash}`,
     expires_at: `gt.${new Date().toISOString()}`,
     limit: "1",

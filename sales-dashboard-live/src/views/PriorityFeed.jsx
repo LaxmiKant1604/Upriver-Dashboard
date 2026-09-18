@@ -20,6 +20,7 @@ import {
   SEVERITY_RANK,
   buildBuyBoxInsights,
   buildBuyBoxRows,
+  buildListingHealthV3Insights,
   buildOptimizerInsights,
   buildOptimizerRows,
   buildPpcInsights,
@@ -65,12 +66,16 @@ export default function PriorityFeed({ reports, accountName, selectedBrand, curr
       out.push({ key: "sales-movers", label: "Sales Movers", insights: [], missing: true });
     }
 
-    // Listing Health is intentionally OMITTED from the Priority Feed. The legacy v1 classification is retired, and the
-    // verified v3 findings are not yet adapted into the feed's insight model, so -- per the accuracy requirement -- we
-    // OMIT these alerts rather than surface stale/unverified v1 gates. The v1 builders are never invoked here. The
-    // verified findings live on the consolidated "Listing Health — v3 preview (read-only)" page. (reports.listingHealth
-    // is retained only for rollback and is deliberately not consumed.)
-    out.push({ key: "listing-health", label: "Listing Health", insights: [] });
+    // Listing Health alerts come EXCLUSIVELY from the verified v3 report via buildListingHealthV3Insights (NO legacy v1
+    // reuse -- the v1 builders are never invoked here; reports.listingHealth is retained only for rollback and is not
+    // consumed). It reads the already-loaded durable v3 snapshot (read-only; ZERO DataDoe) and emits ONLY confirmed,
+    // actionable, non-stale findings. An un-ingested account (snapshotMissing) honestly contributes zero.
+    const lhv3 = reports.listingHealthV3?.data;
+    if (lhv3 && !lhv3.snapshotMissing) {
+      out.push({ key: "listing-health-v3", label: "Listing Health", insights: buildListingHealthV3Insights(lhv3, selectedBrand) });
+    } else {
+      out.push({ key: "listing-health-v3", label: "Listing Health", insights: [], missing: true });
+    }
 
     const buyBox = reports.buyBox?.data;
     if (buyBox && !buyBox.snapshotMissing) {

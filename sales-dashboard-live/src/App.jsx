@@ -3156,8 +3156,10 @@ function DashboardApp({ session, access, onSignOut }) {
   // Legacy v1 Listing Health: RETAINED for rollback only -- no longer mounted in normal navigation and no longer fed
   // to the Priority Feed (its `active` gate can never be true now that the v1 view key redirects to v3). Never fetched.
   const listingHealth = useSharedReport({ params: listingHealthParams, active: false });
-  // v3 preview is now the SOLE, unconditional Listing Health page; it also resolves the legacy "listinghealth" key.
-  const listingHealthV3 = useSharedReport({ params: listingHealthV3Params, active: view === "listinghealth-v3" || view === "listinghealth" });
+  // v3 preview is the SOLE, unconditional Listing Health page; it also resolves the legacy "listinghealth" key AND
+  // feeds the Priority Feed (onFeed). Loading it on the feed reads only the durable Supabase snapshot (read-only; ZERO
+  // DataDoe) -- the same path the page uses -- so the feed's Listing Health alerts come from the verified v3 findings.
+  const listingHealthV3 = useSharedReport({ params: listingHealthV3Params, active: view === "listinghealth-v3" || view === "listinghealth" || onFeed });
   const buyBox = useSharedReport({ params: buyBoxParams, active: view === "buybox" || onFeed });
   const returns = useSharedReport({ params: returnsParams, active: view === "returns" || onFeed });
   const ppc = useSharedReport({ params: ppcParams, active: view === "ppc" || onFeed });
@@ -5607,7 +5609,7 @@ function DashboardApp({ session, access, onSignOut }) {
 
       {view === "priority" && (
         <PriorityFeed
-          reports={{ salesMovers, listingHealth, buyBox, returns, ppc, optimizer }}
+          reports={{ salesMovers, listingHealth, buyBox, returns, ppc, optimizer, listingHealthV3 }}
           accountName={refreshScopeAccount?.name}
           selectedBrand={selectedBrand}
           currency={displayCurrency}

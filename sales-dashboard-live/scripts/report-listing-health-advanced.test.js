@@ -181,6 +181,26 @@ const byId = new Map(payload.rows.map((r) => [r.sku, r]));
   ok("PRICE: an unavailable-price Active listing gains NO negative flag at all from the missing price", b.get("P-NULL").flagged === false && b.get("P-BLANK").flagged === false);
 })();
 
+/* ===================== OWNERSHIP: marketplace isolation (defence-in-depth) ===================== */
+(() => {
+  const base = { asOf, window: resolveListingHealthWindow({ preset: "30D", asOf }), enrichedOliRows: [], oliCoverageWindows: [], completenessRows: [], inventoryRows: [], catalogRows: [], rawRows: [], issuesAvailable: false, provenance };
+  const lr = (o) => [{ sku: "S1", child_asin: "A1", listing_status: "Active", seller_or_vendor_id: "SELLER-1", listing_fulfillment_channel: "AMAZON_NA", ...o }];
+  // Matching marketplace is accepted, and the payload carries the trusted owner marketplace (canonical, uppercase).
+  const okp = buildAdvancedListingHealth({ ...base, owner: { accountId: "acct-1", rawSellerId: "SELLER-1", marketplace: "US" }, listingRows: lr({ marketplace_country_code: "US" }) });
+  ok("OWN: a matching-marketplace row is accepted; payload.marketplace = the owner marketplace", okp.rows.length === 1 && okp.marketplace === "US");
+  // A cross-marketplace row (DE under a US owner) is REJECTED before aggregation -- never silently merged.
+  throws("OWN: a cross-marketplace row (DE under a US owner) fails closed", () => buildAdvancedListingHealth({ ...base, owner: { accountId: "acct-1", rawSellerId: "SELLER-1", marketplace: "US" }, listingRows: lr({ marketplace_country_code: "DE" }) }));
+  // FAIL-OPEN: a row with a BLANK marketplace (already projected by the ingestion isolate boundary) is NOT rejected.
+  const blankp = buildAdvancedListingHealth({ ...base, owner: { accountId: "acct-1", rawSellerId: "SELLER-1", marketplace: "US" }, listingRows: lr({}) });
+  ok("OWN: a blank-marketplace row is accepted (fail-open; ingestion already isolated it)", blankp.rows.length === 1);
+  // FAIL-OPEN + backward compatible: when the OWNER carries no marketplace, a marketplace-bearing row is not rejected.
+  const noMktOwner = buildAdvancedListingHealth({ ...base, owner: { accountId: "acct-1", rawSellerId: "SELLER-1" }, listingRows: lr({ marketplace_country_code: "DE" }) });
+  ok("OWN: with no owner marketplace the row is not rejected (fail-open, backward compatible)", noMktOwner.rows.length === 1 && noMktOwner.marketplace === null);
+  // GB/UK divergence (directory may say "UK", rows say "GB") is FOLDED so a legitimate account is never false-rejected.
+  const ukp = buildAdvancedListingHealth({ ...base, owner: { accountId: "acct-1", rawSellerId: "SELLER-1", marketplace: "UK" }, listingRows: lr({ marketplace_country_code: "GB" }) });
+  ok("OWN: a 'UK' owner accepts a 'GB' row (GB/UK folded; no false reject)", ukp.rows.length === 1 && ukp.marketplace === "GB");
+})();
+
 /* ===================== currency + account isolation ===================== */
 throws("a SKU split across two sales currencies fails closed (currency isolation)", () => buildAdvancedListingHealth({
   owner: { accountId: "acct-1", rawSellerId: "SELLER-1" }, asOf, window: resolveListingHealthWindow({ preset: "30D", asOf }),

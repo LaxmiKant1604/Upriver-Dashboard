@@ -31,7 +31,17 @@ const defaultCatalogReader = async ({ organizationFingerprint, connectionId }) =
 // Cache-ONLY read (getSourceExportCache returns only UNEXPIRED entries and hydrates rows); a miss returns null and is
 // NEVER answered by creating an export. Returns { rows, fetchedAt } so the caller can surface the snapshot's honest
 // as-of date (the UI shows it per row and can label stale evidence). Never triggers a fetch.
-const defaultSavedSourceReader = async (requestHash) => { const e = await getSourceExportCache(requestHash); return e && Array.isArray(e.rows) ? { rows: e.rows, fetchedAt: e.fetched_at || null } : null; };
+const defaultSavedSourceReader = async (requestHash) => {
+  const e = await getSourceExportCache(requestHash);
+  if (!e || !Array.isArray(e.rows)) return null;
+  const meta = e.request_meta && typeof e.request_meta === "object" ? e.request_meta : {};
+  return {
+    rows: e.rows,
+    fetchedAt: e.fetched_at || null,                          // when the per-account fragment was materialized (saved time)
+    effectiveAt: meta.batchFetchedAt || e.fetched_at || null, // the batch's real DataDoe download time (truer data as-of)
+    sourceType: e.source_id || null,                          // the source type (e.g. the listings/raw/inventory source id)
+  };
+};
 
 /**
  * Serve the v3 preview payload for ONE pinned account + window from durable/saved evidence. Pure orchestration over
@@ -82,25 +92,48 @@ export async function serveListingHealthV3Preview({ owner, identity, windowContr
   //    means that per-account fragment has not been materialized yet -> the dimension is honestly Unavailable.
   const readHashes = listingHealthV3PerAccountReadHashes({ apiKey: identity && identity.apiKey, rawSellerId, marketplaceCountry: owner.marketplace || null });
   const hashOf = (rk) => readHashes[rk] || null;
-  // Capture each saved snapshot's honest as-of (fetched_at) alongside its rows. Accepts BOTH an injected reader that
-  // returns a plain array (no as-of) and the production { rows, fetchedAt } shape -- never fabricates a date.
-  const savedAsOf = {};
+  // Capture each saved fragment's provenance (source type + saved time + truer effective/as-of) alongside its rows.
+  // Accepts BOTH an injected reader that returns a plain array (no metadata) and the production { rows, fetchedAt,
+  // effectiveAt, sourceType } shape -- never fabricates a date.
+  const savedMeta = {};
   const readSaved = async (rk) => {
     const h = hashOf(rk); if (!h || typeof getSavedSourceRows !== "function") return null;
     try {
       const res = await getSavedSourceRows(h);
       if (Array.isArray(res)) return res;
-      if (res && Array.isArray(res.rows)) { savedAsOf[rk] = res.fetchedAt || res.fetched_at || null; return res.rows; }
+      if (res && Array.isArray(res.rows)) {
+        savedMeta[rk] = {
+          fetchedAt: res.fetchedAt || res.fetched_at || null,
+          effectiveAt: res.effectiveAt || res.fetchedAt || res.fetched_at || null,
+          sourceType: res.sourceType || res.source_id || null,
+        };
+        return res.rows;
+      }
       return null;
     } catch (_e) { return null; }
   };
   const listingRows = await readSaved("listing-health-v3:listings");
   const inventoryRows = await readSaved("listing-health-v3:inventory");
   const rawRows = await readSaved("listing-health-v3:listings-raw");
+  const metaOf = (rk) => savedMeta[rk] || {};
+
+  // OPERATIONAL LOGGING (observable in server logs; NEVER a write/export). Records which dimensions are Unavailable for
+  // this owner so missing-source evidence is inspectable. Best-effort: a logging failure never affects the response.
+  try {
+    // Availability is the actual hydrated rows (Array.isArray), NOT savedMeta presence -- an injected plain-array
+    // reader (tests) has no savedMeta yet still has rows, so keying off savedMeta would falsely log everything missing.
+    const missing = [["listing-health-v3:listings", listingRows], ["listing-health-v3:listings-raw", rawRows], ["listing-health-v3:inventory", inventoryRows]]
+      .filter(([, v]) => !Array.isArray(v)).map(([rk]) => rk);
+    if (missing.length && typeof console !== "undefined" && console.warn) {
+      console.warn(JSON.stringify({ evt: "lhv3.serve.unavailable_fragments", accountId, marketplace: owner.marketplace || null, missing }));
+    }
+  } catch (_e) { /* logging is best-effort */ }
 
   const issuesAvailable = Array.isArray(rawRows);
   const payload = buildAdvancedListingHealth({
-    owner: { accountId, rawSellerId },
+    // Forward the caller-resolved canonical marketplace so buildAdvancedListingHealth's ownership boundary rejects any
+    // cross-marketplace row (defence-in-depth). Null when the caller did not resolve it -> the assert stays fail-open.
+    owner: { accountId, rawSellerId, marketplace: owner.marketplace || null },
     asOf, window,
     enrichedOliRows, oliCoverageWindows, completenessRows,
     listingRows: Array.isArray(listingRows) ? listingRows : [],
@@ -109,12 +142,20 @@ export async function serveListingHealthV3Preview({ owner, identity, windowContr
     rawRows: Array.isArray(rawRows) ? rawRows : [],
     issuesAvailable,
     issuesUnavailableReason: issuesAvailable ? null : "Listings (Raw JSON) evidence is not yet saved for this account (populated when v3 ingestion is scheduled).",
-    // Honest saved-snapshot as-of dates (fetched_at) so the read-only UI can show each row's evidence source + as-of
-    // and visibly label stale evidence. Null when the dimension is unavailable -- never a fabricated date.
+    // Honest per-fragment provenance so the read-only UI shows each row's evidence source + as-of and labels stale
+    // evidence. `*FetchedAt` is the truer EFFECTIVE date (the batch's real download time, batchFetchedAt) falling back
+    // to the materialization time; `*SavedAt` is the materialization time; `*SourceType` is the source id. Null when
+    // the dimension is Unavailable -- never a fabricated date.
     provenance: {
-      listingsFetchedAt: savedAsOf["listing-health-v3:listings"] || null,
-      inventoryFetchedAt: savedAsOf["listing-health-v3:inventory"] || null,
-      rawFetchedAt: savedAsOf["listing-health-v3:listings-raw"] || null,
+      listingsFetchedAt: metaOf("listing-health-v3:listings").effectiveAt || null,
+      inventoryFetchedAt: metaOf("listing-health-v3:inventory").effectiveAt || null,
+      rawFetchedAt: metaOf("listing-health-v3:listings-raw").effectiveAt || null,
+      listingsSavedAt: metaOf("listing-health-v3:listings").fetchedAt || null,
+      inventorySavedAt: metaOf("listing-health-v3:inventory").fetchedAt || null,
+      rawSavedAt: metaOf("listing-health-v3:listings-raw").fetchedAt || null,
+      listingsSourceType: metaOf("listing-health-v3:listings").sourceType || null,
+      inventorySourceType: metaOf("listing-health-v3:inventory").sourceType || null,
+      rawSourceType: metaOf("listing-health-v3:listings-raw").sourceType || null,
     },
   });
 

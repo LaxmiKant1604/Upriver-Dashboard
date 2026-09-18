@@ -156,4 +156,33 @@ await (async () => {
     () => serveListingHealthV3Preview({ owner: { accountId: SELLER }, identity: { apiKey: API_KEY }, windowControls: { preset: "30D" }, asOf, readers: makeReaders().readers }));
 })();
 
+/* ===================== H. freshness metadata: TRUE effective/as-of + source-type per fragment ===================== */
+await (async () => {
+  const H = hashesFor({ to: asOf });
+  const rich = {
+    getEnrichedOli: async () => [], getOliCoverage: async () => ({ read: "ok", windows: FULL_COVERAGE }), getCompleteness: async () => [], getCatalog: async () => [],
+    // Production { rows, fetchedAt, effectiveAt, sourceType } shape: effectiveAt = the batch's real download time
+    // (truer data as-of), fetchedAt = the materialization time, sourceType = the source id.
+    getSavedSourceRows: async (h) => (h === H["listing-health-v3:listings"]
+      ? { rows: [listingRow(SELLER, "US", "A", { status: "Active", price: 12 })], fetchedAt: "2026-09-18T09:00:00Z", effectiveAt: "2026-09-17T02:00:00Z", sourceType: "listings-health-v1" }
+      : null),
+  };
+  const p = await serveListingHealthV3Preview({ owner: { accountId: SELLER, rawSellerId: SELLER, marketplace: "US" }, identity: { apiKey: API_KEY, connectionId: "primary" }, windowControls: { preset: "30D" }, asOf, readers: rich });
+  ok("H: provenance surfaces the TRUE effective/as-of (batch download time), not the materialization time", p.provenance.listingsFetchedAt === "2026-09-17T02:00:00Z");
+  ok("H: provenance records the materialization saved-time separately", p.provenance.listingsSavedAt === "2026-09-18T09:00:00Z");
+  ok("H: provenance records the per-fragment source type", p.provenance.listingsSourceType === "listings-health-v1");
+  ok("H: absent raw + inventory fragments stay honestly Unavailable (no fabricated date)", p.evidence.issuesEvidenceAvailable === false && p.evidence.inventoryEvidenceAvailable === false && p.provenance.rawFetchedAt === null);
+})();
+
+/* ===================== I. marketplace ownership: a cross-marketplace saved row fails closed ===================== */
+await (async () => {
+  const H = hashesFor({ to: asOf });
+  const cross = {
+    getEnrichedOli: async () => [], getOliCoverage: async () => ({ read: "ok", windows: FULL_COVERAGE }), getCompleteness: async () => [], getCatalog: async () => [],
+    getSavedSourceRows: async (h) => (h === H["listing-health-v3:listings"] ? [listingRow(SELLER, "DE", "A", { status: "Active", price: 12 })] : null),
+  };
+  await throwsAsync("I: a DE listing row under a US owner fails closed (cross-marketplace; never merged)",
+    () => serveListingHealthV3Preview({ owner: { accountId: SELLER, rawSellerId: SELLER, marketplace: "US" }, identity: { apiKey: API_KEY, connectionId: "primary" }, windowControls: { preset: "30D" }, asOf, readers: cross }));
+})();
+
 writeSync(1, `\nreport-listing-health-v3-serve: ${passed} assertions passed\n`);

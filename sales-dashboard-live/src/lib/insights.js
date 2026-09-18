@@ -20,6 +20,7 @@
 // insight locally without a single DataDoe request.
 
 import { ratio } from "./format.js";
+import { buildV3Rows } from "./listing-health-v3-view.js";
 
 export const SEVERITIES = ["high", "medium", "low"];
 export const SEVERITY_RANK = { high: 0, medium: 1, low: 2 };
@@ -553,6 +554,78 @@ function listingAction(row) {
     default:
       return "Clear the reported warning when convenient; it is a performance drag rather than a blocker.";
   }
+}
+
+// ---- v3 Listing Health -> Priority Feed adapter (verified v3 findings ONLY; NO legacy v1 reuse) ----------------------
+// The Priority Feed's Listing Health alerts come EXCLUSIVELY from the READ-ONLY v3 report through this adapter (the v1
+// builders above are never invoked by the feed). It consumes the verified v3 presenter (buildV3Rows) and emits ONLY
+// CONFIRMED, ACTIONABLE, CURRENT findings: a gate in the actionable set, evidence that is not stale. It EXCLUDES
+// needs_verification / ok (unknown / unavailable / no confirming evidence) and any stale-only finding -- so a feed
+// alert is always a real, current problem a user can act on. Resolution is AUTOMATIC: when the durable v3 evidence no
+// longer flags a row, this emits nothing for it and the alert disappears on the next feed re-derivation. The feed is
+// single-account / single-marketplace, so the shared dedupe key (reportKey|category|asin|sku) is owner+marketplace+
+// asin/sku+finding. Reads only the already-loaded durable snapshot -> ZERO DataDoe exports / writes.
+export const LHV3_ACTIONABLE_GATES = Object.freeze(["error", "suppressed", "no_live_offer", "no_price", "inactive", "incomplete", "stranded"]);
+const LHV3_ACTIONABLE = new Set(LHV3_ACTIONABLE_GATES);
+const lhv3Bool = (v) => (v === null || v === undefined ? "Unavailable" : (v ? "Yes" : "No"));
+
+export function buildListingHealthV3Insights(payload, selectedBrand = null) {
+  if (!payload || payload.snapshotMissing) return [];
+  const rows = buildV3Rows(payload, selectedBrand);
+  const asOf = (payload.provenance && payload.provenance.listingsFetchedAt)
+    ? String(payload.provenance.listingsFetchedAt).slice(0, 10)
+    : (payload.asOf || null);
+  const freshness = freshnessNote({
+    sourceLabel: "durable OLI window + latest saved listing snapshot",
+    asOf,
+    extra: payload.issuesAvailable ? null : "Buyable/Discoverable/issue evidence not yet saved",
+  });
+  // Severity share = an item's exposure as a fraction of the ACCOUNT/brand window sales -- so the denominator is the
+  // window sales across ALL rows (not just at-risk rows). Using r.sales (set for every row) mirrors the v1 and Buy Box
+  // builders; summing salesAtRisk would collapse the denominator to the at-risk total and over-escalate every alert.
+  const totalSales = rows.reduce((sum, r) => sum + (Number(r.sales) || 0), 0);
+  const insights = [];
+  for (const r of rows) {
+    if (!LHV3_ACTIONABLE.has(r.gate)) continue;   // EXCLUDE needs_verification / ok (unknown / unavailable)
+    if (r.evidenceStale === true) continue;       // EXCLUDE stale-only findings (evidence >2 days older than as-of)
+    const money = Number(r.salesAtRisk) || 0;
+    const share = totalSales > 0 ? money / totalSales : 0;
+    const tone = (r.gateMeta && r.gateMeta.tone) || "warn";
+    let severity = severityFromExposure({ share, moneyAtRisk: money });
+    if (tone === "bad" && severity === "low") severity = "medium"; // a confirmed blocker is never "low"
+    const finding = (r.gateMeta && r.gateMeta.label) || r.gate;
+    const label = r.productName || r.sku || r.asin;
+    insights.push(makeInsight({
+      id: `lhv3-${r.gate}-${r.sku || r.asin}`,
+      reportKey: "listing-health-v3",
+      reportLabel: "Listing Health",
+      kind: "risk",
+      severity,
+      category: r.gate,
+      title: `${label} — ${finding}${money > 0 ? ` (${money.toFixed(0)} at risk)` : ""}`,
+      asin: r.asin, sku: r.sku, brand: r.brand, entityLabel: label,
+      evidence: [
+        { label: "Account", value: payload.accountId || "" },
+        { label: "Marketplace", value: payload.marketplace || "" },
+        { label: "Amazon Listing Status", value: r.listingStatus || "Unavailable" },
+        { label: "Health Finding", value: finding },
+        { label: "Buyable", value: lhv3Bool(r.buyable) },
+        { label: "Discoverable", value: lhv3Bool(r.discoverable) },
+        { label: "Live offer", value: lhv3Bool(r.liveOffer) },
+        { label: "Evidence source", value: r.evidenceSource || "Unavailable" },
+        { label: "Evidence as of", value: r.evidenceAsOf || "Unavailable" },
+        { label: "Sales at risk", value: money.toFixed(2) },
+      ],
+      moneyAtRisk: money,
+      moneyBasis: "selected-window sales exposure for a listing flagged now (not proven lost revenue)",
+      currency: r.currency,
+      confidence: r.confidence === "confirmed" ? "high" : "medium",
+      freshness,
+      why: r.whyFlagged,
+      action: r.recommendedAction,
+    }));
+  }
+  return sortInsights(insights);
 }
 
 /* ==================================================================== */
