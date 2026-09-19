@@ -194,9 +194,14 @@ export function classifyReportPublish({ liveRow, contract, cycleAsOf, metaOk, ex
   if (!asOf) return { status: "Unavailable", asOf: null, refreshedAt: liveRow.refreshedAt || null };
   // Without a resolvable cycle as-of we CANNOT prove the live row is current -> Unavailable (never a fabricated Yes).
   if (!isDate(cycleAsOf)) return { status: "Unavailable", asOf, refreshedAt: liveRow.refreshedAt || null };
-  // The exact live identity is present. as_of >= the cycle's as-of => this cycle (or a newer one) published; an OLDER
-  // as_of means a last-known-good row is retained while this cycle's publication is still pending.
-  if (asOf < cycleAsOf) return { status: "Waiting", asOf, refreshedAt: liveRow.refreshedAt || null, lkg: true };
+  // The exact live identity is present. as_of >= the cycle's as-of => this cycle (or a newer one) published.
+  // An OLDER as_of means a previous-cycle LAST-KNOWN-GOOD row is retained while this cycle has not (yet) published it:
+  //   - while the cycle is NON-terminal, publication is still in its async completion window -> "Waiting" (in progress);
+  //   - once the cycle is TERMINAL, this cycle did NOT bring the report current. That is a truthful, terminal
+  //     RETAINED-LAST-KNOWN-GOOD state ("LKG") carrying the LAST-PUBLISHED as_of -- NEVER an indefinitely-running
+  //     "Waiting", and NEVER a fabricated "Yes". A weeks-old as_of (e.g. a stuck fba-plan derive) is thus glaringly
+  //     visible as stale LKG rather than masked as "in progress", so the underlying failure is surfaced, not hidden.
+  if (asOf < cycleAsOf) return { status: cycleTerminal ? "LKG" : "Waiting", asOf, refreshedAt: liveRow.refreshedAt || null, lkg: true };
   return { status: "Yes", asOf, refreshedAt: liveRow.refreshedAt || null };
 }
 
@@ -204,20 +209,28 @@ export function classifyReportPublish({ liveRow, contract, cycleAsOf, metaOk, ex
 // Not applicable). ----
 export function aggregatePublish({ dependentReports, perReport, metaOk = true } = {}) {
   const expected = (dependentReports || []).length;
-  if (expected === 0) return { status: "Not applicable", count: 0, expected: 0, lkg: false };
-  if (metaOk === false) return { status: "Unavailable", count: 0, expected, lkg: false };
-  let yes = 0, waiting = 0, unavailable = 0, lkg = false;
+  if (expected === 0) return { status: "Not applicable", count: 0, expected: 0, lkg: false, lkgAsOf: null };
+  if (metaOk === false) return { status: "Unavailable", count: 0, expected, lkg: false, lkgAsOf: null };
+  let yes = 0, waiting = 0, unavailable = 0, no = 0, lkgN = 0, lkg = false, lkgAsOf = null;
   for (const r of dependentReports) {
     const st = perReport[r];
     if (!st) { unavailable += 1; continue; }
     if (st.status === "Yes") yes += 1;
     else if (st.status === "Waiting") { waiting += 1; if (st.lkg) lkg = true; }
+    // LKG (terminal cycle, retained last-known-good, not current): track the OLDEST retained as_of so the cell reports
+    // the worst staleness (a weeks-old date is unmistakable). LKG is NEVER counted toward Yes (it is not current).
+    else if (st.status === "LKG") { lkgN += 1; lkg = true; if (isDate(st.asOf) && (!lkgAsOf || st.asOf < lkgAsOf)) lkgAsOf = st.asOf; }
     else if (st.status === "Unavailable") unavailable += 1;
+    else no += 1; // "No" -- terminal, nothing published for this dependent
   }
-  if (yes === expected) return { status: "Yes", count: yes, expected, lkg };
-  if (unavailable === expected) return { status: "Unavailable", count: yes, expected, lkg };
-  // Some published, some not. Still-running/LKG => Waiting; otherwise a durable partial/No.
-  return { status: waiting > 0 ? "Waiting" : "No", count: yes, expected, lkg };
+  if (yes === expected) return { status: "Yes", count: yes, expected, lkg: false, lkgAsOf: null };
+  if (unavailable === expected) return { status: "Unavailable", count: yes, expected, lkg, lkgAsOf };
+  // Some not-current. Worst-state precedence so the cell states the MOST serious truthful outcome: a hard No (nothing
+  // published) outranks a retained-LKG (previous-cycle data still live), which outranks an in-progress Waiting.
+  if (no > 0) return { status: "No", count: yes, expected, lkg, lkgAsOf };
+  if (lkgN > 0) return { status: "LKG", count: yes, expected, lkg: true, lkgAsOf };
+  if (waiting > 0) return { status: "Waiting", count: yes, expected, lkg, lkgAsOf: null };
+  return { status: "No", count: yes, expected, lkg, lkgAsOf };
 }
 
 // ---- Per-account remark: the single most actionable safe result, naming the SPECIFIC source + safe code (never a
@@ -238,6 +251,11 @@ export function accountRemark({ eligible, reports }) {
   if (exNo) return exNo.label + " export failed" + code(exNo.safeCode);
   const pubNo = firstPublish("No");
   if (pubNo) return pubNo.label + " publication failed " + frac(pubNo);
+  // Terminal cycle with a retained previous-cycle last-known-good (current cycle did NOT publish this report). Name the
+  // EXACT last-published as-of so a stuck/deferred publication (e.g. a weeks-old fba-plan) is unmistakable, never masked
+  // as "in progress". This ranks above unavailability/in-progress because it is a concrete not-current result.
+  const pubLkg = rows.find((r) => r.publishStatus === "LKG");
+  if (pubLkg) return pubLkg.label + " last-known-good as-of " + S(pubLkg.publishLkgAsOf || "unknown") + " retained; current cycle not published " + frac(pubLkg);
   const exUn = firstExport("Unavailable");
   if (exUn) return exUn.label + " evidence unavailable" + code(exUn.safeCode);
   const pubUn = firstPublish("Unavailable");
@@ -297,6 +315,7 @@ export function shapeDeliveryPayload({
         cycleAsOf,
         publishStatus: agg.status,
         publishLkg: agg.lkg === true,
+        publishLkgAsOf: agg.lkgAsOf || null,
         publicationCount: agg.count,
         publicationExpected: agg.expected,
         dependentReports: dependents,
@@ -317,20 +336,25 @@ export function shapeDeliveryPayload({
 
   // Summary over ELIGIBLE accounts only (ineligible/setup-incomplete accounts must not distort success totals).
   const eligibleAccounts = shapedAccounts.filter((a) => a.eligible);
-  let exportYes = 0, exportTotal = 0, publishYes = 0, publishTotal = 0, failedCount = 0, waitingCount = 0;
+  let exportYes = 0, exportTotal = 0, publishYes = 0, publishTotal = 0, failedCount = 0, waitingCount = 0, lkgCount = 0;
   for (const a of eligibleAccounts) {
-    let acctFailed = false, acctWaiting = false;
+    let acctFailed = false, acctWaiting = false, acctLkg = false;
     for (const r of a.reports) {
       exportTotal += 1;
       if (r.exportStatus === "Yes") exportYes += 1;
       if (r.publishStatus !== "Not applicable") {
         publishTotal += 1;
+        // LKG is NOT a current publication (a previous-cycle last-known-good is retained), so it never counts toward
+        // publishYes -- the fraction stays honest about what published THIS cycle.
         if (r.publishStatus === "Yes") publishYes += 1;
       }
       if (r.exportStatus === "No" || r.publishStatus === "No") acctFailed = true;
+      if (r.publishStatus === "LKG") acctLkg = true;
       if (r.exportStatus === "Waiting" || r.publishStatus === "Waiting") acctWaiting = true;
     }
+    // Precedence: a hard failure outranks a retained-LKG (current cycle not published) which outranks in-progress.
     if (acctFailed) failedCount += 1;
+    else if (acctLkg) lkgCount += 1;
     else if (acctWaiting) waitingCount += 1;
   }
 
@@ -352,7 +376,7 @@ export function shapeDeliveryPayload({
       accountsShown: visibleAccounts.length,
       exportYes, exportTotal,
       publishYes, publishTotal,
-      failedCount, waitingCount,
+      failedCount, waitingCount, lkgCount,
     },
     notes: Array.isArray(notes) ? notes : [],
   };

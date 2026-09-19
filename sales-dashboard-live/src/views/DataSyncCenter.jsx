@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, CheckCircle2, Clock, DatabaseZap, LockKeyhole, MinusCircle, PauseCircle, PlayCircle, RefreshCw, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Clock, DatabaseZap, History, LockKeyhole, MinusCircle, PauseCircle, PlayCircle, RefreshCw, XCircle } from "lucide-react";
 
 async function adminFetch(path, accessToken, options = {}) {
   const response = await fetch(path, {
@@ -30,6 +30,9 @@ const DELIVERY_STATUS_META = {
   Yes: { tone: "good", Icon: CheckCircle2 },
   No: { tone: "bad", Icon: XCircle },
   Waiting: { tone: "neutral", Icon: Clock },
+  // LKG: a terminal cycle retained a previous-cycle last-known-good; the current cycle did NOT publish this report.
+  // Warn tone (not neutral "in progress", not "bad" -- data IS live, just not current) with a distinct history icon.
+  LKG: { tone: "warn", Icon: History },
   Unavailable: { tone: "warn", Icon: AlertTriangle },
   "Not applicable": { tone: "neutral", Icon: MinusCircle },
 };
@@ -357,6 +360,7 @@ export default function DataSyncCenter({ accessToken }) {
                 <span className={`status-badge ${delivery.summary.exportTotal > 0 && delivery.summary.exportYes === delivery.summary.exportTotal ? "good" : (delivery.summary.exportTotal === 0 ? "neutral" : "warn")}`}>Exported: {delivery.summary.exportYes} / {delivery.summary.exportTotal}</span>
                 <span className={`status-badge ${delivery.summary.publishTotal > 0 && delivery.summary.publishYes === delivery.summary.publishTotal ? "good" : (delivery.summary.publishTotal === 0 ? "neutral" : "warn")}`}>Published: {delivery.summary.publishYes} / {delivery.summary.publishTotal}</span>
                 {delivery.summary.failedCount > 0 && <span className="status-badge bad">Needs attention: {delivery.summary.failedCount}</span>}
+                {delivery.summary.lkgCount > 0 && <span className="status-badge warn">Last-known-good retained: {delivery.summary.lkgCount}</span>}
                 {delivery.summary.waitingCount > 0 && <span className="status-badge neutral">Waiting: {delivery.summary.waitingCount}</span>}
               </div>
             )}
@@ -385,7 +389,7 @@ export default function DataSyncCenter({ accessToken }) {
                           <td key={r.sourceKey} title={r.dependentReports && r.dependentReports.length ? `Dashboards: ${r.dependentReports.join(", ")}` : undefined}>
                             <div className="delivery-cell">
                               <DeliveryChip prefix="Export" status={r.exportStatus} suffix={r.exportMode === "validated-reuse" ? "reuse" : null} />
-                              <DeliveryChip prefix="Publish" status={r.publishStatus} suffix={r.publicationExpected ? `${r.publicationCount}/${r.publicationExpected}` : null} />
+                              <DeliveryChip prefix="Publish" status={r.publishStatus} suffix={r.publishStatus === "LKG" ? `${r.publicationCount}/${r.publicationExpected} · as-of ${r.publishLkgAsOf || "?"}` : (r.publicationExpected ? `${r.publicationCount}/${r.publicationExpected}` : null)} />
                               <div className="delivery-ts">{r.validatedAt ? fmtTs(r.validatedAt) : (r.sourceAsOf ? `as of ${r.sourceAsOf}` : "—")}{r.safeCode ? ` · ${r.safeCode}` : ""}</div>
                             </div>
                           </td>

@@ -99,18 +99,29 @@ const DR_CONTRACT = { liveReportKey: "daily-reporting", liveReportVersion: "dail
   ok("[#14] wrong reportVersion (shadow/other) -> NOT Yes", classifyReportPublish({ liveRow: { reportVersion: "daily-reporting/v2f-campaign", asOf: "2026-09-14" }, contract: DR_CONTRACT, cycleAsOf: "2026-09-14", metaOk: true, cycleTerminal: true }).status !== "Yes");
   // #15: exact live identity (correct version) + fresh as_of => published.
   ok("[#15] correct liveReportVersion + as_of >= cycle -> Yes", classifyReportPublish({ liveRow: { reportVersion: "daily-reporting-shared-v2", asOf: "2026-09-14" }, contract: DR_CONTRACT, cycleAsOf: "2026-09-14", metaOk: true }).status === "Yes");
-  // #18: a valid live row with an OLDER as_of is last-known-good retained (honest), NOT Yes for this cycle.
-  const lkg = classifyReportPublish({ liveRow: { reportVersion: "daily-reporting-shared-v2", asOf: "2026-09-10" }, contract: DR_CONTRACT, cycleAsOf: "2026-09-14", metaOk: true });
-  ok("[#18] valid live row older than the cycle -> Waiting + lkg flag (last-known-good retained)", lkg.status === "Waiting" && lkg.lkg === true);
+  // #18: a valid live row with an OLDER as_of is a retained last-known-good, NOT Yes for this cycle. While the cycle is
+  // OPEN it is still publishing (Waiting); once the cycle is TERMINAL it is a truthful terminal LKG state carrying the
+  // LAST-PUBLISHED as_of -- NEVER an indefinitely-running Waiting (this is the core Lead-1 fix).
+  const lkgOpen = classifyReportPublish({ liveRow: { reportVersion: "daily-reporting-shared-v2", asOf: "2026-09-10" }, contract: DR_CONTRACT, cycleAsOf: "2026-09-14", metaOk: true, cycleTerminal: false });
+  ok("[#18a] older live row + OPEN cycle -> Waiting + lkg (still publishing)", lkgOpen.status === "Waiting" && lkgOpen.lkg === true);
+  const lkgTerm = classifyReportPublish({ liveRow: { reportVersion: "daily-reporting-shared-v2", asOf: "2026-09-10" }, contract: DR_CONTRACT, cycleAsOf: "2026-09-14", metaOk: true, cycleTerminal: true });
+  ok("[#18b] older live row + TERMINAL cycle -> LKG (not Waiting), carrying the last-published as_of", lkgTerm.status === "LKG" && lkgTerm.lkg === true && lkgTerm.asOf === "2026-09-10");
 
   // aggregate K/N
   const per3yes = { a: { status: "Yes" }, b: { status: "Yes" }, c: { status: "Yes" } };
-  ok("aggregate all-Yes -> Yes N/N", JSON.stringify(aggregatePublish({ dependentReports: ["a", "b", "c"], perReport: per3yes, metaOk: true })) === JSON.stringify({ status: "Yes", count: 3, expected: 3, lkg: false }));
+  ok("aggregate all-Yes -> Yes N/N", JSON.stringify(aggregatePublish({ dependentReports: ["a", "b", "c"], perReport: per3yes, metaOk: true })) === JSON.stringify({ status: "Yes", count: 3, expected: 3, lkg: false, lkgAsOf: null }));
   const perPartial = { a: { status: "Yes" }, b: { status: "Yes" }, c: { status: "No" } };
   const agg = aggregatePublish({ dependentReports: ["a", "b", "c"], perReport: perPartial, metaOk: true });
   ok("[#16] partial publication -> No with 2/3 (never a false aggregate Yes)", agg.status === "No" && agg.count === 2 && agg.expected === 3);
   ok("no dependent reports -> Not applicable", aggregatePublish({ dependentReports: [], perReport: {}, metaOk: true }).status === "Not applicable");
   ok("meta failed -> aggregate Unavailable", aggregatePublish({ dependentReports: ["a"], perReport: {}, metaOk: false }).status === "Unavailable");
+  // LKG aggregate: some Yes + a terminal-LKG dependent -> aggregate LKG (NEVER counted toward Yes), carrying the OLDEST
+  // retained as_of so the cell shows the worst staleness.
+  const aggLkg = aggregatePublish({ dependentReports: ["a", "b"], perReport: { a: { status: "Yes" }, b: { status: "LKG", lkg: true, asOf: "2026-08-29" } }, metaOk: true });
+  ok("[LKG] Yes + terminal LKG -> aggregate LKG 1/2 + oldest retained as_of", aggLkg.status === "LKG" && aggLkg.count === 1 && aggLkg.expected === 2 && aggLkg.lkg === true && aggLkg.lkgAsOf === "2026-08-29");
+  // A hard No (nothing published) OUTRANKS a retained LKG (the most serious truthful state wins the cell).
+  const aggNoOverLkg = aggregatePublish({ dependentReports: ["a", "b"], perReport: { a: { status: "No" }, b: { status: "LKG", lkg: true, asOf: "2026-08-29" } }, metaOk: true });
+  ok("[LKG] a hard No outranks LKG in the aggregate (still surfaces the retained as_of)", aggNoOverLkg.status === "No" && aggNoOverLkg.lkg === true && aggNoOverLkg.lkgAsOf === "2026-08-29");
 }
 
 // ============================ (D) region normalization + date helper ============================
@@ -343,6 +354,35 @@ function secondaryDeps() {
   ok("[#20] FBA Export No is classified (job not validated) with a safe code, never a fabricated Yes", fba.exportStatus === "No" && fba.safeCode === "SOURCE_EVIDENCE_MISSING");
   ok("[#20] FBA Publish stays Yes independently (retained/current live snapshot) -- the contradiction is shown, not hidden", fba.publishStatus === "Yes" && fba.publicationExpected === 2);
   ok("[#20] the account remark honestly surfaces the FBA export failure (specific, not generic)", us1b.remark === "FBA Inventory export failed (SOURCE_EVIDENCE_MISSING)");
+}
+
+// ============================ (E3b) terminal-cycle LKG: a lagging live report is a truthful terminal LKG, never Waiting ============================
+{
+  // Lead-1 end-to-end: the cycle is TERMINAL (succeeded). US1's fba-plan live row lags (as_of 2026-08-29 << cycle
+  // as-of 2026-09-14); everything else is current. The fba-plan-dependent source cells (FBA Inventory + Listings) must
+  // classify as LKG (NOT an indefinitely-running Waiting), surface the last-published as-of, and the account remark +
+  // summary must make the stuck fba-plan publication visible -- never masked, never a fabricated Yes.
+  const lagDeps = baseDeps({
+    getReportSnapshotsMeta: async ({ reportKeys, accountIds }) => reportKeys.flatMap((rk) => (accountIds || ["US1", "CA1"]).map((acct) => ({
+      report_key: rk, account_id: acct,
+      params: { reportVersion: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[rk].liveReportVersion, to: (rk === "fba-plan" && acct === "US1") ? "2026-08-29" : "2026-09-14" },
+      source_refreshed_at: "2026-09-15T17:00:00Z", updated_at: "2026-09-15T17:05:00Z",
+    }))),
+  }).deps;
+  const p = await loadDeliveryStatus({ region: "us-ca" }, lagDeps);
+  const us1 = p.accounts.find((a) => a.accountId === "US1");
+  const ca1 = p.accounts.find((a) => a.accountId === "CA1");
+  const fbaInv = us1.reports.find((r) => r.sourceKey === "fba-inventory-health");
+  const listings = us1.reports.find((r) => r.sourceKey === "listings");
+  ok("[LKG-e2e] terminal cycle + lagging fba-plan -> FBA Inventory Publish is LKG (never Waiting), carrying last-published as-of",
+    fbaInv.publishStatus === "LKG" && fbaInv.publishLkg === true && fbaInv.publishLkgAsOf === "2026-08-29" && fbaInv.publicationCount === 1 && fbaInv.publicationExpected === 2);
+  ok("[LKG-e2e] Listings Publish is also LKG (fba-plan AWD dependent), never Waiting", listings.publishStatus === "LKG" && listings.publishLkgAsOf === "2026-08-29");
+  ok("[LKG-e2e] no cell on a terminal cycle is left 'Waiting' (no indefinite Waiting)", us1.reports.every((r) => r.publishStatus !== "Waiting"));
+  ok("[LKG-e2e] the account remark names the SPECIFIC source + last-published as-of (surfaced, not hidden)",
+    /last-known-good as-of 2026-08-29 retained; current cycle not published/.test(us1.remark));
+  ok("[LKG-e2e] CA1 (all current) stays healthy Publish Yes", ca1.reports.find((r) => r.sourceKey === "fba-inventory-health").publishStatus === "Yes");
+  ok("[LKG-e2e] summary counts the retained-LKG account in lkgCount (not waitingCount, not a false success)",
+    p.summary.lkgCount === 1 && p.summary.waitingCount === 0 && p.summary.publishYes < p.summary.publishTotal);
 }
 
 // ============================ (E4) reportHasActiveLivePublisher: registry-derived, superseded ppc excluded ============================

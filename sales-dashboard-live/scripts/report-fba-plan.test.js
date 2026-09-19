@@ -196,6 +196,7 @@ const EXPECTED = {
   ],
   accountSkus: ["SKU-1"],
   accountSkuDirectory: [{ sku: "SKU-1", childAsin: "ASIN1", productName: "Widget", brand: "Acme", marketplace: "US", provenance: "inventory" }],
+  skuAsinConflicts: [], // no SKU maps to >1 child ASIN in this fixture (Fix B: the field is present + empty when clean)
   catalogByAsin: { ASIN1: { brand: "Acme", productName: "Widget" }, ASIN2: { brand: "Beta", productName: "Gadget" } },
   inventoryByBrandCountry: [{ country: "US", brand: "Acme", fbaAvailable: 100, skuCount: 1 }],
 };
@@ -244,15 +245,37 @@ test("fba-plan: accountSkus is the FULL SKU universe -- includes multi-SKU ASINs
   assert.equal(p.catalogByAsin.ASIN9, undefined, "ASIN9 absent from the catalog -> not a valid manual-SKU ASIN");
 });
 
-test("fba-plan: a SKU mapped to CONFLICTING child ASINs across sources BLOCKS the snapshot (last-known-good preserved)", () => {
-  // Inventory says SKU-1 -> ASIN1; AWD says SKU-1 -> ASIN2. Two different nonblank ASINs for one SKU is unresolvable
-  // identity -> a typed account-level derive refusal (never a silent inventory>AWD>sales priority pick).
+test("fba-plan: a SKU mapped to CONFLICTING child ASINs DERIVES with that SKU flagged ambiguous (Fix B: no longer blocks the account)", () => {
+  // Inventory says SKU-1 -> ASIN1; AWD says SKU-1 -> ASIN2. Two different nonblank ASINs for one SKU is an ambiguous
+  // IDENTITY (a relisted product), not an account-fatal integrity error. It now DERIVES: the per-ASIN plan is keyed by
+  // each row's own ASIN, and SKU-1's directory entry is disambiguated HONESTLY -- childAsin=null (never a silent
+  // inventory>AWD>sales pick), asinAmbiguous:true, surfaced in skuAsinConflicts. LKG is never blanked by this.
   const inv = [{ date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-1", available: 5 }];
   const awd = [{ marketplace_country_code: "US", child_asin: "ASIN2", sku: "SKU-1", awd_available_distributable_quantity: 3 }];
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: inv, awdRows: awd });
   const res = deriveFba(planned, rows);
-  assert.equal(res.status, "invalid");
-  assert.equal(res.payload, null, "conflicting identity -> no snapshot; last-known-good preserved");
+  assert.equal(res.status, "derived", "an ambiguous SKU identity no longer blocks the account");
+  const e = res.payload.accountSkuDirectory.find((x) => x.sku === "SKU-1");
+  assert.ok(e && e.childAsin === null && e.asinAmbiguous === true, "SKU-1 flagged ambiguous, childAsin null (never a silent pick between ASIN1/ASIN2)");
+  const conf = res.payload.skuAsinConflicts.find((c) => c.sku === "SKU-1");
+  assert.deepEqual(conf && conf.asins, ["ASIN1", "ASIN2"], "the conflict is surfaced with both ASINs (sorted, honest)");
+});
+
+test("fba-plan: a SKU relisted across 3+ ASINs surfaces ALL ASINs in skuAsinConflicts (not just two) + stays ambiguous", () => {
+  // MINOR fix: the conflict list accumulates EVERY distinct ASIN for a SKU, so a SKU seen under 3 ASINs is fully
+  // surfaced (not truncated to the first two). The SKU is still flagged ambiguous + excluded as a representative.
+  const inv = [
+    { date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-3X", available: 1 },
+    { date: "2025-08-06", child_asin: "ASIN2", sku: "SKU-3X", available: 1 },
+  ];
+  const awd = [{ marketplace_country_code: "US", child_asin: "ASIN3", sku: "SKU-3X", awd_available_distributable_quantity: 1 }];
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: inv, awdRows: awd });
+  const res = deriveFba(planned, rows);
+  assert.equal(res.status, "derived");
+  const conf = res.payload.skuAsinConflicts.find((c) => c.sku === "SKU-3X");
+  assert.deepEqual(conf && conf.asins, ["ASIN1", "ASIN2", "ASIN3"], "all THREE ASINs surfaced (sorted), not just the first two");
+  const e = res.payload.accountSkuDirectory.find((x) => x.sku === "SKU-3X");
+  assert.ok(e && e.childAsin === null && e.asinAmbiguous === true, "the 3-ASIN SKU is flagged ambiguous, childAsin null");
 });
 
 test("fba-plan: IDENTICAL child ASINs across sources are NOT a conflict (derives cleanly)", () => {
@@ -778,11 +801,12 @@ test("sanitizeReportDiagnostic: defense-in-depth REDACTION matrix -- consumes th
   assert.equal(sanitizeReportDiagnostic(null), "derivation failed", "nullish -> stable fallback label");
 });
 
-test("fba-plan worker: a SKU-conflict exception (SKU carrying a punctuation/space synthetic secret) records the SAFE CODE, never the raw value (defect 3, Codex finding 1)", async () => {
-  // Route the REAL FBA_PLAN_SKU_ASIN_CONFLICT through runReportJobs -- two inventory rows, SAME SKU, distinct ASINs,
-  // available=1, valid D-1 day. The SKU carries a synthetic secret WITH punctuation + a space (Codex's threat shape).
-  // The safe-diagnostic contract persists the throw's SAFE code (FBA_PLAN_SKU_ASIN_CONFLICT), NEVER the raw message
-  // that interpolated the SKU + ASINs -- so no value or suffix can survive. NO real secret used.
+test("fba-plan worker: a SKU mapping to two child ASINs (relisting) DERIVES with the SKU flagged ambiguous -- it no longer BLOCKS the whole account, and the SKU never enters a failure/diagnostic", async () => {
+  // Fix B: a SKU seen under two DIFFERENT child ASINs (a legitimate relisted/replaced product; isolation guarantees
+  // these are all THIS account's rows) is a per-SKU identity AMBIGUITY, not an account-fatal integrity error. It must
+  // now DERIVE (the per-ASIN plan is keyed by each row's own ASIN, unaffected) with the conflicting SKU disambiguated
+  // HONESTLY: childAsin=null (never a silent pick), asinAmbiguous:true, and surfaced in payload.skuAsinConflicts. Since
+  // nothing throws, the SKU (even one carrying a synthetic secret) never enters a recorded failure/diagnostic at all.
   const secretSku = 'password="alpha!PRIVATE_SUFFIX"';
   const conflictInv = [
     { date: ASOF, child_asin: "B012345678", sku: secretSku, available: 1, marketplace_country_code: "US" },
@@ -790,20 +814,30 @@ test("fba-plan worker: a SKU-conflict exception (SKU carrying a punctuation/spac
   ];
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: conflictInv, awdRows: AWD });
   const base = capturingReportPlan(planned, rows);
-  let saveCalls = 0; const saveSnapshot = async () => { saveCalls += 1; return { paramsHash: "ph" }; };
+  let saveCalls = 0; let savedPayload = null;
+  const saveSnapshot = async (a) => { saveCalls += 1; savedPayload = a.payload; return { paramsHash: "ph" }; };
   await runReportJobs({ store: base.store, cycleId: "cycSku", sourceRows: base.sourceRows, saveSnapshot, plannedReports: [base.plannedReport], loadDerivedContext: base.loadDerivedContext });
-  assert.equal(saveCalls, 0, "no snapshot saved for the conflict (integrity) invalid");
-  assert.equal(base.failures.length, 1);
-  assert.equal(base.failures[0].code, "DERIVE_INVALID", "a SKU/ASIN conflict is a genuine integrity error (terminal)");
-  const msg = base.failures[0].message;
-  assert.equal(msg, "FBA_PLAN_SKU_ASIN_CONFLICT", "the recorded message is the throw's SAFE classification CODE, not the raw exception");
-  assert.ok(!/PRIVATE_SUFFIX|alpha|password|B012345678|B087654321/.test(msg), "no synthetic secret, suffix, keyword, or ASIN survives (excluded by construction, not by regex)");
-  assert.ok(msg.length > 0 && msg.length <= 300, "bounded");
+  assert.equal(base.failures.length, 0, "a SKU-ASIN ambiguity no longer BLOCKS the account (Fix B): it derives");
+  assert.equal(saveCalls, 1, "the plan IS saved (the account is no longer blanked for weeks by 2 relisted SKUs)");
+  const dir = savedPayload.accountSkuDirectory.find((e) => e.sku === secretSku);
+  assert.ok(dir && dir.childAsin === null && dir.asinAmbiguous === true, "the conflicting SKU stays in the directory but its ASIN identity is null + flagged ambiguous (never a silent priority pick)");
+  const conf = (savedPayload.skuAsinConflicts || []).find((c) => c.sku === secretSku);
+  assert.ok(conf && conf.asins.includes("B012345678") && conf.asins.includes("B087654321"), "the conflict is surfaced with BOTH ASINs (honest ambiguity, not hidden)");
+  // The per-ASIN plan rows for both real ASINs are present (unaffected by the SKU-identity ambiguity; each has FBA
+  // inventory so neither is dropped as zero-activity). Plan rows key the ASIN on the `asin` field.
+  const asinsInRows = new Set(savedPayload.rows.map((r) => r.asin));
+  assert.ok(asinsInRows.has("B012345678") && asinsInRows.has("B087654321"), "both ASINs still produce their own per-ASIN plan rows");
+  // The ambiguous SKU is NEVER a row's representative `sku` -- otherwise the client (planWarehouseBySku, keyed by SKU)
+  // would attribute one physical seller-warehouse pool to BOTH ASIN rows (a double-count). Both rows here have only the
+  // ambiguous SKU, so both drop to sku=null.
+  const conflictRows = savedPayload.rows.filter((r) => r.asin === "B012345678" || r.asin === "B087654321");
+  assert.ok(conflictRows.length === 2 && conflictRows.every((r) => r.sku !== secretSku), "the ambiguous SKU never represents an ASIN row (no seller-warehouse double-count vector)");
 });
 
-test("fba-plan worker: an ARBITRARY keyword-less bare-secret SKU cannot leak -- the safe contract (not the redactor) protects it (defect 3, Codex finding 1)", async () => {
-  // A bare secret in a SKU (no credential keyword, hyphenated, no digit) is exactly what a redactor CANNOT catch --
-  // proving the safe-diagnostic contract (persist the code, never the raw message) is the real boundary.
+test("fba-plan worker: a bare-secret-carrying conflicting SKU is handled as normal access-controlled payload (directory/conflicts), never a fabricated ASIN pick and never a diagnostic", async () => {
+  // A SKU is legitimate report payload (already in accountSkus/rows). Fix B places a conflicting SKU only in the
+  // access-controlled payload (accountSkuDirectory with childAsin=null + skuAsinConflicts) -- never fabricating an ASIN
+  // and never emitting a failure/diagnostic. So no NEW leak surface is introduced by removing the hard block.
   const bareSecretSku = "my-secret-passphrase-value";
   const conflictInv = [
     { date: ASOF, child_asin: "B012345678", sku: bareSecretSku, available: 1, marketplace_country_code: "US" },
@@ -811,11 +845,12 @@ test("fba-plan worker: an ARBITRARY keyword-less bare-secret SKU cannot leak -- 
   ];
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: conflictInv, awdRows: AWD });
   const base = capturingReportPlan(planned, rows);
-  const saveSnapshot = async () => ({ paramsHash: "ph" });
+  let savedPayload = null; const saveSnapshot = async (a) => { savedPayload = a.payload; return { paramsHash: "ph" }; };
   await runReportJobs({ store: base.store, cycleId: "cycBare", sourceRows: base.sourceRows, saveSnapshot, plannedReports: [base.plannedReport], loadDerivedContext: base.loadDerivedContext });
-  assert.equal(base.failures.length, 1);
-  assert.equal(base.failures[0].message, "FBA_PLAN_SKU_ASIN_CONFLICT", "the code is persisted; the bare-secret SKU never reaches the durable message");
-  assert.ok(!/my-secret-passphrase-value/.test(base.failures[0].message), "the arbitrary bare-secret SKU does NOT leak (safe contract, not redaction)");
+  assert.equal(base.failures.length, 0, "no failure/diagnostic is produced (the SKU never enters an error path)");
+  const dir = savedPayload.accountSkuDirectory.find((e) => e.sku === bareSecretSku);
+  assert.ok(dir && dir.childAsin === null, "no ASIN is fabricated for the ambiguous SKU (childAsin stays null)");
+  assert.ok((savedPayload.skuAsinConflicts || []).some((c) => c.sku === bareSecretSku), "the conflict is surfaced in the access-controlled payload, honestly");
 });
 
 // A two-cycle-aware store (report jobs keyed by cycleId; snapshots are cross-cycle LKG) to prove the natural

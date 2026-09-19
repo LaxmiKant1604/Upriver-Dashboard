@@ -760,7 +760,7 @@ export function fbaPlanPayload({
   //     dropped or warehouse-only SKU keeps its identity + canonical brand. Used as an authorization allowlist + an
   //     identity map; never fabricates a plan number. A SKU maps to exactly one child ASIN.
   const skuDir = new Map();
-  const skuAsinConflicts = new Map(); // sku -> {a, b}  (two DIFFERENT nonblank ASINs seen for one SKU)
+  const skuAsinConflicts = new Map(); // sku -> Set<childAsin>  (ALL distinct nonblank ASINs seen for one SKU, when >1)
   const putSku = (sku, asin, marketplace, provenance, invName) => {
     const s = String(sku || "").trim();
     if (!s) return;
@@ -768,9 +768,14 @@ export function fbaPlanPayload({
     const mkt = String(marketplace || "").trim().toUpperCase() || null;
     let e = skuDir.get(s);
     if (!e) { e = { sku: s, childAsin: a, productName: null, brand: null, marketplace: mkt, provenance }; skuDir.set(s, e); }
-    // Identity conflict: a SKU mapped to two DIFFERENT nonblank child ASINs across sources. Blank -> nonblank is fine;
-    // identical is fine. Two different nonblank ASINs is an unresolvable identity error (never a silent priority pick).
-    if (e.childAsin && a && a !== e.childAsin) { if (!skuAsinConflicts.has(s)) skuAsinConflicts.set(s, { a: e.childAsin, b: a }); }
+    // Identity conflict: a SKU mapped to two (or more) DIFFERENT nonblank child ASINs across sources. Blank -> nonblank
+    // is fine; identical is fine. Accumulate EVERY distinct ASIN (not just the first two) so a SKU relisted across 3+
+    // ASINs is fully surfaced. Never a silent priority pick -- the ambiguity is downgraded (below) to a per-SKU unknown.
+    if (e.childAsin && a && a !== e.childAsin) {
+      let set = skuAsinConflicts.get(s);
+      if (!set) { set = new Set([e.childAsin]); skuAsinConflicts.set(s, set); }
+      set.add(a);
+    }
     if (!e.childAsin && a) e.childAsin = a;
     if (!e.marketplace && mkt) e.marketplace = mkt;
     const ca = e.childAsin;
@@ -784,11 +789,27 @@ export function fbaPlanPayload({
   if (awdOn) for (const r of awdRows || []) { const mkt = canonicalAwdMarketplace(r.marketplace_country_code); if (mkt && awdMarket && mkt !== awdMarket) continue; putSku(r.sku, r.child_asin, awdMarket || mkt, "awd", null); }
   for (const arr of completedUnitRows || []) for (const r of arr || []) putSku(r?.sku, r?.child_asin, marketCountry, "sales", null);
   for (const r of mtdUnitRows || []) putSku(r?.sku, r?.child_asin, marketCountry, "sales", null);
-  if (skuAsinConflicts.size > 0) {
-    const [sku, c] = [...skuAsinConflicts.entries()][0];
-    const err = new Error(`fba-plan: SKU ${sku} maps to conflicting child ASINs (${c.a} vs ${c.b}) across sources; snapshot blocked (last-known-good preserved).`);
-    err.code = "FBA_PLAN_SKU_ASIN_CONFLICT";
-    throw err;
+  // A SKU that maps to two DIFFERENT nonblank child ASINs is an AMBIGUOUS identity -- most commonly a SKU relisted /
+  // replaced across ASINs over time (a legitimate seller scenario; isolation already guarantees every row here is THIS
+  // account's own, so it is NEVER cross-account contamination). This must NOT blank the entire account's FBA plan: the
+  // accountSkuDirectory is only an identity/authorization allowlist ("never fabricates a plan number") and the per-ASIN
+  // plan rows below are keyed by each row's OWN child ASIN, so they are unaffected by a SKU-identity ambiguity. We
+  // therefore DISAMBIGUATE HONESTLY rather than throw: the conflicting SKU stays in the directory but its ASIN-derived
+  // identity (childAsin/brand/productName) is cleared to null -- NEVER a silent priority pick between the two ASINs --
+  // and flagged asinAmbiguous with its conflicting ASINs, and the conflicts are surfaced in the payload for the operator.
+  // (This replaces the former FBA_PLAN_SKU_ASIN_CONFLICT hard block, which left such accounts with a stale plan for
+  // weeks. Cross-account/cross-marketplace/window integrity is still fail-closed elsewhere; only this SKU-identity
+  // ambiguity is downgraded from account-fatal to a per-SKU honest-unknown.)
+  const skuAsinConflictList = [...skuAsinConflicts.entries()]
+    .map(([sku, set]) => ({ sku, asins: [...set].filter(Boolean).map(String).sort() }))
+    .sort((x, y) => x.sku.localeCompare(y.sku));
+  // The set of ambiguous SKUs. A SKU appears under >1 ASIN in skusByAsin IFF it is here, so excluding these from a
+  // row's REPRESENTATIVE sku (below) guarantees no SKU represents more than one ASIN row -- which is what prevents the
+  // client from attributing a single physical seller-warehouse pool (keyed by SKU) to two ASIN rows (a double-count).
+  const conflictedSkus = new Set(skuAsinConflicts.keys());
+  for (const sku of conflictedSkus) {
+    const e = skuDir.get(sku);
+    if (e) { e.childAsin = null; e.brand = null; e.productName = null; e.asinAmbiguous = true; }
   }
   const accountSkuDirectory = [...skuDir.values()].sort((a, b) => a.sku.localeCompare(b.sku));
 
@@ -796,7 +817,12 @@ export function fbaPlanPayload({
   const rows = [];
   for (const asin of asinSet) {
     const inv = invByAsin[asin] || null;
-    const skus = skusByAsin[asin] ? [...skusByAsin[asin]].sort((a, b) => a.localeCompare(b)) : [];
+    // Exclude AMBIGUOUS SKUs (seen under >1 ASIN) from the representative-SKU pick: their child-ASIN identity is
+    // unresolvable, so the client must not attribute their (SKU-keyed) seller-warehouse quantity to THIS ASIN row --
+    // doing so would double-count one physical pool across the relisted product's two ASIN rows. A non-ambiguous SKU
+    // maps to exactly one ASIN, so this never removes a SKU that legitimately represents this ASIN alone. When every
+    // SKU for the ASIN is ambiguous, the representative is null (no per-ASIN warehouse/override attribution) -- honest.
+    const skus = (skusByAsin[asin] ? [...skusByAsin[asin]] : []).filter((s) => !conflictedSkus.has(s)).sort((a, b) => a.localeCompare(b));
     const unitsByMonth = {};
     let salesTotal = 0;
     for (const mo of completed) {
@@ -856,6 +882,10 @@ export function fbaPlanPayload({
     rows,
     accountSkus: accountSkuDirectory.map((e) => e.sku), // backward compat for readers of the old string-only allowlist
     accountSkuDirectory,
+    // SKUs whose child-ASIN identity is ambiguous (the same SKU seen under >1 child ASIN, e.g. a relisted product). The
+    // per-ASIN plan rows are unaffected; these SKUs simply carry childAsin=null in the directory. Surfaced (safe: the
+    // account's own SKU + its own ASINs) so the ambiguity is honest, never a silent pick and never an account-fatal block.
+    skuAsinConflicts: skuAsinConflictList,
     // Org-wide Product Catalog ASIN -> brand/name. ENRICHES manual/warehouse SKUs + proves an ASIN exists; it does NOT
     // prove account membership (that is the account-scoped directory above).
     catalogByAsin: Object.fromEntries([...catalogAsinSet].map((a) => [a, { brand: brandByAsin.get(a) || null, productName: nameByAsin.get(a) || null }])),
