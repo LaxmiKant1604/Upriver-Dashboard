@@ -363,6 +363,19 @@ if (!dryRun) {
   if (!cron.ok) { console.error("STOP OLI_RECONCILE: " + cron.reason + " -- fail closed."); process.exit(1); }
 }
 
+// DR1/DR4 self-heal PRE-PASS (LIVE only): reclaim stale-failed, no-real-export priority-partial Catalog jobs left
+// TERMINAL by a PRE-DR1 cold-cache pass, so THIS pass can ADOPT them from the validated durable snapshot and converge
+// with ZERO exports instead of fast-deferring forever on a stuck failed job. The RPC is snapshot-gated and scoped to the
+// reconciler's OWN `priority-partial-<bucket>-%` cycle namespace (scheduled cycles are never touched); it is a no-op (0)
+// on a clean bucket and IDEMPOTENT. Fail-soft: any error (e.g. the RPC not yet deployed under expand-first rollout) just
+// logs and proceeds -- a stuck job simply defers as before. Reversible kill-switch: DURABLE_CATALOG_ADOPTION=off.
+if (!dryRun && String(process.env.DURABLE_CATALOG_ADOPTION || "on").toLowerCase() !== "off") {
+  try {
+    const reclaimed = await sb.reclaimStalePriorityCatalogJobs(bucket);
+    if (reclaimed > 0) console.log(`oli-reconcile: reclaimed ${reclaimed} stale-failed priority-partial Catalog job(s) for re-adoption from the durable snapshot (zero exports).`);
+  } catch (e) { console.log("oli-reconcile: catalog reclaim pre-pass skipped (" + (e && e.message ? e.message : e) + ") -- proceeding; a stuck job simply defers as before."); }
+}
+
 const out = await reconciler.run({ bucket, requestedAsOf: asOf, accountIds: accountsArg.length ? accountsArg : null, mode, dryRun });
 
 ghOut("outcome", out.outcome || "unknown");

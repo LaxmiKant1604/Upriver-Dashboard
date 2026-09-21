@@ -2200,6 +2200,21 @@ export async function adoptDurableCatalogSnapshot({ cycleId, requestHash, organi
   return typeof value === "string" ? value : null;
 }
 
+// reclaim_stale_priority_catalog_jobs (DR1/DR4 self-heal): the AUDITED, snapshot-gated recovery that resets stale-failed,
+// no-real-export product-catalog jobs in the reconciler's OWN `priority-partial-<bucket>-%` cycle namespace back to a
+// re-adoptable pending state (only where a VALIDATED durable org Catalog snapshot exists). Returns the number of jobs
+// reclaimed (0 when there is nothing stale). NEVER touches scheduled cycles; never resets a job that made a real export.
+export async function reclaimStalePriorityCatalogJobs(bucket, { signal = null } = {}) {
+  const body = await request("/rest/v1/rpc/reclaim_stale_priority_catalog_jobs", {
+    method: "POST",
+    signal,
+    body: { p_bucket: bucket },
+  });
+  const value = Array.isArray(body) ? body[0] : body;
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
 // assign_source_account_batch (Blocker 4): STABLE, transactional <=5 batch assignment. Returns the
 // (existing or newly assigned) batch_index for (family, account). An already-assigned account keeps its
 // index (never reshuffled); a new account is placed into a non-full or fresh batch under the 5-cap.
