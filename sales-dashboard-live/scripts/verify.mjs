@@ -104,6 +104,7 @@ const SUITES = [
   "test:durable-catalog-adoption-migration",
   "test:reclaim-stale-catalog-jobs-migration",
   "test:resume-stalled-catalog-migration",
+  "test:report-publication-outbox-migration",
   "test:oli-continuation-ceiling",
   "test:oli-dependent-reports",
   "test:oli-publication-revision",

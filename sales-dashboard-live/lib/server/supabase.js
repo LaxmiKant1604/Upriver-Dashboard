@@ -2200,6 +2200,40 @@ export async function adoptDurableCatalogSnapshot({ cycleId, requestHash, organi
   return typeof value === "string" ? value : null;
 }
 
+// DR2 TRANSACTIONAL OUTBOX (report_publication_outbox). claim: FOR UPDATE SKIP LOCKED lease claim of a batch of pending
+// (or lease-expired) rows; returns the claimed rows (each {id, account_id, source_key, requested_as_of, attempts, ...}).
+// complete: mark a claimed row 'done' unless a newer persist re-armed it (owner-fenced by claim_token) -> 'done' |
+// 're-armed' | 'not-owner'. release: return a NOT-published (deferred/failed) claim to 'pending' for re-claim next pass.
+// The drain reuses the ZERO-EXPORT reconciler; the report_snapshots freshness CAS makes a re-drain idempotent.
+export async function claimReportPublicationOutbox({ limit = 25, claimToken, leaseSeconds = 900, maxAttempts = 8 }, { signal = null } = {}) {
+  const body = await request("/rest/v1/rpc/claim_report_publication_outbox", {
+    method: "POST",
+    signal,
+    body: { p_limit: limit, p_claim_token: claimToken, p_lease_seconds: leaseSeconds, p_max_attempts: maxAttempts },
+  });
+  return Array.isArray(body) ? body : [];
+}
+
+export async function completeReportPublicationOutbox({ id, claimToken, doneAsOf }, { signal = null } = {}) {
+  const body = await request("/rest/v1/rpc/complete_report_publication_outbox", {
+    method: "POST",
+    signal,
+    body: { p_id: id, p_claim_token: claimToken, p_done_as_of: doneAsOf },
+  });
+  const value = Array.isArray(body) ? body[0] : body;
+  return typeof value === "string" ? value : null;
+}
+
+export async function releaseReportPublicationOutbox({ id, claimToken, lastError = null }, { signal = null } = {}) {
+  const body = await request("/rest/v1/rpc/release_report_publication_outbox", {
+    method: "POST",
+    signal,
+    body: { p_id: id, p_claim_token: claimToken, p_last_error: lastError },
+  });
+  const value = Array.isArray(body) ? body[0] : body;
+  return typeof value === "string" ? value : null;
+}
+
 // reclaim_stale_priority_catalog_jobs (DR1/DR4 self-heal): the AUDITED, snapshot-gated recovery that resets stale-failed,
 // no-real-export product-catalog jobs in the reconciler's OWN `priority-partial-<bucket>-%` cycle namespace back to a
 // re-adoptable pending state (only where a VALIDATED durable org Catalog snapshot exists). Returns the number of jobs

@@ -32,6 +32,7 @@
     "test:durable-catalog-adoption-migration": "node scripts/durable-catalog-adoption-migration.test.js",
     "test:reclaim-stale-catalog-jobs-migration": "node scripts/reclaim-stale-catalog-jobs-migration.test.js",
     "test:resume-stalled-catalog-migration": "node scripts/resume-stalled-catalog-migration.test.js",
+    "test:report-publication-outbox-migration": "node scripts/report-publication-outbox-migration.test.js",
     "test:oli-continuation-ceiling": "node scripts/oli-continuation-ceiling.test.js",
     "test:oli-dependent-reports": "node scripts/oli-dependent-reports.test.js",
     "test:oli-publication-revision": "node scripts/oli-publication-revision.test.js",

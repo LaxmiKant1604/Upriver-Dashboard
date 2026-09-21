@@ -48,6 +48,11 @@ on:
         required: false
         default: ""
         type: string
+      outbox_drain:
+        description: "DR2: drain the transactional report_publication_outbox (restrict to enqueued accounts) instead of the all-accounts poll. No-op until the outbox gate (publication_outbox_control.enabled) is turned on."
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   # ONE reconcile pass at a time (the control-plane lease is global). A delayed/overlapping tick QUEUES rather than
@@ -112,14 +117,18 @@ jobs:
           ASOF="$(date -u -d 'yesterday' +%F)"
           echo "asof=$ASOF" >> "$GITHUB_OUTPUT"; echo "only=$ONLY" >> "$GITHUB_OUTPUT"; echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           LIVE=""; if [ "$MODE" = "live" ]; then LIVE="--live"; fi
+          # DR2: --outbox-drain (dispatch-only) restricts the pass to accounts enqueued in report_publication_outbox by the
+          # source_coverage persist trigger. A no-op until the outbox gate is enabled; the SCHEDULED run never sets it (it
+          # stays the all-accounts backstop poll).
+          DRAIN=""; if [ "${{ github.event.inputs.outbox_drain }}" = "true" ]; then DRAIN="--outbox-drain"; fi
           rc=0
           for REGION in india europe-au us-ca; do
             if [ -n "$ONLY" ] && [ "$ONLY" != "$REGION" ]; then echo "skip $REGION (dispatch restricted to $ONLY)"; continue; fi
-            echo "::group::oli-reconcile $REGION mode=$MODE as-of=$ASOF"
+            echo "::group::oli-reconcile $REGION mode=$MODE as-of=$ASOF drain=${DRAIN:-none}"
             # --deadline-seconds=330 makes the reconciler stop new accounts + bound the in-flight one + safe-close BEFORE
             # the 420s hard kill (cooperative reserve). The SEPARATE always() cleanup job below reclaims + proves the
             # control plane closed if a region was still hard-killed (a step here would be killed with the job).
-            timeout 420 node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=330 $LIVE || { echo "region $REGION reconcile exited nonzero (isolated; continuing)"; rc=1; }
+            timeout 420 node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=330 $LIVE $DRAIN || { echo "region $REGION reconcile exited nonzero (isolated; continuing)"; rc=1; }
             echo "::endgroup::"
           done
           exit $rc

@@ -376,7 +376,52 @@ if (!dryRun && String(process.env.DURABLE_CATALOG_ADOPTION || "on").toLowerCase(
   } catch (e) { console.log("oli-reconcile: catalog reclaim pre-pass skipped (" + (e && e.message ? e.message : e) + ") -- proceeding; a stuck job simply defers as before."); }
 }
 
-const out = await reconciler.run({ bucket, requestedAsOf: asOf, accountIds: accountsArg.length ? accountsArg : null, mode, dryRun });
+// DR2 TRANSACTIONAL-OUTBOX DRAIN (LIVE only): claim the pending outbox rows (report_publication_outbox, enqueued IN the
+// persist transaction by the source_coverage trigger) and restrict THIS pass to exactly the enqueued accounts, so a
+// persisted advance publishes with LOW LATENCY instead of waiting for the daily all-accounts poll. The reconciler's own
+// discovery bucket-filters the claimed accounts (a claimed account in another region is simply not in scope this pass and
+// is RELEASED for that region's drain). Fail-soft + expand-first: the outbox is GATED OFF by default (the trigger no-ops),
+// so with no enqueued rows the drain claims nothing and the reconciler behaves EXACTLY as the periodic poll. The
+// report_snapshots freshness CAS makes a re-drain of an already-current account a no-op (idempotent, at-least-once).
+const outboxDrain = process.argv.includes("--outbox-drain");
+let claimedOutbox = [];
+const outboxClaimToken = "outbox-" + bucket + "-" + asOf + "-" + Math.random().toString(36).slice(2, 10);
+if (!dryRun && outboxDrain) {
+  try {
+    claimedOutbox = await sb.claimReportPublicationOutbox({ limit: 500, claimToken: outboxClaimToken, leaseSeconds: 900, maxAttempts: 8 });
+    console.log(`oli-reconcile: outbox drain claimed ${claimedOutbox.length} pending row(s).`);
+  } catch (e) { console.log("oli-reconcile: outbox claim skipped (" + (e && e.message ? e.message : e) + ") -- proceeding as a periodic poll."); claimedOutbox = []; }
+}
+const drainAccountIds = outboxDrain ? [...new Set(claimedOutbox.map((r) => String(r.account_id)))] : null;
+
+const out = await reconciler.run({ bucket, requestedAsOf: asOf, accountIds: outboxDrain ? drainAccountIds : (accountsArg.length ? accountsArg : null), mode, dryRun });
+
+// Complete the outbox rows for accounts whose reports are now published/current; RELEASE the rest (deferred/failed OR
+// belonging to another region) so they are re-claimed next pass. completeReportPublicationOutbox RE-ARMS a row whose
+// requested_as_of advanced past this pass's as-of (a newer persist mid-flight) -> never lost.
+if (!dryRun && outboxDrain && claimedOutbox.length) {
+  const PUBLISHED = new Set(["READBACK_VERIFIED", "PUBLISHED_LIVE", "PUBLICATION_NOT_REQUIRED"]);
+  const publishedAccounts = new Set();
+  for (const rec of (out.perAccount || [])) {
+    const reports = rec.reports || {};
+    const keys = Object.keys(reports);
+    if (keys.length > 0 && keys.every((rk) => PUBLISHED.has(String(reports[rk] && reports[rk].state)))) publishedAccounts.add(String(rec.accountId));
+  }
+  let drained = 0, released = 0, rearmed = 0;
+  for (const row of claimedOutbox) {
+    const acc = String(row.account_id);
+    try {
+      if (publishedAccounts.has(acc)) {
+        const ack = await sb.completeReportPublicationOutbox({ id: row.id, claimToken: outboxClaimToken, doneAsOf: asOf });
+        if (ack === "re-armed") rearmed += 1; else drained += 1;
+      } else {
+        await sb.releaseReportPublicationOutbox({ id: row.id, claimToken: outboxClaimToken, lastError: "not-published-this-pass (deferred/failed/other-region)" });
+        released += 1;
+      }
+    } catch (_e) { /* fail-soft: the lease expiry re-claims it */ }
+  }
+  console.log(`oli-reconcile: outbox drain done=${drained} re-armed=${rearmed} released=${released}.`);
+}
 
 ghOut("outcome", out.outcome || "unknown");
 ghOut("published_count", String(out.counts ? out.counts.targetsPublished : 0));
