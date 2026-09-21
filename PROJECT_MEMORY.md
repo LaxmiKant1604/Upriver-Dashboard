@@ -1,5 +1,44 @@
 # Project Memory
 
+## Publication convergence P0 -- PARTIAL fix shipped + europe-au repaired; permanent automatic-convergence is migration-gated (2026-09-21)
+
+INCIDENT. Exported/saved reports were not reaching the dashboard. FULL diagnosis (8-agent pipeline map + live evidence):
+(1) NO transactional outbox -- publication work (sync_report_jobs) is created only at DERIVE time behind the
+globalDrained gate, never at persist, so any stall/defer/crash leaves nothing to resume. (2) The zero-export OLI
+publication reconciler BACKSTOP (cron daily, OLI_RECONCILE_LIVE=true) DEFERS ~all dependents whenever the org Product
+Catalog's 24h EXPORT cache is cold (proven: cron runs 09-17..20 all FAILED; a manual run deferred 96/96 published 0),
+because its noExport adapter cannot re-export the catalog and the derive/finalize gate (source-priority-dashboards.js:370)
+requires a SUCCEEDED catalog job -- EVEN THOUGH the durable source_snapshots catalog is FRESH (the read-path self-heal
+uses it fine). (3) europe-au scheduler stalled 09-07..16 (zombie 'running' cycles, never reaped), recovered 09-17..20,
+but today's forward pass failed. (4) The live completeness label could exceed the served snapshot window (stale LKG +
+newer "Final through" banner). Indya Store IN provisional = TRUTHFUL (Amazon itemization lag). Premium-Avenue IT recent
+days genuinely final/itemized=0 (TZ-shifted completeness dates).
+
+SHIPPED (commit 9953cc7, PUSHED origin/main, DEPLOYED prod upriverdashboard.vercel.app dpl_5D9TMu4, live-verified).
+STEP 0: the completeness freshness label is CLAMPED to the served snapshot window (report-store.js passes servedTo=
+snapshot.params.to; oli-completeness-serve.js clamps finalizedThrough/latestDate/provenThrough, surfaces
+completenessHorizon+behindServedTo+updating). Freshness can never exceed served values (invariant #8). +3 clamp tests;
+verify 230/202 green. Live smoke PASS (flexii: servedTo=09-15 -> label clamped to 09-15, horizon 09-20 surfaced).
+
+REPAIR (zero-export, creates=0/tokens=0). backfill-daily-v2.mjs --asOfCeiling=2026-09-20 BACKFILL_APPLY=1 re-derived +
+published daily-reporting for all 51 accounts from the FRESH durable snapshot (the self-heal path, NOT the cold cache):
+51/51 published, 0 failed. europe-au daily-reporting now 32/32 CONVERGED (snap==proven 2026-09-20). Sales Dashboard/
+Daily restored for the stalled region WITHOUT a page load.
+
+REVERTED (regression avoided). A code-only STEP 3 (suppress the catalog deferral-stop when a durable snapshot exists) was
+implemented + reverted: the repair proved it insufficient -- suppressing the stop lets the derive run but it then fails
+`source-job-not-succeeded` (the gate requires a SUCCEEDED catalog job). No regression pushed (reset the unpushed commit).
+
+PENDING / NOT DONE (permanent automatic convergence -- do NOT call the P0 resolved):
+- CORRECT STEP 3 = the reconciler/worker must ADOPT the fresh durable source_snapshots catalog as a SUCCEEDED catalog
+  job (a new adoption CAS RPC, like adopt_source_export_cache but for source_snapshots) so it converges even when the
+  24h cache is cold. Needs a MIGRATION -> owner sign-off.
+- STEP 6 outbox (enqueue sync_report_jobs at persist time), STEP 5 stuck-cycle watchdog, migrations 20260924 (partial-
+  publish namespace) + 20260925 (content-dep republish) -- all PREPARED/UNAPPLIED, sign-off-gated.
+- brand-sales/brand-inventory for europe-au still lag (reconciler cold-cache-blocked; convergeable via backfill-brand-
+  sales or the permanent fix). sku-movement self-heals on read.
+Builds on [[flexii-false-proven-empty-oli]], [[oli-publication-reconciler]], [[europe-au-scheduler-stall]], [[daily-v2-selfheal-autoloading]].
+
 ## flexii UK OLI historical-sales RESTORED end-to-end (2026-09-21; DataDoe 50,000 ceiling confirmed; 1 export / 0 tokens; verify 230/202; commits local-only, NOT pushed)
 
 WHAT. Recovered flexii UK's (account f08cefca, GB/GBP) missing Order Line Items history that was rendering as
