@@ -176,6 +176,10 @@ export function makeDurableCatalogGuard({ inner, reservation, operationKey }) {
     },
     poll: (...a) => inner.poll(...a),
     download: (...a) => inner.download(...a),
+    // DR1: surface the inner adapter's no-export flag so the worker can (for the Catalog family only) satisfy a
+    // cold-cache Catalog job from the validated durable snapshot instead of deferring. The SCHEDULED full-region
+    // adapter has no noExport flag (=> undefined/false), so its worker path is byte-identical (it re-exports daily).
+    noExport: inner.noExport === true,
   };
 }
 
@@ -361,6 +365,9 @@ export function buildPriorityDashboardsRelease({
     // (3) source jobs: EXACTLY ONE org-scoped succeeded product-catalog job, PLUS zero-or-more succeeded
     // order-line-items jobs (a SCHEDULED cycle refreshes OLI first; the initial catalog-only go-live has none).
     // NO other source key may appear -- Ads/FBA/any unrelated family is refused. Every job must be succeeded.
+    // DR1: a 'succeeded' Catalog job may be a real export OR a durable-snapshot adoption (adoption_kind=
+    // 'durable_snapshot', proven exactly equivalent to this job's canonical request by the adopt_durable_catalog_
+    // snapshot CAS at adoption time) -- both are validated evidence, so the succeeded check accepts either.
     const srcJobs = await store.listSourceJobs(cycleId);
     if (!Array.isArray(srcJobs) || srcJobs.length < 1) return refuse("source-job-count", String(Array.isArray(srcJobs) ? srcJobs.length : "na"));
     const CATALOG_KEY = PRIORITY_DASHBOARDS.catalogSourceKey;
@@ -409,22 +416,40 @@ export function buildPriorityDashboardsRelease({
     }
 
     // (4) TOKEN/RESERVATION coherence with the Catalog job's create_export_count -- CROSS-BUCKET aware. The one
-    // org-scoped Catalog export is shared by BOTH buckets against ONE operation-wide reservation, so a bucket
-    // legitimately finalizes in either role:
-    //   create_export_count=1 -> THIS bucket made the create: the EXACT created reservation (same hash, tokens=2)
-    //                            whose export id is the one THIS job created.
-    //   create_export_count=0 -> zero tokens here, but durable cache evidence is REQUIRED, and the reservation is
-    //                            EITHER absent (true warm-cache-first) OR the OTHER bucket's EXACT created
-    //                            reservation (same hash/export/tokens=2). Any reserved-not-created / different
-    //                            hash / malformed export / wrong tokens / unrelated reservation is refused.
+    // org-scoped Catalog export is shared against ONE operation-wide reservation, so a bucket finalizes in either role:
+    //   create_export_count=1 -> THIS bucket made the create: the EXACT created reservation (THIS pass's catalog hash,
+    //                            tokens=2) whose export id is the one THIS job created. The hash-equality here is the
+    //                            double-spend guard and is REQUIRED.
+    //   create_export_count=0 -> zero tokens here; durable cache/snapshot evidence is REQUIRED, and the reservation is
+    //                            EITHER absent (true warm-cache-first) OR a PAID created reservation for THIS operation
+    //                            (created, tokens=2, a recorded export id). Its catalog_request_hash is NOT required to
+    //                            equal this pass's carrier hash: the ONE org catalog is content-identical regardless of
+    //                            which bucket's carrier (or the reconciler's per-account carrier) fetched it, the derive
+    //                            independently reads+validates the org durable snapshot, and the report's catalog lineage
+    //                            binds to that snapshot's own source_request_hash (daily-reporting-release.js), NEVER to
+    //                            this reservation. Requiring carrier-hash equality here wrongly refused a legitimate
+    //                            zero-token reuse when the SIBLING bucket created the shared export (or a directory drift
+    //                            changed the carrier) -> reservation-hash-mismatch. Reserved-not-created / malformed
+    //                            export / wrong tokens are still refused; if THIS warm job adopted an export id it must
+    //                            match the reservation's. Zero tokens are spent on this path, so dropping the hash check
+    //                            cannot enable a double spend (the cec=1 guard above is unchanged).
     const cec = Number(cj.create_export_count ?? cj.createExportCount);
     const jobExportId = S(cj.export_id ?? cj.exportId);
     const reservationRow = await reservation.get({ operationKey, catalogRequestHash: null });
-    // An EXACT created reservation for THIS operation's one Catalog export: created status, THIS catalog hash,
-    // a nonblank export id, exactly two tokens. Returns a typed refusal reason, or null when coherent.
+    // An EXACT created reservation for THIS operation's one Catalog export made by THIS pass: created status, THIS
+    // catalog hash, a nonblank export id, exactly two tokens. Returns a typed refusal reason, or null when coherent.
     const provenCreatedReservation = () => {
       if (S(reservationRow.status) !== "created") return "reservation-not-created";
       if (S(reservationRow.catalogRequestHash) !== catalogHash) return "reservation-hash-mismatch";
+      if (!nb(S(reservationRow.exportId))) return "reservation-no-export";
+      if (Number(reservationRow.tokensSpent) !== 2) return "reservation-tokens";
+      return null;
+    };
+    // A PAID created org-catalog reservation for THIS operation, carrier-hash-AGNOSTIC (see the cec=0 note above). Only
+    // valid where THIS pass spent zero tokens (cec===0); it proves the org bought exactly one Catalog export without
+    // pinning WHICH bucket's carrier hash carried it.
+    const provenPaidOrgReservation = () => {
+      if (S(reservationRow.status) !== "created") return "reservation-not-created";
       if (!nb(S(reservationRow.exportId))) return "reservation-no-export";
       if (Number(reservationRow.tokensSpent) !== 2) return "reservation-tokens";
       return null;
@@ -437,7 +462,7 @@ export function buildPriorityDashboardsRelease({
     } else if (cec === 0) {
       if (!nb(S(cj.cache_object_path ?? cj.cacheObjectPath))) return refuse("no-cache-evidence");
       if (reservationRow) {
-        const bad = provenCreatedReservation();
+        const bad = provenPaidOrgReservation();
         if (bad) return refuse(bad);
         // If THIS warm job recorded an adopted export id, it must be the SAME org export the reservation created.
         if (nb(jobExportId) && jobExportId !== S(reservationRow.exportId)) return refuse("reservation-export-mismatch");

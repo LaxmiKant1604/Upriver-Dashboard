@@ -101,6 +101,7 @@ const SUITES = [
   "test:report-contracts",
   "test:oli-source-correction",
   "test:flexii-oli-restore",
+  "test:durable-catalog-adoption-migration",
   "test:oli-continuation-ceiling",
   "test:oli-dependent-reports",
   "test:oli-publication-revision",

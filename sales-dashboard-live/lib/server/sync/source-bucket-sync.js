@@ -1060,10 +1060,44 @@ export async function runBucketSourceSync({
       const job = family.plannedJobs[0];
       const rows = await store.listSourceJobs(rollup.cycleId);
       const row = rows.find((r) => (r.request_hash ?? r.requestHash) === job.requestHash);
-      if (row && stat(row) === "succeeded") {
+      if (row && stat(row) === "succeeded" && String(row.adoption_kind ?? row.adoptionKind ?? "") === "durable_snapshot") {
+        // DR1: this catalog job was satisfied by DURABLE-SNAPSHOT adoption -- its validated snapshot already exists in
+        // source_snapshots/* (that IS the evidence it adopted, and exactly what the derive reads as
+        // evidence.catalogSnapshot). Do NOT reload from the cold 24h export cache or re-persist; the family is drained.
+        // Never a SOURCE_PAYLOAD_UNAVAILABLE here -- the durable snapshot is the last-known-good, unchanged.
+        rollup.snapshots.reusedDurableCatalog = (rollup.snapshots.reusedDurableCatalog || 0) + 1;
+      } else if (row && stat(row) === "succeeded") {
         const payload = await loadPayloadOrNull(store, job.requestHash);
-        // Finding 4: a succeeded catalog job with a lost/unreadable cached payload fails closed typed.
+        // Finding 4 + DR1: a succeeded catalog job with a lost/unreadable cached payload normally fails closed.
+        // BUT a catalog job that GENUINELY SUCCEEDED days ago (rows fetched, validated, and copied to the durable
+        // org-catalog snapshot at that time) will have long-since lost its 24h export cache. Re-persisting from that
+        // cold cache is redundant: the derive reads the durable source_snapshots catalog (evidence.catalogSnapshot),
+        // NEVER this ephemeral cache. So before failing, PROVE a fresh validated durable snapshot exists for THIS
+        // EXACT org/connection/source/scope and reuse it (the family is drained on the unchanged last-known-good).
+        // This is never a blind skip -- the snapshot must be present, read cleanly, be validated, and carry a real
+        // content object (object_path + payload_sha). A genuinely absent/unvalidated durable snapshot still fails
+        // closed. On the scheduled full-region path the cache is warm right after export, so payload is non-null and
+        // this fallback never runs (byte-identical); it is gated by the DURABLE_CATALOG_ADOPTION kill-switch too.
         if (!payload || !Array.isArray(payload.rows)) {
+          let durableCatalogReusable = false;
+          if (String(process.env.DURABLE_CATALOG_ADOPTION || "on").toLowerCase() !== "off" && store.readDurableCatalogSnapshot) {
+            try {
+              const dr = await store.readDurableCatalogSnapshot({
+                organizationFingerprint: job.organizationFingerprint,
+                connectionId: job.connectionId || "primary",
+                sourceKey: CATALOG_SOURCE_KEY, scopeKey: catalogSnapshotScope(),
+              });
+              const snap = dr && String(dr.read) === "ok" ? (dr.snapshot || null) : null;
+              durableCatalogReusable = !!(snap
+                && String(snap.object_path || "").trim() !== ""
+                && String(snap.payload_sha || "").trim() !== ""
+                && snap.validated_at);
+            } catch (_e) { durableCatalogReusable = false; }
+          }
+          if (durableCatalogReusable) {
+            rollup.snapshots.reusedDurableCatalog = (rollup.snapshots.reusedDurableCatalog || 0) + 1;
+            continue;
+          }
           rollup.stopped = true;
           rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: CATALOG_SOURCE_KEY, requestHash: job.requestHash, detail: "missing-or-malformed" });
           break;

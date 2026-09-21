@@ -2176,6 +2176,30 @@ export async function adoptSourceExportCache({ cycleId, requestHash, sourceId, o
   return typeof value === "string" ? value : null;
 }
 
+// DR1 durable Catalog evidence adoption: the ATOMIC, snapshot-validated adoption CAS (adopt_durable_catalog_snapshot).
+// Lets a noExport reconciler's org Catalog source job be satisfied by a VALIDATED durable source_snapshots snapshot that
+// PROVES exact equivalence to the job's canonical request (never a fake success). Typed ack: 'adopted' | 'not-adopted'
+// | 'snapshot-missing' | 'snapshot-mismatch' | 'snapshot-stale'. Zero DataDoe. Fails closed on any schema/read error.
+export async function adoptDurableCatalogSnapshot({ cycleId, requestHash, organizationFingerprint, connectionId = "primary", sourceKey = "product-catalog", scopeKey, objectPath, payloadSha, minValidatedAt = null }, { signal = null } = {}) {
+  const body = await request("/rest/v1/rpc/adopt_durable_catalog_snapshot", {
+    method: "POST",
+    signal,
+    body: {
+      p_cycle_id: cycleId,
+      p_request_hash: requestHash,
+      p_expected_organization_fingerprint: organizationFingerprint,
+      p_expected_connection_id: connectionId,
+      p_expected_source_key: sourceKey,
+      p_expected_scope_key: scopeKey,
+      p_expected_object_path: objectPath,
+      p_expected_payload_sha: payloadSha,
+      p_min_validated_at: minValidatedAt,
+    },
+  });
+  const value = Array.isArray(body) ? body[0] : body;
+  return typeof value === "string" ? value : null;
+}
+
 // assign_source_account_batch (Blocker 4): STABLE, transactional <=5 batch assignment. Returns the
 // (existing or newly assigned) batch_index for (family, account). An already-assigned account keeps its
 // index (never reshuffled); a new account is placed into a non-full or fresh batch under the 5-cap.

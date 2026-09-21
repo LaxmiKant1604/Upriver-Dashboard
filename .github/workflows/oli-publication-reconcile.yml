@@ -81,6 +81,9 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
       DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+      # DR1 reversible kill-switch: 'off' disables the durable-Catalog adoption path (reverts to deferring on a cold
+      # cache) without a code revert. Default 'on'. Set the repository variable DURABLE_CATALOG_ADOPTION to override.
+      DURABLE_CATALOG_ADOPTION: ${{ vars.DURABLE_CATALOG_ADOPTION || 'on' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -148,6 +151,9 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
       DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+      # DR1 reversible kill-switch: 'off' disables the durable-Catalog adoption path (reverts to deferring on a cold
+      # cache) without a code revert. Default 'on'. Set the repository variable DURABLE_CATALOG_ADOPTION to override.
+      DURABLE_CATALOG_ADOPTION: ${{ vars.DURABLE_CATALOG_ADOPTION || 'on' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

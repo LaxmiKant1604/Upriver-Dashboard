@@ -61,7 +61,8 @@ const steadyCoverage = (accounts, upTo) => Object.fromEntries(accounts.map((a) =
 /* ------------------------- in-memory store (worker + budget models) ------------------------- */
 function makeStore() {
   const cycles = new Map(); const jobsByCycle = new Map(); const ownersByCycle = new Map();
-  const cache = new Map(); const budgets = new Map(); let seq = 0;
+  const cache = new Map(); const budgets = new Map(); const snapshots = new Map(); let seq = 0;
+  const snapKey = (o, c, s, k) => [o, c, s, k].join("|");
   const counters = { claims: 0, reserves: 0 };
   const findCycle = (id) => [...cycles.values()].find((c) => c.id === id) || null;
   const ownerRows = (cid) => [...((ownersByCycle.get(cid) && ownersByCycle.get(cid).values()) || [])];
@@ -73,6 +74,10 @@ function makeStore() {
     _owners: (cid) => ownerRows(cid).map((m) => ({ ...m })),
     _seedCache(hash, entry) { cache.set(hash, { ...entry }); },
     _cache: cache,
+    // DR1 durable Catalog snapshot double: seed the org catalog snapshot evidence (source_snapshots).
+    _seedSnapshot({ organizationFingerprint = "org", connectionId = "primary", sourceKey = "product-catalog", scopeKey = "__organization", ...snap }) {
+      snapshots.set(snapKey(organizationFingerprint, connectionId, sourceKey, scopeKey), { organization_fingerprint: organizationFingerprint, connection_id: connectionId, source_key: sourceKey, scope_key: scopeKey, ...snap });
+    },
     openCycle({ bucket, cycleDate }) {
       const k = bucket + "|" + cycleDate;
       if (!cycles.has(k)) { const id = "cyc_" + (seq += 1); cycles.set(k, { id, bucket, status: "pending" }); jobsByCycle.set(id, new Map()); }
@@ -119,6 +124,30 @@ function makeStore() {
       const j = jobsByCycle.get(cycleId) && jobsByCycle.get(cycleId).get(requestHash);
       if (j && j.fetch_status === "pending" && j.attempted_at === null && j.create_export_count === 0) {
         Object.assign(j, { fetch_status: "succeeded", export_id: null, row_count: e.row_count, cache_object_path: e.object_path });
+        return "adopted";
+      }
+      return "not-adopted";
+    },
+    // DR1: read the org durable Catalog snapshot pointer (mirrors getSourceSnapshot).
+    readDurableCatalogSnapshot({ organizationFingerprint, connectionId, sourceKey, scopeKey }) {
+      const s = snapshots.get(snapKey(organizationFingerprint, connectionId, sourceKey, scopeKey));
+      return { snapshot: s ? { ...s } : null, read: "ok", error: null };
+    },
+    // DR1: the ATOMIC durable-Catalog adoption CAS (mirrors adopt_durable_catalog_snapshot). The caller's values are
+    // EXPECTATIONS; the snapshot row is authority. Adopts pending->succeeded ONLY on exact equivalence + validated.
+    adoptDurableCatalogSnapshot({ cycleId, requestHash, organizationFingerprint, connectionId, sourceKey, scopeKey, objectPath, payloadSha, minValidatedAt }) {
+      if (sourceKey !== "product-catalog") throw new Error("adopt_durable_catalog_snapshot only adopts product-catalog");
+      const s = snapshots.get(snapKey(organizationFingerprint, connectionId, sourceKey, scopeKey));
+      if (!s) return "snapshot-missing";
+      // CONTENT equivalence (not request_hash): the org's canonical catalog snapshot's content hash must match what
+      // the caller validated. The export request_hash legitimately differs (carrier/as-of) and is not compared.
+      if (s.object_path !== objectPath || s.payload_sha !== payloadSha) return "snapshot-mismatch";
+      if (!s.validated_at) return "snapshot-stale";
+      if (minValidatedAt && String(s.validated_at) < String(minValidatedAt)) return "snapshot-stale";
+      const j = jobsByCycle.get(cycleId) && jobsByCycle.get(cycleId).get(requestHash);
+      if (j && j.source_key === "product-catalog" && j.organization_fingerprint === organizationFingerprint && j.connection_id === connectionId
+          && j.fetch_status === "pending" && j.attempted_at === null && j.create_export_count === 0) {
+        Object.assign(j, { fetch_status: "succeeded", adoption_kind: "durable_snapshot", export_id: null, row_count: s.row_count, cache_object_path: s.object_path });
         return "adopted";
       }
       return "not-adopted";
@@ -191,6 +220,9 @@ function makeDataDoe(opts = {}) {
     createCount: (h) => create[h] || 0,
     totalCreates: () => Object.values(create).reduce((a, b) => a + b, 0),
     createSeq,
+    // DR1: the makeDurableCatalogGuard exposes inner.noExport for the reconciler; the spy mirrors it so the worker's
+    // durable-Catalog adoption branch fires exactly when the real reconciler's adapter would refuse to create.
+    noExport: !!opts.noExportKey,
     async create(job) {
       if (opts.failKey && (job.requestKey || "").includes(opts.failKey)) throw new Error("DataDoe create-export failed (500) here.");
       // ZERO-EXPORT reconciler no-export refusal (the makeNoExportInnerAdapter behavior): create is refused with the
@@ -587,6 +619,97 @@ test("E2c. a GENUINE Catalog failure (a real DataDoe error, NOT the no-export re
   assert.equal(rollup.stopped, true, JSON.stringify(rollup.stopReason));
   assert.equal(rollup.stopReason.code, "REQUIRED_SOURCE_FAILED", JSON.stringify(rollup.stopReason));
   assert.equal(rollup.stopReason.state.deferredPending || 0, 0, "a real DataDoe failure is NEVER counted as deferred-pending");
+});
+
+// A first deferred run reveals the deterministic canonical catalog job identity (request_hash + the org/connection
+// it carries), so the durable snapshot can be seeded on the EXACT tenant/scope/request the worker will look up.
+async function probeCatalogJob() {
+  const probe = runHarness({ pausedSources: new Set(["order-line-items", "fba-inventory-health"]), forceCatalogRefresh: true, dd: makeDataDoe({ noExportKey: "catalog" }) });
+  const rollup = await probe.run();
+  const cat = probe.store.listSourceJobs(rollup.cycleId).find((j) => j.source_key === "product-catalog");
+  return { rollup, hash: cat && cat.request_hash, org: cat && cat.organization_fingerprint, conn: cat && cat.connection_id };
+}
+
+test("E2f. (DR1) a cold-cache Catalog job is satisfied by a VALIDATED, EXACTLY-EQUIVALENT durable snapshot: it adopts (zero export), records EXPLICIT provenance, and the bucket drains instead of deferring", async () => {
+  const p = await probeCatalogJob();
+  assert.ok(p.hash && p.org, "the forced catalog job carries a canonical request hash + org fingerprint");
+  assert.equal(p.rollup.stopped, true, "with NO durable snapshot the cold-cache catalog still defers (baseline)");
+  // A FRESH run whose durable org catalog snapshot is compatible evidence for that job's tenant/scope -> adopt. The
+  // snapshot's ORIGINAL export request_hash deliberately DIFFERS from the reconciler job's request_hash (carrier/as-of
+  // drift): the org catalog is date-independent content the derive reads directly, so adoption must still succeed.
+  const st = makeStore();
+  st._seedSnapshot({ organizationFingerprint: p.org, connectionId: p.conn, source_request_hash: (p.hash || "x") + "-ORIGINAL-EXPORT-DIFFERENT", object_path: "cat/org-catalog.json", payload_sha: "sha-abc123", row_count: 3, payload_bytes: 4096, validated_at: "2026-08-01T04:00:00Z" });
+  const h = runHarness({ store: st, pausedSources: new Set(["order-line-items", "fba-inventory-health"]), forceCatalogRefresh: true, dd: makeDataDoe({ noExportKey: "catalog" }) });
+  const rollup = await h.run();
+  assert.equal(rollup.stopped, false, "the catalog job adopted the durable snapshot -> bucket drains: " + JSON.stringify(rollup.stopReason || null));
+  assert.equal(rollup.globalDrained, true, "cycle drained (catalog succeeded via durable adoption; OLI/FBA paused) -> derive proceeds");
+  const cj = st.listSourceJobs(rollup.cycleId).find((j) => j.source_key === "product-catalog");
+  assert.equal(cj.fetch_status, "succeeded", "the catalog job is succeeded");
+  assert.equal(cj.adoption_kind, "durable_snapshot", "with EXPLICIT durable-snapshot provenance (never an anonymous fake success)");
+  assert.equal(cj.create_export_count, 0, "no create was attempted (one-attempt invariant intact)");
+  assert.equal(h.dd.totalCreates(), 0, "ZERO DataDoe creates");
+});
+
+test("E2g. (DR1) an UNVALIDATED durable snapshot (validated_at null) is NEVER adopted (fail closed on freshness -> defers retryably)", async () => {
+  const p = await probeCatalogJob();
+  const st = makeStore();
+  // Correct tenant/scope + matching content, but NO validated_at => not proven evidence -> refuse. (Cross-org and
+  // content-hash refusals are pinned by the migration guard test; here we prove the freshness fail-closed path.)
+  st._seedSnapshot({ organizationFingerprint: p.org, connectionId: p.conn, source_request_hash: p.hash, object_path: "cat/org-catalog.json", payload_sha: "sha-abc123", row_count: 3, payload_bytes: 4096, validated_at: null });
+  const h = runHarness({ store: st, pausedSources: new Set(["order-line-items", "fba-inventory-health"]), forceCatalogRefresh: true, dd: makeDataDoe({ noExportKey: "catalog" }) });
+  const rollup = await h.run();
+  assert.equal(rollup.stopped, true, "an unvalidated snapshot is refused -> the catalog defers retryably (never adopts unproven evidence)");
+  assert.equal(rollup.stopReason.code, "SOURCE_READINESS_PENDING", JSON.stringify(rollup.stopReason));
+  const cj = st.listSourceJobs(rollup.cycleId).find((j) => j.source_key === "product-catalog");
+  assert.notEqual(cj.adoption_kind, "durable_snapshot", "no unvalidated-evidence adoption");
+});
+
+test("E2h. (DR1) durable adoption is scoped to the no-export refusal: a GENUINE catalog DataDoe failure still hard-stops REQUIRED_SOURCE_FAILED even with a valid snapshot present (a real defect is never masked)", async () => {
+  const p = await probeCatalogJob();
+  const st = makeStore();
+  // A perfectly valid, equivalent snapshot is present, BUT the adapter raises a REAL DataDoe error (failKey, not the
+  // no-export refusal) -- so dataDoe.noExport is false and the DR1 branch never fires; the failure hard-stops.
+  st._seedSnapshot({ organizationFingerprint: p.org, connectionId: p.conn, source_request_hash: p.hash, object_path: "cat/org-catalog.json", payload_sha: "sha-abc123", row_count: 3, payload_bytes: 4096, validated_at: "2026-08-01T04:00:00Z" });
+  const h = runHarness({ store: st, pausedSources: new Set(["order-line-items", "fba-inventory-health"]), forceCatalogRefresh: true, dd: makeDataDoe({ failKey: "catalog" }) });
+  const rollup = await h.run();
+  assert.equal(rollup.stopped, true, "a real catalog failure hard-stops even with a valid snapshot present");
+  assert.equal(rollup.stopReason.code, "REQUIRED_SOURCE_FAILED", JSON.stringify(rollup.stopReason));
+});
+
+test("E2i. (DR1) a GENUINELY-SUCCEEDED catalog job whose 24h export cache has EXPIRED reuses the fresh validated durable snapshot (never reloads the cold cache, never SOURCE_PAYLOAD_UNAVAILABLE) -> the family drains", async () => {
+  // Run 1: a real refresh so the catalog job SUCCEEDS via an actual export (adoption_kind ABSENT), cache warm.
+  const seedRun = runHarness({});
+  const r1 = await seedRun.run();
+  assert.equal(r1.stopped, false, "run 1 completed: " + JSON.stringify(r1.stopReason || null));
+  const st = seedRun.store;
+  const cat = st.listSourceJobs(r1.cycleId).find((j) => j.source_key === "product-catalog");
+  assert.equal(cat.fetch_status, "succeeded", "run 1 succeeded the catalog");
+  assert.notEqual(cat.adoption_kind, "durable_snapshot", "run 1 was a REAL export (not a durable adoption) -> exercises the succeeded+cold-cache branch, not the adoption branch");
+  // Simulate 24h-cache expiry AFTER a genuine success: drop the cached payload; the durable org snapshot persisted at
+  // success remains the validated LKG (seed it, mirroring source_snapshots).
+  st._cache.delete(cat.request_hash);
+  st._seedSnapshot({ organizationFingerprint: cat.organization_fingerprint, connectionId: cat.connection_id || "primary", object_path: "cat/org-catalog.json", payload_sha: "sha-live-59", row_count: 3, validated_at: TODAY + "T04:00:00Z" });
+  // Reuse the SAME cycle (with its succeeded catalog job) via a fresh continuation run.
+  st.getCycle(r1.cycleId).status = "pending";
+  // Run 2: OLI+FBA paused, forceCatalogRefresh -> the persist path sees the succeeded catalog job + a COLD cache.
+  const h = runHarness({ store: st, pausedSources: new Set(["order-line-items", "fba-inventory-health"]), forceCatalogRefresh: true });
+  const rollup = await h.run();
+  assert.notEqual(rollup.stopReason && rollup.stopReason.code, "SOURCE_PAYLOAD_UNAVAILABLE", "cold cache + fresh durable snapshot must reuse, NOT fail closed: " + JSON.stringify(rollup.stopReason || null));
+  assert.ok((rollup.snapshots.reusedDurableCatalog || 0) >= 1, "the fresh durable catalog snapshot was reused for the cold-cache succeeded job");
+  assert.equal(h.dd.totalCreates(), 0, "ZERO re-export (a succeeded job is never re-created)");
+});
+
+test("E2j. (DR1) a succeeded catalog job with a COLD cache AND NO durable snapshot STILL fails closed (SOURCE_PAYLOAD_UNAVAILABLE) -- reuse is never a blind skip", async () => {
+  const seedRun = runHarness({});
+  const r1 = await seedRun.run();
+  const st = seedRun.store;
+  const cat = st.listSourceJobs(r1.cycleId).find((j) => j.source_key === "product-catalog");
+  st._cache.delete(cat.request_hash); // cold cache, and NO durable snapshot seeded
+  st.getCycle(r1.cycleId).status = "pending";
+  const h = runHarness({ store: st, pausedSources: new Set(["order-line-items", "fba-inventory-health"]), forceCatalogRefresh: true });
+  const rollup = await h.run();
+  assert.equal(rollup.stopped, true, "no durable snapshot -> stop");
+  assert.equal(rollup.stopReason.code, "SOURCE_PAYLOAD_UNAVAILABLE", "fail closed when NEITHER cache nor a durable snapshot is available: " + JSON.stringify(rollup.stopReason));
 });
 
 test("E3. >=60s completion-anchored cooldown between families on the FAKE clock (never sleeps)", async () => {

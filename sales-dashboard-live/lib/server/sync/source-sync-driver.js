@@ -14,6 +14,7 @@ import { organizationFingerprint, sourceJobOwnerId, accountScopeHash } from "../
 import {
   openSyncCycle, claimSyncCycle, getSyncCycle, getSyncCycleByBucketDate, updateSyncCycleCounts, finalizeSyncCycle,
   upsertSyncSourceJob, getSyncSourceJobs, getSyncSourceJobsWithMeta, claimSourceExportAttempt, adoptSourceExportCache,
+  adoptDurableCatalogSnapshot, getSourceSnapshot,
   claimSourceExportRecovery,
   recordSyncSourceSuccess, recordSyncSourceFailure, recordSyncSourceSkipped, recordSyncSourceExportCreated,
   getSourceExportCache, sourceCacheStorageAdapter, sourceCacheMetadataAdapter,
@@ -280,6 +281,11 @@ export function makeSupabaseSourceStore({ deadline = null } = {}) {
     // Blocker 2: the atomic cache-adoption CAS (adopt_source_export_cache), returning a typed
     // 'adopted' | 'not-adopted' acknowledgement. Mutually exclusive with claimExportAttempt.
     adoptSourceCache: (args) => w("adopt-cache", true, (signal) => adoptSourceExportCache(args, { signal })),
+    // DR1: the ATOMIC durable-Catalog adoption CAS (adopt_durable_catalog_snapshot) + a read of the org Catalog's
+    // durable snapshot pointer. Lets the noExport reconciler satisfy a cold-cache Catalog job from validated durable
+    // evidence with EXPLICIT provenance (never a fake success). Mutually exclusive with claimExportAttempt/adoptSourceCache.
+    adoptDurableCatalogSnapshot: (args) => w("adopt-durable-catalog", true, (signal) => adoptDurableCatalogSnapshot(args, { signal })),
+    readDurableCatalogSnapshot: (args) => r("read-durable-snapshot", (signal) => getSourceSnapshot({ ...(args || {}), signal })),
     recordExportCreated: (args) => w("export-created", true, (signal) => recordSyncSourceExportCreated(args, { signal })),
     loadSourceRows: (requestHash) => r("load-source-rows", (signal) => getSourceExportCache(requestHash, { signal })),
     // The immutable-object storage save + pointer switch is already commit-unknown-safe by construction (a

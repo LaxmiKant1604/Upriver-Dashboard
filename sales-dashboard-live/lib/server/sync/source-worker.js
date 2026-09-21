@@ -39,6 +39,7 @@ import { validateBatchSourcePayload } from "./source-account-isolation.js";
 import { isRoutingScope } from "./scheduler-scope.js";
 import { compactLatestInventorySnapshot, isLatestSnapshotSource } from "./fba-inventory-latest-snapshot.js";
 import { isInitialLoadIncompleteMessage, READINESS_INCOMPLETE_CODE } from "./source-readiness-isolation.js";
+import { ORGANIZATION_SCOPE_KEY } from "./source-durable-model.js";
 
 const DEFAULT_RESERVE_MS = 3_000; // stop before the server cap so status/locks persist
 
@@ -290,6 +291,60 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
           // claim success.
           return fail("create-export", "ADOPT_ACK_MALFORMED", "The atomic adopt CAS returned a malformed acknowledgement; refusing to create or fabricate (fail closed).", false);
         }
+      }
+    }
+    // DR1 -- DURABLE CATALOG EVIDENCE ADOPTION. When the org Product Catalog job cannot be exported (the zero-export
+    // reconciler's noExport adapter) and the 24h export cache was cold (not adopted above), satisfy the Catalog
+    // dependency from the VALIDATED durable source_snapshots snapshot -- the SAME canonical evidence the read-path
+    // self-heal derives from -- so OLI-dependent publication converges with ZERO export instead of deferring. It NEVER
+    // fabricates success: the durable snapshot must prove EXACT equivalence to THIS job's canonical request
+    // (source_request_hash == request_hash), carry the exact object_path + payload_sha the worker validated, and be
+    // validated evidence; any mismatch/stale/absent snapshot falls through to the normal (deferring) path. The
+    // adoption is an atomic CAS with EXPLICIT provenance (adoption_kind='durable_snapshot'); a concurrent real export
+    // wins (fetch_status='pending' predicate). The SCHEDULED full-region adapter has no noExport flag, so this branch
+    // never fires for it -- it still re-EXPORTS the Catalog daily (fetch obligation unchanged), byte-identical.
+    // Reversible kill-switch (expand-first / canary safety): DURABLE_CATALOG_ADOPTION=off disables the new path
+    // entirely (the reconciler reverts to deferring on a cold cache) WITHOUT a code revert or dropping the migration.
+    if (String(process.env.DURABLE_CATALOG_ADOPTION || "on").toLowerCase() !== "off"
+        && job.sourceKey === "product-catalog" && dataDoe && dataDoe.noExport === true
+        && typeof store.adoptDurableCatalogSnapshot === "function" && typeof store.readDurableCatalogSnapshot === "function") {
+      let snap = null;
+      try {
+        const snapRead = await store.readDurableCatalogSnapshot({
+          organizationFingerprint: job.organizationFingerprint, connectionId: job.connectionId || "primary",
+          sourceKey: "product-catalog", scopeKey: ORGANIZATION_SCOPE_KEY,
+        });
+        snap = snapRead && snapRead.read === "ok" ? snapRead.snapshot : null;
+      } catch (_e) { snap = null; }
+      // Fail-fast evidence gate (re-validated authoritatively inside the CAS): the org's ONE canonical product-catalog
+      // snapshot for THIS tenant/scope must exist, carry a content hash (object_path + payload_sha) the CAS will match,
+      // and be validated. The export request_hash is NOT the basis (the org catalog is date-independent content the
+      // derive reads directly); the snapshot is compatible evidence for any product-catalog job of the same tenant.
+      if (snap && String(snap.object_path || "").trim() !== "" && String(snap.payload_sha || "").trim() !== "" && snap.validated_at) {
+        // Fail-soft: any adoption error (e.g. the RPC is not yet deployed under expand-first rollout, or a transient
+        // read error) is treated as "did not adopt" -> fall through to the normal (deferring) path. NEVER a crash and
+        // NEVER a fabricated success -- only a typed 'adopted' ack ever marks the job succeeded.
+        let ack = null;
+        try {
+          ack = await store.adoptDurableCatalogSnapshot({
+            cycleId, requestHash,
+            organizationFingerprint: job.organizationFingerprint, connectionId: job.connectionId || "primary",
+            sourceKey: "product-catalog", scopeKey: ORGANIZATION_SCOPE_KEY,
+            objectPath: snap.object_path, payloadSha: snap.payload_sha, minValidatedAt: null,
+          });
+        } catch (_e) { ack = null; }
+        if (ack === "adopted") {
+          progress.succeeded += 1;
+          return { requestKey, requestHash, status: "success", validated: true, rowCount: (typeof snap.row_count === "number" ? snap.row_count : null), reused: true, adoption: "durable_snapshot" };
+        }
+        if (ack === "not-adopted") {
+          // A real export / warm-cache adoption concurrently WON the pending->succeeded transition -> the real
+          // evidence wins; a fresh invocation re-reads the true status and resumes/skips. Never a second create.
+          progress.skipped += 1;
+          return { requestKey, requestHash, status: "skipped", validated: false, reason: "durable-adopt-not-won" };
+        }
+        // 'snapshot-missing' | 'snapshot-mismatch' | 'snapshot-stale' -> the durable evidence is not adoptable; fall
+        // through to the normal path (which, for the noExport reconciler, defers retryably as before). Fail closed.
       }
     }
     // Blocker 3: reuseOnly REHEARSAL gate. No durable exact cache entry was adopted above, and a pending

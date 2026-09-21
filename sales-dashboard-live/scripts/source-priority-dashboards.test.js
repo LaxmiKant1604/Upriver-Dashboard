@@ -415,6 +415,12 @@ test("P4b4. CROSS-BUCKET WARM finalize ACCEPTS: create_export_count=0 + cache ev
   const res = await makeRelease({ ...finBase, srcJobs: CAT_JOB_WARM, reservationRow: XBUCKET_RESV }).finalizeBucket("us");
   assert.equal(res.disposition, "finalized");
 });
+test("P4b4b. (DR1) CROSS-BUCKET WARM with a DIFFERENT carrier hash finalizes: cec=0 + cache + the SIBLING bucket's PAID created reservation (created, 2 tokens, export id) whose catalog_request_hash DIFFERS from this pass's carrier hash. The org catalog is content-identical across carriers and the report's catalog lineage binds to the durable snapshot's own hash, so a non-creating bucket (e.g. a stalled europe-au the day us-ca created the shared export, or the reconciler's per-account carrier) derives from the one paid export at ZERO new tokens. Token accounting (created/2-tokens/export-id) is still enforced; cec=1 double-spend protection is unchanged (see P4c: 'cold but reservation hash != job hash').", async () => {
+  const siblingResv = { catalog_request_hash: "sibling-bucket-carrier-hash", export_id: "e1", status: "created", tokens_spent: 2 };
+  const res = await makeRelease({ ...finBase, srcJobs: CAT_JOB_WARM, reservationRow: siblingResv }).finalizeBucket("us");
+  assert.equal(res.disposition, "finalized", "a different-carrier-hash sibling reservation is accepted for a zero-token warm derive");
+  assert.deepEqual(res.accounts, ["A01"]);
+});
 test("P4b5. RESUMABLE finalize: an ALREADY-terminal cycle (scope re-proven) is ACCEPTED as 'already-terminal' WITHOUT re-issuing the finalize RPC", async () => {
   for (const status of ["succeeded", "partial"]) {
     let finCalls = 0;
@@ -514,7 +520,8 @@ test("P4c. finalizeBucket REFUSES every unrelated / open / malformed / mis-scope
     // WARM (create_export_count=0) cross-bucket reservation coherence:
     ["warm but no cache evidence", { srcJobs: [{ source_key: CATALOG, request_hash: "cat-hash", fetch_status: "succeeded", create_export_count: 0 }], reservedHash: null }, "no-cache-evidence"],
     ["warm cross-bucket but reservation still 'reserved'", { srcJobs: CAT_JOB_WARM, reservationRow: { catalog_request_hash: "cat-hash", export_id: null, status: "reserved", tokens_spent: 0 } }, "reservation-not-created"],
-    ["warm cross-bucket but reservation hash != job hash", { srcJobs: CAT_JOB_WARM, reservationRow: { catalog_request_hash: "other-hash", export_id: "e1", status: "created", tokens_spent: 2 } }, "reservation-hash-mismatch"],
+    // NOTE: a warm (cec=0) reservation whose catalog_request_hash != the job hash is NO LONGER refused -- see P4b4b:
+    // a zero-token reuse of the SIBLING bucket's paid org-catalog reservation is accepted (carrier hash may differ).
     ["warm cross-bucket but blank export id", { srcJobs: CAT_JOB_WARM, reservationRow: { catalog_request_hash: "cat-hash", export_id: "", status: "created", tokens_spent: 2 } }, "reservation-no-export"],
     ["warm cross-bucket but tokens != 2", { srcJobs: CAT_JOB_WARM, reservationRow: { catalog_request_hash: "cat-hash", export_id: "e1", status: "created", tokens_spent: 5 } }, "reservation-tokens"],
     ["impossible create_export_count", { srcJobs: [{ source_key: CATALOG, request_hash: "cat-hash", fetch_status: "succeeded", create_export_count: 2 }], reservationRow: { catalog_request_hash: "cat-hash", export_id: "e1", status: "created", tokens_spent: 2 } }, "bad-create-count"],
