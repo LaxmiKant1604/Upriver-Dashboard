@@ -100,6 +100,7 @@ const SUITES = [
   "test:source-identity",
   "test:report-contracts",
   "test:oli-source-correction",
+  "test:flexii-oli-restore",
   "test:oli-continuation-ceiling",
   "test:oli-dependent-reports",
   "test:oli-publication-revision",
