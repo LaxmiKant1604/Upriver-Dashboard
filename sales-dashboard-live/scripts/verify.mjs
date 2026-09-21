@@ -103,6 +103,7 @@ const SUITES = [
   "test:flexii-oli-restore",
   "test:durable-catalog-adoption-migration",
   "test:reclaim-stale-catalog-jobs-migration",
+  "test:resume-stalled-catalog-migration",
   "test:oli-continuation-ceiling",
   "test:oli-dependent-reports",
   "test:oli-publication-revision",

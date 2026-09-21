@@ -390,11 +390,12 @@ test("D3. paid scheduler-v2 is dispatch-only; scheduled workflows are zero-expor
   // and listing-health-v3-reconcile (zero-export durable Listings/Listings-Raw -> listing-health-v3) are the other
   // scheduled workflows and are structurally ZERO-EXPORT: each runs ONLY its own operator (whose module graph contains
   // no export adapter/create path); none invokes an export/release/golive script that issues a paid create.
-  assert.deepEqual(scheduled, ["account-onboarding.yml", "ads-publication-reconcile.yml", "fba-publication-reconcile.yml", "listing-health-v3-reconcile.yml", "oli-publication-reconcile.yml", "scheduler-recovery.yml"],
+  assert.deepEqual(scheduled, ["account-onboarding.yml", "ads-publication-reconcile.yml", "fba-publication-reconcile.yml", "listing-health-v3-reconcile.yml", "oli-publication-reconcile.yml", "scheduler-recovery.yml", "scheduler-watchdog.yml"],
     "only zero-export workers carry native schedules; got " + JSON.stringify(scheduled));
-  // oli/fba/ads/listing-health-v3-publication-reconcile: exactly the reconciler entrypoint (its core module +
-  // revision/registry graph reaches no DataDoe export transport), no export/create/token/force-latest symbol anywhere.
-  for (const [wf, op] of [["oli-publication-reconcile.yml", "node scripts/release/oli-publication-reconcile.mjs"], ["fba-publication-reconcile.yml", "node scripts/release/fba-publication-reconcile.mjs"], ["ads-publication-reconcile.yml", "node scripts/release/ads-publication-reconcile.mjs"], ["listing-health-v3-reconcile.yml", "node scripts/release/listing-health-v3-reconcile.mjs"]]) {
+  // oli/fba/ads/listing-health-v3-publication-reconcile + scheduler-watchdog (DR4 zero-export stalled-cycle recovery):
+  // exactly the operator entrypoint (its module graph reaches no DataDoe export transport), no export/create/token/
+  // force-latest symbol anywhere -- the watchdog only calls resume_stalled_catalog_job + finalize_sync_cycle RPCs.
+  for (const [wf, op] of [["oli-publication-reconcile.yml", "node scripts/release/oli-publication-reconcile.mjs"], ["fba-publication-reconcile.yml", "node scripts/release/fba-publication-reconcile.mjs"], ["ads-publication-reconcile.yml", "node scripts/release/ads-publication-reconcile.mjs"], ["listing-health-v3-reconcile.yml", "node scripts/release/listing-health-v3-reconcile.mjs"], ["scheduler-watchdog.yml", "node scripts/release/scheduler-watchdog.mjs"]]) {
     const reconcile = readFileSync(resolve(WORKFLOWS_DIR, wf), "utf8");
     const reconcileCalls = [...reconcile.matchAll(/node scripts\/[^\s"']+/g)].map((m) => m[0]);
     assert.deepEqual([...new Set(reconcileCalls)], [op],

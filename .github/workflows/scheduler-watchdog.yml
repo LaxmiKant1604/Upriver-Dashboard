@@ -1,0 +1,105 @@
+name: scheduler-watchdog
+
+# DR4 SCHEDULER WATCHDOG -- audited, ZERO-EXPORT recovery of stalled sync cycles.
+#
+# A scheduled full-region cycle stalls in status='running' FOREVER when its REQUIRED product-catalog job fails or is
+# never executed (e.g. the cross-bucket carrier-hash race -> a create refused PRIORITY_CATALOG_HASH_MISMATCH, export_id
+# NULL, ZERO tokens; or a "case-c" frozen-but-unexecuted catalog). The failed/pending REQUIRED job blocks the derive
+# (0 report jobs) and the cycle never finalizes; a strict continuation only retries OPEN jobs, and the D-1 OLI refresh
+# operator supersedes only TERMINAL cycles -- so nothing escapes without this watchdog.
+#
+# WHAT IT DOES (never a paid export; the DATA is published by the ZERO-EXPORT oli-publication-reconcile workflow, which
+# runs earlier): DETECT stalled running cycles (stale, no non-catalog open job) -> RESUME the failed/pending catalog job
+# by ATOMICALLY adopting the VALIDATED durable org snapshot (resume_stalled_catalog_job, migrations 20260930/20260931;
+# failed/pending -> succeeded|durable_snapshot, no pending window, zero tokens) -> FINALIZE via the reviewed
+# finalize_sync_cycle RPC (truthful partial/succeeded/failed). It NEVER creates a DataDoe export, deletes a cycle, or
+# touches export_id, and prints creates/tokens=0.
+#
+# SAFETY POSTURE (default OFF for live recovery):
+#   - MANUAL runs default to DRY-RUN (read-only plan; zero writes) and must opt in to live.
+#   - SCHEDULED runs are DRY-RUN unless the repository variable SCHEDULER_WATCHDOG_LIVE == 'true' is set deliberately.
+#   - Default scope is SUPERSEDED-ONLY (recover only cycles that already have a NEWER TERMINAL sibling; the current slot
+#     is left to the scheduler). --include-current-slot opts into the latest stalled cycle too (still zero-export).
+# Merging this workflow is safe: it only reports the plan + proves DataDoe creates/tokens = 0 until an operator enables
+# live recovery. Required secrets (never printed): POSTGRES_URL, SUPABASE_URL (or VITE_SUPABASE_URL), SUPABASE_SERVICE_ROLE_KEY.
+
+on:
+  schedule:
+    # Once daily, AFTER oli-publication-reconcile (13 20) so the reconciler has published current data first; the
+    # watchdog then cleans up any cycle left stalled. A delayed GitHub cron is fine -- this is recovery, not the export schedule.
+    - cron: "43 20 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry-run (default: read-only plan, ZERO writes) | live (resume + finalize stalled cycles)"
+        required: false
+        default: "dry-run"
+        type: choice
+        options:
+          - dry-run
+          - live
+      bucket:
+        description: "restrict to one region (india|europe-au|us-ca); blank = all three"
+        required: false
+        default: ""
+        type: string
+      include_current_slot:
+        description: "also recover the LATEST stalled cycle per bucket (default false: superseded-only)"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  # One watchdog pass at a time. Its RPCs are fenced (status='running' + staleness) + idempotent, so a queued duplicate
+  # is a harmless no-op.
+  group: scheduler-watchdog
+  cancel-in-progress: false
+
+permissions:
+  # Least privilege: read the repo (checkout) only. All state changes go to the database via service_role RPCs.
+  contents: read
+
+jobs:
+  watchdog:
+    if: github.event_name == 'workflow_dispatch' || vars.SCHEDULER_WATCHDOG_LIVE == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      # DR1 reversible kill-switch (shared): 'off' would disable the durable-Catalog adoption the watchdog relies on.
+      DURABLE_CATALOG_ADOPTION: ${{ vars.DURABLE_CATALOG_ADOPTION || 'on' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Verify required secrets are present (fail closed; never print values)
+        run: |
+          missing=""
+          for v in POSTGRES_URL SUPABASE_SERVICE_ROLE_KEY; do
+            if [ -z "${!v:-}" ]; then missing="$missing $v"; fi
+          done
+          if [ -z "${SUPABASE_URL:-}" ] && [ -z "${VITE_SUPABASE_URL:-}" ]; then missing="$missing SUPABASE_URL|VITE_SUPABASE_URL"; fi
+          if [ -n "$missing" ]; then echo "STOP missing required secret(s):$missing"; exit 1; fi
+      - name: Install dependencies
+        run: npm ci
+      # DRY-RUN unless a manual dispatch selected 'live' OR the repository variable SCHEDULER_WATCHDOG_LIVE == 'true'.
+      # ZERO DataDoe creates/tokens either way. Per-region isolation is inside the operator (one region's error never
+      # aborts another). Default scope is superseded-only; a manual dispatch may opt into the current slot.
+      - name: Recover stalled scheduler cycles (zero export)
+        run: |
+          MODE='${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode || (vars.SCHEDULER_WATCHDOG_LIVE == 'true' && 'live' || 'dry-run') }}'
+          ONLY='${{ github.event.inputs.bucket }}'
+          INCLUDE_CURRENT='${{ github.event.inputs.include_current_slot }}'
+          LIVE=""; if [ "$MODE" = "live" ]; then LIVE="--live"; fi
+          SLOT=""; if [ "$INCLUDE_CURRENT" = "true" ]; then SLOT="--include-current-slot"; fi
+          BUCKET=""; if [ -n "$ONLY" ]; then BUCKET="--bucket=$ONLY"; fi
+          echo "::group::scheduler-watchdog mode=$MODE bucket=${ONLY:-all} include-current-slot=${INCLUDE_CURRENT:-false}"
+          node scripts/release/scheduler-watchdog.mjs $BUCKET $LIVE $SLOT
+          echo "::endgroup::"

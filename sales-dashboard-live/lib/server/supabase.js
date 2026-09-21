@@ -2215,6 +2215,22 @@ export async function reclaimStalePriorityCatalogJobs(bucket, { signal = null } 
   return Number.isFinite(n) ? n : 0;
 }
 
+// resume_stalled_catalog_job (DR4 watchdog): the AUDITED, snapshot-gated, ZERO-EXPORT resume of a stalled SCHEDULED
+// cycle whose REQUIRED product-catalog create failed terminally (export_id NULL -> zero tokens). Atomically transitions
+// that failed catalog job -> succeeded via the VALIDATED durable org snapshot (adoption_kind='durable_snapshot'), with
+// NO intervening 'pending' window in which the daily cron could fire a PAID re-export. Fenced: only a status='running'
+// cycle not updated since p_staleBefore, with NO open (pending/attempted) source job. Returns a typed acknowledgement
+// ('resumed' | 'not-stalled' | 'has-open-jobs' | 'not-eligible' | 'no-snapshot' | 'cycle-not-found'); never a paid export.
+export async function resumeStalledCatalogJob({ cycleId, staleBefore }, { signal = null } = {}) {
+  const body = await request("/rest/v1/rpc/resume_stalled_catalog_job", {
+    method: "POST",
+    signal,
+    body: { p_cycle_id: cycleId, p_stale_before: staleBefore },
+  });
+  const value = Array.isArray(body) ? body[0] : body;
+  return typeof value === "string" ? value : null;
+}
+
 // assign_source_account_batch (Blocker 4): STABLE, transactional <=5 batch assignment. Returns the
 // (existing or newly assigned) batch_index for (family, account). An already-assigned account keeps its
 // index (never reshuffled); a new account is placed into a non-full or fresh batch under the 5-cap.
