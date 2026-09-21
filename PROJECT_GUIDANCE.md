@@ -19,30 +19,30 @@ This file is the durable source of truth for agents planning or executing a
 DataDoe export, diagnostic probe, historical backfill, or publication repair.
 Read it before touching production data or estimating token cost.
 
-### 1. Limits are source-specific
+### 1. DataDoe export limits (hard rule)
 
-There is no global DataDoe row limit. Identify the exact source/report first,
-then verify its current limit in production code and, where applicable, the
-DataDoe create contract.
+The repository owner received direct confirmation from the DataDoe team and
+recorded it here on 2026-09-21. This is the current provider contract:
 
-Current verified examples in `api/datadoe.js`:
+- **Every DataDoe report/source permits up to 50,000 rows in one export.**
+- **One export may include at most 5 sellers.**
+- The 50,000-row ceiling and 5-seller batching ceiling are independent.
+- Order Line Items (OLI) is a standard source and costs 2 tokens per
+  create-export.
 
-| Source/report | Code constant | Row limit |
-| --- | --- | ---: |
-| Order Line Items (OLI) sales | `OLI_SALES_ROW_LIMIT` / `ORDER_SALES_ROW_LIMIT` | **5,000** |
-| SKU P&L | `SKU_PL_ROW_LIMIT` | 50,000 |
-| Search Query Performance | `SQP_ROW_LIMIT` | 50,000 |
-| FBA Inventory Health / plan inventory | `PLAN_INVENTORY_ROW_LIMIT` | 50,000 |
-| Reconciliation | `RECONCILIATION_ROW_LIMIT` | 50,000 |
+Treat repository OLI constants/comments that still say 5,000 as stale
+application constraints, not as the DataDoe provider contract. In particular,
+`OLI_SALES_ROW_LIMIT`, `ORDER_SALES_ROW_LIMIT`, their mirrored scheduler
+contracts, Supabase read defaults, tests, and comments must be audited and
+corrected to 50,000 before the flexii OLI backfill. Preserve strict behavior:
+an export returning exactly 50,000 rows is potentially truncated and must not
+be persisted as complete.
 
-The Order Line Items contract is the important exception: the code records
-that DataDoe's current OLI create contract rejects a limit above **5,000**.
-Do not substitute a 50,000-row limit from FBA, P&L, SQP, or reconciliation.
-
-Constants can change. Before every operation, re-open the source registry and
-request builder used by that operation. If documentation, conversation, and
-code disagree, stop and resolve the discrepancy with evidence before creating
-an export. Never accept or repeat a correction from memory alone.
+Before every operation, re-open the source registry and request builder to
+confirm the application matches this provider contract. If a live create
+rejects 50,000 or DataDoe supplies a newer written contract, stop and report
+contract drift; do not silently fall back, spend additional tokens, or record
+false coverage.
 
 ### 2. Mandatory preflight before a paid action
 
@@ -52,7 +52,8 @@ Before the first create-export call, write down and verify all of the following:
 2. DataDoe connection/organization and authoritative marketplace.
 3. Source ID, report key, grain, grouping, and requested columns.
 4. Requested date range and whether the operation must bypass existing coverage.
-5. The source-specific row limit, cited by constant or contract evidence.
+5. The 50,000-row provider limit, 5-seller batch limit, and confirmation that
+   the active application request path implements both correctly.
 6. Maximum export creates and maximum token spend approved by the user.
 7. Persistence target, overwrite semantics, and downstream rebuild path.
 8. Stop conditions, including cap hit, ownership mismatch, currency mismatch,
@@ -113,8 +114,10 @@ These facts prevent the active incident from being re-planned from memory:
 - Account: flexii UK.
 - Raw seller/account ID: `f08cefca-c527-41d6-a2e7-71a435478f5d`.
 - Marketplace/currency: GB / GBP.
-- Source: Order Line Items, so the verified export ceiling is **5,000 rows**,
-  not 50,000.
+- Source: Order Line Items. Per direct DataDoe-team confirmation, its export
+  ceiling is **50,000 rows** and the request may contain at most 5 sellers.
+- The current repository's OLI 5,000 constants/comments are known stale and
+  must be corrected and parity-tested before executing this recovery.
 - Required history includes `2025-06-01` onward; the current canonical recovery
   plan requests `2025-01-01` through D-1 to satisfy the gapless history contract.
 - Existing broad `source_coverage` is known to be false for the missing history;
@@ -124,9 +127,10 @@ These facts prevent the active incident from being re-planned from memory:
   `2026-08-19..2026-08-25`: 427 rows, GBP 3,727.33 sales, 427 units, zero
   canonical-grain duplicates, correct seller/GB/GBP ownership. It cost zero
   tokens because DataDoe served it from cache. It was not persisted.
-- The observed probe density is about 61 rows/day. At that density, one 5,000-row
-  OLI export represents about 82 active-selling days. This is an estimate, not
-  proof of historical density.
+- The observed probe density is about 61 rows/day. At that density, the missing
+  `2025-01-01..2026-09-02` interval is roughly 37,000 rows and may fit in one
+  50,000-row export costing 2 tokens. This is an estimate, not proof of the
+  historical density or final row count.
 - Preserve the existing valid Sep 3 onward durable history while replacing the
   false historical coverage with validated rows and truthful intervals.
 - As of the creation of this runbook, the full historical backfill has **not**
