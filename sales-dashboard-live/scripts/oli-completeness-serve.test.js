@@ -124,4 +124,41 @@ const row = (o) => ({ account_id: "A1", sale_date: "2026-08-26", completeness_st
   assert.equal(c.pendingOrderCount, 0);
 });
 
+// ---- OLI COVERAGE PLUMBING (flexii UK repair): the augment surfaces coverage bounds so the client can render an
+// uncovered period as Unavailable instead of a fabricated zero. makeCompletenessAugment returns an ASYNC function, so
+// these run via top-level await (ESM). ----
+async function atest(name, fn) { try { await fn(); passed += 1; out("  ok  " + name); } catch (e) { out("FAIL  " + name); out(String(e && e.stack ? e.stack : e)); process.exitCode = 1; } }
+
+await atest("augment surfaces OLI coverageFrom/coverageTo/coverageWindows alongside the completeness label", async () => {
+  let sawSourceKey = null;
+  const readCoverage = async ({ sourceKey }) => { sawSourceKey = sourceKey; return { read: "ok", windows: [{ from: "2025-01-01", to: "2026-03-17" }, { from: "2026-03-18", to: "2026-09-09" }] }; };
+  const augment = makeCompletenessAugment({ organizationFingerprint: "org", read: async () => [row({ sale_date: "2026-09-09" })], readCoverage });
+  const { completeness } = await augment({ accountId: "A1", params: { from: "2025-01-01", to: "2026-09-09" } });
+  assert.equal(sawSourceKey, "order-line-items", "coverage is read for the OLI source key");
+  assert.equal(completeness.coverageFrom, "2025-01-01", "earliest covered_from across windows");
+  assert.equal(completeness.coverageTo, "2026-09-09", "latest covered_to across windows");
+  assert.equal(completeness.coverageWindows.length, 2);
+  assert.equal(completeness.latestDate, "2026-09-09", "the completeness label still rides alongside coverage (a covered date with no sales stays a genuine zero)");
+});
+
+await atest("coverage is NOT attached as a coverage-only object when there is NO completeness row (avoids a spurious 'final' banner)", async () => {
+  const augment = makeCompletenessAugment({ organizationFingerprint: "org", read: async () => [], readCoverage: async () => ({ read: "ok", windows: [{ from: "2025-06-01", to: "2026-09-09" }] }) });
+  const res = await augment({ accountId: "A1", params: {} });
+  assert.deepEqual(res, {}, "no completeness rows -> augment returns {} (coverage rides ONLY alongside a real completeness label)");
+});
+
+await atest("NO readCoverage collaborator -> NO coverage field (byte-identical legacy augment)", async () => {
+  const augment = makeCompletenessAugment({ organizationFingerprint: "org", read: async () => [row({ sale_date: "2026-09-09" })] });
+  const { completeness } = await augment({ accountId: "A1", params: {} });
+  assert.equal(completeness.coverageFrom, undefined);
+  assert.equal(completeness.latestDate, "2026-09-09");
+});
+
+await atest("a coverage READ FAILURE is advisory -> completeness still returned WITHOUT coverage (never breaks the report)", async () => {
+  const augment = makeCompletenessAugment({ organizationFingerprint: "org", read: async () => [row({ sale_date: "2026-09-09" })], readCoverage: async () => ({ read: "read-failed", windows: [] }) });
+  const { completeness } = await augment({ accountId: "A1", params: {} });
+  assert.equal(completeness.coverageFrom, undefined, "a failed coverage read omits coverage but keeps the completeness label");
+  assert.equal(completeness.latestDate, "2026-09-09");
+});
+
 out("\n" + passed + " assertions passed");

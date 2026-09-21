@@ -66,6 +66,7 @@
     "test:oli-dimensional": "node scripts/oli-dimensional.test.js",
     "test:oli-itemization": "node scripts/oli-itemization.test.js",
     "test:oli-completeness-serve": "node scripts/oli-completeness-serve.test.js",
+    "test:dashboard-coverage-display": "node scripts/dashboard-coverage-display.test.js",
     "test:oli-operational-units": "node scripts/oli-operational-units.test.js",
     "test:oli-sales-estimate": "node scripts/oli-sales-estimate.test.js && node scripts/oli-sales-estimate-integration.test.js && node scripts/oli-sku-asin-resolution.test.js",
     "test:brand-view-render": "node scripts/brand-view-render.test.js && node scripts/brand-portfolio-view.test.js",

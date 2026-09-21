@@ -138,6 +138,7 @@ const SUITES = [
   "test:oli-dimensional",
   "test:oli-itemization",
   "test:oli-completeness-serve",
+  "test:dashboard-coverage-display",
   "test:oli-operational-units",
   "test:oli-sales-estimate",
   "test:sku-movement",

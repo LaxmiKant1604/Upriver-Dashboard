@@ -130,7 +130,7 @@ function primaryOrgFingerprintOrNull() {
 // pending-without-sku / cancelled) from the additive operational-unit table -- advisory; never breaks a report read.
 function oliCompletenessAugmentSingle() {
   const fp = primaryOrgFingerprintOrNull();
-  return fp ? makeCompletenessAugment({ organizationFingerprint: fp, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows, readEstimates: getSourceOliSalesEstimateRows }) : null;
+  return fp ? makeCompletenessAugment({ organizationFingerprint: fp, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows, readEstimates: getSourceOliSalesEstimateRows, readCoverage: getSourceCoverageWindows }) : null;
 }
 // A portfolio (multi-account) completeness augment (Brand View portfolio surfaces; any provisional -> provisional).
 function oliCompletenessAugmentPortfolio(accountIds) {
@@ -1116,7 +1116,7 @@ async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, co
     readOliOperationalUnits: getSourceOliOperationalUnitRows,
     readOliSkuAsinResolution: getOliSkuAsinResolutionRows, readDirectory: getAccountDirectorySnapshotAccounts,
   };
-  const augment = makeCompletenessAugment({ organizationFingerprint: orgFp, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows, readEstimates: getSourceOliSalesEstimateRows });
+  const augment = makeCompletenessAugment({ organizationFingerprint: orgFp, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows, readEstimates: getSourceOliSalesEstimateRows, readCoverage: getSourceCoverageWindows });
 
   // Manual per-(account, marketplace, ASIN) identifiers, JOINED at serve time (kept OUT of the snapshot so a
   // re-derive never erases them). Account-scoped; fail-soft (any read failure -> no identifiers, report unaffected).
@@ -3172,7 +3172,7 @@ async function handleDataDoe(req, res) {
           }
           // Two-layer PROVISIONAL/FINAL completeness: attach the current itemization state (read live from
           // source_oli_completeness) so Daily Reporting labels D-1 provisional/final without a snapshot rewrite.
-          sharedOptions.augmentResponse = makeCompletenessAugment({ organizationFingerprint: dailyOrgFingerprint, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows, readEstimates: getSourceOliSalesEstimateRows });
+          sharedOptions.augmentResponse = makeCompletenessAugment({ organizationFingerprint: dailyOrgFingerprint, connectionId: "primary", read: getOliCompleteness, readUnitBreakdown: getSourceOliOperationalUnitRows, readEstimates: getSourceOliSalesEstimateRows, readCoverage: getSourceCoverageWindows });
           sharedOptions.deriveDurable = async () => {
             // sharedAccountMetadata (defined in THIS module) reads the account's currency from the shared
             // account-directory snapshot. The previous call referenced an UNDEFINED helper (accountDirectoryMeta),

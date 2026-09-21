@@ -3240,6 +3240,15 @@ function DashboardApp({ session, access, onSignOut }) {
       || yesterday;
     if (latest > yesterday) latest = yesterday;
     const columns = dailyReportColumns(latest, 3, 5);
+    // A column whose whole span is BEFORE the account's proven OLI coverage start is UNAVAILABLE, not a genuine zero:
+    // no source proof exists for it, so Total Sales / Units must render as "—" rather than a fabricated 0 (a covered
+    // column with no sales stays a real zero). coverageFrom marks where OLI proof BEGINS. Mirrors SKU Movement's
+    // monthAvailable. Absent coverage (older payload / read miss) => available stays true (byte-identical behaviour).
+    // Clamp coverageFrom to the earliest ACTUAL row date: a durable row is itself proof of coverage, so if coverage
+    // lags the data we never mark a row-bearing column unavailable (guards the coverage-lags-rows case).
+    const rawCoverageFrom = dailyCompleteness && /^\d{4}-\d{2}-\d{2}$/.test(String(dailyCompleteness.coverageFrom || "")) ? String(dailyCompleteness.coverageFrom) : null;
+    const firstRowDate = dailyRows.reduce((m, r) => (!m || r.date < m ? r.date : m), null);
+    const coverageFrom = rawCoverageFrom && firstRowDate && firstRowDate < rawCoverageFrom ? firstRowDate : rawCoverageFrom;
     const cells = columns.map((col) => {
       let sales = 0, units = 0, adSales = 0, adSpend = 0, clicks = 0, hasAd = false;
       dailyRows.forEach((r) => {
@@ -3250,7 +3259,8 @@ function DashboardApp({ session, access, onSignOut }) {
         if (as !== null || sp !== null || ck !== null) hasAd = true;
         adSales += as || 0; adSpend += sp || 0; clicks += ck || 0;
       });
-      return { sales, units, adSales, adSpend, clicks, hasAd };
+      const available = !(coverageFrom && col.to < coverageFrom);
+      return { sales, units, adSales, adSpend, clicks, hasAd, available };
     });
     return { latest, columns, cells };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -4203,6 +4213,22 @@ function DashboardApp({ session, access, onSignOut }) {
   // which are two different states and get two different screens.
   const hasDashboardData = scopedRows.length > 0;
 
+  // OLI coverage state for the selected range (flexii UK repair). Distinguishes an UNCOVERED range (no source proof
+  // exists -> Unavailable, never a fabricated GBP 0) from a covered range that genuinely had no sales (a real zero).
+  // `coverageFrom` (from the serve-time augment) marks where OLI proof BEGINS. When it is absent (older payload / read
+  // miss) the status is "unknown" and the dashboard keeps its exact prior row-presence behaviour.
+  //   unavailable = the whole selected range is before coverage; partial = the range starts before coverage.
+  const salesWindowStatus = useMemo(() => {
+    const raw = salesCompleteness && /^\d{4}-\d{2}-\d{2}$/.test(String(salesCompleteness.coverageFrom || "")) ? String(salesCompleteness.coverageFrom) : null;
+    // Clamp to scopeMin (earliest actual sales row): a durable row is proof of coverage, so if coverage lags the data
+    // we never claim a row-bearing range is unavailable/partial (guards the coverage-lags-rows case).
+    const cf = raw && scopeMin && scopeMin < raw ? scopeMin : raw;
+    if (!cf || !rangeFrom || !rangeTo) return "unknown";
+    if (rangeTo < cf) return "unavailable";
+    if (rangeFrom < cf) return "partial";
+    return "covered";
+  }, [salesCompleteness, rangeFrom, rangeTo, scopeMin]);
+
   // Whether the DISPLAYED figures include an un-itemized provisional D-1: the
   // completeness state is provisional AND the selected range ends on that latest
   // date. Presentation-only -- it drives the small "Provisional" badges on the
@@ -4594,10 +4620,18 @@ function DashboardApp({ session, access, onSignOut }) {
           </div>
         ) : !hasDashboardData ? (
           <div className="panel">
-            <EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="No sales in this range">
-              This account has saved data, but no sales were reported between {fmtRangeLabel(rangeFrom, rangeTo)}.
-              Widen the date range or clear the brand filter.
-            </EmptyState>
+            {salesWindowStatus === "unavailable" ? (
+              <EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="Sales unavailable for this range">
+                Historical sales for {fmtRangeLabel(rangeFrom, rangeTo)} are not yet available from the source for this
+                account, so no total is shown — this is not a zero. Choose a more recent range, or widen it to include
+                covered dates{salesCompleteness && salesCompleteness.coverageFrom ? ` (coverage begins ${fmtDateHuman(salesCompleteness.coverageFrom)})` : ""}.
+              </EmptyState>
+            ) : (
+              <EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="No sales in this range">
+                This account has saved data, but no sales were reported between {fmtRangeLabel(rangeFrom, rangeTo)}.
+                Widen the date range or clear the brand filter.
+              </EmptyState>
+            )}
           </div>
         ) : (
         <>
@@ -4609,6 +4643,16 @@ function DashboardApp({ session, access, onSignOut }) {
               entrance-animation replay, no full-KPI-row flash on a filter change.
               The entrance animation therefore runs only once, when the Dashboard
               route first mounts. */}
+          {salesWindowStatus === "partial" && salesCompleteness && salesCompleteness.coverageFrom ? (
+            <div
+              role="note"
+              style={{ margin: "0 0 14px", padding: "9px 13px", borderRadius: 10, fontSize: 13, lineHeight: 1.45,
+                background: "rgba(245,158,11,0.10)", border: "1px solid rgba(245,158,11,0.28)", color: "var(--amber-800, #92400e)" }}
+            >
+              Source coverage begins {fmtDateHuman(salesCompleteness.coverageFrom)}. The totals below reflect only the
+              covered part of {fmtRangeLabel(rangeFrom, rangeTo)} — earlier dates are unavailable, not zero.
+            </div>
+          ) : null}
           <div className="metric-grid">
             <MetricCard
               label="Total Sales"
@@ -5674,11 +5718,14 @@ function ReconTh({ label, col, sort, setSort, align = "right" }) {
 // Rows of the Daily Reporting table, in display order. Ad-derived rows fall
 // back to "—" until advertising data is present on the fetched rows.
 const DAILY_METRICS = [
-  { key: "sales", label: "Total Sales", fmt: (c, cur) => fmtMoney(c.sales, cur) },
+  // Total Sales / Units render "—" (Unavailable) for a column with NO proven OLI coverage -- never a fabricated 0.
+  // `available === false` only when the client received coverage bounds and the column is entirely pre-coverage;
+  // absent/true keeps the exact prior rendering.
+  { key: "sales", label: "Total Sales", fmt: (c, cur) => (c.available === false ? "—" : fmtMoney(c.sales, cur)) },
   { key: "adSales", label: "Ad Sales", fmt: (c, cur) => (c.hasAd ? fmtMoney(c.adSales, cur) : "—") },
   { key: "adSpend", label: "Ad Spend", fmt: (c, cur) => (c.hasAd ? fmtMoney(c.adSpend, cur) : "—") },
   { key: "clicks", label: "Clicks", fmt: (c) => (c.hasAd ? c.clicks.toLocaleString("en-US") : "—") },
-  { key: "units", label: "Units", fmt: (c) => c.units.toLocaleString("en-US") },
+  { key: "units", label: "Units", fmt: (c) => (c.available === false ? "—" : c.units.toLocaleString("en-US")) },
   // ROI is the BUSINESS return on ad spend: Total Sales / Ad Spend (NOT Ad Sales / Ad Spend). The cell already
   // carries the column-SUMMED sales + adSpend (see dailyReport cells), so formatDailyRoi computes SUM(Total
   // Sales) / SUM(Ad Spend) for the period -- never an average of row-level ratios. Zero/missing/unavailable Ad

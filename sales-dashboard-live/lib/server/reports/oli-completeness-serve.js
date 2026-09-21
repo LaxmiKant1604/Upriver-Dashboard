@@ -169,7 +169,7 @@ export function makePortfolioCompletenessAugment({ organizationFingerprint, conn
 
 // Build the async serveSharedReport augment: ({ accountId, params }) => { completeness } | {}. The read is advisory:
 // any failure returns {} so a completeness hiccup never breaks a report read.
-export function makeCompletenessAugment({ organizationFingerprint, connectionId = "primary", read, readUnitBreakdown = null, readEstimates = null }) {
+export function makeCompletenessAugment({ organizationFingerprint, connectionId = "primary", read, readUnitBreakdown = null, readEstimates = null, readCoverage = null, coverageSourceKey = "order-line-items" }) {
   return async ({ accountId, params }) => {
     // Daily uses the real accountId as the serve id; the Brand endpoints use a brand-SCOPED serve id but carry the
     // real account in params.accountId -- prefer that so completeness always keys on the real account.
@@ -181,9 +181,28 @@ export function makeCompletenessAugment({ organizationFingerprint, connectionId 
         from: params && params.from ? String(params.from) : null,
         to: params && (params.to || params.asOf) ? String(params.to || params.asOf) : null,
       });
-      const c = summarizeCompleteness(rows);
+      let c = summarizeCompleteness(rows);
+      // OLI COVERAGE bounds (flexii UK repair): surface the account's PROVEN OLI coverage window bounds so the client
+      // can render a period with NO coverage as Unavailable / em dash instead of a fabricated zero (a covered date
+      // that simply has no sales stays a genuine zero -- coverageFrom marks where proof BEGINS, not where sales do).
+      // Attached ONLY onto an EXISTING completeness object (never as a coverage-only object -- that would make the
+      // DataStatusBanner assert a spurious "final" label for an account with no completeness rows). Advisory: any read
+      // failure simply omits coverage (the client falls back to its row-presence behaviour).
+      if (c && typeof readCoverage === "function") {
+        try {
+          const cov = await readCoverage({ organizationFingerprint, connectionId, accountId: acc, sourceKey: coverageSourceKey });
+          const windows = cov && S(cov.read) === "ok" && Array.isArray(cov.windows)
+            ? cov.windows.filter((w) => w && /^\d{4}-\d{2}-\d{2}$/.test(S(w.from)) && /^\d{4}-\d{2}-\d{2}$/.test(S(w.to)))
+            : [];
+          if (windows.length) {
+            const coverageFrom = windows.reduce((m, w) => (!m || S(w.from) < m ? S(w.from) : m), null);
+            const coverageTo = windows.reduce((m, w) => (!m || S(w.to) > m ? S(w.to) : m), null);
+            c = { ...c, coverageFrom, coverageTo, coverageWindows: windows.map((w) => ({ from: S(w.from), to: S(w.to) })) };
+          }
+        } catch (_ce) { /* advisory: coverage omitted */ }
+      }
       if (!c) return {};
-      const breakdown = await readUnitBreakdownFor({ read: readUnitBreakdown, readEstimates, organizationFingerprint, connectionId, accountIds: [acc], onDate: c.latestDate });
+      const breakdown = c.latestDate ? await readUnitBreakdownFor({ read: readUnitBreakdown, readEstimates, organizationFingerprint, connectionId, accountIds: [acc], onDate: c.latestDate }) : null;
       if (breakdown) c.unitBreakdown = breakdown;
       return { completeness: c };
     } catch (_e) {
