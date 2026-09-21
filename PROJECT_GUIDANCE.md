@@ -1,10 +1,25 @@
-# DataDoe Export and Backfill Guardrails
+# Shared Project Guidance and Rules
+
+This is the **single canonical file** for durable project instructions shared
+by Codex, Claude, and other repository agents.
+
+## Maintenance Rule
+
+- Add or change durable guidance only in this file.
+- Do not duplicate project rules in `AGENTS.md`, `CLAUDE.md`, prompts, or other
+  documents. Those agent-specific files are loader pointers only.
+- `PROJECT_MEMORY.md` records historical outcomes and evidence; this file holds
+  the current rules that agents must follow.
+- When a remembered fact conflicts with code or current source evidence, verify
+  it before updating this file or acting on it.
+
+## DataDoe Export and Backfill Guardrails
 
 This file is the durable source of truth for agents planning or executing a
 DataDoe export, diagnostic probe, historical backfill, or publication repair.
 Read it before touching production data or estimating token cost.
 
-## 1. Limits are source-specific
+### 1. Limits are source-specific
 
 There is no global DataDoe row limit. Identify the exact source/report first,
 then verify its current limit in production code and, where applicable, the
@@ -29,7 +44,7 @@ request builder used by that operation. If documentation, conversation, and
 code disagree, stop and resolve the discrepancy with evidence before creating
 an export. Never accept or repeat a correction from memory alone.
 
-## 2. Mandatory preflight before a paid action
+### 2. Mandatory preflight before a paid action
 
 Before the first create-export call, write down and verify all of the following:
 
@@ -47,7 +62,7 @@ User approval for investigation is not approval for a paid export. User
 approval for a probe is not approval for a full backfill. Never exceed the
 explicit account/source/date/token scope.
 
-## 3. Truncation and splitting rules
+### 3. Truncation and splitting rules
 
 - A result with `rowCount < sourceLimit` may be complete only after date and
   ownership checks pass.
@@ -65,7 +80,7 @@ explicit account/source/date/token scope.
 - Rebuild dependent reports from restored durable evidence. Do not launch
   unrelated source exports to make downstream reports look complete.
 
-## 4. Token estimates
+### 4. Token estimates
 
 Token estimates must distinguish:
 
@@ -78,7 +93,7 @@ the initial capped request and every possible split in the estimate. A hard
 ceiling is not an expected spend. Check the fresh balance before every create
 and stop before the next create would exceed the approved ceiling.
 
-## 5. Persistence and truthfulness
+### 5. Persistence and truthfulness
 
 - Never infer proven-empty coverage from a blank, capped, failed, pending, or
   otherwise incomplete export.
@@ -91,7 +106,7 @@ and stop before the next create would exceed the approved ceiling.
 - Record export IDs, token balance before/after, row/date boundaries, validation
   results, writes, rebuilt reports, and production smoke evidence.
 
-## 6. Current flexii UK recovery facts
+### 6. Current flexii UK recovery facts
 
 These facts prevent the active incident from being re-planned from memory:
 
@@ -117,7 +132,7 @@ These facts prevent the active incident from being re-planned from memory:
 - As of the creation of this runbook, the full historical backfill has **not**
   started and no additional backfill tokens have been spent.
 
-## 7. Required completion report
+### 7. Required completion report
 
 Report code state and production data state separately. Include:
 
