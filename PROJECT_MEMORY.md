@@ -1,5 +1,53 @@
 # Project Memory
 
+## flexii UK OLI historical-sales RESTORED end-to-end (2026-09-21; DataDoe 50,000 ceiling confirmed; 1 export / 0 tokens; verify 230/202; commits local-only, NOT pushed)
+
+WHAT. Recovered flexii UK's (account f08cefca, GB/GBP) missing Order Line Items history that was rendering as
+fabricated £0 for 2025-01-01..2026-09-02. Two parts. (1) CODE: the DataDoe team confirmed (PROJECT_GUIDANCE.md,
+commit a896218) EVERY source, OLI included, permits 50,000 rows/export (max 5 sellers; OLI still 2 std tokens/create);
+the repo's OLI 5,000 constants were stale (a since-resolved DataDoe-side incident). Corrected 5000->50000 across all
+six OLI-order-grain mirrors (report-source-contracts.js OLI_SALES_ROW_LIMIT; api/datadoe.js OLI_SALES_ROW_LIMIT/
+ORDER_SALES_ROW_LIMIT/DAILY_ROW_LIMIT/DAILY_BRAND_ROW_LIMIT; lib/server/reports/sources.js OLI_ROW_LIMIT) + comments,
+so live==scheduler request identity stays byte-identical. Left untouched (documented): DASHBOARD_ROW_LIMIT (source
+b24cd69c06 != OLI), supabase.js maxRows=5000 (zero-row-proof owner-hash guard, not a data cap), SOURCE_OLI_HISTORY_
+MAX_ROWS=200000 (read cap already >50k). Commit 66d0e79. (2) NEW narrow single-account operator scripts/release/
+flexii-oli-history-restore.mjs (commit 574d499) -- NOT the bucket-wide oli-dimensional-replacement.mjs: single seller,
+ONE forced 50k export, direct-pg 9-arg replace_oli_dimensional_window with ALL THREE grains (dimensional + order-audit
++ operational-units), coveredTo=2026-09-02 (< 2026-09-03) so the windowed delete cannot touch the valid tail. Pure
+helpers unit-tested (scripts/flexii-oli-history-restore.test.mjs, wired as test:flexii-oli-restore).
+
+VERIFICATION. Focused parity/truncation tests green; regenerated 4 intentionally-changed OLI golden request_hashes
+(report-derivation-core brand-sales:order-lines e498a480; sync-dispatch 72a5ecdc; timeout-slicing 92c9007c + 27f316ac).
+Full npm run verify 230 steps / 202 suites green incl. build:check (was 229/201 + the new suite). verify-sku-movement-v2
+51/51 accounts PASS (flexii incl., unit-conservation 5960/5960).
+
+PRODUCTION (approved: exactly 1 create, hard ceiling 2 tokens). --apply: fresh balance 1338 rechecked; ONE forced OLI
+export [2025-01-01..2026-09-02] returned 44,077 rows (< 50k -> COMPLETE), **0 tokens consumed** (DataDoe cache-served;
+balance 1338->1338). Validation PASS: dates 2025-01-01..2026-09-02, £371,341.87, 43,750 units, 0 dupes, seller
+[f08cefca] only, [GBP] only. Persisted all grains via the 9-arg RPC: dimensional 41,372 / order-audit 44,076 /
+operational-units 4,819 / non-cancelled rollup 4,803 inserted (all *Replaced=0 -- clean insert into the empty gap).
+PRESERVED tail EXACT: 125 rollup rows / £7,920.16 / 859 units [2026-09-03..2026-09-20] unchanged. Truthful coverage
+[2025-01-01..2026-09-02] succeeded upserted (the 3 pre-existing false broad windows are NOT deleted by the RPC but are
+now redundant-but-true, fully subsumed by real+proven-empty data). Durable rollup after: every month 2025-01..2026-09
+has GENUINE sales (£10k-26k/mo, 28-31 active days); 2025-06-01+ (user floor) = £301,747.97 raw / 33,890 units.
+
+REBUILD (zero export). OLI publication reconcile (europe-au, periodic, flexii-scoped) ran LIVE: dataDoeCreates=0/
+tokens=0 but all 3 targets DEFERRED -- the designed learn-once cold shared-Catalog fast-defer (europe-au scheduler
+stalled since 09-06; its 24h catalog-cache carrier is unadoptable). Crucially this does NOT block the UI: the DEPLOYED
+serve (api/datadoe.js) SELF-HEALS Daily Reporting (rederiveDailyV2, reads the DURABLE catalog snapshot -- not the cold
+24h cache) and SKU Movement (serveSelfHealingSkuMovement) from durable OLI on read, and persists on read. Serve-parity
+smoke proved rederiveDailyV2 for flexii returns £309,668.13 / 34,749 units for 2025-06-01+ (enriched with the canonical
+OLI sales-estimate fill = the same Total Sales the scheduler publishes; monthly matches durable exactly). flexii's 8
+stored daily snapshots are ALL stale-by-advance (newest to=2026-09-19 < proven 2026-09-20) so the self-heal fires on
+next load; the scheduler also republishes flexii daily. fba-plan dry-run europe-au = 0 creates/0 tokens (all adoptable);
+NOT taken live (separate forward-inventory decision). Reconciliation: durable OLI == derived == visible (all trace to
+the same restored rollup; enriched >= raw by the estimate fill).
+
+DELIVERY. 5 local commits on main (3 owner docs 8acd777/498a6fa/a896218 + 66d0e79 + 574d499), origin/main still 9369dde
+-- NOT pushed, NOT deployed (per owner: push/deploy reviewed separately; the operational restoration used the local
+release script + already-deployed self-heal serve, so no redeploy is required to show the data). Builds on
+[[flexii-false-proven-empty-oli]], [[oli-publication-reconciler]], [[daily-v2-selfheal-autoloading]].
+
 ## OLI sales-estimate historical-price fallback look-back extended 7 -> 30 days (2026-09-17, commit 09c400c on main, PUSHED; verify 220/196 green incl. build:check; backfill APPLIED + reconcilers all 3 regions clean; acceptance proven)
 
 WHAT. Extended the OLI pending/zero-price sales-estimate historical-price fallback from a 7-day to a 30-day calendar
