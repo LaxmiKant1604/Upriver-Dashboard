@@ -999,12 +999,12 @@ const INSIGHT_SPEC = [
   { rk: "sales-movers:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
   { rk: "sales-movers:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   { rk: "buy-box-loss:daily", file: "buy-box.js", cols: "DAILY_COLUMNS", group: null, aggs: null, src: "profit-by-sku-date", limit: 50000, oc: "date", od: "ASC", strict: true },
-  { rk: "buy-box-loss:oli-sales", file: "buy-box.js", cols: "OLI_SALES_GROUP_BY", group: "OLI_SALES_GROUP_BY", aggs: "OLI_SALES_AGGREGATIONS", src: "order-line-items", limit: 5000, oc: "date", od: "ASC", strict: true },
+  { rk: "buy-box-loss:oli-sales", file: "buy-box.js", cols: "OLI_SALES_GROUP_BY", group: "OLI_SALES_GROUP_BY", aggs: "OLI_SALES_AGGREGATIONS", src: "order-line-items", limit: 50000, oc: "date", od: "ASC", strict: true },
   { rk: "buy-box-loss:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
   { rk: "buy-box-loss:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   { rk: "returns-leakage:returns", file: "returns.js", cols: "RETURN_COLUMNS", group: null, aggs: null, src: "returns", limit: 50000, oc: "date", od: "DESC", strict: true },
   { rk: "returns-leakage:settlements", file: "returns.js", cols: "SETTLEMENT_GROUP_BY", group: "SETTLEMENT_GROUP_BY", aggs: "SETTLEMENT_AGGREGATIONS", src: "settlements", limit: 50000, oc: "sku", od: "ASC", strict: true },
-  { rk: "returns-leakage:oli-sales", file: "returns.js", cols: "OLI_SALES_GROUP_BY", group: "OLI_SALES_GROUP_BY", aggs: "OLI_SALES_AGGREGATIONS", src: "order-line-items", limit: 5000, oc: "date", od: "ASC", strict: true },
+  { rk: "returns-leakage:oli-sales", file: "returns.js", cols: "OLI_SALES_GROUP_BY", group: "OLI_SALES_GROUP_BY", aggs: "OLI_SALES_AGGREGATIONS", src: "order-line-items", limit: 50000, oc: "date", od: "ASC", strict: true },
   { rk: "returns-leakage:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   // Listing Health
   { rk: "listing-health:listings", file: "listing-health.js", cols: "LISTING_COLUMNS", group: null, aggs: null, src: "listings", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
@@ -1013,7 +1013,7 @@ const INSIGHT_SPEC = [
   { rk: "listing-health:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
   { rk: "listing-health:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   // PPC Performance (ads are derived; this is the only owned export besides catalog)
-  { rk: "ppc-performance:oli-sales", file: "ppc.js", cols: "OLI_SALES_GROUP_BY", group: "OLI_SALES_GROUP_BY", aggs: "OLI_SALES_AGGREGATIONS", src: "order-line-items", limit: 5000, oc: "date", od: "ASC", strict: true },
+  { rk: "ppc-performance:oli-sales", file: "ppc.js", cols: "OLI_SALES_GROUP_BY", group: "OLI_SALES_GROUP_BY", aggs: "OLI_SALES_AGGREGATIONS", src: "order-line-items", limit: 50000, oc: "date", od: "ASC", strict: true },
   { rk: "ppc-performance:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   // Listing Optimizer (richer SQP + richer content catalog; both intentionally unshared)
   { rk: "listing-optimizer:sqp-weekly", file: "listing-optimizer.js", cols: "SQP_COLUMNS", group: null, aggs: null, src: "sqp-weekly", limit: 50000, oc: "date", od: "ASC", strict: true, policy: "degraded" },

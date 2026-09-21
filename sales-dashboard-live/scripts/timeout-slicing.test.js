@@ -251,8 +251,8 @@ test("GOLDEN: the sliced request windows produce the pinned request_hashes for a
   assert.equal(daily.length, 27, "6 calendar months (Mar..Aug-partial) -> 27 slices");
   assert.deepEqual([daily[0].from, daily[0].to], ["2025-03-01", "2025-03-07"]);
   assert.deepEqual([daily[daily.length - 1].from, daily[daily.length - 1].to], ["2025-08-08", "2025-08-10"]);
-  assert.equal(daily[0].requestHash, "5a6eb8e5fd1ae372e8caa8d2e6650c4f47f1af5c8fc292870bbea4ef37b051ab");
-  assert.equal(daily[daily.length - 1].requestHash, "0d8d2f94b0da15f30c5b14aff495df6ab7a0de804229d6aa9ef999571b46a343");
+  assert.equal(daily[0].requestHash, "92c9007caa96451833cec3820395503e5d380e9c7b3a29e5b79e13e3bb2870a6");
+  assert.equal(daily[daily.length - 1].requestHash, "27f316acc467465be85041386fce36882fdbae7254ab99c5cb6aa5d248200e3b");
 });
 
 /* ============================= 5: malformed-fragment fail-closed matrix ============================= */

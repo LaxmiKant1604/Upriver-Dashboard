@@ -359,7 +359,7 @@ const dailyOli = () => reportSourceRequestHashes({ reportKey: "daily-reporting",
 } }).filter((r) => r.requestKey === "daily-reporting:oli-sales");
 
 // The request_hash the LIVE (browser/manual) datadoe.js fetch produces for one canonical OLI slice: the
-// EXACT canonical OLI spec (sourceId 89b27535, OLI columns/groupBy/aggregations, 5000 cap, orderBy date/ASC)
+// EXACT canonical OLI spec (sourceId 89b27535, OLI columns/groupBy/aggregations, 50000 cap, orderBy date/ASC)
 // -- byte-identical to what fetchDailyBrandSalesRows and the fba route now pass per canonicalOliSlices slice.
 // (report-source-contracts.test.mjs independently proves the datadoe.js constants == this canonical spec.)
 // The canonical OLI fragment carries the four order dimensions (amazon_order_status, fulfillment_channel,
@@ -369,7 +369,7 @@ const dailyOli = () => reportSourceRequestHashes({ reportKey: "daily-reporting",
 const LIVE_OLI_COLUMNS = ["date", "seller_or_vendor_id", "sku", "child_asin", "item_price_currency", "amazon_order_status", "fulfillment_channel", "address_state", "address_city", "amazon_order_id", "item_status"];
 const liveOliRequestHash = (slice, ids = ["A1"], apiKey = "k") => sourceRequestIdentity({
   apiKey, sourceId: OLI_ID, columns: LIVE_OLI_COLUMNS,
-  ids, from: slice.from, to: slice.to, limit: 5000,
+  ids, from: slice.from, to: slice.to, limit: 50000,
   options: {
     groupBy: LIVE_OLI_COLUMNS,
     aggregations: [{ column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" }, { column: "quantity", aggregation: "sum", alias: "total_units_sum" }],

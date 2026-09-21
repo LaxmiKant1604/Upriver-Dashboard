@@ -784,7 +784,8 @@ group("scheduler-v2 dispatch: strict truncation on the new contracts (finding 2)
 test("(strict + identity pin) all four newly dispatched contracts are strict:true; request_hash matches the corrected source contract", () => {
   // Golden hashes captured at HEAD 554b859 BEFORE strict was added; strict stays OUTSIDE sourceRequestIdentity.
   const GOLDEN = {
-    "brand-sales:order-lines": "b177f31042ff69cfbf0d98325c1fb21bfda51da2eb84f7eedbe1b5d00f141007",
+    "brand-sales:order-lines": "72a5ecdc9d8992a2bd60f222682155ca694cf9e18a37f5c291b225dd6895c315", // regenerated for the 50,000 OLI ceiling (2026-09-21); only the OLI limit changed
+
     "brand-sales:catalog": "0e9c4e5a4653e92e8fb4aea2de50b5cade8f3f379daddce5bc8e3f392b33abac",
     "content-changes:events": "94e6c902b901cb48fe3ce785144f8a0d6529c635c702d376be71a5d5e7b29d69",
     "content-changes:catalog": "314e46657501b9d6515cefa0b10bd8b9bc661ba958312986213755dfb9751acf",

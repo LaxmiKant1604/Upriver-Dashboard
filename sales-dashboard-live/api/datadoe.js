@@ -1952,7 +1952,7 @@ const OLI_SALES_AGGREGATIONS = [
   { column: "item_price_value", aggregation: "sum", alias: "total_sales_sum" },
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
 ];
-const OLI_SALES_ROW_LIMIT = 5000;
+const OLI_SALES_ROW_LIMIT = 50000; // DataDoe-team-confirmed source ceiling (2026-09-21); mirrors report-source-contracts.js OLI_SALES_ROW_LIMIT (parity-tested)
 
 // Advertising source (ad sales / spend / clicks), merged into the daily report by (account, date, currency).
 // ad_campaign_budget_currency is carried + normalized to `currency` (Blocker 4) so the currency-keyed
@@ -2089,16 +2089,17 @@ const LISTINGS_AWD_COLUMNS = [
 const planInventoryDay = (now = Date.now()) => new Date(now - 86400000).toISOString().slice(0, 10);
 const PLAN_INVENTORY_ROW_LIMIT = 50000; // raised from 15000 so a marketplace-safe <=5-seller FBA Health batch of large-inventory accounts returns without truncation (parity with the fba-plan:inventory-health contract limit).
 
-const DASHBOARD_ROW_LIMIT = 5000;
-// Order rows are grouped by day and ASIN before download. A year of data can
-// still contain more than 5,000 ASIN/day groups, so use a higher export cap.
-// DataDoe's current Order Line Items create contract rejects a limit above 5,000.
-const ORDER_SALES_ROW_LIMIT = 5000;
+const DASHBOARD_ROW_LIMIT = 5000; // legacy aggregated "dashboard" source (b24cd69c06), NOT the OLI order grain -- unrelated cap, left as-is
+// Order rows are grouped by day and ASIN before download. Per direct DataDoe-team confirmation (2026-09-21) the
+// Order Line Items source permits up to 50,000 rows per export; the former 5,000 value was a stale application
+// constraint. Keep it byte-identical to report-source-contracts.js OLI_SALES_ROW_LIMIT (parity-tested) so the live
+// and scheduler request identities share one cached export.
+const ORDER_SALES_ROW_LIMIT = 50000;
 const CATALOG_ROW_LIMIT = 10000;
-// Daily sources are aggregated by account/date before download, so a compact
-// limit safely covers years of history without raw ASIN row truncation.
-const DAILY_ROW_LIMIT = 5000;
-const DAILY_BRAND_ROW_LIMIT = 5000;
+// Daily brand/all-brand sales fetch the EXACT canonical OLI order grain (OLI_SALES_COLUMNS via canonicalOliSlices),
+// so this cap must equal the OLI source ceiling (50,000) to keep request-hash parity with the scheduler fragments.
+const DAILY_ROW_LIMIT = 50000; // currently unused; kept at the OLI ceiling for consistency
+const DAILY_BRAND_ROW_LIMIT = 50000;
 const RECONCILIATION_ROW_LIMIT = 50000;
 const CONTENT_CHANGE_ROW_LIMIT = 1000;
 

@@ -194,6 +194,8 @@ export const ROW_LIMITS = {
   dateRollup: 500,
 };
 
-// Source-specific API ceiling confirmed by the live DataDoe create endpoint. This is deliberately separate
-// from the larger limits accepted by other sources.
-export const OLI_ROW_LIMIT = 5000;
+// Order Line Items source ceiling. Per direct DataDoe-team confirmation (2026-09-21, PROJECT_GUIDANCE.md) OLI
+// permits up to 50,000 rows per export like every other source; the former 5,000 value was a stale application
+// constraint (since-resolved DataDoe-side incident). Kept equal to ROW_LIMITS.rawGrain so the buy-box / returns /
+// ppc OLI fetches share the scheduler's cached export (request-hash parity).
+export const OLI_ROW_LIMIT = 50000;
