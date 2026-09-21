@@ -94,7 +94,7 @@ export default function DailyReporting({
   // The six KPI cards, values straight from the MTD column (adSales/adSpend are null -> em dash when advertising is
   // unavailable, never a fabricated zero). Money footers carry the full-precision figure; ratio footers the formula.
   const cards = kpis ? [
-    { key: "sales",   ...KPI_META.sales,   big: moneyC(kpis.totalSales), val: moneyF(kpis.totalSales) },
+    { key: "sales",   ...KPI_META.sales,   big: moneyC(kpis.totalSales), val: moneyF(kpis.totalSales), partial: !!kpis.salesPartial },
     { key: "adSales", ...KPI_META.adSales, big: moneyC(kpis.adSales),    val: moneyF(kpis.adSales) },
     { key: "adSpend", ...KPI_META.adSpend, big: moneyC(kpis.adSpend),    val: moneyF(kpis.adSpend) },
     { key: "roi",     ...KPI_META.roi,     big: kpis.roi,   val: null },
@@ -214,7 +214,17 @@ export default function DailyReporting({
           {cards.map((card) => (
             <div key={card.key} className={"dr-kpi dr-kpi--" + card.accent}>
               <div>
-                <div className="dr-kpi-label">{card.label}</div>
+                <div className="dr-kpi-label">
+                  {card.label}
+                  {card.partial && (
+                    <span
+                      title="This month's OLI coverage is partial; the total is source-backed for the covered dates only -- some dates are unavailable, not zero."
+                      style={{ display: "inline-block", marginLeft: 6, padding: "1px 6px", borderRadius: 8, fontSize: 10, fontWeight: 600, letterSpacing: 0.2, background: "rgba(245,158,11,0.14)", border: "1px solid rgba(245,158,11,0.32)", color: "var(--amber-800, #92400e)", verticalAlign: "middle" }}
+                    >
+                      Partial
+                    </span>
+                  )}
+                </div>
                 <div className={"dr-kpi-value" + (card.valueClass ? " " + card.valueClass : "")}>{card.big}</div>
               </div>
               <div className="dr-kpi-foot">
@@ -282,10 +292,32 @@ export default function DailyReporting({
                   <th scope="col" className="dr-th dr-th-metric">Metric / Measure</th>
                   {cols.map((col, i) => {
                     const cc = colClass(i, col);
+                    // OLI coverage badge (flexii UK follow-up): a column whose OLI coverage is not fully proven is
+                    // labelled so its Total Sales / Units are never read as a fully-available figure. Partial shows the
+                    // covered date range (source-backed total for those dates only); unavailable/unknown are shown as
+                    // such -- never as a zero. A fully-covered column (incl. a genuine covered zero) carries no badge.
+                    const cell = report.cells[i] || {};
+                    const st = cell.status;
+                    const cov = st === "partial"
+                      ? { label: "Partial", title: `Only ${cell.provenDays} of ${cell.totalDays} days in this column are source-covered; the total is source-backed for those dates, and some dates in this range are unavailable, not zero.` }
+                      : st === "unavailable"
+                        ? { label: "Unavailable", title: "No source coverage for this period — shown as unavailable, never as a zero." }
+                        : st === "unknown"
+                          ? { label: "Unknown", title: "Coverage evidence could not be read for this period." }
+                          : null;
                     return (
                       <th key={col.key} scope="col" className={"dr-th dr-th-" + cc}>
                         {col.label}
                         {i === latestIdx && <span className="dr-th-tag">Latest</span>}
+                        {cov && (
+                          <span
+                            className="dr-th-cov"
+                            title={cov.title}
+                            style={{ display: "inline-block", marginLeft: 6, padding: "1px 6px", borderRadius: 8, fontSize: 10, fontWeight: 600, letterSpacing: 0.2, background: "rgba(245,158,11,0.14)", border: "1px solid rgba(245,158,11,0.32)", color: "var(--amber-800, #92400e)", verticalAlign: "middle" }}
+                          >
+                            {cov.label}
+                          </span>
+                        )}
                       </th>
                     );
                   })}

@@ -5,7 +5,7 @@
 // -- never Infinity, NaN, or a fabricated zero). Advertising that a period does not cover is `null` (an honest gap),
 // never 0. 7-bit ASCII.
 
-import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./daily-metrics.js";
+import { formatDailyRoi, formatDailyAcos, formatDailyTacos, oliCovMissing, oliRatioBlocked, EM_DASH } from "./daily-metrics.js";
 
 // Index of the MTD column in a daily report; -1 when there is none. The column set is dynamic (built from the
 // account's latest proven date), so the MTD position is found by group, never hard-coded.
@@ -15,22 +15,27 @@ export function mtdColumnIndex(report) {
 }
 
 // The SIX MTD KPI values, sourced ENTIRELY from the report's MTD column cell. Returns null when there is no MTD
-// column (nothing to summarise). totalSales is always the summed sales; adSales/adSpend are null when advertising is
-// UNAVAILABLE for the period (never a fabricated zero); roi/acos/tacos are the locked business formulas as display
-// strings ("--" when unavailable). label is the dynamic MTD column label (e.g. "Aug '26 MTD").
+// column (nothing to summarise). totalSales HONOURS OLI coverage exactly as the table cell does: null (-> em dash) when
+// the MTD column's coverage is UNAVAILABLE / UNKNOWN (never a fabricated or silently-understated total), and a
+// `salesPartial` flag marks a PARTIAL MTD so the card labels its covered-only total (matching the table's Partial
+// badge). adSales/adSpend are null when advertising is unavailable; roi/tacos (sales-derived) em dash unless the MTD is
+// fully covered; acos (ad-only) is unchanged. label is the dynamic MTD column label (e.g. "Aug '26 MTD").
 export function dailyMtdKpis(report) {
   const idx = mtdColumnIndex(report);
   if (idx < 0) return null;
   const cell = ((report && report.cells) || [])[idx];
   if (!cell) return null;
+  const covMissing = oliCovMissing(cell);      // unavailable / unknown -> the OLI total is NOT shown (em dash)
+  const ratioBlocked = oliRatioBlocked(cell);  // partial / unavailable / unknown -> a period ratio is not meaningful
   return {
     label: report.columns[idx].label,
-    totalSales: Number(cell.sales) || 0,
+    totalSales: covMissing ? null : (Number(cell.sales) || 0),
+    salesPartial: cell.status === "partial",
     adSales: cell.hasAd ? Number(cell.adSales) || 0 : null,
     adSpend: cell.hasAd ? Number(cell.adSpend) || 0 : null,
-    roi: formatDailyRoi(cell.sales, cell.adSpend, cell.hasAd),
+    roi: ratioBlocked ? EM_DASH : formatDailyRoi(cell.sales, cell.adSpend, cell.hasAd),
     acos: formatDailyAcos(cell.adSpend, cell.adSales, cell.hasAd),
-    tacos: formatDailyTacos(cell.adSpend, cell.sales, cell.hasAd),
+    tacos: ratioBlocked ? EM_DASH : formatDailyTacos(cell.adSpend, cell.sales, cell.hasAd),
   };
 }
 
@@ -44,9 +49,11 @@ export function dailyTrendSeries(report) {
   cols.forEach((c, i) => { if (c && c.group === "day") days.push({ label: c.label, cell: cells[i] || {} }); });
   return {
     labels: days.map((d) => d.label),
-    sales: days.map((d) => Number(d.cell.sales) || 0),
+    // A day whose OLI coverage is UNAVAILABLE / UNKNOWN is an honest GAP (null) the sparkline drops -- never a plotted
+    // 0 that lastFinite could headline as a real zero. A covered (incl. genuine-zero) or partial day plots its total.
+    sales: days.map((d) => (oliCovMissing(d.cell) ? null : (Number(d.cell.sales) || 0))),
     adSales: days.map((d) => (d.cell.hasAd ? Number(d.cell.adSales) || 0 : null)),
-    roi: days.map((d) => (d.cell.hasAd && Number(d.cell.adSpend) > 0 ? Number(d.cell.sales) / Number(d.cell.adSpend) : null)),
+    roi: days.map((d) => (!oliRatioBlocked(d.cell) && d.cell.hasAd && Number(d.cell.adSpend) > 0 ? Number(d.cell.sales) / Number(d.cell.adSpend) : null)),
     acos: days.map((d) => (d.cell.hasAd && Number(d.cell.adSales) > 0 ? (Number(d.cell.adSpend) / Number(d.cell.adSales)) * 100 : null)),
   };
 }

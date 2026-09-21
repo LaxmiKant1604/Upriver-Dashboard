@@ -41,7 +41,12 @@ import { computeAsinWdd, resolveWddWeights, validateWddWeights, WDD_DEFAULT_WEIG
 import { buildFbaLeadTimeMatrix, validateFbaLeadTimeRows, validateFbaLeadTimeText } from "./lib/fba-lead-time-import.js";
 import { useFbaPlanConfig } from "./lib/use-fba-plan-config.js";
 import { useFbaPlanColumns } from "./lib/use-fba-plan-columns.js";
-import { formatDailyRoi, formatDailyAcos, formatDailyTacos } from "./lib/daily-metrics.js";
+import { DAILY_METRICS } from "./lib/daily-metrics.js";
+import { applyDailyCoverage, classifyInterval, coverageActive, positiveRowDates, COVERAGE_STATUS } from "./lib/coverage-windows.js";
+// The OLI history floor (the durable backfill era start). The Dashboard date-control minimum is pinned here, NOT to
+// the first saved row, so a Custom range may be set BEFORE the earliest data to investigate whether earlier coverage
+// exists (per the flexii UK follow-up). It is the earliest date the OLI backfill/coverage model tracks.
+const OLI_HISTORY_FLOOR = "2025-01-01";
 import { canonicalBrandKey, permittedBrandKeySetForAccount, filterBrandNamesToPermitted } from "./lib/brand-scope-filter.js";
 import { filterAccounts, accountSelectionCounts } from "./lib/account-access-select.js";
 // Regional Brand View: Region -> Brand selection, using the SINGLE canonical marketplace->region mapping the
@@ -3240,16 +3245,7 @@ function DashboardApp({ session, access, onSignOut }) {
       || yesterday;
     if (latest > yesterday) latest = yesterday;
     const columns = dailyReportColumns(latest, 3, 5);
-    // A column whose whole span is BEFORE the account's proven OLI coverage start is UNAVAILABLE, not a genuine zero:
-    // no source proof exists for it, so Total Sales / Units must render as "—" rather than a fabricated 0 (a covered
-    // column with no sales stays a real zero). coverageFrom marks where OLI proof BEGINS. Mirrors SKU Movement's
-    // monthAvailable. Absent coverage (older payload / read miss) => available stays true (byte-identical behaviour).
-    // Clamp coverageFrom to the earliest ACTUAL row date: a durable row is itself proof of coverage, so if coverage
-    // lags the data we never mark a row-bearing column unavailable (guards the coverage-lags-rows case).
-    const rawCoverageFrom = dailyCompleteness && /^\d{4}-\d{2}-\d{2}$/.test(String(dailyCompleteness.coverageFrom || "")) ? String(dailyCompleteness.coverageFrom) : null;
-    const firstRowDate = dailyRows.reduce((m, r) => (!m || r.date < m ? r.date : m), null);
-    const coverageFrom = rawCoverageFrom && firstRowDate && firstRowDate < rawCoverageFrom ? firstRowDate : rawCoverageFrom;
-    const cells = columns.map((col) => {
+    const baseCells = columns.map((col) => {
       let sales = 0, units = 0, adSales = 0, adSpend = 0, clicks = 0, hasAd = false;
       dailyRows.forEach((r) => {
         if (r.date < col.from || r.date > col.to) return;
@@ -3259,9 +3255,14 @@ function DashboardApp({ session, access, onSignOut }) {
         if (as !== null || sp !== null || ck !== null) hasAd = true;
         adSales += as || 0; adSpend += sp || 0; clicks += ck || 0;
       });
-      const available = !(coverageFrom && col.to < coverageFrom);
-      return { sales, units, adSales, adSpend, clicks, hasAd, available };
+      return { sales, units, adSales, adSpend, clicks, hasAd };
     });
+    // Classify each column against the FULL normalized coverage-window union (coverageTo + internal gaps, not
+    // coverageFrom alone). A row is positive evidence for its OWN date only. The cell's summed sales/units are already
+    // the source-backed totals (an uncovered date carries no row), so this only LABELS each column so the renderer can
+    // show GBP 0 for a fully proven-empty column, a total + Partial marker for a partially-proven one, and an em dash
+    // for unavailable/unknown. A payload without coverage evidence keeps the exact prior rendering (unknown-legacy).
+    const cells = applyDailyCoverage({ report: { columns, cells: baseCells }, completeness: dailyCompleteness, rows: dailyRows });
     return { latest, columns, cells };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dailyRows, dailyCompleteness]);
@@ -4051,7 +4052,11 @@ function DashboardApp({ session, access, onSignOut }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [brandRows, latest, scopeMin]);
 
-  const [rangeFrom, rangeTo] = useMemo(() => {
+  // The REQUESTED interval is preserved SEPARATELY from the EFFECTIVE (aggregation) interval so a 90D request stays
+  // "90 days" for coverage classification + labelling and is never silently rewritten into the 17 days that happen to
+  // carry rows. requestedFrom/To = what the user asked for; rangeFrom/To = the aggregation window (start clamped up to
+  // the earliest available data row, since there are no rows before it -> the totals are the covered intersection).
+  const [requestedFrom, requestedTo, rangeFrom, rangeTo] = useMemo(() => {
     let f, t;
     switch (rangePreset) {
       case "YESTERDAY": {
@@ -4070,9 +4075,11 @@ function DashboardApp({ session, access, onSignOut }) {
       case "CUSTOM": f = customFrom || scopeMin || latest; t = customTo || latest; break;
       default: f = addDays(latest, -29); t = latest;
     }
-    if (scopeMin && f < scopeMin) f = scopeMin;
     if (t > latest) t = latest;
-    return [f, t];
+    const reqFrom = f, reqTo = t; // preserved verbatim -- coverage is judged against the REQUESTED interval
+    let effFrom = f;
+    if (scopeMin && effFrom < scopeMin) effFrom = scopeMin; // clamp only the aggregation window (a Custom range may request earlier)
+    return [reqFrom, reqTo, effFrom, t];
   }, [rangePreset, latest, scopeMin, customFrom, customTo]);
 
   const scopedRows = useMemo(() => filterRows(rangeFrom, rangeTo), [brandRows, rangeFrom, rangeTo]);
@@ -4213,21 +4220,29 @@ function DashboardApp({ session, access, onSignOut }) {
   // which are two different states and get two different screens.
   const hasDashboardData = scopedRows.length > 0;
 
-  // OLI coverage state for the selected range (flexii UK repair). Distinguishes an UNCOVERED range (no source proof
-  // exists -> Unavailable, never a fabricated GBP 0) from a covered range that genuinely had no sales (a real zero).
-  // `coverageFrom` (from the serve-time augment) marks where OLI proof BEGINS. When it is absent (older payload / read
-  // miss) the status is "unknown" and the dashboard keeps its exact prior row-presence behaviour.
-  //   unavailable = the whole selected range is before coverage; partial = the range starts before coverage.
-  const salesWindowStatus = useMemo(() => {
-    const raw = salesCompleteness && /^\d{4}-\d{2}-\d{2}$/.test(String(salesCompleteness.coverageFrom || "")) ? String(salesCompleteness.coverageFrom) : null;
-    // Clamp to scopeMin (earliest actual sales row): a durable row is proof of coverage, so if coverage lags the data
-    // we never claim a row-bearing range is unavailable/partial (guards the coverage-lags-rows case).
-    const cf = raw && scopeMin && scopeMin < raw ? scopeMin : raw;
-    if (!cf || !rangeFrom || !rangeTo) return "unknown";
-    if (rangeTo < cf) return "unavailable";
-    if (rangeFrom < cf) return "partial";
-    return "covered";
-  }, [salesCompleteness, rangeFrom, rangeTo, scopeMin]);
+  // The earliest date the Sales Dashboard actually FETCHES rows for (the brand-sales `from`), so coverage proof can be
+  // bounded to what the view loaded (see salesCoverage). Keep in step with the brand-sales params `from` above.
+  const dashboardFetchFloor = useMemo(() => addDays(monthStart(TODAY), -420), [TODAY]);
+
+  // OLI coverage classification for the REQUESTED range (flexii UK follow-up). Uses the FULL normalized coverage-window
+  // union (coverageTo + internal gaps, not coverageFrom alone) plus positive-row evidence (a row proves its own date
+  // only). Judged against the user-REQUESTED interval, so a 90D request that only has 17 covered days classifies as
+  // PARTIAL (never a silent "covered" over the shrunk data window). "unknown-legacy" = the payload predates the coverage
+  // feature -> the dashboard keeps its exact prior rendering. `coverage` carries the proven span for the partial notice.
+  const salesCoverage = useMemo(() => {
+    if (!coverageActive(salesCompleteness)) return { status: "unknown-legacy", coveredFrom: null, coveredTo: null, provenDays: 0, totalDays: 0 };
+    const rowDates = positiveRowDates(brandRows, { valueKeys: ["total_sales", "total_units_sold"] });
+    // The dashboard only FETCHES rows from `dashboardFetchFloor` forward (brand-sales params `from`), so a coverage
+    // window that extends earlier proves coverage EXISTS but the KPI cannot sum those unfetched dates. Bounding window-
+    // proof to the fetch floor makes a requested range that reaches before it classify partial/unavailable (honest
+    // covered-intersection total + disclosure) instead of a false "covered" (understated total) or false "No sales".
+    return classifyInterval({
+      coverageWindows: salesCompleteness.coverageWindows,
+      coverageRead: salesCompleteness.coverageRead,
+      rowDates, from: requestedFrom, to: requestedTo, dataFloor: dashboardFetchFloor,
+    });
+  }, [salesCompleteness, brandRows, requestedFrom, requestedTo, dashboardFetchFloor]);
+  const salesWindowStatus = salesCoverage.status;
 
   // Whether the DISPLAYED figures include an un-itemized provisional D-1: the
   // completeness state is provisional AND the selected range ends on that latest
@@ -4487,9 +4502,9 @@ function DashboardApp({ session, access, onSignOut }) {
           customTo={customTo}
           onCustomFrom={setCustomFrom}
           onCustomTo={setCustomTo}
-          minDate={scopeMin}
+          minDate={OLI_HISTORY_FLOOR}
           maxDate={latest}
-          rangeLabel={hasDashboardData ? fmtRangeLabel(rangeFrom, rangeTo) : null}
+          rangeLabel={fmtRangeLabel(requestedFrom, requestedTo)}
           icon={<CalendarRange size={13} aria-hidden="true" />}
         />
 
@@ -4618,20 +4633,22 @@ function DashboardApp({ session, access, onSignOut }) {
               Refresh is the one action that calls DataDoe.
             </EmptyState>
           </div>
+        ) : salesWindowStatus === "unavailable" ? (
+          // No date in the REQUESTED range is source-proven -> Unavailable, checked BEFORE hasDashboardData so a
+          // non-positive (zero/returns-only) row sitting in the window can never render a fabricated GBP 0 KPI.
+          <div className="panel">
+            <EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="Sales unavailable for this range">
+              Historical sales for {fmtRangeLabel(requestedFrom, requestedTo)} are not available from the source for
+              this account, so no total is shown — this is not a zero. Choose a more recent range, or widen it to
+              include covered dates.
+            </EmptyState>
+          </div>
         ) : !hasDashboardData ? (
           <div className="panel">
-            {salesWindowStatus === "unavailable" ? (
-              <EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="Sales unavailable for this range">
-                Historical sales for {fmtRangeLabel(rangeFrom, rangeTo)} are not yet available from the source for this
-                account, so no total is shown — this is not a zero. Choose a more recent range, or widen it to include
-                covered dates{salesCompleteness && salesCompleteness.coverageFrom ? ` (coverage begins ${fmtDateHuman(salesCompleteness.coverageFrom)})` : ""}.
-              </EmptyState>
-            ) : (
-              <EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="No sales in this range">
-                This account has saved data, but no sales were reported between {fmtRangeLabel(rangeFrom, rangeTo)}.
-                Widen the date range or clear the brand filter.
-              </EmptyState>
-            )}
+            <EmptyState icon={<Inbox size={19} aria-hidden="true" />} title="No sales in this range">
+              This account has saved data, but no sales were reported for {fmtRangeLabel(requestedFrom, requestedTo)}.
+              Widen the date range or clear the brand filter.
+            </EmptyState>
           </div>
         ) : (
         <>
@@ -4643,14 +4660,21 @@ function DashboardApp({ session, access, onSignOut }) {
               entrance-animation replay, no full-KPI-row flash on a filter change.
               The entrance animation therefore runs only once, when the Dashboard
               route first mounts. */}
-          {salesWindowStatus === "partial" && salesCompleteness && salesCompleteness.coverageFrom ? (
+          {salesWindowStatus === "partial" && salesCoverage.coveredFrom ? (
             <div
               role="note"
               style={{ margin: "0 0 14px", padding: "9px 13px", borderRadius: 10, fontSize: 13, lineHeight: 1.45,
                 background: "rgba(245,158,11,0.10)", border: "1px solid rgba(245,158,11,0.28)", color: "var(--amber-800, #92400e)" }}
             >
-              Source coverage begins {fmtDateHuman(salesCompleteness.coverageFrom)}. The totals below reflect only the
-              covered part of {fmtRangeLabel(rangeFrom, rangeTo)} — earlier dates are unavailable, not zero.
+              Showing {fmtRangeLabel(requestedFrom, requestedTo)} as requested, but only {salesCoverage.provenDays} of {salesCoverage.totalDays} days is source-covered. The totals below reflect only the covered dates &mdash; some dates in this range are unavailable, not zero.
+            </div>
+          ) : salesWindowStatus === "unknown" ? (
+            <div
+              role="note"
+              style={{ margin: "0 0 14px", padding: "9px 13px", borderRadius: 10, fontSize: 13, lineHeight: 1.45,
+                background: "rgba(148,163,184,0.12)", border: "1px solid rgba(148,163,184,0.32)", color: "var(--slate-700, #334155)" }}
+            >
+              Source coverage could not be verified for {fmtRangeLabel(requestedFrom, requestedTo)}; the totals below reflect the saved rows only.
             </div>
           ) : null}
           <div className="metric-grid">
@@ -4660,7 +4684,7 @@ function DashboardApp({ session, access, onSignOut }) {
               value={fmtMoney(kpi.sales, displayCurrency)}
               hint={`Order value in ${displayCurrency}. Currencies are never converted or combined.`}
               badge={provisionalActive ? <span className="prov-badge" title="Provisional — includes an un-itemized D-1 whose value may change on the next order refresh">Provisional</span> : null}
-              period={fmtRangeLabel(rangeFrom, rangeTo)}
+              period={fmtRangeLabel(requestedFrom, requestedTo)}
               trend={kpiDeltas ? <TrendIndicator value={kpiDeltas.sales} text={fmtPct(kpiDeltas.sales)} title={`vs ${kpiDeltas.label}`} /> : null}
               spark={<Sparkline values={kpiSpark.sales} color={DASH_CHART.primary} ariaLabel="Daily sales for the selected range" />}
             />
@@ -4670,7 +4694,7 @@ function DashboardApp({ session, access, onSignOut }) {
               value={kpi.units.toLocaleString("en-US")}
               hint="Units counted by the saved sales report for the selected range. The observed-unit status above is a separate completeness breakdown and may include pending-price, explicit-zero or cancelled units."
               badge={provisionalActive ? <span className="prov-badge" title="Provisional — includes an un-itemized D-1 whose units may change on the next order refresh">Provisional</span> : null}
-              period={fmtRangeLabel(rangeFrom, rangeTo)}
+              period={fmtRangeLabel(requestedFrom, requestedTo)}
               trend={kpiDeltas ? <TrendIndicator value={kpiDeltas.units} text={fmtPct(kpiDeltas.units)} title={`vs ${kpiDeltas.label}`} /> : null}
               spark={<Sparkline values={kpiSpark.units} color={DASH_CHART.teal} ariaLabel="Daily units for the selected range" />}
             />
@@ -4679,7 +4703,7 @@ function DashboardApp({ session, access, onSignOut }) {
               icon={<ReceiptText size={15} />}
               value={hasOrders ? kpi.orders.toLocaleString("en-US") : "—"}
               hint={hasOrders ? undefined : "This sales source reports no order count, so Orders and Average Order Value are unavailable rather than shown as zero."}
-              period={fmtRangeLabel(rangeFrom, rangeTo)}
+              period={fmtRangeLabel(requestedFrom, requestedTo)}
               trend={hasOrders && kpiDeltas && kpiDeltas.orders !== null ? <TrendIndicator value={kpiDeltas.orders} text={fmtPct(kpiDeltas.orders)} title={`vs ${kpiDeltas.label}`} /> : null}
               spark={hasOrders ? <Sparkline values={kpiSpark.orders} color={DASH_CHART.orders} ariaLabel="Daily orders for the selected range" /> : null}
             />
@@ -4688,7 +4712,7 @@ function DashboardApp({ session, access, onSignOut }) {
               icon={<Wallet size={15} />}
               value={hasOrders ? fmtMoney(aov, displayCurrency, 2) : "—"}
               hint={hasOrders ? "Total sales divided by orders for the selected range." : "Requires an order count, which this sales source does not report."}
-              period={fmtRangeLabel(rangeFrom, rangeTo)}
+              period={fmtRangeLabel(requestedFrom, requestedTo)}
               trend={hasOrders && kpiDeltas && kpiDeltas.aov !== null ? <TrendIndicator value={kpiDeltas.aov} text={fmtPct(kpiDeltas.aov)} title={`vs ${kpiDeltas.label}`} /> : null}
               spark={hasOrders ? <Sparkline values={kpiSpark.aov} color={DASH_CHART.gold} ariaLabel="Daily average order value for the selected range" /> : null}
             />
@@ -5717,25 +5741,6 @@ function ReconTh({ label, col, sort, setSort, align = "right" }) {
 
 // Rows of the Daily Reporting table, in display order. Ad-derived rows fall
 // back to "—" until advertising data is present on the fetched rows.
-const DAILY_METRICS = [
-  // Total Sales / Units render "—" (Unavailable) for a column with NO proven OLI coverage -- never a fabricated 0.
-  // `available === false` only when the client received coverage bounds and the column is entirely pre-coverage;
-  // absent/true keeps the exact prior rendering.
-  { key: "sales", label: "Total Sales", fmt: (c, cur) => (c.available === false ? "—" : fmtMoney(c.sales, cur)) },
-  { key: "adSales", label: "Ad Sales", fmt: (c, cur) => (c.hasAd ? fmtMoney(c.adSales, cur) : "—") },
-  { key: "adSpend", label: "Ad Spend", fmt: (c, cur) => (c.hasAd ? fmtMoney(c.adSpend, cur) : "—") },
-  { key: "clicks", label: "Clicks", fmt: (c) => (c.hasAd ? c.clicks.toLocaleString("en-US") : "—") },
-  { key: "units", label: "Units", fmt: (c) => (c.available === false ? "—" : c.units.toLocaleString("en-US")) },
-  // ROI is the BUSINESS return on ad spend: Total Sales / Ad Spend (NOT Ad Sales / Ad Spend). The cell already
-  // carries the column-SUMMED sales + adSpend (see dailyReport cells), so formatDailyRoi computes SUM(Total
-  // Sales) / SUM(Ad Spend) for the period -- never an average of row-level ratios. Zero/missing/unavailable Ad
-  // Spend -> em dash. Two decimals. ACoS/TACoS keep their existing business meaning (extracted unchanged).
-  { key: "roi", label: "ROI", highlight: true, fmt: (c) => formatDailyRoi(c.sales, c.adSpend, c.hasAd) },
-  { key: "acos", label: "ACoS %", fmt: (c) => formatDailyAcos(c.adSpend, c.adSales, c.hasAd) },
-  { key: "tacos", label: "TACoS %", fmt: (c) => formatDailyTacos(c.adSpend, c.sales, c.hasAd) },
-];
-
-
 export default function App() {
   const [session, setSession] = useState(null);
   const [authReady, setAuthReady] = useState(false);

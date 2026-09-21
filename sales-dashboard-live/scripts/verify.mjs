@@ -139,6 +139,8 @@ const SUITES = [
   "test:oli-itemization",
   "test:oli-completeness-serve",
   "test:dashboard-coverage-display",
+  "test:coverage-windows",
+  "test:daily-coverage-render",
   "test:oli-operational-units",
   "test:oli-sales-estimate",
   "test:sku-movement",

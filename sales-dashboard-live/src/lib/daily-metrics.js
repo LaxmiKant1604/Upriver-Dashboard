@@ -9,7 +9,33 @@
 //   adSales = SUM(Ad Sales)      -- durable ASIN Ads ad_sales_same_sku
 //   hasAd   = any advertising row was present for the period (else advertising is UNAVAILABLE -> em dash)
 
+import { fmtMoney } from "./format.js";
+
 export const EM_DASH = "—";
+
+// OLI coverage rendering rules (flexii UK follow-up). A cell's `status` comes from the coverage classifier
+// (applyDailyCoverage): covered | partial | unavailable | unknown | "unknown-legacy" (a payload with no coverage
+// evidence -> exact prior rendering). UNAVAILABLE / UNKNOWN OLI coverage renders an em dash for the OLI metrics
+// (Total Sales / Units) -- NEVER a fabricated 0. COVERED shows the source-backed total (a genuine covered zero is a
+// real 0). PARTIAL shows the source-backed total for its covered dates (the column header carries the Partial marker
+// + covered range). A period-total RATIO (ROI / TACoS) is meaningful only over a FULLY covered period, so partial /
+// unavailable / unknown coverage renders the ratio as an em dash too (a partial-window total must not mint a ratio).
+export const oliCovMissing = (c) => !!(c && (c.status === "unavailable" || c.status === "unknown"));
+export const oliRatioBlocked = (c) => !!(c && (c.status === "unavailable" || c.status === "unknown" || c.status === "partial"));
+
+// The Daily Reporting metric rows, in display order. Ad-derived rows fall back to em dash until advertising data is
+// present on the fetched rows; the OLI rows (sales/units) + the sales-derived ratios (roi/tacos) honour the coverage
+// status above. Exported (not inlined in App.jsx) so the rendered behavioural tests can drive the real render.
+export const DAILY_METRICS = [
+  { key: "sales", label: "Total Sales", fmt: (c, cur) => (oliCovMissing(c) ? EM_DASH : fmtMoney(c.sales, cur)) },
+  { key: "adSales", label: "Ad Sales", fmt: (c, cur) => (c.hasAd ? fmtMoney(c.adSales, cur) : EM_DASH) },
+  { key: "adSpend", label: "Ad Spend", fmt: (c, cur) => (c.hasAd ? fmtMoney(c.adSpend, cur) : EM_DASH) },
+  { key: "clicks", label: "Clicks", fmt: (c) => (c.hasAd ? c.clicks.toLocaleString("en-US") : EM_DASH) },
+  { key: "units", label: "Units", fmt: (c) => (oliCovMissing(c) ? EM_DASH : c.units.toLocaleString("en-US")) },
+  { key: "roi", label: "ROI", highlight: true, fmt: (c) => (oliRatioBlocked(c) ? EM_DASH : formatDailyRoi(c.sales, c.adSpend, c.hasAd)) },
+  { key: "acos", label: "ACoS %", fmt: (c) => formatDailyAcos(c.adSpend, c.adSales, c.hasAd) },
+  { key: "tacos", label: "TACoS %", fmt: (c) => (oliRatioBlocked(c) ? EM_DASH : formatDailyTacos(c.adSpend, c.sales, c.hasAd)) },
+];
 
 const finite2 = (v) => (Number.isFinite(v) ? v.toFixed(2) : EM_DASH);
 const finite1pct = (v) => (Number.isFinite(v) ? v.toFixed(1) + "%" : EM_DASH);

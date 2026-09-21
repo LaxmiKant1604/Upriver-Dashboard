@@ -1,9 +1,9 @@
-// CLIENT coverage-aware rendering guard (flexii UK repair). App.jsx is not unit-tested, so this is a source-level
-// regression guard -- the SAME pattern the lineage-preflight suites use for their .mjs operators -- proving the Daily
-// Reporting + Sales Dashboard render an UNCOVERED OLI period as Unavailable / em dash, NEVER a fabricated 0 / GBP 0,
-// while a covered date with no sales stays a genuine zero. It asserts the wiring is present (removing it fails here),
-// complementing the server-side behavioural tests (oli-completeness-serve coverage plumbing + the readiness gate).
-// 7-bit ASCII, LF.
+// Sales Dashboard coverage WIRING guard (flexii UK follow-up). The Daily table is proved end-to-end by the RENDERED
+// suite (daily-reporting-render.test.js) and the classifier by coverage-windows.test.js; this lean source guard covers
+// the Dashboard-only wiring that is not otherwise unit/render-tested: the REQUESTED range is preserved separately from
+// the effective/aggregation range (a 90D request is never silently rewritten into the covered days), coverage is judged
+// against the requested interval via the shared classifier, the date-control minimum is NOT the first saved row, and an
+// uncovered range renders "unavailable" (never a fabricated zero). 7-bit ASCII, LF.
 import assert from "node:assert/strict";
 import { writeSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -18,35 +18,38 @@ const APP = readFileSync(path.join(ROOT, "src/App.jsx"), "utf8");
 
 out("dashboard-coverage-display guard");
 
-test("Daily cells derive `available` from the served OLI coverageFrom (a column entirely before coverage is Unavailable)", () => {
-  assert.match(APP, /dailyCompleteness\.coverageFrom/, "coverageFrom is read from the daily completeness/coverage augment");
-  assert.match(APP, /firstRowDate\s*&&\s*firstRowDate\s*<\s*rawCoverageFrom\s*\?\s*firstRowDate\s*:\s*rawCoverageFrom/, "coverageFrom is clamped to the earliest actual row (a durable row is proof; coverage-lags-rows never marks a row-bearing column unavailable)");
-  assert.match(APP, /const available\s*=\s*!\(\s*coverageFrom\s*&&\s*col\.to\s*<\s*coverageFrom\s*\)/, "a column whose whole span is before coverageFrom is marked unavailable (mirrors SKU Movement's monthAvailable)");
-  assert.match(APP, /return \{ sales, units, adSales, adSpend, clicks, hasAd, available \}/, "the availability flag rides on each daily cell");
+test("the REQUESTED range is preserved separately from the effective/aggregation range (90D is never silently shrunk)", () => {
+  assert.match(APP, /const \[requestedFrom, requestedTo, rangeFrom, rangeTo\] = useMemo/, "requested + effective ranges are distinct");
+  assert.match(APP, /const reqFrom = f, reqTo = t;/, "the requested interval is captured BEFORE the scopeMin clamp");
+  assert.match(APP, /if \(scopeMin && effFrom < scopeMin\) effFrom = scopeMin;/, "only the EFFECTIVE (aggregation) start is clamped to the earliest data row");
 });
 
-test("DAILY_METRICS render Total Sales + Units as em dash when the column is Unavailable (never a fabricated 0)", () => {
-  const i = APP.indexOf("const DAILY_METRICS");
-  assert.ok(i > 0, "DAILY_METRICS exists");
-  const block = APP.slice(i, i + 900);
-  assert.match(block, /key: "sales"[\s\S]{0,120}c\.available === false \? "—" : fmtMoney\(c\.sales/, "Total Sales -> em dash when unavailable");
-  assert.match(block, /key: "units"[\s\S]{0,120}c\.available === false \? "—" : c\.units\.toLocaleString/, "Units -> em dash when unavailable");
+test("coverage is classified against the REQUESTED interval via the shared full-windows classifier (not coverageFrom alone), bounded to the fetched-data horizon", () => {
+  assert.match(APP, /const salesCoverage = useMemo/, "the dashboard derives a coverage classification");
+  assert.match(APP, /classifyInterval\(\{[\s\S]{0,260}coverageWindows: salesCompleteness\.coverageWindows/, "uses the full normalized coverage windows");
+  assert.match(APP, /coverageRead: salesCompleteness\.coverageRead/, "honours the coverage read status (-> Unknown on read failure)");
+  assert.match(APP, /from: requestedFrom, to: requestedTo, dataFloor: dashboardFetchFloor/, "classifies the REQUESTED interval, bounding window-proof to what the view fetched");
+  assert.match(APP, /const dashboardFetchFloor = useMemo\(\(\) => addDays\(monthStart\(TODAY\), -420\)/, "the fetch floor mirrors the brand-sales fetch `from` (coverage earlier than the fetch horizon is not proven-for-display)");
+  assert.match(APP, /positiveRowDates\(brandRows/, "a positive row is proof of its own date");
 });
 
-test("Sales Dashboard computes a salesWindowStatus (covered / partial / unavailable) from coverageFrom", () => {
-  assert.match(APP, /const salesWindowStatus\s*=\s*useMemo/, "the dashboard derives an explicit coverage verdict");
-  assert.match(APP, /scopeMin\s*&&\s*scopeMin\s*<\s*raw\s*\?\s*scopeMin\s*:\s*raw/, "coverageFrom is clamped to scopeMin (earliest sales row is proof; guards coverage-lags-rows)");
-  assert.match(APP, /if \(rangeTo\s*<\s*cf\) return "unavailable"/, "a range entirely before coverage -> unavailable");
-  assert.match(APP, /if \(rangeFrom\s*<\s*cf\) return "partial"/, "a range that starts before coverage -> partial");
+test("an unavailable range renders Unavailable BEFORE the has-data branch (a non-positive row never mints a GBP 0 KPI); a covered empty range keeps the genuine 'no sales'", () => {
+  // The unavailable arm must precede !hasDashboardData so a zero/returns-only row in the window cannot reach the KPI grid.
+  const iUnavail = APP.indexOf('salesWindowStatus === "unavailable" ?');
+  const iHasData = APP.indexOf(") : !hasDashboardData ? (");
+  assert.ok(iUnavail > 0 && iHasData > 0 && iUnavail < iHasData, "the unavailable branch is checked before hasDashboardData");
+  assert.match(APP, /Sales unavailable for this range/, "an unavailable range is Unavailable, not a zero");
+  assert.match(APP, /this is not a zero/i, "the copy states the absence is Unavailable, not zero");
+  assert.match(APP, /salesWindowStatus === "partial"/, "a partial range is disclosed");
+  assert.match(APP, /\{salesCoverage\.provenDays\} of \{salesCoverage\.totalDays\} days is source-covered/, "the partial disclosure quotes covered days (accurate for internal gaps), not a covered span");
 });
 
-test("Sales Dashboard shows Unavailable (not a genuine-zero 'no sales') for a fully-uncovered range, and a partial disclosure", () => {
-  assert.match(APP, /salesWindowStatus === "unavailable" \?/, "the fully-uncovered branch is keyed on the coverage verdict");
-  assert.match(APP, /Sales unavailable for this range/, "an uncovered range renders an 'unavailable' title, distinct from the genuine 'No sales in this range'");
-  assert.match(APP, /this is not a zero/i, "the copy explicitly states the absence is Unavailable, not zero");
-  assert.match(APP, /No sales in this range/, "the genuine-zero empty state is preserved for a covered range with no sales");
-  assert.match(APP, /salesWindowStatus === "partial"/, "the partial-coverage disclosure is keyed on the coverage verdict");
-  assert.match(APP, /Source coverage begins/, "a partially-covered range discloses that earlier dates are unavailable, not zero");
+test("the KPI period labels + date-control show the REQUESTED period; the date-control minimum is the OLI floor, not the first saved row", () => {
+  assert.match(APP, /period=\{fmtRangeLabel\(requestedFrom, requestedTo\)\}/, "KPI cards label the requested period");
+  assert.match(APP, /rangeLabel=\{fmtRangeLabel\(requestedFrom, requestedTo\)\}/, "the date control shows the requested period");
+  assert.match(APP, /const OLI_HISTORY_FLOOR = "2025-01-01";/, "the OLI history floor constant exists");
+  assert.match(APP, /minDate=\{OLI_HISTORY_FLOOR\}/, "the date-control minimum is the OLI floor (a Custom range may start before the first saved row)");
+  assert.doesNotMatch(APP, /minDate=\{scopeMin\}/, "the date-control minimum is NOT clamped to the first saved row");
 });
 
 out("\n" + passed + " assertions passed");

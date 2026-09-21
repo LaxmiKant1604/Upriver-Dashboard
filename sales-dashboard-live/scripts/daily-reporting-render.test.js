@@ -94,10 +94,11 @@ async function rendered() {
 }
 
 /* --------------------------------------------------------------- static label guard */
-test("App.jsx DAILY_METRICS uses 'Ad Spend' (never 'Ad Spends')", () => {
-  const src = readFileSync(path.join(appRoot, "src/App.jsx"), "utf8");
+test("DAILY_METRICS uses 'Ad Spend' (never 'Ad Spends')", () => {
+  // DAILY_METRICS now lives in the shared lib (moved out of App.jsx so the coverage suite can drive the real render).
+  const src = readFileSync(path.join(appRoot, "src/lib/daily-metrics.js"), "utf8");
   assert.ok(/label:\s*"Ad Spend"/.test(src), "the adSpend metric row is labelled 'Ad Spend'");
-  assert.ok(!/Ad Spends/.test(src), "'Ad Spends' must not appear anywhere in App.jsx");
+  assert.ok(!/Ad Spends/.test(src), "'Ad Spends' must not appear anywhere in the daily metrics");
 });
 
 /* ------------------------------------------------------------------- rendered guards */

@@ -191,15 +191,16 @@ export function makeCompletenessAugment({ organizationFingerprint, connectionId 
       if (c && typeof readCoverage === "function") {
         try {
           const cov = await readCoverage({ organizationFingerprint, connectionId, accountId: acc, sourceKey: coverageSourceKey });
-          const windows = cov && S(cov.read) === "ok" && Array.isArray(cov.windows)
-            ? cov.windows.filter((w) => w && /^\d{4}-\d{2}-\d{2}$/.test(S(w.from)) && /^\d{4}-\d{2}-\d{2}$/.test(S(w.to)))
+          // coverageRead is ALWAYS surfaced (ok / read-failed / schema-missing) so the client can distinguish a
+          // covered/empty period from one whose evidence could not be read (UNKNOWN -> em dash, never a fabricated 0).
+          const read = cov && S(cov.read) ? S(cov.read) : "read-failed";
+          const windows = read === "ok" && Array.isArray(cov.windows)
+            ? cov.windows.filter((w) => w && /^\d{4}-\d{2}-\d{2}$/.test(S(w.from)) && /^\d{4}-\d{2}-\d{2}$/.test(S(w.to))).map((w) => ({ from: S(w.from), to: S(w.to) }))
             : [];
-          if (windows.length) {
-            const coverageFrom = windows.reduce((m, w) => (!m || S(w.from) < m ? S(w.from) : m), null);
-            const coverageTo = windows.reduce((m, w) => (!m || S(w.to) > m ? S(w.to) : m), null);
-            c = { ...c, coverageFrom, coverageTo, coverageWindows: windows.map((w) => ({ from: S(w.from), to: S(w.to) })) };
-          }
-        } catch (_ce) { /* advisory: coverage omitted */ }
+          const coverageFrom = windows.length ? windows.reduce((m, w) => (!m || w.from < m ? w.from : m), null) : null;
+          const coverageTo = windows.length ? windows.reduce((m, w) => (!m || w.to > m ? w.to : m), null) : null;
+          c = { ...c, coverageRead: read, coverageWindows: windows, coverageFrom, coverageTo };
+        } catch (_ce) { c = { ...c, coverageRead: "read-failed", coverageWindows: [], coverageFrom: null, coverageTo: null }; }
       }
       if (!c) return {};
       const breakdown = c.latestDate ? await readUnitBreakdownFor({ read: readUnitBreakdown, readEstimates, organizationFingerprint, connectionId, accountIds: [acc], onDate: c.latestDate }) : null;

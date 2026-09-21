@@ -135,9 +135,11 @@ await atest("augment surfaces OLI coverageFrom/coverageTo/coverageWindows alongs
   const augment = makeCompletenessAugment({ organizationFingerprint: "org", read: async () => [row({ sale_date: "2026-09-09" })], readCoverage });
   const { completeness } = await augment({ accountId: "A1", params: { from: "2025-01-01", to: "2026-09-09" } });
   assert.equal(sawSourceKey, "order-line-items", "coverage is read for the OLI source key");
+  assert.equal(completeness.coverageRead, "ok", "the coverage read status is surfaced");
   assert.equal(completeness.coverageFrom, "2025-01-01", "earliest covered_from across windows");
   assert.equal(completeness.coverageTo, "2026-09-09", "latest covered_to across windows");
   assert.equal(completeness.coverageWindows.length, 2);
+  assert.deepEqual(completeness.coverageWindows[0], { from: "2025-01-01", to: "2026-03-17" }, "the FULL windows (with internal gaps + coverageTo) are surfaced, not just coverageFrom");
   assert.equal(completeness.latestDate, "2026-09-09", "the completeness label still rides alongside coverage (a covered date with no sales stays a genuine zero)");
 });
 
@@ -147,17 +149,27 @@ await atest("coverage is NOT attached as a coverage-only object when there is NO
   assert.deepEqual(res, {}, "no completeness rows -> augment returns {} (coverage rides ONLY alongside a real completeness label)");
 });
 
-await atest("NO readCoverage collaborator -> NO coverage field (byte-identical legacy augment)", async () => {
+await atest("NO readCoverage collaborator -> NO coverage field at all (byte-identical legacy augment: client falls back)", async () => {
   const augment = makeCompletenessAugment({ organizationFingerprint: "org", read: async () => [row({ sale_date: "2026-09-09" })] });
   const { completeness } = await augment({ accountId: "A1", params: {} });
+  assert.equal(completeness.coverageRead, undefined, "no coverage feature -> no coverageRead -> client keeps legacy rendering");
   assert.equal(completeness.coverageFrom, undefined);
   assert.equal(completeness.latestDate, "2026-09-09");
 });
 
-await atest("a coverage READ FAILURE is advisory -> completeness still returned WITHOUT coverage (never breaks the report)", async () => {
+await atest("a coverage READ FAILURE surfaces coverageRead='read-failed' (client -> Unknown/em dash) and never breaks the report", async () => {
   const augment = makeCompletenessAugment({ organizationFingerprint: "org", read: async () => [row({ sale_date: "2026-09-09" })], readCoverage: async () => ({ read: "read-failed", windows: [] }) });
   const { completeness } = await augment({ accountId: "A1", params: {} });
-  assert.equal(completeness.coverageFrom, undefined, "a failed coverage read omits coverage but keeps the completeness label");
+  assert.equal(completeness.coverageRead, "read-failed", "the read failure is surfaced explicitly (distinct from covered/empty)");
+  assert.equal(completeness.coverageFrom, null, "no coverageFrom on a failed read");
+  assert.deepEqual(completeness.coverageWindows, []);
+  assert.equal(completeness.latestDate, "2026-09-09", "the completeness label is preserved (the read never fails the report)");
+});
+
+await atest("a THROWING coverage reader is caught -> coverageRead='read-failed' (advisory, never throws to the caller)", async () => {
+  const augment = makeCompletenessAugment({ organizationFingerprint: "org", read: async () => [row({ sale_date: "2026-09-09" })], readCoverage: async () => { throw new Error("boom"); } });
+  const { completeness } = await augment({ accountId: "A1", params: {} });
+  assert.equal(completeness.coverageRead, "read-failed");
   assert.equal(completeness.latestDate, "2026-09-09");
 });
 

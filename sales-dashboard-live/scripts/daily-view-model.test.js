@@ -125,6 +125,49 @@ test("trend series drop advertising gaps as null (honest), never as 0", () => {
   assert.equal(lastFinite([null, null]), null);
 });
 
+test("MTD KPI honours OLI coverage (flexii UK follow-up): unavailable/unknown -> totalSales null (em dash) + ratios em dash; NOT a fabricated/understated total", () => {
+  for (const status of ["unavailable", "unknown"]) {
+    const report = makeReport();
+    report.cells[3] = { ...report.cells[3], status };
+    const k = dailyMtdKpis(report);
+    assert.equal(k.totalSales, null, status + " MTD -> no OLI total shown");
+    assert.equal(k.salesPartial, false);
+    assert.equal(k.roi, EM_DASH, status + " -> ROI em dash (sales not fully covered)");
+    assert.equal(k.tacos, EM_DASH);
+  }
+});
+
+test("MTD KPI: a PARTIAL MTD shows the source-backed covered-only total + a salesPartial marker; ratios em dash", () => {
+  const report = makeReport();
+  report.cells[3] = { ...report.cells[3], status: "partial" };
+  const k = dailyMtdKpis(report);
+  assert.equal(k.totalSales, 3406980, "the covered-only total is still shown (matches the table's Partial column)");
+  assert.equal(k.salesPartial, true, "the card is flagged partial (no silent full-availability claim)");
+  assert.equal(k.roi, EM_DASH, "a partial-window total must not mint a ratio");
+  assert.equal(k.tacos, EM_DASH);
+});
+
+test("MTD KPI: a COVERED MTD (incl. a genuine covered zero) shows the total + no partial marker + real ratios", () => {
+  const report = makeReport();
+  report.cells[3] = { ...report.cells[3], status: "covered" };
+  const k = dailyMtdKpis(report);
+  assert.equal(k.totalSales, 3406980);
+  assert.equal(k.salesPartial, false);
+  assert.equal(k.roi, "6.99", "a fully covered period keeps its real ratio");
+});
+
+test("trend series honour OLI coverage: an unavailable/unknown day is a null GAP (never a plotted 0); covered/partial plot the total", () => {
+  const report = makeReport();
+  report.cells[6] = { ...report.cells[6], status: "unavailable" }; // day index 2 of the 5-day series
+  report.cells[7] = { ...report.cells[7], status: "partial" };
+  report.cells[8] = { ...report.cells[8], status: "covered" };
+  const t = dailyTrendSeries(report);
+  assert.equal(t.sales[2], null, "an unavailable day is a gap, never a plotted 0 lastFinite could headline");
+  assert.equal(t.roi[2], null, "a sales-derived ratio is dropped for an unavailable day");
+  assert.equal(t.sales[3], 144551, "a partial day plots its source-backed total");
+  assert.equal(t.sales[4], 116696, "a covered day plots its total");
+});
+
 test("completeness badge preserves the provisional > source-defect > final precedence", () => {
   assert.equal(dailyCompletenessLabel(null), null);
   assert.deepEqual(dailyCompletenessLabel({ provisional: true }), { label: "Provisional D-1", tone: "provisional" });
