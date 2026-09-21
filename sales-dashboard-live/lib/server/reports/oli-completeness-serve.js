@@ -170,7 +170,7 @@ export function makePortfolioCompletenessAugment({ organizationFingerprint, conn
 // Build the async serveSharedReport augment: ({ accountId, params }) => { completeness } | {}. The read is advisory:
 // any failure returns {} so a completeness hiccup never breaks a report read.
 export function makeCompletenessAugment({ organizationFingerprint, connectionId = "primary", read, readUnitBreakdown = null, readEstimates = null, readCoverage = null, coverageSourceKey = "order-line-items" }) {
-  return async ({ accountId, params }) => {
+  return async ({ accountId, params, servedTo = null }) => {
     // Daily uses the real accountId as the serve id; the Brand endpoints use a brand-SCOPED serve id but carry the
     // real account in params.accountId -- prefer that so completeness always keys on the real account.
     const acc = params && params.accountId ? String(params.accountId) : (accountId ? String(accountId) : "");
@@ -182,6 +182,31 @@ export function makeCompletenessAugment({ organizationFingerprint, connectionId 
         to: params && (params.to || params.asOf) ? String(params.to || params.asOf) : null,
       });
       let c = summarizeCompleteness(rows);
+      // FRESHNESS <= SERVED VALUES (invariant): the completeness LABEL must never claim finalized/latest/proven data
+      // NEWER than the snapshot values actually being served. When the served snapshot window (servedTo, the snapshot's
+      // own params.to) ends BEFORE the account's real completeness horizon -- a convergence lag where the scheduler/
+      // reconciler has not yet republished the newer window, e.g. a stale-scope LKG at Sep-17 while completeness reads
+      // Sep-20 -- clamp the label to the served window and expose the true durable horizon as `completenessHorizon` +
+      // `behindServedTo` so the UI shows an honest "updating to <date>" instead of stapling a later "Final through
+      // <date>" onto older values. servedTo null/blank (unknown window) => no clamp (fail-soft, byte-identical).
+      const isD = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+      if (c && isD(servedTo)) {
+        const horizon = [c.finalizedThrough, c.provenThrough, c.latestDate].filter(isD).sort();
+        const realHorizon = horizon.length ? horizon[horizon.length - 1] : null;
+        if (isD(realHorizon) && realHorizon > servedTo) {
+          const clamp = (d) => (isD(d) && d > servedTo ? servedTo : d);
+          c = {
+            ...c,
+            finalizedThrough: clamp(c.finalizedThrough),
+            latestDate: clamp(c.latestDate),
+            provenThrough: clamp(c.provenThrough),
+            servedThrough: servedTo,
+            completenessHorizon: realHorizon,   // the true durable horizon the snapshot is CATCHING UP to
+            behindServedTo: true,               // the served values lag the source; a zero-export republish is due
+            updating: true,
+          };
+        }
+      }
       // OLI COVERAGE bounds (flexii UK repair): surface the account's PROVEN OLI coverage window bounds so the client
       // can render a period with NO coverage as Unavailable / em dash instead of a fabricated zero (a covered date
       // that simply has no sales stays a genuine zero -- coverageFrom marks where proof BEGINS, not where sales do).

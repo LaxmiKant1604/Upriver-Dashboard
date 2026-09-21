@@ -293,7 +293,9 @@ export async function serveSharedReport({
       // The EXACT snapshot exists. If the contributing sources have advanced past it (e.g. brand-sales rolled
       // 21 -> 25 Aug under the same asOf), serve it NOW but flag `updating` so a zero-export rebuild is triggered.
       const updating = isSourceStale(snapshot);
-      const extra = augmentResponse ? await augmentResponse({ accountId, params, payload: snapshot.payload }) : {};
+      // servedTo = the window this snapshot was actually derived for, so the completeness augment can clamp its
+      // freshness label to the served values (never label older values with a newer finalized-through date).
+      const extra = augmentResponse ? await augmentResponse({ accountId, params, payload: snapshot.payload, servedTo: snapshot.params && snapshot.params.to != null ? String(snapshot.params.to) : null }) : {};
       res.status(200).json({
         ...present(snapshot.payload),
         reportKey, reportVersion, paramsHash,
@@ -329,7 +331,9 @@ export async function serveSharedReport({
       // scope; when a rebuild is deferred (Brand View portfolio) OR the sources advanced past it, flag updating
       // so the caller shows this LKG NOW and polls until the rebuild republishes the exact-identity snapshot.
       const updating = deferRebuildOnRead || isSourceStale(latest);
-      const extra = augmentResponse ? await augmentResponse({ accountId, params, payload: latest.payload }) : {};
+      // servedTo = the (older, stale-scope) window this LKG snapshot was derived for: the completeness label is
+      // clamped to it so a Sep-17 LKG can never be stapled with a Sep-20 "Final through" freshness (invariant #8).
+      const extra = augmentResponse ? await augmentResponse({ accountId, params, payload: latest.payload, servedTo: latest.params && latest.params.to != null ? String(latest.params.to) : null }) : {};
       res.status(200).json({
         ...present(latest.payload),
         reportKey, reportVersion, paramsHash,

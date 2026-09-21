@@ -173,4 +173,38 @@ await atest("a THROWING coverage reader is caught -> coverageRead='read-failed' 
   assert.equal(completeness.latestDate, "2026-09-09");
 });
 
+// ---- FRESHNESS <= SERVED VALUES clamp (invariant #8): the completeness label must never claim a finalized/latest
+// horizon NEWER than the served snapshot window (servedTo). Premium-Avenue-IT-class: a stale-scope LKG at Sep-17
+// must not be stapled with a "Final through Sep-20" freshness. ----
+await atest("clamp: completeness horizon AHEAD of the served snapshot window is clamped to servedTo + flagged behindServedTo/updating", async () => {
+  const augment = makeCompletenessAugment({ organizationFingerprint: "org", read: async () => [
+    row({ sale_date: "2026-09-19", completeness_status: "final" }),
+    row({ sale_date: "2026-09-20", completeness_status: "final", proven_export_through: "2026-09-20" }),
+  ] });
+  const { completeness } = await augment({ accountId: "A1", params: { to: "2026-09-21" }, servedTo: "2026-09-17" });
+  assert.equal(completeness.finalizedThrough, "2026-09-17", "finalizedThrough clamped to the served window");
+  assert.equal(completeness.latestDate, "2026-09-17", "latestDate clamped to the served window");
+  assert.equal(completeness.provenThrough, "2026-09-17", "provenThrough clamped to the served window");
+  assert.equal(completeness.behindServedTo, true, "the served values are flagged as lagging the source");
+  assert.equal(completeness.completenessHorizon, "2026-09-20", "the TRUE durable horizon is surfaced for the honest 'updating to' state");
+  assert.equal(completeness.servedThrough, "2026-09-17");
+  assert.equal(completeness.updating, true, "a zero-export republish is due");
+});
+
+await atest("clamp: when servedTo MATCHES (or exceeds) the horizon, the label is byte-identical (no clamp, no behindServedTo)", async () => {
+  const augment = makeCompletenessAugment({ organizationFingerprint: "org", read: async () => [row({ sale_date: "2026-09-20", completeness_status: "final", proven_export_through: "2026-09-20" })] });
+  const { completeness } = await augment({ accountId: "A1", params: { to: "2026-09-21" }, servedTo: "2026-09-20" });
+  assert.equal(completeness.finalizedThrough, "2026-09-20");
+  assert.equal(completeness.latestDate, "2026-09-20");
+  assert.equal(completeness.behindServedTo, undefined, "no clamp when the served window already covers the horizon");
+  assert.equal(completeness.updating, undefined);
+});
+
+await atest("clamp: servedTo unknown (null) -> NO clamp, byte-identical legacy behaviour (fail-soft)", async () => {
+  const augment = makeCompletenessAugment({ organizationFingerprint: "org", read: async () => [row({ sale_date: "2026-09-20", completeness_status: "final" })] });
+  const { completeness } = await augment({ accountId: "A1", params: { to: "2026-09-21" } });
+  assert.equal(completeness.finalizedThrough, "2026-09-20", "no servedTo -> label unchanged");
+  assert.equal(completeness.behindServedTo, undefined);
+});
+
 out("\n" + passed + " assertions passed");
