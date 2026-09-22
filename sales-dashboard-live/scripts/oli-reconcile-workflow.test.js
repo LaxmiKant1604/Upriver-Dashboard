@@ -40,8 +40,11 @@ ok("(blocker 5) the workflow is NON-GREEN when a region's control cleanup cannot
 // defers on CONTROL_LEASE_HELD; the india->us-ca cascade observed in run 35662300118). Guards the SCRIPT source. ----
 const recSrc = readFileSync(new URL("./release/oli-publication-reconcile.mjs", import.meta.url), "utf8");
 ok("(lease-strand) the script defines a positive START_RESERVE_SEC (stop starting new derives before the hard deadline)", /const START_RESERVE_SEC = (\d+)/.test(recSrc) && Number((recSrc.match(/const START_RESERVE_SEC = (\d+)/) || [])[1]) > 0);
-ok("(lease-strand) outOfTime() trips at (deadline - reserve), NOT at the raw deadline (reserves time for the last derive + safe-close)", /startCutoffSec = deadlineSec > 0 \? Math\.max\(0, deadlineSec - START_RESERVE_SEC\)/.test(recSrc) && /outOfTime = \(\) => deadlineSec > 0 && \(Date\.now\(\) - runStartMs\) \/ 1000 > startCutoffSec/.test(recSrc));
-ok("(lease-strand) the reserve is a no-op when no deadline is set (immediate/unbounded local runs unaffected)", /deadlineSec > 0 \? Math\.max\(0, deadlineSec - START_RESERVE_SEC\) : 0/.test(recSrc));
+ok("(lease-strand) outOfTime() trips at the start-cutoff (deadline - reserve), NOT at the raw deadline (reserves time for the last derive + safe-close)", /startCutoffSec = deadlineSec > 0 \?[^\n]*deadlineSec - START_RESERVE_SEC/.test(recSrc) && /outOfTime = \(\) => deadlineSec > 0 && \(Date\.now\(\) - runStartMs\) \/ 1000 > startCutoffSec/.test(recSrc));
+ok("(lease-strand) the reserve is a no-op when no deadline is set (immediate/unbounded local runs unaffected)", /deadlineSec > 0 \?[^\n]*deadlineSec - START_RESERVE_SEC\) : 0/.test(recSrc));
+// FOOTGUN GUARD: a deadline <= START_RESERVE_SEC must NOT collapse the start-cutoff to 0 (which would defer every
+// account and publish nothing). The formula keeps at least half the budget as a publish window.
+ok("(lease-strand) a small --deadline-seconds cannot defer everything: startCutoff keeps >= half the budget", /Math\.max\(Math\.floor\(deadlineSec \/ 2\), deadlineSec - START_RESERVE_SEC\)/.test(recSrc));
 // The reserve MUST be strictly less than the workflow's --deadline-seconds, else the reconcile would defer EVERY account
 // (never publish). Cross-check the constant against the YAML's cap so the two can never drift into a no-publish state.
 const wfDeadline = Number((wf.match(/--deadline-seconds=(\d+)/) || [])[1]);

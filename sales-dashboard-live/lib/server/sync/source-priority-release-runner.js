@@ -207,6 +207,19 @@ export async function runPriorityDashboardsRelease(deps = {}) {
       return { code: 1, ok: false, stage: "contention", status: "CONTROL_LEASE_LOST", leaseLost: true,
         problems: ["CONTROL_LEASE_LOST: a report write for " + accountId + " lost the control-plane fence at the write boundary after " + published.length + " publications -- stopping; LKG preserved; retryable."] };
     }
+    // A 'newer-live' disposition is a BENIGN freshness outcome, never a publish FAILURE: the report_snapshots CAS found
+    // the LIVE row STRICTLY NEWER than this (older) candidate and preserved it (LKG kept, ZERO overwrite) -- e.g. a
+    // brand-inventory live maintained by the scheduler's materialize-inventory job with a fresher source_refreshed_at.
+    // The account's report is already AT LEAST as fresh as what we derived; overwriting it would be a regression the CAS
+    // correctly refuses. Defer this account (retryable; retain the newer live), consistent with EVERY shadow-save path
+    // (daily-reporting / fba-brand-inventory / listing-health-v3 all `defer("shadow-newer-live")`). This runner is used
+    // ONLY by the per-account reconciler + bootstrap (never the high-volume scheduler publish), so the return defers just
+    // this account; the read-back below is skipped for it (nothing was written). NEVER a hard FAILED_PUBLISH.
+    if (Array.isArray(res && res.results) && res.results.some((r) => r && r.disposition === "newer-live")) {
+      const keys = res.results.filter((r) => r && r.disposition === "newer-live").map((r) => S(r.reportKey)).join(",");
+      return { code: 1, ok: false, stage: "publish", status: "NEWER_LIVE", reason: "publish-newer-live",
+        problems: ["a strictly-newer live row exists for " + accountId + " [" + keys + "] (CAS newer-live; LKG preserved, zero overwrite) -- deferring this account; its report is already at least as fresh as the derived candidate; retryable."] };
+    }
     const probs = threeResultProblems(FROZEN, res, accountId, OK_PUBLISH);
     if (probs.length) return fail("publish", probs);
     for (const r of res.results) published.push({ reportKey: S(r.reportKey), accountId, liveReportKey: S(r.liveReportKey), paramsHash: S(r.paramsHash), disposition: r.disposition });

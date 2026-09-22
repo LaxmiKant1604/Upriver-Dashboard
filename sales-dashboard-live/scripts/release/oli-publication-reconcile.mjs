@@ -292,7 +292,11 @@ const runStartMs = Date.now();
 // drain on the next run -- so a large backlog converges over several cooperative runs instead of stranding the plane once.
 // Never larger than the deadline itself, and a no-op when no deadline is set (immediate/unbounded local runs).
 const START_RESERVE_SEC = 120;
-const startCutoffSec = deadlineSec > 0 ? Math.max(0, deadlineSec - START_RESERVE_SEC) : 0;
+// FOOTGUN GUARD: a naive (deadlineSec - START_RESERVE_SEC) collapses to <=0 when --deadline-seconds <= 120, which would
+// trip outOfTime() on the FIRST account and defer EVERY account (publish NOTHING, silently -- available data never
+// reaches the reports). Keep at least HALF the budget as a publish window, so even a small deadline makes progress; the
+// shipped 330s deadline is unaffected (max(165, 210) = 210). The reserve is thus min(START_RESERVE_SEC, deadlineSec/2).
+const startCutoffSec = deadlineSec > 0 ? Math.max(Math.floor(deadlineSec / 2), deadlineSec - START_RESERVE_SEC) : 0;
 const outOfTime = () => deadlineSec > 0 && (Date.now() - runStartMs) / 1000 > startCutoffSec;
 // Bound the IN-FLIGHT account operation: race the release against the remaining budget so a stuck account cannot hang
 // past the reserve (it resolves the DEADLINE_HIT sentinel; the reconciler then ABORTS the op, AWAITS its confirmed

@@ -110,8 +110,10 @@ const ALLOWED = ["family", "region", "accountId", "requestedAsOf", "stage", "rea
   // "derive:<bucket>" stage, the raw skip reason, and NO blockerCodes.
   ok("catalog-snapshot-missing (source not ready) -> DEFERRED_DEPENDENCY (retryable; LKG retained; run stays green)",
     cls({ code: 1, ok: false, stage: "derive:india", reason: "catalog-snapshot-missing", blockerCodes: [] }) === RECONCILE_STATUS.DEFERRED_DEPENDENCY);
-  ok("catalog-hydration-failed (catalog rows unavailable this pass) -> DEFERRED_DEPENDENCY (retryable)",
-    cls({ code: 1, ok: false, stage: "derive:europe-au", reason: "catalog-hydration-failed", blockerCodes: [] }) === RECONCILE_STATUS.DEFERRED_DEPENDENCY);
+  // A catalog INTEGRITY/hydration failure is NOT retryable here: it is hard-refused upstream (preflightEvidence) so it
+  // never reaches this branch; if it ever did, it must hard-fail (a dangling/corrupt catalog must surface, not defer).
+  ok("catalog-hydration-failed -> FAILED_DERIVE (integrity/read failure hard-fails; only not-yet-available catalog defers)",
+    cls({ code: 1, ok: false, stage: "derive:europe-au", reason: "catalog-hydration-failed", blockerCodes: [] }) === RECONCILE_STATUS.FAILED_DERIVE);
   // Regression guards: integrity + unknown derive stops MUST still be hard FAILED_DERIVE (never silently deferred).
   ok("derive:count-mismatch (integrity) -> FAILED_DERIVE (still hard)",
     cls({ code: 1, ok: false, stage: "derive:india", reason: "derive:count-mismatch", blockerCodes: ["derive:count-mismatch"] }) === RECONCILE_STATUS.FAILED_DERIVE);
@@ -126,6 +128,13 @@ const ALLOWED = ["family", "region", "accountId", "requestedAsOf", "stage", "rea
     cls({ code: 1, ok: false, stage: "d1-not-ready:india", status: "DATADOE_D1_NOT_READY", reason: "" }) === RECONCILE_STATUS.DEFERRED_DEPENDENCY);
   ok("a fully-verified release (ok, code 0) -> READBACK_VERIFIED (unchanged)",
     cls({ code: 0, ok: true, stage: "complete" }) === RECONCILE_STATUS.READBACK_VERIFIED);
+  // NEWER_LIVE: the freshness CAS preserved a strictly-newer live row (LKG kept, zero overwrite) -> retryable benign
+  // defer, NEVER a hard FAILED_PUBLISH (the account's report is already at least as fresh as the derived candidate).
+  ok("NEWER_LIVE publish status -> DEFERRED_DEPENDENCY (freshness CAS preserved a newer live; LKG kept; run stays green)",
+    cls({ code: 1, ok: false, stage: "publish", status: "NEWER_LIVE", reason: "publish-newer-live" }) === RECONCILE_STATUS.DEFERRED_DEPENDENCY);
+  // Regression guard: a GENUINE publish failure (no benign status) still hard-fails.
+  ok("a publish-stage failure with no retryable status -> FAILED_PUBLISH (still hard)",
+    cls({ code: 1, ok: false, stage: "publish", status: "", reason: "publish-conflict" }) === RECONCILE_STATUS.FAILED_PUBLISH);
 }
 
 writeSync(1, `\nsaved-data-reconciler-diag: ${passed} assertions passed\n`);

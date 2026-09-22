@@ -38,18 +38,25 @@ const noop = () => {};
 //   - Contention (leaseLost) + explicit readiness statuses -> retryable DEFERRED_DEPENDENCY.
 //   - A derive stop is retryable ONLY for an explicit source/readiness CODE (RETRYABLE_DERIVE_CODES); every other derive
 //     stop, and every finalize / token-ceiling / publish-gate / publish / scope integrity failure, is a hard FAILED_*.
-const RETRYABLE_STATUS = new Set(["CONTROL_LEASE_LOST", "DATADOE_D1_NOT_READY"]);
+// NEWER_LIVE: the report_snapshots freshness CAS refused to overwrite a STRICTLY-NEWER live row with this (older)
+// reconciler candidate (LKG preserved, zero write) -- e.g. a brand-inventory live kept fresh by the scheduler's
+// materialize-inventory job. The account's report is already at least as fresh as what we derived, so this is a
+// retryable benign defer (retain the newer live), NEVER a hard FAILED_PUBLISH. Mirrors the shadow-save "shadow-newer-
+// live" defer across daily-reporting / fba-brand-inventory / listing-health-v3.
+const RETRYABLE_STATUS = new Set(["CONTROL_LEASE_LOST", "DATADOE_D1_NOT_READY", "NEWER_LIVE"]);
 const RETRYABLE_STAGES = new Set(["reconcile", "assert-no-cron", "assert-no-cron-final", "contention", "d1-not-ready"]);
 // SOURCE-NOT-READY derive stops are RETRYABLE (defer + retain LKG), NOT integrity failures. "catalog-snapshot-missing"
-// (the org catalog snapshot is absent, or present but dropped by the daily-snapshot freshness policy because its
-// validated_at predates the requested as-of) and "catalog-hydration-failed" (the snapshot exists but its rows could not
-// be loaded this pass) mean the REQUIRED catalog evidence is not yet available for this as-of -- e.g. the scheduler-v2
-// cycle that produces D-1's catalog has not run/succeeded. The pre-DR1 behavior already deferred this (a cold catalog
-// refused the create -> NO_EXPORT_REQUIRED -> SOURCE_READINESS_PENDING -> DEFERRED); the zero-export catalog ADOPTION
-// (DR1) shifted the same not-ready condition to a derive-stage stop, so it must classify identically -- retryable, LKG
-// preserved, publishes once a fresh catalog lands. This matches daily-reporting-release.js, which defers on every
-// catalog condition. INTEGRITY derive codes (derive:count-mismatch / :lineage-mismatch / :saved-zero) stay HARD failures.
-const RETRYABLE_DERIVE_CODES = new Set(["SOURCE_UNAVAILABLE", "SOURCE_PAUSED", "DATADOE_INITIAL_LOAD_INCOMPLETE", "DATADOE_D1_NOT_READY", "SOURCE_D1_NOT_READY", "SOURCE_READINESS_PENDING", "catalog-snapshot-missing", "catalog-hydration-failed"]);
+// means the REQUIRED org catalog snapshot is absent, OR present but DROPPED by the daily-snapshot freshness policy
+// because its validated_at is not on the current UTC EXECUTION DAY (the scheduler-v2 cycle that refreshes the org
+// catalog has not yet run/succeeded today) -- so the catalog evidence is not available this pass. The pre-DR1 behavior
+// already deferred this (a cold catalog refused the create -> NO_EXPORT_REQUIRED -> SOURCE_READINESS_PENDING ->
+// DEFERRED); the zero-export catalog ADOPTION (DR1) shifted the same not-ready condition to a derive-stage stop, so it
+// must classify identically -- retryable, LKG preserved, publishes once a fresh catalog lands. This matches
+// daily-reporting-release.js, which defers on every catalog condition. A catalog INTEGRITY or hydration failure
+// (dangling storage object, row_count mismatch, read error) is HARD-REFUSED upstream by preflightEvidence ->
+// FAILED_DERIVE with a diagnostic, so it never reaches this retryable branch -- only a genuinely not-yet-available
+// catalog does. INTEGRITY derive codes (derive:count-mismatch / :lineage-mismatch / :saved-zero) also stay HARD.
+const RETRYABLE_DERIVE_CODES = new Set(["SOURCE_UNAVAILABLE", "SOURCE_PAUSED", "DATADOE_INITIAL_LOAD_INCOMPLETE", "DATADOE_D1_NOT_READY", "SOURCE_D1_NOT_READY", "SOURCE_READINESS_PENDING", "catalog-snapshot-missing"]);
 // The KNOWN-retryable ready=false blocker reasons (durable-dashboards readiness/coverage). A derive whose blockers are
 // ALL in this set is retryable (source coverage not yet available); an integrity code (derive:count-mismatch /
 // derive:lineage-mismatch / derive:saved-zero), an UNKNOWN code, or a MIX with any non-retryable code is a HARD failure.
