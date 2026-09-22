@@ -1,0 +1,147 @@
+name: oli-outbox-drain
+
+# DR2 LOW-LATENCY OUTBOX DRAIN. The transactional report_publication_outbox is enqueued IN the source_coverage persist
+# transaction (trigger enqueue_report_publication_on_coverage, gated by publication_outbox_control.enabled). This
+# workflow is the low-latency drain: every 30 minutes it claims the enqueued rows and re-derives + promotes ONLY those
+# accounts (restricted pass), instead of waiting for the once-daily all-accounts reconcile backstop. It is ZERO-EXPORT
+# (the same reconciler entrypoint with its create-refusing adapter -- never a DataDoe create/token/source-refresh).
+#
+# ALL REGIONS, ALWAYS. The enqueue gate (publication_outbox_control.enabled) is GLOBAL, so EVERY region can enqueue the
+# moment it is on. This drain therefore ALWAYS loops all three regions (never a single-region canary) so no region's
+# queue is left to accumulate. The control-plane lease is global, so regions run SEQUENTIALLY; a region with nothing
+# enqueued is a fast no-op. A per-region failure/timeout is isolated (the loop continues).
+#
+# MONITORING: after draining, outbox-monitor.mjs reports queue age, per-status counts, attempts, dead-letters, and rows
+# with a last_error, and turns the run NON-GREEN on a hard safety breach (a dead-letter, or an open row older than the
+# stale threshold -> the drain is not keeping up). That is the visible alarm to trip the rollback.
+#
+# ROLLBACK: two independent switches. (1) DB: `update publication_outbox_control set enabled=false` STOPS new enqueues
+# (the queue drains to empty and stays empty). (2) Repo var: unset OLI_OUTBOX_DRAIN_LIVE to STOP this scheduled drain
+# (the once-daily reconcile remains the backstop). Neither is a code change.
+#
+# Required repository secrets (never printed): POSTGRES_URL, SUPABASE_URL (or VITE_SUPABASE_URL),
+# SUPABASE_SERVICE_ROLE_KEY, DATADOE_API_KEY (+ DATADOE_API_KEY_SECONDARY if a secondary connection is configured).
+
+on:
+  schedule:
+    # Every 30 minutes at :15 / :45 -- OFFSET from the :00/:30 scheduler slots so the drain rarely contends with a
+    # scheduler-v2 publish window (and when it does, it defers cleanly on CONTROL_LEASE_HELD, never strands).
+    - cron: "15,45 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry-run (default: read-only plan + monitor, ZERO writes) | live (drain enqueued accounts)"
+        required: false
+        default: "dry-run"
+        type: choice
+        options:
+          - dry-run
+          - live
+      alert_stale_minutes:
+        description: "monitor: alarm (non-green) when an open outbox row is older than this many minutes"
+        required: false
+        default: "180"
+        type: string
+
+concurrency:
+  # ONE drain at a time (the control-plane lease is global). A delayed/overlapping tick QUEUES; the drain is idempotent
+  # (an already-current live snapshot is a zero-write no-op; the report_snapshots CAS makes a re-drain safe).
+  group: oli-outbox-drain
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  drain:
+    # SCHEDULED runs live-drain ONLY when the dedicated repo var OLI_OUTBOX_DRAIN_LIVE == 'true' (independent rollback
+    # switch); a manual dispatch is always available and defaults to dry-run. When neither, no runner is allocated.
+    if: github.event_name == 'workflow_dispatch' || vars.OLI_OUTBOX_DRAIN_LIVE == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      asof: ${{ steps.drain.outputs.asof }}
+      mode: ${{ steps.drain.outputs.mode }}
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+      DURABLE_CATALOG_ADOPTION: ${{ vars.DURABLE_CATALOG_ADOPTION || 'on' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Verify required secrets are present (fail closed; never print values)
+        run: |
+          missing=""
+          for v in POSTGRES_URL SUPABASE_SERVICE_ROLE_KEY DATADOE_API_KEY; do
+            if [ -z "${!v:-}" ]; then missing="$missing $v"; fi
+          done
+          if [ -z "${SUPABASE_URL:-}" ] && [ -z "${VITE_SUPABASE_URL:-}" ]; then missing="$missing SUPABASE_URL|VITE_SUPABASE_URL"; fi
+          if [ -n "$missing" ]; then echo "STOP missing required secret(s):$missing"; exit 1; fi
+      - name: Install dependencies
+        run: npm ci
+      - name: Drain the report_publication_outbox for all regions in order (zero export)
+        id: drain
+        run: |
+          MODE='${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode || (vars.OLI_OUTBOX_DRAIN_LIVE == 'true' && 'live' || 'dry-run') }}'
+          ASOF="$(date -u -d 'yesterday' +%F)"
+          echo "asof=$ASOF" >> "$GITHUB_OUTPUT"; echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          LIVE=""; if [ "$MODE" = "live" ]; then LIVE="--live"; fi
+          rc=0
+          for REGION in india europe-au us-ca; do
+            echo "::group::oli-outbox-drain $REGION mode=$MODE as-of=$ASOF"
+            timeout 420 node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=330 --outbox-drain $LIVE || { echo "region $REGION drain exited nonzero (isolated; continuing)"; rc=1; }
+            echo "::endgroup::"
+          done
+          exit $rc
+      - name: Monitor the outbox queue (age / retries / dead-letters); alarm on a safety breach
+        if: always()
+        run: |
+          node scripts/release/outbox-monitor.mjs --alert-stale-minutes="${{ github.event.inputs.alert_stale_minutes || '180' }}"
+
+  # ABNORMAL-TERMINATION CLEANUP: a SEPARATE job (needs: drain, if: always()) so it survives the drain job's
+  # timeout/cancellation. Proves (read-only) each region's priority control plane is closed and reclaims only a
+  # free/expired plane; NON-GREEN if any region cannot be proven closed. Runs only when the drain effectively ran live.
+  cleanup:
+    needs: drain
+    if: always() && ((github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'live') || (github.event_name != 'workflow_dispatch' && vars.OLI_OUTBOX_DRAIN_LIVE == 'true'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+      DATADOE_API_KEY_SECONDARY: ${{ secrets.DATADOE_API_KEY_SECONDARY }}
+      DURABLE_CATALOG_ADOPTION: ${{ vars.DURABLE_CATALOG_ADOPTION || 'on' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify each region's control plane is proven closed (reclaim only a free/expired plane)
+        run: |
+          ASOF='${{ needs.drain.outputs.asof }}'
+          if [ -z "$ASOF" ]; then ASOF="$(date -u -d 'yesterday' +%F)"; fi
+          rc=0
+          for REGION in india europe-au us-ca; do
+            echo "::group::oli-outbox-drain cleanup $REGION as-of=$ASOF"
+            node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --cleanup || { echo "region $REGION control cleanup UNVERIFIED"; rc=1; }
+            echo "::endgroup::"
+          done
+          if [ "$rc" != "0" ]; then echo "STOP OLI_OUTBOX_DRAIN_CLEANUP_UNVERIFIED: one or more regions' control plane could not be proven closed."; fi
+          exit $rc

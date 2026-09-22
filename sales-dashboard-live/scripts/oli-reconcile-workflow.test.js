@@ -95,4 +95,22 @@ ok("it is DRY-RUN unless the repository variable OLI_RECONCILE_LIVE=='true'", /i
 ok("it invokes the SAME reconciler entrypoint as the periodic backstop (one implementation)", /node scripts\/release\/oli-publication-reconcile\.mjs --bucket=\$\{\{ steps\.cfg\.outputs\.region \}\}/.test(step));
 ok("the immediate step NEVER creates a DataDoe export/token (zero export)", !/createExport|reserveTokens|exportsCreate|--force-latest/.test(step));
 
+// ---- DR2 low-latency outbox drain workflow + monitor (oli-outbox-drain.yml + outbox-monitor.mjs) ----
+const drainWf = readFileSync(new URL("../../.github/workflows/oli-outbox-drain.yml", import.meta.url), "utf8");
+const mon = readFileSync(new URL("./release/outbox-monitor.mjs", import.meta.url), "utf8");
+ok("(drain) runs frequently (every 30 min at :15/:45, offset from the :00/:30 scheduler slots)", /- cron: "15,45 \* \* \* \*"/.test(drainWf));
+ok("(drain) ALWAYS loops all three regions in order -- never a single-region canary that leaves a queue", /for REGION in india europe-au us-ca/.test(drainWf) && !/matrix:/.test(drainWf) && !/inputs\.bucket/.test(drainWf));
+ok("(drain) uses --outbox-drain (restricts the pass to enqueued accounts) via the SAME reconciler entrypoint", /--outbox-drain\b/.test(drainWf) && /oli-publication-reconcile\.mjs/.test(drainWf));
+ok("(drain) SCHEDULED live is gated by the dedicated OLI_OUTBOX_DRAIN_LIVE repo var (independent rollback switch)", /vars\.OLI_OUTBOX_DRAIN_LIVE == 'true'/.test(drainWf));
+ok("(drain) manual dispatch defaults to dry-run (live must be explicitly chosen)", /mode:[\s\S]{0,200}default: "dry-run"[\s\S]{0,120}options:[\s\S]{0,60}- dry-run[\s\S]{0,20}- live/.test(drainWf));
+ok("(drain) ZERO export: installs deps but references NO DataDoe export/token/force symbol", /npm ci/.test(drainWf) && !/createExport|reserveTokens|exportsCreate|--force-latest/.test(drainWf));
+ok("(drain) least-privilege: contents: read, no actions: write", /permissions:[\s\S]{0,120}contents: read/.test(drainWf) && !/actions: write/.test(drainWf));
+ok("(drain) each region is hard-capped (timeout 420) with the cooperative deadline (reserve fix applies)", /timeout 420 node scripts\/release\/oli-publication-reconcile\.mjs/.test(drainWf) && /--deadline-seconds=330/.test(drainWf));
+ok("(drain) MONITORS the queue after draining and alarms on a breach (always() so it reports even on a hiccup)", /outbox-monitor\.mjs/.test(drainWf) && /if: always\(\)/.test(drainWf));
+ok("(drain) a SEPARATE cleanup job (needs: drain, if: always()) proves the control plane closed; NON-GREEN otherwise", /\n  cleanup:\n/.test(drainWf) && /needs: drain\b/.test(drainWf) && /OLI_OUTBOX_DRAIN_CLEANUP_UNVERIFIED/.test(drainWf) && /exit \$rc/.test(drainWf));
+// monitor script: read-only + fails closed on a hard safety breach (dead-letter / stale backlog)
+ok("(monitor) is READ-ONLY: no INSERT/UPDATE/DELETE/upsert against the outbox", !/\b(insert|update|delete|upsert)\b/i.test(mon.replace(/updated_at|enqueued_at/g, "")) || !/method:\s*["'](POST|PATCH|DELETE|PUT)["']/i.test(mon));
+ok("(monitor) EXITS NONZERO on a dead-letter or a stale open backlog (visible alarm to trip the rollback)", /deadLetters > 0 \|\| staleBacklog/.test(mon) && /process\.exit\(1\)/.test(mon));
+ok("(monitor) reports queue age + per-status counts + attempts + dead-letters for publication-lag monitoring", /oldestOpenAgeMinutes/.test(mon) && /byStatus/.test(mon) && /deadLetters/.test(mon) && /maxAttempts/.test(mon));
+
 writeSync(1, `\noli-reconcile-workflow: ${passed} assertions passed\n`);
