@@ -318,7 +318,15 @@ async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revis
 
 const deadlineSec = Number(argOf("deadline-seconds")) || 0;
 const runStartMs = Date.now();
-const outOfTime = () => deadlineSec > 0 && (Date.now() - runStartMs) / 1000 > deadlineSec;
+// START RESERVE (lease-strand fix, mirrors oli-publication-reconcile.mjs): stop STARTING new per-account work
+// START_RESERVE_SEC before the hard deadline so the LAST in-flight op completes + the ALWAYS safe-close runs before the
+// deadline would abort it. Without it, an op started just under the raw deadline runs past it -> the abort's grace can
+// expire mid-uninterruptible-DB-call -> termination UNCONFIRMED -> the GLOBAL control lease strands -> the next
+// sequential region defers on CONTROL_LEASE_HELD. Overflow work defers cleanly (LKG kept) and drains next run. Guarded
+// so a small --deadline-seconds still keeps >= half the budget as a work window; a no-op when no deadline is set.
+const START_RESERVE_SEC = 120;
+const startCutoffSec = deadlineSec > 0 ? Math.max(Math.floor(deadlineSec / 2), deadlineSec - START_RESERVE_SEC) : 0;
+const outOfTime = () => deadlineSec > 0 && (Date.now() - runStartMs) / 1000 > startCutoffSec;
 const deadlineRace = (p, _signal) => {
   if (deadlineSec <= 0) return p;
   const remainingMs = Math.max(0, deadlineSec * 1000 - (Date.now() - runStartMs));
