@@ -4,7 +4,7 @@
 // object is a fixed 6-key allowlist. Offline; zero network. 7-bit ASCII, LF.
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
-import { diagStageFor } from "../lib/server/sync/saved-data-reconciler.js";
+import { diagStageFor, statusFromRelease, RECONCILE_STATUS } from "../lib/server/sync/saved-data-reconciler.js";
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -99,6 +99,33 @@ const ALLOWED = ["family", "region", "accountId", "requestedAsOf", "stage", "rea
   // so we assert on genuinely sensitive VALUES only -- the appended message (after ':'), params, payload rows, tokens.
   for (const secret of ["customer", "token=abc", "secret", "problems", "params", "'X'"]) ok(`emitted JSON excludes sensitive '${secret}'`, !json.includes(secret));
   ok("emitted values are correct", obj.family === "ads" && obj.region === "india" && obj.accountId === "acct-00" && obj.requestedAsOf === "2026-09-14" && obj.stage === "derive" && obj.reasonCode === "daily-payload-malformed");
+}
+
+// ---- (4) statusFromRelease classification: a SOURCE-NOT-READY catalog derive stop is RETRYABLE (DEFERRED_DEPENDENCY,
+//         LKG retained), NOT a hard FAILED_DERIVE -- so the reconciler run stays GREEN when the scheduler-v2 has not yet
+//         produced the requested day's catalog. INTEGRITY derive codes and unknown reasons stay HARD failures. ----
+{
+  const cls = (result) => statusFromRelease(result);
+  // The EXACT shape the release runner emits for a catalog evidence stop (source-priority-release-runner.js): a
+  // "derive:<bucket>" stage, the raw skip reason, and NO blockerCodes.
+  ok("catalog-snapshot-missing (source not ready) -> DEFERRED_DEPENDENCY (retryable; LKG retained; run stays green)",
+    cls({ code: 1, ok: false, stage: "derive:india", reason: "catalog-snapshot-missing", blockerCodes: [] }) === RECONCILE_STATUS.DEFERRED_DEPENDENCY);
+  ok("catalog-hydration-failed (catalog rows unavailable this pass) -> DEFERRED_DEPENDENCY (retryable)",
+    cls({ code: 1, ok: false, stage: "derive:europe-au", reason: "catalog-hydration-failed", blockerCodes: [] }) === RECONCILE_STATUS.DEFERRED_DEPENDENCY);
+  // Regression guards: integrity + unknown derive stops MUST still be hard FAILED_DERIVE (never silently deferred).
+  ok("derive:count-mismatch (integrity) -> FAILED_DERIVE (still hard)",
+    cls({ code: 1, ok: false, stage: "derive:india", reason: "derive:count-mismatch", blockerCodes: ["derive:count-mismatch"] }) === RECONCILE_STATUS.FAILED_DERIVE);
+  ok("derive:saved-zero (integrity) -> FAILED_DERIVE (still hard)",
+    cls({ code: 1, ok: false, stage: "derive:us-ca", reason: "derive:saved-zero", blockerCodes: ["derive:saved-zero"] }) === RECONCILE_STATUS.FAILED_DERIVE);
+  ok("an UNKNOWN derive reason -> FAILED_DERIVE (fail closed; never a silent defer)",
+    cls({ code: 1, ok: false, stage: "derive:india", reason: "daily-payload-malformed", blockerCodes: [] }) === RECONCILE_STATUS.FAILED_DERIVE);
+  // Sanity: the pre-existing retryable paths are unchanged.
+  ok("SOURCE_READINESS_PENDING derive reason -> DEFERRED_DEPENDENCY (unchanged)",
+    cls({ code: 1, ok: false, stage: "derive:india", reason: "SOURCE_READINESS_PENDING", blockerCodes: [] }) === RECONCILE_STATUS.DEFERRED_DEPENDENCY);
+  ok("DATADOE_D1_NOT_READY status -> DEFERRED_DEPENDENCY (unchanged)",
+    cls({ code: 1, ok: false, stage: "d1-not-ready:india", status: "DATADOE_D1_NOT_READY", reason: "" }) === RECONCILE_STATUS.DEFERRED_DEPENDENCY);
+  ok("a fully-verified release (ok, code 0) -> READBACK_VERIFIED (unchanged)",
+    cls({ code: 0, ok: true, stage: "complete" }) === RECONCILE_STATUS.READBACK_VERIFIED);
 }
 
 writeSync(1, `\nsaved-data-reconciler-diag: ${passed} assertions passed\n`);

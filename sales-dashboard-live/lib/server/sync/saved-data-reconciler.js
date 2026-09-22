@@ -40,7 +40,16 @@ const noop = () => {};
 //     stop, and every finalize / token-ceiling / publish-gate / publish / scope integrity failure, is a hard FAILED_*.
 const RETRYABLE_STATUS = new Set(["CONTROL_LEASE_LOST", "DATADOE_D1_NOT_READY"]);
 const RETRYABLE_STAGES = new Set(["reconcile", "assert-no-cron", "assert-no-cron-final", "contention", "d1-not-ready"]);
-const RETRYABLE_DERIVE_CODES = new Set(["SOURCE_UNAVAILABLE", "SOURCE_PAUSED", "DATADOE_INITIAL_LOAD_INCOMPLETE", "DATADOE_D1_NOT_READY", "SOURCE_D1_NOT_READY", "SOURCE_READINESS_PENDING"]);
+// SOURCE-NOT-READY derive stops are RETRYABLE (defer + retain LKG), NOT integrity failures. "catalog-snapshot-missing"
+// (the org catalog snapshot is absent, or present but dropped by the daily-snapshot freshness policy because its
+// validated_at predates the requested as-of) and "catalog-hydration-failed" (the snapshot exists but its rows could not
+// be loaded this pass) mean the REQUIRED catalog evidence is not yet available for this as-of -- e.g. the scheduler-v2
+// cycle that produces D-1's catalog has not run/succeeded. The pre-DR1 behavior already deferred this (a cold catalog
+// refused the create -> NO_EXPORT_REQUIRED -> SOURCE_READINESS_PENDING -> DEFERRED); the zero-export catalog ADOPTION
+// (DR1) shifted the same not-ready condition to a derive-stage stop, so it must classify identically -- retryable, LKG
+// preserved, publishes once a fresh catalog lands. This matches daily-reporting-release.js, which defers on every
+// catalog condition. INTEGRITY derive codes (derive:count-mismatch / :lineage-mismatch / :saved-zero) stay HARD failures.
+const RETRYABLE_DERIVE_CODES = new Set(["SOURCE_UNAVAILABLE", "SOURCE_PAUSED", "DATADOE_INITIAL_LOAD_INCOMPLETE", "DATADOE_D1_NOT_READY", "SOURCE_D1_NOT_READY", "SOURCE_READINESS_PENDING", "catalog-snapshot-missing", "catalog-hydration-failed"]);
 // The KNOWN-retryable ready=false blocker reasons (durable-dashboards readiness/coverage). A derive whose blockers are
 // ALL in this set is retryable (source coverage not yet available); an integrity code (derive:count-mismatch /
 // derive:lineage-mismatch / derive:saved-zero), an UNKNOWN code, or a MIX with any non-retryable code is a HARD failure.
@@ -82,7 +91,7 @@ function diagErrClass(reason) {
   ]) { if (re.test(s)) { kw = label; break; } }
   return [status, kw].filter(Boolean).join(":");
 }
-function statusFromRelease(result) {
+export function statusFromRelease(result) {
   if (result && result.ok === true && Number(result.code) === 0) return RECONCILE_STATUS.READBACK_VERIFIED;
   const stage = S(result && result.stage);
   const baseStage = stage.split(":")[0];
