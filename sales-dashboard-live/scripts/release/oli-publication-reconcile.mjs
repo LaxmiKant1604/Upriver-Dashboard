@@ -283,7 +283,17 @@ async function bucketAccounts(b) {
 // ALWAYS safe-close runs before the kill. A separate --cleanup invocation (below) handles an ABNORMAL termination.
 const deadlineSec = Number(argOf("deadline-seconds")) || 0;
 const runStartMs = Date.now();
-const outOfTime = () => deadlineSec > 0 && (Date.now() - runStartMs) / 1000 > deadlineSec;
+// START RESERVE (lease-strand fix): stop STARTING new per-account derives this many seconds BEFORE the hard deadline so
+// the LAST in-flight derive completes (and the ALWAYS safe-close runs) before deadlineRace would abort it. Without this,
+// a derive started just under the deadline runs PAST it -> deadlineRace aborts -> the 8s awaitSettled grace expires while
+// the derive is still in an uninterruptible DB call -> termination UNCONFIRMED -> the lease is left held -> the NEXT
+// region defers on CONTROL_LEASE_HELD (the exact india->us-ca cascade observed in run 35662300118). Conservatively sized
+// to cover one full account derive + the safe-close; overflow accounts defer CLEANLY (DEFERRED_DEPENDENCY, LKG kept) and
+// drain on the next run -- so a large backlog converges over several cooperative runs instead of stranding the plane once.
+// Never larger than the deadline itself, and a no-op when no deadline is set (immediate/unbounded local runs).
+const START_RESERVE_SEC = 120;
+const startCutoffSec = deadlineSec > 0 ? Math.max(0, deadlineSec - START_RESERVE_SEC) : 0;
+const outOfTime = () => deadlineSec > 0 && (Date.now() - runStartMs) / 1000 > startCutoffSec;
 // Bound the IN-FLIGHT account operation: race the release against the remaining budget so a stuck account cannot hang
 // past the reserve (it resolves the DEADLINE_HIT sentinel; the reconciler then ABORTS the op, AWAITS its confirmed
 // settlement, and safe-closes). The `signal` arg is unused here (the reconciler owns the AbortController); it keeps the
@@ -426,6 +436,14 @@ if (!dryRun && outboxDrain && claimedOutbox.length) {
 ghOut("outcome", out.outcome || "unknown");
 ghOut("published_count", String(out.counts ? out.counts.targetsPublished : 0));
 ghOut("failed_count", String(out.counts ? out.counts.targetsFailed : 0));
+// OPERATOR DIAGNOSTIC (gated, off by default): dump the per-account/per-report classification + reason so an operator can
+// prove WHY each account was deferred (e.g. genuine D-1 itemization lag) vs published, without payload/credential data.
+if (process.env.OLI_RECONCILE_DUMP === "1") {
+  for (const rec of (out.perAccount || [])) {
+    const reports = {}; for (const [rk, v] of Object.entries(rec.reports || {})) reports[rk] = { state: v && v.state, reason: v && v.reason };
+    console.log("PERACCT " + JSON.stringify({ accountId: String(rec.accountId).slice(0, 8), eligible: rec.eligible, status: rec.status, revisionId: rec.revisionId ? String(rec.revisionId).slice(0, 12) : null, reports }));
+  }
+}
 console.log("RESULT " + JSON.stringify({
   ok: out.ok, outcome: out.outcome, code: out.code || "OK", bucket, requestedAsOf: asOf, mode, dryRun,
   dataDoeCreates: 0, dataDoeTokens: 0,

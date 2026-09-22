@@ -35,6 +35,19 @@ ok("(blocker 5) a SEPARATE cleanup JOB (needs: reconcile, if: always()) survives
 ok("(blocker 5) the cleanup job reclaims controls left open by an abnormal termination (per region, --cleanup)", /--mode=periodic --cleanup\b/.test(wf) && /reclaim/.test(wf.toLowerCase()));
 ok("(blocker 5) the workflow is NON-GREEN when a region's control cleanup cannot be verified", /OLI_RECONCILE_CLEANUP_UNVERIFIED/.test(wf) && /exit \$rc/.test(wf));
 
+// ---- lease-strand fix: the reconcile SCRIPT reserves start-time before the hard deadline (so the last in-flight derive
+// completes + safe-close runs before deadlineRace would abort it -> the lease never strands -> the next region never
+// defers on CONTROL_LEASE_HELD; the india->us-ca cascade observed in run 35662300118). Guards the SCRIPT source. ----
+const recSrc = readFileSync(new URL("./release/oli-publication-reconcile.mjs", import.meta.url), "utf8");
+ok("(lease-strand) the script defines a positive START_RESERVE_SEC (stop starting new derives before the hard deadline)", /const START_RESERVE_SEC = (\d+)/.test(recSrc) && Number((recSrc.match(/const START_RESERVE_SEC = (\d+)/) || [])[1]) > 0);
+ok("(lease-strand) outOfTime() trips at (deadline - reserve), NOT at the raw deadline (reserves time for the last derive + safe-close)", /startCutoffSec = deadlineSec > 0 \? Math\.max\(0, deadlineSec - START_RESERVE_SEC\)/.test(recSrc) && /outOfTime = \(\) => deadlineSec > 0 && \(Date\.now\(\) - runStartMs\) \/ 1000 > startCutoffSec/.test(recSrc));
+ok("(lease-strand) the reserve is a no-op when no deadline is set (immediate/unbounded local runs unaffected)", /deadlineSec > 0 \? Math\.max\(0, deadlineSec - START_RESERVE_SEC\) : 0/.test(recSrc));
+// The reserve MUST be strictly less than the workflow's --deadline-seconds, else the reconcile would defer EVERY account
+// (never publish). Cross-check the constant against the YAML's cap so the two can never drift into a no-publish state.
+const wfDeadline = Number((wf.match(/--deadline-seconds=(\d+)/) || [])[1]);
+const reserve = Number((recSrc.match(/const START_RESERVE_SEC = (\d+)/) || [])[1]);
+ok("(lease-strand) START_RESERVE_SEC leaves a positive publish window under the workflow deadline (reserve < deadline)", wfDeadline > 0 && reserve > 0 && reserve < wfDeadline);
+
 // ---- defect 2: the cleanup-job gate must EVALUATE identically to the reconcile job's effective-mode==live decision ----
 // A manual DRY-RUN must be zero-write: cleanup must NOT run even when vars.OLI_RECONCILE_LIVE=='true' (the repo flag
 // decides SCHEDULED runs only). We EXTRACT both GitHub-Actions expressions from the YAML and EVALUATE them (not a
