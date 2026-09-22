@@ -112,5 +112,15 @@ ok("(drain) a SEPARATE cleanup job (needs: drain, if: always()) proves the contr
 ok("(monitor) is READ-ONLY: no INSERT/UPDATE/DELETE/upsert against the outbox", !/\b(insert|update|delete|upsert)\b/i.test(mon.replace(/updated_at|enqueued_at/g, "")) || !/method:\s*["'](POST|PATCH|DELETE|PUT)["']/i.test(mon));
 ok("(monitor) EXITS NONZERO on a dead-letter or a stale open backlog (visible alarm to trip the rollback)", /deadLetters > 0 \|\| staleBacklog/.test(mon) && /process\.exit\(1\)/.test(mon));
 ok("(monitor) reports queue age + per-status counts + attempts + dead-letters for publication-lag monitoring", /oldestOpenAgeMinutes/.test(mon) && /byStatus/.test(mon) && /deadLetters/.test(mon) && /maxAttempts/.test(mon));
+// The 30-min drain must NO-OP on an empty queue, never fall through to a full all-accounts poll (the core treats an
+// empty accountIds as "all"); else the cron would run ~48 full reconciles/day and churn the global control lease.
+ok("(drain) an EMPTY outbox queue is a NO-OP, never a full all-accounts poll (restricted-pass at 30-min cadence)", /outboxDrain && \(!Array\.isArray\(drainAccountIds\) \|\| drainAccountIds\.length === 0\)/.test(recSrc) && /outbox-drain no-op/.test(recSrc) && /outcome: "noop"/.test(recSrc));
+// REGION-FILTER: the claim is not region-scoped, so the drain must release out-of-region rows BEFORE deriving them (else
+// an out-of-region account fails 'derive-not-ready' and the row bounces across regions, inflating attempts).
+ok("(drain) REGION-FILTERS claimed rows: releases out-of-region rows (before any derive) for their own region's drain", /not-in-region/.test(recSrc) && /regionAccts\.has\(String\(r\.account_id\)\)/.test(recSrc) && /await bucketAccounts\(bucket\)/.test(recSrc));
+// DEFER vs FAIL: a legitimate deferral is a TERMINAL-OK complete (LKG kept, a future advance re-enqueues); only a HARD
+// failure is released for retry -> so a normal multi-day D-1 lag never churns into a FALSE dead-letter / monitor alarm.
+ok("(drain) a legitimate DEFERRAL is COMPLETED (terminal-ok), never retried into a false dead-letter", /DEFERRED_DEPENDENCY/.test(recSrc) && /DEFERRED_PROVENANCE/.test(recSrc) && /isTerminalOk/.test(recSrc) && /deferred-complete/.test(recSrc));
+ok("(drain) ONLY a HARD failure is RELEASED for retry (dead-letters after the attempt cap = genuine poison isolation)", /hard-failure-this-pass/.test(recSrc) && /released\(hard-fail\)/.test(recSrc));
 
 writeSync(1, `\noli-reconcile-workflow: ${passed} assertions passed\n`);

@@ -395,8 +395,9 @@ if (!dryRun && String(process.env.DURABLE_CATALOG_ADOPTION || "on").toLowerCase(
 // persisted advance publishes with LOW LATENCY instead of waiting for the daily all-accounts poll. The reconciler's own
 // discovery bucket-filters the claimed accounts (a claimed account in another region is simply not in scope this pass and
 // is RELEASED for that region's drain). Fail-soft + expand-first: the outbox is GATED OFF by default (the trigger no-ops),
-// so with no enqueued rows the drain claims nothing and the reconciler behaves EXACTLY as the periodic poll. The
-// report_snapshots freshness CAS makes a re-drain of an already-current account a no-op (idempotent, at-least-once).
+// so with no enqueued rows the drain claims nothing and NO-OPS (zero work; see the empty-queue guard below) -- the daily
+// --mode=periodic run is the all-accounts backstop. The report_snapshots freshness CAS makes a re-drain of an
+// already-current account a no-op (idempotent, at-least-once).
 const outboxDrain = process.argv.includes("--outbox-drain");
 let claimedOutbox = [];
 const outboxClaimToken = "outbox-" + bucket + "-" + asOf + "-" + Math.random().toString(36).slice(2, 10);
@@ -406,35 +407,74 @@ if (!dryRun && outboxDrain) {
     console.log(`oli-reconcile: outbox drain claimed ${claimedOutbox.length} pending row(s).`);
   } catch (e) { console.log("oli-reconcile: outbox claim skipped (" + (e && e.message ? e.message : e) + ") -- proceeding as a periodic poll."); claimedOutbox = []; }
 }
+// REGION-FILTER (critical): claim_report_publication_outbox is NOT region-scoped, so a claim can include OTHER regions'
+// rows (the outbox row carries no region -- only the account). Process ONLY this region's accounts; RELEASE the rest
+// (BEFORE any derive) so their OWN region's drain (later in this same ordered run) handles them. Deriving an
+// out-of-region account fails 'derive-not-ready' and would bounce the row across regions, inflating attempts toward a
+// spurious dead-letter. Release-without-derive is not a failed attempt.
+if (!dryRun && outboxDrain && claimedOutbox.length) {
+  let regionAccts = null;
+  try { regionAccts = new Set((await bucketAccounts(bucket)).map((a) => String(a.accountId))); }
+  catch (e) { console.log("oli-reconcile: outbox region-filter skipped (" + (e && e.message ? e.message : e) + ") -- proceeding with the claimed set."); regionAccts = null; }
+  if (regionAccts) {
+    const outOfRegion = claimedOutbox.filter((r) => !regionAccts.has(String(r.account_id)));
+    for (const row of outOfRegion) { try { await sb.releaseReportPublicationOutbox({ id: row.id, claimToken: outboxClaimToken, lastError: "not-in-region:" + bucket }); } catch (_e) { /* fail-soft: lease expiry re-claims it */ } }
+    if (outOfRegion.length) console.log("oli-reconcile: outbox region-filter released " + outOfRegion.length + " out-of-region row(s) for their own region's drain.");
+    claimedOutbox = claimedOutbox.filter((r) => regionAccts.has(String(r.account_id)));
+  }
+}
 const drainAccountIds = outboxDrain ? [...new Set(claimedOutbox.map((r) => String(r.account_id)))] : null;
 
-const out = await reconciler.run({ bucket, requestedAsOf: asOf, accountIds: outboxDrain ? drainAccountIds : (accountsArg.length ? accountsArg : null), mode, dryRun });
+// OUTBOX-DRAIN NO-OP on an EMPTY queue: the low-latency drain is a RESTRICTED pass over EXACTLY the enqueued accounts.
+// When nothing is enqueued for this region this pass, do ZERO work -- do NOT fall through to reconciler.run with an
+// empty accountIds, which the core (saved-data-reconciler.js) treats as "all accounts" (the full poll). At the 30-min
+// drain cadence that empty->full-poll fallback would run ~48 all-accounts reconciles/day and churn the GLOBAL control
+// lease; the daily --mode=periodic run (WITHOUT --outbox-drain) is the all-accounts backstop. Only a genuine dispatch
+// that wants a full poll runs without --outbox-drain.
+let out;
+if (outboxDrain && (!Array.isArray(drainAccountIds) || drainAccountIds.length === 0)) {
+  console.log("oli-reconcile: outbox-drain no-op for " + bucket + " (0 rows enqueued this pass; the daily poll is the all-accounts backstop). ZERO writes.");
+  out = { ok: true, outcome: "noop", code: "OK", accountsExamined: 0, brandView: { status: "not-required", accounts: [] }, counts: { targetsExamined: 0, targetsStale: 0, targetsPublished: 0, targetsAlreadyCurrent: 0, targetsDeferred: 0, targetsFailed: 0 }, perAccount: [] };
+} else {
+  out = await reconciler.run({ bucket, requestedAsOf: asOf, accountIds: outboxDrain ? drainAccountIds : (accountsArg.length ? accountsArg : null), mode, dryRun });
+}
 
-// Complete the outbox rows for accounts whose reports are now published/current; RELEASE the rest (deferred/failed OR
-// belonging to another region) so they are re-claimed next pass. completeReportPublicationOutbox RE-ARMS a row whose
-// requested_as_of advanced past this pass's as-of (a newer persist mid-flight) -> never lost.
+// COMPLETE the outbox rows whose account reached a TERMINAL-OK state -- either PUBLISHED/current OR legitimately
+// DEFERRED (LKG kept: D-1 itemization lag, newer-live, no-newer-evidence). A deferral is a TERMINAL decision for THIS
+// advance: the account is at its correct state, and a FUTURE advance (a re-persist -> a fresh enqueue) re-processes it.
+// So a defer is NOT retried here -- else a persistently-deferred account (a genuine multi-day D-1 lag) would climb
+// attempts every drain and DEAD-LETTER (a FALSE poison alarm). RELEASE (retry) ONLY a HARD failure (FAILED_*), which
+// dead-letters after the attempt cap to isolate a genuine poison. completeReportPublicationOutbox RE-ARMS a row whose
+// requested_as_of advanced past this pass's as-of (a newer persist mid-flight) -> never lost. The daily all-accounts
+// reconcile remains the backstop for anything the low-latency drain completes-as-deferred.
 if (!dryRun && outboxDrain && claimedOutbox.length) {
   const PUBLISHED = new Set(["READBACK_VERIFIED", "PUBLISHED_LIVE", "PUBLICATION_NOT_REQUIRED"]);
-  const publishedAccounts = new Set();
+  const DEFERRED = new Set(["DEFERRED_DEPENDENCY", "DEFERRED_PROVENANCE"]);
+  const isTerminalOk = (st) => PUBLISHED.has(st) || DEFERRED.has(st);
+  const handled = new Set(); const deferredOnly = new Set();
   for (const rec of (out.perAccount || [])) {
     const reports = rec.reports || {};
-    const keys = Object.keys(reports);
-    if (keys.length > 0 && keys.every((rk) => PUBLISHED.has(String(reports[rk] && reports[rk].state)))) publishedAccounts.add(String(rec.accountId));
+    const states = Object.keys(reports).map((rk) => String(reports[rk] && reports[rk].state));
+    if (states.length > 0 && states.every(isTerminalOk)) {
+      handled.add(String(rec.accountId));
+      if (states.every((st) => DEFERRED.has(st))) deferredOnly.add(String(rec.accountId)); // all reports deferred (no publish)
+    }
   }
-  let drained = 0, released = 0, rearmed = 0;
+  let published = 0, deferred = 0, released = 0, rearmed = 0;
   for (const row of claimedOutbox) {
     const acc = String(row.account_id);
     try {
-      if (publishedAccounts.has(acc)) {
+      if (handled.has(acc)) {
         const ack = await sb.completeReportPublicationOutbox({ id: row.id, claimToken: outboxClaimToken, doneAsOf: asOf });
-        if (ack === "re-armed") rearmed += 1; else drained += 1;
+        if (ack === "re-armed") rearmed += 1; else if (deferredOnly.has(acc)) deferred += 1; else published += 1;
       } else {
-        await sb.releaseReportPublicationOutbox({ id: row.id, claimToken: outboxClaimToken, lastError: "not-published-this-pass (deferred/failed/other-region)" });
+        // A HARD failure (FAILED_DERIVE/PUBLISH/READBACK): retry next pass; the attempt cap dead-letters a genuine poison.
+        await sb.releaseReportPublicationOutbox({ id: row.id, claimToken: outboxClaimToken, lastError: "hard-failure-this-pass (retry; dead-letters after the attempt cap)" });
         released += 1;
       }
     } catch (_e) { /* fail-soft: the lease expiry re-claims it */ }
   }
-  console.log(`oli-reconcile: outbox drain done=${drained} re-armed=${rearmed} released=${released}.`);
+  console.log(`oli-reconcile: outbox drain published=${published} deferred-complete=${deferred} re-armed=${rearmed} released(hard-fail)=${released}.`);
 }
 
 ghOut("outcome", out.outcome || "unknown");
