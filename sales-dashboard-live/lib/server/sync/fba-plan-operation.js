@@ -190,6 +190,13 @@ export async function advanceFbaPlanBucket({
   // taken over / renew error) the publisher STOPS immediately, publishes nothing further, preserves LKG, and
   // returns a typed retryable contention result. Default null => no fencing (byte-identical natural behavior).
   verifyLease = null,
+  // ZERO-EXPORT durable FBA source-snapshot persist (backstop enabler). Injected async collaborator:
+  //   ({ reportRequests, includedIds, inventoryAsOf, bucket, accountsById, outOfTime }) => { persisted, skipped, failed }
+  // It reuses the ALREADY-FETCHED source-job cache (never a create) to write public.source_snapshots(
+  // fba-inventory-health) per account -- the exact durable evidence the zero-export FBA reconciler reads. Runs ONCE
+  // after the cycle drains (before publish), so a fetch that already spent tokens also lands the durable source the
+  // backstop needs. NON-FATAL + idempotent + per-account isolated. Default null => byte-identical prior behavior.
+  persistDurableFbaSnapshots = null,
 } = {}) {
   const cycleBucket = cycleBucketOverride || fbaCycleBucket(bucket);
   const cycleDate = inventoryAsOf || asOf;
@@ -283,6 +290,29 @@ export async function advanceFbaPlanBucket({
     return { ...base, phase: "sync", ok: false, problems: [bucket + " dedicated " + cycleBucket + " cycle is missing, mismatched, or non-terminal; refusing stale publication"] };
   }
   base.cycleId = S(cycleId); // the durable FBA cycle this operation published from (evidence provenance)
+
+  // ---------------- DURABLE SOURCE persist (ZERO export): land public.source_snapshots(fba-inventory-health) ----
+  // The fba-plan derive consumed the fetched FBA inventory from the batched source-job cache but never persisted the
+  // durable per-account source snapshot the ZERO-EXPORT reconciler reads. Persist it now, from the SAME validated
+  // rows, so the FBA backstop can converge (and the priority path publishes real inventory) -- reusing the cache, no
+  // new create. NON-FATAL: a failure here never blocks the fba-plan publication (the durable source is a backstop
+  // enabler, not a publish gate); it is idempotent + per-account isolated inside the collaborator.
+  if (typeof persistDurableFbaSnapshots === "function") {
+    try {
+      const reportRequests = (cost && cost.plan && Array.isArray(cost.plan.reportRequests)) ? cost.plan.reportRequests : [];
+      const accountsById = new Map((bucketAccounts || []).filter((a) => a && a.accountId).map((a) => [S(a.accountId), { country: S(a.country) }]));
+      const pr = await persistDurableFbaSnapshots({ reportRequests, includedIds: included, inventoryAsOf: inventoryAsOf || asOf, bucket, accountsById, outOfTime });
+      if (pr) {
+        base.durableFbaPersisted = Array.isArray(pr.persisted) ? pr.persisted.length : 0;
+        log(bucket + " durable FBA source snapshots: persisted " + base.durableFbaPersisted
+          + (pr.skipped && pr.skipped.length ? " skipped " + pr.skipped.length : "")
+          + (pr.failed && pr.failed.length ? " failed " + pr.failed.length : "")
+          + (pr.error ? " error=" + pr.error : ""));
+      }
+    } catch (e) {
+      log(bucket + " WARN durable FBA source persist failed (non-fatal; backstop enabler only): " + S(e && e.message ? e.message : e));
+    }
+  }
 
   // ---------------- PUBLISH phase: open gates -> preflight+publish -> ALWAYS safe-close -> read-back ----------
   const published = [];

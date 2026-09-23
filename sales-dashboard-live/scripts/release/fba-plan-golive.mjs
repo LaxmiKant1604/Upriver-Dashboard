@@ -225,6 +225,9 @@ try {
         runtime: release.runtime, publisher: release.publisher, controls: release.controls,
         readbackLive: release.readbackLive, ownershipBackfill: release.ownershipBackfill,
         verifyLease: release.verifyLease,
+        // ZERO-EXPORT durable FBA source persist: land source_snapshots(fba-inventory-health) from the just-fetched
+        // cache so the zero-export FBA reconciler can converge (the fba-plan derive alone never wrote it).
+        persistDurableFbaSnapshots: release.persistDurableFbaSnapshots,
         trigger: "github", deadlineMs: Infinity, reserveMs: 0, outOfTime: () => false,
         overflowSellers,
         // BOOTSTRAP: a WAVE-BOUND FBA cycle (no collision with a terminal natural <region>-fba cycle) +

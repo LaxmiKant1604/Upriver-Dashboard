@@ -237,6 +237,9 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
             runtime: release.runtime, publisher: release.publisher, controls: release.controls,
             readbackLive: release.readbackLive, ownershipBackfill: release.ownershipBackfill,
             verifyLease: release.verifyLease,
+            // ZERO-EXPORT durable FBA source persist (backstop enabler): lands source_snapshots(fba-inventory-health)
+            // from the just-fetched cache when a manual sync drains in one slice (the scheduled go-live is authoritative).
+            persistDurableFbaSnapshots: release.persistDurableFbaSnapshots,
             trigger: "vercel", deadlineMs: fbaDeadline.deadlineMs, reserveMs: fbaDeadline.reserveMs, outOfTime: fbaDeadline.outOfTime,
           });
           // P1-D: a lost control-lease fence (write-boundary or heartbeat) is a TYPED RETRYABLE 409, never a

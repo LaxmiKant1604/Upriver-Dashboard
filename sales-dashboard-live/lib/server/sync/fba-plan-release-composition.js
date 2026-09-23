@@ -12,6 +12,7 @@ import { buildSchedulerV2Runtime, makeProductionDiscoverAccounts } from "./runti
 import { buildSchedulerV2Publisher } from "./publisher-composition.js";
 import { planFbaPlanBucketBatched } from "./report-planner.js";
 import { fbaCycleBucket } from "./fba-plan-operation.js";
+import { persistDurableFbaSnapshotsFromPlan } from "./fba-durable-source-persist.js";
 import { defaultInventoryBatchesOf, overflowSellersFromTruncated, readRecentTruncatedInventoryOwnership, DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS } from "./fba-inventory-overflow.js";
 import { readRecentReadinessRejectionOwnership, readinessIsolationFrom } from "./source-readiness-isolation.js";
 import { getRecentSyncCycleIds, getSyncSourceJobsWithMeta, getSyncSourceJobOwnersForCycle } from "../supabase.js";
@@ -25,6 +26,7 @@ import { paramsHashFor } from "../report-store.js";
 import {
   getReportSnapshot, getReportSnapshotStoragePayload,
   getSourceCoverageWindows, getSourceExportCache,
+  saveSourceSnapshotPayload, recordSourceSnapshot,
 } from "../supabase.js";
 import { getDataDoeConnections, resolveDataDoeAccountIds } from "../datadoe-connections.js";
 import { discoverPrimaryAccountIds, connectPriorityControlStore } from "./priority-control-pg-store.js";
@@ -209,9 +211,27 @@ export function buildFbaPlanRelease(overrides = {}) {
     return { overflowSellers: new Set([...base.overflowSellers, ...readinessIsolate]), singleSellerHardStops: base.singleSellerHardStops };
   };
 
+  // ZERO-EXPORT durable FBA source-snapshot persist collaborator (backstop enabler). Reuses the source-job cache
+  // (never a create) to land public.source_snapshots(fba-inventory-health) per account under the per-seller identity
+  // the reconciler recomputes -- so the zero-export FBA reconciler can converge. The primary connection's api key is
+  // resolved lazily (no build-time I/O) and folds into the request hash EXACTLY as the reconciler's resolver does.
+  const persistDurableFbaSnapshots = async ({ reportRequests = [], includedIds = [], inventoryAsOf, bucket, accountsById = new Map(), outOfTime = () => false, log = () => {} } = {}) => {
+    const conns = getConnections();
+    const primary = (conns || []).find((c) => c && c.id === "primary");
+    if (!primary || !primary.apiKey) return { persisted: [], skipped: [], failed: [], error: "no-primary-connection" };
+    return persistDurableFbaSnapshotsFromPlan({
+      reportRequests, includedIds, inventoryAsOf, bucket, accountsById,
+      apiKey: primary.apiKey, connectionId: "primary",
+      loadSourceExportCache: (h) => readExportCache(h),
+      saveSnapshotPayload: saveSourceSnapshotPayload,
+      recordSnapshot: recordSourceSnapshot,
+      outOfTime, log,
+    });
+  };
+
   return Object.freeze({
     runtime, publisher, controls, readbackLive, ownershipBackfill, verifyLease,
-    loadAccounts, resolveOverflowSellers,
+    loadAccounts, resolveOverflowSellers, persistDurableFbaSnapshots,
     connections: getConnections(),
     scopeReaders: { resolveDataDoeAccountIds: resolveAccountIds, getSourceCoverageWindows: readCoverage },
     getSourceExportCache: readExportCache,
