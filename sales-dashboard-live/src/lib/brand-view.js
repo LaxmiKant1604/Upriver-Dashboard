@@ -171,12 +171,15 @@ export function brandViewModel(payload) {
 
   for (const row of payload?.series || []) {
     const entry = ensure(row.c, row.cur);
-    const day = entry.byDate.get(row.d) || { sales: 0, units: 0, adSpend: null, missingOrderValueUnits: 0 };
+    const day = entry.byDate.get(row.d) || { sales: 0, units: 0, adSpend: null, adUnattributed: false, missingOrderValueUnits: 0 };
     day.sales += Number(row.s) || 0;
     day.units += Number(row.u) || 0;
     day.missingOrderValueUnits += Number(row.x) || 0;
     // `a` is absent when the saved Ads history has nothing for that country/day.
     if (row.a !== undefined && row.a !== null) day.adSpend = (day.adSpend === null ? 0 : day.adSpend) + Number(row.a);
+    // `au` marks a day carrying UNMAPPED campaign spend: that spend's brand is unknown (it could be this brand's), so
+    // a 0 for the brand on that day is NOT a proven zero.
+    if (row.au === true) day.adUnattributed = true;
     entry.byDate.set(row.d, day);
   }
 
@@ -231,10 +234,16 @@ export function rangeAdSpend(model, country, from, to) {
   if (!adsFrom || !adsTo) return null;
   if (from < adsFrom || to > adsTo) return null;
   let spend = 0;
+  let sawUnattributed = false;
   for (const [date, day] of country.byDate) {
     if (date < from || date > to) continue;
     if (day.adSpend !== null) spend += day.adSpend;
+    if (day.adUnattributed) sawUnattributed = true;
   }
+  // A brand's mapped spend of 0 is a PROVEN zero only when the marketplace's campaign spend is FULLY attributed for
+  // the selected range. If any range day carries UNMAPPED campaign spend, that spend could be this brand's, so a 0 is
+  // unknown -> Unavailable (em dash), never a fabricated zero. A known non-zero mapped spend is still shown.
+  if (spend === 0 && sawUnattributed) return null;
   return spend;
 }
 

@@ -206,8 +206,8 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
     { key: "country", label: "Country" },
     { key: "sales", label: `Total Sales${suffix}` },
     { key: "ly", label: `LY Sales${suffix}`, hint: "The equivalent period one year earlier. Shown only when the saved snapshot fully covers that window." },
-    { key: "spend", label: `Ad Spend${suffix}`, hint: "Same-ASIN advertising spend for this brand only. A dash means the saved Ads history cannot answer for this marketplace and window — not zero spend." },
-    { key: "tacos", label: "TACoS%", hint: "Brand ad spend divided by brand sales for the same marketplace and window." },
+    { key: "spend", label: `Ad Spend${suffix}`, hint: "Ad Spend from Campaign Ads campaigns mapped to this brand, for this marketplace and window. A dash means Ads are unavailable, or the marketplace has campaign spend not yet mapped to a brand (unknown attribution) — never zero spend." },
+    { key: "tacos", label: "TACoS%", hint: "This brand's Ad Spend divided by its Total Sales for the same marketplace and window; All Markets divides aggregated spend by aggregated sales." },
     { key: "fba", label: "FBA Inv.", tone: "positive", hint: "Available FBA units for this brand's ASINs from the latest saved FBA snapshot. Never currency converted." },
     { key: "cover", label: "Inv Cover", tone: "positive", hint: "Months of cover: available FBA units divided by this brand's month-to-date daily unit run rate." },
     { key: "units", label: "Units" },
@@ -225,7 +225,16 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
   groups.forEach((group, index) => {
     if (banded) rows.push(currencyBand(group, displayCurrency, index));
 
-    const groupTacos = tacos(group.totals.adSpend, group.totals.sales);
+    // All Markets Ad Spend is COMPLETE only when EVERY contributing marketplace has an available spend for this
+    // window (saved Ads coverage AND, in converted mode, a display-currency rate). currencyGroups sums with addMaybe,
+    // which silently omits an unavailable marketplace and would leave the total reading as complete -- so when any
+    // marketplace is unavailable, WITHHOLD the All Markets Ad Spend + TACoS (em dash + tooltip) instead of showing a
+    // partial figure. A genuine covered zero (every marketplace present, summing to 0) still shows 0.
+    const adSpendComplete = group.rows.every((row) => row.adSpend !== null && row.adSpend !== undefined);
+    const groupAdSpend = adSpendComplete ? group.totals.adSpend : null;
+    const groupTacos = tacos(groupAdSpend, group.totals.sales);
+    const partialSpendHint = adSpendComplete ? undefined
+      : "Withheld: at least one marketplace has no Ad Spend for this window (no saved Ads coverage, or no exchange rate to the display currency), so the All Markets Ad Spend and TACoS are not shown as a partial total.";
     const groupFba = group.fbaAvailable === null ? unattributedFba : group.fbaAvailable;
     const groupRangeUnits = group.rows.reduce((sum, row) => sum + (Number(row.coverUnits) || 0), 0);
     const groupCover = daily.selectedRangeDays
@@ -235,12 +244,12 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
       key: `total-${group.key}`,
       kind: "total",
       label: "All Markets",
-      hints: [undefined, undefined, undefined, undefined, undefined, undefined, coverHint(groupCover), undefined],
+      hints: [undefined, undefined, undefined, partialSpendHint, partialSpendHint, undefined, coverHint(groupCover), undefined],
       cells: [
         cell("All Markets"),
         cell(money(group.totals.sales, group.currency, SALES_DECIMALS), group.totals.sales),
         cell(money(group.totals.lySales, group.currency, SALES_DECIMALS), group.totals.lySales),
-        cell(money(group.totals.adSpend, group.currency, SPEND_DECIMALS), group.totals.adSpend),
+        cell(money(groupAdSpend, group.currency, SPEND_DECIMALS), groupAdSpend),
         cell(ratePct(groupTacos), groupTacos === null ? null : groupTacos * 100),
         cell(groupFba === null ? NA : nInt(groupFba), groupFba),
         cell(coverLabel(groupCover, NA), groupCover),
@@ -270,7 +279,10 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
       });
     }
   });
-  return withoutAdvertisingColumns({ headers, rows });
+  // Daily Snapshot now shows Ad Spend + TACoS% (between LY Sales and FBA Inv.) for every brand and marketplace,
+  // including the All Markets row -- the same canonical Brand View model + saved Ads evidence the Monthly and 7-Day
+  // reports already display. showAdvertising:true keeps the two columns (screen + Excel/CSV/print share this builder).
+  return withoutAdvertisingColumns({ headers, rows }, { showAdvertising: true });
 }
 
 /* ============================== 2. MONTHLY ============================== */
@@ -287,7 +299,7 @@ export function buildMonthlyTable({ monthly, groups, displayCurrency, scope }) {
     ...completed.map((month) => ({ key: month.key, label: monthKeyLabel(month.key) })),
     { key: "actual", label: `${currentLabel} Act.`, tone: "positive", hint: `Month to date, ${current.from} to ${current.to}.` },
     { key: "runrate", label: `${currentLabel} RR`, tone: "positive", hint: `Run rate = actual / ${current.elapsedDays} elapsed days x ${current.daysInMonth} days in the month.` },
-    { key: "spend", label: "Ad Spend", tone: "accent", hint: "Brand same-ASIN spend for the current month to date. A dash means unavailable, not zero." },
+    { key: "spend", label: "Ad Spend", tone: "accent", hint: "Ad Spend from Campaign Ads campaigns mapped to this brand, for the current month to date. A dash means unavailable, not zero." },
     { key: "tacos", label: "TACoS%", tone: "accent" },
   ];
 

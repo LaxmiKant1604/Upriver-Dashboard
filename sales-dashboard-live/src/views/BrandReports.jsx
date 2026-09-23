@@ -266,7 +266,7 @@ export default function BrandReports({
           ].filter(Boolean).join(" · ")}
           headers={tables.dailyTable.headers}
           rows={tables.dailyTable.rows}
-          minWidth={900}
+          minWidth={1040}
         />
       )}
       {tables.monthlyTable && (

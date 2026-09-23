@@ -651,6 +651,9 @@ await asyncTest("Campaign->brand mapping drives Brand View ad attribution (not t
   const common = { accountId: ACCOUNT_A, brand: "Bebi Born", asOf: "2026-07-28", account: { name: "Bebi EU", country: "IT" }, getSnapshot: salesOnly, getAdsRows: fakeGetAdsRows, required: false };
   const noMap = await buildAccountBrandSlice(common); // default getCampaignMappings -> [] (all campaigns unmapped)
   assert.equal(noMap.ads.matchedRows, 0, "with NO campaign->brand mapping, Ads cannot attribute (matchedRows 0; honest empty)");
+  // The unmapped campaigns carry REAL spend, so their (country,date) is UNATTRIBUTED (unknown brand) -- the read path
+  // must show an em dash (Unavailable), never a fabricated 0 (the spend could be this brand's).
+  assert.ok(noMap.ads.unattributedByKey.size > 0, "unmapped campaigns WITH spend mark the marketplace UNATTRIBUTED (unknown), not a proven zero");
   const withMap = await buildAccountBrandSlice({ ...common, getCampaignMappings: getCampaignMappingsFake });
   assert.equal(withMap.ads.matchedRows, 2, "the mapping attributes the two Bebi Born campaigns -> Ads attributed");
   let spend = 0; for (const v of withMap.ads.spendByKey.values()) spend += v;
@@ -1351,7 +1354,7 @@ test("both reports build the same three tables from the same payload shape", () 
     assert.ok(tables.weeklyTable, `${label}: no weekly table`);
     assert.deepEqual(
       tables.dailyTable.headers.map((header) => header.label),
-      ["Country", "Total Sales", "LY Sales", "FBA Inv.", "FBA Cover (days)", "Units"],
+      ["Country", "Total Sales", "LY Sales", "Ad Spend", "TACoS%", "FBA Inv.", "FBA Cover (days)", "Units"],
       `${label}: unexpected Daily Snapshot columns`
     );
     assert.ok(tables.monthlyTable.headers.some((header) => header.label === "Ad Spend"));
@@ -1381,9 +1384,12 @@ test("the portfolio table names the accounts behind a shared marketplace", () =>
   assert.ok(italy.labelTitle.includes("Bebi EU"), "the contributing accounts must be discoverable");
   assert.ok(italy.labelTitle.includes("Bebi Reseller"));
   assert.match(italy.labelTitle, /Combined from 2 accounts/);
-  // Advertising metrics are intentionally absent until coverage is complete.
-  assert.equal(italy.cells.length, 6);
-  assert.equal(italy.cells[3].t, "883");
+  // Ad Spend + TACoS% now sit between LY Sales and FBA Inv.; Italy has no Ads coverage so both are honest em
+  // dashes (never a fabricated zero), and FBA Inv. shifts from index 3 to index 5.
+  assert.equal(italy.cells.length, 8);
+  assert.equal(italy.cells[3].t, "—", "Ad Spend is an em dash where this marketplace has no Ads coverage");
+  assert.equal(italy.cells[4].t, "—", "TACoS% is an em dash where Ad Spend is unavailable");
+  assert.equal(italy.cells[5].t, "883");
   // More than one currency, so every group is introduced by a currency band.
   const bands = tables.dailyTable.rows.filter((row) => row.kind === "band");
   assert.equal(bands.length, tables.dailyGroups.length);
@@ -1419,8 +1425,8 @@ test("inventory cover reads in selected-range days and a marketplace with no FBA
     displayCurrency: ORIGINAL_CURRENCY, rates: null,
   });
   const italy = tables.dailyTable.rows.find((row) => row.label?.includes("Italy"));
-  assert.match(italy.cells[4].t, /^\d+ days?$/, `expected days, got ${italy.cells[4].t}`);
-  assert.match(italy.hints[4], /days of cover/, "the exact day count stays available in the tooltip");
+  assert.match(italy.cells[6].t, /^\d+ days?$/, `expected days, got ${italy.cells[6].t}`);
+  assert.match(italy.hints[6], /days of cover/, "the exact day count stays available in the tooltip");
   // Poland holds stock but never sold, so it carries the reference's "(FC only)".
   const poland = tables.dailyTable.rows.find((row) => row.label?.includes("Poland"));
   assert.match(poland.label, /\(FC only\)/);
@@ -1434,8 +1440,8 @@ test("an unavailable value reaches the table as an em dash, never a zero", () =>
   });
   const germany = tables.dailyTable.rows.find((row) => row.label?.includes("Germany"));
   assert.equal(germany.cells[2].t, "—", "no complete last-year window");
-  // A real measured value is still a number.
-  assert.ok(germany.cells[5].t !== "—");
+  // A real measured value is still a number (Units, now at index 7 after the two ad columns were inserted).
+  assert.ok(germany.cells[7].t !== "—");
 });
 
 /* ========================================================== 8. exports */

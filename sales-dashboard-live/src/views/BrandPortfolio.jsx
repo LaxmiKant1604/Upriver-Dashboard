@@ -704,7 +704,7 @@ export default function BrandPortfolio({
                 ].filter(Boolean).join(" · ")}
                 headers={tables.dailyTable.headers}
                 rows={tables.dailyTable.rows}
-                minWidth={900}
+                minWidth={1040}
               />
             </div>
           )}

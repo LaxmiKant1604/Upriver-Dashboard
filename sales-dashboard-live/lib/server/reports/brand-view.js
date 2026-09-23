@@ -341,14 +341,20 @@ export function aggregateBrandAds(adRows, asinBrand, brand) {
  * CAMPAIGN-grain equivalent of aggregateBrandAds for the ASIN->Campaign cutover: attribute each campaign row to a
  * brand via the campaign identity -> brand-key map (campaign_brand_mapping) instead of child_asin -> brand, and fold
  * the matched brand's ad_spend per (country, date). Same return shape as aggregateBrandAds. `brandKeyWanted` is the
- * canonical key of the selected brand. An UNMAPPED campaign (absent from the map) still contributes to
- * adCountries/coverage but NEVER to a brand's spend -- so until campaigns are mapped every brand honestly shows 0
- * spend where campaign data exists (a real synced 0), never a fabricated value and never ASIN spend.
+ * canonical key of the selected brand.
+ *
+ * A campaign mapped to ANOTHER brand is attributed elsewhere and creates no uncertainty for this brand. But an
+ * UNMAPPED campaign (absent from the map) with real spend is UNKNOWN attribution -- that spend could belong to ANY
+ * brand, including the selected one -- so a 0 for this brand where such spend exists is NOT a proven zero. We record
+ * those (country|date) keys in `unattributedByKey`; the assembler emits them as an `au` flag so the read path shows an
+ * em dash (Unavailable) rather than a fabricated 0. A genuine 0 remains only where the marketplace's campaign spend is
+ * FULLY attributed for the range.
  */
 export function aggregateBrandCampaignAdsSpend(adRows, campaignIdentityBrandKey, brandKeyWanted) {
   const spendByKey = new Map();
   const adCountries = new Set();
   const coverageByCountry = new Map();
+  const unattributedByKey = new Set();
   let matchedRows = 0;
   const map = campaignIdentityBrandKey instanceof Map ? campaignIdentityBrandKey : new Map();
   for (const row of adRows || []) {
@@ -361,13 +367,20 @@ export function aggregateBrandCampaignAdsSpend(adRows, campaignIdentityBrandKey,
     if (date > coverage.to) coverage.to = date;
     coverageByCountry.set(country, coverage);
     const id = campaignIdentityOfRow(row);
-    if (!id || map.get(id) !== brandKeyWanted) continue;
-    matchedRows += 1;
+    if (!id) continue; // no campaign identity -> cannot attribute or count (unchanged)
     const key = seriesKey(country, date);
-    const spend = campaignAdsMetricsFromRow(row).spend;
-    spendByKey.set(key, (spendByKey.get(key) || 0) + (spend || 0));
+    const mappedBrand = map.get(id);
+    if (mappedBrand === brandKeyWanted) {
+      matchedRows += 1;
+      const spend = campaignAdsMetricsFromRow(row).spend;
+      spendByKey.set(key, (spendByKey.get(key) || 0) + (spend || 0));
+    } else if (mappedBrand === undefined) {
+      // Unmapped campaign (attributed to no brand). ONLY real spend creates attribution uncertainty for this brand.
+      const spend = campaignAdsMetricsFromRow(row).spend;
+      if (Number(spend) > 0) unattributedByKey.add(key);
+    }
   }
-  return { spendByKey, adCountries: [...adCountries], coverageByCountry, matchedRows };
+  return { spendByKey, adCountries: [...adCountries], coverageByCountry, matchedRows, unattributedByKey };
 }
 
 /**
@@ -904,6 +917,9 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
   const adsCoverageByCountry = {};
   const adsCountries = [];
   const spendByKey = new Map();
+  // (country|date) keys where UNMAPPED campaign spend exists (union across contributing accounts). Where the brand's
+  // mapped spend for a range is 0 but a range day is here, the spend is unknown attribution -> em dash, not a 0.
+  const adsUnattributedByKey = new Set();
   let adsMatchedRows = 0;
 
   for (const country of currencyByCountry.keys()) {
@@ -929,6 +945,13 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
         if (date < from || date > to) continue;
         spendByKey.set(key, (spendByKey.get(key) || 0) + spend);
         adsMatchedRows += 1;
+      }
+      // Any contributing account with UNMAPPED spend for this (country, date) makes the merged figure uncertain.
+      for (const key of (slice.ads.unattributedByKey || new Set())) {
+        if (!key.startsWith(`${country}|`)) continue;
+        const date = key.slice(country.length + 1);
+        if (date < from || date > to) continue;
+        adsUnattributedByKey.add(key);
       }
     }
   }
@@ -994,17 +1017,30 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
   /* ---------- series ---------- */
   const series = [];
   for (const entry of seriesByKey.values()) {
+    const key = seriesKey(entry.c, entry.d);
     const row = { c: entry.c, cur: currencyByCountry.get(entry.c) ?? null, d: entry.d, s: round4(entry.s), u: entry.u };
     if (entry.x) row.x = entry.x;
-    const spend = spendByKey.get(seriesKey(entry.c, entry.d));
+    const spend = spendByKey.get(key);
     if (spend !== undefined) row.a = round4(spend);
+    if (adsUnattributedByKey.has(key)) row.au = true;
     series.push(row);
   }
   // Days with ad spend but no order value are still real spend days.
   for (const [key, spend] of spendByKey) {
     if (seriesByKey.has(key)) continue;
     const [country, date] = key.split("|");
-    series.push({ c: country, cur: currencyByCountry.get(country) ?? null, d: date, s: 0, u: 0, a: round4(spend) });
+    const row = { c: country, cur: currencyByCountry.get(country) ?? null, d: date, s: 0, u: 0, a: round4(spend) };
+    if (adsUnattributedByKey.has(key)) row.au = true;
+    series.push(row);
+  }
+  // Days with ONLY unmapped (unattributed) campaign spend -- no order value AND no mapped brand spend -- still carry
+  // the attribution-uncertainty flag for a DISPLAYED marketplace, so a selected range overlapping them shows an em dash
+  // (Unavailable), never a fabricated 0.
+  for (const key of adsUnattributedByKey) {
+    if (seriesByKey.has(key) || spendByKey.has(key)) continue;
+    const [country, date] = key.split("|");
+    if (!currencyByCountry.has(country)) continue; // not a marketplace the brand sells in -> never displayed
+    series.push({ c: country, cur: currencyByCountry.get(country) ?? null, d: date, s: 0, u: 0, au: true });
   }
   if (series.length > MAX_SERIES_ROWS) {
     throw new Error(`Brand View produced ${series.length.toLocaleString("en-US")} country/day rows, above the ${MAX_SERIES_ROWS.toLocaleString("en-US")} design limit. It was not saved. This means an upstream source changed grain; report it rather than narrowing the window.`);
