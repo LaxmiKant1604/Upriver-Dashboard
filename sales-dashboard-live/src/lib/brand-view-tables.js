@@ -206,8 +206,8 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
     { key: "country", label: "Country" },
     { key: "sales", label: `Total Sales${suffix}` },
     { key: "ly", label: `LY Sales${suffix}`, hint: "The equivalent period one year earlier. Shown only when the saved snapshot fully covers that window." },
-    { key: "spend", label: `Ad Spend${suffix}`, hint: "Ad Spend from Campaign Ads campaigns mapped to this brand, for this marketplace and window. A dash means Ads are unavailable, or the marketplace has campaign spend not yet mapped to a brand (unknown attribution) — never zero spend." },
-    { key: "tacos", label: "TACoS%", hint: "This brand's Ad Spend divided by its Total Sales for the same marketplace and window; All Markets divides aggregated spend by aggregated sales." },
+    { key: "spend", label: `Ad Spend${suffix}`, hint: "Ad Spend from Campaign Ads campaigns mapped to this brand, for this marketplace and window. A dash means Ads are unavailable, or the marketplace has campaign spend not yet mapped to any brand — so this brand's total could be partial and is withheld (never shown as zero)." },
+    { key: "tacos", label: "TACoS%", hint: "This brand's Ad Spend divided by its Total Sales for the same marketplace and window; All Markets divides aggregated spend by aggregated sales. Withheld whenever Ad Spend is unavailable or only partially attributed." },
     { key: "fba", label: "FBA Inv.", tone: "positive", hint: "Available FBA units for this brand's ASINs from the latest saved FBA snapshot. Never currency converted." },
     { key: "cover", label: "Inv Cover", tone: "positive", hint: "Months of cover: available FBA units divided by this brand's month-to-date daily unit run rate." },
     { key: "units", label: "Units" },
@@ -234,7 +234,7 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
     const groupAdSpend = adSpendComplete ? group.totals.adSpend : null;
     const groupTacos = tacos(groupAdSpend, group.totals.sales);
     const partialSpendHint = adSpendComplete ? undefined
-      : "Withheld: at least one marketplace has no Ad Spend for this window (no saved Ads coverage, or no exchange rate to the display currency), so the All Markets Ad Spend and TACoS are not shown as a partial total.";
+      : "Withheld: at least one marketplace's Ad Spend is unavailable or only partially attributed (unmapped campaigns, no saved Ads coverage, or no exchange rate to the display currency), so the All Markets Ad Spend and TACoS are not shown as a partial total.";
     const groupFba = group.fbaAvailable === null ? unattributedFba : group.fbaAvailable;
     const groupRangeUnits = group.rows.reduce((sum, row) => sum + (Number(row.coverUnits) || 0), 0);
     const groupCover = daily.selectedRangeDays

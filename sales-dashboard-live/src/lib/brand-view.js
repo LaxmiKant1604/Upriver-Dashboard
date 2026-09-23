@@ -240,10 +240,12 @@ export function rangeAdSpend(model, country, from, to) {
     if (day.adSpend !== null) spend += day.adSpend;
     if (day.adUnattributed) sawUnattributed = true;
   }
-  // A brand's mapped spend of 0 is a PROVEN zero only when the marketplace's campaign spend is FULLY attributed for
-  // the selected range. If any range day carries UNMAPPED campaign spend, that spend could be this brand's, so a 0 is
-  // unknown -> Unavailable (em dash), never a fabricated zero. A known non-zero mapped spend is still shown.
-  if (spend === 0 && sawUnattributed) return null;
+  // ANY unmapped campaign spend in the range makes the brand's total POTENTIALLY PARTIAL: an unmapped campaign is
+  // attributed to no brand, so we cannot prove it is not this brand's -- its spend could belong here. A partial total
+  // (and the TACoS derived from it) would mislead, so the marketplace's Ad Spend + TACoS are Unavailable (em dash),
+  // not a partial-shown-as-complete figure and never a fabricated zero. A genuine value/zero is shown only when every
+  // campaign with spend in the range is attributed (to this brand or, provably, to another).
+  if (sawUnattributed) return null;
   return spend;
 }
 

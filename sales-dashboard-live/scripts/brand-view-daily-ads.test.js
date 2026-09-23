@@ -76,8 +76,8 @@ test("attribution TOOLTIP names the ACTIVE method (Campaign Ads), not the retire
   const spendHint = t.headers.find((h) => h.key === "spend").hint;
   ok("Ad Spend tooltip says Campaign Ads", /Campaign Ads/.test(spendHint));
   ok("Ad Spend tooltip no longer says 'same-ASIN'", !/same-ASIN/i.test(spendHint));
-  ok("dash tooltip is honest (dash != zero)", /(not|never) zero spend/i.test(spendHint));
-  ok("Ad Spend tooltip names unmapped/unknown attribution as a dash reason", /unmapped|attribution/i.test(spendHint));
+  ok("dash tooltip is honest (dash != zero)", /(not|never)[^.]*\bzero\b/i.test(spendHint));
+  ok("Ad Spend tooltip names unmapped/partial as a dash reason", /unmapped|partial|attribution/i.test(spendHint));
 });
 
 test("EXACT per-brand-marketplace spend + TACoS from saved Ads (each brand only its own mapped spend, own currency)", () => {
@@ -180,10 +180,31 @@ test("UNATTRIBUTED (unmapped) spend + no mapped brand spend -> Ad Spend em dash,
   ok("IN TACoS is an em dash too", inRow.cells[4].t === DASH);
   ok("All Markets also withheld (em dash), never a partial/fabricated 0", totalRow(t).cells[3].t === DASH && totalRow(t).cells[4].t === DASH);
 });
-test("UNATTRIBUTED spend but the brand HAS mapped spend > 0 -> the known mapped value is still shown", () => {
+test("UNATTRIBUTED spend WITH mapped spend > 0 -> POTENTIALLY PARTIAL: Ad Spend + TACoS Unavailable at country AND All Markets", () => {
+  // A mapped 150 coexists with unmapped spend that could ALSO be this brand's -> the total is not provably complete,
+  // so it must not be shown as a complete figure. Withhold (em dash), never a partial-as-complete value.
   const series = DATES.map((d) => ({ c: "IN", cur: "INR", d, s: 1000, u: 10, a: 50, au: true }));
-  const inRow = R(dailyRaw(series, IN_ONLY), "INR-IN");
-  ok("IN Ad Spend = 150 (50/day x3) shown despite coexisting unmapped spend", inRow.cells[3].n === 150 && inRow.cells[3].t !== DASH);
+  const t = dailyRaw(series, IN_ONLY);
+  const inRow = R(t, "INR-IN");
+  ok("IN Ad Spend em dash despite a mapped 150 (unmapped spend could be this brand's; never shown partial)", inRow.cells[3].t === DASH && inRow.cells[3].n === undefined);
+  ok("IN TACoS withheld (em dash)", inRow.cells[4].t === DASH);
+  ok("All Markets Ad Spend + TACoS also em dash (same rule applied to the total)", totalRow(t).cells[3].t === DASH && totalRow(t).cells[4].t === DASH);
+});
+test("mixed group: a fully-attributed marketplace keeps its value, but a partial sibling withholds it AND the All Markets total", () => {
+  // DE fully attributed (no unmapped) -> shows its value. FR has unmapped spend -> withheld. The EUR All Markets is
+  // therefore also withheld (it cannot be a complete total while one contributing marketplace is potentially partial).
+  const series = [];
+  for (const d of DATES) {
+    series.push({ c: "DE", cur: "EUR", d, s: 100, u: 1, a: 10 });           // DE: mapped only, complete
+    series.push({ c: "FR", cur: "EUR", d, s: 200, u: 1, a: 30, au: true }); // FR: mapped + unmapped -> partial
+  }
+  const t = dailyRaw(series, [
+    { country: "DE", currency: "EUR", hasSales: true, adsAvailable: true },
+    { country: "FR", currency: "EUR", hasSales: true, adsAvailable: true },
+  ]);
+  ok("DE (fully attributed) still shows its value 30", R(t, "EUR-DE").cells[3].n === 30 && R(t, "EUR-DE").cells[4].t === "10.0%");
+  ok("FR (partial) Ad Spend + TACoS withheld (em dash)", R(t, "EUR-FR").cells[3].t === DASH && R(t, "EUR-FR").cells[4].t === DASH);
+  ok("EUR All Markets withheld because FR is potentially partial", totalRow(t).cells[3].t === DASH && totalRow(t).cells[4].t === DASH);
 });
 test("NO unattributed spend + brand mapped 0 -> a genuine PROVEN 0 (fully attributed)", () => {
   const series = DATES.map((d) => ({ c: "IN", cur: "INR", d, s: 1000, u: 10, a: 0 }));
