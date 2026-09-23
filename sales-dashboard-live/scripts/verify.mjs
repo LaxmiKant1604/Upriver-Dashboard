@@ -124,6 +124,7 @@ const SUITES = [
   "test:ads-reconcile-prodshape",
   "test:fba-reconcile-prodshape",
   "test:fba-durable-source-persist",
+  "test:fba-durable-backstop-integration",
   "test:listing-health-v3-dependency-bundle",
   "test:listings-date-free-request-contract",
   "test:delivery-status",

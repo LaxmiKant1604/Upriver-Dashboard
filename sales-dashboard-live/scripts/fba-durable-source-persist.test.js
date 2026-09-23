@@ -188,10 +188,15 @@ test("I2: the go-live, release, and route all wire persistDurableFbaSnapshots (t
   const rel = readFileSync(new URL("../lib/server/sync/fba-plan-release-composition.js", import.meta.url), "utf8");
   const cli = readFileSync(new URL("./release/fba-plan-golive.mjs", import.meta.url), "utf8");
   const route = readFileSync(new URL("../api/admin/sources.js", import.meta.url), "utf8");
-  ok("advanceFbaPlanBucket accepts + invokes the collaborator AFTER the terminal-cycle proof (before publish)",
+  ok("advanceFbaPlanBucket invokes the collaborator AFTER the publish phase (publish gets the bounded slice first) but before the outcome returns",
     /persistDurableFbaSnapshots = null/.test(op) && /await persistDurableFbaSnapshots\(/.test(op)
     && op.indexOf("base.cycleId = S(cycleId)") < op.indexOf("await persistDurableFbaSnapshots(")
-    && op.indexOf("await persistDurableFbaSnapshots(") < op.indexOf("// ---------------- PUBLISH phase"));
+    && op.indexOf("// ---------------- PUBLISH phase") < op.indexOf("await persistDurableFbaSnapshots(")
+    && op.indexOf("await persistDurableFbaSnapshots(") < op.indexOf("const okReadback = typeof readbackLive"));
+  // The plan-drop repair: reportRequests come from the SEPARATE `plan` arg, NOT the token-cost object (cost.plan
+  // never existed -> the historical silent no-op). Behavioural proof lives in fba-durable-backstop-integration.test.js.
+  ok("the op reads reportRequests from the PLAN arg, never cost.plan (the bug this repair closes)",
+    /Array\.isArray\(plan && plan\.reportRequests\) \? plan\.reportRequests : \[\]/.test(op) && !/cost\.plan\.reportRequests/.test(op));
   ok("the collaborator is NON-FATAL (wrapped) and never gates the fba-plan publish", /WARN durable FBA source persist failed/.test(op));
   ok("the release builds + exposes persistDurableFbaSnapshots (reusing getSourceExportCache + the source-snapshot CAS)",
     /const persistDurableFbaSnapshots = async/.test(rel) && /persistDurableFbaSnapshotsFromPlan\(/.test(rel) && /saveSnapshotPayload: saveSourceSnapshotPayload/.test(rel) && /recordSnapshot: recordSourceSnapshot/.test(rel) && /loadSourceExportCache: \(h\) => readExportCache\(h\)/.test(rel));

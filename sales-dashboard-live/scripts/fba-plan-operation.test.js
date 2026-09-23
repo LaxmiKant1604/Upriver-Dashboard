@@ -172,7 +172,15 @@ test("resolveFbaPlanScope: picks the coverage-max as-of; stale accounts blocked;
 // ---- advanceFbaPlanBucket: the bounded state machine -------------------------------------------------------
 group("fba-plan-operation: bounded, resumable state machine");
 
-const OK_COST = { creates: 2, tokens: 10, plan: { sourceJobs: [{}, {}] } };
+// The REAL token-cost contract: fbaGoLiveTokenCost returns ONLY { creates, tokens, byFamily } -- there is NO `.plan`
+// on the cost object (the historical bug read cost.plan and silently got undefined). The batched plan travels as a
+// SEPARATE `plan` arg; the token gate uses only cost.tokens.
+const OK_COST = { creates: 2, tokens: 10, byFamily: {} };
+// A minimal batched plan double: two source jobs + one per-account inventory report request per included account.
+const planFor = (ids) => ({
+  sourceJobs: [{ requestHash: "BATCH-1" }, { requestHash: "BATCH-2" }],
+  reportRequests: ids.map((accountId) => ({ accountId, owner: { rawSellerId: "s-" + accountId }, sources: [{ requestKey: "fba-plan:inventory-health", requestHash: "BATCH-1" }] })),
+});
 
 test("no bucket accounts -> complete, zero published (nothing to do, never a failure)", async () => {
   const r = await OP.advanceFbaPlanBucket({ bucket: "us", asOf: "2026-08-29", includedIds: [], bucketAccounts: [], runtime: makeRuntime(), publisher: makePublisher(), controls: makeControls(), readbackLive: okReadback });
@@ -322,6 +330,128 @@ test("BLOCKED (stale-OLI) accounts are never published; base.blocked counts them
   assert.equal(r.published, 2);
   assert.equal(r.blocked, 1, "the stale account is counted blocked, never published");
   assert.ok(!publisher.calls.publish.some(([, acc]) => acc === "a3"), "the blocked account is never published");
+});
+
+// ---- durable FBA backstop disposition (the plan-drop repair) ------------------------------------------------
+group("fba-plan-operation: ZERO-EXPORT durable backstop -- driven by the PLAN arg, no silent empty-plan success");
+
+const TERMINAL_US = { preTerminal: { id: "cyc-us-fba", status: "succeeded" } };
+
+test("BACKSTOP: the persist runs from the PLAN arg (never cost.plan) -> non-empty reportRequests, persisted per account", async () => {
+  const runtime = makeRuntime(TERMINAL_US);
+  const seen = [];
+  const persist = async ({ reportRequests, includedIds }) => { seen.push({ reportRequests, includedIds }); return { persisted: includedIds.map((accountId) => ({ accountId })), skipped: [], failed: [] }; };
+  const r = await OP.advanceFbaPlanBucket({
+    bucket: "us", asOf: "2026-08-29", inventoryAsOf: "2026-08-29", includedIds: ["a1", "a2"],
+    bucketAccounts: [{ accountId: "a1", country: "US" }, { accountId: "a2", country: "US" }],
+    plan: planFor(["a1", "a2"]), cost: OK_COST, maxTokens: 80,
+    runtime, publisher: makePublisher(), controls: makeControls(), readbackLive: okReadback, persistDurableFbaSnapshots: persist,
+  });
+  assert.equal(r.phase, "complete");
+  assert.ok(r.durableFba && r.durableFba.ok === true, "backstop ok");
+  assert.equal(r.durableFba.persisted, 2);
+  assert.equal(r.durableFba.expected, 2);
+  assert.equal(seen.length, 1, "persist invoked once");
+  assert.equal(seen[0].reportRequests.length, 2, "the persist received the PLAN's reportRequests (NON-empty -- the bug is gone)");
+});
+
+test("BACKSTOP: no plan + included accounts -> TYPED observable failure (never a silent persisted 0); publish still completes, LKG untouched", async () => {
+  const runtime = makeRuntime(TERMINAL_US);
+  let called = 0;
+  const persist = async () => { called += 1; return { persisted: [], skipped: [], failed: [] }; };
+  const r = await OP.advanceFbaPlanBucket({
+    bucket: "us", asOf: "2026-08-29", inventoryAsOf: "2026-08-29", includedIds: ["a1"],
+    bucketAccounts: [{ accountId: "a1", country: "US" }],
+    // NO plan arg == the historical bug (plan dropped). The persist MUST NOT be silently called with an empty plan.
+    cost: OK_COST, maxTokens: 80,
+    runtime, publisher: makePublisher(), controls: makeControls(), readbackLive: okReadback, persistDurableFbaSnapshots: persist,
+  });
+  assert.equal(r.phase, "complete", "fba-plan publication still proceeds (backstop is non-fatal)");
+  assert.equal(r.ok, true);
+  assert.equal(r.published, 1, "publication/LKG untouched");
+  assert.ok(r.durableFba && r.durableFba.ok === false, "backstop is NOT ok (never a silent success)");
+  assert.equal(r.durableFba.reason, "plan-missing");
+  assert.equal(r.durableFba.expected, 1);
+  assert.equal(called, 0, "the persist is NEVER invoked with an empty plan (no silent 0)");
+});
+
+test("BACKSTOP: a source-cache-miss is reported as needs-next-cycle (backstop not ok; publication completes)", async () => {
+  const runtime = makeRuntime({ preTerminal: { id: "cyc-non-us-fba", status: "succeeded" } });
+  const persist = async ({ includedIds }) => ({ persisted: [], skipped: includedIds.map((accountId) => ({ accountId, reason: "source-cache-miss" })), failed: [] });
+  const r = await OP.advanceFbaPlanBucket({
+    bucket: "non-us", asOf: "2026-08-29", inventoryAsOf: "2026-08-29", includedIds: ["a1"],
+    bucketAccounts: [{ accountId: "a1", country: "DE" }], plan: planFor(["a1"]), cost: OK_COST, maxTokens: 80,
+    runtime, publisher: makePublisher(), controls: makeControls(), readbackLive: okReadback, persistDurableFbaSnapshots: persist,
+  });
+  assert.equal(r.phase, "complete");
+  assert.ok(r.durableFba.ok === false && r.durableFba.reason === "incomplete-evidence");
+  assert.deepEqual(r.durableFba.needsNextCycle, ["a1"]);
+});
+
+test("BACKSTOP: zero included accounts -> expected 0, ok true (never a false failure)", async () => {
+  const runtime = makeRuntime(TERMINAL_US);
+  const persist = async () => ({ persisted: [], skipped: [], failed: [] });
+  const r = await OP.advanceFbaPlanBucket({
+    bucket: "us", asOf: "2026-08-29", inventoryAsOf: "2026-08-29", includedIds: [],
+    bucketAccounts: [{ accountId: "a1", country: "US" }], plan: planFor([]), cost: OK_COST, maxTokens: 80,
+    runtime, publisher: makePublisher(), controls: makeControls(), readbackLive: okReadback, persistDurableFbaSnapshots: persist,
+  });
+  assert.ok(r.durableFba && r.durableFba.ok === true && r.durableFba.expected === 0, "no included accounts -> backstop ok with expected 0");
+});
+
+test("BACKSTOP: a per-account persist failure is isolated + typed (publication still completes)", async () => {
+  const runtime = makeRuntime(TERMINAL_US);
+  const persist = async ({ includedIds }) => ({ persisted: includedIds.filter((id) => id !== "a2").map((accountId) => ({ accountId })), skipped: [], failed: includedIds.filter((id) => id === "a2").map((accountId) => ({ accountId, reason: "fba-rows-invalid:FBA_CROSS_MARKETPLACE" })) });
+  const r = await OP.advanceFbaPlanBucket({
+    bucket: "us", asOf: "2026-08-29", inventoryAsOf: "2026-08-29", includedIds: ["a1", "a2"],
+    bucketAccounts: [{ accountId: "a1", country: "US" }, { accountId: "a2", country: "US" }], plan: planFor(["a1", "a2"]), cost: OK_COST, maxTokens: 80,
+    runtime, publisher: makePublisher(), controls: makeControls(), readbackLive: okReadback, persistDurableFbaSnapshots: persist,
+  });
+  assert.equal(r.phase, "complete");
+  assert.equal(r.published, 2, "publication unaffected by the backstop failure");
+  assert.ok(r.durableFba.ok === false && r.durableFba.reason === "persist-failed");
+  assert.equal(r.durableFba.persisted, 1);
+  assert.equal(r.durableFba.failed.length, 1);
+});
+
+test("BACKSTOP: a collaborator throw is non-fatal + typed (publication still completes)", async () => {
+  const runtime = makeRuntime(TERMINAL_US);
+  const persist = async () => { throw new Error("kaboom"); };
+  const r = await OP.advanceFbaPlanBucket({
+    bucket: "us", asOf: "2026-08-29", inventoryAsOf: "2026-08-29", includedIds: ["a1"],
+    bucketAccounts: [{ accountId: "a1", country: "US" }], plan: planFor(["a1"]), cost: OK_COST, maxTokens: 80,
+    runtime, publisher: makePublisher(), controls: makeControls(), readbackLive: okReadback, persistDurableFbaSnapshots: persist,
+  });
+  assert.equal(r.phase, "complete");
+  assert.ok(r.durableFba.ok === false && /collaborator-threw/.test(r.durableFba.reason));
+});
+
+test("base.batches reflects the PLAN's source jobs (not the token cost)", async () => {
+  const runtime = makeRuntime(TERMINAL_US);
+  const r = await OP.advanceFbaPlanBucket({
+    bucket: "us", asOf: "2026-08-29", inventoryAsOf: "2026-08-29", includedIds: ["a1"],
+    bucketAccounts: [{ accountId: "a1", country: "US" }], plan: planFor(["a1"]), cost: OK_COST, maxTokens: 80,
+    runtime, publisher: makePublisher(), controls: makeControls(), readbackLive: okReadback,
+  });
+  assert.equal(r.batches, 2, "two source jobs from the plan");
+});
+
+test("STARVATION FIX: the persist runs LAST -- publish (the live path) gets the bounded slice first, so a large-bucket manual route can never livelock", async () => {
+  const runtime = makeRuntime(TERMINAL_US);
+  const order = [];
+  const publisher = {
+    preflight: async () => ({}),
+    publish: async (rk, acc) => { order.push("publish:" + acc); return { disposition: "published", reportKey: rk, accountId: acc, liveReportKey: "fba-plan", paramsHash: "ph-" + acc }; },
+  };
+  const persist = async ({ includedIds }) => { order.push("persist"); return { persisted: includedIds.map((accountId) => ({ accountId })), skipped: [], failed: [] }; };
+  const r = await OP.advanceFbaPlanBucket({
+    bucket: "us", asOf: "2026-08-29", inventoryAsOf: "2026-08-29", includedIds: ["a1", "a2"],
+    bucketAccounts: [{ accountId: "a1", country: "US" }, { accountId: "a2", country: "US" }], plan: planFor(["a1", "a2"]), cost: OK_COST, maxTokens: 80,
+    runtime, publisher, controls: makeControls(), readbackLive: okReadback, persistDurableFbaSnapshots: persist,
+  });
+  assert.equal(r.phase, "complete");
+  assert.equal(order.filter((o) => o.startsWith("publish:")).length, 2, "both accounts published");
+  assert.equal(order[order.length - 1], "persist", "the persist runs AFTER every publish (never before) -- publish can never be starved by the sequential backstop");
 });
 
 // ---- release composition ------------------------------------------------------------------------------------

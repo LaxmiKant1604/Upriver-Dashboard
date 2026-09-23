@@ -204,6 +204,9 @@ if (accountScope === "bootstrap") {
 let anyPublished = 0; let anyFailure = false; let anyIncomplete = false;
 // Per-bucket published/expected/failed breakdown for the honest completeness report (never a green "complete").
 const bucketCompleteness = []; // [{ bucket, published, expected, failed }]
+// Per-bucket ZERO-EXPORT durable FBA backstop disposition (persisted/expected + typed reasons) -- OBSERVABLE, never
+// silent. A not-ok backstop is surfaced but does NOT fail the go-live (the fba-plan publication + LKG are untouched).
+const durableBackstop = []; // [{ bucket, attempted, expected, persisted, skipped, failed, needsNextCycle, ok, reason }]
 // Per-wave fba-plan publication identities (blocker 2): the EXACT live identity + the ACTUAL durable cycle id
 // + operation identity this operation produced. There is NO "source-incapable" evidence (blocker 3): an
 // empty-inventory account still PUBLISHES (inventoryAvailable:false) and earns a manifest identity here.
@@ -211,7 +214,7 @@ const waveFbaPublished = []; // [{ accountId, liveReportKey, paramsHash, cycleId
 try {
   for (const bucket of selectedScopes) {
     if (!bucketPlan.has(bucket)) continue;
-    const { bucketAccounts, cost, scope, overflowSellers } = bucketPlan.get(bucket);
+    const { bucketAccounts, plan, cost, scope, overflowSellers } = bucketPlan.get(bucket);
     const asOf = scope.asOf;
     if (!bucketAccounts.length) { log(bucket + ": no accounts in this bucket -- skipping."); continue; }
     const includedIds = scope.included.filter((id) => bucketAccounts.some((a) => a.accountId === id));
@@ -221,12 +224,14 @@ try {
     // idempotent + resumable, bounded by a generous cap.
     for (let pass = 1; pass <= 80; pass += 1) {
       result = await advanceFbaPlanBucket({
-        bucket, asOf, inventoryAsOf, includedIds, bucketAccounts, cost, maxTokens,
+        bucket, asOf, inventoryAsOf, includedIds, bucketAccounts, plan, cost, maxTokens,
         runtime: release.runtime, publisher: release.publisher, controls: release.controls,
         readbackLive: release.readbackLive, ownershipBackfill: release.ownershipBackfill,
         verifyLease: release.verifyLease,
         // ZERO-EXPORT durable FBA source persist: land source_snapshots(fba-inventory-health) from the just-fetched
-        // cache so the zero-export FBA reconciler can converge (the fba-plan derive alone never wrote it).
+        // cache so the zero-export FBA reconciler can converge (the fba-plan derive alone never wrote it). The `plan`
+        // above carries the per-account inventory request identities the persist reuses -- without it the backstop
+        // silently persists nothing (the bug this repair closes).
         persistDurableFbaSnapshots: release.persistDurableFbaSnapshots,
         trigger: "github", deadlineMs: Infinity, reserveMs: 0, outOfTime: () => false,
         overflowSellers,
@@ -245,6 +250,15 @@ try {
     const bucketPublished = Number(result && result.published) || 0;
     const bucketFailed = result && Array.isArray(result.failedAccounts) ? result.failedAccounts : [];
     bucketCompleteness.push({ bucket, published: bucketPublished, expected: includedIds.length, failed: bucketFailed });
+    // ZERO-EXPORT durable FBA backstop disposition (OBSERVABLE, never silent): persisted/expected + skipped/failed/
+    // need-next-cycle reasons. A not-ok backstop does NOT fail the go-live (the fba-plan publication + LKG stand), but
+    // it is surfaced loudly so a UNRESOLVED backstop is never mistaken for a converged one.
+    const df = result && result.durableFba ? result.durableFba : null;
+    if (df) {
+      durableBackstop.push({ bucket, ...df });
+      if (!df.ok) console.error("WARNING " + bucket + " durable FBA backstop UNRESOLVED: persisted " + df.persisted + "/" + df.expected + " (reason=" + (df.reason || "unknown") + (df.needsNextCycle && df.needsNextCycle.length ? "; need-next-cycle=" + df.needsNextCycle.length : "") + "). The zero-export reconciler cannot fully converge until this is resolved.");
+      else log(bucket + " durable FBA backstop OK: persisted " + df.persisted + "/" + df.expected + " durable source_snapshots(fba-inventory-health).");
+    }
     if (result && result.phase === "complete" && result.ok === true && result.complete === true) {
       anyPublished += bucketPublished;
       for (const pi of (Array.isArray(result.publishedIdentities) ? result.publishedIdentities : [])) {
@@ -302,8 +316,17 @@ if (accountScope === "bootstrap" && !anyFailure && waveFbaPublished.length) {
 // Emitted as an EXPLICIT durable signal + step summary -- downstream must read this, never the green job status.
 const fbaComplete = !anyFailure && !anyIncomplete;
 const completenessSummary = bucketCompleteness.map((b) => b.bucket + " " + b.published + "/" + b.expected + (b.failed.length ? " (failed " + b.failed.length + ")" : "")).join("; ");
+// ZERO-EXPORT durable FBA backstop: the honest aggregate (persisted/expected across buckets + whether every bucket's
+// backstop converged). Emitted as an EXPLICIT durable signal -- a green FBA job is NEVER backstop-convergence proof.
+const backstopExpected = durableBackstop.reduce((n, b) => n + (Number(b.expected) || 0), 0);
+const backstopPersisted = durableBackstop.reduce((n, b) => n + (Number(b.persisted) || 0), 0);
+const backstopOk = durableBackstop.length > 0 && durableBackstop.every((b) => b.ok === true);
+const backstopSummary = durableBackstop.map((b) => b.bucket + " " + b.persisted + "/" + b.expected + (b.ok ? "" : " (UNRESOLVED:" + (b.reason || "?") + (b.needsNextCycle && b.needsNextCycle.length ? ",need-next-cycle=" + b.needsNextCycle.length : "") + ")")).join("; ");
 if (mode === "go-live") {
   ghOut("fba_complete", fbaComplete ? "true" : "false");
+  ghOut("fba_durable_backstop_ok", backstopOk ? "true" : "false");
+  ghOut("fba_durable_backstop", backstopPersisted + "/" + backstopExpected);
+  ghSum("### FBA durable backstop (zero export)\n- **fba_durable_backstop_ok=" + backstopOk + "** -- persisted " + backstopPersisted + "/" + backstopExpected + " durable source_snapshots(fba-inventory-health): " + (backstopSummary || "(no buckets)") + "\n- The durable source is what the zero-export FBA reconciler reads; an UNRESOLVED backstop means the reconciler cannot fully converge from saved data.");
   // Emit a BOOLEAN string ("true"/"false"), not the numeric count -- the listing-health-v3 job gate is
   // `needs.fba.outputs.fba_published == 'true'` (a GitHub Actions STRING compare), so a count like "8" would never
   // equal "true" and would silently skip v3 on every region. true = at least one account published (partial OR

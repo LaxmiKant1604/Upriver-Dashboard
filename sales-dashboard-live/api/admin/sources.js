@@ -15,7 +15,7 @@ import { shapeSourceCards, dashboardReadinessSummary, CARD_BUCKETS } from "../..
 import { sourceRegistryEntry } from "../../lib/server/sync/source-registry.js";
 import { buildBucketSourceSyncRuntime } from "../../lib/server/sync/source-bucket-sync-runtime.js";
 import { validateSourceSyncRequest, runReleaseSlice, ORCHESTRATED_SOURCE_KEYS } from "../../lib/server/sync/source-sync-operation.js";
-import { isFbaOperationSource, resolveFbaPlanScope, planFbaBucketCost, fbaBucketAccounts, advanceFbaPlanBucket, fbaServerCeiling, fbaCycleBucket, fbaInventoryAsOf } from "../../lib/server/sync/fba-plan-operation.js";
+import { isFbaOperationSource, resolveFbaPlanScope, planFbaBucketCost, buildFbaBucketPlan, fbaBucketAccounts, advanceFbaPlanBucket, fbaServerCeiling, fbaCycleBucket, fbaInventoryAsOf } from "../../lib/server/sync/fba-plan-operation.js";
 // The ONE ASIN->Campaign cutover authority: reject a forged action on the retired ads grain at the API BOUNDARY,
 // after auth + source-key parse, BEFORE any runtime / preflight / coverage / discovery / control-or-audit write.
 import { isAdsRegistryKeyRetired } from "../../lib/server/active-ads-source.js";
@@ -225,20 +225,29 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
           if (!scope.asOf) { res.status(200).json({ operation: { phase: "sync", ok: false, problems: ["no account has durable OLI coverage; cannot resolve an as-of"] }, status: await boundedStatusFn(fbaDeadline) }); return; }
           if (!bucketAccounts.length) { res.status(200).json({ operation: { phase: "complete", ok: true, published: 0, note: "no-bucket-accounts" }, status: await boundedStatusFn(fbaDeadline) }); return; }
           // Skip the FETCH-only cost plan when the dedicated cycle is already terminal: a publish-only pass has
-          // nothing to fetch (no token gate needed), and the plan/adopt reads would only slow the bounded slice.
+          // nothing to fetch (no token gate needed). But the batched PLAN (per-account inventory request identities)
+          // is ALWAYS required -- the durable-source persist runs on the terminal/publish pass, so we rebuild the plan
+          // deterministically (ZERO export, pure) even when the token cost is intentionally null. The route uses
+          // default batching (no overflow) for BOTH its fetch and this plan, so the plan's request identities match
+          // what this route fetched; the scheduled go-live remains authoritative for any overflow-split seller.
           const existingCycle = await release.runtime.store.getCycleByBucketDate(fbaCycleBucket(bucket), inventoryAsOf).catch(() => null);
           const terminal = existingCycle && ["succeeded", "partial", "failed"].includes(String(existingCycle.status));
-          const cost = terminal ? null : (await planFbaBucketCost({ bucketAccounts, connections: release.connections, asOf: scope.asOf, inventoryAsOf, getSourceExportCache: release.getSourceExportCache })).cost;
+          const planned = terminal ? null : await planFbaBucketCost({ bucketAccounts, connections: release.connections, asOf: scope.asOf, inventoryAsOf, getSourceExportCache: release.getSourceExportCache });
+          const plan = terminal
+            ? buildFbaBucketPlan({ bucketAccounts, connections: release.connections, asOf: scope.asOf, inventoryAsOf })
+            : planned.plan;
+          const cost = terminal ? null : planned.cost;
           const includedIds = scope.included.filter((id) => bucketAccounts.some((a) => a.accountId === id));
           const maxTokens = bucket === "us" ? 30 : 70; // per-bucket share of the 80-token daily ceiling (scheduler parity)
 
           const result = await advanceFbaPlanBucket({
-            bucket, asOf: scope.asOf, inventoryAsOf, includedIds, bucketAccounts, cost, maxTokens,
+            bucket, asOf: scope.asOf, inventoryAsOf, includedIds, bucketAccounts, plan, cost, maxTokens,
             runtime: release.runtime, publisher: release.publisher, controls: release.controls,
             readbackLive: release.readbackLive, ownershipBackfill: release.ownershipBackfill,
             verifyLease: release.verifyLease,
             // ZERO-EXPORT durable FBA source persist (backstop enabler): lands source_snapshots(fba-inventory-health)
-            // from the just-fetched cache when a manual sync drains in one slice (the scheduled go-live is authoritative).
+            // from the just-fetched cache. The `plan` above carries the per-account inventory request identities it
+            // reuses -- required on the terminal/publish pass too (the scheduled go-live is authoritative overall).
             persistDurableFbaSnapshots: release.persistDurableFbaSnapshots,
             trigger: "vercel", deadlineMs: fbaDeadline.deadlineMs, reserveMs: fbaDeadline.reserveMs, outOfTime: fbaDeadline.outOfTime,
           });
@@ -253,7 +262,12 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
             : result.continuationRequired === true
               ? { phase: result.phase, continuationRequired: true, published: result.published, accounts: result.accounts, batches: result.batches, creates: result.creates, tokens: result.tokens }
               : { phase: result.phase, ok: false, problems: result.problems || ["typed failure"], published: result.published };
-          res.status(200).json({ operation, result: { fbaPlan: { operationId: result.operationId, asOf: scope.asOf, includedAccounts: includedIds.length, blockedAccounts: result.blocked } }, status: await boundedStatusFn(fbaDeadline) });
+          // Surface the ZERO-EXPORT durable backstop disposition (OBSERVABLE, never silent) alongside the fba-plan
+          // operation result -- a not-ok backstop does NOT fail the sync (publication + LKG stand) but is reported.
+          const durableFba = result.durableFba
+            ? { ok: result.durableFba.ok === true, expected: result.durableFba.expected, persisted: result.durableFba.persisted, reason: result.durableFba.reason || null, needsNextCycle: (result.durableFba.needsNextCycle || []).length }
+            : null;
+          res.status(200).json({ operation, result: { fbaPlan: { operationId: result.operationId, asOf: scope.asOf, includedAccounts: includedIds.length, blockedAccounts: result.blocked, durableFba } }, status: await boundedStatusFn(fbaDeadline) });
           return;
         } catch (error) {
           // Safety net: the core ALWAYS safe-closes in its own finally, but a throw before/around a pass could
