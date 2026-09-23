@@ -104,10 +104,19 @@ test("SEAM: report-derivation blocks US on missing AWD but is best-effort for Eu
   assert.ok(/if \(awdRequired\) throw/.test(src), "only awdRequired (US) throws/blocks on a bad AWD source");
   assert.ok(/awdCapableMarketplace\(context\.marketCountry\)/.test(src), "AWD eligibility is the shared capability rule");
 });
-test("SEAM: the AWD source contract now admits US + EU5 (never Australia)", () => {
+test("SEAM: the AWD contract is the shared canonical Listings (no marketplace restriction); AWD eligibility (never AU) is enforced in the DERIVE", () => {
   const src = readFileSync(join(root, "lib/server/sync/report-source-contracts.js"), "utf8");
-  assert.ok(/marketplaceCountries: \[\.\.\.AWD_CONTRACT_COUNTRIES\]/.test(src), "AWD contract uses the shared capability list");
-  assert.ok(!AWD_CONTRACT_COUNTRIES.includes("AU"), "Australia is NOT in the AWD contract countries");
+  // The former per-marketplace AWD restriction is GONE: fba-plan:awd is now the canonical Listings export fetched for
+  // EVERY marketplace (byte-identical batch family to listing-health-v3:listings, so both consumers share ONE paid
+  // export). AWD ELIGIBILITY (US + EU5, never Australia) is enforced in the DERIVE via awdCapableMarketplace -- a
+  // non-AWD marketplace's Listings rows are still fetched (for v3 + the shared hash) but its AWD stays honestly
+  // unavailable, and the derive never even reads fba-plan:awd for it. AWD_CONTRACT_COUNTRIES is retained here only to
+  // prove it no longer gates the contract.
+  assert.ok(!/marketplaceCountries:\s*\[\.\.\.AWD_CONTRACT_COUNTRIES\]/.test(src), "the AWD contract no longer restricts by marketplaceCountries (it is the shared canonical Listings for all marketplaces)");
+  assert.ok(/LISTINGS_CANONICAL_COLUMNS/.test(src), "the AWD contract requests the canonical union Listings columns (the validated superset of v3 listing_* + AWD fields)");
+  assert.ok(!AWD_CAPABLE_MARKETPLACES.includes("AU"), "Australia is NOT an AWD-capable marketplace (derive never folds AU AWD)");
+  assert.equal(awdCapableMarketplace("AU"), false, "awdCapableMarketplace('AU') is false -> AU AWD stays honestly unavailable even though its Listings are fetched");
+  assert.ok(!AWD_CONTRACT_COUNTRIES.includes("AU"), "Australia is NOT in the AWD capability countries");
 });
 
 console.log(`\nawd-europe: ${passed} assertions passed`);

@@ -53,6 +53,7 @@
   "test:fba-reconcile-prodshape": "node scripts/fba-reconcile-prodshape.test.js",
   "test:fba-durable-source-persist": "node scripts/fba-durable-source-persist.test.js",
   "test:fba-durable-backstop-integration": "node scripts/fba-durable-backstop-integration.test.js",
+  "test:listings-canonical-reuse": "node scripts/listings-canonical-reuse.test.js",
   "test:listing-health-v3-dependency-bundle": "node scripts/listing-health-v3-dependency-bundle.test.js",
   "test:listings-date-free-request-contract": "node scripts/listings-date-free-request-contract.test.js",
   "test:delivery-status": "node scripts/delivery-status.test.js",

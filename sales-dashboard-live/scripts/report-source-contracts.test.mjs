@@ -41,6 +41,10 @@ import { chunkAccountIds, MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT } from "../lib/ser
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DD = readFileSync(join(ROOT, "api", "datadoe.js"), "utf8");
+// The canonical Listings column set (LISTINGS_CANONICAL_COLUMNS) is composed in the sync contract module from
+// LH_V3_LISTING_COLUMNS + LISTINGS_AWD_COLUMNS. Read that source verbatim (same parity discipline as constArray)
+// so the fba-plan:awd union assertion tracks the real constants instead of a hand-copied list.
+const SYNC_CONTRACTS_SRC = readFileSync(join(ROOT, "lib", "server", "sync", "report-source-contracts.js"), "utf8");
 
 let passed = 0;
 function test(name, fn) {
@@ -67,6 +71,21 @@ function constNumber(name) {
   if (!m) throw new Error("const " + name + " (number) not found");
   return Number(m[1]);
 }
+
+/* ---- read a string-array constant out of the sync contract module (report-source-contracts.js).
+   Same parity discipline as constArray, but the source is SYNC_CONTRACTS_SRC. Used to compose
+   LISTINGS_CANONICAL_COLUMNS from its two real building blocks instead of hand-copying the union. ---- */
+function syncArr(name) {
+  const start = SYNC_CONTRACTS_SRC.indexOf("const " + name + " = [");
+  if (start < 0) throw new Error("const " + name + " not found in report-source-contracts.js");
+  const open = SYNC_CONTRACTS_SRC.indexOf("[", start);
+  const close = SYNC_CONTRACTS_SRC.indexOf("];", open);
+  return [...SYNC_CONTRACTS_SRC.slice(open + 1, close).matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+}
+// The canonical Listings column set = the exact UNION the sync module composes:
+//   LISTINGS_CANONICAL_COLUMNS = [...new Set([...LH_V3_LISTING_COLUMNS, ...LISTINGS_AWD_COLUMNS])]
+// Recomputed here from the two real constants (verbatim) so the fba-plan:awd union assertion tracks source.
+const LISTINGS_CANONICAL_COLUMNS = [...new Set([...syncArr("LH_V3_LISTING_COLUMNS"), ...syncArr("LISTINGS_AWD_COLUMNS")])];
 
 /* ---- insight builders: read the real column/aggregation constants out of the
    executable builder files (lib/server/reports/*.js). Same parity discipline as
@@ -467,12 +486,25 @@ test("fba-plan inventory-health / awd match their constants (both now seller-sco
   assert.equal(inv.orderByColumn, "date");
   assert.equal(inv.orderByDirection, "DESC");
   const awd = byKey(fba, "fba-plan:awd");
-  assert.ok(awd.columns.includes("seller_or_vendor_id"), "batchable AWD contract carries the seller split key");
-  assert.deepEqual(awd.columns.filter((c) => c !== "seller_or_vendor_id"), constArray("LISTINGS_AWD_COLUMNS"));
-  assert.equal(awd.limit, constNumber("CATALOG_ROW_LIMIT"));
-  // AWD is offered in the US + the EU5 (GB/UK, DE, FR, IT, ES). US stays in the list (byte-identical); AU + smaller EU
-  // marketplaces are excluded. Both UK and GB are accepted (directory uses UK, Amazon rows use GB).
-  assert.deepEqual([...awd.marketplaceCountries].sort(), ["DE", "ES", "FR", "GB", "IT", "UK", "US"]);
+  // UNIFIED canonical Listings export: fba-plan:awd no longer carries the AWD-only column set. It requests the
+  // validated UNION of the v3 listing fields + the AWD fields (LISTINGS_CANONICAL_COLUMNS), so one paid Listings
+  // export is shared with listing-health-v3:listings. Column set is order-for-order the sync module's union.
+  assert.deepEqual(awd.columns, LISTINGS_CANONICAL_COLUMNS);
+  // It carries the seller split key, the AWD fields, AND the v3 listing_* fields (both consumers' projections).
+  assert.ok(awd.columns.includes("seller_or_vendor_id"), "canonical Listings contract carries the seller split key");
+  for (const c of ["fnsku", "awd_available_distributable_quantity", "awd_total_inbound_quantity"]) {
+    assert.ok(awd.columns.includes(c), "canonical Listings must carry the AWD field " + c);
+  }
+  for (const c of ["listing_status", "listing_price_value", "fba_quantity_available", "listing_fulfillment_channel", "listing_open_date"]) {
+    assert.ok(awd.columns.includes(c), "canonical Listings must carry the v3 listing field " + c);
+  }
+  // Limit is now the 50,000-row provider ceiling (was CATALOG_ROW_LIMIT/10,000) -- byte-identical to
+  // listing-health-v3:listings so both consumers resolve to ONE request_hash.
+  assert.equal(awd.limit, 50000);
+  assert.equal(awd.limit, byKey(REPORT_SOURCE_CONTRACTS["listing-health-v3"], "listing-health-v3:listings").limit);
+  // No per-marketplace AWD gate anymore: the canonical Listings export is planned for EVERY marketplace and AWD
+  // eligibility moves to the DERIVE (awdCapableMarketplace). The contract carries no marketplaceCountries field.
+  assert.equal(awd.marketplaceCountries, undefined, "the shared canonical Listings contract has no marketplaceCountries gate");
   assert.equal(awd.orderByColumn, "child_asin");
 });
 
@@ -494,11 +526,15 @@ test("fba-plan resolves ONLY its owned FBA Health + US AWD sources (OLI/catalog 
   assert.equal(got.length, 2);
 });
 
-/* --- country-driven AWD: US + EU5 capable; AU + others excluded --- */
-test("fba-plan resolves without AWD for a non-AWD marketplace (IN)", () => {
-  const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaBase, marketplaceCountry: "IN" });
-  assert.equal(got.length, 1); // only the owned FBA Health snapshot (OLI/catalog derived; no AWD for a non-AWD marketplace)
-  assert.ok(got.every((r) => r.requestKey !== "fba-plan:awd"));
+/* --- unified canonical Listings: fba-plan:awd is now planned for EVERY marketplace (the former US+EU5 gate is
+   removed); AWD ELIGIBILITY moves to the derive (awdCapableMarketplace), so a non-AWD marketplace still fetches the
+   shared Listings export but its AWD stays honestly unavailable (null) in the derive, never a fabricated zero. --- */
+test("fba-plan resolves the canonical Listings (fba-plan:awd) for a non-AWD marketplace (IN) too", () => {
+  // IN is NOT AWD-capable, yet it still resolves the shared canonical Listings export (for v3's benefit + the shared
+  // hash). The window is therefore REQUIRED for IN now, so fbaBase (no awd window) would throw -- use fbaWithAwd.
+  const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "IN" });
+  assert.equal(got.length, 2); // owned FBA Health snapshot + the shared canonical Listings export (OLI/catalog derived)
+  assert.equal(got.filter((r) => r.requestKey === "fba-plan:awd").length, 1, "IN resolves the shared canonical Listings export");
 });
 test("fba-plan resolves AWD for the AWD-capable European marketplaces (UK/GB, DE, FR, IT, ES)", () => {
   for (const cc of ["UK", "GB", "DE", "FR", "IT", "ES"]) {
@@ -508,10 +544,12 @@ test("fba-plan resolves AWD for the AWD-capable European marketplaces (UK/GB, DE
     assert.equal(awd[0].from, null); assert.equal(awd[0].to, null);
   }
 });
-test("fba-plan EXCLUDES AWD for Australia + Canada + smaller EU marketplaces (never fetched)", () => {
+test("fba-plan resolves the shared canonical Listings for Australia + Canada + smaller EU marketplaces too", () => {
+  // Previously these non-AWD marketplaces were EXCLUDED from the AWD fetch. The unified canonical Listings export is
+  // now planned for ALL of them (AWD eligibility is decided in the derive, not the fetch).
   for (const cc of ["AU", "CA", "NL", "BE", "PL", "IE", "SE", "AT"]) {
-    const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaBase, marketplaceCountry: cc });
-    assert.ok(got.every((r) => r.requestKey !== "fba-plan:awd"), `${cc} is excluded from AWD`);
+    const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: cc });
+    assert.equal(got.filter((r) => r.requestKey === "fba-plan:awd").length, 1, `${cc} resolves the shared canonical Listings export`);
   }
 });
 test("fba-plan resolves AWD as a no-date request for a US account", () => {
@@ -522,11 +560,12 @@ test("fba-plan resolves AWD as a no-date request for a US account", () => {
   assert.equal(awd[0].to, null);
   assert.equal(awd[0].requestMeta.from, null);
 });
-test("fba-plan requires marketplace metadata for its conditional AWD contract", () => {
-  assert.throws(
-    () => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaBase }),
-    /Marketplace country is required/,
-  );
+test("fba-plan no longer requires marketplace metadata to resolve its Listings contract (marketplace-independent)", () => {
+  // The former US+EU5 marketplaceCountries gate on fba-plan:awd is removed, so no fba-plan contract is
+  // country-conditional and marketplaceCountry is no longer required to resolve. It resolves with none supplied.
+  const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd });
+  assert.equal(got.filter((r) => r.requestKey === "fba-plan:awd").length, 1);
+  assert.equal(got.length, 2);
 });
 test("US fba-plan cannot silently omit its AWD request", () => {
   assert.throws(
@@ -534,11 +573,36 @@ test("US fba-plan cannot silently omit its AWD request", () => {
     /Missing windows.*fba-plan:awd/,
   );
 });
-test("non-US fba-plan rejects an accidental AWD request", () => {
-  assert.throws(
-    () => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "IN" }),
-    /does not apply.*IN/,
-  );
+test("non-US fba-plan now ACCEPTS the shared canonical Listings request (no longer a marketplace mismatch)", () => {
+  // Previously a non-US Listings window was rejected as "does not apply"; the unified canonical Listings export is
+  // planned for every marketplace, so IN resolves it as a valid no-date request.
+  const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "IN" });
+  const awd = got.filter((r) => r.requestKey === "fba-plan:awd");
+  assert.equal(awd.length, 1);
+  assert.equal(awd[0].from, null);
+  assert.equal(awd[0].to, null);
+});
+
+test("ONE SHARED EXPORT: fba-plan:awd and listing-health-v3:listings resolve to the SAME request_hash for a batch", () => {
+  // Because columns (LISTINGS_CANONICAL_COLUMNS) + limit (50000) + order + no-date window + source all MATCH, the two
+  // consumers of the DataDoe Listings source resolve to ONE request_hash per <=5-seller batch => ONE paid export (one
+  // owns, the other adopts from source_export_cache). Mirrors scripts/listings-canonical-reuse.test.js.
+  const batch = ["sA", "sB", "sC", "sD", "sE"]; // one <=5-seller batch (the provider ceiling)
+  const NO_DATE = [{ from: null, to: null }];
+  const INV = [{ from: "2025-08-06", to: "2025-08-06" }];
+  const awd = reportSourceRequestHashes({
+    reportKey: "fba-plan", apiKey: "shared-key", ids: batch,
+    windowsByRequestKey: { "fba-plan:inventory-health": INV, "fba-plan:awd": NO_DATE }, marketplaceCountry: "US",
+  }).find((r) => r.requestKey === "fba-plan:awd");
+  const v3 = reportSourceRequestHashes({
+    reportKey: "listing-health-v3", apiKey: "shared-key", ids: batch,
+    windowsByRequestKey: { "listing-health-v3:listings": NO_DATE, "listing-health-v3:listings-raw": NO_DATE, "listing-health-v3:inventory": INV },
+    marketplaceCountry: "US",
+  }).find((r) => r.requestKey === "listing-health-v3:listings");
+  assert.ok(awd && v3, "both consumers resolve a Listings request");
+  assert.equal(awd.sourceId, v3.sourceId, "both request the shared Listings source id");
+  assert.equal(awd.limit, v3.limit, "both request the 50,000-row canonical ceiling");
+  assert.equal(awd.requestHash, v3.requestHash, "identical request_hash => ONE paid Listings export, shared per batch");
 });
 test("empty fba-plan scope returns before country and window validation", () => {
   assert.deepEqual(reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: [] }), []);

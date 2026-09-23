@@ -38,6 +38,7 @@ let slicedOliSourceFromHistory;
 let makeFbaPlanDurableContextLoader, oliCoverageProvesWindow;
 let planFbaPlanBucketBatched, marketplaceCodeFor;
 let resolveGoLiveAsOf, fbaGoLiveTokenCost;
+let awdCapableMarketplace;
 
 const ID = "A1";
 const ASOF = "2025-08-06";
@@ -171,6 +172,16 @@ const INV = [
 // validation -- it can never be silently ignored or summed (see the cross-date test below).
 const INV_WITH_CROSS_DATE_ROW = [...INV, { date: "2025-08-01", child_asin: "ASIN1", sku: "SKU-OLD", available: 999 }];
 const AWD = [{ marketplace_country_code: "US", child_asin: "ASIN1", sku: "SKU-1", awd_available_distributable_quantity: 42, awd_total_inbound_quantity: 15 }];
+// The SAME AWD row as it arrives on the UNIFIED canonical "Listings" export (LISTINGS_CANONICAL_COLUMNS = the union of
+// the v3 listing_* columns + the AWD columns). It ADDITIONALLY carries listing_name/listing_status/listing_price_value/
+// fba_quantity_available/fnsku (the v3 half of the union). The AWD fold reads awd_* (+ marketplace/child_asin/sku) BY
+// NAME, so these extra columns are inert and the projected awdAvailable/awdInbound must equal the AWD-only row's.
+const AWD_UNION = [{
+  marketplace_country_code: "US", child_asin: "ASIN1", sku: "SKU-1",
+  listing_name: "Widget Listing", listing_status: "Active", listing_price_value: 19.99, listing_price_currency: "USD",
+  listing_current_quantity: 7, fba_quantity_available: 100, listing_fulfillment_channel: "AMAZON", listing_open_date: "2024-01-01", fnsku: "X00WIDGET",
+  awd_available_distributable_quantity: 42, awd_total_inbound_quantity: 15,
+}];
 
 // Hand-computed expected payload, transcribed from the api/datadoe.js `fba-plan` handler formula.
 const EXPECTED = {
@@ -360,12 +371,16 @@ test("fba-plan: inventoryByBrandCountry folds per (marketplace, brand)", () => {
 
 group("fba-plan: AWD is US-only and never silently zero");
 
-test("fba-plan: non-US account plans + reads NO AWD; awdAvailable false, per-row awdAvailable null", () => {
+test("fba-plan: a non-AWD marketplace (CA) derive reads NO AWD; awdEligible false, awdAvailable false, per-row awdAvailable null", () => {
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, includeAwd: false });
   const p = deriveFba(planned, rows, usContext({ marketCountry: "CA", isUS: false })).payload;
   assert.equal(p.isUS, false);
+  // AWD eligibility is decided in the DERIVE via awdCapableMarketplace(marketCountry): CA is not AWD-capable, so the
+  // derive is NOT eligible and every AWD value is honestly unavailable (null), never a fabricated 0.
+  assert.equal(awdCapableMarketplace("CA"), false, "CA is not AWD-capable (the derive gate, not the fetch)");
+  assert.equal(p.awdEligible, false, "the derive marks a non-AWD marketplace ineligible");
   assert.equal(p.awdAvailable, false);
-  assert.ok(p.rows.every((r) => r.awdAvailable === null), "non-US rows carry awdAvailable null");
+  assert.ok(p.rows.every((r) => r.awdAvailable === null), "non-AWD rows carry awdAvailable null (never a fabricated 0)");
 });
 
 test("fba-plan: a US account with a MISSING AWD source blocks (never a silent zero)", () => {
@@ -387,6 +402,23 @@ test("fba-plan: a VALIDATED EMPTY AWD source is NOT a failure (no AWD rows -> ge
   const p = deriveFba(planned, rows, usContext()).payload;
   assert.equal(p.awdAvailable, false, "empty AWD => availability false");
   assert.equal(p.rows[0].awdAvailable, 0, "US row AWD is a genuine 0, not null");
+});
+
+test("fba-plan: AWD projects BYTE-IDENTICALLY from a UNION-column canonical Listings row (extra listing_* columns ignored)", () => {
+  // Since fba-plan:awd is now the UNIFIED canonical "Listings" export (its rows carry the v3 listing_* fields AND the
+  // AWD fields in one union payload -- shared byte-for-byte with listing-health-v3:listings), the AWD derive must
+  // project the SAME awdAvailable/awdInbound from a union-column row as it did from the old AWD-only row: the fold reads
+  // awd_* by NAME and ignores the extra columns. Same US fixture, only the AWD row shape differs (AWD -> AWD_UNION).
+  const only = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const union = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD_UNION });
+  const onlyRes = deriveFba(only.planned, only.rows);
+  const unionRes = deriveFba(union.planned, union.rows);
+  assert.equal(unionRes.status, "derived");
+  const a1 = unionRes.payload.rows.find((r) => r.asin === "ASIN1");
+  assert.equal(a1.awdAvailable, 42, "awd_available_distributable_quantity read by name from the union-column row");
+  assert.equal(a1.awdInbound, 15, "awd_total_inbound_quantity read by name from the union-column row");
+  assert.deepEqual(unionRes.payload, onlyRes.payload, "the union-column Listings row derives the byte-identical AWD-only payload (extra columns inert)");
+  assert.deepEqual(unionRes.payload, EXPECTED, "and still equals the hand-computed route payload");
 });
 
 /* ============================= inventory availability semantics ============================= */
@@ -545,11 +577,15 @@ test("planFbaPlan: US account emits ONLY the owned FBA Health + AWD sources (OLI
   assert.deepEqual(req.sources.map((s) => s.requestHash), b, "identical inputs -> identical hashes");
 });
 
-test("planFbaPlan: a non-US account plans NO AWD source and marks isUS false", () => {
+test("planFbaPlan: a non-US account STILL plans the canonical Listings (fba-plan:awd); AWD eligibility is a DERIVE gate; isUS false", () => {
   const req = planFbaPlan({ accountId: ID, name: "Acme", country: "CA", currency: "CAD", connections: PL_CONN, asOf: ASOF });
-  assert.ok(!req.sources.some((s) => s.requestKey === "fba-plan:awd"), "no AWD source for non-US");
+  // The canonical Listings export (fba-plan:awd) is now planned for EVERY marketplace -- byte-identical to
+  // listing-health-v3:listings so the two consumers share ONE paid Listings export. The former US-only fetch gate is
+  // gone; AWD ELIGIBILITY is decided in the DERIVE (awdCapableMarketplace), never in the planner.
+  assert.ok(req.sources.some((s) => s.requestKey === "fba-plan:awd"), "the shared canonical Listings source IS planned for a non-US account");
   assert.equal(req.context.isUS, false);
   assert.equal(req.context.marketCountry, "CA");
+  assert.equal(awdCapableMarketplace("CA"), false, "CA is not AWD-eligible: its AWD stays honestly unavailable in the derive, never a fabricated 0");
 });
 
 test("planFbaPlan: organizations never share a request hash", () => {
@@ -929,17 +965,20 @@ const bAccounts = [
 ];
 const bAsOfFor = () => ASOF;
 
-test("planFbaPlanBucketBatched: single-marketplace <=5 batches, per-account owner metadata, US-only AWD", () => {
+test("planFbaPlanBucketBatched: single-marketplace <=5 batches, per-account owner metadata, all-marketplace canonical Listings", () => {
   const reqs = planFbaPlanBucketBatched({ accounts: bAccounts, connections: PL_CONN, asOfFor: bAsOfFor });
   assert.equal(reqs.length, 3, "one report request per account");
   // US1+US2 share ONE FBA batch hash; IN1 is a SEPARATE marketplace batch (never mixed with US).
   const invHash = (id) => reqs.find((r) => r.accountId === id).sources.find((s) => s.requestKey === "fba-plan:inventory-health").requestHash;
   assert.equal(invHash("US1"), invHash("US2"), "US1 + US2 share ONE batched FBA export (<=5, same marketplace)");
   assert.notEqual(invHash("US1"), invHash("IN1"), "IN never batches with US (marketplace-safe)");
-  // AWD is US-only: US accounts carry it, IN does not.
+  // The canonical Listings (fba-plan:awd) is now planned for EVERY marketplace (shared byte-for-byte with
+  // listing-health-v3:listings): US AND IN carry it. AWD ELIGIBILITY is decided in the DERIVE (awdCapableMarketplace),
+  // so IN fetches the shared Listings snapshot but its AWD stays honestly unavailable -- never a fabricated zero.
   const awd = (id) => reqs.find((r) => r.accountId === id).sources.some((s) => s.requestKey === "fba-plan:awd");
-  assert.ok(awd("US1") && awd("US2"), "US accounts carry the AWD source");
-  assert.ok(!awd("IN1"), "IN (non-US) carries NO AWD source");
+  assert.ok(awd("US1") && awd("US2"), "US accounts carry the canonical Listings source");
+  assert.ok(awd("IN1"), "IN (non-AWD) STILL carries the shared canonical Listings source (former US-only fetch gate removed)");
+  assert.equal(awdCapableMarketplace("IN"), false, "IN is NOT AWD-eligible: its AWD is decided unavailable in the derive");
   // Every request carries COMPLETE, per-account owner metadata (never the batch scope).
   for (const r of reqs) {
     for (const f of ["accountId", "rawSellerId", "connectionId", "organizationFingerprint", "accountScopeHash"]) {
@@ -975,11 +1014,16 @@ test("planFbaPlanBucketBatched: UK accounts batch under the GB marketplace (neve
   const awdHashes = new Set(reqs.map((r) => r.sources.find((s) => s.requestKey === "fba-plan:awd").requestHash));
   assert.equal(awdHashes.size, 1, "UK accounts share ONE batched AWD export under GB");
 });
-test("planFbaPlanBucketBatched: an Australia account is NEVER planned for AWD (excluded from the Europe expansion)", () => {
+test("planFbaPlanBucketBatched: an Australia account STILL plans the canonical Listings but is NEVER AWD-eligible (derive keeps AWD unavailable)", () => {
   const au = [{ accountId: "AU1", name: "a1", country: "AU", currency: "AUD" }];
   const reqs = planFbaPlanBucketBatched({ accounts: au, connections: PL_CONN, asOfFor: bAsOfFor });
   assert.ok(reqs.length >= 1);
-  assert.ok(reqs.every((r) => !r.sources.some((s) => s.requestKey === "fba-plan:awd")), "Australia is excluded from AWD");
+  // The canonical Listings (fba-plan:awd) is now planned for EVERY marketplace (shared with v3), AU included -- the
+  // former AWD-capability fetch gate is removed, so AU's Listings rows are fetched for v3 + the shared hash.
+  assert.ok(reqs.every((r) => r.sources.some((s) => s.requestKey === "fba-plan:awd")), "AU plans the shared canonical Listings source");
+  // But AU is EXPLICITLY excluded from AWD eligibility, so the DERIVE renders its AWD honestly unavailable (never a
+  // fabricated zero) -- eligibility is enforced in the derive (awdCapableMarketplace), not the plan.
+  assert.equal(awdCapableMarketplace("AU"), false, "Australia is excluded from AWD eligibility (derive gate)");
 });
 
 test("fba-plan BATCHED derive ISOLATES each account's rows from a shared <=5-seller FBA/AWD export (no cross-account leak)", async () => {
@@ -1081,6 +1125,40 @@ test("fbaGoLiveTokenCost: 16 batched exports = 80 premium tokens; adoptable jobs
   assert.equal(partial.byFamily["fba-inventory-health"].adoptable, 4);
 });
 
+/* ===== SHARED CANONICAL LISTINGS: a truncation/failure is PER-ACCOUNT isolated ===== */
+// The permanent fix makes fba-plan:awd the ONE canonical Listings export for EVERY marketplace (shared byte-identically
+// with listing-health-v3:listings). Because a <=5-seller batch now co-owns US (AWD hard-required) with same-region
+// non-AWD sellers (CA/AU), we PROVE the reviewed concern is contained: a truncated/failed shared Listings blocks ONLY
+// the hard-required account (LKG preserved, never a fabricated zero); a non-AWD co-member of the SAME batch is wholly
+// unaffected because the derive reads fba-plan:awd only inside `if (awdEligible)`. So one account's Listings truncation
+// can never block another, and the 50000-row cap is fail-closed (a cap-sized Listings is TRUNCATED, never "complete").
+group("fba-plan: shared canonical Listings truncation is per-account isolated");
+
+test("a TRUNCATED shared canonical Listings BLOCKS a US (AWD-required) account -> last-known-good preserved (never a fabricated zero)", () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const awdHash = planned.find((p) => p.requestKey === "fba-plan:awd").requestHash;
+  // The shared Listings export came back at exactly the 50000-row cap -> strict TRUNCATED -> the source is unavailable.
+  // A missing/failed/truncated US AWD is a terminal integrity block (status "invalid") that preserves last-known-good
+  // (report-worker.js writes no snapshot on "invalid") -- byte-identical to the MISSING/FAILED US-AWD tests above.
+  const res = deriveFba(planned, rows, usContext(), { [awdHash]: "truncated" });
+  assert.equal(res.status, "invalid", "US requires a validated AWD source; a truncated shared Listings blocks (LKG kept, never a fabricated zero)");
+});
+
+test("the SAME truncated shared canonical Listings is INERT for a NON-AWD (CA) co-member -> one account's Listings truncation never blocks another", () => {
+  // CA shares the batch + the request_hash (it co-owns the very export that truncated) but its marketplace is NOT
+  // AWD-capable: the derive never reads fba-plan:awd for it, so its outcome must be byte-identical with or without the
+  // truncation. Compare a HEALTHY-AWD CA derive against the truncated-AWD CA derive: identical status AND payload.
+  const caCtx = usContext({ marketCountry: "CA", isUS: false });
+  const healthy = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const truncated = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const awdHashT = truncated.planned.find((p) => p.requestKey === "fba-plan:awd").requestHash;
+  const resHealthy = deriveFba(healthy.planned, healthy.rows, caCtx);
+  const resTruncated = deriveFba(truncated.planned, truncated.rows, caCtx, { [awdHashT]: "truncated" });
+  assert.equal(resTruncated.status, resHealthy.status, "CA's derive status is identical with or without the shared Listings truncation");
+  assert.deepEqual(resTruncated.payload, resHealthy.payload, "and CA's payload is byte-identical -> a co-member's Listings truncation cannot leak into a non-AWD account");
+  assert.equal(resTruncated.payload && resTruncated.payload.awdEligible, false, "CA is not AWD-eligible (its AWD stays honestly unavailable, never a fabricated zero)");
+});
+
 /* ============================= run ============================= */
 
 async function main() {
@@ -1093,6 +1171,7 @@ async function main() {
   ({ slicedOliSourceFromHistory } = await import("../lib/server/sync/durable-dashboards.js"));
   ({ makeFbaPlanDurableContextLoader, oliCoverageProvesWindow } = await import("../lib/server/sync/fba-plan-durable-loader.js"));
   ({ resolveGoLiveAsOf, fbaGoLiveTokenCost } = await import("../lib/server/sync/fba-plan-golive-plan.js"));
+  ({ awdCapableMarketplace } = await import("../lib/server/reports/awd-capability.js"));
   mark("modules loaded; running " + tests.filter((t) => !t.marker).length + " tests");
 
   let failures = 0;

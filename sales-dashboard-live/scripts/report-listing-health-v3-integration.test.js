@@ -79,10 +79,16 @@ const distinctHashes = (plan, key) => { const s = new Set(); for (const r of pla
     v3inv.size > 0 && v3inv.size === fbainv.size && [...v3inv].every((h) => fbainv.has(h)));
   ok("C: v3 defines NO owned inventory/catalog export beyond the reused identity (catalog is derived durable)",
     !(REPORT_SOURCE_CONTRACTS["listing-health-v3"] || []).some((c) => c.requestKey === "listing-health-v3:catalog"));
-  // v3's own new hashes are ONLY the two seller-scoped listings/raw keys.
+  // v3:listings now REUSES the fba-plan:awd CANONICAL Listings export (identical hash SET over the same batches),
+  // exactly like v3:inventory reuses fba-plan:inventory-health -- ONE shared paid Listings export instead of two. This
+  // also proves the two planners produce IDENTICAL listings batches (same batch family => same membership => same ids).
+  const v3listings = distinctHashes(v3, "listing-health-v3:listings");
+  const fbaAwd = distinctHashes(fba, "fba-plan:awd");
+  ok("C: v3 listings request_hash SET is IDENTICAL to fba-plan:awd (ONE shared canonical Listings export; identical batches)",
+    v3listings.size > 0 && v3listings.size === fbaAwd.size && [...v3listings].every((h) => fbaAwd.has(h)));
+  // Listings Raw is a DIFFERENT DataDoe source (id 6ea445cd) and stays its OWN export -- it must never collide with FBA.
   const fbaHashes = new Set(fba.flatMap((r) => r.sources.map((s) => s.requestHash)));
-  const v3ListingsRaw = new Set([...distinctHashes(v3, "listing-health-v3:listings"), ...distinctHashes(v3, "listing-health-v3:listings-raw")]);
-  ok("C: v3's genuinely-new hashes (listings + listings-raw) never collide with any FBA hash", [...v3ListingsRaw].every((h) => !fbaHashes.has(h)));
+  ok("C: v3 listings-raw (a DISTINCT source) never collides with any FBA hash", [...distinctHashes(v3, "listing-health-v3:listings-raw")].every((h) => !fbaHashes.has(h)));
 })();
 
 /* ===================== fixtures for derive / save / isolation ===================== */

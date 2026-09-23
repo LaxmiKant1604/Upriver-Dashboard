@@ -42,7 +42,12 @@ const sizeByHash = new Map(invSrcs.map((s) => [s.requestHash, s.sellerOrVendorId
   ok("A: India (8 accounts) -> exactly 2 inventory batches", invSrcs.length === 2);
   ok("A: the batches are [5,3]", [...sizeByHash.values()].sort((a, b) => b - a).join(",") === "5,3");
   ok("A: every inventory batch is strict + capped at 50000", invSrcs.every((s) => s.strict === true && s.limit === ROW_CAP));
-  ok("A: FBA India plans inventory only (no AWD for a non-AWD marketplace)", plan.reportRequests.every((r) => r.sources.every((s) => s.requestKey === "fba-plan:inventory-health")));
+  // fba-plan:awd is now the SHARED CANONICAL Listings export, planned for EVERY marketplace (India included) so it
+  // shares ONE export with listing-health-v3:listings. AWD ELIGIBILITY is decided in the derive (India = not AWD-capable
+  // => AWD unavailable, never a fabricated zero), NOT by omitting the fetch.
+  ok("A: FBA India plans inventory-health + the shared canonical Listings (fba-plan:awd), and nothing else",
+    plan.reportRequests.every((r) => r.sources.every((s) => s.requestKey === "fba-plan:inventory-health" || s.requestKey === "fba-plan:awd"))
+    && plan.reportRequests.some((r) => r.sources.some((s) => s.requestKey === "fba-plan:awd")));
 })();
 
 // A fake DataDoe: create -> exportId; poll -> ok; download -> the 3-seller batch returns a CAP-SIZED page (TRUNCATED),

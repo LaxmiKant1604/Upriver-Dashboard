@@ -29,7 +29,6 @@
 
 import { sourceRequestIdentity } from "../source-identity.js";
 import { sourceContractForKey } from "../source-contracts.js";
-import { AWD_CONTRACT_COUNTRIES } from "../reports/awd-capability.js";
 import { chunkAccountIds } from "../id-batching.js";
 // addDaysStr for the derived Sales Movers windows; the strict calendar-month helpers
 // (splitDateRangeByMonth / isFullCalendarMonthWindow) are the SAME helpers the production
@@ -245,6 +244,20 @@ const LH_SALES_AGGREGATIONS = [
 const LH_V3_LISTING_COLUMNS = ["seller_or_vendor_id", "marketplace_country_code", "sku", "child_asin", "listing_name", "listing_status", "listing_price_value", "listing_price_currency", "listing_current_quantity", "fba_quantity_available", "listing_fulfillment_channel", "listing_open_date"];
 const LH_V3_LISTING_RAW_COLUMNS = ["seller_or_vendor_id", "marketplace_country_code", "child_asin", "sku", "summaries", "issues", "offers"];
 
+// CANONICAL Listings column set = the validated UNION of the two consumers of the DataDoe "Listings" source
+// (ba689c05d7): Listing Health v3 (LH_V3_LISTING_COLUMNS -- listing_name/status/price/quantity/fulfillment/open_date)
+// PLUS FBA Plan AWD (LISTINGS_AWD_COLUMNS -- fnsku + the two awd_* fields). Both fba-plan:awd and
+// listing-health-v3:listings request EXACTLY this set at the 50,000-row provider ceiling so they resolve to ONE
+// request_hash (identical columns+limit+order+window+family) => ONE paid Listings export per <=5-seller batch, shared:
+// the fba job (which runs first) creates it, the v3 job ADOPTS it from source_export_cache (zero export), and each
+// derive projects only the columns it names (the AWD fold reads awd_* by name; v3 reads listing_* by name; extra
+// columns are ignored). This mirrors the existing fba-plan:inventory-health <-> listing-health-v3:inventory reuse.
+// Every AWD field (LISTINGS_AWD_COLUMNS) is a subset of this, so AWD values are byte-identical to the old dedicated
+// export; AWD capability is decided by the DERIVE gate (awdCapableMarketplace), NOT by column presence, so a non-AWD
+// marketplace stays honestly unavailable (never a fabricated zero). Listings Raw is a DIFFERENT source (id 6ea445cd)
+// and keeps its own separate export. Order-independent (the request identity sorts the column set).
+const LISTINGS_CANONICAL_COLUMNS = [...new Set([...LH_V3_LISTING_COLUMNS, ...LISTINGS_AWD_COLUMNS])];
+
 // ppc.js — PPC's TACoS denominator (total account sales) comes from the shared canonical Order Line
 // Items sales fragment (OLI_SALES_*, Blocker 1); all advertising figures are derived from persisted rows.
 
@@ -417,20 +430,24 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       latestSnapshot: true,
     },
     {
+      // fba-plan:awd is the FBA Plan owner of the CANONICAL Listings export. It requests LISTINGS_CANONICAL_COLUMNS
+      // (the v3+AWD union) at the 50,000-row ceiling for EVERY account across ALL marketplaces -- byte-identical to
+      // listing-health-v3:listings -- so the two consumers resolve to ONE request_hash and ONE paid Listings export
+      // per <=5-seller batch (the fba job runs first and creates it; the v3 job adopts it from cache, zero export).
+      // The former AWD-only marketplace gate (marketplaceCountries: US+EU5, 10,000-row limit, LISTINGS_AWD_COLUMNS) is
+      // REMOVED here: AWD eligibility is enforced in the DERIVE (awdCapableMarketplace(context.marketCountry)), NOT the
+      // fetch, so a non-AWD marketplace's Listings rows are fetched (for v3's benefit + the shared hash) but its AWD
+      // stays honestly unavailable -- never a fabricated zero -- and US remains a HARD requirement in the derive.
       requestKey: "fba-plan:awd",
       strict: true,
       sourceKey: "listings",
-      columns: LISTINGS_AWD_COLUMNS,
-      limit: 10000, // CATALOG_ROW_LIMIT
+      columns: LISTINGS_CANONICAL_COLUMNS,
+      limit: 50000, // ROW_LIMITS.rawGrain -- the confirmed DataDoe provider ceiling; a cap-sized page is rejected as TRUNCATED
       groupBy: null,
       aggregations: null,
       orderByColumn: "child_asin",
       orderByDirection: "ASC",
-      windowKind: "none (no-date; AWD-capable marketplaces: US + EU5)",
-      // AWD is offered by Amazon in the US + the EU5 (GB/UK, DE, FR, IT, ES). The gate accepts either UK or GB (the
-      // account directory uses UK, Amazon rows use GB). AU + smaller EU marketplaces are excluded (no AWD). US is
-      // byte-identical (it stays in the list); see lib/server/reports/awd-capability.js.
-      marketplaceCountries: [...AWD_CONTRACT_COUNTRIES],
+      windowKind: "none (no-date Listings snapshot; ALL marketplaces; shared canonical Listings export)",
     },
   ],
   // Keyword Rank (single account). SQP weekly (primary) + SQP monthly (data-dependent
@@ -799,15 +816,21 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
   // never an owned export -- so a window change re-aggregates stored OLI and spends zero exports.
   "listing-health-v3": [
     {
+      // REUSE: requests the CANONICAL Listings column set (LISTINGS_CANONICAL_COLUMNS) at the 50,000-row ceiling --
+      // byte-identical columns/limit/order/window to fba-plan:awd -- so listing-health-v3:listings resolves to the
+      // SAME request_hash as fba-plan:awd and ADOPTS the fba job's Listings export from source_export_cache (zero
+      // v3 create), exactly like listing-health-v3:inventory reuses fba-plan:inventory-health. v3 projects only the
+      // listing_* columns it names; the extra awd_*/fnsku columns are ignored. Widening from LH_V3_LISTING_COLUMNS/
+      // 20000 changes this request_hash once, so the next cycle re-fetches + re-persists the durable Listings snapshot.
       requestKey: "listing-health-v3:listings",
       sourceKey: "listings",
-      columns: LH_V3_LISTING_COLUMNS,
-      limit: 20000, // ROW_LIMITS.listings
+      columns: LISTINGS_CANONICAL_COLUMNS,
+      limit: 50000, // ROW_LIMITS.rawGrain -- canonical shared Listings ceiling (matches fba-plan:awd for hash reuse)
       groupBy: null,
       aggregations: null,
       orderByColumn: "child_asin",
       orderByDirection: "ASC",
-      windowKind: "none (no-date listings snapshot; seller+marketplace scoped)",
+      windowKind: "none (no-date Listings snapshot; seller+marketplace scoped; shared canonical Listings export)",
       strict: true,
     },
     {

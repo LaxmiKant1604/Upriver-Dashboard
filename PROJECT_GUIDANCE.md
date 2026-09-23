@@ -30,11 +30,9 @@ recorded it here on 2026-09-21. This is the current provider contract:
 - Order Line Items (OLI) is a standard source and costs 2 tokens per
   create-export.
 
-Treat repository OLI constants/comments that still say 5,000 as stale
-application constraints, not as the DataDoe provider contract. In particular,
-`OLI_SALES_ROW_LIMIT`, `ORDER_SALES_ROW_LIMIT`, their mirrored scheduler
-contracts, Supabase read defaults, tests, and comments must be audited and
-corrected to 50,000 before the flexii OLI backfill. Preserve strict behavior:
+The OLI source contract now requests 50,000 rows. A lower application request
+limit on any source is not the DataDoe provider ceiling; inspect and justify it
+before planning an export. Preserve strict behavior:
 an export returning exactly 50,000 rows is potentially truncated and must not
 be persisted as complete.
 
@@ -43,6 +41,24 @@ confirm the application matches this provider contract. If a live create
 rejects 50,000 or DataDoe supplies a newer written contract, stop and report
 contract drift; do not silently fall back, spend additional tokens, or record
 false coverage.
+
+### Cross-report source reuse (hard rule)
+
+- One source export may serve multiple reports. Before creating an export,
+  identify every consumer of that source for the same seller batch and window.
+- For Listings used by FBA Plan and Listing Health v3, plan one validated
+  canonical Listings export per batch of at most 5 sellers, with the union of
+  required columns and a 50,000-row request limit, then reuse its saved rows
+  for both consumers. Do not create two paid Listings exports merely because
+  the current consumer-specific requests use different columns or limits.
+- Verify that DataDoe accepts the combined fields and that each consumer can
+  safely project its own columns and isolate seller/marketplace rows. AWD data
+  remains unavailable where its marketplace is unsupported; never invent a
+  zero. Listings Raw is a distinct source and needs its own export.
+- Exact-request cache hashes alone are not proof of cross-report reuse. If
+  safe shared extraction cannot be proven, stop and report the incompatibility
+  before any duplicate paid export. Keep the 50,000-row truncation and
+  approved create/token ceilings in force.
 
 ### 2. Mandatory preflight before a paid action
 
@@ -116,8 +132,8 @@ These facts prevent the active incident from being re-planned from memory:
 - Marketplace/currency: GB / GBP.
 - Source: Order Line Items. Per direct DataDoe-team confirmation, its export
   ceiling is **50,000 rows** and the request may contain at most 5 sellers.
-- The current repository's OLI 5,000 constants/comments are known stale and
-  must be corrected and parity-tested before executing this recovery.
+- The OLI source contract now requests 50,000 rows; re-check every active
+  request path and parity test before a future recovery.
 - Required history includes `2025-06-01` onward; the current canonical recovery
   plan requests `2025-01-01` through D-1 to satisfy the gapless history contract.
 - Existing broad `source_coverage` is known to be false for the missing history;

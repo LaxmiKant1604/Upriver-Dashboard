@@ -21,7 +21,6 @@ import { bucketForCountry } from "./registry.js";
 import { buildDependencyPlan } from "./planner.js";
 import { assignAccountBatches, batchSellerIds, MAX_ACCOUNTS_PER_BATCH } from "./source-batching.js";
 import { organizationFingerprint, accountScopeHash } from "../source-identity.js";
-import { awdCapableMarketplace } from "../reports/awd-capability.js";
 import { regionForMarketplace } from "./campaign-region-routing.js";
 
 // Daily Reporting spans the last SIX calendar months exactly as the live UI does:
@@ -352,11 +351,11 @@ export function planFbaPlan({ accountId, name, country, currency, connections, a
   // emits NO OLI/catalog windows. Only the FBA Inventory Health snapshot + US-only AWD listing are owned exports.
   const windowsByRequestKey = {
     "fba-plan:inventory-health": [{ from: asOfStr, to: asOfStr }],
+    // fba-plan:awd is the CANONICAL Listings export (no-date), now planned for EVERY marketplace (shared with
+    // listing-health-v3:listings). AWD eligibility is decided in the DERIVE (awdCapableMarketplace), never here, so a
+    // non-AWD marketplace still requests the shared Listings snapshot but its AWD stays honestly unavailable.
+    "fba-plan:awd": [{ from: null, to: null }],
   };
-  // AWD is a no-date source for the AWD-CAPABLE marketplaces (US + EU5); supply its window only for those (the
-  // contract's country gate would otherwise reject an inapplicable request key). US is byte-identical (awdCapable("US")
-  // === true, exactly the former isUS gate). See lib/server/reports/awd-capability.js.
-  if (awdCapableMarketplace(scope.country)) windowsByRequestKey["fba-plan:awd"] = [{ from: null, to: null }];
   const sources = reportSourceRequestHashes({
     reportKey: "fba-plan", apiKey: scope.apiKey, ids: [scope.rawSellerId],
     windowsByRequestKey, marketplaceCountry: scope.country,
@@ -427,16 +426,38 @@ export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, 
   for (const members of partitions.values()) {
     const apiKey = members[0].scope.apiKey;
     const sourcesByAccount = new Map(members.map((m) => [m.scope.accountId, []]));
-    // Pack each source independently: ineligible AWD accounts must neither be exported nor fragment the AWD batches.
+    // Pack each source independently. fba-plan:awd is now the CANONICAL Listings export (LISTINGS_CANONICAL_COLUMNS,
+    // 50000): it is planned for EVERY account across ALL marketplaces -- byte-identical batch family to
+    // listing-health-v3:listings -- so both consumers resolve to ONE request_hash per <=5-seller batch and share ONE
+    // paid Listings export (fba creates it first; v3 adopts it). AWD ELIGIBILITY is enforced in the DERIVE
+    // (awdCapableMarketplace), never here: a non-AWD marketplace's Listings rows are still fetched (for v3 + the shared
+    // hash) but its AWD stays honestly unavailable. Inventory-health likewise batches every member (US-required + best-effort).
     for (const requestKey of ["fba-plan:inventory-health", "fba-plan:awd"]) {
-      const eligible = members.filter((m) => requestKey !== "fba-plan:awd" || awdCapableMarketplace(m.scope.country));
+      const eligible = members;
       const byId = new Map(eligible.map((m) => [m.scope.accountId, m]));
       const membership = new Map([...existingFbaMembership].filter(([id]) => byId.has(id)));
       const { batches } = assignAccountBatches(eligible.map((m) => ({ accountId: m.scope.accountId, rawSellerId: m.scope.rawSellerId })), membership, MAX_ACCOUNTS_PER_BATCH);
-      // Adaptive self-heal: isolate proven-overflow sellers into single-seller INVENTORY batches (never AWD). The
-      // overflowSellers set also carries readiness-isolation sellers (DATADOE_INITIAL_LOAD_INCOMPLETE) folded in by
+      // Adaptive self-heal: isolate proven-overflow sellers into single-seller INVENTORY batches (never AWD/Listings).
+      // The overflowSellers set also carries readiness-isolation sellers (DATADOE_INITIAL_LOAD_INCOMPLETE) folded in by
       // the release composition, so a readiness-poisoned inventory seller is split off the same way. Empty set =>
       // byte-identical to the default plan (existing hashes unchanged).
+      //
+      // WHY the canonical Listings (fba-plan:awd) is DELIBERATELY excluded from the split (mirrors v3's listings, which
+      // also never splits -- see planListingHealthV3BucketBatched): (1) the overflowSellers evidence is SINGLE-DAY
+      // INVENTORY-specific (isSingleDayOverflowEvidence in fba-inventory-overflow.js) -- a seller whose dense SKUxdate
+      // inventory truncates says NOTHING about its date-free Listings row count, so peeling it off the Listings batch
+      // would be unjustified AND would fork the shared hash (fba peels, v3 does not) exactly when a seller overflows,
+      // breaking the one-paid-export invariant. (2) Listings is a per-SKU snapshot with NO date dimension; the largest
+      // account anywhere is ~3.6k listings (largest us-ca ~1.0k), so a <=5-seller Listings batch is ~5k rows -- a ~10x
+      // margin under the 50000 cap, and the OLD v3 listings already co-batched these same US+CA sellers at a 20000 cap
+      // without truncating, so the canonical 50000 batch is strictly safer than a shipped-and-proven path. (3) If a
+      // Listings batch ever DID hit 50000 it is rejected fail-closed by the strict contract (TRUNCATED, terminal, never
+      // saved) -- a US (AWD-hard-required) account then blocks to last-known-good (report-derivation.js ~550), while a
+      // non-AWD co-member (CA/AU) is UNAFFECTED because the derive only reads fba-plan:awd inside `if (awdEligible)` and
+      // never touches it for a non-AWD marketplace. So the shared batch never couples a non-AWD account's plan to the
+      // Listings export, and a truncation degrades exactly one hard-required account to truthful stale data, never wrong
+      // data. Should real account listings ever approach the cap, add a SEPARATE listings-truncation evidence path
+      // applied IDENTICALLY here and in the v3 planner (to keep the shared hash), not this inventory-only set.
       const effectiveBatches = requestKey === "fba-plan:inventory-health" ? splitOverflowBatches(batches, byId, overflowSellers) : batches;
       for (const batch of effectiveBatches) {
         const owners = batch.accounts.map((a) => byId.get(a.accountId));
@@ -444,7 +465,8 @@ export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, 
         const markets = [...new Set(pairs.map((p) => p.marketplace))];
         const inventoryTo = owners[0].inventoryTo;
         const windowsByRequestKey = { "fba-plan:inventory-health": [{ from: inventoryTo, to: inventoryTo }] };
-        if (awdCapableMarketplace(markets[0])) windowsByRequestKey["fba-plan:awd"] = [{ from: null, to: null }];
+        // The canonical Listings (fba-plan:awd) is a no-date snapshot fetched for EVERY marketplace (shared with v3).
+        windowsByRequestKey["fba-plan:awd"] = [{ from: null, to: null }];
         const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey, ids: batchSellerIds(batch), windowsByRequestKey, marketplaceCountry: markets[0] }).filter((s) => s.requestKey === requestKey);
         const sources = resolved.map((s) => ({ ...s, marketplaceConstraint: markets.length === 1 ? markets[0] : null,
           marketplacePairs: pairs, ...(inventoryAsOf == null ? {} : { freshnessNotBefore: inventoryTo + "T00:00:00.000Z" }) }));

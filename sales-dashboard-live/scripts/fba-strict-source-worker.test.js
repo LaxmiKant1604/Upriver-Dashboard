@@ -107,7 +107,7 @@ const runOpts = (over) => ({ bucket: "us", cycleDate: "2026-08-07", ...over });
 // A single-seller fba-plan inventory source (CA, non-US -> owns ONLY inventory-health). marketplaceConstraint "CA"
 // so the worker's latest-snapshot compaction validates each block row against the trusted seller + marketplace.
 function invJob(ids = ["A1"], marketplace = "CA") {
-  const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids, windowsByRequestKey: { "fba-plan:inventory-health": [{ from: "2025-07-27", to: "2025-08-06" }] }, marketplaceCountry: marketplace });
+  const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids, windowsByRequestKey: { "fba-plan:inventory-health": [{ from: "2025-07-27", to: "2025-08-06" }], "fba-plan:awd": [{ from: null, to: null }] }, marketplaceCountry: marketplace });
   const src = resolved.find((r) => r.requestKey === "fba-plan:inventory-health");
   assert.equal(src.strict, true, "the fba-plan:inventory-health contract is strict:true");
   assert.equal(src.sourceKey, "fba-inventory-health", "the inventory contract's sourceKey is the latest-snapshot key");
@@ -207,7 +207,7 @@ group("source worker: FBA latest-snapshot EMPTY = valid-empty inventory-unavaila
 // (rowCount 0) typed inventory-unavailable -- CONSISTENT with a multi-seller batch's zero-row valid-empty, so
 // splitting a seller no longer flips a successful empty inventory export from valid-empty to blocked.
 function invJobD1(ids, marketplace, day) {
-  const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids, windowsByRequestKey: { "fba-plan:inventory-health": [{ from: day, to: day }] }, marketplaceCountry: marketplace });
+  const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids, windowsByRequestKey: { "fba-plan:inventory-health": [{ from: day, to: day }], "fba-plan:awd": [{ from: null, to: null }] }, marketplaceCountry: marketplace });
   const src = resolved.find((r) => r.requestKey === "fba-plan:inventory-health");
   return { src, job: plannedSourceJob("fba-plan", src, "us", "primary", "acct-" + ids[0], ids[0], marketplace) };
 }
@@ -243,7 +243,7 @@ test("EMPTY multi-seller D-1 inventory batch is ALSO a valid-empty SUCCESS -> si
 
 test("an UNBOUNDED (multi-day) single-seller EMPTY inventory export is STILL a terminal hard stop (unbounded empty proves nothing)", async () => {
   const store = makeStore();
-  const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "fba-plan:inventory-health": [{ from: "2026-08-30", to: "2026-09-08" }] }, marketplaceCountry: "CA" });
+  const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "fba-plan:inventory-health": [{ from: "2026-08-30", to: "2026-09-08" }], "fba-plan:awd": [{ from: null, to: null }] }, marketplaceCountry: "CA" });
   const src = resolved.find((r) => r.requestKey === "fba-plan:inventory-health");
   const job = plannedSourceJob("fba-plan", src, "us", "primary", "acct-A1", "A1", "CA");
   const dd = makeDataDoe(() => []);

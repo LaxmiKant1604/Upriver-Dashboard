@@ -14,15 +14,20 @@ const inventoryDate = "2026-09-04";
 const make = (countries) => countries.map((country, i) => ({ accountId: `acct-${String(i).padStart(2, "0")}`, country, currency: "EUR", name: `Account ${i}` }));
 const planFor = (accounts) => buildShadowReportPlan({ accounts, connections, reportKeys: ["fba-plan"], asOfFor: () => salesDate, inventoryAsOf: inventoryDate });
 const europe = make(["UK", "DE", "FR", "IT", "ES", "UK", "DE", "IT", "UK", "NL", "BE", "PL", "AU", "NL", "FR", "ES"]);
-// Eleven AWD-eligible sellers here: independent source packing must produce 4 Health + 3 AWD, not marketplace groups.
+// fba-plan:awd is now the CANONICAL Listings export planned for EVERY marketplace (shared byte-identically with
+// listing-health-v3:listings), NOT the old US+EU5-gated AWD. So "listings" packs ALL 16 sellers into ceil(16/5)=4
+// batches (was 11 AWD-eligible -> 3); AWD ELIGIBILITY (which marketplaces fold AWD) is enforced in the DERIVE, not by
+// the plan's source count. Independent source packing (not marketplace groups): 4 Health + 4 canonical Listings.
 const plan = planFor(europe);
 const count = (p, key) => p.sourceJobs.filter((s) => s.sourceKey === key).length;
 assert.equal(count(plan, "fba-inventory-health"), 4);
-assert.equal(count(plan, "listings"), 3);
-const nineEligible = planFor(europe.slice(0, 14));
-assert.equal(count(nineEligible, "listings"), 2);
+assert.equal(count(plan, "listings"), 4); // canonical Listings for ALL 16 europe/AU sellers -> ceil(16/5)=4 batches
+const allFourteen = planFor(europe.slice(0, 14));
+assert.equal(count(allFourteen, "listings"), 3); // 14 sellers -> ceil(14/5)=3 canonical Listings batches (was 9 eligible -> 2)
 assert.equal(count(planFor(make(Array(8).fill("IN"))), "fba-inventory-health"), 2);
-assert.equal(count(planFor(make(Array(8).fill("IN"))), "listings"), 0);
+// India is not AWD-eligible, but the canonical Listings export is STILL planned for it (shared with v3 -> 0 extra cost;
+// India's derive simply never folds AWD). 8 IN sellers -> ceil(8/5)=2 Listings batches (was 0 under the old AWD gate).
+assert.equal(count(planFor(make(Array(8).fill("IN"))), "listings"), 2);
 assert.equal(count(planFor(make([...Array(8).fill("US"), "CA", "CA"])), "fba-inventory-health"), 2);
 assert.equal(count(planFor(make([...Array(8).fill("US"), "CA", "CA"])), "listings"), 2);
 assert.deepEqual(planFor([...europe].reverse()).sourceJobs.map((s) => s.requestHash).sort(), plan.sourceJobs.map((s) => s.requestHash).sort());
@@ -97,7 +102,7 @@ console.log("PASS cross-date inventory row rejected: no cross-date combination o
 
 const expired = await planFbaBucketCost({ bucketAccounts: europe, connections, asOf: salesDate, inventoryAsOf: inventoryDate,
   getSourceExportCache: async () => ({ fetched_at: "2026-09-03T10:00:00Z" }) });
-assert.equal(expired.cost.creates, 7);
+assert.equal(expired.cost.creates, 8); // 4 inventory-health + 4 canonical Listings (all 16 sellers) all stale -> refetch
 const fresh = await planFbaBucketCost({ bucketAccounts: europe, connections, asOf: salesDate, inventoryAsOf: inventoryDate,
   getSourceExportCache: async () => ({ fetched_at: "2026-09-04T08:40:00Z" }) });
 assert.equal(fresh.cost.creates, 0);
