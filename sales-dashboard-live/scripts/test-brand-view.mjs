@@ -437,7 +437,7 @@ test("1/2/3. impossible, future, malformed and out-of-window dates are rejected 
   assert.equal(isStrictCalendarDate("2099-01-01"), true, "2099-01-01 is a valid CALENDAR date; the window check is what rejects it");
 });
 
-test("4/5. missing ASIN, non-object rows, and non-finite/malformed/negative available are rejected (never zeroed)", () => {
+test("4/5. missing ASIN + non-object rows + PRESENT-malformed available reject; a NO-STOCK null/undefined available folds to an honest 0", () => {
   const row = (over) => [{ date: INV_TO, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "S", available: 1, ...over }];
   const safe = (e) => e.brandInventorySafe === true;
   assert.throws(() => buildInv({ invRows: "not-an-array" }), safe, "invRows must be an array");
@@ -445,12 +445,27 @@ test("4/5. missing ASIN, non-object rows, and non-finite/malformed/negative avai
   assert.throws(() => buildInv({ invRows: [["array-row"]] }), safe, "an array row");
   assert.throws(() => buildInv({ invRows: row({ child_asin: "" }) }), safe, "missing ASIN");
   assert.throws(() => buildInv({ invRows: row({ child_asin: "   " }) }), safe, "blank ASIN");
+  // A PRESENT malformed / negative / non-numeric value is corruption -> still rejected (never coerced), LKG preserved.
   assert.throws(() => buildInv({ invRows: row({ available: -1 }) }), safe, "negative available");
   assert.throws(() => buildInv({ invRows: row({ available: "5" }) }), safe, "a numeric STRING is not converted, it is rejected");
-  assert.throws(() => buildInv({ invRows: row({ available: null }) }), safe, "null available is not converted to zero");
-  assert.throws(() => buildInv({ invRows: row({ available: undefined }) }), safe, "missing available");
   assert.throws(() => buildInv({ invRows: row({ available: NaN }) }), safe, "NaN available");
   assert.throws(() => buildInv({ invRows: row({ available: Infinity }) }), safe, "non-finite available");
+  // A NULL / UNDEFINED available is a legitimate NO-STOCK ASIN (DataDoe returns null for a listed-but-unstocked SKU) --
+  // it folds to an HONEST 0 exactly like the canonical fba-plan derive's num(), NEVER rejected. This is the exact gate
+  // that had deferred 9 europe-au accounts whose valid D-1 FBA snapshots carried no-stock ASINs.
+  for (const noStock of [null, undefined]) {
+    const p = buildInv({ invRows: row({ available: noStock }) });
+    assert.equal(p.inventoryAvailable, true, `a no-stock (${String(noStock)}) available still yields a valid saved snapshot`);
+    const it = p.inventoryByBrandCountry.find((e) => e.country === "IT");
+    assert.ok(it && it.fbaAvailable === 0 && it.skuCount === 1, `the no-stock ASIN folds to fbaAvailable 0 (honest no-stock, never fabricated) for ${String(noStock)}`);
+  }
+  // MIXED: a no-stock null row alongside a real quantity row -> the real quantity is preserved, the null adds 0.
+  const mixed = buildInv({ invRows: [
+    { date: INV_TO, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "S1", available: 7 },
+    { date: INV_TO, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "S2", available: null },
+  ] });
+  const itMixed = mixed.inventoryByBrandCountry.find((e) => e.country === "IT");
+  assert.ok(itMixed && itMixed.fbaAvailable === 7 && itMixed.skuCount === 2, "a null no-stock row adds 0 to a real 7 (fold matches the canonical num() derive)");
 });
 
 test("8. an FBA inventory result exactly at the row cap is refused as truncated and not saved", () => {

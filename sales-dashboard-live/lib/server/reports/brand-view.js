@@ -520,7 +520,9 @@ export function selectAuthoritativeInventorySnapshot(rows) {
  *   - `row.date` a strict UTC calendar date INSIDE [from, to] (impossible / malformed /
  *     future / out-of-window dates are rejected, never coerced);
  *   - `row.child_asin` non-empty;
- *   - `row.available` finite and >= 0 (a malformed/negative value is rejected, never 0);
+ *   - `row.available` a NO-STOCK null/undefined (folds to an honest 0, exactly like the canonical fba-plan derive's
+ *     num()) OR an already-finite non-negative number; a PRESENT malformed value (negative / NaN / Infinity /
+ *     non-numeric string) is rejected, never coerced;
  *   - a country (row marketplace, else the authoritative account-country fallback).
  * Only the LATEST validated date folds. `inventoryAvailable` is true only when rows were
  * returned, so a brand present with 0 available is a genuine zero while an empty snapshot
@@ -540,6 +542,14 @@ export function buildBrandInventoryPayload({ accountId, invRows, brandByAsin, ac
   }
   const brandOf = brandByAsin instanceof Map ? brandByAsin : new Map(Object.entries(brandByAsin || {}));
   const accountFallbackCountry = trimmed(accountCountry).toUpperCase();
+  // `available` folded exactly like the CANONICAL fba-plan derive (derivation-core.js `num`): a null/undefined value
+  // is a legitimate NO-STOCK ASIN (DataDoe's fba-inventory-health returns null available -- and null reserved/inbound --
+  // for a SKU that is LISTED but holds no FBA inventory record) and folds to an HONEST 0, never a fabricated
+  // availability. A PRESENT value is used as-is and must be a finite non-negative number (a negative / NaN / Infinity /
+  // non-numeric string is corruption -> rejected below, LKG preserved). This makes the ZERO-EXPORT reconciler backstop
+  // reproduce the go-live's brand-inventory byte-for-byte instead of deferring an account whose valid D-1 snapshot
+  // merely carries some no-stock ASINs (the exact gate that deferred 9 europe-au accounts).
+  const availableUnitsOf = (row) => (row.available == null ? 0 : row.available);
 
   // Pass 1: STRICTLY validate EVERY row (any invalid row rejects the whole payload) and
   // find the latest in-window date. A row is validated even if it is not the latest date.
@@ -555,10 +565,10 @@ export function buildBrandInventoryPayload({ accountId, invRows, brandByAsin, ac
     if (!trimmed(row.child_asin)) {
       throw safeInventoryError("Brand View inventory contained a row without an ASIN and was not saved; the previous snapshot is preserved.");
     }
-    // STRICT, no coercion: `available` must already be a finite non-negative number.
-    // Number.isFinite does not coerce, so null / undefined / "" / "5" / NaN / Infinity
-    // are all rejected rather than converted to zero.
-    if (!Number.isFinite(row.available) || row.available < 0) {
+    // A NO-STOCK null/undefined folds to 0 (availableUnitsOf); a PRESENT value must ALREADY be a finite non-negative
+    // number -- no coercion, so "" / "5" / NaN / Infinity / a negative are all rejected rather than converted to zero.
+    const availableUnits = availableUnitsOf(row);
+    if (!Number.isFinite(availableUnits) || availableUnits < 0) {
       throw safeInventoryError("Brand View inventory contained a malformed or negative available quantity and was not saved; the previous snapshot is preserved.");
     }
     if (!(trimmed(row.marketplace_country_code).toUpperCase() || accountFallbackCountry)) {
@@ -576,7 +586,7 @@ export function buildBrandInventoryPayload({ accountId, invRows, brandByAsin, ac
     const brand = brandOf.get(asin) || null;
     const key = `${country}|${brand || ""}`;
     const bucket = byCountryBrand.get(key) || { country, brand, fbaAvailable: 0, skus: new Set() };
-    bucket.fbaAvailable += row.available; // validated finite non-negative number in pass 1
+    bucket.fbaAvailable += availableUnitsOf(row); // no-stock null/undefined -> 0; else the finite non-negative validated in pass 1
     const sku = trimmed(row.sku);
     if (sku) bucket.skus.add(sku);
     byCountryBrand.set(key, bucket);

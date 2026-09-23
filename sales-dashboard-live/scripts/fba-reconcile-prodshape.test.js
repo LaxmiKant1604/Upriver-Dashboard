@@ -574,6 +574,84 @@ test("blocker 2 (fenced CAS final defense): a NULL control fence makes the REAL 
 
 export { makeWorld, wireRelease, buildProd, liveRow };
 
+// ---------------------------------------------------------------------------------------------------------------------
+// NO-STOCK null-available fold (the 9-account europe-au defer). A valid D-1 FBA snapshot whose rows include a listed-but-
+// unstocked ASIN (DataDoe returns `available: null` + null reserved/inbound) MUST derive + publish -- folding the null to
+// an honest 0 exactly like the canonical fba-plan derive -- instead of throwing "malformed or negative available" and
+// deferring forever. A PRESENT malformed value (negative) still defers (corruption guard). Reproduces + proves convergence.
+// ---------------------------------------------------------------------------------------------------------------------
+test("NO-STOCK FIX: a valid D-1 snapshot with null-available rows DERIVES + PUBLISHES (was 'brand-inventory-derive-refused' -> the 9-account defer)", async () => {
+  const world = makeWorld({ fbaPayloadSha: "ps-nostock", fbaRowCount: 3, fbaRows: [
+    { date: ASOF, child_asin: "ASIN1", available: 12, marketplace_country_code: "US", sku: "S1" },
+    { date: ASOF, child_asin: "ASIN1", available: null, marketplace_country_code: "US", sku: "S2", reserved_customer_order: null, inbound_working: null, inbound_shipped: null }, // listed but unstocked
+    { date: ASOF, child_asin: "ASIN1", available: 0, marketplace_country_code: "US", sku: "S3" },
+  ] });
+  const h = buildProd(world);
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("READBACK_VERIFIED (the null-available snapshot now publishes, never deferred)", st(out) === FBA_RECONCILE_STATUS.READBACK_VERIFIED && out.ok === true);
+  const lr = liveRow(world);
+  ok("live folds null as 0: fbaAvailable = 12 + 0 + 0 = 12, all 3 SKUs counted (byte-parity with the canonical num() derive)", lr && lr.payload.inventoryAvailable === true && lr.payload.inventoryByBrandCountry.some((r) => r.country === "US" && r.fbaAvailable === 12 && r.skuCount === 3));
+  const token = fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: A, connectionId: "primary", requestHash: "rh-A01", contentSha: "ps-nostock" });
+  ok("the FBA content token is bound to the REAL derive (the durable_content_deps gap is filled, not stamped)", world.jobs.some((j) => j.report_key === RK && j.durable_content_deps.length === 1 && j.durable_content_deps[0] === token));
+  ok("zero export", out.dataDoeCreates === 0 && out.dataDoeTokens === 0);
+});
+
+test("NO-STOCK FIX: an OLDER promotable brand-inventory job with EMPTY durable_content_deps + a valid D-1 snapshot -> STALE -> re-derive CONVERGES (binds the token 0->1)", async () => {
+  const world = makeWorld({ fbaPayloadSha: "ps-conv", fbaRows: [
+    { date: ASOF, child_asin: "ASIN1", available: 5, marketplace_country_code: "US", sku: "S1" },
+    { date: ASOF, child_asin: "ASIN1", available: null, marketplace_country_code: "US", sku: "S2" },
+  ] });
+  // Seed the EXACT production state: an older PROMOTABLE brand-inventory job that never bound the FBA content token
+  // (durable_content_deps=[]). revisionCoveredByJob=false -> STALE -> re-derive (which previously threw on the null).
+  world.cycles.set("bi-old", { id: "cyc-bi-old", bucket: "priority-partial-india-old", cycle_date: ASOF, status: "succeeded", trigger: "manual", created_at: "2026-09-10T09:00:00Z" });
+  world.jobs.push({ cycle_id: "cyc-bi-old", report_key: RK, account_id: A, connection_id: "primary", bucket: "india", depends_on: ["oli-h", "catalog"], durable_content_deps: [], derive_status: "succeeded", save_status: "succeeded", validated: true, snapshot_params_hash: "old-bi-hash", latest_data_date: ASOF, created_at: -1 });
+  const h = buildProd(world);
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("the empty-dcd job is STALE -> re-derived + published (READBACK_VERIFIED) -- converges", st(out) === FBA_RECONCILE_STATUS.READBACK_VERIFIED);
+  const token = fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: A, connectionId: "primary", requestHash: "rh-A01", contentSha: "ps-conv" });
+  const latest = world.jobs.filter((j) => j.report_key === RK).sort((a, b) => b.created_at - a.created_at)[0];
+  ok("the NEW brand-inventory job binds the FBA content token (durable_content_deps 0 -> 1)", latest.durable_content_deps.length === 1 && latest.durable_content_deps[0] === token);
+});
+
+test("NO-STOCK FIX: after a null-available account publishes, a replay is PUBLICATION_NOT_REQUIRED (idempotent; no duplicate inventory)", async () => {
+  const world = makeWorld({ fbaPayloadSha: "ps-idem", fbaRows: [
+    { date: ASOF, child_asin: "ASIN1", available: 8, marketplace_country_code: "US", sku: "S1" },
+    { date: ASOF, child_asin: "ASIN1", available: null, marketplace_country_code: "US", sku: "S2" },
+  ] });
+  const h = buildProd(world);
+  await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  const publishedBefore = world.writes.publishedLiveKeys.length;
+  const out2 = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("replay: PUBLICATION_NOT_REQUIRED, zero additional writes (no duplicate inventory)", st(out2) === "PUBLICATION_NOT_REQUIRED" && world.writes.publishedLiveKeys.length === publishedBefore);
+});
+
+test("NO-STOCK FIX: the fold keys by marketplace (a null in GB never leaks to DE; each market folds independently, null->0)", async () => {
+  const world = makeWorld({ fbaPayloadSha: "ps-eu", fbaRows: [
+    { date: ASOF, child_asin: "ASIN1", available: 4, marketplace_country_code: "GB", sku: "G1" },
+    { date: ASOF, child_asin: "ASIN1", available: null, marketplace_country_code: "GB", sku: "G2" },
+    { date: ASOF, child_asin: "ASIN1", available: 9, marketplace_country_code: "DE", sku: "D1" },
+  ] });
+  const h = buildProd(world);
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("READBACK_VERIFIED", st(out) === FBA_RECONCILE_STATUS.READBACK_VERIFIED);
+  const lr = liveRow(world);
+  const gb = lr.payload.inventoryByBrandCountry.find((r) => r.country === "GB");
+  const de = lr.payload.inventoryByBrandCountry.find((r) => r.country === "DE");
+  ok("GB folds 4 + 0(null) = 4 (2 SKUs); DE folds 9 (1 SKU) -- per-market, the null never crosses marketplaces", gb && gb.fbaAvailable === 4 && gb.skuCount === 2 && de && de.fbaAvailable === 9 && de.skuCount === 1);
+});
+
+test("GUARD: a PRESENT malformed (negative) available still DEFERS the derive (corruption guard preserved) -> zero brand-inventory writes, LKG untouched", async () => {
+  const world = makeWorld({ fbaPayloadSha: "ps-neg", fbaRows: [
+    { date: ASOF, child_asin: "ASIN1", available: 3, marketplace_country_code: "US", sku: "S1" },
+    { date: ASOF, child_asin: "ASIN1", available: -2, marketplace_country_code: "US", sku: "S2" }, // genuine corruption, not a no-stock null
+  ] });
+  const h = buildProd(world);
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  const fp = invFootprint(world);
+  ok("a negative available DEFERS (never coerced to 0, never published)", st(out) === FBA_RECONCILE_STATUS.DEFERRED_DEPENDENCY);
+  ok("zero brand-inventory live/shadow/job writes (LKG preserved)", fp.published === 0 && fp.shadow === 0 && fp.invJobs === 0 && fp.live === false);
+});
+
 async function main() {
   writeSync(1, "fba-reconcile-prodshape\n");
   let failures = 0;
