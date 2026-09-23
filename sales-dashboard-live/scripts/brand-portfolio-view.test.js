@@ -238,4 +238,54 @@ test("empty / non-array input is safe", () => {
   assert.deepEqual(VIEW.orderStatusItems(undefined), []);
 });
 
+/* ---------------------------------------------------------- adSpendKpiCopy */
+group("adSpendKpiCopy: ACTIVE Campaign Ads attribution + honest unavailable reasons (never same-ASIN, never 'no Ads' when Ads exist)");
+
+// The two retired/misleading strings must appear in NO state.
+const noStale = (r) => {
+  assert.ok(!/same[- ]ASIN/i.test(r.sub), "no retired same-ASIN wording: " + r.sub);
+  assert.ok(!/no saved Ads history/i.test(r.sub), "never claims no saved Ads history: " + r.sub);
+};
+
+test("value shown, complete -> Campaign Ads attribution, no Partial badge", () => {
+  const r = VIEW.adSpendKpiCopy({ hasValue: true, valuePartial: false, hasAdsCoverage: true, hasUnmapped: false, singleCurrency: true });
+  assert.equal(r.badge, null);
+  assert.match(r.sub, /Campaign Ads mapped to this brand/);
+  noStale(r);
+});
+test("value shown but PARTIAL (uncovered or unmapped marketplace) -> Partial badge, names it", () => {
+  const r = VIEW.adSpendKpiCopy({ hasValue: true, valuePartial: true, hasAdsCoverage: true, hasUnmapped: true, singleCurrency: true });
+  assert.equal(r.badge, "Partial");
+  assert.match(r.sub, /Campaign Ads/);
+  assert.match(r.sub, /unavailable or unmapped/);
+  noStale(r);
+});
+test("em dash, NO Ads coverage -> 'Ads data is unavailable' (real absence)", () => {
+  const r = VIEW.adSpendKpiCopy({ hasValue: false, valuePartial: false, hasAdsCoverage: false, hasUnmapped: false, singleCurrency: true });
+  assert.match(r.sub, /Ads data is unavailable/);
+  noStale(r);
+});
+test("em dash, saved Ads exist but campaigns UNMAPPED -> attribution-incomplete message (never 'no Ads history')", () => {
+  const r = VIEW.adSpendKpiCopy({ hasValue: false, valuePartial: false, hasAdsCoverage: true, hasUnmapped: true, singleCurrency: true });
+  assert.equal(r.badge, "Unmapped");
+  assert.match(r.sub, /can't be confirmed/);
+  assert.match(r.sub, /aren't mapped|not mapped|unmapped/i);
+  noStale(r);
+});
+test("em dash, coverage + multi-currency -> per-marketplace hint (Ads exist, just no single total)", () => {
+  const r = VIEW.adSpendKpiCopy({ hasValue: false, valuePartial: false, hasAdsCoverage: true, hasUnmapped: false, singleCurrency: false });
+  assert.match(r.sub, /per marketplace/);
+  noStale(r);
+});
+test("em dash, coverage + single currency + no unmapped (other partial) -> 'Partial Ads coverage'", () => {
+  const r = VIEW.adSpendKpiCopy({ hasValue: false, valuePartial: false, hasAdsCoverage: true, hasUnmapped: false, singleCurrency: true });
+  assert.match(r.sub, /Partial Ads coverage/);
+  noStale(r);
+});
+test("NO combination of states ever uses the retired same-ASIN or 'no saved Ads history' wording", () => {
+  for (const hasValue of [true, false]) for (const valuePartial of [true, false]) for (const hasAdsCoverage of [true, false]) for (const hasUnmapped of [true, false]) for (const singleCurrency of [true, false]) {
+    noStale(VIEW.adSpendKpiCopy({ hasValue, valuePartial, hasAdsCoverage, hasUnmapped, singleCurrency }));
+  }
+});
+
 main().then((f) => { if (f) process.exitCode = 1; }).catch((e) => { out("FATAL " + String(e && e.stack ? e.stack : e)); process.exitCode = 1; });

@@ -60,6 +60,29 @@ export function portfolioKpis(tables) {
   };
 }
 
+/**
+ * The Ad Spend KPI badge + sub text, chosen from the ACTIVE attribution (Campaign Ads via campaign->brand mapping)
+ * and the REAL coverage/attribution state -- never the retired "same-ASIN" wording, and never "no saved Ads history"
+ * when saved Ads actually exist. Pure + exhaustively testable.
+ *   hasValue       - the KPI shows a number (adSpend !== null)
+ *   valuePartial   - that number omits at least one marketplace (uncovered OR unmapped) -> a lower bound
+ *   hasAdsCoverage - any marketplace has saved Ads coverage
+ *   hasUnmapped    - a covered marketplace has unmapped (unattributed) campaign spend this window
+ *   singleCurrency - the KPI can show one overall total (else it is per-marketplace)
+ */
+export function adSpendKpiCopy({ hasValue, valuePartial, hasAdsCoverage, hasUnmapped, singleCurrency }) {
+  if (hasValue) {
+    return valuePartial
+      ? { badge: "Partial", sub: "Campaign Ads mapped to this brand — some marketplaces are unavailable or unmapped" }
+      : { badge: null, sub: "Campaign Ads mapped to this brand" };
+  }
+  // Unavailable (em dash): name the actual reason. Never claim there is no Ads data when saved Ads exist.
+  if (!hasAdsCoverage) return { badge: null, sub: "Ads data is unavailable for this window" };
+  if (hasUnmapped) return { badge: "Unmapped", sub: "Brand spend can't be confirmed — some campaigns aren't mapped to a brand" };
+  if (!singleCurrency) return { badge: null, sub: "Shown per marketplace — pick a display currency for one total" };
+  return { badge: "Partial", sub: "Partial Ads coverage for this window" };
+}
+
 // Deterministic status severity: error > warning > success/final > informational/busy.
 // The sort is explicitly stable (an index tiebreak) so nothing is dropped and the
 // order within a severity tier is exactly the order the page appended it -- the

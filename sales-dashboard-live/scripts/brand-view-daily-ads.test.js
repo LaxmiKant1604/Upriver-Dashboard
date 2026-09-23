@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { build } from "esbuild";
-import { brandViewModel } from "../src/lib/brand-view.js";
+import { brandViewModel, hasAdsCoverage, hasUnmappedAds } from "../src/lib/brand-view.js";
 import { buildBrandTables, DASH } from "../src/lib/brand-view-tables.js";
 
 const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -235,6 +235,40 @@ process.stdout.write(JSON.stringify({ headers: daily.headers, screenHeaders: tab
   ok("export row count equals the screen row count", R.rowCount === R.screenRowCount);
   const flat = R.dailyCells.flat().join(" | ");
   ok("the exported Daily Snapshot contains the 120 All Markets spend + 13.3% TACoS (same as screen)", /120/.test(flat) && /13\.3%/.test(flat));
+});
+
+// ===== KPI-copy model utilities: hasAdsCoverage / hasUnmappedAds =====
+// These drive the account-scoped Ad Spend KPI's honest unavailable-state copy: "Ads data is unavailable" (NO coverage)
+// vs "campaigns aren't mapped" (coverage exists but attribution incomplete). They must never conflate the two.
+function rawModel(series, countries) {
+  return brandViewModel({
+    brand: "X", scope: "account", accountId: "a", asOf: ANCHOR, countries, series,
+    coverage: { accountCount: 1, salesFrom: "2025-01-01", salesTo: ANCHOR, salesLatestDate: ANCHOR, adsFrom: "2025-01-01", adsTo: ANCHOR },
+  });
+}
+test("hasAdsCoverage: true when any marketplace has saved Ads coverage; false when none; false for a null model", () => {
+  ok("covered model -> true", hasAdsCoverage(modelOf(BASE)) === true);
+  const noAds = modelOf({ DE: { cur: "EUR", s: 100, ads: false }, FR: { cur: "EUR", s: 200, ads: false } });
+  ok("no coverage anywhere -> false", hasAdsCoverage(noAds) === false);
+  ok("null model -> false (never throws)", hasAdsCoverage(null) === false);
+});
+test("hasUnmappedAds: true when a COVERED marketplace carries unmapped (unattributed) spend inside the range", () => {
+  const series = DATES.map((d) => ({ c: "IN", cur: "INR", d, s: 1000, u: 10, au: true }));
+  ok("unmapped spend in range -> true", hasUnmappedAds(rawModel(series, IN_ONLY), RANGE.rangeFrom, RANGE.rangeTo) === true);
+});
+test("hasUnmappedAds: false when every marketplace's spend is fully mapped (no unattributed days)", () => {
+  ok("fully mapped BASE -> false", hasUnmappedAds(modelOf(BASE), RANGE.rangeFrom, RANGE.rangeTo) === false);
+  ok("null model -> false (never throws)", hasUnmappedAds(null, RANGE.rangeFrom, RANGE.rangeTo) === false);
+});
+test("hasUnmappedAds is RANGE-SCOPED: an unmapped day OUTSIDE [from,to] does not count, one INSIDE does", () => {
+  const series = DATES.map((d) => ({ c: "IN", cur: "INR", d, s: 1000, u: 10, au: true })); // all in Aug 2026
+  ok("range after the unmapped days -> false", hasUnmappedAds(rawModel(series, IN_ONLY), "2026-09-01", "2026-09-03") === false);
+  ok("range covering the unmapped days -> true", hasUnmappedAds(rawModel(series, IN_ONLY), "2026-08-01", "2026-08-31") === true);
+});
+test("hasUnmappedAds: an unmapped day on a marketplace WITHOUT Ads coverage is ignored (coverage gate wins)", () => {
+  const series = DATES.map((d) => ({ c: "IN", cur: "INR", d, s: 1000, u: 10, au: true }));
+  const model = rawModel(series, [{ country: "IN", currency: "INR", hasSales: true, adsAvailable: false }]);
+  ok("adsAvailable:false marketplace is not counted as unmapped", hasUnmappedAds(model, RANGE.rangeFrom, RANGE.rangeTo) === false);
 });
 
 let failures = 0;

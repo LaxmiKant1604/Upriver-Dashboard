@@ -25,9 +25,9 @@ import { DataQualityAlert, EmptyState, ErrorState, SkeletonMetricGrid, SkeletonT
 import { fmtRangeLabel, monthKeyLabel, nInt } from "../lib/format.js";
 import { partitionBrandSourceAccounts, refreshBrandSourceAccounts } from "../lib/brand-source-refresh.js";
 import { marketplaceToday } from "../../lib/marketplaces.js";
-import { CURRENCY_OPTIONS, brandViewModel, isConvertedMode, shareOf } from "../lib/brand-view.js";
+import { CURRENCY_OPTIONS, brandViewModel, isConvertedMode, shareOf, hasAdsCoverage, hasUnmappedAds } from "../lib/brand-view.js";
 import { DASH, buildBrandTables, countryTitle, coverLabel, money, ratePct } from "../lib/brand-view-tables.js";
-import { orderStatusItems, portfolioKpis } from "../lib/brand-portfolio-view.js";
+import { orderStatusItems, portfolioKpis, adSpendKpiCopy } from "../lib/brand-portfolio-view.js";
 import { regionLabel } from "../lib/region-view.js";
 import { ReportPanel, buildExportModel, freshnessSummaryLine, fxSummaryLine } from "./BrandReports.jsx";
 import {
@@ -475,6 +475,18 @@ export default function BrandPortfolio({
   const RANGE_BADGE = { "7D": "7D", "30D": "30D", MTD: "MTD", LASTMONTH: "Last month", LATEST: "Latest day", CUSTOM: "Custom" };
   const rangeBadge = RANGE_BADGE[range.preset] || null;
   const adPartial = Boolean(model) && model.countries.some((entry) => entry.adsAvailable) && model.countries.some((entry) => !entry.adsAvailable);
+  // Accurate Ad Spend KPI copy: active attribution is Campaign Ads (campaign->brand mapping), and an em dash names the
+  // real reason (no coverage / campaigns unmapped / per-marketplace) from existing model+coverage data -- never a
+  // stale "same-ASIN" claim, and never "no saved Ads history" when saved Ads exist. A shown total that omits an
+  // uncovered OR unmapped marketplace is flagged Partial.
+  const adUnmapped = hasUnmappedAds(model, range.rangeFrom, range.rangeTo);
+  const adSpendCopy = adSpendKpiCopy({
+    hasValue: Boolean(kpis) && kpis.adSpend !== null && kpis.adSpend !== undefined,
+    valuePartial: adPartial || adUnmapped,
+    hasAdsCoverage: hasAdsCoverage(model),
+    hasUnmapped: adUnmapped,
+    singleCurrency: Boolean(kpis && kpis.single),
+  });
   const lastYear = tables?.daily?.lastYearWindow;
   const weekDates = tables?.weekly?.dates || [];
   const weekLabel = weekDates.length ? fmtRangeLabel(weekDates[0], weekDates[weekDates.length - 1]) : "";
@@ -684,7 +696,7 @@ export default function BrandPortfolio({
             <BvKpi label="Units Sold" icon={<Boxes size={12} aria-hidden="true" />} badge={rangeBadge} value={nInt(kpis.units)} sub={`Across ${marketplaceCount} marketplace${marketplaceCount === 1 ? "" : "s"}`} hint="Ordered units summed across every marketplace. Unit counts are never currency converted." />
             <BvKpi label="FBA Inventory" value={kpis.fba === null ? DASH : nInt(kpis.fba)} sub={`Available FBA units${coverage.inventoryDate ? ` · as of ${coverage.inventoryDate}` : ""}`} hint={kpis.fba === null ? "No overall FBA inventory total is available for this scope." : "Available FBA units for this brand's ASINs; unit counts are never currency converted."} />
             <BvKpi label="FBA Cover" value={kpis.cover === null ? DASH : coverLabel(kpis.cover)} sub="Based on selected-range unit velocity" hint="Available FBA units divided by this brand's average daily unit sales in the selected range." />
-            <BvKpi label="Ad Spend" badge={adPartial ? "Partial" : null} value={kpis.adSpend === null ? DASH : money(kpis.adSpend, kpis.currency, 2)} sub={kpis.adSpend === null ? "No saved Ads history for this window" : (adPartial ? "Some marketplaces have no saved Ads" : "Same-ASIN brand ad spend")} />
+            <BvKpi label="Ad Spend" badge={adSpendCopy.badge} value={kpis.adSpend === null ? DASH : money(kpis.adSpend, kpis.currency, 2)} sub={adSpendCopy.sub} />
             <BvKpi label="TACoS" badge="Overall" value={kpis.tacos === null ? DASH : ratePct(kpis.tacos)} sub="Brand ad spend ÷ brand sales" />
           </div>
 

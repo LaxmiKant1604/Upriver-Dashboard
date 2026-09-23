@@ -301,6 +301,29 @@ function daysInSelectedRange(from, to) {
   return days > 0 ? days : null;
 }
 
+/** True when at least one marketplace has saved Ads coverage (so saved Ads exist for this brand somewhere). */
+export function hasAdsCoverage(model) {
+  return Boolean(model) && (model.countries || []).some((entry) => entry.adsAvailable);
+}
+
+/**
+ * True when, within [from,to], a covered marketplace carries UNMAPPED (unattributed) campaign spend -- saved Ads
+ * exist but campaign->brand attribution is incomplete, so the brand's figure cannot be confirmed. Distinguishes
+ * "campaigns unmapped" from "no Ads coverage" for honest unavailable-state copy. Range-scoped; falls back to all
+ * dates when a bound is absent.
+ */
+export function hasUnmappedAds(model, from, to) {
+  for (const country of model?.countries || []) {
+    if (!country.adsAvailable) continue;
+    for (const [date, day] of country.byDate) {
+      if (from && date < from) continue;
+      if (to && date > to) continue;
+      if (day.adUnattributed) return true;
+    }
+  }
+  return false;
+}
+
 /** TACoS as a fraction. Null unless both a real spend and a real sales base exist. */
 export function tacos(adSpend, sales) {
   if (adSpend === null || adSpend === undefined) return null;
