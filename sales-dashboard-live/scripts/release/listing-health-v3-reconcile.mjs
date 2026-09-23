@@ -60,6 +60,11 @@ const { getDataDoeConnections, classifyDirectoryAccounts, resolveDataDoeAccountI
 const { fetchAccounts: fetchDirectory } = await import("../../lib/server/datadoe.js");
 const { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } = await import("../../lib/server/sync/report-publisher.js");
 const { REPORT_DERIVATIONS, deriveReportSnapshot } = await import("../../lib/server/sync/report-derivation.js");
+// Canonical marketplace normalization: the account DIRECTORY reports country "UK" for the UK marketplace, but every
+// durable source (Listings/Listings-Raw/Catalog) stores Amazon's marketplace code "GB". Without normalizing, the bundle's
+// authoritative marketplace ("UK") never matches the durable listings marketplace ("GB") -> listings-marketplace-mismatch
+// deferred EVERY UK account's LHv3 forever. Reuse the SAME normalizer campaign-ads/AWD already apply (UK->GB, else upper).
+const { normalizeMarketplace } = await import("../../lib/server/sync/oli-sales-estimate.js");
 const { paramsHashFor } = await import("../../lib/server/report-store.js");
 const { buildListingHealthV3Release } = await import("../../lib/server/sync/listing-health-v3-release.js");
 const { resolveListingHealthV3DependencyBundle } = await import("../../lib/server/sync/listing-health-v3-dependency-bundle.js");
@@ -257,12 +262,13 @@ const loadDurableContext = makeListingHealthV3DurableContextLoader({
   buildObjectPath: sb.sourceSnapshotObjectPath,
 });
 
-// The authoritative per-account identity for the dependency bundle: marketplace = the directory country (uppercased),
-// rawSellerId = the resolved raw seller. Blank when the account is unresolvable -> the bundle resolver defers it.
+// The authoritative per-account identity for the dependency bundle: marketplace = the directory country NORMALIZED to
+// the Amazon marketplace code (UK->GB), matching how every durable source stores it; rawSellerId = the resolved raw
+// seller. Blank when the account is unresolvable -> the bundle resolver defers it.
 async function resolveAccountBundleIdentity(accountId) {
   const meta = await loadDirectoryMeta();
   const m = meta.get(String(accountId));
-  return m ? { marketplace: String(m.country).toUpperCase(), rawSellerId: String(m.rawSellerId) } : { marketplace: "", rawSellerId: "" };
+  return m ? { marketplace: normalizeMarketplace(m.country), rawSellerId: String(m.rawSellerId) } : { marketplace: "", rawSellerId: "" };
 }
 
 // The ONE shared dependency-bundle resolver closure, used by BOTH the scope scan (readScopeEvidence) AND the release
@@ -388,6 +394,12 @@ if (!dryRun) {
 
 const out = await reconciler.run({ bucket, requestedAsOf: asOf, accountIds: accountsArg.length ? accountsArg : null, mode, dryRun });
 
+if (process.env.RECONCILE_DUMP === "1") {
+  for (const rec of (out.perAccount || [])) {
+    const reports = {}; for (const [rk, v] of Object.entries(rec.reports || {})) reports[rk] = { state: v && v.state, reason: v && v.reason };
+    console.log("PERACCT " + JSON.stringify({ accountId: String(rec.accountId).slice(0, 8), eligible: rec.eligible, status: rec.status, reports }));
+  }
+}
 ghOut("outcome", out.outcome || "unknown");
 ghOut("published_count", String(out.counts ? out.counts.targetsPublished : 0));
 ghOut("failed_count", String(out.counts ? out.counts.targetsFailed : 0));

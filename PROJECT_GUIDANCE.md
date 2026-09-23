@@ -151,3 +151,38 @@ Report code state and production data state separately. Include:
 
 Do not call the incident resolved until durable OLI history, truthful coverage,
 derived reports, and the visible flexii date ranges all agree.
+
+### 8. Full-scope evidence before a publication-resolution claim
+
+For any saved-source-to-dashboard publication incident (Campaign Ads, FBA
+Inventory, Listings / Listings Raw, Product Catalog, Order Line Items, and every
+dependent report), do NOT claim RESOLVED until, for EVERY applicable
+account x marketplace x source x dependent report, the complete chain is verified
+with evidence: source export/evidence -> validated durable persistence ->
+source coverage/identity -> derivation/materialization -> publication ->
+live read-back -> dashboard-served value.
+
+- An aggregate green workflow, a published shadow, or a fresh scheduler run is NOT
+  proof of publication: a shadow row (`scheduler-v2/<key>`) or a report JOB is
+  never a live publication, and a green run with N deferred targets is PARTIAL,
+  never RESOLVED.
+- Count and report published / deferred / failed / already-current / not-applicable
+  PER REGION and PER ACCOUNT. Distinguish (a) legitimate upstream absence or a
+  read-only self-heal serve (NO publication required) from (b) a retryable
+  reconciler defect, lease/deadline contention, or an unresolved backlog. Never
+  relabel an absent upstream export as a publication defect, and never mark an
+  outbox/queue item complete on DEFERRED while valid saved publishable evidence
+  still awaits publication.
+- A report whose serve contract is read-only derivation/self-heal is
+  Not-applicable for publication and must not inflate a partial fraction. Confirm
+  the actual serve contract from code before counting a report as an expected
+  publication target.
+- Marketplace identity is normalized to the Amazon code before any ownership
+  comparison (the account directory says "UK"; every durable source stores "GB").
+- Missing data displays UNAVAILABLE, never a fabricated zero; genuinely pending
+  itemization stays PROVISIONAL.
+- Say RESOLVED only when ALL applicable publication targets are verified
+  end-to-end against source values, saved values, and served values. Otherwise say
+  PARTIAL or NOT VERIFIED and list every unresolved target with its typed reason.
+  Prove detection, isolation, retry, and monitoring; never claim future defects
+  are impossible.

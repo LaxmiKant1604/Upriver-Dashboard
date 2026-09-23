@@ -68,6 +68,10 @@ process.stdout.write("listing-health-v3-live-contract\n");
   ok("control package fails closed on an empty account set / blank operator", (() => { try { buildListingHealthV3ControlPackage({ accounts: [], operator: "op@x.co" }); return false; } catch { return true; } })() && (() => { try { buildListingHealthV3ControlPackage({ accounts: ["A1"], operator: "" }); return false; } catch { return true; } })());
   const entry = readFileSync(path.join(ROOT, "scripts/release/listing-health-v3-reconcile.mjs"), "utf8");
   ok("the entrypoint wires buildApplyPackage: buildListingHealthV3ControlPackage in openControls (so the publish gate is opened for listing-health-v3, not brand-inventory)", /buildApplyPackage: buildListingHealthV3ControlPackage/.test(entry));
+  // MARKETPLACE CODE NORMALIZATION (UK->GB): the directory reports country "UK" for the UK marketplace, but every durable
+  // source (Listings/Listings-Raw/Catalog) stores Amazon's code "GB". The bundle identity MUST normalize (not pass raw
+  // "UK") or validateListingsPointer's marketplace check ("UK" !== "GB") defers EVERY UK account's LHv3 forever.
+  ok("(marketplace) the bundle identity NORMALIZES the directory country to the Amazon code (UK->GB), matching the durable listings -- never the raw country", /marketplace: normalizeMarketplace\(m\.country\)/.test(entry) && !/marketplace: String\(m\.country\)\.toUpperCase\(\)/.test(entry));
 }
 
 // ---- (5) the 30-min reconcile workflow + immediate hook gates ----

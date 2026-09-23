@@ -58,7 +58,9 @@ jobs:
   reconcile:
     if: github.event_name == 'workflow_dispatch' || vars.LISTINGS_RECONCILE_LIVE == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 3 regions x the 840s per-region hard cap = 42 min worst case; normally india/us-ca finish in <3 min and only
+    # europe-au uses its full budget, so a run is ~12 min. 45 leaves headroom above the theoretical worst case.
+    timeout-minutes: 45
     outputs:
       asof: ${{ steps.reconcile.outputs.asof }}
       only: ${{ steps.reconcile.outputs.only }}
@@ -104,7 +106,12 @@ jobs:
           for REGION in india europe-au us-ca; do
             if [ -n "$ONLY" ] && [ "$ONLY" != "$REGION" ]; then echo "skip $REGION (dispatch restricted to $ONLY)"; continue; fi
             echo "::group::listing-health-v3-reconcile $REGION mode=$MODE as-of=$ASOF"
-            timeout 420 node scripts/release/listing-health-v3-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=330 $LIVE || { echo "region $REGION reconcile exited nonzero (isolated; continuing)"; rc=1; }
+            # deadline-seconds=720 (timeout 840): the LHv3 per-account derive is HEAVY (the dependency-bundle resolves
+            # Listings + Listings-Raw + Catalog + FBA + OLI evidence per account, twice -- scan + release). europe-au has
+            # 32 accounts; at ~12s/account the 330s deadline only published ~14/run, so a full region took several daily
+            # runs to converge (2->14->26 observed). 720s lets europe-au fully converge in ONE run while the reserve fix
+            # still safe-closes before the 840s kill; india/europe-au/us-ca that finish early exit immediately (no waste).
+            timeout 840 node scripts/release/listing-health-v3-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=720 $LIVE || { echo "region $REGION reconcile exited nonzero (isolated; continuing)"; rc=1; }
             echo "::endgroup::"
           done
           exit $rc

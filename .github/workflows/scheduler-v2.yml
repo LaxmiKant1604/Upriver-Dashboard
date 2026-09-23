@@ -690,7 +690,7 @@ jobs:
         continue-on-error: true
         run: |
           if [ "${{ vars.LISTINGS_RECONCILE_LIVE }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
-          node scripts/release/listing-health-v3-reconcile.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --mode=periodic --deadline-seconds=300 $LIVE
+          node scripts/release/listing-health-v3-reconcile.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --mode=periodic --deadline-seconds=720 $LIVE
 
   # Report materialization -- scheduler-OWNED, ZERO-EXPORT derivation of the durable reports that would otherwise
   # self-heal on a browser GET (brand-view-brands, sku-movement per brand incl. ALL, returns-leakage). It depends ONLY
