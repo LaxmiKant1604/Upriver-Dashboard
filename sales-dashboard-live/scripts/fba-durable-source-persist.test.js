@@ -14,6 +14,7 @@ import { writeSync, readFileSync } from "node:fs";
 import { persistDurableFbaSnapshotsFromPlan } from "../lib/server/sync/fba-durable-source-persist.js";
 import { resolvedFbaSnapshot } from "../lib/server/sync/source-bucket-sync.js";
 import { FBA_INVENTORY_SOURCE_KEY } from "../lib/server/sync/source-durable-model.js";
+import { computeFbaAccountRevision, FBA_REVISION_STATUS } from "../lib/server/sync/fba-inventory-revision.js";
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -29,6 +30,8 @@ const BATCH_HASH = "BATCH-HASH-1";
 // The reconciler's expected per-seller identity for an account -- recomputed EXACTLY as resolveExpectedRequestHash does.
 const expectedHashFor = (rawSellerId, country) =>
   String(resolvedFbaSnapshot({ apiKey: API_KEY, account: { rawSellerId, country }, asOf: ASOF, bucket: BUCKET }).requestHash);
+const expectedHashForAsOf = (rawSellerId, country, asOf) =>
+  String(resolvedFbaSnapshot({ apiKey: API_KEY, account: { rawSellerId, country }, asOf, bucket: BUCKET }).requestHash);
 
 const ownerOf = (accountId, rawSellerId, marketplace) => ({
   accountId, rawSellerId, connectionId: "primary", organizationFingerprint: ORG,
@@ -194,6 +197,40 @@ test("I2: the go-live, release, and route all wire persistDurableFbaSnapshots (t
     /const persistDurableFbaSnapshots = async/.test(rel) && /persistDurableFbaSnapshotsFromPlan\(/.test(rel) && /saveSnapshotPayload: saveSourceSnapshotPayload/.test(rel) && /recordSnapshot: recordSourceSnapshot/.test(rel) && /loadSourceExportCache: \(h\) => readExportCache\(h\)/.test(rel));
   ok("the scheduled go-live threads release.persistDurableFbaSnapshots", /persistDurableFbaSnapshots: release\.persistDurableFbaSnapshots/.test(cli));
   ok("the Data Sync route threads release.persistDurableFbaSnapshots", /persistDurableFbaSnapshots: release\.persistDurableFbaSnapshots/.test(route));
+});
+
+// ===== INTEGRATION SEAM: the persisted snapshot DRIVES the FBA reconciler's revision (cdcc087 end-to-end) =====
+// The whole point of the persist is that the zero-export reconciler READS exactly what the go-live WRITES. These tests
+// build the durable snapshot precisely as the persist recorded it, then feed it to computeFbaAccountRevision with the
+// SAME per-seller identity the reconciler recomputes (resolveExpectedRequestHash) -- proving the persist output is a
+// D-1-proven, ELIGIBLE, content-bound snapshot the reconciler accepts and re-derives from (not a defer).
+test("SEAM: a persisted non-empty snapshot is D-1-proven + ELIGIBLE (status AVAILABLE) in the reconciler's revision", async () => {
+  const io = makeIO();
+  await persistDurableFbaSnapshotsFromPlan(baseArgs(io, { reportRequests: [requestOf(A_ID, "sA", "GB")], includedIds: [A_ID] }));
+  const rec = io.recordCalls.find((c) => c.scopeKey === A_ID);
+  ok("persist recorded a snapshot for A (2 isolated GB rows)", !!rec && rec.rowCount === 2);
+  const snapshot = { source_request_hash: rec.sourceRequestHash, payload_sha: rec.payloadSha, row_count: rec.rowCount, validated_at: rec.validatedAt };
+  const rev = computeFbaAccountRevision({ organizationFingerprint: ORG, connectionId: "primary", accountId: A_ID, requestedAsOf: ASOF, snapshot, expectedRequestHash: expectedHashFor("sA", "UK") });
+  ok("the reconciler accepts the persisted snapshot as ELIGIBLE + D-1 (status AVAILABLE, revisionId bound)", rev.eligible === true && rev.status === FBA_REVISION_STATUS.AVAILABLE && !!rev.revisionId);
+  ok("the revision binds a content token over the persisted (requestHash, payload_sha) -> STALE detection works", rev.contentDeps.length === 1 && rev.contentDeps[0].includes(rec.sourceRequestHash) && rev.contentDeps[0].includes(rec.payloadSha));
+});
+test("SEAM: a valid-EMPTY persisted snapshot is ELIGIBLE (status PROVEN_EMPTY) -- honest unavailable, never a fabricated zero", async () => {
+  const io = makeIO();
+  await persistDurableFbaSnapshotsFromPlan(baseArgs(io, { reportRequests: [requestOf("acct-C", "sC", "GB")], includedIds: ["acct-C"], accountsById: new Map([["acct-C", { country: "UK" }]]) }));
+  const rec = io.recordCalls.find((c) => c.scopeKey === "acct-C");
+  ok("empty snapshot recorded (row_count 0)", !!rec && rec.rowCount === 0);
+  const snapshot = { source_request_hash: rec.sourceRequestHash, payload_sha: rec.payloadSha, row_count: 0, validated_at: rec.validatedAt };
+  const rev = computeFbaAccountRevision({ organizationFingerprint: ORG, accountId: "acct-C", requestedAsOf: ASOF, snapshot, expectedRequestHash: expectedHashFor("sC", "UK") });
+  ok("valid-empty is ELIGIBLE + PROVEN_EMPTY (unavailable band, not a defer, not a zero)", rev.eligible === true && rev.status === FBA_REVISION_STATUS.PROVEN_EMPTY);
+});
+test("SEAM: a WRONG-DAY reconciler request DEFERS the persisted snapshot (snapshot-not-d1) -- never publishes stale as fresh", async () => {
+  const io = makeIO();
+  await persistDurableFbaSnapshotsFromPlan(baseArgs(io, { reportRequests: [requestOf(A_ID, "sA", "GB")], includedIds: [A_ID] }));
+  const rec = io.recordCalls.find((c) => c.scopeKey === A_ID);
+  const snapshot = { source_request_hash: rec.sourceRequestHash, payload_sha: rec.payloadSha, row_count: rec.rowCount, validated_at: rec.validatedAt };
+  // The reconciler recomputes the D-1 identity for a DIFFERENT day -> today's persisted hash no longer matches.
+  const rev = computeFbaAccountRevision({ organizationFingerprint: ORG, accountId: A_ID, requestedAsOf: "2026-09-21", snapshot, expectedRequestHash: expectedHashForAsOf("sA", "UK", "2026-09-21") });
+  ok("a snapshot whose day != the reconciler's requested day DEFERS (snapshot-not-d1), preserving LKG", rev.eligible === false && rev.reason === "snapshot-not-d1");
 });
 
 // Guard: missing I/O collaborators fail closed with a typed error (never a silent no-op success).
