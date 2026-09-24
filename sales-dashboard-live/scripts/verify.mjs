@@ -129,6 +129,8 @@ const SUITES = [
   "test:listing-health-v3-dependency-bundle",
   "test:listings-date-free-request-contract",
   "test:delivery-status",
+  "test:publication-recovery-units",
+  "test:publication-recovery-worker",
   "test:listing-health-v3-durable-loader",
   "test:listing-health-v3-live-identity",
   "test:listing-health-v3-fingerprint-invariant",

@@ -363,6 +363,12 @@ const out = await reconciler.run({ bucket, requestedAsOf: asOf, accountIds: acco
 ghOut("outcome", out.outcome || "unknown");
 ghOut("published_count", String(out.counts ? out.counts.targetsPublished : 0));
 ghOut("failed_count", String(out.counts ? out.counts.targetsFailed : 0));
+// OPT-IN machine-readable per-account states for the independent publication recovery worker (--emit-targets; OFF by
+// default so every existing invocation is byte-identical). Sanitized: ids + state + reason CODE only.
+if (process.argv.includes("--emit-targets")) {
+  const { formatTargetsLine } = await import("../../lib/server/sync/reconcile-targets-output.js");
+  console.log(formatTargetsLine({ family: "fba", summary: { ...out, bucket, requestedAsOf: asOf, dryRun } }));
+}
 console.log("RESULT " + JSON.stringify({
   ok: out.ok, outcome: out.outcome, code: out.code || "OK", bucket, requestedAsOf: asOf, mode, dryRun,
   dataDoeCreates: 0, dataDoeTokens: 0,

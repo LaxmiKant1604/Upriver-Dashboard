@@ -8,3 +8,8 @@
 *.md  text eol=lf
 *.sql text eol=lf
 *.css text eol=lf
+# Deployed to Linux (Ubuntu VM): bash rejects CRLF scripts, and `git archive` applies the
+# checkout conversion (core.autocrlf) unless eol is pinned here.
+*.sh  text eol=lf
+*.service text eol=lf
+*.example text eol=lf

@@ -488,6 +488,12 @@ if (process.env.OLI_RECONCILE_DUMP === "1") {
     console.log("PERACCT " + JSON.stringify({ accountId: String(rec.accountId).slice(0, 8), eligible: rec.eligible, status: rec.status, revisionId: rec.revisionId ? String(rec.revisionId).slice(0, 12) : null, reports }));
   }
 }
+// OPT-IN machine-readable per-account states for the independent publication recovery worker (--emit-targets; OFF by
+// default so every existing invocation is byte-identical). Sanitized: ids + state + reason CODE only.
+if (process.argv.includes("--emit-targets")) {
+  const { formatTargetsLine } = await import("../../lib/server/sync/reconcile-targets-output.js");
+  console.log(formatTargetsLine({ family: "oli", summary: { ...out, bucket, requestedAsOf: asOf, dryRun } }));
+}
 console.log("RESULT " + JSON.stringify({
   ok: out.ok, outcome: out.outcome, code: out.code || "OK", bucket, requestedAsOf: asOf, mode, dryRun,
   dataDoeCreates: 0, dataDoeTokens: 0,
