@@ -44,6 +44,7 @@
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
 import { readFileSync, readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -69,6 +70,7 @@ let SCHEDULER_V2_READY_REPORT_KEYS;
 let CONTROLLED_REPORT_KEYS;
 let SHADOW_PLANNED_REPORT_KEYS;
 let paramsHashFor;
+let REPORT_DERIVATIONS;
 let getSchedulerAccountRollout, getSchedulerPublishApproval, publishLiveSnapshotIfNewer;
 let insightConsts; // { key: [REPORT_KEY const, VERSION const] } from lib/server/reports/*.js
 
@@ -1251,7 +1253,7 @@ test("(EM4) least-privilege service_role ACL: proven for all 3 tables; missing-r
 // =================================================================================================
 group("F. all 13 scheduler->live mappings statically pinned against the REAL live route truths");
 
-test("(F1) exactly 15 contracts (13 dispatch + the 2 source-promoted brand-inventory + listing-health-v3); key/version/params pinned; insight versions equal the live modules' constants", () => {
+test("(F1) exactly 20 contracts (13 dispatch + the 2 source-promoted brand-inventory + listing-health-v3 + the 5 WP1 recovery routes); key/version/params pinned; insight versions equal the live modules' constants", () => {
   const EXPECTED_VERSIONS = {
     "brand-sales": "brand-sales-shared-v1",
     "daily-reporting": "daily-reporting-shared-v2",
@@ -1273,12 +1275,22 @@ test("(F1) exactly 15 contracts (13 dispatch + the 2 source-promoted brand-inven
     // NEVER dispatchable (not in CONTROLLED_REPORT_KEYS; proven below). Live version DISTINCT from the shadow
     // snapshotVersion ("listing-health/v3-oli-window").
     "listing-health-v3": "listing-health-v3-shared-v1",
+    // Publication recovery WP1: the five SOURCE-PROMOTED zero-export recovery ROUTE publisher keys (never dispatchable;
+    // their hooks + identities are proven in publisher-route-hooks.test.js).
+    "sku-movement": "sku-movement/v2",
+    "returns-leakage-v3": "returns-leakage-v3",
+    "brand-view-brands": "brand-view-brands-v1",
+    "brand-view": "brand-view-account-scoped-v2",
+    "brand-view-portfolio": "brand-view-portfolio-v1",
   };
+  // The ONE publisher key whose live report_key differs from the key itself: the v3 Returns route promotes into the
+  // serve's "returns-leakage" report_key under its own live version (=> its own paramsHash; v2 contract untouched).
+  const LIVE_KEY_OVERRIDE = { "returns-leakage-v3": "returns-leakage" };
   assert.ok(Object.isFrozen(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS), "the contract table is frozen");
-  assert.deepEqual(Object.keys(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS).sort(), Object.keys(EXPECTED_VERSIONS).sort(), "exactly the 13 dispatch reports + the 2 source-promoted reports");
+  assert.deepEqual(Object.keys(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS).sort(), Object.keys(EXPECTED_VERSIONS).sort(), "exactly the 13 dispatch reports + the 2 source-promoted reports + the 5 recovery routes");
   for (const [key, version] of Object.entries(EXPECTED_VERSIONS)) {
     const c = SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[key];
-    assert.equal(c.liveReportKey, key, key + ": live key === scheduler key");
+    assert.equal(c.liveReportKey, LIVE_KEY_OVERRIDE[key] || key, key + ": live key === scheduler key (returns-leakage-v3 -> returns-leakage)");
     assert.equal(c.liveReportVersion, version, key + ": pinned live version");
   }
   // The six insight versions/keys must equal the constants the LIVE routes import (single source of truth).
@@ -1355,6 +1367,210 @@ test("(F3) the pinned shared mappings appear VERBATIM in the live api/datadoe.js
 });
 
 // =================================================================================================
+group("F2. WP1 route hooks leave the 15 pre-existing contracts BYTE-IDENTICAL (golden replay pinned to the pre-hook publisher)");
+
+// Replays the 15 pre-existing contracts x 17 scenarios (happy publish, preflight, every gate closed, job/shadow/payload
+// failures, every CAS outcome, transport/settings throws, storage-backed shadow, unknown account) through the REAL
+// publishSchedulerV2Snapshot. The digests below were produced by the PRE-WP1 publisher (HEAD ffb035b + the WP0 tree,
+// before the hook code existed): the result objects, every publishLive argument (stored params INCLUDING key order,
+// paramsHash, live account, payload bytes, refresh stamp) and every collaborator call must reproduce them exactly.
+const G7R_EXISTING_KEYS = [
+  "brand-sales", "daily-reporting", "reconciliation", "sku-pl", "keyword-rank", "content-changes", "fba-plan",
+  "sales-movers", "listing-health", "buy-box-loss", "returns-leakage", "ppc-performance", "listing-optimizer",
+  "brand-inventory", "listing-health-v3",
+];
+const G7R_SCENARIOS = [
+  "publish", "preflight", "control-off", "control-missing", "account-disabled", "not-approved", "job-running",
+  "hash-mismatch", "payload-invalid", "cas-already-current", "cas-newer-live", "cas-conflict", "cas-lease-lost",
+  "cas-throws", "settings-throw", "storage-backed", "unknown-account",
+];
+const G7R_BASELINE_MATRIX_DIGEST = "2f7140bd37582f4f2a02a80c6ace58d267dc53a352152eedf1c44f4560fc39a4";
+const G7R_BASELINE_COUNTS_DIGEST = "a69b79905fa403252ab8a06cac8efe922f9c56bd493b2b62f61dd5864c15f9ab";
+async function g7rReplay() {
+  const ACCT = "IN1";
+  const TO = "2026-08-14";
+  const FROM = "2026-07-01";
+  const TS = "2026-08-14T10:00:00.000Z";
+  const PAYLOADS = {
+    "brand-sales": { rows: [], catalogBrands: [], asinBrand: { A1: "Acme" } },
+    "content-changes": { events: [], catalogBrands: [], unassignedEvents: 0, accountId: ACCT, retrievedAt: null },
+    "daily-reporting": { rows: [], brandFiltered: false, adsAvailability: { status: "available" } },
+    "fba-plan": { rows: [], months: [], inventoryByBrandCountry: [], isUS: false, asOf: TO, inventoryAvailable: true, awdAvailable: false },
+    reconciliation: { orders: [], settlements: [], months: [], from: FROM, to: TO },
+    "sku-pl": { rows: [], months: [], currencies: [], catalogBrands: [] },
+    "keyword-rank": { rows: [], products: [], catalogBrands: [], periods: [], cadence: "weekly", weeklyPeriodCount: 0, accountId: ACCT, retrievedAt: null },
+    "sales-movers": { accountId: ACCT, asOf: TO, dataUnavailable: false, rows: [], catalogBrands: [], salesLatestDate: "2026-08-13", currencies: ["INR"], buyBoxEvaluated: false, inventoryAvailable: true, inventorySnapshotDate: "2026-08-13", windows: { recent: {}, prior: {} } },
+    "listing-health": { accountId: ACCT, asOf: TO, rows: [], catalogBrands: [], currencies: [], issuesAvailable: false, salesWindow: {}, inventoryAvailable: true, inventorySnapshotDate: null, listingCount: 0, issuesUnavailableReason: null },
+    "buy-box-loss": { accountId: ACCT, asOf: TO, rows: [], catalogBrands: [], currencies: [], window: {}, inventoryAvailable: true, inventorySnapshotDate: null, observedWindow: null },
+    "returns-leakage": { accountId: ACCT, asOf: TO, rows: [], catalogBrands: [], currencies: [], reasonTotals: [], window: {}, fbmOnly: {}, returnRecordCount: 0, pendingReturnRequests: 0 },
+    "ppc-performance": { accountId: ACCT, asOf: TO, campaigns: [], asins: [], targets: [], searchTerms: [], daily: [], currencies: [], sourceAvailability: [], catalogBrands: [], totalSales: null, totalSalesUnavailable: true, adsRowCount: 0, latestMetricDate: null },
+    "listing-optimizer": { sqpAvailable: false, window: {}, periods: [], queries: [], products: [], catalogBrands: [], accountId: ACCT, asOf: TO },
+    "brand-inventory": { inventoryByBrandCountry: [], inventoryDate: TO, inventoryAvailable: true },
+    "listing-health-v3": {
+      accountId: ACCT, asOf: TO, rows: [], catalogBrands: [], currencies: [], issuesAvailable: false,
+      window: { kind: "30D", days: 30, from: "2026-07-16", to: TO },
+      coverage: { requestedFrom: "2026-07-16", requestedTo: TO, coveredFrom: "2026-07-16", coveredTo: TO, complete: true, gaps: [] },
+      salesWindowStatus: "complete", inventory: {}, listingCount: 0, issuesUnavailableReason: null, salesSource: "order-line-items",
+    },
+  };
+  // Shadow params EXACTLY as makeShadowSnapshotSaver saves them; the fba-plan row carries the scheduler's full PAID
+  // planned context (report-planner.js) so the WP1 liveParamsExtra pick is proven EMPTY for a real paid shadow.
+  const shadowParamsFor = (key) => {
+    const base = { reportVersion: REPORT_DERIVATIONS[key].snapshotVersion, accountId: ACCT, from: FROM, to: TO };
+    if (key === "fba-plan") return { ...base, inventoryAsOf: TO, rawSellerId: "RAW1", accountName: "India One", marketCountry: "IN", isUS: false };
+    if (key === "daily-reporting") return { ...base, brand: "ALL" };
+    return base;
+  };
+  const matrix = {};
+  const counts = {};
+  for (const key of G7R_EXISTING_KEYS) {
+    for (const sc of G7R_SCENARIOS) {
+      const params = shadowParamsFor(key);
+      const hash = paramsHashFor(params.reportVersion, params);
+      const payload = PAYLOADS[key];
+      const c = { settings: 0, promoted: 0, rollout: 0, discover: 0, approval: [], job: 0, shadow: 0, storage: 0 };
+      const writes = [];
+      const deps = {
+        codeReadyKeys: [key],
+        getReportSyncSettings: async () => {
+          c.settings += 1;
+          if (sc === "settings-throw") throw new Error("boom");
+          if (sc === "control-missing") return [];
+          return [{ report_key: key, schedule_enabled: sc !== "control-off" }];
+        },
+        getPromotedPublishSettings: async () => {
+          c.promoted += 1;
+          if (sc === "settings-throw") throw new Error("boom");
+          if (sc === "control-missing") return [];
+          return [{ report_key: key, publish_enabled: sc !== "control-off" }];
+        },
+        loadAccountRollout: async () => { c.rollout += 1; return { read: "ok", allPrimary: false, enabledAccountIds: sc === "account-disabled" ? ["US9"] : [ACCT] }; },
+        discoverPrimaryAccounts: async () => { c.discover += 1; return [{ accountId: ACCT, country: "IN" }, { accountId: "US9", country: "US" }]; },
+        getPublishApproval: async (k, a) => { c.approval.push(k + "|" + a); return { read: "ok", approved: sc !== "not-approved" }; },
+        getLatestReportJob: async () => { c.job += 1; return { cycle_id: "cyc-1", validated: true, snapshot_params_hash: hash, derive_status: "succeeded", save_status: "succeeded", cycle_status: sc === "job-running" ? "running" : "succeeded" }; },
+        getShadowSnapshot: async () => {
+          c.shadow += 1;
+          const row = { params_hash: sc === "hash-mismatch" ? "f".repeat(40) : hash, params: { ...params }, payload: sc === "payload-invalid" ? { nope: true } : payload, payload_storage_path: null, source_refreshed_at: TS };
+          if (sc === "storage-backed") { row.payload = null; row.payload_storage_path = "report-snapshots/scheduler-v2/" + key + "/" + ACCT + ".json"; }
+          return row;
+        },
+        loadStoragePayload: async () => { c.storage += 1; return payload; },
+        publishLive: async (args) => {
+          writes.push(args);
+          if (sc === "cas-throws") throw new Error("transport");
+          const outcome = { "cas-already-current": "already-current", "cas-newer-live": "newer-live", "cas-conflict": "conflict", "cas-lease-lost": "lease-lost" }[sc] || "inserted";
+          return { outcome };
+        },
+      };
+      const res = await publishSchedulerV2Snapshot(deps, { reportKey: key, accountId: sc === "unknown-account" ? "GHOST" : ACCT, preflight: sc === "preflight" });
+      matrix[key + "|" + sc] = { res, writes };
+      counts[key + "|" + sc] = c;
+    }
+  }
+  return { matrix, counts, shadowParamsFor, ACCT, TO, TS, PAYLOADS };
+}
+// The pre-WP1 binding (evaluatePublicationBinding), candidate resolver (resolveValidatedLiveCandidate) and shared live
+// read-back (buildLivePromotedResolver) over the SAME 15 contracts/fixtures -- the proof paths the WP1 hooks also
+// touched (asOfField, liveAccountId, targetIdentity, liveParamsExtra, semanticIdentity liveParams).
+const G7R_BASELINE_BINDING_DIGEST = "4be0d29f39a91deb937cd684423609582eda1c2b69e98258f122911f8ed254ad";
+async function g7rBindingReplay({ shadowParamsFor, ACCT, TO, TS, PAYLOADS }) {
+  const { evaluatePublicationBinding, resolveValidatedLiveCandidate } = await import("../lib/server/sync/publication-binding.js");
+  const { buildLivePromotedResolver } = await import("../lib/server/sync/live-promoted-resolver.js");
+  const CONTRACTS = SCHEDULER_LIVE_SNAPSHOT_CONTRACTS;
+  const out = {};
+  for (const key of G7R_EXISTING_KEYS) {
+    const contract = CONTRACTS[key];
+    const params = shadowParamsFor(key);
+    const hash = paramsHashFor(params.reportVersion, params);
+    const payload = PAYLOADS[key];
+    const lp = contract.liveParams(params);
+    const candHash = paramsHashFor(contract.liveReportVersion, lp);
+    const job = { deriveStatus: "succeeded", saveStatus: "succeeded", validated: true, cycleStatus: "succeeded", snapshotParamsHash: hash, dependsOn: ["h1"], durableContentDeps: [] };
+    const shadow = { report_key: "scheduler-v2/" + key, account_id: ACCT, params_hash: hash, params: { ...params }, payload, payload_storage_path: null, source_refreshed_at: TS };
+    const live = { report_key: contract.liveReportKey, account_id: ACCT, params_hash: candHash, params: { reportVersion: contract.liveReportVersion, ...lp }, payload, payload_storage_path: null, source_refreshed_at: TS };
+    const revision = { eligible: true, deps: ["h1"], contentDeps: [] };
+    const bind = (over = {}) => evaluatePublicationBinding({
+      revision, accountId: ACCT, reportKey: key, requestedAsOf: lp.to || lp.asOf || TO, expectedShadowKey: "scheduler-v2/" + key,
+      job, shadow, hydratedShadowPayload: payload, live, hydratedLivePayload: payload, liveReadback: { ok: true },
+      contract, computeHash: paramsHashFor, reportDerivations: REPORT_DERIVATIONS, ...over,
+    });
+    const B = {
+      good: bind(),
+      olderAsOf: bind({ requestedAsOf: "2026-08-15" }),
+      badAsOf: bind({ requestedAsOf: "2026-02-30" }),
+      liveMissing: bind({ live: null }),
+      liveAcct: bind({ live: { ...live, account_id: "OTHER" } }),
+      liveRefresh: bind({ live: { ...live, source_refreshed_at: "2026-08-15T00:00:00.000Z" } }),
+      livePayload: bind({ hydratedLivePayload: { ...payload, zz: 1 } }),
+      readback: bind({ liveReadback: { ok: false, reason: "x" } }),
+      notCovered: bind({ revision: { eligible: true, deps: ["h2"], contentDeps: [] } }),
+      ineligible: bind({ revision: { eligible: false, reason: "r" } }),
+    };
+    const rows = new Map([["scheduler-v2/" + key + "|" + hash, shadow], [contract.liveReportKey + "|" + candHash, live]]);
+    const readSnapshot = async ({ reportKey: rk, accountId: a, paramsHash: ph }) => { const r = rows.get(rk + "|" + ph); return r && r.account_id === a ? r : null; };
+    const verifyLiveReadback = buildLivePromotedResolver({ getReportSnapshot: readSnapshot, loadStoragePayload: async () => null, liveContracts: CONTRACTS, reportDerivations: REPORT_DERIVATIONS, computeHash: paramsHashFor });
+    const cand = (over = {}) => resolveValidatedLiveCandidate({
+      reportKey: key, accountId: ACCT, readReportJob: async () => job, readSnapshot, loadStoragePayload: async () => null,
+      verifyLiveReadback, liveContracts: CONTRACTS, computeHash: paramsHashFor, reportDerivations: REPORT_DERIVATIONS, ...over,
+    });
+    const C = {
+      noAsOf: await cand(),
+      exact: await cand({ requestedAsOf: lp.to || lp.asOf || TO }),
+      older: await cand({ requestedAsOf: "2026-08-13" }),
+      badReq: await cand({ requestedAsOf: "nope" }),
+      otherAcct: await cand({ accountId: "OTHER" }),
+    };
+    const R = {
+      good: await verifyLiveReadback({ reportKey: key, liveReportKey: contract.liveReportKey, accountId: ACCT, paramsHash: candHash }),
+      wrongKey: await verifyLiveReadback({ reportKey: key, liveReportKey: "x", accountId: ACCT, paramsHash: candHash }),
+      wrongAcct: await verifyLiveReadback({ reportKey: key, liveReportKey: contract.liveReportKey, accountId: "OTHER", paramsHash: candHash }),
+    };
+    out[key] = { B, C: Object.fromEntries(Object.entries(C).map(([k, v]) => [k, { ok: v.ok, reason: v.reason, dependsOn: v.dependsOn, hasPayload: v.payload != null }])), R: Object.fromEntries(Object.entries(R).map(([k, v]) => [k, { ok: v.ok, reason: v.reason || null }])) };
+  }
+  return out;
+}
+const g7rDigest = (obj) => createHash("sha256").update(JSON.stringify(obj)).digest("hex");
+
+test("(G7R) a replay of all 15 pre-existing contracts yields BYTE-IDENTICAL dispositions, stored params and paramsHash with the WP1 hook code present", async () => {
+  const { matrix, counts, shadowParamsFor, ACCT } = await g7rReplay();
+  assert.equal(Object.keys(matrix).length, 15 * 17, "15 contracts x 17 scenarios replayed");
+  // (1) Independent reference model (the pre-hook contract): the live write is { reportVersion, ...liveParams } at the
+  //     target account, hashed from liveParams ONLY; the result carries ONLY the pre-hook fields (no liveAccountId).
+  for (const key of G7R_EXISTING_KEYS) {
+    const c = SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[key];
+    const lp = c.liveParams(shadowParamsFor(key));
+    const wantHash = paramsHashFor(c.liveReportVersion, lp);
+    const pub = matrix[key + "|publish"];
+    assert.equal(pub.res.disposition, "published", key + ": publishes");
+    assert.deepEqual(Object.keys(pub.res), ["disposition", "reportKey", "accountId", "liveReportKey", "paramsHash"], key + ": result shape unchanged (no hook field leaks)");
+    assert.equal(pub.writes.length, 1, key + ": exactly one CAS write");
+    assert.equal(pub.writes[0].accountId, ACCT, key + ": live account === target account");
+    assert.equal(pub.writes[0].paramsHash, wantHash, key + ": paramsHash from liveParams only");
+    assert.equal(JSON.stringify(pub.writes[0].params), JSON.stringify({ reportVersion: c.liveReportVersion, ...lp }), key + ": stored params (incl. key order) === { reportVersion, ...liveParams }");
+    assert.deepEqual(matrix[key + "|preflight"].res, { disposition: "ready", reportKey: key, accountId: ACCT, liveReportKey: c.liveReportKey, paramsHash: wantHash }, key + ": preflight shape unchanged");
+  }
+  // (2) The FULL matrix (every result + every publishLive argument) equals the PRE-WP1 publisher's output.
+  assert.equal(g7rDigest(matrix), G7R_BASELINE_MATRIX_DIGEST, "dispositions + stored params + paramsHash + CAS args byte-identical to the pre-hook publisher");
+  // (3) Collaborator calls are identical too, with ONE documented WP1 delta: fba-plan's promotedGateKey reads the promoted
+  //     control ONCE when (and only when) its dispatch control is closed -- the disposition stays report-disabled.
+  for (const sc of ["control-off", "control-missing"]) {
+    assert.equal(counts["fba-plan|" + sc].promoted, 1, "fba-plan " + sc + ": the promoted gate row was consulted once");
+    assert.equal(matrix["fba-plan|" + sc].res.disposition, "report-disabled", "fba-plan " + sc + ": still report-disabled (the promoted row is not enabled)");
+    counts["fba-plan|" + sc].promoted = 0;
+  }
+  assert.equal(counts["fba-plan|publish"].promoted, 0, "fba-plan with the dispatch control ON never reads the promoted row");
+  assert.equal(g7rDigest(counts), G7R_BASELINE_COUNTS_DIGEST, "every other collaborator call sequence is byte-identical to the pre-hook publisher");
+});
+
+test("(G7RB) the binding, the candidate resolver and the shared live read-back are BYTE-IDENTICAL for the 15 pre-existing contracts (hooks absent => pre-hook states + reasons)", async () => {
+  const fx = await g7rReplay();
+  const out = await g7rBindingReplay(fx);
+  assert.equal(out["brand-sales"].B.good.state, "PUBLICATION_NOT_REQUIRED", "sanity: the canonical fixture binds");
+  assert.equal(out["brand-sales"].B.olderAsOf.reason, "candidate-asof-not-exact", "sanity: the exact requested-as-of gate still compares params.to");
+  assert.equal(g7rDigest(out), G7R_BASELINE_BINDING_DIGEST, "every binding state/reason, candidate result and read-back verdict equals the pre-hook output");
+});
+
+// =================================================================================================
 group("G. structural isolation: no browser route can promote; the scheduler never auto-publishes");
 
 test("(G1) NO api/ route references the publisher or the rollout module (recursive), EXCEPT the admin Data Sync Center route through the reviewed release engine", () => {
@@ -1423,6 +1639,7 @@ async function loadModules() {
   ({ SCHEDULER_V2_READY_REPORT_KEYS, CONTROLLED_REPORT_KEYS } = await import("../lib/server/sync/report-controls.js"));
   ({ SHADOW_PLANNED_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
   ({ paramsHashFor } = await import("../lib/server/report-store.js"));
+  ({ REPORT_DERIVATIONS } = await import("../lib/server/sync/report-derivation.js"));
   // The GENUINE snapshot hash for the fixture params, from the SAME hasher the saver + publisher use.
   JOB_HASH = paramsHashFor(SHADOW_PARAMS.reportVersion, SHADOW_PARAMS);
   ({ getSchedulerAccountRollout, getSchedulerPublishApproval, publishLiveSnapshotIfNewer } = await import("../lib/server/supabase.js"));

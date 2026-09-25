@@ -4145,12 +4145,16 @@ export async function getLatestSyncReportJob(reportKey, accountId) {
 // plus validated + snapshot_params_hash + latest_data_date. Read-only; returns a typed flat row or null. Used to
 // detect a SAME-AS-OF but content-CORRECTED OLI export: the current durable OLI provenance hashes are compared
 // against this depends_on -- a hash not present here means the OLI advanced and the live snapshot is stale.
+// ADDITIVE lineage identity (publication-recovery WP2): the row's own `id`, its owning `cycleId` (sync_report_jobs.
+// cycle_id) and `createdAt` are also mapped, so a dedicated release can prove the latest job belongs to EXACTLY its
+// terminal priority-partial cycle (the crash-after-finalize resume) and a route can nonce over the latest promotable
+// job id. Every pre-existing field keeps its exact name + value; the new fields are appended (null when absent).
 export async function getLatestReportJobLineage(reportKey, accountId, { signal = null } = {}) {
   // durable_content_deps (migration 20260925, PREPARED-UNAPPLIED) records per-source CONTENT provenance (e.g. the FBA
   // snapshot's payload_sha) that a DATE-addressed depends_on hash cannot represent. FAIL-SOFT: select it, and if the
   // column is absent (migration not yet applied) retry WITHOUT it -> durableContentDeps degrades to [] (the
   // pre-migration behaviour, exactly like ads_sync_state.content_rev / migration 20260923).
-  const baseSelect = "cycle_id,report_key,account_id,derive_status,save_status,validated,depends_on,snapshot_params_hash,latest_data_date,created_at,sync_cycles(status)";
+  const baseSelect = "id,cycle_id,report_key,account_id,derive_status,save_status,validated,depends_on,snapshot_params_hash,latest_data_date,created_at,sync_cycles(status)";
   const fetchRows = (withContentDeps) => {
     const query = new URLSearchParams({
       select: withContentDeps ? baseSelect + ",durable_content_deps" : baseSelect,
@@ -4178,6 +4182,9 @@ export async function getLatestReportJobLineage(reportKey, accountId, { signal =
     snapshotParamsHash: row.snapshot_params_hash ?? null,
     latestDataDate: row.latest_data_date ?? null,
     cycleStatus: cycle && typeof cycle === "object" ? (cycle.status ?? null) : null,
+    id: row.id ?? null,
+    cycleId: row.cycle_id ?? null,
+    createdAt: row.created_at ?? null,
   };
 }
 
@@ -4802,6 +4809,68 @@ export async function saveShadowSnapshotIfNewer({ reportKey, accountId, paramsHa
   if (livePayload == null || candPayload == null) return { outcome: "conflict" };
   if (canonicalJsonString(livePayload) !== canonicalJsonString(candPayload)) return { outcome: "conflict" };
   return { outcome: "already-current" };
+}
+
+// Publication-recovery WP2: the SIX route publisher keys whose scheduler-v2/<key> shadows are CONTENT-ADDRESSED per
+// evidence revision (params.route + params.rev) and so accumulate one row per revision. HARD-CODED on purpose: the prune
+// below can never be pointed at any other shadow namespace (the OLI/FBA/Ads/LHv3 families keep ONE shadow per identity
+// that the publisher's GATE-7 job binding reads) nor at a live key (the filter always prefixes scheduler-v2/).
+export const ROUTE_SHADOW_PRUNE_PUBLISHER_KEYS = Object.freeze([
+  "fba-plan", "sku-movement", "returns-leakage-v3", "brand-view-brands", "brand-view", "brand-view-portfolio",
+]);
+const ROUTE_SHADOW_ROUTE_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const ROUTE_SHADOW_PARAMS_HASH_RE = /^[0-9a-f]{40}$/; // exactly paramsHashFor's output (sha256 hex, first 40)
+
+function routeShadowPruneRefused(detail) {
+  const error = new Error(`deleteRouteShadowSnapshots refused (fail closed, zero rows deleted): ${detail}`);
+  error.code = "ROUTE_SHADOW_PRUNE_REFUSED";
+  return error;
+}
+
+/**
+ * GUARDED prune of SUPERSEDED content-addressed ROUTE shadows (publication-recovery WP2). Not called by any existing
+ * path. ONE REST DELETE on report_snapshots restricted to ALL of:
+ *   report_key   = 'scheduler-v2/' + publisherKey   (publisherKey in ROUTE_SHADOW_PRUNE_PUBLISHER_KEYS; never live)
+ *   account_id   = targetId
+ *   params->>route = routeId                         (paid fba-plan shadows carry NO route param -> can never match)
+ *   params->>rev   IS NOT NULL                       (only content-addressed revision shadows)
+ *   params_hash  NOT IN keepParamsHashes             (non-empty; the caller keeps the latest promotable job's shadow +
+ *                                                     any in-flight revision)
+ *   updated_at   < olderThanIso                      (a concurrent prepare's fresh shadow is never touched)
+ * Every argument is validated BEFORE any request; a bad argument throws ROUTE_SHADOW_PRUNE_REFUSED with ZERO network.
+ * Returns the deleted row count (return=representation of the deleted params_hash only; never a payload).
+ */
+export async function deleteRouteShadowSnapshots({ routeId, publisherKey, targetId, keepParamsHashes, olderThanIso } = {}, { signal = null } = {}) {
+  const key = typeof publisherKey === "string" ? publisherKey : "";
+  if (!ROUTE_SHADOW_PRUNE_PUBLISHER_KEYS.includes(key)) throw routeShadowPruneRefused("publisherKey is not one of the route publisher keys");
+  if (typeof routeId !== "string" || !ROUTE_SHADOW_ROUTE_ID_RE.test(routeId)) throw routeShadowPruneRefused("routeId is blank or malformed");
+  if (typeof targetId !== "string" || targetId.trim() === "" || targetId !== targetId.trim()) throw routeShadowPruneRefused("targetId is blank or padded");
+  const keep = Array.isArray(keepParamsHashes) ? [...new Set(keepParamsHashes)] : [];
+  if (keep.length === 0 || !keep.every((h) => typeof h === "string" && ROUTE_SHADOW_PARAMS_HASH_RE.test(h))) {
+    throw routeShadowPruneRefused("keepParamsHashes must be a non-empty list of params hashes");
+  }
+  const olderMs = typeof olderThanIso === "string" ? Date.parse(olderThanIso) : NaN;
+  if (!Number.isFinite(olderMs)) throw routeShadowPruneRefused("olderThanIso is not a timestamp");
+  const query = new URLSearchParams({
+    select: "params_hash",
+    report_key: `eq.scheduler-v2/${key}`,
+    account_id: `eq.${targetId}`,
+    "params->>route": `eq.${routeId}`,
+    "params->>rev": "not.is.null",
+    params_hash: `not.in.(${keep.join(",")})`,
+    updated_at: `lt.${new Date(olderMs).toISOString()}`,
+  });
+  const rows = await request(`/rest/v1/report_snapshots?${query}`, {
+    method: "DELETE",
+    signal,
+    headers: { Prefer: "return=representation" },
+  });
+  if (!Array.isArray(rows)) {
+    const error = new Error("deleteRouteShadowSnapshots: DELETE acknowledgement is not a row array (deleted count unknown).");
+    error.code = "ROUTE_SHADOW_PRUNE_ACK_INVALID";
+    throw error;
+  }
+  return rows.length;
 }
 
 // Hard budget for one PPC read. PostgREST returns at most 1,000 rows per

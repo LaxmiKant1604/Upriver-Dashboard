@@ -94,6 +94,18 @@ export const SOURCE_PROMOTED_REPORT_KEYS = Object.freeze([
   // (no dispatcher can select it) and SCHEDULER_V2_READY_REPORT_KEYS; its GATE-2 durable enable is the promoted
   // publish control (source_promoted_publish_settings.publish_enabled; default OFF, fail-closed).
   "listing-health-v3",
+  // Publication recovery WP1: the five ZERO-EXPORT recovery ROUTE publisher keys. Each is PRODUCED from durable saved
+  // evidence by its route (publication-route-reconcile.mjs --route=<id>) and PROMOTED through the SAME four gates + the
+  // SAME fenced CAS as every key above -- never dispatched. Like brand-inventory they are DISJOINT from
+  // CONTROLLED_REPORT_KEYS and SCHEDULER_V2_READY_REPORT_KEYS (structurally undispatchable; pinned by
+  // publisher-route-hooks.test.js), and their GATE-2 durable enable is their own promoted publish control (default
+  // OFF, fail-closed). "returns-leakage-v3" is a PUBLISHER key only: its live report_key stays "returns-leakage" (the
+  // v3 serve identity), and the v2 "returns-leakage" dispatch key above is untouched.
+  "sku-movement",
+  "returns-leakage-v3",
+  "brand-view-brands",
+  "brand-view",
+  "brand-view-portfolio",
 ]);
 
 // The Scheduler-v2 control catalog: SAME row shape as reportControlCatalog, but `ready` is the explicit

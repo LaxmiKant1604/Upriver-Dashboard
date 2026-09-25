@@ -17,6 +17,9 @@
 //      manifest converges to a zero-write no-op via revisionCoveredByJob);
 //   5. finalize ONLY this dedicated cycle; preflight + publish + canonical read-back ONLY listing-health-v3 through the
 //      reviewed FENCED publisher + CAS + buildLiveReadback.
+//   A retry whose dedicated cycle is already TERMINAL (a crash after step 5's finalize, before the publish) resumes at
+//   preflight/publish ONLY when the latest job is provably this exact derivation (resumableAtTerminalCycle); anything
+//   else still defers 'cycle-not-running'. A publish 'newer-live' is a retryable NEWER_LIVE deferral (zero rows written).
 //
 // TERMINATION BOUNDARY: the caller's AbortSignal is threaded into EVERY supported read/write (the bundle resolver
 // forwards it through pointer reads, storage hydration, AND the durable OLI/catalog loader), abort is rechecked AFTER
@@ -26,6 +29,8 @@
 // Every side effect is an INJECTED collaborator (offline-testable); the production entrypoint wires the real resolver +
 // publisher + control fence. It imports NO provider export transport. The returned per-account result is the SAME typed
 // shape the release runner returns. 7-bit ASCII, LF.
+
+import { jobIsPromotable, revisionCoveredByJob } from "./publication-binding.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
@@ -44,6 +49,34 @@ const DEADLINE = () => defer("deadline-aborted", "DEADLINE_ABORTED");
 const contention = (reason) => ({ code: 1, ok: false, stage: "contention", status: "CONTROL_LEASE_LOST", leaseLost: true, reason, blockerCodes: [], problems: [reason] });
 // A HARD, non-retryable failure (integrity / publish / readback). stage NOT in RETRYABLE_STAGES -> FAILED_* + non-green.
 const hardFail = (stage, reason) => ({ code: 1, ok: false, stage, status: null, leaseLost: false, reason, blockerCodes: stage.startsWith("derive") ? ["derive:" + reason] : [], problems: [reason] });
+// A publish 'newer-live' (publication-recovery WP2): the fenced live CAS found a STRICTLY-NEWER live row and wrote ZERO
+// rows (LKG kept). A benign freshness outcome, never a hard publish failure: status NEWER_LIVE is in the shared
+// statusFromRelease RETRYABLE_STATUS -> DEFERRED_DEPENDENCY (the recovery worker classes it superseded-newer-live). Same
+// typed {stage, status, reason} as source-priority-release-runner.js's publish-newer-live deferral.
+const newerLive = () => ({ code: 1, ok: false, stage: "publish", status: "NEWER_LIVE", leaseLost: false, reason: "publish-newer-live", blockerCodes: [], problems: ["publish-newer-live"] });
+
+// Default readLatestJob = supabase getLatestReportJobLineage, loaded LAZILY on first use: supabase.js captures its
+// credentials at module evaluation, so a STATIC import would evaluate it whenever this module is imported (the
+// release-env import-ordering defect, release-env-ordering.test.js) and would make this collaborator-injected module
+// non-leaf. Only the terminal-cycle resume below ever calls it; tests inject a reader.
+const defaultReadLatestJob = async (reportKey, accountId, opt) => (await import("../supabase.js")).getLatestReportJobLineage(reportKey, accountId, opt);
+
+// NARROW CRASH-STRAND RESUME (publication-recovery WP2; C's resume-at-terminal-cycle, NO cycle-nonce retrofit). A pass
+// killed AFTER finalize and BEFORE the live publish leaves this revision's dedicated cycle TERMINAL; the retry (same
+// revision -> same bucket) can never claim it and used to defer 'cycle-not-running:<status>' forever (the worker's
+// TERMINAL_CYCLE dead-letter). It RESUMES at preflight -> verifyLease -> publish -> read-back ONLY when the latest job
+// for (report, account) PROVABLY is this exact derivation already completed: it belongs to EXACTLY this cycle, is
+// promotable (validated + succeeded in a terminal cycle + nonblank hash), carries EXACTLY this derive's shadow params
+// hash, and its lineage covers EXACTLY this derive's deps + content deps. Anything else (another cycle's job, another
+// revision, an unreadable job) keeps today's defer. The publisher re-proves every gate + the shadow hash provenance +
+// the payload contract before the fenced CAS, so a resume never trusts the job row alone.
+function resumableAtTerminalCycle(job, { cycleId, paramsHash, dependsOn, durableContentDeps }) {
+  return !!job && nb(cycleId)
+    && S(job.cycleId) === S(cycleId)
+    && jobIsPromotable(job)
+    && S(job.snapshotParamsHash) === S(paramsHash)
+    && revisionCoveredByJob({ eligible: true, deps: dependsOn, contentDeps: durableContentDeps }, job);
+}
 
 // A single-owner no-date fragment source (Listings / Listings-Raw): the derive's noDateFragmentRows requires EXACTLY one
 // fragment with from===null, to===null, sellerOrVendorIds===[rawSellerId]. `available:true` + Array.isArray(rows) gates
@@ -68,6 +101,8 @@ function noDateSource(requestKey, rows, rawSellerId) {
  *   saveShadow(args, { signal }) / reconcileSuccess(args, { signal }) / finalizeCycle({ cycleId }, { signal })
  *   publisher { preflight(reportKey, accountId), publish(reportKey, accountId) }  (buildSchedulerV2Publisher, fenced)
  *   readbackLive({ reportKey, liveReportKey, accountId, paramsHash, signal }) -> { ok, reason? }
+ *   readLatestJob(reportKey, accountId, { signal }) -> lineage | null   (default getLatestReportJobLineage; read ONLY
+ *       by the terminal-cycle resume)
  *   verifyLease() -> { ok, reason? } ; snapshotBytes(payload) ; leaseSeconds ; log
  */
 export function buildListingHealthV3Release({
@@ -78,12 +113,13 @@ export function buildListingHealthV3Release({
   upsertReportJob, claimLease, saveShadow, reconcileSuccess,
   finalizeCycle,
   publisher, readbackLive,
+  readLatestJob = defaultReadLatestJob,
   verifyLease = async () => ({ ok: true }),
   snapshotBytes = (p) => Buffer.byteLength(JSON.stringify(p == null ? null : p), "utf8"),
   leaseSeconds = 300,
   log = () => {},
 } = {}) {
-  for (const [name, fn] of [["resolveBundle", resolveBundle], ["openCycle", openCycle], ["getCycleByBucketDate", getCycleByBucketDate], ["claimCycle", claimCycle], ["deriveSnapshot", deriveSnapshot], ["computeHash", computeHash], ["upsertReportJob", upsertReportJob], ["claimLease", claimLease], ["saveShadow", saveShadow], ["reconcileSuccess", reconcileSuccess], ["finalizeCycle", finalizeCycle], ["readbackLive", readbackLive]]) {
+  for (const [name, fn] of [["resolveBundle", resolveBundle], ["openCycle", openCycle], ["getCycleByBucketDate", getCycleByBucketDate], ["claimCycle", claimCycle], ["deriveSnapshot", deriveSnapshot], ["computeHash", computeHash], ["upsertReportJob", upsertReportJob], ["claimLease", claimLease], ["saveShadow", saveShadow], ["reconcileSuccess", reconcileSuccess], ["finalizeCycle", finalizeCycle], ["readbackLive", readbackLive], ["readLatestJob", readLatestJob]]) {
     if (typeof fn !== "function") throw new Error(`buildListingHealthV3Release requires ${name} (fail closed).`);
   }
   if (!liveContracts || !reportDerivations) throw new Error("buildListingHealthV3Release requires liveContracts + reportDerivations (fail closed).");
@@ -173,72 +209,86 @@ export function buildListingHealthV3Release({
 
     // Claim the freshly-opened cycle pending -> running (claim_sync_cycle) BEFORE finalize (finalize requires 'running',
     // else 'invalid-status'). Idempotent: true = this call won pending->running; false = already running (resume a prior
-    // in-flight pass -> re-read requires 'running') or terminal (already finalized -> defer fail-closed).
+    // in-flight pass -> re-read requires 'running') or terminal (already finalized -> defer fail-closed, UNLESS the
+    // WP2 crash-strand resume proves this exact derivation already completed in it -> skip straight to publish).
     if (aborted()) return DEADLINE();
     let claimed;
     try { claimed = await claimCycle(cycleId, opt); }
     catch (e) { return defer("cycle-claim-threw:" + S(e && e.message)); }
+    let resumed = false;
     if (claimed !== true) {
       let recheck;
       try { recheck = await getCycleByBucketDate(cycleBucket, requestedAsOf, opt); }
       catch (e) { return defer("cycle-reclaim-read-threw:" + S(e && e.message)); }
-      if (S(recheck && recheck.status) !== "running") return defer("cycle-not-running:" + S(recheck && recheck.status));
+      const cycleStatus = S(recheck && recheck.status);
+      if (cycleStatus !== "running") {
+        if (cycleStatus !== "succeeded" && cycleStatus !== "partial") return defer("cycle-not-running:" + cycleStatus);
+        // Terminal: read the latest job (signal-threaded, read-only). An unreadable job never resumes (fail closed).
+        if (aborted()) return DEADLINE();
+        let latest = null;
+        try { latest = await readLatestJob(LIVE_REPORT_KEY, accountId, opt); } catch { latest = null; }
+        if (aborted()) return DEADLINE();
+        if (!resumableAtTerminalCycle(latest, { cycleId, paramsHash, dependsOn, durableContentDeps })) return defer("cycle-not-running:" + cycleStatus);
+        resumed = true; // zero job/shadow/finalize writes: the terminal cycle already holds this derivation's validated job
+      }
     }
 
-    if (aborted()) return DEADLINE();
-    // The report JOB carries the REAL REGION bucket, NOT the priority-partial CYCLE bucket -- sync_report_jobs_bucket_check
-    // permits only the region buckets (migration 20260924 widened only sync_cycles.bucket for the priority-partial CYCLE
-    // namespace, keeping the report-job bucket the real region, like the scheduler's priority release). cycleBucket here
-    // would violate sync_report_jobs_bucket_check (400 constraint -> lineage-upsert-threw).
-    const jobBucket = (S(cycleBucket).match(/^priority-partial-(india|europe-au|us-ca)-/) || [])[1] || "";
-    if (!nb(jobBucket)) return hardFail("derive", "job-bucket-unresolved");
-    try {
-      await upsertReportJob({
-        cycleId, reportKey: LIVE_REPORT_KEY, reportVersion: SHADOW_REPORT_VERSION,
-        accountId, connectionId: "primary", bucket: jobBucket,
-        dependsOn, durableContentDeps,
-      }, opt);
-    } catch (e) { return hardFail("derive", "lineage-upsert-threw:" + S(e && e.message)); }
+    if (!resumed) {
+      if (aborted()) return DEADLINE();
+      // The report JOB carries the REAL REGION bucket, NOT the priority-partial CYCLE bucket -- sync_report_jobs_bucket_check
+      // permits only the region buckets (migration 20260924 widened only sync_cycles.bucket for the priority-partial CYCLE
+      // namespace, keeping the report-job bucket the real region, like the scheduler's priority release). cycleBucket here
+      // would violate sync_report_jobs_bucket_check (400 constraint -> lineage-upsert-threw).
+      const jobBucket = (S(cycleBucket).match(/^priority-partial-(india|europe-au|us-ca)-/) || [])[1] || "";
+      if (!nb(jobBucket)) return hardFail("derive", "job-bucket-unresolved");
+      try {
+        await upsertReportJob({
+          cycleId, reportKey: LIVE_REPORT_KEY, reportVersion: SHADOW_REPORT_VERSION,
+          accountId, connectionId: "primary", bucket: jobBucket,
+          dependsOn, durableContentDeps,
+        }, opt);
+      } catch (e) { return hardFail("derive", "lineage-upsert-threw:" + S(e && e.message)); }
 
-    if (aborted()) return DEADLINE();
-    let lease;
-    try { lease = await claimLease(cycleId, LIVE_REPORT_KEY, accountId, { leaseSeconds, signal }); }
-    catch (e) { return defer("claim-threw:" + S(e && e.message)); }
-    if (aborted()) return DEADLINE();
-    const disp = lease && lease.disposition;
-    if (disp === "already-complete") {
-      if (S(lease.snapshotParamsHash) !== S(paramsHash)) return hardFail("derive", "already-complete-hash-mismatch");
-    } else if (disp === "held") {
-      return defer("claim-held", "SOURCE_READINESS_PENDING");
-    } else if ((disp !== "claimed" && disp !== "reclaimed") || !nb(lease.leaseToken)) {
-      return hardFail("derive", "claim-" + S(disp || "malformed"));
-    }
-    if (disp === "claimed" || disp === "reclaimed") {
       if (aborted()) return DEADLINE();
-      let cas;
-      try { cas = await saveShadow({ reportKey: SHADOW_KEY, accountId, paramsHash, params, payload, payloadBytes: snapshotBytes(payload), sourceRefreshedAt }, opt); }
-      catch (e) { return hardFail("derive", "shadow-cas-threw:" + S(e && e.message)); }
+      let lease;
+      try { lease = await claimLease(cycleId, LIVE_REPORT_KEY, accountId, { leaseSeconds, signal }); }
+      catch (e) { return defer("claim-threw:" + S(e && e.message)); }
       if (aborted()) return DEADLINE();
-      const outcome = cas && cas.outcome;
-      if (outcome === "newer-live") return defer("shadow-newer-live"); // a newer durable exists -> resumable, LKG kept
-      if (outcome !== "inserted" && outcome !== "replaced" && outcome !== "already-current") return hardFail("derive", "shadow-conflict:" + S(outcome));
-      if (aborted()) return DEADLINE();
-      let rec;
-      try { rec = await reconcileSuccess({ cycleId, reportKey: LIVE_REPORT_KEY, accountId, snapshotParamsHash: paramsHash, leaseToken: lease.leaseToken, latestDataDate: derived.latestDataDate || null }, opt); }
-      catch (e) { return hardFail("derive", "reconcile-threw:" + S(e && e.message)); }
-      if (aborted()) return DEADLINE();
-      const rdisp = rec && rec.disposition;
-      if (rdisp !== "reconciled" && rdisp !== "already-complete") return hardFail("derive", "reconcile-" + S(rdisp || "malformed"));
-    }
+      const disp = lease && lease.disposition;
+      if (disp === "already-complete") {
+        if (S(lease.snapshotParamsHash) !== S(paramsHash)) return hardFail("derive", "already-complete-hash-mismatch");
+      } else if (disp === "held") {
+        return defer("claim-held", "SOURCE_READINESS_PENDING");
+      } else if ((disp !== "claimed" && disp !== "reclaimed") || !nb(lease.leaseToken)) {
+        return hardFail("derive", "claim-" + S(disp || "malformed"));
+      }
+      if (disp === "claimed" || disp === "reclaimed") {
+        if (aborted()) return DEADLINE();
+        let cas;
+        try { cas = await saveShadow({ reportKey: SHADOW_KEY, accountId, paramsHash, params, payload, payloadBytes: snapshotBytes(payload), sourceRefreshedAt }, opt); }
+        catch (e) { return hardFail("derive", "shadow-cas-threw:" + S(e && e.message)); }
+        if (aborted()) return DEADLINE();
+        const outcome = cas && cas.outcome;
+        if (outcome === "newer-live") return defer("shadow-newer-live"); // a newer durable exists -> resumable, LKG kept
+        if (outcome !== "inserted" && outcome !== "replaced" && outcome !== "already-current") return hardFail("derive", "shadow-conflict:" + S(outcome));
+        if (aborted()) return DEADLINE();
+        let rec;
+        try { rec = await reconcileSuccess({ cycleId, reportKey: LIVE_REPORT_KEY, accountId, snapshotParamsHash: paramsHash, leaseToken: lease.leaseToken, latestDataDate: derived.latestDataDate || null }, opt); }
+        catch (e) { return hardFail("derive", "reconcile-threw:" + S(e && e.message)); }
+        if (aborted()) return DEADLINE();
+        const rdisp = rec && rec.disposition;
+        if (rdisp !== "reconciled" && rdisp !== "already-complete") return hardFail("derive", "reconcile-" + S(rdisp || "malformed"));
+      }
 
-    // (5) finalize ONLY this dedicated cycle (directly).
-    if (aborted()) return DEADLINE();
-    let fin;
-    try { fin = await finalizeCycle({ cycleId }, opt); }
-    catch (e) { return hardFail("finalize", "finalize-threw:" + S(e && e.message)); }
-    if (aborted()) return DEADLINE();
-    const fdisp = fin && fin.disposition;
-    if (fdisp !== "finalized" && fdisp !== "already-terminal") return hardFail("finalize", "finalize-" + S(fdisp || "malformed"));
+      // (5) finalize ONLY this dedicated cycle (directly).
+      if (aborted()) return DEADLINE();
+      let fin;
+      try { fin = await finalizeCycle({ cycleId }, opt); }
+      catch (e) { return hardFail("finalize", "finalize-threw:" + S(e && e.message)); }
+      if (aborted()) return DEADLINE();
+      const fdisp = fin && fin.disposition;
+      if (fdisp !== "finalized" && fdisp !== "already-terminal") return hardFail("finalize", "finalize-" + S(fdisp || "malformed"));
+    }
 
     // preflight + publish + read back ONLY listing-health-v3 (reviewed fenced publisher + CAS + buildLiveReadback).
     if (aborted()) return DEADLINE();
@@ -260,6 +310,7 @@ export function buildListingHealthV3Release({
     catch (e) { return hardFail("publish", "publish-threw:" + S(e && e.message)); }
     const pdisp = res && S(res.disposition);
     if (pdisp === "lease-lost") return contention("publish-lease-lost");
+    if (pdisp === "newer-live") return newerLive(); // zero rows written; the strictly-newer live LKG is retained
     if (pdisp !== "published" && pdisp !== "already-current") return hardFail("publish", "publish-" + S(pdisp));
     if (!nb(res.liveReportKey) || !nb(res.paramsHash)) return hardFail("publish", "publish-missing-live-identity");
 
@@ -271,7 +322,7 @@ export function buildListingHealthV3Release({
     if (aborted()) return DEADLINE();
     if (!rb || rb.ok !== true) return hardFail("readback", "live-readback-failed:" + S(rb && rb.reason));
 
-    log("listing-health-v3: published + read back listing-health-v3 for " + accountId + " (" + pdisp + ")");
+    log("listing-health-v3: published + read back listing-health-v3 for " + accountId + " (" + pdisp + (resumed ? ", resumed at terminal cycle" : "") + ")");
     return ok();
   }
 

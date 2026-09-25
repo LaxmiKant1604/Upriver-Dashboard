@@ -45,9 +45,11 @@ export function buildLivePromotedResolver({ getReportSnapshot, loadStoragePayloa
     // OPTIONAL per-report SEMANTIC identity: prove the payload's OWN account/date/window agree with the requested
     // account + the live params.to. A report contract with no hook is byte-for-byte unchanged (OLI/FBA/Ads); only
     // listing-health-v3 defines one today. A structurally-valid but wrong-account / wrong-day / wrong-window payload
-    // fails here (it can never masquerade as this account's exact-D-1 promotion).
+    // fails here (it can never masquerade as this account's exact-D-1 promotion). WP1: the hook also receives the full
+    // re-derived `liveParams` (route contracts key their identity by asOf/brand/accountIds, not `to`); LHv3 ignores it.
+    // The stored route extras (liveParamsExtra) never enter liveParams, so the provenance hash above is unaffected.
     if (typeof contract.semanticIdentity === "function") {
-      const sem = contract.semanticIdentity(payload, { accountId, to: liveParams.to });
+      const sem = contract.semanticIdentity(payload, { accountId, to: liveParams.to, liveParams });
       if (!sem || sem.ok !== true) return { ok: false, reason: "semantic-identity:" + S(sem && sem.reason) };
     }
     return { ok: true, payload };

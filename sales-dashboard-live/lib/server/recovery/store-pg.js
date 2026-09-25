@@ -3,6 +3,7 @@
 // control plane, sync tables, or any source table; it never loads a source payload (metadata columns only).
 
 import pg from "pg";
+import { verifiedPgConfig } from "../pg-tls.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const iso = (v) => (v instanceof Date ? v.toISOString() : v == null ? "" : String(v));
@@ -38,21 +39,16 @@ export function regionForCycleBucket(bucket) {
 }
 
 /**
- * The pooled connection string, exactly as the release scripts build it: sslmode FORCED to no-verify. The production
- * POSTGRES_URL carries sslmode=require, which pg-connection-string >= 2.x treats as verify-full -- the Supabase pooler
- * chain then fails with SELF_SIGNED_CERT_IN_CHAIN. A malformed URL throws a REDACTED error (Node's own ERR_INVALID_URL
- * would print the whole value, password included).
+ * The worker's pool config: VERIFIED TLS (chain pinned to the Supabase root CA + hostname checked; lib/server/pg-tls.js)
+ * -- never sslmode=no-verify / rejectUnauthorized:false. The URL query (incl. sslmode=require) is dropped so it cannot
+ * override the verified `ssl`. A malformed URL throws a REDACTED error (Node's ERR_INVALID_URL prints the password).
  */
-export function recoveryConnectionString(connectionString) {
-  let url;
-  try { url = new URL(String(connectionString || "")); }
-  catch { throw new Error("POSTGRES_URL is not a valid URL (value not printed; check for unencoded / # ? in the password, or stray quotes)"); }
-  url.searchParams.set("sslmode", "no-verify");
-  return url.toString();
+export function recoveryPoolConfig(connectionString, { max = 2 } = {}) {
+  return verifiedPgConfig(connectionString, { max, idleTimeoutMillis: 30000, connectionTimeoutMillis: 15000, statement_timeout: 60000, types: recoveryPgTypes });
 }
 
 export function createRecoveryStore({ connectionString, max = 2, poolImpl = null, onError = () => {} }) {
-  const pool = poolImpl || new pg.Pool({ connectionString: recoveryConnectionString(connectionString), max, idleTimeoutMillis: 30000, connectionTimeoutMillis: 15000, statement_timeout: 60000, types: recoveryPgTypes });
+  const pool = poolImpl || new pg.Pool(recoveryPoolConfig(connectionString, { max }));
   // pg-pool re-emits an IDLE client's error (pooler restart, network drop) on the pool; without a listener that is an
   // uncaught exception that would kill the worker (and, via KillMode=mixed, a live child). Log the code only.
   if (typeof pool.on === "function") pool.on("error", (e) => { try { onError(String((e && e.code) || "error")); } catch { /* ignore */ } });

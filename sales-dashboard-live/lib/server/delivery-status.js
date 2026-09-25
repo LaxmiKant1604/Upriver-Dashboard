@@ -26,7 +26,7 @@ import { OLI_LINEAGE_DEPENDS_ON } from "./sync/oli-dependent-reports.js";
 import { ADS_LINEAGE_DEPENDS_ON, ADS_CAMPAIGN_SOURCE_KEY, adsWorkerKeyForGrain } from "./sync/ads-dependent-reports.js";
 import { FBA_LINEAGE_DEPENDS_ON } from "./sync/fba-dependent-reports.js";
 import { LISTINGS_LINEAGE_DEPENDS_ON } from "./sync/listing-health-v3-dependent-reports.js";
-import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "./sync/report-publisher.js";
+import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS, RECOVERY_ROUTE_PUBLISHER_KEYS } from "./sync/report-publisher.js";
 // The CANONICAL active-connection predicate every scheduler/reconciler/publisher path already applies (report-planner,
 // sync-dispatch, source-bucket-sync-runtime, publisher-composition, all four reconcilers). The admin view MUST apply
 // the SAME one so it can never show an account the pipeline will not operate. datadoe-connections.js is a pure registry
@@ -87,7 +87,9 @@ export const DELIVERY_SOURCES = Object.freeze([
 
 // ---- Registry-derived source -> dependent live-report mapping (drift-proof). ----
 const LINEAGE_MAPS = [OLI_LINEAGE_DEPENDS_ON, ADS_LINEAGE_DEPENDS_ON, FBA_LINEAGE_DEPENDS_ON, LISTINGS_LINEAGE_DEPENDS_ON];
-export const LIVE_PUBLISHABLE_REPORT_KEYS = Object.freeze(Object.keys(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS).slice().sort());
+// The recovery-route publisher keys (publication recovery WP1) are excluded: this read-only view keeps its pre-existing
+// universe byte-identical (no extra per-key live-meta read, no new Unavailable note) until it deliberately adopts them.
+export const LIVE_PUBLISHABLE_REPORT_KEYS = Object.freeze(Object.keys(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS).filter((rk) => !RECOVERY_ROUTE_PUBLISHER_KEYS.includes(rk)).slice().sort());
 
 // ---- Registry-derived "has an ACTIVE per-region live publisher" predicate (drift-proof; never hardcoded). ----
 // A live-publishable report is a REAL current publication target ONLY when the canonical materialization registry says

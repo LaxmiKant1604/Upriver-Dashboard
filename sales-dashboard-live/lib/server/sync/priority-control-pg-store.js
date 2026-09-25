@@ -7,6 +7,7 @@
 // imported by trusted server-side operators/routes (never the pure derivation graph).
 
 import pg from "pg";
+import { verifiedPgConfig } from "../pg-tls.js";
 import { getDataDoeConnections, classifyDirectoryAccounts } from "../datadoe-connections.js";
 import { fetchAccountsDetailed as fetchDataDoeAccountsDetailed } from "../datadoe.js";
 import { getAccountOnboardingRows, getAccountDirectorySnapshotAccounts } from "../supabase.js";
@@ -60,8 +61,8 @@ export async function discoverPrimaryAccountIds(bucket = null) {
 
 export async function connectPriorityControlStore() {
   const ADV = PRIORITY_CONTROL_ADVISORY_LOCK;
-  const base = String(process.env.POSTGRES_URL).split("?")[0];
-  const client = new pg.Client({ connectionString: base, ssl: { rejectUnauthorized: false } });
+  // Verified TLS: chain pinned to the Supabase root CA + hostname checked (lib/server/pg-tls.js).
+  const client = new pg.Client(verifiedPgConfig(process.env.POSTGRES_URL));
   const q = (t, p) => client.query(t, p);
   await client.connect();
   const hasSchedulerCron = async () => {

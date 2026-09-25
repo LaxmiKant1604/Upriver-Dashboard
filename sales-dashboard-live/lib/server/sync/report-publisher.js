@@ -35,6 +35,13 @@ import { resolveRolloutAccounts } from "./account-rollout.js";
 import { isValidCalendarDate } from "./report-source-contracts.js";
 import { paramsHashFor } from "../report-store.js";
 import { listingHealthV3SemanticIdentity } from "../reports/listing-health-v3-live-identity.js";
+// WP1 route hooks: the SAME pure helpers the binding + candidate resolver use, so a hook means one thing everywhere.
+import {
+  contractGatesNeedShadow, contractLiveAccountId, contractGateAccountIds, contractLiveParamsExtra, contractTargetIdentityOk,
+} from "./publication-binding.js";
+// The CANONICAL Brand View scope-id rules (brand-view.js:112-120) -- the route contracts' targetIdentity proves the
+// target IS that scope, never a re-implemented copy.
+import { brandViewScopeId, brandViewPortfolioScopeId } from "../reports/brand-view.js";
 
 // Round-6 fix 3: the publisher's CODE-readiness set = the 13 approved DISPATCH keys plus the
 // source-promoted keys (compact brand-inventory). Source-promoted keys are publishable through the SAME
@@ -52,6 +59,41 @@ const norm = (s) => String(s ?? "").trim();
 // from/to contract additionally requires from <= to (lexicographic == chronological for valid ISO dates).
 const isDate = (v) => isValidCalendarDate(v);
 const orderedRange = (from, to) => isDate(from) && isDate(to) && from <= to;
+const nb = (v) => norm(v) !== "";
+
+// WP1 route-contract helpers. `pickExtra` builds a liveParamsExtra hook that copies ONLY the named shadow params that are
+// present (an absent key contributes nothing -- so a paid fba-plan shadow, which carries no route token, stores exactly
+// the pre-hook params); the publisher then validates the picked values (allowlisted keys, nonblank strings <= 200).
+const pickExtra = (...keys) => (p) => {
+  const out = {};
+  for (const k of keys) if (p && Object.prototype.hasOwnProperty.call(p, k) && p[k] !== undefined) out[k] = p[k];
+  return out;
+};
+// A route liveParams builder must be IDEMPOTENT over its own stored live params, because the shared read-back
+// (live-promoted-resolver.js) re-derives the identity hash from contract.liveParams(<stored live params>). So each
+// identity field is read from the shadow's route field when present, else from the stored live field it maps to.
+const brandViewOwner = (p) => (p && typeof p === "object" && "ownerAccountId" in p ? p.ownerAccountId : p && p.accountId);
+// Portfolio members: the shadow's `members` array, else the stored `accountIds` string. Canonical ids only (nonblank,
+// untrimmed-equal, no ',' -- the live identity joins them); SORTED + de-duplicated exactly like
+// brandViewPortfolioScopeId and the serve (api/datadoe.js brand-view-portfolio). null when malformed/empty.
+const portfolioMembers = (p) => {
+  const raw = Array.isArray(p.members) ? p.members : (typeof p.accountIds === "string" && p.accountIds !== "" ? p.accountIds.split(",") : null);
+  if (!raw || raw.length === 0) return null;
+  if (!raw.every((id) => typeof id === "string" && id.trim() !== "" && id === id.trim() && !id.includes(","))) return null;
+  return [...new Set(raw)].sort();
+};
+const semOk = { ok: true };
+const semFail = (reason) => ({ ok: false, reason });
+// Brand View payload self-identity (assembleBrandViewPayload): the payload's OWN scope/brand/asOf (and, for the
+// single-account view, its accountId) must equal the live identity it is promoted under.
+const brandViewSemanticIdentity = (scope) => (payload, { liveParams } = {}) => {
+  if (!payload || typeof payload !== "object" || !liveParams || typeof liveParams !== "object") return semFail("payload-not-object");
+  if (payload.scope !== scope) return semFail("payload-scope-mismatch");
+  if (payload.brand !== liveParams.brand) return semFail("payload-brand-mismatch");
+  if (payload.asOf !== liveParams.asOf) return semFail("payload-asof-mismatch");
+  if (scope === "account" && String(payload.accountId ?? "") !== liveParams.accountId) return semFail("payload-account-mismatch");
+  return semOk;
+};
 
 /**
  * The CANONICAL scheduler->live snapshot mapping for ALL 13 reports, transcribed from the EXECUTABLE live
@@ -89,6 +131,12 @@ export const SCHEDULER_LIVE_SNAPSHOT_CONTRACTS = Object.freeze({
   "fba-plan": Object.freeze({
     liveReportKey: "fba-plan", liveReportVersion: "fba-plan-shared-v1",
     liveParams: (p) => (isDate(p.to) ? { to: p.to } : null),
+    // WP1 (fba-plan zero-export route): GATE 2 also opens on the PROMOTED row source_promoted_publish_settings
+    // ['fba-plan'] -- so the route never has to open the paid DISPATCH control (report_sync_settings) -- and the
+    // route's evidence/manifest tokens ride the stored live params (never the { to } identity hash). A paid scheduler
+    // shadow carries neither token, so its pick is {} and the paid publish is byte-identical.
+    promotedGateKey: "fba-plan",
+    liveParamsExtra: pickExtra("evidenceToken", "manifestToken"),
   }),
   "sales-movers": Object.freeze({
     liveReportKey: "sales-movers", liveReportVersion: "sales-movers-v1",
@@ -141,7 +189,87 @@ export const SCHEDULER_LIVE_SNAPSHOT_CONTRACTS = Object.freeze({
     // before the CAS. Only this report defines the hook -> every other report's live proof is byte-for-byte unchanged.
     semanticIdentity: listingHealthV3SemanticIdentity,
   }),
+  // ---- Publication recovery WP1: the five ZERO-EXPORT recovery ROUTE contracts (SOURCE_PROMOTED; never dispatched).
+  // Each live identity is transcribed from the EXECUTABLE serve (api/datadoe.js) so the route's promoted row IS the
+  // row the page reads. The shadow is saved at scheduler-v2/<publisher key> keyed by the route TARGET id (params
+  // .accountId === targetId); the hooks map that target onto the live account + the gate accounts.
+  // SKU Movement (api/datadoe.js sharedSnapshotSpec "sku-movement": params { asOf, brand } at the RAW account). The
+  // target is one (account, brand) unit ("sku-movement:<acct>::<brand>"); the live row + both gates are the owner.
+  "sku-movement": Object.freeze({
+    liveReportKey: "sku-movement", liveReportVersion: "sku-movement/v2",
+    liveParams: (p) => (isDate(p.asOf) && nb(p.brand) ? { asOf: p.asOf, brand: norm(p.brand) } : null),
+    asOfField: "asOf",
+    // Ids are passed through VERBATIM: the shared helpers refuse a noncanonical id (never trimmed into another account).
+    liveAccountId: (p) => p.ownerAccountId,
+    gateAccountIds: (p) => [p.ownerAccountId],
+    liveParamsExtra: pickExtra("evidenceToken", "serveToken", "manifestToken"),
+    // The payload's own honest as-of must be the identity as-of (sku-movement-core skuMovementPayload.effectiveAsOf).
+    semanticIdentity: (payload, { liveParams } = {}) => (payload && typeof payload === "object" && liveParams
+      && isDate(payload.effectiveAsOf) && payload.effectiveAsOf === liveParams.asOf ? semOk : semFail("payload-effective-asof-mismatch")),
+  }),
+  // Returns & Refund Leakage v3 (api/datadoe.js serveSelfHealingReturns: report_key "returns-leakage", version
+  // RETURNS_ADVANCED_VERSION, params { to }). A PUBLISHER key distinct from the v2 dispatch contract above (which is
+  // untouched); both map onto live report_key "returns-leakage", each under its own version => its own paramsHash.
+  "returns-leakage-v3": Object.freeze({
+    liveReportKey: "returns-leakage", liveReportVersion: "returns-leakage-v3",
+    liveParams: (p) => (isDate(p.to) ? { to: p.to } : null),
+    liveParamsExtra: pickExtra("evidenceToken", "manifestToken"),
+  }),
+  // Brand View brand directory (api/datadoe.js brandViewDirectory: paramsHashFor(BRAND_VIEW_BRANDS_VERSION,
+  // { accountId }) at the raw account). No as-of in the identity => asOfField null (only the requested-as-of gate is
+  // skipped; every other binding check applies).
+  "brand-view-brands": Object.freeze({
+    liveReportKey: "brand-view-brands", liveReportVersion: "brand-view-brands-v1",
+    liveParams: (p) => (nb(p.accountId) ? { accountId: norm(p.accountId) } : null),
+    asOfField: null,
+    liveParamsExtra: pickExtra("evidenceToken"),
+    // The directory payload names its own account (buildBrandViewBrandDirectory) -- never another account's list.
+    semanticIdentity: (payload, { liveParams } = {}) => (payload && typeof payload === "object" && liveParams
+      && String(payload.accountId ?? "") === liveParams.accountId ? semOk : semFail("payload-account-mismatch")),
+  }),
+  // Account-scoped Brand View (api/datadoe.js brand-view: account_id brandViewScopeId(owner, brand), params
+  // { accountId: owner, brand, asOf }). The target + live account is the SCOPE id; the gates run on the OWNER only.
+  "brand-view": Object.freeze({
+    liveReportKey: "brand-view", liveReportVersion: "brand-view-account-scoped-v2",
+    liveParams: (p) => {
+      const owner = brandViewOwner(p);
+      return nb(owner) && nb(p.brand) && isDate(p.asOf) ? { accountId: norm(owner), brand: norm(p.brand), asOf: p.asOf } : null;
+    },
+    asOfField: "asOf",
+    gateAccountIds: (p) => [p.ownerAccountId],
+    targetIdentity: (p, targetId) => nb(p.ownerAccountId) && nb(p.brand) && targetId === brandViewScopeId(norm(p.ownerAccountId), norm(p.brand)),
+    liveParamsExtra: pickExtra("depFingerprint", "evidenceToken"),
+    semanticIdentity: brandViewSemanticIdentity("account"),
+  }),
+  // Cross-account Brand View (api/datadoe.js brand-view-portfolio: account_id brandViewPortfolioScopeId(members,
+  // brand), params { accountIds: sorted members joined ",", brand, asOf, region? }). The target + live account is the
+  // SCOPE id; GATES 3+4 are an AND over EVERY member (one member not rolled out / unapproved => no publish).
+  "brand-view-portfolio": Object.freeze({
+    liveReportKey: "brand-view-portfolio", liveReportVersion: "brand-view-portfolio-v1",
+    liveParams: (p) => {
+      const members = portfolioMembers(p);
+      if (!members || !nb(p.brand) || !isDate(p.asOf)) return null;
+      // `region` participates only when present, exactly like the serve's `...(region ? { region } : {})`.
+      return { accountIds: members.join(","), brand: norm(p.brand), asOf: p.asOf, ...(nb(p.region) ? { region: norm(p.region) } : {}) };
+    },
+    asOfField: "asOf",
+    gateAccountIds: (p) => portfolioMembers(p) || [],
+    targetIdentity: (p, targetId) => {
+      const members = Array.isArray(p.members) ? portfolioMembers(p) : null;
+      return !!members && nb(p.brand) && targetId === brandViewPortfolioScopeId(members, norm(p.brand));
+    },
+    liveParamsExtra: pickExtra("depFingerprint", "evidenceToken"),
+    semanticIdentity: brandViewSemanticIdentity("portfolio"),
+  }),
 });
+
+// WP1: the five recovery ROUTE publisher keys added to the contract table above (pinned equal to the route contracts +
+// SOURCE_PROMOTED by publisher-route-hooks.test.js). A consumer that enumerates the PRE-EXISTING live-contract universe
+// for a read-only view (delivery-status.js LIVE_PUBLISHABLE_REPORT_KEYS) excludes them, so it stays byte-identical until
+// it deliberately adopts the routes.
+export const RECOVERY_ROUTE_PUBLISHER_KEYS = Object.freeze([
+  "sku-movement", "returns-leakage-v3", "brand-view-brands", "brand-view", "brand-view-portfolio",
+]);
 
 // Typed safe dispositions (the ONLY values publishSchedulerV2Snapshot returns in `disposition`).
 // 'data-unavailable' is DISTINCT from 'invalid-snapshot': the derived payload is structurally VALID but
@@ -193,7 +321,20 @@ const CAS_OUTCOME_DISPOSITION = Object.freeze({
  *                        primitive; it decides fail-closed against the REAL live row -- an EQUAL source
  *                        timestamp is "already-current" ONLY when the content is PROVEN identical, else
  *                        "conflict"; it never returns a payload/path/digest).
- * Returns { disposition, reportKey, accountId, liveReportKey?, paramsHash? } -- typed safe fields ONLY.
+ * Returns { disposition, reportKey, accountId, liveReportKey?, paramsHash?, liveAccountId? } -- typed safe fields ONLY
+ * (`liveAccountId` only for a contract with an identity hook -- every pre-existing result shape is unchanged).
+ *
+ * WP1 OPTIONAL CONTRACT HOOKS (all absent on the 15 pre-existing contracts except fba-plan's promotedGateKey +
+ * liveParamsExtra, whose pick is empty for a paid shadow => byte-identical dispositions, stored params, paramsHash and
+ * collaborator calls; pinned by gate7-rollout-publisher.test.js G7R). `accountId` is the route TARGET id the job +
+ * shadow are keyed by:
+ *   promotedGateKey  -- GATE 2 (dispatch branch) ALSO passes on source_promoted_publish_settings[key].publish_enabled,
+ *                       read ONLY when the dispatch control is not enabled (a failed read fails closed as before);
+ *   targetIdentity / liveAccountId / gateAccountIds -- the gate + live identity is resolved from the PROVEN shadow, so
+ *                       GATES 3+4 run AFTER the exact job-linked shadow + hash provenance (and targetIdentity) passed,
+ *                       over EVERY gate account (AND); the live row is written at liveAccountId;
+ *   liveParamsExtra  -- validated extras merged into the STORED live params only, NEVER into paramsHash;
+ *   semanticIdentity -- now also receives the full liveParams (LHv3 ignores it).
  */
 export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId, preflight = false }) {
   const {
@@ -204,6 +345,19 @@ export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId, p
   const key = norm(reportKey);
   const acct = norm(accountId);
   const base = { reportKey: key, accountId: acct };
+  // GATES 3+4 over a set of gate accounts (ONE rollout + discovery read; approvals in order). With [acct] this is
+  // EXACTLY the pre-hook call sequence: loadAccountRollout, discoverPrimaryAccounts, getPublishApproval(key, acct).
+  const accountGates = async (ids) => {
+    const rollout = await loadAccountRollout();
+    const discovered = (await discoverPrimaryAccounts()) || [];
+    const resolved = resolveRolloutAccounts(rollout, discovered);
+    if (!ids.every((id) => resolved.selectedIds.includes(id))) return "account-disabled";
+    for (const id of ids) {
+      const approval = await getPublishApproval(key, id);
+      if (!approval || approval.read !== "ok" || approval.approved !== true) return "publish-not-approved";
+    }
+    return null;
+  };
   try {
     const contract = SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[key];
     if (!contract || !acct) return { disposition: "unknown-report", ...base };
@@ -224,21 +378,37 @@ export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId, p
     } else {
       const settings = (await getReportSyncSettings()) || [];
       const row = settings.find((s) => s && String(s.report_key ?? s.reportKey) === key);
-      if (!row || row.schedule_enabled !== true) return { disposition: "report-disabled", ...base };
+      if (!row || row.schedule_enabled !== true) {
+        // WP1 promotedGateKey (fba-plan only): the zero-export route opens its OWN promoted row, never the paid
+        // dispatch control. Consulted ONLY when the dispatch control is closed; any read failure / absent row / non-true
+        // value keeps the pre-hook 'report-disabled'. A contract without the hook never reads the promoted table here.
+        const gateKey = typeof contract.promotedGateKey === "string" ? norm(contract.promotedGateKey) : "";
+        let promotedOpen = false;
+        if (gateKey) {
+          try {
+            const promoted = (typeof getPromotedPublishSettings === "function" ? await getPromotedPublishSettings() : null) || [];
+            const prow = Array.isArray(promoted) ? promoted.find((s) => s && String(s.report_key ?? s.reportKey) === gateKey) : null;
+            promotedOpen = !!prow && prow.publish_enabled === true;
+          } catch (_e) {
+            promotedOpen = false;
+          }
+        }
+        if (!promotedOpen) return { disposition: "report-disabled", ...base };
+      }
     }
 
-    // GATE 3 -- durable account enable, resolved against REAL fresh primary discovery (never a synthetic
-    // record): the requested id must be a CURRENTLY DISCOVERED active primary account that the durable
-    // rollout state selects. An unknown/stale id and every dd-secondary id fail here -- including when
-    // all_primary=true (all-primary widens to every DISCOVERED primary account, nothing else).
-    const rollout = await loadAccountRollout();
-    const discovered = (await discoverPrimaryAccounts()) || [];
-    const resolved = resolveRolloutAccounts(rollout, discovered);
-    if (!resolved.selectedIds.includes(acct)) return { disposition: "account-disabled", ...base };
-
-    // GATE 4 -- explicit durable publish approval for the exact (report, account).
-    const approval = await getPublishApproval(key, acct);
-    if (!approval || approval.read !== "ok" || approval.approved !== true) return { disposition: "publish-not-approved", ...base };
+    // A contract whose gate / live identity is NOT the target id (WP1 identity hooks) defers GATES 3+4 until the exact
+    // job-linked shadow is proven below; every other contract gates the target id HERE, byte-identically.
+    const gatesNeedShadow = contractGatesNeedShadow(contract);
+    if (!gatesNeedShadow) {
+      // GATE 3 -- durable account enable, resolved against REAL fresh primary discovery (never a synthetic
+      // record): the requested id must be a CURRENTLY DISCOVERED active primary account that the durable
+      // rollout state selects. An unknown/stale id and every dd-secondary id fail here -- including when
+      // all_primary=true (all-primary widens to every DISCOVERED primary account, nothing else).
+      // GATE 4 -- explicit durable publish approval for the exact (report, account).
+      const denied = await accountGates([acct]);
+      if (denied) return { disposition: denied, ...base };
+    }
 
     // SOURCE-OF-TRUTH -- the LATEST report job must be a VALIDATED success (validated=true AND derive+save
     // succeeded) inside a TERMINAL cycle (succeeded, or partial WITH this exact report succeeded), and must
@@ -272,6 +442,23 @@ export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId, p
     const refreshedOk = !!shadow && norm(shadow.source_refreshed_at) !== "";
     if (!shadow || !hashOk || !versionOk || !accountOk || !refreshedOk) return { disposition: "invalid-snapshot", ...base };
 
+    // WP1 IDENTITY HOOKS -- resolved ONLY from the proven shadow params (never a caller input). targetIdentity first: the
+    // target must BE the scope the shadow names (brand-view / portfolio scope id), else invalid-snapshot with zero gate
+    // reads. Then the live account, then GATES 3+4 over EVERY gate account (the owner for brand-view / sku-movement,
+    // every member for the portfolio -- an AND gate; a scope id is never a gate account).
+    let liveAcct = acct;
+    if (gatesNeedShadow) {
+      if (!contractTargetIdentityOk(contract, params, acct)) return { disposition: "invalid-snapshot", ...base };
+      liveAcct = contractLiveAccountId(contract, params, acct);
+      if (liveAcct === null) return { disposition: "invalid-snapshot", ...base };
+      const gate = contractGateAccountIds(contract, params, acct);
+      // A prefixed (dd-secondary / scope) id can never be a rollout account -> the account gate refuses it; any other
+      // malformed gate set is a malformed shadow.
+      if (!gate.ok) return { disposition: gate.reason === "gate-account-prefixed" ? "account-disabled" : "invalid-snapshot", ...base };
+      const denied = await accountGates(gate.ids);
+      if (denied) return { disposition: denied, ...base };
+    }
+
     // PAYLOAD -- STORAGE-FIRST precedence (round-9 finding 3): a nonblank payload_storage_path is
     // AUTHORITATIVE and is always hydrated through the trusted loader, EVEN IF an inline payload is also
     // present (a stale inline can never win over the authoritative storage object). The inline payload is
@@ -301,14 +488,27 @@ export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId, p
     // LIVE identity -- canonical mapping; a missing/malformed planned param fails closed.
     const liveParams = contract.liveParams(params);
     if (!liveParams) return { disposition: "invalid-snapshot", ...base };
+    // WP1 liveParamsExtra: allowlisted, bounded string extras STORED with the live params (tokens the recovery worker
+    // proves freshness with). Any unknown key / non-string / blank / over-long value / identity collision => invalid.
+    let extra = null;
+    if (typeof contract.liveParamsExtra === "function") {
+      const x = contractLiveParamsExtra(contract, params, liveParams);
+      if (!x.ok) return { disposition: "invalid-snapshot", ...base };
+      extra = x.extra;
+    }
     // OPTIONAL per-report SEMANTIC identity (WORK C/D blocker 1): prove the payload's OWN account/date/window agree
     // with the promoted account + live params.to, BEFORE the live CAS -- so a structurally-valid but wrong-account /
-    // wrong-day / wrong-window payload is never promoted. A contract with no hook is byte-for-byte unchanged.
+    // wrong-day / wrong-window payload is never promoted. A contract with no hook is byte-for-byte unchanged. WP1: the
+    // hook also receives the full liveParams, and `accountId` is the LIVE account (=== acct for every hookless contract).
     if (typeof contract.semanticIdentity === "function") {
-      const sem = contract.semanticIdentity(payload, { accountId: acct, to: liveParams.to });
+      const sem = contract.semanticIdentity(payload, { accountId: liveAcct, to: liveParams.to, liveParams });
       if (!sem || sem.ok !== true) return { disposition: "invalid-snapshot", ...base };
     }
+    // The live IDENTITY hash is ALWAYS computed from contract.liveParams alone -- extras are never hashed, so the serve's
+    // identity (and the read-back's re-derived hash, live-promoted-resolver.js) is unchanged by a stored token.
     const paramsHash = paramsHashFor(contract.liveReportVersion, liveParams);
+    // `liveAccountId` is surfaced ONLY for an identity-hooked contract (every pre-existing result shape is unchanged).
+    const liveOut = gatesNeedShadow ? { liveAccountId: liveAcct } : {};
 
     // READ-ONLY PREFLIGHT: every gate (code readiness, dispatch/promoted control, primary rollout resolved
     // against fresh discovery, audited approval), the source-of-truth validated job inside a terminal cycle, the
@@ -316,7 +516,7 @@ export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId, p
     // live-params mapping have ALL passed -- so this (report, account) IS publishable. Return 'ready' WITHOUT the
     // CAS write, carrying the exact live identity (liveReportKey + paramsHash) the eventual publish + read-back
     // will use. Same collaborators + logic as the real publish; the CLI never duplicates any gate.
-    if (preflight === true) return { disposition: "ready", ...base, liveReportKey: contract.liveReportKey, paramsHash };
+    if (preflight === true) return { disposition: "ready", ...base, liveReportKey: contract.liveReportKey, paramsHash, ...liveOut };
 
     // CAS publish -- the primitive decides fail-closed against the REAL live row: inserted/replaced =>
     // published; strictly-newer live => newer-live; EQUAL freshness proven identical => already-current;
@@ -325,14 +525,15 @@ export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId, p
     const payloadBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
     const res = await publishLive({
       reportKey: contract.liveReportKey,
-      accountId: acct,
+      accountId: liveAcct,
       paramsHash,
-      params: { reportVersion: contract.liveReportVersion, ...liveParams },
+      // Stored params = { reportVersion, ...liveParams } exactly as before; a WP1 route's validated extras follow them.
+      params: extra ? { reportVersion: contract.liveReportVersion, ...liveParams, ...extra } : { reportVersion: contract.liveReportVersion, ...liveParams },
       payload,
       payloadBytes,
       sourceRefreshedAt: shadow.source_refreshed_at,
     });
-    const out = { ...base, liveReportKey: contract.liveReportKey, paramsHash };
+    const out = { ...base, liveReportKey: contract.liveReportKey, paramsHash, ...liveOut };
     const disposition = res && CAS_OUTCOME_DISPOSITION[res.outcome];
     if (disposition) return { disposition, ...out };
     return { disposition: "publish-failed", ...base };

@@ -59,6 +59,7 @@
   "test:delivery-status": "node scripts/delivery-status.test.js",
   "test:publication-recovery-units": "node scripts/publication-recovery-units.test.js",
   "test:publication-recovery-worker": "node scripts/publication-recovery-worker.test.js",
+  "test:pg-tls": "node scripts/pg-tls.test.js",
   "test:listing-health-v3-durable-loader": "node scripts/listing-health-v3-durable-loader.test.js",
   "test:listing-health-v3-live-identity": "node scripts/listing-health-v3-live-identity.test.js",
   "test:listing-health-v3-fingerprint-invariant": "node scripts/listing-health-v3-fingerprint-invariant.test.js",

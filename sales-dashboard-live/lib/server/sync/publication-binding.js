@@ -73,6 +73,91 @@ export function jobIsPromotable(job) {
     && nb(job.snapshotParamsHash);
 }
 
+// ---- OPTIONAL live-contract ROUTE hooks (publication recovery WP1) --------------------------------------------------
+// A live contract (report-publisher.js SCHEDULER_LIVE_SNAPSHOT_CONTRACTS) MAY declare these hooks. ALL are ABSENT on
+// the 15 pre-existing contracts except fba-plan's promotedGateKey + liveParamsExtra (whose pick is EMPTY for a paid
+// shadow), so every default below reproduces the pre-hook behaviour byte-for-byte (pinned by
+// gate7-rollout-publisher.test.js G7R). The publisher, the binding and the candidate resolver share THESE helpers, so
+// a hook means the same thing on the write path and on every proof path:
+//   liveAccountId(shadowParams, targetId)   -> the live report_snapshots.account_id (default: targetId VERBATIM);
+//   gateAccountIds(shadowParams, targetId)  -> the accounts GATES 3+4 must ALL pass (default: [liveAccountId]);
+//   liveParamsExtra(shadowParams)           -> extra STORED live params (allowlisted keys, bounded strings) -- merged
+//                                              into the stored params ONLY, NEVER into the identity paramsHash;
+//   asOfField: 'to' (default) | 'asOf' | null -> which live param the requested-as-of gate compares (null skips ONLY
+//                                              that gate; the real-calendar check on every date param remains);
+//   targetIdentity(shadowParams, targetId)  -> boolean: the target id IS the scope the shadow's identity names.
+// A hook that throws or returns a malformed value fails CLOSED (never a default fallback).
+export const LIVE_PARAMS_EXTRA_KEYS = Object.freeze(["depFingerprint", "evidenceToken", "serveToken", "manifestToken"]);
+export const LIVE_PARAMS_EXTRA_MAX_CHARS = 200;
+const LIVE_ASOF_FIELDS = Object.freeze(["to", "asOf"]);
+const LIVE_DATE_PARAM_KEYS = Object.freeze(["from", "to", "asOf", "through"]);
+const IDENTITY_HOOKS = Object.freeze(["liveAccountId", "gateAccountIds", "targetIdentity"]);
+
+// 'to' | 'asOf' | null for a well-formed contract; undefined for a malformed asOfField (the caller fails closed).
+export function contractAsOfField(contract) {
+  if (!contract || contract.asOfField === undefined) return "to";
+  if (contract.asOfField === null) return null;
+  return LIVE_ASOF_FIELDS.includes(contract.asOfField) ? contract.asOfField : undefined;
+}
+
+// True when the contract's gate/live identity is NOT the target id itself, so it can only be resolved from the shadow's
+// params (the publisher then runs GATES 3+4 after the exact shadow is proven, never on the target id).
+export function contractGatesNeedShadow(contract) {
+  return !!contract && IDENTITY_HOOKS.some((h) => typeof contract[h] === "function");
+}
+
+// The live account id: targetId VERBATIM without the hook (byte-identical); with the hook a canonical nonblank string
+// (never trimmed into another id) or null (fail closed).
+export function contractLiveAccountId(contract, shadowParams, targetId) {
+  if (!contract || typeof contract.liveAccountId !== "function") return targetId;
+  let v;
+  try { v = contract.liveAccountId(shadowParams, targetId); } catch { return null; }
+  return typeof v === "string" && v.trim() !== "" && v === v.trim() ? v : null;
+}
+
+// The gate accounts: a non-empty array of canonical (nonblank, untrimmed-equal) ids with NO ':' (a prefixed id is a
+// dd-secondary / scope id and can never be a rollout account). { ok, ids } | { ok:false, reason }.
+export function contractGateAccountIds(contract, shadowParams, targetId) {
+  let raw;
+  if (contract && typeof contract.gateAccountIds === "function") {
+    try { raw = contract.gateAccountIds(shadowParams, targetId); } catch { return { ok: false, ids: [], reason: "gate-accounts-threw" }; }
+  } else {
+    const live = contractLiveAccountId(contract, shadowParams, targetId);
+    raw = live == null ? [] : [live];
+  }
+  if (!Array.isArray(raw) || raw.length === 0) return { ok: false, ids: [], reason: "gate-accounts-empty" };
+  if (!raw.every((id) => typeof id === "string" && id.trim() !== "" && id === id.trim())) return { ok: false, ids: [], reason: "gate-account-noncanonical" };
+  if (raw.some((id) => id.includes(":"))) return { ok: false, ids: [], reason: "gate-account-prefixed" };
+  return { ok: true, ids: raw.slice(), reason: null };
+}
+
+// The extra STORED live params: {} without the hook. With it, a plain object whose keys are a subset of
+// LIVE_PARAMS_EXTRA_KEYS, whose values are nonblank strings of at most LIVE_PARAMS_EXTRA_MAX_CHARS, and which never
+// collides with reportVersion or a live identity param. Returned in the fixed allowlist order (deterministic stored
+// params). { ok, extra } | { ok:false, reason }.
+export function contractLiveParamsExtra(contract, shadowParams, liveParams) {
+  if (!contract || typeof contract.liveParamsExtra !== "function") return { ok: true, extra: {}, reason: null };
+  let x;
+  try { x = contract.liveParamsExtra(shadowParams); } catch { return { ok: false, extra: {}, reason: "extra-threw" }; }
+  const proto = x && typeof x === "object" ? Object.getPrototypeOf(x) : undefined;
+  if (!x || typeof x !== "object" || Array.isArray(x) || (proto !== Object.prototype && proto !== null)) return { ok: false, extra: {}, reason: "extra-not-object" };
+  const lp = liveParams && typeof liveParams === "object" ? liveParams : {};
+  for (const [k, v] of Object.entries(x)) {
+    if (!LIVE_PARAMS_EXTRA_KEYS.includes(k)) return { ok: false, extra: {}, reason: "extra-key-unknown" };
+    if (Object.prototype.hasOwnProperty.call(lp, k)) return { ok: false, extra: {}, reason: "extra-key-collision" };
+    if (typeof v !== "string" || v.trim() === "" || v.length > LIVE_PARAMS_EXTRA_MAX_CHARS) return { ok: false, extra: {}, reason: "extra-value-invalid" };
+  }
+  const extra = {};
+  for (const k of LIVE_PARAMS_EXTRA_KEYS) if (Object.prototype.hasOwnProperty.call(x, k)) extra[k] = x[k];
+  return { ok: true, extra, reason: null };
+}
+
+// targetIdentity: true without the hook; with it, ONLY an explicit true passes (a throw / non-true fails closed).
+export function contractTargetIdentityOk(contract, shadowParams, targetId) {
+  if (!contract || typeof contract.targetIdentity !== "function") return true;
+  try { return contract.targetIdentity(shadowParams, targetId) === true; } catch { return false; }
+}
+
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 // A REAL calendar date (YYYY-MM-DD): the regex shape alone is NOT enough -- an impossible day (2026-02-30, 2026-13-01)
@@ -102,8 +187,14 @@ export function isCalendarDate(v) {
  * Everything else is STALE with a typed reason. Never uses updated_at. Inputs are pre-loaded/hydrated + the shared
  * `liveReadback` result is supplied by the reconciler; this function is PURE. `reportDerivations[reportKey]` supplies
  * the expected shadow snapshotVersion + the real payload validator.
+ *
+ * ROUTE hooks (WP1; absent => byte-identical): the requested-as-of gate compares liveParams[contractAsOfField] (null
+ * skips ONLY that gate); the shadow must satisfy the publisher's targetIdentity + liveParamsExtra checks; and the live
+ * row is expected at contractLiveAccountId (the owner for sku-movement, the scope id for brand-view) -- `accountId`
+ * stays the TARGET the job + shadow are keyed by. An optional caller `liveAccountId` must EQUAL the contract-derived
+ * value (a caller can never re-point the live identity).
  */
-export function evaluatePublicationBinding({ revision, accountId, reportKey, requestedAsOf, expectedShadowKey, job, shadow, hydratedShadowPayload, live, hydratedLivePayload, liveReadback, contract, computeHash, reportDerivations, revisionChangedReason = "source-revision-changed" } = {}) {
+export function evaluatePublicationBinding({ revision, accountId, reportKey, requestedAsOf, expectedShadowKey, job, shadow, hydratedShadowPayload, live, hydratedLivePayload, liveReadback, contract, computeHash, reportDerivations, revisionChangedReason = "source-revision-changed", liveAccountId = null } = {}) {
   const stale = (reason) => ({ state: PUBLICATION_STATE.STALE, reason });
   if (!revision || revision.eligible !== true) return { state: PUBLICATION_STATE.DEFERRED_PROVENANCE, reason: (revision && revision.reason) || "not-eligible" };
   if (!jobIsPromotable(job)) return stale("job-not-promotable");
@@ -136,13 +227,30 @@ export function evaluatePublicationBinding({ revision, accountId, reportKey, req
   // the request hashes + payload content are unchanged. This SUPPLEMENTS the binding; it never replaces it.
   const liveParams = contract.liveParams(shadowParams);
   if (!liveParams || typeof liveParams !== "object") return stale("live-params-underivable");
-  if (!isCalendarDate(requestedAsOf)) return stale("requested-asof-invalid");
-  if (!isCalendarDate(liveParams.to)) return stale("candidate-asof-invalid");
-  if (S(liveParams.to) !== S(requestedAsOf)) return stale("candidate-asof-not-exact");
+  // asOfField (WP1): default 'to' == the original gate; null skips ONLY the requested-as-of gate; a malformed contract
+  // value fails closed.
+  const asOfField = contractAsOfField(contract);
+  if (asOfField === undefined) return stale("live-contract-asof-field-invalid");
+  if (asOfField !== null) {
+    if (!isCalendarDate(requestedAsOf)) return stale("requested-asof-invalid");
+    if (!isCalendarDate(liveParams[asOfField])) return stale("candidate-asof-invalid");
+    if (S(liveParams[asOfField]) !== S(requestedAsOf)) return stale("candidate-asof-not-exact");
+  }
+  // Every date-valued live param stays a REAL calendar date (a no-op for the pre-existing contracts, whose builders
+  // already validate every date they emit).
+  for (const k of LIVE_DATE_PARAM_KEYS) { if (k in liveParams && !isCalendarDate(liveParams[k])) return stale("candidate-asof-invalid"); }
+  // PUBLISHER-IDENTICAL route checks (no-ops without the hooks): the target IS the shadow's scope, and the stored extras
+  // are well-formed -- a shadow the publisher would refuse can never be "already promoted".
+  if (!contractTargetIdentityOk(contract, shadowParams, accountId)) return stale("shadow-target-identity");
+  if (!contractLiveParamsExtra(contract, shadowParams, liveParams).ok) return stale("shadow-live-params-extra-invalid");
   const candHash = computeHash(contract.liveReportVersion, liveParams);
+  // The live row's account: targetId verbatim without the hook (byte-identical), else the contract-derived id.
+  const liveAcct = contractLiveAccountId(contract, shadowParams, accountId);
+  if (typeof contract.liveAccountId === "function" && liveAcct === null) return stale("live-account-underivable");
+  if (liveAccountId != null && S(liveAccountId) !== S(liveAcct)) return stale("live-account-mismatch");
   // ---- LIVE: canonical identity + the SHARED publisher readback (identity/version/params-provenance/payload) ----
   if (!live) return stale("live-unpromoted");
-  if (S(live.report_key) !== S(contract.liveReportKey) || S(live.account_id) !== S(accountId) || S(live.params_hash) !== S(candHash)) return stale("live-identity-mismatch");
+  if (S(live.report_key) !== S(contract.liveReportKey) || S(live.account_id) !== S(liveAcct) || S(live.params_hash) !== S(candHash)) return stale("live-identity-mismatch");
   if (!liveReadback || liveReadback.ok !== true) return stale("live-readback:" + S(liveReadback && liveReadback.reason));
   // ---- SHADOW <-> LIVE binding equality: the live IS this exact derivation's promotion ----
   if (S(live.source_refreshed_at) !== S(shadow.source_refreshed_at)) return stale("live-refresh-differs");
@@ -178,11 +286,17 @@ export async function hydrateSnapshotPayload(row, loadStoragePayload, { signal =
  *   { ok:true,  payload:<hydrated proven live/shadow payload>, dependsOn:[...job hashes], reason:null }   when proven
  *   { ok:false, payload:null, dependsOn:[], reason:<token> }                                              otherwise (DEFER)
  * A false result MUST make the caller DEFER (never combine separate "latest" records, never fabricate lineage).
+ *
+ * ROUTE hooks (WP1; absent => byte-identical): the opt-in requested-as-of gate compares liveParams[contractAsOfField]
+ * (an asOfField:null contract skips that gate entirely); the shadow must pass the publisher's targetIdentity +
+ * liveParamsExtra checks; and the live row is read + proven at contractLiveAccountId (`accountId` stays the TARGET the
+ * job + shadow are keyed by). An optional caller `liveAccountId` must EQUAL the contract-derived value.
  */
 export async function resolveValidatedLiveCandidate({
   reportKey, accountId, signal = null, requestedAsOf = null,
   readReportJob, readSnapshot, loadStoragePayload, verifyLiveReadback,
   liveContracts, computeHash, reportDerivations, shadowKeyFor = (rk) => "scheduler-v2/" + rk,
+  liveAccountId = null,
 } = {}) {
   const fail = (reason) => ({ ok: false, payload: null, dependsOn: [], reason });
   const aborted = () => !!(signal && signal.aborted);
@@ -191,9 +305,12 @@ export async function resolveValidatedLiveCandidate({
   const derivation = reportDerivations && reportDerivations[reportKey];
   if (!contract || typeof contract.liveParams !== "function" || typeof computeHash !== "function") return fail("no-live-contract");
   if (!derivation || typeof derivation.validatePayload !== "function") return fail("no-report-derivation");
+  const asOfField = contractAsOfField(contract);
+  if (asOfField === undefined) return fail("live-contract-asof-field-invalid");
   // OPT-IN exact requested-as-of: a supplied requestedAsOf MUST be a real calendar date (a malformed request defers
-  // before any read). The candidate's live `to` is matched against it below, after liveParams is derived.
-  if (requestedAsOf != null && !isCalendarDate(requestedAsOf)) return fail("requested-asof-invalid");
+  // before any read). The candidate's live `to` (liveParams[asOfField]; 'to' by default) is matched against it below,
+  // after liveParams is derived. An asOfField:null contract has no as-of identity, so the whole gate is skipped.
+  if (requestedAsOf != null && asOfField !== null && !isCalendarDate(requestedAsOf)) return fail("requested-asof-invalid");
   if (aborted()) return fail("aborted");
   let job; try { job = await readReportJob(reportKey, accountId, { signal }); } catch { job = null; }
   if (aborted()) return fail("aborted");
@@ -225,18 +342,24 @@ export async function resolveValidatedLiveCandidate({
   // EXACT requested-as-of (opt-in): the candidate window END must EQUAL requestedAsOf exactly -- an older OR a future
   // `to` both DEFER. `to` must EXIST + be a real calendar date (a missing/malformed `to` defers). `from` (the rolling
   // window start) is intentionally NOT constrained.
-  if (requestedAsOf != null) {
-    if (!isCalendarDate(liveParams.to)) return fail("candidate-asof-invalid");
-    if (S(liveParams.to) !== S(requestedAsOf)) return fail("candidate-asof-not-exact");
+  if (requestedAsOf != null && asOfField !== null) {
+    if (!isCalendarDate(liveParams[asOfField])) return fail("candidate-asof-invalid");
+    if (S(liveParams[asOfField]) !== S(requestedAsOf)) return fail("candidate-asof-not-exact");
   }
+  // PUBLISHER-IDENTICAL route checks (no-ops without the hooks) + the live account (targetId verbatim by default).
+  if (!contractTargetIdentityOk(contract, shadowParams, accountId)) return fail("shadow-target-identity");
+  if (!contractLiveParamsExtra(contract, shadowParams, liveParams).ok) return fail("shadow-live-params-extra-invalid");
+  const liveAcct = contractLiveAccountId(contract, shadowParams, accountId);
+  if (typeof contract.liveAccountId === "function" && liveAcct === null) return fail("live-account-underivable");
+  if (liveAccountId != null && S(liveAccountId) !== S(liveAcct)) return fail("live-account-mismatch");
   const candHash = computeHash(contract.liveReportVersion, liveParams);
   if (aborted()) return fail("aborted");
-  let live; try { live = await readSnapshot({ reportKey: contract.liveReportKey, accountId, paramsHash: candHash }, { signal }); } catch { live = null; }
+  let live; try { live = await readSnapshot({ reportKey: contract.liveReportKey, accountId: liveAcct, paramsHash: candHash }, { signal }); } catch { live = null; }
   if (aborted()) return fail("aborted");
   if (!live) return fail("live-unpromoted");
-  if (S(live.report_key) !== S(contract.liveReportKey) || S(live.account_id) !== S(accountId) || S(live.params_hash) !== S(candHash)) return fail("live-identity-mismatch");
+  if (S(live.report_key) !== S(contract.liveReportKey) || S(live.account_id) !== S(liveAcct) || S(live.params_hash) !== S(candHash)) return fail("live-identity-mismatch");
   if (aborted()) return fail("aborted");
-  let liveReadback; try { liveReadback = await verifyLiveReadback({ reportKey, liveReportKey: contract.liveReportKey, accountId, paramsHash: candHash, signal }); } catch (e) { liveReadback = { ok: false, reason: "readback-threw:" + S(e && e.message) }; }
+  let liveReadback; try { liveReadback = await verifyLiveReadback({ reportKey, liveReportKey: contract.liveReportKey, accountId: liveAcct, paramsHash: candHash, signal }); } catch (e) { liveReadback = { ok: false, reason: "readback-threw:" + S(e && e.message) }; }
   if (aborted()) return fail("aborted");
   if (!liveReadback || liveReadback.ok !== true) return fail("live-readback:" + S(liveReadback && liveReadback.reason));
   if (S(live.source_refreshed_at) !== S(shadow.source_refreshed_at)) return fail("live-refresh-differs");

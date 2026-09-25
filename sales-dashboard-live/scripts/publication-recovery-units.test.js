@@ -14,7 +14,7 @@ import { getEventListeners } from "node:events";
 import { buildReconcileArgs, makeRunToken } from "../lib/server/recovery/runner.js";
 import { loadRecoveryConfig } from "../lib/server/recovery/config.js";
 import { sanitizeReasonCode, buildTargetsPayload, formatTargetsLine, parseTargetsLine } from "../lib/server/sync/reconcile-targets-output.js";
-import { composeEvidenceTokens, recoveryPgTypes, regionForCycleBucket, recoveryConnectionString, createRecoveryStore } from "../lib/server/recovery/store-pg.js";
+import { composeEvidenceTokens, recoveryPgTypes, regionForCycleBucket, recoveryPoolConfig, createRecoveryStore } from "../lib/server/recovery/store-pg.js";
 import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "../lib/server/sync/report-publisher.js";
 import { REPORT_MATERIALIZATION } from "../lib/server/reports/report-materialization-registry.js";
 
@@ -132,10 +132,10 @@ writeSync(1, "publication-recovery-units\n");
   ok("I9: tables are revoked from service_role too (select-only; writes only through the RPC invariants)", (sql.match(/revoke all on table public\.publication_recovery_\w+ from public, anon, authenticated, service_role;/g) || []).length === 6);
   // --- safety/deploy review ---
   const secretUrl = "postgresql://postgres.ref:Sup3r-Secret@aws-0-ap-south-1.pooler.supabase.com:6543/postgres?sslmode=require&supa=base-pooler.x";
-  const cs = new URL(recoveryConnectionString(secretUrl));
-  ok("I11: sslmode is FORCED to no-verify (the real URL's sslmode=require is verify-full in pg-connection-string 2.x)", cs.searchParams.get("sslmode") === "no-verify" && cs.searchParams.get("supa") === "base-pooler.x" && new URL(recoveryConnectionString("postgres://u:p@h/db")).searchParams.get("sslmode") === "no-verify");
+  const pc = recoveryPoolConfig(secretUrl, { max: 2 });
+  ok("I11: the worker pool uses VERIFIED TLS (pinned Supabase root CA + hostname), the URL query (sslmode/supa) removed", pc.ssl && pc.ssl.rejectUnauthorized === true && /BEGIN CERTIFICATE/.test(pc.ssl.ca) && !pc.connectionString.includes("?") && pc.max === 2 && pc.types === recoveryPgTypes);
   let urlErr = "";
-  try { recoveryConnectionString("postgres://u:pa#ss/word@host:5432/db?x"); recoveryConnectionString("not a url with Sup3r-Secret"); } catch (e) { urlErr = String(e && e.message) + String(e && e.input); }
+  try { recoveryPoolConfig("postgres://u:pa#ss/word@host:5432/db?x"); recoveryPoolConfig("not a url with Sup3r-Secret"); } catch (e) { urlErr = String(e && e.message) + String(e && e.input); }
   ok("I12: a malformed POSTGRES_URL throws a REDACTED error (never the value)", /not a valid URL/.test(urlErr) && !urlErr.includes("Sup3r-Secret"));
   const handlers = [];
   const fakePool = { on: (ev, fn) => handlers.push([ev, fn]), query: async () => ({ rows: [] }), end: async () => {} };

@@ -31,6 +31,7 @@
 // that account, and daily's re-derive still publishes OLI sales from the durable union. 7-bit ASCII, LF.
 
 import pg from "pg";
+import { verifiedPgConfig } from "../../lib/server/pg-tls.js";
 import { appendFileSync } from "node:fs";
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
 import { isRegionScope, accountInScope } from "../../lib/server/sync/scheduler-scope.js";
@@ -103,8 +104,9 @@ if (!primaryConn) { console.error("STOP ADS_RECONCILE_NO_PRIMARY_CONNECTION -- f
 const orgFp = primaryConn.organizationFingerprint || organizationFingerprint(primaryConn.apiKey);
 
 const withTimeout = (p, label) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timed out after 120000ms")), 120000))]);
-const pgBase = String(process.env.POSTGRES_URL || "").split("?")[0];
-const makePgReadOnly = () => new pg.Client({ connectionString: pgBase, ssl: { rejectUnauthorized: false } });
+// Verified TLS: chain pinned to the Supabase root CA + hostname checked (lib/server/pg-tls.js); never rejectUnauthorized:false.
+const pgConfig = () => verifiedPgConfig(process.env.POSTGRES_URL);
+const makePgReadOnly = () => new pg.Client(pgConfig());
 
 const readbackLive = buildLiveReadback({
   getReportSnapshot: sb.getReportSnapshot,
@@ -122,8 +124,9 @@ const readbackLive = buildLiveReadback({
 // and the dedicated release module for transport symbols.)
 
 async function assertNoCron() {
-  const client = makePgReadOnly();
+  let client = null; // constructed inside try: an invalid POSTGRES_URL stays a typed {ok:false}, never an uncaught throw
   try {
+    client = makePgReadOnly();
     await client.connect();
     const t = await client.query("select to_regclass('cron.job')::text cron_table");
     if (!t.rows[0].cron_table) return { ok: true };
@@ -138,8 +141,8 @@ const OPERATOR = "ads-reconcile:" + bucket + ":" + (runToken || asOf);
 const CONTROL_OP_KEY = "ads-reconcile/" + bucket + "/" + asOf;
 
 async function partialNamespacePermitted() {
-  const probe = new pg.Client({ connectionString: pgBase, ssl: { rejectUnauthorized: false } });
-  try { await probe.connect(); return await readPartialCycleCapability((sql) => probe.query(sql).then((r) => r.rows)); }
+  let probe = null;
+  try { probe = new pg.Client(pgConfig()); await probe.connect(); return await readPartialCycleCapability((sql) => probe.query(sql).then((r) => r.rows)); }
   catch (e) { return { permitted: false, reason: "capability-unreadable: " + (e && e.message ? e.message : e) }; }
   finally { try { await probe.end(); } catch { /* ignore */ } }
 }

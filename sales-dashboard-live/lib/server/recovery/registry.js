@@ -45,7 +45,9 @@ export const FORBIDDEN_WORKER_SCRIPTS = Object.freeze([
 
 // The materialization registry keys a report under a different name than its live contract in one case.
 const REGISTRY_KEY_FOR_LIVE = Object.freeze({ "daily-reporting": "daily" });
-const LIVE_KEY_FOR_REGISTRY = Object.freeze({ daily: "daily-reporting" });
+// WP1: the route publisher key "returns-leakage-v3" is classified by its materialization entry "returns-leakage" (the
+// same live report_key) until WP11 replaces this registry with the route registry.
+const LIVE_KEY_FOR_REGISTRY = Object.freeze({ daily: "daily-reporting", "returns-leakage-v3": "returns-leakage" });
 
 /** live report key -> [family ids] that publish it through a zero-export reconciler. */
 export function familiesForLiveReport(reportKey) {
