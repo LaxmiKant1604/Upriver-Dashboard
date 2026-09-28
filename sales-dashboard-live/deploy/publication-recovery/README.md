@@ -239,8 +239,8 @@ and the job upsert) is an ignored orphan, never a stall. The status also shows t
 | Leading `-threw` / race-prone / strict-default classification; the guard's leading newline | units K1-K6, vocabulary V1c / V3 / V5, zero-export-guard G10 |
 | Real SQL of the redesigned 20260934 + the store's own SQL + exact rollback | `publication-recovery-sql-selftest.mjs` (PGlite, 55 assertions) |
 | Ads digest partials: the per-(account, day) partials folded per window == the old per-window `adr1:` digest (both statements) on real Postgres; an empty window is `adr1:0:0:0` | `ads-digest-equivalence-selftest.mjs` (PGlite, 12 assertions), `ads-daily-digest.test.js` |
-| Tier-1 sweep cache: ONE shared Ads scan per tier-1 / watermark pass; every other read stays account-scoped and fresh; a failed shared read fails fast for that pass only | worker 15t, brand-view E11, `ads-daily-digest.test.js` |
-| FBA reconcile fairness: most-starved accounts first (served inventory date), a hung account defers `deadline-account-in-flight` without stalling the run, the served-date reads are capped | `fba-reconcile-fairness.test.js` |
+| Tier-1 sweep cache: ONE shared Ads scan per tier-1 / watermark pass; every other read stays account-scoped and fresh; a failed shared read fails fast for that pass only | worker 15t (one Map per pass), 1j / 5d / 11f (the per-job, dependency and deep-sweep reads get none), brand-view E11, `ads-daily-digest.test.js` |
+| FBA reconcile fairness: most-starved accounts first (served inventory date), a hung account defers `deadline-account-in-flight` without stalling the run, the served-date reads are capped (10 s per read, 60 s in total including an in-flight read) | `fba-reconcile-fairness.test.js` (F14, F15) |
 | Structural zero-export (import closure, allow-list) | `worker-closure.test.js`, `publication-recovery-units.test.js` C1-C9 |
 
 **Honest limit:** PGlite is a single connection: `FOR UPDATE SKIP LOCKED` and the advisory lock are not contended by two
@@ -859,8 +859,9 @@ rebuild from the workflow, and retires every legacy unfenced writer (9.2). Owner
    (`fba-publication-reconciler.js fbaFairOrder`: stocked before honest-empty, then the OLDEST dashboard-served
    inventory date first, then a per-day tie), so whenever a deadline still cuts, the next run starts with whoever was
    left behind (`scripts/fba-reconcile-fairness.test.js`, incl. the multi-day starvation simulation). Every account also
-   gets its OWN 180 s budget (`fba-publication-reconcile.mjs ACCOUNT_DEADLINE_SECONDS`, ~9x the typical ~20 s): a hung
-   account is aborted (its fence goes null: the fenced CAS writes nothing), deferred `deadline-account-in-flight` with LKG
+   gets its OWN budget (`fba-publication-reconcile.mjs ACCOUNT_DEADLINE_SECONDS`: a quarter of the run deadline within
+   [60, 180] s -- 180 s in the 900 s `fba` step, 82 s in the 330 s backstop and the recovery worker's fba child; ~4-9x the
+   typical ~20 s): a hung account is aborted (its fence goes null: the fenced CAS writes nothing), deferred `deadline-account-in-flight` with LKG
    kept, and the run CONTINUES -- so the account the fair order puts first can never consume the whole window (an
    unconfirmed termination still stops the run and leaves lease + controls for cleanup, exactly as before). Trade-offs to
    know: the europe-au step now holds the GLOBAL control lease up to ~11-15 min (32 x ~20 s, renewed with a 900 s TTL

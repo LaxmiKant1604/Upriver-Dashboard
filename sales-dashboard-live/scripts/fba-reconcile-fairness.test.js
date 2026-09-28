@@ -320,6 +320,15 @@ test("F15 the served-date reads are CAPPED per read and in TOTAL: a hanging read
   const h2 = harness({ readServed: async () => { reads += 1; return new Promise((r) => setTimeout(() => r("2026-09-27"), 15)); }, readCapMs: 1000, readBudgetMs: 40, logs, capacity: 0 });
   await h2.reconciler.run({ bucket: "europe-au", requestedAsOf: "2026-09-28", mode: "periodic" });
   ok("F15b the TOTAL read budget stops further reads (the rest are null) and is logged", reads > 0 && reads < 23 && logs.some((l) => /served-date read budget reached/.test(l)));
+  // The budget also bounds the LAST read: a read that starts inside the budget is cut when the budget runs out, never
+  // after its full per-read cap (the phase was budget + one cap before; review P3).
+  const logs3 = [];
+  let reads3 = 0;
+  const t3 = Date.now();
+  const h3 = harness({ readServed: async () => { reads3 += 1; return new Promise(() => {}); }, readCapMs: 5000, readBudgetMs: 60, logs: logs3, capacity: 0 });
+  await h3.reconciler.run({ bucket: "europe-au", requestedAsOf: "2026-09-28", mode: "periodic" });
+  ok("F15c an in-flight read is cut at the budget left (min(per-read cap, budget left)): hung reads under a 60 ms budget and a 5 s cap end the phase near 60 ms, never after the 5 s cap",
+    reads3 >= 1 && reads3 <= 3 && Date.now() - t3 < 2500 && logs3.some((l) => /served-date read budget reached/.test(l)));
 });
 
 test("F16 when the fair-order phase itself reaches the start cutoff, NO control is opened (no apply + rollback for zero work)", async () => {

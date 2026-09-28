@@ -258,14 +258,16 @@ function literalsOf(files) {
   let compared = 0;
   for (const routeId of LEGACY_ROUTE_IDS) {
     const ctx = { routeId, routeKind: "legacy-cli" };
-    // 'derive-not-ready:<sub>' and the INTENTIONAL_LEGACY_ADDITIONS are the intentional changes (asserted separately below).
-    for (const r of [...codes].filter((x) => !x.startsWith("derive-not-ready:") && !INTENTIONAL_LEGACY_ADDITIONS.includes(x.split(":")[0]))) for (const st of states) {
+    // 'derive-not-ready:<sub>' is intentional change 1 (asserted separately below). An INTENTIONAL_LEGACY_ADDITIONS code
+    // (bare or ':detail') changes ONLY its two deferred-state verdicts (change 3 below); every other state is compared here.
+    for (const r of [...codes].filter((x) => !x.startsWith("derive-not-ready:"))) for (const st of states) {
+      if (INTENTIONAL_LEGACY_ADDITIONS.includes(r.split(":")[0]) && (st === STATES.PROVENANCE || st === STATES.DEPENDENCY)) continue;
       const n = classifyReason(st, r, ctx); const o = OLD(st, r, ctx); compared += 1;
       if (n.cls !== o.cls || (n.alert || null) !== (o.alert || null)) diffs.push([routeId, st, r, o.cls + "/" + o.alert, n.cls + "/" + n.alert]);
     }
   }
   ok(`V2: the 4 legacy families' verdicts (class AND alert) are IDENTICAL to the pre-fix classifier over ${codes.size} codes x ${states.length} states x ${LEGACY_ROUTE_IDS.length} routes (${compared} comparisons: every legacy module literal, LEGACY_REASON_CODES, ':detail' variants)` + (diffs.length ? " -- DIFFS: " + J([...new Set(diffs.map((d) => d[2] + "@" + d[1] + ":" + d[3] + "->" + d[4]))].slice(0, 400)) : ""), diffs.length === 0 && compared > 4 * 6 * 300);
-  // The THREE intentional legacy-path changes (excluded from the V2 loop above and asserted here):
+  // The THREE intentional legacy-path changes, asserted here (change 3's other states stay in the V2 loop above):
   // (1) a 'derive-not-ready:<sub>' is no longer blanket-whitelisted; (2) a writer-fence refusal ('REPORT_WRITER_FENCED')
   // is INTEGRITY + alert 'writer-fenced' (the WP14 first rule) instead of the pre-fix classification (neither is emitted
   // by a legacy module literal); (3) 'zero-row-window-gap' (INTENTIONAL_LEGACY_ADDITIONS) is typed missing evidence.
@@ -273,11 +275,16 @@ function literalsOf(files) {
   ok("V2: intentional legacy-path change 1 is the 'derive-not-ready:<sub>' blanket (never emitted by a legacy family) -- now an unmapped alert; the class is unchanged", dnr.cls === CLASSES.DEPENDENCY && /^unmapped-reason:/.test(S(dnr.alert)) && OLD(STATES.DEPENDENCY, "derive-not-ready:zz-sub", {}).alert === null && ![...literalsOf(LEGACY_FILES).keys()].some((x) => x.startsWith("derive-not-ready:")));
   const wf = classifyReason(STATES.FAILED_PUBLISH, "REPORT_WRITER_FENCED:brand-sales", { routeKind: "legacy-cli" });
   ok("V2: intentional legacy-path change 2 is the writer-fence refusal ('REPORT_WRITER_FENCED', never a legacy module literal) -- INTEGRITY + alert 'writer-fenced'", wf.cls === CLASSES.INTEGRITY && wf.alert === "writer-fenced" && ![...literalsOf(LEGACY_FILES).keys()].some((x) => /REPORT_WRITER_FENCED/.test(x)));
-  // (3) 'zero-row-window-gap' (observe-only soak 2026-09-28): the pre-fix model raised 'unmapped-reason'; now a typed
-  // missing-evidence deferral WITHOUT an alert. Its class is unchanged in every state.
-  const z = [STATES.PROVENANCE, STATES.DEPENDENCY].map((st) => [classifyReason(st, "zero-row-window-gap", { routeKind: "legacy-cli", routeId: "oli" }), OLD(st, "zero-row-window-gap", {})]);
-  ok("V2: intentional legacy-path change 3 is 'zero-row-window-gap' -- the pre-fix 'unmapped-reason' alert is gone, the class is unchanged",
-    z.every(([n, o]) => n.cls === o.cls && n.alert === null && /^unmapped-reason:zero-row-window-gap/.test(S(o.alert))));
+  // (3) 'zero-row-window-gap' (observe-only soak 2026-09-28): in the two deferred states the pre-fix model raised
+  // 'unmapped-reason'; now a typed missing-evidence deferral WITHOUT an alert, same class. Every other state is identical
+  // (compared in the V2 loop above).
+  const z = [];
+  for (const routeId of LEGACY_ROUTE_IDS) for (const r of ["zero-row-window-gap", "zero-row-window-gap:detail"]) for (const st of [STATES.PROVENANCE, STATES.DEPENDENCY]) {
+    const ctx = { routeKind: "legacy-cli", routeId };
+    z.push([classifyReason(st, r, ctx), OLD(st, r, ctx), r]);
+  }
+  ok(`V2: intentional legacy-path change 3 is 'zero-row-window-gap' (bare + ':detail', ${LEGACY_ROUTE_IDS.length} legacy routes, both deferred states) -- the pre-fix 'unmapped-reason' alert is gone, the class is unchanged`,
+    z.length === LEGACY_ROUTE_IDS.length * 4 && z.every(([n, o, r]) => n.cls === o.cls && n.alert === null && S(o.alert) === "unmapped-reason:" + r));
 }
 
 /* V3. the explicit NOT_ACTIVATED STOP list against the CLIs' real STOP codes */

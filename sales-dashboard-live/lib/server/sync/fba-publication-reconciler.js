@@ -145,9 +145,11 @@ export function buildFbaPublicationReconciler({
         const readOrder = [...staleAccounts].sort((x, y) => { const a = fairTie(requestedAsOf, x), b = fairTie(requestedAsOf, y); return a < b ? -1 : a > b ? 1 : 0; });
         for (const accountId of readOrder) {
           if (statusOf.get(accountId) !== FBA_REVISION_STATUS.AVAILABLE) continue;
-          if (clock().getTime() - t0 >= readBudgetMs) { budgetHit = true; break; }
+          const elapsed = clock().getTime() - t0;
+          if (elapsed >= readBudgetMs) { budgetHit = true; break; }
           let d = null;
-          try { d = await capRead(readServedInventoryDate({ accountId }), readCapMs); } catch { d = null; }
+          // Each read is capped at min(per-read cap, budget left), so the phase never outlasts the total budget.
+          try { d = await capRead(readServedInventoryDate({ accountId }), Math.min(readCapMs, readBudgetMs - elapsed)); } catch { d = null; }
           servedAsOf.set(accountId, DATE_RE.test(S(d)) ? S(d) : null);
         }
       }

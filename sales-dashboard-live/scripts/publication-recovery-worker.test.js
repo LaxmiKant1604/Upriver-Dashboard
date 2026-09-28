@@ -159,7 +159,15 @@ const drain = async (rig, max = 30) => { let i = 0; while (i < max && (await rig
   const lg = makeRig({ liveRoutes: ["oli"] });
   setEv(lg, "oli", "india", { A1: "cov:1" });
   lg.world.set("oli", "india", "A1", "stale");
-  await lg.worker.watermarkPass(); await lg.worker.processOneBatch();
+  await lg.worker.watermarkPass();
+  const jobEv = [];
+  const origJobRead = lg.store.readRouteEvidence.bind(lg.store);
+  lg.store.readRouteEvidence = async (route, ctx, ...rest) => { jobEv.push({ rest }); return origJobRead(route, ctx, ...rest); };
+  await lg.worker.processOneBatch();
+  lg.store.readRouteEvidence = origJobRead;
+  // 1j [tier-1 perf] the per-job token re-read of a legacy settle (settleCurrent -> currentToken) never gets a sweep cache.
+  ok("1j [tier-1 perf]: the per-job token re-read of a legacy settle passes NO sweep cache (fresh read)",
+    jobEv.length >= 1 && jobEv.every((c) => !(c.rest[0] && c.rest[0].sweepCache)));
   ok("1f: a legacy route runs dry-run -> live -> dry-run with its byte-identical argv; verified (v1 carries no evaluated token: the worker re-read its own)", J(kindsOf(lg.world)) === J(["dry-run", "live", "dry-run"]) && jobsOf(lg.store)[0].status === "verified" && J(buildRouteArgs({ route: "oli", region: "india", asOf: EPOCH, targets: ["A1"], kind: "live", runToken: "prw-w1-oli-india-1-abc" })) === J(["scripts/release/oli-publication-reconcile.mjs", "--bucket=india", `--as-of=${EPOCH}`, "--mode=periodic", "--accounts=A1", "--deadline-seconds=330", "--run-token=prw-w1-oli-india-1-abc", "--emit-targets", "--live"]));
   ok("1g: a legacy verification has NO served proof yet (v1 units carry none) -> the hand-off matrix says deferred:current-unserved", stateOf(lg.store, "oli", "A1").served_confirmed === null && buildHandoffMatrix({ stateRows: (await lg.store.status()).state, directory: await lg.store.readDirectory(), regions: ["india"] }).some((r) => r.accountId === "A1" && r.reportKey === "brand-sales" && r.handoff === "deferred" && r.type === "current-unserved"));
   await lg.worker.tier1Scan();
@@ -319,7 +327,15 @@ const drain = async (rig, max = 30) => { let i = 0; while (i < max && (await rig
   for (const [r, t] of Object.entries(tok)) { setEv(rig, r, "india", { A1: t + "-1" }); rig.world.set(r, "india", "A1", "stale", t + "-1"); }
   setEv(rig, "brand-view-portfolio", "india", { "region:india": "pf-1" }); rig.world.set("brand-view-portfolio", "india", "region:india", "stale", "pf-1");
   await rig.store.enqueue({ route: "fba-plan", region: "india", targetKey: "A1", owners: ["A1"], asOf: EPOCH, token: "fp-1", origin: "scan", priority: 2 });
+  const evReads = [];
+  const origRead = rig.store.readRouteEvidence.bind(rig.store);
+  rig.store.readRouteEvidence = async (route, ctx, ...rest) => { evReads.push({ route: S(route && route.id ? route.id : route), rest }); return origRead(route, ctx, ...rest); };
   await drain(rig);
+  // 5d [tier-1 perf] the cascade's dependency reads (enqueueDependents, one per dependent route) never get a sweep cache:
+  // they must read fresh, through each route's account-scoped statements.
+  ok("5d [tier-1 perf]: every dependency evidence read of the cascade (the 4 dependent routes) passes NO sweep cache (fresh, account-scoped)",
+    evReads.length >= 4 && evReads.every((c) => !(c.rest[0] && c.rest[0].sweepCache))
+    && J([...new Set(evReads.map((c) => c.route))].sort()) === J(["brand-view", "brand-view-brands", "brand-view-portfolio", "sku-movement"]));
   const order = rig.world.calls.filter((c) => c.kind === "live" || c.kind === "repair").map((c) => c.route);
   ok("5a: a verified fba-plan PUBLISH cascades through the dependents in order fba-plan -> brand-view-brands -> sku-movement -> brand-view -> brand-view-portfolio", J(order) === J(["fba-plan", "brand-view-brands", "sku-movement", "brand-view", "brand-view-portfolio"]));
   ok("5b: dependents are enqueued with origin 'dependency' (owner scope; the portfolio at its REGION target) and every one is verified", ["brand-view-brands", "sku-movement", "brand-view", "brand-view-portfolio"].every((r) => jobsOf(rig.store, r).length === 1 && jobsOf(rig.store, r)[0].origin === "dependency" && jobsOf(rig.store, r)[0].status === "verified") && jobsOf(rig.store, "brand-view-portfolio")[0].target_key === "region:india");
@@ -458,7 +474,14 @@ const drain = async (rig, max = 30) => { let i = 0; while (i < max && (await rig
   rig.store.env.cycles.push({ bucket: "india", status: "running", started_ms: T0 - 60000, updated_ms: T0 - 1000 });
   ok("11a: the deep sweep does NOT start while the scheduler gate is blocked", (await rig.worker.deepSweepStep()) === false && rig.world.calls.length === 0);
   rig.store.env.cycles.length = 0; rig.clk.t += 3 * 60000;
+  const deepEv = [];
+  const origDeepRead = rig.store.readRouteEvidence.bind(rig.store);
+  rig.store.readRouteEvidence = async (route, ctx, ...rest) => { deepEv.push({ rest }); return origDeepRead(route, ctx, ...rest); };
   let steps = 0; while ((await rig.worker.deepSweepStep()) && steps < 40) steps += 1;
+  rig.store.readRouteEvidence = origDeepRead;
+  // 11f [tier-1 perf] the deep sweep's evidence reads never get a sweep cache (fresh, account-scoped statements).
+  ok("11f [tier-1 perf]: every deep-sweep evidence read passes NO sweep cache (fresh, account-scoped)",
+    deepEv.length === 10 && deepEv.every((c) => !(c.rest[0] && c.rest[0].sweepCache)));
   const kinds = rig.world.calls.map((c) => `${c.route}:${c.kind}`);
   ok("11b: once the gate clears, ONE read-only child per (region, route) in topo order (--verify-exact for a route CLI, dry-run for a legacy CLI), full-region (no --targets)", rig.world.calls.length === 10 && kinds[0] === "oli:dry-run" && kinds.includes("returns-v3:verify") && kinds[kinds.length - 1] === "brand-view-portfolio:verify" && rig.world.calls.every((c) => c.targets === null));
   ok("11c: the sweep records the unit baseline (verified_rows for current targets) and enqueues the STALE one (origin deep-scan) for a live route", stateOf(rig.store, "brand-view", "A1").verified_token === "brand-view-t" && stateOf(rig.store, "brand-view", "A1").verified_rows.length === 2 && jobsOf(rig.store, "returns-v3")[0].origin === "deep-scan" && rig.store.scanRow.deepSweep.epoch === EPOCH);
