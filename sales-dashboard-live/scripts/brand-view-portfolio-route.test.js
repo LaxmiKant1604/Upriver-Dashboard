@@ -59,6 +59,7 @@ const RSC = await import("../lib/server/reports/region-scope.js");
 const BV = await import("../lib/server/reports/brand-view.js");
 const FPM = await import("../lib/server/reports/brand-view-dependency-fingerprint.js");
 const W = await import("../lib/server/recovery/routes/brand-view-portfolio.route.js");
+const ADE = await import("../lib/server/recovery/routes/ads-daily-evidence.js");
 const C = await import("../lib/server/sync/routes/brand-view-portfolio.release.js");
 const RC = await import("../lib/server/recovery/route-contract.js");
 const REL = await import("../lib/server/sync/route-publication-release.js");
@@ -277,12 +278,14 @@ function makeDb(fx) {
         for (const r of rows.values()) if (r.report_key === "brand-inventory" && r.payload && String(r.payload.inventoryAvailable) === "true" && S(r.params && r.params.reportVersion) === S(params[0])) { if (!groups.has(r.account_id)) groups.set(r.account_id, []); groups.get(r.account_id).push(r); }
         return [...groups.values()].flatMap(rankOne).map((r) => ({ account_id: r.account_id, id: r.id, params_hash: r.params_hash, report_version: S(r.params && r.params.reportVersion), sra: db.sqlTs(r._s), ua: db.sqlTs(r._u) }));
       }
-      case "ads_rows": {
-        // count(*) + max(updated_at) + the digest aggregate (interpreted from the SQL text) per account over [$2, $3] for
-        // source $1; the window echoed as text; accounts without a row in the window have no result row.
-        const by = new Map();
-        for (const r of db.adsRows) if (r.source_key === params[0] && r.metric_date >= params[1] && r.metric_date <= params[2]) { const g = by.get(r.account_id) || { n: 0, max: "", rows: [] }; g.n += 1; g.rows.push(r); const u = pgToCharUs(r.updated_at); if (u > g.max) g.max = u; by.set(r.account_id, g); }
-        return [...by.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([a, g]) => ({ account_id: a, n: String(g.n), max_ua: g.max, rows_digest: pgAdsRowsDigest(g.rows), win_from: params[1], win_to: params[2] }));
+      case "ads_daily": {
+        // the SHARED per-day partials (RD.ADS_DAILY_PARTIALS_SQL): per (account, metric_date) over [$2, $3] of source $1 --
+        // count, the two digest lanes (interpreted from the SQL text), max(updated_at) as to_char'd, the range echoed --
+        // plus the always-present range SENTINEL row.
+        const groups = new Map();
+        for (const r of db.adsRows) if (r.source_key === params[0] && r.metric_date >= params[1] && r.metric_date <= params[2]) { const k = r.account_id + "\u0000" + r.metric_date; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(r); }
+        const partials = [...groups.keys()].sort().map((k) => { const g = groups.get(k); const [, n, s1, s2] = pgAdsRowsDigest(g).split(":"); const max = g.map((r) => pgToCharUs(r.updated_at)).sort().pop(); return { account_id: g[0].account_id, metric_date: g[0].metric_date, n, s1, s2, max_ua: max, range_from: params[1], range_to: params[2] }; });
+        return [...partials, { account_id: null, metric_date: null, n: "0", s1: "0", s2: "0", max_ua: null, range_from: params[1], range_to: params[2] }];
       }
       case "ads_state": return [...db.adsState.entries()].filter(([k]) => k.endsWith("|" + params[0])).map(([k, st]) => ({ account_id: k.split("|")[0], last_status: S(st.last_status), latest_metric_date: S(st.latest_metric_date), content_rev: S(st.content_rev) }));
       case "ads_coverage": return [...db.adsCoverage.entries()].filter(([k]) => k.endsWith("|" + params[0])).flatMap(([k, wins]) => wins.map(([f, t]) => ({ account_id: k.split("|")[0], covered_from: f, covered_to: t })));
@@ -589,12 +592,20 @@ async function browserServedIdentities(db, fx, region) {
     && /latest_metric_date::text/.test(sqlOf("ads_state")) && /covered_from::text/.test(sqlOf("ads_coverage")));
   ok("V1 P3-1: the latest-row reads are rank()-based (never DISTINCT ON) -- a tie at the newest updated_at is VISIBLE",
     ["snapshot_latest", "inventory_available"].every((n) => /rank\(\) over \(partition by [a-z_, ]+ order by updated_at desc\)/.test(sqlOf(n)) && /where id in \(select id from ranked where rnk = 1\)/.test(sqlOf(n)) && !/distinct on/i.test(sqlOf(n))));
-  ok("V1 P3-2: ads_rows = per-account count(*) + to_char(max(updated_at)) over ads_daily_source_rows for the ACTIVE source and the build window ($2/$3 cast ONLY to date, echoed DateStyle-independently)",
-    /count\(\*\)::text as n/.test(sqlOf("ads_rows")) && /to_char\(max\(updated_at\) at time zone 'UTC'/.test(sqlOf("ads_rows")) && /from public\.ads_daily_source_rows where source_key = \$1 and metric_date >= \$2::date and metric_date <= \$3::date group by account_id/.test(sqlOf("ads_rows"))
-    && /to_char\(\$2::date, 'YYYY-MM-DD'\) as win_from, to_char\(\$3::date, 'YYYY-MM-DD'\) as win_to/.test(sqlOf("ads_rows")) && !/\$[23]::text/.test(sqlOf("ads_rows"))
-    && J(W.EVIDENCE_SQL.find((q) => q.name === "ads_rows").params({ now: CLOCK0 })) === J([ACTIVE_ADS_SOURCE_KEY, "2026-04-01", IN_ASOF]));
+  // Tier-1 performance: the evidence reads the SHARED per-day partials (the SAME frozen statement object as Brand View);
+  // the per-account statement stays exported as W.PORTFOLIO_ADS_ROWS_SQL (the equivalence reference).
+  const adsStmt = W.EVIDENCE_SQL.find((q) => q.name === "ads_daily");
+  ok("V1 tier-1: the evidence reads ADE.ADS_DAILY_STATEMENT (shared: true; no per-region ads_rows); with no directory its params are EXACTLY [ACTIVE source, the IN build window] (the anchor); the SQL echoes the scanned range on every row + an always-present sentinel",
+    !!adsStmt && adsStmt === ADE.ADS_DAILY_STATEMENT && adsStmt.shared === true && !W.EVIDENCE_SQL.some((q) => q.name === "ads_rows")
+    && J(adsStmt.params({ now: CLOCK0 })) === J([ACTIVE_ADS_SOURCE_KEY, "2026-04-01", IN_ASOF]) && ADE.ADS_DAILY_ANCHOR_MARKETPLACE === W.PORTFOLIO_ASOF_MARKETPLACE
+    && /to_char\(\$2::date, 'YYYY-MM-DD'\) as range_from, to_char\(\$3::date, 'YYYY-MM-DD'\) as range_to/.test(adsStmt.text) && / union all select null::text, null::text, '0', '0', '0', null::text, to_char\(\$2::date/.test(adsStmt.text)
+    && adsStmt.text.includes(DEPR.adsLaneSumSql("", 1) + " as s1, " + DEPR.adsLaneSumSql("", 16) + " as s2") && !/\$[23]::text/.test(adsStmt.text));
+  const sqlOfRef = () => W.PORTFOLIO_ADS_ROWS_SQL;
+  ok("V1 P3-2: (reference) ads_rows = per-account count(*) + to_char(max(updated_at)) over ads_daily_source_rows for the ACTIVE source and the build window ($2/$3 cast ONLY to date, echoed DateStyle-independently)",
+    /count\(\*\)::text as n/.test(sqlOfRef()) && /to_char\(max\(updated_at\) at time zone 'UTC'/.test(sqlOfRef()) && /from public\.ads_daily_source_rows where source_key = \$1 and metric_date >= \$2::date and metric_date <= \$3::date group by account_id/.test(sqlOfRef())
+    && /to_char\(\$2::date, 'YYYY-MM-DD'\) as win_from, to_char\(\$3::date, 'YYYY-MM-DD'\) as win_to/.test(sqlOfRef()) && !/\$[23]::text/.test(sqlOfRef()));
   ok("V1 round-3 P2: ads_rows ALSO selects the EXACT content digest -- the SHARED adsRowsDigestSql fragment embedded VERBATIM (one definition with the JS twin; count + max alone is not a content identity)",
-    sqlOf("ads_rows").includes(" " + DEPR.adsRowsDigestSql("") + " as rows_digest, ") && /^'adr1:' \|\| count\(account_id\)::text/.test(DEPR.adsRowsDigestSql("")));
+    sqlOfRef().includes(" " + DEPR.adsRowsDigestSql("") + " as rows_digest, ") && /^'adr1:' \|\| count\(account_id\)::text/.test(DEPR.adsRowsDigestSql("")));
   // The build window IS buildAccountBrandSlice's getAdsRows window (the brand-view.js source expression, pinned).
   const BVSRC = src("lib/server/reports/brand-view.js");
   ok("V1 P3-2: adsBuildWindow == brand-view.js buildAccountBrandSlice's Ads window (monthBack(asOf, 5)?.from || monthStart(asOf) .. asOf), incl. a January as-of",

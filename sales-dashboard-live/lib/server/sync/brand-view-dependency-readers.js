@@ -228,13 +228,116 @@ export function adsRowDigestTextSql(p = "") {
   ].join(" || ");
 }
 
+/** One EXACT digest lane sum over the grouped rows: hex digits start..start+14 of md5(row text) as 60-bit unsigned. */
+export function adsLaneSumSql(p = "", start = 1) {
+  return `coalesce(sum(('x' || substr(md5(${adsRowDigestTextSql(p)}), ${start}, 15))::bit(60)::bigint), 0)::text`;
+}
+
 /**
  * The SQL AGGREGATE expression of the per-account digest over the grouped rows (`p` = the table alias prefix). Counts
  * `<p>account_id` (never count(*)) and coalesces the sums, so a LEFT JOIN group with no row yields EMPTY_ADS_ROWS_DIGEST.
  */
 export function adsRowsDigestSql(p = "") {
-  const lane = (start) => `coalesce(sum(('x' || substr(md5(${adsRowDigestTextSql(p)}), ${start}, 15))::bit(60)::bigint), 0)::text`;
-  return `'${ADS_ROWS_DIGEST_PREFIX}' || count(${p}account_id)::text || ':' || ${lane(1)} || ':' || ${lane(16)}`;
+  return `'${ADS_ROWS_DIGEST_PREFIX}' || count(${p}account_id)::text || ':' || ${adsLaneSumSql(p, 1)} || ':' || ${adsLaneSumSql(p, 16)}`;
+}
+
+// ---- THE SHARED PER-DAY PARTIALS OF THE SAME DIGEST (publication recovery tier-1 performance) -----------------------
+// The 'adr1:' digest is ADDITIVE: count, lane-1 sum and lane-2 sum are plain sums over rows, so the digest of a window
+// equals the sums of the per-(account, metric_date) partials of the days inside it -- EXACTLY (count + BigInt sums, no
+// modulus), and max(updated_at) of a window is the max of its days' maxima. ONE heap scan of the ACTIVE source over the
+// UNION of every window a sweep needs (ADS_DAILY_PARTIALS_SQL) therefore yields every per-account window digest the
+// Brand View and portfolio evidence used to compute with SIX separate scans of the same wide, disk-bound table (the
+// 2026-09-28 VM tier-1 took 82 s against the 60 s gate; EXPLAIN: ~11-15 s of heap I/O per scan, md5 only ~2-5 s).
+// adsWindowRowsFromDaily folds the partials back into rows IDENTICAL to what ADS_ROWS_SQL (Brand View, one LEFT JOIN
+// row per requested account: an account with no row -> EMPTY_ADS_ROWS_DIGEST) and the portfolio's per-account group
+// (accounts with >= 1 row only, with n + max_ua) returned -- pinned against both old statements on real Postgres
+// (scripts/worker/ads-digest-equivalence-selftest.mjs) and in JS (scripts/ads-daily-digest.test.js).
+// THE SCANNED RANGE IS ECHOED: every partial row AND one always-present SENTINEL row (account_id NULL, zero sums) carry
+// range_from / range_to = $2 / $3 through a DateStyle-independent to_char, so a compose can PROVE the partials cover its
+// windows even when the scan found no row at all (a params / compose clock split across a local midnight -> a window
+// outside the scanned range -> fail closed typed 'ads-rows-window-mismatch', exactly as the old per-window echo did).
+// $2 / $3 are only ever cast to date (one deduced parameter type).
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const BIGINT_RE = /^\d+$/;
+const ADS_DAILY_TS = (col) => `to_char(${col} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+const ADS_DAILY_RANGE ="to_char($2::date, 'YYYY-MM-DD') as range_from, to_char($3::date, 'YYYY-MM-DD') as range_to";
+export const ADS_DAILY_PARTIALS_SQL = "select p.account_id, p.metric_date, p.n, p.s1, p.s2, p.max_ua, " + ADS_DAILY_RANGE + " from ("
+  + "select account_id, to_char(metric_date, 'YYYY-MM-DD') as metric_date, "
+  + "count(account_id)::text as n, " + adsLaneSumSql("", 1) + " as s1, " + adsLaneSumSql("", 16) + " as s2, "
+  + ADS_DAILY_TS("max(updated_at)") + " as max_ua "
+  + "from public.ads_daily_source_rows where source_key = $1 and metric_date >= $2::date and metric_date <= $3::date "
+  + "group by account_id, metric_date) p "
+  + "union all select null::text, null::text, '0', '0', '0', null::text, " + ADS_DAILY_RANGE;
+// The ACCOUNT-SCOPED twin ($4 = the evidence accounts): the SAME columns, partials, range echo and sentinel, restricted to
+// the requested accounts -- an index-driven read (ads_daily_source_rows_lookup_idx: account_id, source_key, metric_date)
+// for every reader WITHOUT a sweep cache (the route CLI's per-unit reads, the worker's per-job / dependency / deep-sweep
+// reads). Folding its partials for the requested accounts yields EXACTLY the unscoped statement's digests.
+export const ADS_DAILY_ACCOUNT_PARTIALS_SQL = ADS_DAILY_PARTIALS_SQL.replace(
+  "where source_key = $1 and metric_date >= $2::date and metric_date <= $3::date ",
+  "where source_key = $1 and metric_date >= $2::date and metric_date <= $3::date and account_id = any($4::text[]) ",
+);
+// FAIL CLOSED AT LOAD: if the base text ever changes so the replace above no longer matches, the "scoped" statement
+// would silently be the full scan again -- refuse to load instead.
+if (ADS_DAILY_ACCOUNT_PARTIALS_SQL === ADS_DAILY_PARTIALS_SQL || ADS_DAILY_ACCOUNT_PARTIALS_SQL.split("account_id = any($4::text[])").length !== 2) {
+  throw new Error("brand-view-dependency-readers: ADS_DAILY_ACCOUNT_PARTIALS_SQL lost its account filter (fail closed).");
+}
+
+/**
+ * PURE: split an ADS_DAILY_PARTIALS_SQL result into { range: { from, to }, rows: the real partials } -- or null when the
+ * result is malformed (no sentinel, more than one sentinel, a row whose echoed range differs, a blank range). A caller
+ * treats null as missing evidence (fail closed).
+ */
+export function splitAdsDailyPartials(result) {
+  if (!Array.isArray(result)) return null;
+  let range = null; let sentinels = 0; const rows = [];
+  for (const r of result) {
+    const from = String(r && r.range_from != null ? r.range_from : ""); const to = String(r && r.range_to != null ? r.range_to : "");
+    if (!DAY_RE.test(from) || !DAY_RE.test(to) || from > to) return null;
+    if (range && (range.from !== from || range.to !== to)) return null;
+    range = { from, to };
+    if (r.account_id == null) { sentinels += 1; continue; }
+    rows.push(r);
+  }
+  return sentinels === 1 && range ? { range, rows } : null;
+}
+
+/**
+ * PURE: fold ADS_DAILY_PARTIALS_SQL rows into per-window rows. windows: [{ accountId, from, to }] ('YYYY-MM-DD',
+ * inclusive). includeEmpty: true -> one row per requested window even with no day inside (the LEFT JOIN semantics:
+ * n '0', max_ua null, rows_digest EMPTY_ADS_ROWS_DIGEST); false -> only windows with >= 1 row (the GROUP BY semantics).
+ * -> [{ account_id, win_from, win_to, n, max_ua, rows_digest }] in the windows' order. THROWS on a malformed partial
+ * of a REQUESTED account (a non-date day, a non-integer count / sum): a corrupted read must never become a plausible
+ * digest (fail closed). Validation is per requested account: a malformed row of an account no window asks for cannot
+ * change any returned digest, so it never blocks the others (isolation).
+ */
+export function adsWindowRowsFromDaily(dailyRows, windows, { includeEmpty = false } = {}) {
+  const byAcct = new Map();
+  for (const r of Array.isArray(dailyRows) ? dailyRows : []) {
+    const a = r == null ? "" : String(r.account_id == null ? "" : r.account_id);
+    if (!byAcct.has(a)) byAcct.set(a, []);
+    byAcct.get(a).push(r);
+  }
+  const partialsOf = (accountId) => (byAcct.get(accountId) || []).map((r) => {
+    const d = String(r && r.metric_date != null ? r.metric_date : "");
+    const n = String(r && r.n != null ? r.n : ""); const s1 = String(r && r.s1 != null ? r.s1 : ""); const s2 = String(r && r.s2 != null ? r.s2 : "");
+    if (!DAY_RE.test(d) || !BIGINT_RE.test(n) || !BIGINT_RE.test(s1) || !BIGINT_RE.test(s2)) throw new Error("adsWindowRowsFromDaily: malformed daily partial (fail closed)");
+    return { d, n: BigInt(n), s1: BigInt(s1), s2: BigInt(s2), ua: r.max_ua == null ? "" : String(r.max_ua) };
+  });
+  const out = [];
+  for (const w of Array.isArray(windows) ? windows : []) {
+    const accountId = String(w && w.accountId != null ? w.accountId : "");
+    const from = String(w && w.from != null ? w.from : ""); const to = String(w && w.to != null ? w.to : "");
+    if (accountId === "" || !DAY_RE.test(from) || !DAY_RE.test(to)) throw new Error("adsWindowRowsFromDaily: malformed window (fail closed)");
+    let n = 0n; let s1 = 0n; let s2 = 0n; let ua = "";
+    for (const p of partialsOf(accountId)) {
+      if (p.d < from || p.d > to) continue;
+      n += p.n; s1 += p.s1; s2 += p.s2;
+      if (p.ua > ua) ua = p.ua; // one fixed-width canonical UTC form -> lexicographic = chronological
+    }
+    if (n === 0n && !includeEmpty) continue;
+    out.push({ account_id: accountId, win_from: from, win_to: to, n: n.toString(), max_ua: n === 0n ? null : ua, rows_digest: ADS_ROWS_DIGEST_PREFIX + n.toString() + ":" + s1.toString() + ":" + s2.toString() });
+  }
+  return out;
 }
 
 /** The JS twin of adsRowDigestTextSql over one REST row (PostgREST shapes: '+00:00' instants, trimmed fractions). */

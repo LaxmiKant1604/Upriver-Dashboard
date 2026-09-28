@@ -11,10 +11,12 @@
 // refuses provider creates (zero export, structurally).
 //
 // OPT-IN ROUTE hooks (publication recovery WP3: units, per-target as-of, two-phase prepare/publish with chunked control
-// windows, a served-row verdict, a per-route current predicate). Every hook is ABSENT on the four live families (oli /
-// fba / ads / listings), and with all of them absent run() takes the ORIGINAL code path -- identical reads, calls,
-// logs and summary (pinned by scripts/saved-data-reconciler-routes.test.js G0 against the pre-hook module). 7-bit
-// ASCII, LF.
+// windows, a served-row verdict, a per-route current predicate). Every ROUTE hook is ABSENT on the four live families
+// (oli / fba / ads / listings), and with all of them absent run() takes the ORIGINAL code path -- identical reads, calls,
+// logs and summary (pinned by scripts/saved-data-reconciler-routes.test.js G0 against the pre-hook module). The ONE
+// single-phase exception is publication recovery D3: the FBA family supplies adapter.orderStale (its fair execution
+// order) and a per-account deadline marker ({ __accountDeadline: true } from its deadlineRace); OLI / Ads / LHv3 supply
+// neither and are unchanged. 7-bit ASCII, LF.
 
 import { PUBLICATION_STATE, evaluatePublicationBinding, contractAsOfField, isCalendarDate } from "./publication-binding.js";
 
@@ -261,6 +263,15 @@ export function normalizeRouteUnits(raw, { accountId, requestedAsOf, reportKeys 
  * With any hook present the perAccount records ALSO carry units[] (and report entries h / sra / served); the outcome and
  * count semantics are unchanged (a count is one (unit, report)). A target whose expansion was EMPTY also carries
  * unitsReason UNITS_EMPTY_REASON (zero counts; the TARGETS v2 line flags it -- an empty unit list is never "verified").
+ *
+ * OPT-IN FAIR ORDER (publication recovery D3; SINGLE-PHASE only; absent on every family but FBA -> the sorted scope
+ * order, byte-identical):
+ *   adapter.orderStale({ staleAccounts, perAccount: [{ accountId, status }], requestedAsOf, bucket }) -> string[]
+ *       (may be async) the ORDER in which the stale accounts are executed. The deadline cuts the tail of this order
+ *       ('deadline-cleanup-reserved', LKG kept), so a fixed sorted order starves the SAME tail on every run. It runs
+ *       BEFORE openControls (its reads never hold the lease). It only reorders: the result must be a PERMUTATION of
+ *       staleAccounts, else (or on a throw) the default sorted order is kept and the fallback is logged -- the stale
+ *       set, the classification, the publication and every count are unchanged.
  */
 export function buildSavedDataReconciler({
   resolveOrg, bucketAccounts, adapter,
@@ -303,9 +314,12 @@ export function buildSavedDataReconciler({
   }
   if (!liveContracts || typeof computeHash !== "function" || !reportDerivations) throw new Error("buildSavedDataReconciler requires liveContracts + computeHash + reportDerivations (fail closed).");
   if (postPromotionHook != null && typeof postPromotionHook !== "function") throw new Error("buildSavedDataReconciler postPromotionHook must be a function when provided (fail closed).");
-  for (const hook of ["expandUnits", "currentPredicate", "servedCheck"]) {
+  for (const hook of ["expandUnits", "currentPredicate", "servedCheck", "orderStale"]) {
     if (adapter[hook] != null && typeof adapter[hook] !== "function") throw new Error(`buildSavedDataReconciler adapter.${hook} must be a function when provided (fail closed).`);
   }
+  // The fair order is a SINGLE-PHASE hook: the two-phase runner orders units by its own windows (never silently ignored).
+  if (adapter.orderStale != null && twoPhase) throw new Error("buildSavedDataReconciler adapter.orderStale is single-phase only (fail closed).");
+  const orderStaleFn = typeof adapter.orderStale === "function" ? adapter.orderStale : null;
   const unitsMode = typeof adapter.expandUnits === "function";
   if (unitsMode && !twoPhase) throw new Error("buildSavedDataReconciler adapter.expandUnits requires the two-phase runPrepareForUnit + runPublishForUnit (per-unit isolation; fail closed).");
   const predicateFn = typeof adapter.currentPredicate === "function" ? adapter.currentPredicate : null;
@@ -313,6 +327,32 @@ export function buildSavedDataReconciler({
   // EXTENDED = any route hook present. Only then do records carry units[] and entries h/sra/served; otherwise every
   // branch below is the pre-hook code path.
   const extended = unitsMode || twoPhase || predicateFn != null || servedCheckFn != null;
+
+  // The adapter's fair order of the stale accounts, or the given (sorted) order when the hook throws or does not return
+  // an exact PERMUTATION of them (a dropped, duplicated or foreign id can never change what is published).
+  async function applyStaleOrder(stale, perAccount, requestedAsOf, bucket) {
+    let out;
+    try {
+      out = await orderStaleFn({
+        staleAccounts: [...stale],
+        perAccount: perAccount.filter((r) => stale.includes(r.accountId)).map((r) => ({ accountId: r.accountId, status: r.status == null ? null : S(r.status) })),
+        requestedAsOf, bucket,
+      });
+    } catch (e) {
+      // Never the raw message (the core logs only typed codes): the error's class / code.
+      log(`SAVED_DATA_RECONCILE stale-order-fallback (orderStale threw ${S(e && (e.code || e.name)).slice(0, 40) || "error"}) -- the sorted order of ${stale.length} stale account(s) is kept.`);
+      return stale;
+    }
+    // Array.from (never .map): a SPARSE array's holes become "" and fail the check (map / every skip holes).
+    const ids = Array.isArray(out) ? Array.from(out, S) : null;
+    const valid = !!ids && ids.length === stale.length && new Set(ids).size === ids.length && ids.every((a) => stale.includes(a)) && stale.every((a) => ids.includes(a));
+    if (!valid) {
+      log(`SAVED_DATA_RECONCILE stale-order-fallback (orderStale did not return a permutation of the ${stale.length} stale account(s)) -- the sorted order is kept.`);
+      return stale;
+    }
+    log(`SAVED_DATA_RECONCILE stale-order fair: ${ids.length} stale account(s) in the adapter's order.`);
+    return ids;
+  }
 
   // Storage-first payload hydration for a snapshot row (inline payload, else load the offloaded object). null on absence.
   async function hydrate(row) {
@@ -413,6 +453,16 @@ export function buildSavedDataReconciler({
       return summarize({ bucket, requestedAsOf, mode, dryRun, startedAt, perAccount });
     }
 
+    // OPT-IN FAIR ORDER (see the header): reorder ONLY the execution sequence of the stale accounts, before any control
+    // is opened. Absent -> the sorted order (byte-identical). If the ordering phase itself used up the work window, no
+    // control is opened at all (an apply + rollback for zero work would only contend for the global lease).
+    let orderedPastCutoff = false;
+    if (orderStaleFn && !twoPhase && staleAccounts.length > 1) {
+      const ordered = await applyStaleOrder(staleAccounts, perAccount, requestedAsOf, bucket);
+      staleAccounts.splice(0, staleAccounts.length, ...ordered);
+      orderedPastCutoff = outOfTime() === true;
+    }
+
     // Execute ONLY the stale accounts, EACH INDEPENDENTLY (per-ACCOUNT isolation): one account's failure never blocks
     // another; a failed account keeps its exact dated LKG. Healthy accounts are processed first (sorted). Zero provider
     // export (the injected release is wired with a create-refusing adapter). CONTROL LIFECYCLE: open the publication
@@ -422,6 +472,9 @@ export function buildSavedDataReconciler({
     const markStale = (accountId, state, reason, extra) => { const rec = perAccount.find((r) => r.accountId === accountId); for (const rk of reportKeys) if (rec.reports[rk] && rec.reports[rk].state === PUBLICATION_STATE.STALE) rec.reports[rk] = { state, reason, lkgPreserved: true, ...(extra || {}) }; };
     if (twoPhase) {
       await runTwoPhase({ bucket, requestedAsOf, staleUnits, control, promoted });
+    } else if (orderedPastCutoff) {
+      for (const accountId of staleAccounts) markStale(accountId, RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-cleanup-reserved");
+      log(`SAVED_DATA_RECONCILE the fair-order phase reached the start cutoff -- deferring ${staleAccounts.length} account(s), NO controls opened, ZERO publication writes.`);
     } else if (staleAccounts.length > 0) {
       let opened = { ok: false, reason: "not-opened" };
       try {
@@ -455,6 +508,26 @@ export function buildSavedDataReconciler({
               if (confirmedStopped) {
                 markStale(accountId, RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-in-flight", { terminationConfirmed: true });
               } else {
+                control.terminationUnconfirmed = true;
+                markStale(accountId, RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-termination-unconfirmed", { terminationConfirmed: false });
+              }
+              continue;
+            }
+            // PER-ACCOUNT deadline (publication recovery D3; only a family whose deadlineRace returns this marker -- the FBA
+            // CLI): THIS account's own time budget ran out while the run still has time. Terminate it exactly like a run
+            // deadline (abort -> its fence is null -> the fenced CAS writes zero rows; await confirmed settlement), then
+            // CONTINUE with the next account -- a single hung account can never consume the whole work window (with the
+            // fair order it would otherwise lead EVERY run and starve its region). Unconfirmed termination stops the run
+            // exactly as a run deadline does (the op may still hold the fence: lease + controls left for cleanup).
+            if (result && result.__accountDeadline === true) {
+              if (typeof ac.abort === "function") ac.abort();
+              let confirmedStopped = false;
+              try { const s = await awaitSettled(opPromise); confirmedStopped = !!(s && s.settled === true); }
+              catch { confirmedStopped = false; }
+              if (confirmedStopped) {
+                markStale(accountId, RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-account-in-flight", { terminationConfirmed: true });
+              } else {
+                deadlineHit = true;
                 control.terminationUnconfirmed = true;
                 markStale(accountId, RECONCILE_STATUS.DEFERRED_DEPENDENCY, "deadline-termination-unconfirmed", { terminationConfirmed: false });
               }

@@ -10,7 +10,7 @@
 //
 // REAL (read-only: zero writes, zero DataDoe creates / tokens; one zero-token account-directory GET per legacy child):
 //   (1) the TIER-1 metadata pass exactly as the worker runs it -- every route's evidence SQL per region (per-statement
-//       timings: the ads_rows digest scans of brand-view / the portfolio, the legacy GLOBAL evidence SQL, fba-plan /
+//       timings: the ONE shared ads_daily digest scan of brand-view + the portfolio, the legacy GLOBAL evidence SQL, fba-plan /
 //       returns / sku-movement statements), the served-row write scan, the global scheduler gate, the writer fence and
 //       the report-key universe. This is ALSO the pre-live "every route's evidence SQL read-only once" check;
 //   (2) the two foreign-job lineage statements (FBA_PLAN_FOREIGN_JOB_SQL, LISTING_HEALTH_V3_FOREIGN_JOB_SQL) once per
@@ -157,6 +157,9 @@ const t1Start = Date.now();
 const stmtStats = [];
 let evidenceFailures = 0;
 const directory = await store.readDirectory();
+// The worker's tier-1 sweep cache (routes.js sweepMemoQuery): ONE Map for this whole pass, exactly like worker.js
+// tier1Scan -- a `shared: true` statement (the Ads digest partials) runs once; its later hits are timed at ~0 ms.
+const sweepCache = new Map();
 for (const region of regions) {
   const ctx = buildEvidenceContext({ epoch: asOf, now, directory, region, organizationFingerprint: orgFp });
   for (const id of routeIds) {
@@ -166,10 +169,18 @@ for (const region of regions) {
     const s0 = Date.now();
     let map = null, err = null;
     try {
+      // Time each statement by wrapping its params() -- AND its sweep-mode sharedVariant's (recorded under the statement's
+      // own name), so the one real shared Ads scan is attributed to 'ads_daily', never to the statement before it. The
+      // wrapped variant keeps the ORIGINAL variant's text + values, so the sweep-cache key (and hits) are unchanged.
+      const timed = (q) => ({ name: q.name, t: Date.now() });
       map = await store.readRouteEvidence({
         ...route,
-        evidence: { ...route.evidence, sql: route.evidence.sql.map((q) => ({ ...q, params: (c) => { perStmt.push({ name: q.name, t: Date.now() }); return q.params(c); } })) },
-      }, ctx);
+        evidence: { ...route.evidence, sql: route.evidence.sql.map((q) => ({
+          ...q,
+          params: (c) => { perStmt.push(timed(q)); return q.params(c); },
+          ...(q.sharedVariant ? { sharedVariant: { ...q.sharedVariant, params: (c) => { perStmt.push(timed(q)); return q.sharedVariant.params(c); } } } : {}),
+        })) },
+      }, ctx, { sweepCache });
     } catch (e) { err = String((e && (e.code || e.message)) || "error").slice(0, 120); evidenceFailures += 1; }
     const ms = Date.now() - s0;
     // statement i ran between perStmt[i].t and perStmt[i+1].t (or the end)
@@ -190,7 +201,7 @@ const k0 = Date.now(); const keys = await store.readReportKeys(); const keysMs =
 const tier1Seconds = Math.round((Date.now() - t1Start) / 100) / 10;
 out({ tier1: "global", gateMs, gateBlocked: gate.blocked, gateAlerts: gate.alerts.map((a) => a.code), fenceState: fence.state, fenceMs, reportKeys: keys.length, keysMs });
 const pick = (re) => stmtStats.filter((s) => re.test(s.name)).sort((a, b) => b.ms - a.ms)[0] || null;
-out({ measure: "ads_rows digest scans (brand-view / portfolio)", slowest: stmtStats.filter((s) => s.name === "ads_rows").sort((a, b) => b.ms - a.ms).slice(0, 6) });
+out({ measure: "ads_daily shared digest scan (brand-view / portfolio; one real scan per pass, the rest sweep-cache hits)", slowest: stmtStats.filter((s) => s.name === "ads_daily").sort((a, b) => b.ms - a.ms).slice(0, 6) });
 out({ measure: "legacy GLOBAL evidence SQL (unfiltered by region)", slowest: ["oli_coverage", "oli_completeness", "fba_pointers", "ads_revs", "listings_pointers", "catalog_pointer"].map((n) => pick(new RegExp("^" + n + "$"))).filter(Boolean) });
 
 // (2) the two foreign-job lineage statements (pre-live read-only check), once per region's first account.

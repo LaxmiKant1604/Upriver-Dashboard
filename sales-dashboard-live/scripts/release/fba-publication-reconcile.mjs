@@ -82,7 +82,7 @@ const { REPORT_DERIVATIONS } = await import("../../lib/server/sync/report-deriva
 const { paramsHashFor } = await import("../../lib/server/report-store.js");
 const { buildFbaBrandInventoryRelease } = await import("../../lib/server/sync/fba-brand-inventory-release.js");
 const { buildSchedulerV2Publisher } = await import("../../lib/server/sync/publisher-composition.js");
-const { buildBrandInventorySnapshot } = await import("../../lib/server/reports/brand-view.js");
+const { buildBrandInventorySnapshot, selectAuthoritativeInventorySnapshot, BRAND_INVENTORY_REPORT_VERSION } = await import("../../lib/server/reports/brand-view.js");
 const { buildLiveReadback } = await import("../../lib/server/sync/source-priority-release-runner.js");
 const { readPartialCycleCapability } = await import("../../lib/server/sync/priority-partial-capability.js");
 const { runControlPackageCli } = await import("../../lib/server/sync/source-priority-control-package.js");
@@ -311,6 +311,17 @@ async function resolveExpectedRequestHash({ accountId, requestedAsOf }) {
   } catch { return ""; }
 }
 
+// The inventory date the DASHBOARD serves for an account today (read-only; the serve's own candidate read +
+// selectAuthoritativeInventorySnapshot): the served AVAILABLE compact's real inventory date, null when the page shows
+// unavailable / nothing. It feeds ONLY the fair execution order (fba-publication-reconciler.js fbaFairOrder).
+async function readServedInventoryDate({ accountId }) {
+  const rows = await sb.getInventorySnapshotCandidates({ reportKey: "brand-inventory", accountId, reportVersion: BRAND_INVENTORY_REPORT_VERSION });
+  const served = selectAuthoritativeInventorySnapshot(rows);
+  if (!served || !served.payload || served.payload.inventoryAvailable !== true) return null;
+  const d = String(served.payload.inventoryDate || served.payload.inventorySnapshotDate || "");
+  return DATE_RE.test(d) ? d : null;
+}
+
 const deadlineSec = Number(argOf("deadline-seconds")) || 0;
 const runStartMs = Date.now();
 // START RESERVE (lease-strand fix, mirrors oli-publication-reconcile.mjs): stop STARTING new per-account work
@@ -322,10 +333,21 @@ const runStartMs = Date.now();
 const START_RESERVE_SEC = 120;
 const startCutoffSec = deadlineSec > 0 ? Math.max(Math.floor(deadlineSec / 2), deadlineSec - START_RESERVE_SEC) : 0;
 const outOfTime = () => deadlineSec > 0 && (Date.now() - runStartMs) / 1000 > startCutoffSec;
+// PER-ACCOUNT TIME BUDGET (publication recovery D3): the fair order (fbaFairOrder) puts the most-starved account FIRST,
+// so an account whose release hangs every time would otherwise lead -- and consume -- every run's whole work window and
+// starve its region. Each account's release therefore races min(its own ACCOUNT_DEADLINE_SECONDS, the run's remaining
+// deadline): the account budget resolves { __accountDeadline: true } (the core aborts that op -- its fence goes null, the
+// fenced CAS writes zero rows -- awaits confirmed settlement, defers it 'deadline-account-in-flight' and CONTINUES); the
+// run deadline keeps resolving { __deadline: true } exactly as before. PROPORTIONAL to the run: a quarter of the deadline,
+// within [60, 180] s (~20 s is typical per account) -- 180 s for the scheduler's 900 s step, 82 s for the 330 s backstop /
+// recovery-worker child, so a hung account the fair order puts first costs at most ~a quarter of any run's window.
+const ACCOUNT_DEADLINE_SECONDS = deadlineSec > 0 ? Math.min(180, Math.max(60, Math.floor(deadlineSec / 4))) : 0;
 const deadlineRace = (p, _signal) => {
   if (deadlineSec <= 0) return p;
   const remainingMs = Math.max(0, deadlineSec * 1000 - (Date.now() - runStartMs));
-  let t; const timer = new Promise((resolve) => { t = setTimeout(() => resolve({ __deadline: true }), remainingMs); });
+  const accountMs = ACCOUNT_DEADLINE_SECONDS * 1000;
+  const accountFirst = accountMs < remainingMs;
+  let t; const timer = new Promise((resolve) => { t = setTimeout(() => resolve(accountFirst ? { __accountDeadline: true } : { __deadline: true }), accountFirst ? accountMs : remainingMs); });
   return Promise.race([Promise.resolve(p).then((v) => { clearTimeout(t); return v; }), timer]);
 };
 const SETTLE_GRACE_MS = 8000;
@@ -342,6 +364,7 @@ const reconciler = buildFbaPublicationReconciler({
   bucketAccounts,
   readFbaSnapshot,
   resolveExpectedRequestHash,
+  readServedInventoryDate,
   readLatestReportJob: ({ reportKey, accountId }) => sb.getLatestReportJobLineage(reportKey, accountId),
   readShadowSnapshot: (args) => sb.getReportSnapshot(args),
   readLiveSnapshot: (args) => sb.getReportSnapshot(args),

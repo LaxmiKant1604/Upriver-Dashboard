@@ -1007,6 +1007,8 @@ const INVENTORY = {
     "offline PGlite self-test of the worker SQL (20260934 + the WP12 fence read): seeds a minimal report_snapshots in in-process WASM Postgres; its computed import is the PGlite entry. Never a real database.", "t1:2,dynimport:1"),
   "scripts/worker/report-writer-fence-selftest.mjs": E(TEST, [], ["<module>", "fencedCas", "legacyInsertIgnore", "legacyPatch", "legacyUpsert", "unfencedCas"], ["rpc:report_snapshots", "sql:report_snapshots"],
     "THIS package's PGlite self-test: in-process WASM Postgres only (it also runs the README section 9 operator SQL; its computed import is the PGlite entry).", "t1:73,dynimport:1"),
+  "scripts/worker/ads-digest-equivalence-selftest.mjs": R("dynimport:1",
+    "offline PGlite self-test of the SHARED Ads digest partials vs the two per-window statements they replace: in-process WASM Postgres only; it creates + seeds its OWN ads_daily_source_rows and never names report_snapshots (no report writer) -- its one computed import is the PGlite entry. Never a real database."),
 
   // ---- READ-ONLY (tripwire only: they name report_snapshots, the fine-grained analysis finds no write) -----------------------
   "lib/server/recovery/registry.js": R("t1:2", "recovery registry: two reason STRINGS that mention report_snapshots (no I/O)."),

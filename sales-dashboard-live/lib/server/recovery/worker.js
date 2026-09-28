@@ -263,11 +263,13 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
   };
 
   // ---------------- evidence ----------------
-  async function evidenceFor(route, region, epoch, now) {
+  // sweepCache (tier-1 and the watermark pass; a fresh Map per pass): a `shared: true` statement runs once per pass.
+  // Every other read (per-job, deep sweep, dependency) passes none: each route reads its account-scoped statements.
+  async function evidenceFor(route, region, epoch, now, sweepCache = null) {
     const directory = await store.readDirectory();
     if (!(directory instanceof Map) || directory.size === 0) { const e = new Error("the durable account directory is empty"); e.code = "DIRECTORY_EMPTY"; throw e; }
     const ctx = buildEvidenceContext({ epoch, now, directory, region, organizationFingerprint });
-    return { ctx, directory, map: await store.readRouteEvidence(route, ctx) };
+    return { ctx, directory, map: sweepCache ? await store.readRouteEvidence(route, ctx, { sweepCache }) : await store.readRouteEvidence(route, ctx) };
   }
   // Owners are informational for a region target and bounded by the jobs CHECK (<= 128).
   const boundedOwners = (owners) => (Array.isArray(owners) ? owners.slice(0, 128) : []);
@@ -277,6 +279,9 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
     const now = clock(); const epoch = utcDMinus1(now);
     const ctl = await store.control();
     let n = 0;
+    // ONE sweep cache per watermark pass (like tier-1): the live Brand View + portfolio pairs of this pass (one clock)
+    // read the shared Ads digest partials once, instead of one scan per live route x region.
+    const sweepCache = new Map();
     for (const id of byPriority) {
       const route = routeOf.get(id);
       if ((lastWatermarkAt.get(id) || 0) + route.evidence.everySeconds * 1000 > now) continue;
@@ -285,7 +290,7 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
       lastWatermarkAt.set(id, now);
       for (const region of regions) {
         let ev;
-        try { ev = await evidenceFor(route, region, epoch, now); } catch (e) { stats.evidenceErrors += 1; log(`watermark ${id}/${region} evidence read failed: ${S(e && (e.code || e.name))}`); continue; }
+        try { ev = await evidenceFor(route, region, epoch, now, sweepCache); } catch (e) { stats.evidenceErrors += 1; log(`watermark ${id}/${region} evidence read failed: ${S(e && (e.code || e.name))}`); continue; }
         const st = await store.readState({ route: id, region, epoch });
         for (const [targetKey, e] of ev.map) {
           if (e.token == null || (e.region != null && e.region !== region)) continue;
@@ -310,11 +315,14 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
     const counts = {}; let enq = 0, targets = 0, errors = 0;
     const obs = []; const baseline = []; const served = [];
     const digestParts = new Map();
+    // ONE sweep cache per tier-1 pass (dropped when the pass ends): the shared Ads digest partials scan runs once for
+    // every Brand View + portfolio route x region evaluation of this pass (all at the same t0 clock).
+    const sweepCache = new Map();
     for (const region of config.regions) {
       for (const id of byPriority) {
         const route = routeOf.get(id);
         let ev;
-        try { ev = await evidenceFor(route, region, epoch, t0); }
+        try { ev = await evidenceFor(route, region, epoch, t0, sweepCache); }
         catch (e) { errors += 1; stats.evidenceErrors += 1; alerts.add(S(e && e.code) === "DIRECTORY_EMPTY" ? "directory-empty" : "evidence-read-failed", `${id}/${region}`); continue; }
         const live = isLive(ctl, id, region);
         const st = await store.readState({ route: id, region, epoch });

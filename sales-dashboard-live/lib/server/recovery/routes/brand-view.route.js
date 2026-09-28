@@ -53,12 +53,13 @@ import { paramsHashFor } from "../../report-params-hash.js";
 import { marketplaceToday } from "../../../marketplaces.js";
 import { stableJson } from "../../sync/publication-binding.js";
 import {
-  snapshotRowIdentity, canonicalInstant, adsRowsDigestSql, brandViewAdsWindow, brandViewCodeIdentity,
+  snapshotRowIdentity, canonicalInstant, adsRowsDigestSql, brandViewAdsWindow, brandViewCodeIdentity, adsWindowRowsFromDaily, splitAdsDailyPartials,
 } from "../../sync/brand-view-dependency-readers.js";
 import {
   LATEST_ROWS_SQL, evidenceAccountIds, regionOfCountry, directoryEntry, groupLatestRows, evidenceMaterialEntry, targetAccountId, recoveryNowDate,
   routingIneligibleReason,
 } from "./brand-view-brands.route.js";
+import { ADS_DAILY_SCOPED_STATEMENT, adsWindowCovered } from "./ads-daily-evidence.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const sha256 = (v) => createHash("sha256").update(String(v)).digest("hex");
@@ -128,7 +129,11 @@ export const PRODUCT_CATALOG_SQL = "select c.organization_fingerprint, c.payload
 // exactly one result row (no rows -> the empty-set digest); the window is echoed through a DateStyle-independent to_char
 // so the compose can prove the digest was taken over the window of ITS as-of (a params / compose clock split across a
 // local midnight fails closed, typed 'ads-rows-window-mismatch').
-export const ADS_ROWS_SQL = "select a.account_id, to_char(a.win_from::date, 'YYYY-MM-DD') as win_from, to_char(a.win_to::date, 'YYYY-MM-DD') as win_to, "
+// TIER-1 PERFORMANCE: NO LONGER an evidence statement -- the route reads per-day partials (ads-daily-evidence.js
+// ADS_DAILY_SCOPED_STATEMENT: account-scoped; its unscoped shared variant once per sweep) and folds them into EXACTLY these
+// rows (adsWindowRowsFromDaily, includeEmpty).
+// Kept as the reference definition the equivalence self-test runs against the new path on real Postgres.
+export const ADS_ROWS_SQL ="select a.account_id, to_char(a.win_from::date, 'YYYY-MM-DD') as win_from, to_char(a.win_to::date, 'YYYY-MM-DD') as win_to, "
   + adsRowsDigestSql("r.") + " as rows_digest"
   + " from unnest($1::text[], $2::text[], $3::text[]) as a(account_id, win_from, win_to)"
   + " left join public.ads_daily_source_rows r on r.account_id = a.account_id and r.source_key = $4::text"
@@ -224,7 +229,16 @@ export function composeBrandViewEvidence(rowsByName, ctx = {}) {
   const available = groupLatestRows((R.inventory_available || []).map((r) => ({ ...r, report_key: INVENTORY_AVAILABLE_KEY })));
   const byAcct = (rows) => { const m = new Map(); for (const r of Array.isArray(rows) ? rows : []) { const a = S(r && r.account_id); if (!m.has(a)) m.set(a, []); m.get(a).push(r); } return m; };
   const dirRows = byAcct(R.directory_rows); const adsRows = byAcct(R.ads_state); const mapRows = byAcct(R.campaign_mapping);
-  const adsRowDigests = byAcct(R.ads_rows);
+  // The Ads rows' per-window digests: the SHARED per-day partials (ads_daily) folded over THIS evidence's per-account
+  // windows -- the rows ADS_ROWS_SQL returned (one per account; no rows -> the empty digest 'adr1:0:0:0', which the
+  // derive's JS twin computes too). FAIL CLOSED: malformed / absent partials -> no row -> 'ads-rows-evidence-missing'
+  // (never a silent empty digest); a window NOT inside the range the statement actually SCANNED (its echoed sentinel;
+  // a params / compose clock split across a local midnight) -> 'ads-rows-window-mismatch'.
+  const adsWin = adsRowsWindows(ctx);
+  const adsDaily = splitAdsDailyPartials(R.ads_daily);
+  const adsWindows = adsWin.ids.map((id, i) => ({ accountId: id, from: adsWin.froms[i], to: adsWin.tos[i] }));
+  const adsUncovered = new Set(adsDaily ? adsWindows.filter((w) => !adsWindowCovered(w, adsDaily.range)).map((w) => w.accountId) : []);
+  const adsRowDigests = byAcct(adsDaily ? adsWindowRowsFromDaily(adsDaily.rows, adsWindows.filter((w) => !adsUncovered.has(w.accountId)), { includeEmpty: true }) : []);
   const catRows = (Array.isArray(R.product_catalog) ? R.product_catalog : []).filter((r) => org !== "" && S(r && r.organization_fingerprint) === org);
   const catalog = catRows.length === 1 ? { sha: S(catRows[0].payload_sha), at: canonicalInstant(catRows[0].validated_at) } : null;
   const out = new Map();
@@ -273,7 +287,8 @@ export function composeBrandViewEvidence(rowsByName, ctx = {}) {
     if (asOf) {
       const win = brandViewAdsWindow(asOf);
       const got = adsRowDigests.get(acct) || [];
-      if (got.length !== 1 || S(got[0].rows_digest) === "") problems.push("ads-rows-evidence-missing");
+      if (adsUncovered.has(acct)) problems.push("ads-rows-window-mismatch");
+      else if (got.length !== 1 || S(got[0].rows_digest) === "") problems.push("ads-rows-evidence-missing");
       else if (S(got[0].win_from) !== win.from || S(got[0].win_to) !== win.to) problems.push("ads-rows-window-mismatch");
       else adsRowsEv = { from: win.from, to: win.to, digest: S(got[0].rows_digest) };
     }
@@ -313,8 +328,9 @@ const route = Object.freeze({
       Object.freeze({ name: "ads_state", text: ADS_STATE_SQL, params: (ctx = {}) => [evidenceAccountIds(ctx), ACTIVE_ADS_SOURCE_KEY] }),
       Object.freeze({ name: "campaign_mapping", text: CAMPAIGN_MAPPING_SQL, params: (ctx = {}) => [evidenceAccountIds(ctx), orgOf(ctx)] }),
       Object.freeze({ name: "product_catalog", text: PRODUCT_CATALOG_SQL, params: (ctx = {}) => [orgOf(ctx)] }),
-      // ctx.now (and ctx.directory) MUST be the ones the compose gets (the window is derived from each account's as-of).
-      Object.freeze({ name: "ads_rows", text: ADS_ROWS_SQL, params: (ctx = {}) => { const w = adsRowsWindows(ctx); return [w.ids, w.froms, w.tos, ACTIVE_ADS_SOURCE_KEY]; } }),
+      // The per-day Ads digest partials over the union of every window at ctx.now: ACCOUNT-SCOPED (index-driven) for every
+      // reader without a sweep cache; in sweep mode its unscoped sharedVariant (== the portfolio statement) runs ONCE per pass.
+      ADS_DAILY_SCOPED_STATEMENT,
     ]),
     // -> Map<targetKey (the owner account), { token, owners, region, targetAsOf, alerts } | { token: null, owners,
     // region, alerts, reason }> (the returns-v3 compose contract) for EVERY evidence account: an eligible, routable

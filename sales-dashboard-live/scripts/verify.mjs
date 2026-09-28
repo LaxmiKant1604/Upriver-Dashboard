@@ -123,6 +123,8 @@ const SUITES = [
   "test:ads-publication-reconciler-behavior",
   "test:ads-reconcile-prodshape",
   "test:fba-reconcile-prodshape",
+  "test:fba-reconcile-fairness",
+  "test:ads-daily-digest",
   "test:fba-durable-source-persist",
   "test:fba-durable-backstop-integration",
   "test:listings-canonical-reuse",

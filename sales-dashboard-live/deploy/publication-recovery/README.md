@@ -238,6 +238,9 @@ and the job upsert) is an ignored orphan, never a stall. The status also shows t
 | An out-of-scope target never poisons its batch (superseded before the child; the scope STOP race defers without an attempt) | worker 16l-16m, SQL SS1, units K5 |
 | Leading `-threw` / race-prone / strict-default classification; the guard's leading newline | units K1-K6, vocabulary V1c / V3 / V5, zero-export-guard G10 |
 | Real SQL of the redesigned 20260934 + the store's own SQL + exact rollback | `publication-recovery-sql-selftest.mjs` (PGlite, 55 assertions) |
+| Ads digest partials: the per-(account, day) partials folded per window == the old per-window `adr1:` digest (both statements) on real Postgres; an empty window is `adr1:0:0:0` | `ads-digest-equivalence-selftest.mjs` (PGlite, 12 assertions), `ads-daily-digest.test.js` |
+| Tier-1 sweep cache: ONE shared Ads scan per tier-1 / watermark pass; every other read stays account-scoped and fresh; a failed shared read fails fast for that pass only | worker 15t, brand-view E11, `ads-daily-digest.test.js` |
+| FBA reconcile fairness: most-starved accounts first (served inventory date), a hung account defers `deadline-account-in-flight` without stalling the run, the served-date reads are capped | `fba-reconcile-fairness.test.js` |
 | Structural zero-export (import closure, allow-list) | `worker-closure.test.js`, `publication-recovery-units.test.js` C1-C9 |
 
 **Honest limit:** PGlite is a single connection: `FOR UPDATE SKIP LOCKED` and the advisory lock are not contended by two
@@ -264,11 +267,34 @@ tokens). It must measure, and the verdict lines print:
   (`--verify-exact` for a route CLI). This includes the **fba-plan extra reads** (the latest paid job, its shadow if
   promotable, the live row / payload of a foreign pending job, and the publish guard's re-reads) and the **brand-view
   per-unit reads** (about 18 evidence queries + 25 REST reads per brand unit; the per-target seconds are printed);
-- the **tier-1 duration**: every route's evidence SQL per region with per-statement timings -- in particular the
-  **`ads_rows` digest scans** of brand-view and the portfolio (a 6-month `ads_daily_source_rows` scan for every region
-  account) and the **legacy GLOBAL evidence SQL** (`oli_coverage`, `fba_pointers`, `listings_pointers`, ... are not
-  region-filtered) -- plus the served-row write scan, the gate, the fence and the report-key universe;
+- the **tier-1 duration**: every route's evidence SQL per region with per-statement timings -- in particular the ONE
+  **`ads_daily` shared digest scan** of brand-view and the portfolio (below) and the **legacy GLOBAL evidence SQL**
+  (`oli_coverage`, `fba_pointers`, `listings_pointers`, ... are not region-filtered) -- plus the served-row write scan,
+  the gate, the fence and the report-key universe;
 - the per-epoch deep-sweep total.
+
+**Tier-1 performance (2026-09-28).** The first real memcheck FAILED the 60 s gate (tier-1 84 s on the VM; the observe-only
+worker measured 82 s). About 85% of it was SIX scans per pass of the same wide, disk-bound `ads_daily_source_rows`
+(718 MB heap): Brand View per region and the portfolio three times with an identical statement. EXPLAIN: each scan is
+~11-15 s of heap I/O; the md5 digest itself only ~2-5 s. Both routes now read the per-(account, day) partials of the
+SAME `adr1:` digest (additive: count + exact BigInt lane sums, max of the daily maxima), folded back into the old
+per-window rows (`adsWindowRowsFromDaily`): the portfolio its unscoped `ads-daily-evidence.js ADS_DAILY_STATEMENT`
+(`shared: true`; it needs every account, as its old statement did), Brand View an ACCOUNT-SCOPED twin
+(`ADS_DAILY_SCOPED_STATEMENT`, index-driven, `account_id = any($4)`) for every reader WITHOUT a sweep cache -- the route
+CLI's per-unit reads (scope, prepare b1 / b2, the publish-time token, verify-exact; they must stay fresh and never share)
+and the worker's per-job, dependency and deep-sweep reads -- whose `sharedVariant` IS the portfolio statement. Only a
+sweep-mode evaluation (`evaluateRouteEvidence(..., { sweep: true })`: the worker's tier-1 AND watermark passes, memcheck
+`--real`) runs the shared variant, through one sweep cache per pass (`routes.js sweepMemoQuery`), so Brand View + the
+portfolio read ONE scan per pass; a failed shared read fails fast for the rest of that pass (the next pass retries). The
+statement echoes the range it actually scanned (every row + an always-present sentinel), so a params / compose clock split
+still fails closed `ads-rows-window-mismatch`. Proof: the portfolio tokens
+are IDENTICAL on production data (one read-only snapshot, all 3 regions); Brand View tokens are identical except for the
+accounts with NO Ads row in their window, where the old LEFT JOIN digested its null-extended row
+(`adr1:0:403621951634681328:664928202173542839`) -- a value the derive's JS twin can never produce, so those accounts could
+never publish; the new path yields the documented empty digest `adr1:0:0:0` (pinned on real Postgres by
+`scripts/worker/ads-digest-equivalence-selftest.mjs`). A full read-only tier-1 pass from the development machine: 105.5 s
+before, 32.5-33.6 s after (the VM runs ~20% faster than that machine). The VM `--real` re-run on the release is the
+verdict.
 
 PASS thresholds: max child peak <= 448 MB; worker 240 + largest child + OS 250 <= 85% of 1024 MB (870 MB); tier-1 <= 60 s;
 per-epoch deep sweep <= 4 h. Otherwise the check prints the measured value and the required change (a longer
@@ -285,6 +311,7 @@ legacy families only, 2026-09-25, development machine): a full scan took 312 s, 
 | `scripts/worker/publication-recovery-status.mjs` | Redacted status, alerts, writer fence per key, hand-off matrix (`--summary`, `--matrix`) |
 | `scripts/worker/publication-recovery-memcheck.mjs` | Memory / throughput check (synthetic and `--real` on the VM) |
 | `scripts/worker/publication-recovery-sql-selftest.mjs` | Real-SQL self-test of 20260934 + the store's SQL (PGlite; exit 3 = SKIPPED, not a pass) |
+| `scripts/worker/ads-digest-equivalence-selftest.mjs` | Real-SQL proof that the Ads digest partials equal the old per-window digests (`PRW_PGLITE_DIR=<dir> node scripts/worker/ads-digest-equivalence-selftest.mjs`; exit 3 = SKIPPED, not a pass) |
 | `scripts/worker/publication-recovery-reaper.mjs` | Operator tool: stuck-cycle candidates (read-only) / finalize ONE with sign-off (section 8) |
 | `lib/server/recovery/{routes,route-contract,registry,classify,runner,worker,store-pg,config,memory-store}.js` | Worker modules (`memory-store` is test-only) |
 | `supabase/migrations/20260934_publication_recovery_worker.sql` | **Prepared, not applied.** 7 tables, 12 RPCs, expand-only, idempotent |
@@ -473,6 +500,8 @@ re-runs the paid publish phase.
 
 **Known limits and risks.**
 
+- **Tier-1 must pass the VM gate on the release you install**: the 2026-09-28 real memcheck FAILED at 84 s; the shared Ads
+  scan (section 3) is the fix, but only the VM `--real` re-run on that exact release proves it.
 - **Capacity is unproven** for brand-view and the portfolio on 1/8 OCPU until the VM memcheck passes (the plan's
   PARTIAL). A failing route stays capacity-exceeded on the VM and keeps its GitHub run.
 - **Tier-1 is metadata-only**; the exact child-verified binding runs per job and in the deep sweep (once per epoch, then
@@ -820,7 +849,37 @@ rebuild from the workflow, and retires every legacy unfenced writer (9.2). Owner
 4. **(owner)** brand-inventory freshness is accepted after this read-only check. Without the rebuild, the same-day
    conversion of the cycle's `inventoryAvailable:false` placeholder depends on the `fba` job's immediate FBA reconcile
    (`FBA_RECONCILE_LIVE`) and the once-daily `fba-publication-reconcile.yml` backstop (20:48 UTC). The serve always picks
-   the newest AVAILABLE compact (never a fabricated zero), so the risk is staleness, not wrong data:
+   the newest AVAILABLE compact (never a fabricated zero), so the risk is staleness, not wrong data.
+   **D3 (2026-09-28): the reconcilers used to STARVE a fixed tail.** Both walked the stale accounts in sorted id order and
+   stopped at their deadline: the `fba` step (300 s = a 180 s start cutoff, ~20 s per account) always reached the first
+   8 europe-au ids and the backstop the middle ones, so the last five FBA-active accounts (b7b13aac, bf623cf8, f08cefca,
+   f0bd8ce3, fbd72f10) were made available ONLY by the rebuild WP13 retires (on every day checked; their last fenced
+   available row was 2026-09-23). Fixed without any new writer: the `fba` step's reconcile deadline is 900 s (780 s start
+   cutoff covers all 32 europe-au accounts) and the FBA reconciler executes its stale accounts in a FAIR order
+   (`fba-publication-reconciler.js fbaFairOrder`: stocked before honest-empty, then the OLDEST dashboard-served
+   inventory date first, then a per-day tie), so whenever a deadline still cuts, the next run starts with whoever was
+   left behind (`scripts/fba-reconcile-fairness.test.js`, incl. the multi-day starvation simulation). Every account also
+   gets its OWN 180 s budget (`fba-publication-reconcile.mjs ACCOUNT_DEADLINE_SECONDS`, ~9x the typical ~20 s): a hung
+   account is aborted (its fence goes null: the fenced CAS writes nothing), deferred `deadline-account-in-flight` with LKG
+   kept, and the run CONTINUES -- so the account the fair order puts first can never consume the whole window (an
+   unconfirmed termination still stops the run and leaves lease + controls for cleanup, exactly as before). Trade-offs to
+   know: the europe-au step now holds the GLOBAL control lease up to ~11-15 min (32 x ~20 s, renewed with a 900 s TTL
+   before every account's publish; the LHv3 reconciler's 720 s hold is the precedent). EVERY bounded lease-waiter that
+   starts inside that hold waits at most its own cap -- another region's `materialize` / `materialize-inventory` route
+   CLIs, control applies, `fba-plan-golive`, the other immediate reconcilers and the evening backstops (600 s, never past
+   their own start cutoff), the half-hourly OLI outbox drain (210 s) -- and if the hold outlasts it, that pass publishes
+   nothing and keeps LKG (the next pass / cycle retries). The old 300 s hold was shorter than every 600 s cap; now a
+   waiter can outlast its cap, which needs two regions' downstream jobs to overlap (e.g. an overrunning india
+   `materialize` during europe-au's `fba` step). The `fba` job's 120-minute timeout now has to cover fba-plan-golive plus
+   up to ~15 min of reconcile. If the timeout ever cuts the reconcile step (continue-on-error; the step has NO in-job
+   cleanup): no partial row is possible (each account is one fenced CAS), unreached accounts keep LKG, the lease lapses
+   within its 900 s TTL, and controls left open are rolled back by a `--cleanup` (the 20:48 UTC backstop runs one as a
+   separate always() job; a live owner is never touched); the next reconcile that opens its controls (the backstop, or
+   the next cycle's `fba` step in fair order: the unreached accounts first) converges them. To converge sooner, dispatch
+   `fba-publication-reconcile.yml` (`mode=live`, the region's bucket; zero export) -- never re-run the `fba` job for it. The backstop keeps its 330 / 420 s (the recovery worker's fba argv pins
+   it). After the WP13
+   merge the proof is the next europe-au `fba` step's RESULT (32 examined, the five tail accounts published through the
+   fenced CAS, read back) plus this query:
 
    ```sql
    -- per recent D-1: brand-inventory rows that are available / placeholders / out-of-line, and how many the (retired)

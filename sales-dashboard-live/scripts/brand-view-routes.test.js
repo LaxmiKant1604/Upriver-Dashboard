@@ -74,6 +74,8 @@ const RD = await import("../lib/server/sync/brand-view-dependency-readers.js");
 const BVB_W = await import("../lib/server/recovery/routes/brand-view-brands.route.js");
 const BVB_C = await import("../lib/server/sync/routes/brand-view-brands.release.js");
 const BV_W = await import("../lib/server/recovery/routes/brand-view.route.js");
+const ADE = await import("../lib/server/recovery/routes/ads-daily-evidence.js");
+const ROUTES = await import("../lib/server/recovery/routes.js");
 const BV_C = await import("../lib/server/sync/routes/brand-view.release.js");
 
 let passed = 0;
@@ -310,6 +312,25 @@ const pgAdsRowsDigest = (rows) => {
   }
   return ADS_PROGRAM.prefix + rows.length + ":" + sums.map(String).join(":");
 };
+// The SHARED per-day partials statement (RD.ADS_DAILY_PARTIALS_SQL) emulated with the SAME digest program: one row per
+// (account, metric_date) with rows in [from, to] of source `key` -- n, the two lane sums, max(updated_at) as to_char'd.
+const pgAdsDailyPartials = (rows, key, from, to) => {
+  const groups = new Map();
+  for (const r of rows) {
+    if (r.source_key !== key || S(r.metric_date).slice(0, 10) < from || S(r.metric_date).slice(0, 10) > to) continue;
+    const g = r.account_id + "\u0000" + S(r.metric_date).slice(0, 10);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(r);
+  }
+  const partials = [...groups.keys()].sort().map((g) => {
+    const list = groups.get(g);
+    const [, n, s1, s2] = pgAdsRowsDigest(list).split(":");
+    const maxUa = list.map((r) => pgUs(r.updated_at)).sort().pop();
+    return { account_id: list[0].account_id, metric_date: S(list[0].metric_date).slice(0, 10), n, s1, s2, max_ua: maxUa, range_from: from, range_to: to };
+  });
+  // the always-present SENTINEL row (UNION ALL) echoing the scanned range
+  return [...partials, { account_id: null, metric_date: null, n: "0", s1: "0", s2: "0", max_ua: null, range_from: from, range_to: to }];
+};
 const jsonbTypeof = (v) => (v === undefined ? null : v === null ? "null" : Array.isArray(v) ? "array" : typeof v === "object" ? "object" : typeof v === "string" ? "string" : typeof v === "number" ? "number" : typeof v === "boolean" ? "boolean" : null);
 
 function makeWorld() {
@@ -321,7 +342,7 @@ function makeWorld() {
   const n = { cycleCreate: 0, jobInsert: 0, claimLease: 0, shadowCas: 0, shadowWrite: 0, reconcile: 0, finalize: 0, liveCas: 0, liveWrite: 0, preflight: 0, publish: 0, snapshotUpdate: 0 };
   const rest = []; const restFail = new Set(); const sql = []; let sqlFail = false;
   let seq = 0;
-  const w = { snaps, storage, storageFail, cycles, jobs, adsState, adsCoverage, mappings, catalog, adsRows, hooks: {}, n, rest, restFail, sql };
+  const w = { snaps, storage, storageFail, cycles, jobs, adsState, adsCoverage, mappings, catalog, adsRows, hooks: {}, n, rest, restFail, sql, adsReads: [] };
   w.now = () => clock;
   w.setClock = (ms) => { clock = ms; };
   w.tick = (ms = 1000) => { clock += ms; return clock; };
@@ -436,11 +457,17 @@ function makeWorld() {
       const [org] = values;
       return catalog.filter((c) => c.connection_id === "primary" && c.source_key === "product-catalog" && c.scope_key === "__organization" && c.organization_fingerprint === org).map((c) => ({ organization_fingerprint: c.organization_fingerprint, payload_sha: c.payload_sha, validated_at: toChar(c.validated_at), source_request_hash: c.source_request_hash }));
     }
-    if (text === BV_W.ADS_ROWS_SQL) {
-      // unnest($1, $2, $3) LEFT JOIN ads_daily_source_rows ON account + source $4 + [from, to]: ONE row per requested
-      // account (the empty set digests to 'adr1:0:0:0'); the window echoed through to_char.
-      const [accts, froms, tos, key] = values;
-      return accts.map((a, i) => ({ account_id: a, win_from: froms[i], win_to: tos[i], rows_digest: pgAdsRowsDigest(adsRows.filter((r) => r.account_id === a && r.source_key === key && r.metric_date >= froms[i] && r.metric_date <= tos[i])) }));
+    if (text === RD.ADS_DAILY_PARTIALS_SQL) {
+      // the SHARED per-day partials over [$2, $3] of source $1 (every account; the route folds them per window).
+      const [key, from, to] = values;
+      w.adsReads.push({ scoped: false, accounts: null });
+      return clone(pgAdsDailyPartials(adsRows, key, from, to));
+    }
+    if (text === RD.ADS_DAILY_ACCOUNT_PARTIALS_SQL) {
+      // the ACCOUNT-SCOPED twin: the same partials restricted to $4 (the evidence accounts) + the sentinel.
+      const [key, from, to, accts] = values;
+      w.adsReads.push({ scoped: true, accounts: [...accts] });
+      return clone(pgAdsDailyPartials(adsRows.filter((r) => accts.includes(r.account_id)), key, from, to));
     }
     throw new Error("unknown evidence SQL");
   };
@@ -608,6 +635,15 @@ async function workerTokens(w, workerRoute) {
   const ctx = { directory: w.directory, organizationFingerprint: ORG, now: new Date(w.now()) };
   const rows = {};
   for (const q of workerRoute.evidence.sql) rows[q.name] = await w.pgReadOnly(q.text, q.params(ctx));
+  return workerRoute.evidence.compose(rows, ctx);
+}
+// The SAME evaluation in SWEEP MODE (the worker's tier-1 / watermark pass): a statement's sharedVariant runs through ONE
+// sweep cache (routes.js sweepMemoQuery), exactly as evaluateRouteEvidence(..., { sweep: true }) does.
+async function workerTokensSweep(w, workerRoute, cache) {
+  const ctx = { directory: w.directory, organizationFingerprint: ORG, now: new Date(w.now()) };
+  const q2 = ROUTES.sweepMemoQuery(w.pgReadOnly, cache);
+  const rows = {};
+  for (const q of workerRoute.evidence.sql) { const st = q.sharedVariant || q; rows[q.name] = await q2(st.text, st.params(ctx), st); }
   return workerRoute.evidence.compose(rows, ctx);
 }
 
@@ -907,7 +943,7 @@ function serveReaders(w, { org = ORG } = {}) {
     bvState(s0, "IN1", "Acme").state === RS.RV && spendOn(acme0.payload, "2026-09-21") === 12
     && JSON.stringify(ev0.adsRows) === JSON.stringify({ from: "2026-04-01", to: IN_TODAY, digest: RD.adsRowsDigest(w.adsRows) }) && ev0.adsRows.digest === pgAdsRowsDigest(w.adsRows) && /^adr1:2:\d+:\d+$/.test(ev0.adsRows.digest));
   const scan0 = await hv.run({ dryRun: true, accounts: ["IN1"] });
-  ok("E11 worker token == CLI token with Ads rows present (the worker compose runs the SAME ads_rows SQL + compose at the SAME ctx.now)",
+  ok("E11 worker token == CLI token with Ads rows present (the worker compose runs the SAME account-scoped ads_daily partials statement + compose at the SAME ctx.now)",
     (await workerTokens(w, BV_W.default)).get("IN1").token === targetsTok(scan0, BVK).get("IN1") && bvState(scan0, "IN1", "Acme").state === RS.NR);
   // The Q1a case on brand-view: the OLDER row is corrected by a transaction whose now() (01:30) predates the newest
   // updated_at (02:00): content_rev, coverage windows and latest_metric_date are all unchanged.
@@ -945,15 +981,36 @@ function serveReaders(w, { org = ORG } = {}) {
   const rowsAt = async (now) => { const r = {}; for (const q of BV_W.default.evidence.sql) r[q.name] = await w.pgReadOnly(q.text, q.params({ ...ctx, now })); return r; };
   const beforeRoll = await rowsAt(Date.UTC(2026, 8, 24, 18, 29)); // IN 23:59 -> 2026-09-24
   const split = BV_W.composeBrandViewEvidence(beforeRoll, { ...ctx, now: Date.UTC(2026, 8, 24, 18, 31) }).get("IN1"); // IN 2026-09-25
-  const missing = BV_W.composeBrandViewEvidence({ ...beforeRoll, ads_rows: [] }, { ...ctx, now: Date.UTC(2026, 8, 24, 18, 29) }).get("IN1");
+  const missing = BV_W.composeBrandViewEvidence({ ...beforeRoll, ads_daily: [] }, { ...ctx, now: Date.UTC(2026, 8, 24, 18, 29) }).get("IN1");
   const wSplit = BV_W.default.evidence.compose(beforeRoll, { ...ctx, now: Date.UTC(2026, 8, 24, 18, 31) }).get("IN1");
-  ok("E11 a params / compose clock split across the IN midnight fails closed typed 'ads-rows-window-mismatch' (CLI revision ineligible; worker token null + the SAME reason); an absent ads_rows row is 'ads-rows-evidence-missing'",
+  ok("E11 a params / compose clock split across the IN midnight fails closed typed 'ads-rows-window-mismatch' (the window lies outside the SCANNED range the sentinel echoes; CLI revision ineligible; worker token null + the SAME reason); absent / sentinel-less partials are 'ads-rows-evidence-missing'",
     BV_C.brandViewRevision(split).eligible === false && BV_C.brandViewRevision(split).reason === "ads-rows-window-mismatch" && split.adsRows === null
     && wSplit.token === null && wSplit.reason === "ads-rows-window-mismatch" && BV_C.brandViewRevision(missing).reason === "ads-rows-evidence-missing");
-  ok("E11 the evidence SQL embeds the SHARED digest fragment VERBATIM (alias r.) over a LEFT JOIN from the requested accounts (one row each; the windows only ever cast to date); params = [ids, froms, tos, ACTIVE source] at each account's marketplace as-of",
-    BV_W.ADS_ROWS_SQL.includes(" " + RD.adsRowsDigestSql("r.") + " as rows_digest from ") && RC.isReadOnlyEvidenceSql(BV_W.ADS_ROWS_SQL)
-    && / from unnest\(\$1::text\[\], \$2::text\[\], \$3::text\[\]\) as a\(account_id, win_from, win_to\) left join public\.ads_daily_source_rows r on r\.account_id = a\.account_id and r\.source_key = \$4::text and r\.metric_date >= a\.win_from::date and r\.metric_date <= a\.win_to::date group by a\.account_id, a\.win_from, a\.win_to$/.test(BV_W.ADS_ROWS_SQL)
-    && JSON.stringify(BV_W.default.evidence.sql.find((q) => q.name === "ads_rows").params({ ...ctx, accountIds: ["IN1", "IN2", "NOPE"], now: W.now() })) === JSON.stringify([["IN1", "IN2"], ["2026-04-01", "2026-04-01"], [IN_TODAY, IN_TODAY], ACTIVE_ADS_SOURCE_KEY]));
+  // Tier-1 performance: the evidence reads the SHARED per-day partials (ONE frozen statement object for both Brand View
+  // routes) instead of the per-region ads_rows LEFT JOIN, which stays exported as the equivalence reference.
+  const adsStmt = BV_W.default.evidence.sql.find((q) => q.name === "ads_daily");
+  const region2 = { ...ctx, accountIds: ["IN2"], now: W.now() };
+  ok("E11 the evidence reads ADS_DAILY_SCOPED_STATEMENT: ACCOUNT-SCOPED by default (params [ACTIVE source, union from, union to, the evidence accounts]; the index-driven twin) with the unscoped portfolio statement as its sweep-mode sharedVariant (region-independent params); no per-region ads_rows; ADS_ROWS_SQL kept as the reference (SHARED digest fragment VERBATIM, LEFT JOIN)",
+    !!adsStmt && adsStmt === ADE.ADS_DAILY_SCOPED_STATEMENT && adsStmt.text === RD.ADS_DAILY_ACCOUNT_PARTIALS_SQL && RC.isReadOnlyEvidenceSql(adsStmt.text) && adsStmt.shared !== true
+    && adsStmt.sharedVariant === ADE.ADS_DAILY_STATEMENT && adsStmt.sharedVariant.shared === true && adsStmt.sharedVariant.text === RD.ADS_DAILY_PARTIALS_SQL
+    && !BV_W.default.evidence.sql.some((q) => q.name === "ads_rows")
+    && JSON.stringify(adsStmt.params(region2).slice(0, 3)) === JSON.stringify(adsStmt.sharedVariant.params(region2)) && JSON.stringify(adsStmt.params(region2)[3]) === JSON.stringify(["IN2"])
+    && JSON.stringify(adsStmt.sharedVariant.params({ ...ctx, accountIds: ["IN1", "IN2", "NOPE"], now: W.now() })) === JSON.stringify(adsStmt.sharedVariant.params(region2))
+    && adsStmt.params(region2)[0] === ACTIVE_ADS_SOURCE_KEY && adsStmt.params(region2)[1] <= "2026-04-01" && adsStmt.params(region2)[2] >= IN_TODAY
+    && BV_W.ADS_ROWS_SQL.includes(" " + RD.adsRowsDigestSql("r.") + " as rows_digest from ") && RC.isReadOnlyEvidenceSql(BV_W.ADS_ROWS_SQL));
+  // P1 (tier-1 review): the route CLI's reads (scope, b1 / b2, the publish-time token, verify-exact) and the worker's
+  // reads WITHOUT a sweep cache are the ACCOUNT-SCOPED twin -- never the unscoped all-accounts scan -- and a per-unit read
+  // carries exactly the unit's account.
+  ok("E11 (scope) every Ads partials read so far (CLI runs incl. publish + verify, worker evaluations without a sweep cache) is ACCOUNT-SCOPED; the CLI's per-unit reads carry exactly ['IN1']",
+    w.adsReads.length > 0 && w.adsReads.every((r) => r.scoped === true) && w.adsReads.some((r) => JSON.stringify(r.accounts) === JSON.stringify(["IN1"])));
+  const sweepCache = new Map();
+  const before = w.adsReads.length;
+  const tScoped = (await workerTokens(w, BV_W.default)).get("IN1").token;
+  const tSweep = (await workerTokensSweep(w, BV_W.default, sweepCache)).get("IN1").token;
+  const tSweep2 = (await workerTokensSweep(w, BV_W.default, sweepCache)).get("IN1").token;
+  const sweepReads = w.adsReads.slice(before).filter((r) => r.scoped === false).length;
+  ok("E11 (sweep) sweep mode reads the UNSCOPED shared variant ONCE per cache (a second evaluation is a cache hit) and yields the BYTE-IDENTICAL token of the scoped evaluation",
+    tScoped != null && tSweep === tScoped && tSweep2 === tScoped && sweepReads === 1);
   ok("E11 zero network", net.calls.length === 0);
 }
 // =====================================================================================================================
@@ -1004,8 +1061,12 @@ const sha256hex = (v) => createHash("sha256").update(String(v)).digest("hex");
     ads_state: [{ account_id: "A", has_state: true, last_status: "succeeded", latest_metric_date: "2026-09-22", content_rev: "r1", windows: "2026-08-01..2026-09-22" }],
     campaign_mapping: [{ account_id: "A", n: 2, max_updated_at: FT1, content_md5: "m1" }],
     product_catalog: [{ organization_fingerprint: ORG, payload_sha: "sha1", validated_at: FT1, source_request_hash: "q" }],
-    // The account's Ads-row digest over its IN build window at 2026-09-24 (brandViewAdsWindow: 2026-04-01 .. 2026-09-24).
-    ads_rows: [{ account_id: "A", win_from: "2026-04-01", win_to: "2026-09-24", rows_digest: "adr1:2:11:22" }],
+    // The account's Ads-row digest over its IN build window at 2026-09-24 (brandViewAdsWindow: 2026-04-01 .. 2026-09-24):
+    // ONE per-day partial inside the window (n 2, lanes 11 / 22 -> 'adr1:2:11:22') + the sentinel echoing the scanned range.
+    ads_daily: [
+      { account_id: "A", metric_date: "2026-09-22", n: "2", s1: "11", s2: "22", max_ua: "2026-09-23T02:00:00.000000Z", range_from: "2026-04-01", range_to: "2026-09-24" },
+      { account_id: null, metric_date: null, n: "0", s1: "0", s2: "0", max_ua: null, range_from: "2026-04-01", range_to: "2026-09-24" },
+    ],
   });
   const NOW = Date.UTC(2026, 8, 24, 6, 0, 0);
   const ctx = { accountIds: ["A"], directory: DIRA, organizationFingerprint: ORG, now: NOW };

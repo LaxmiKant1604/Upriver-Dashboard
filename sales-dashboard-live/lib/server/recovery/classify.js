@@ -334,7 +334,7 @@ export const ROUTE_REASON_VOCABULARY = Object.freeze(new Set([
   "not-eligible", "revision-missing", "revision-malformed", "revision-threw", "expand-units-threw", "units-invalid:", "target-asof-unresolved", "binding-threw:",
   "current-predicate-threw", "current-predicate-invalid", "served-check-threw", "served-check-invalid", "served-row-differs", "manifest-differs", "served-row-preempted:",
   "already-current", "prepare-threw", "prepare-result-malformed", "prepare-unconfirmed", "publish-threw", "publish-result-malformed", "deadline-cleanup-reserved",
-  "deadline-in-flight", "deadline-termination-unconfirmed", "controls-open-threw", "controls-not-opened:", "control-apply-commit-unknown", "controls-close-unresolved",
+  "deadline-in-flight", "deadline-account-in-flight", "deadline-termination-unconfirmed", "controls-open-threw", "controls-not-opened:", "control-apply-commit-unknown", "controls-close-unresolved",
   // publication-binding.js (STALE reasons of the exact binding)
   "job-not-promotable", "source-revision-changed", "no-live-contract", "no-report-derivation", "shadow-missing", "shadow-identity-report-key", "shadow-identity-account",
   "shadow-params-account", "shadow-version", "shadow-hash-mismatch", "shadow-refresh-blank", "shadow-payload-unavailable", "shadow-payload-validator-threw",
@@ -492,7 +492,17 @@ export const LEGACY_REASON_CODES = Object.freeze(new Set((
   // not (harvested from the legacy family modules; pinned by the vocabulary suite's legacy-identity proof).
   + "controls-close-unresolved coverage-incomplete daily-window-unresolved empty-content-deps job-bucket-unresolved live-payload-unavailable missing "
   + "publish-missing-live-identity revision-advanced-at-entry revision-advanced-before-write source-evidence source-revision-changed source-unavailable "
-  + "unavailable units-empty"
+  + "unavailable units-empty "
+  // Observe-only soak 2026-09-28 (europe-au 572a7b1b, c3092b8c): the OLI lineage resolver's (source-durable-model.js
+  // resolveOliLineageProvenance) MISSING verdict for a zero-sales account whose succeeded row_count=0 exports do not
+  // GAPLESSLY cover [oliStart..as-of] -- zero sales cannot be PROVEN for part of the window, i.e. missing UPSTREAM proof.
+  // It closes only when the uncovered slice gets a proven zero-row export: a gap at the window's END closes with the next
+  // daily export, but a slice whose export has rows without positive sales (zero-amount / cancelled / pending lines) can
+  // keep it open -- visible as missing-source in the hand-off matrix. A typed MISSING_EVIDENCE deferral, never an export
+  // and never a zero payload.
+  // Its integrity siblings (positive-row-missing-hash, zero-row-proof-malformed, bad-derivation-window) stay UNMAPPED on
+  // purpose: a malformed durable proof is a defect signal and keeps its 'unmapped-reason' alert.
+  + "zero-row-window-gap"
 ).split(" ").filter(Boolean)));
 // The legacy 'derive-not-ready:<sub>' sub-codes. EMPTY by evidence: the legacy families' runner emits 'derive-not-ready'
 // BARE (or a '<sourceKey>:<reason>' / 'derive:<integrity>' blocker code), never a 'derive-not-ready:' prefix.

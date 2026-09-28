@@ -24,7 +24,7 @@ import { verifiedPgConfig } from "../pg-tls.js";
 // WP11: the four legacy families' evidence-token compose lives with the legacy route wrappers (token strings
 // byte-identical); re-exported here for existing importers.
 import { composeEvidenceTokens } from "./routes/oli.route.js";
-import { evaluateRouteEvidence } from "./routes.js";
+import { evaluateRouteEvidence, sweepMemoQuery } from "./routes.js";
 import { ROUTE_REGIONS } from "./route-contract.js";
 import { normalizeMarketplace } from "../sync/oli-sales-estimate.js";
 import { readReportWriterFence } from "../sync/report-writer-fence.js";
@@ -404,8 +404,15 @@ export function createRecoveryStore({ connectionString, max = 2, poolImpl = null
       dirCache = { at: now, directory: built.directory, excluded: built.excluded.length };
       return built.directory;
     },
-    /** One route's evidence (its OWN metadata-only SQL + compose) in ONE repeatable-read read-only snapshot. */
-    async readRouteEvidence(route, ctx) { return tx((q) => evaluateRouteEvidence(route, q, ctx)); },
+    /**
+     * One route's evidence (its OWN metadata-only SQL + compose) in ONE repeatable-read read-only snapshot. sweepCache
+     * (optional Map, one per tier-1 sweep): a `shared: true` statement runs once per sweep (routes.js sweepMemoQuery).
+     */
+    async readRouteEvidence(route, ctx, { sweepCache = null } = {}) {
+      // With a sweep cache: sweep mode (a statement's shared variant, run once per pass); without: every statement's own
+      // text in this evaluation's own snapshot (byte-identical to the pre-cache call).
+      return tx((raw) => { const q = sweepMemoQuery(raw, sweepCache); return sweepCache instanceof Map ? evaluateRouteEvidence(route, q, ctx, { sweep: true }) : evaluateRouteEvidence(route, q, ctx); });
+    },
     /** The state rows of (route, region, epoch): Map targetKey -> row (verified_ms epoch-ms; dates never parsed). */
     async readState({ route, region, epoch }) {
       const rows = await read(STATE_SQL, [route, region, epoch]);

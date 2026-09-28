@@ -51,6 +51,8 @@
   "test:ads-publication-reconciler-behavior": "node scripts/ads-publication-reconciler-behavior.test.js",
   "test:ads-reconcile-prodshape": "node scripts/ads-reconcile-prodshape.test.js",
   "test:fba-reconcile-prodshape": "node scripts/fba-reconcile-prodshape.test.js",
+  "test:fba-reconcile-fairness": "node scripts/fba-reconcile-fairness.test.js",
+  "test:ads-daily-digest": "node scripts/ads-daily-digest.test.js",
   "test:fba-durable-source-persist": "node scripts/fba-durable-source-persist.test.js",
   "test:fba-durable-backstop-integration": "node scripts/fba-durable-backstop-integration.test.js",
   "test:listings-canonical-reuse": "node scripts/listings-canonical-reuse.test.js",

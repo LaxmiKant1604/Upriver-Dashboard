@@ -57,7 +57,8 @@ import { regionForCountry, REGION_SCOPES } from "../../sync/scheduler-scope.js";
 import { campaignMappingRevision } from "../../reports/campaign-ads-aggregation.js";
 import { BRAND_INVENTORY_REPORT_VERSION } from "../../reports/brand-view.js";
 import { ACTIVE_ADS_SOURCE_KEY } from "../../active-ads-source.js";
-import { brandViewAdsWindow, adsRowsDigestSql, EMPTY_ADS_ROWS_DIGEST, brandViewCodeIdentity } from "../../sync/brand-view-dependency-readers.js";
+import { brandViewAdsWindow, adsRowsDigestSql, EMPTY_ADS_ROWS_DIGEST, brandViewCodeIdentity, adsWindowRowsFromDaily, splitAdsDailyPartials } from "../../sync/brand-view-dependency-readers.js";
+import { ADS_DAILY_STATEMENT, adsWindowCovered } from "./ads-daily-evidence.js";
 import { ROUTE_CLI_SCRIPT } from "../route-contract.js";
 
 const S = (v) => (v == null ? "" : String(v));
@@ -164,6 +165,16 @@ function jsonFieldValue(row, col) {
 
 // ---- the evidence SQL (read-only; route-contract.js isReadOnlyEvidenceSql) ------------------------------------------
 const TS = (col) => `to_char(${col} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+// The per-account Ads rows over the EXACT build window (adsBuildWindow of the IN as-of at the read's `now`): count(*) +
+// max(updated_at) and the EXACT content digest rows_digest ('adr1:', the SHARED adsRowsDigestSql -- count + max alone is
+// not a content identity, see the header), the window echoed. An account with no row in the window has no result row.
+// TIER-1 PERFORMANCE: NO LONGER an evidence statement (the route reads ADS_DAILY_STATEMENT and folds it into exactly
+// these rows); kept as the reference definition the equivalence self-test runs against the new path on real Postgres.
+export const PORTFOLIO_ADS_ROWS_SQL = "select account_id, count(*)::text as n, " + TS("max(updated_at)") + " as max_ua, "
+  + adsRowsDigestSql("") + " as rows_digest, "
+  + "to_char($2::date, 'YYYY-MM-DD') as win_from, to_char($3::date, 'YYYY-MM-DD') as win_to "
+  + "from public.ads_daily_source_rows where source_key = $1 and metric_date >= $2::date and metric_date <= $3::date "
+  + "group by account_id order by account_id";
 export const EVIDENCE_SQL = Object.freeze([
   Object.freeze({
     name: "account_directory",
@@ -213,21 +224,10 @@ export const EVIDENCE_SQL = Object.freeze([
       + "from public.ads_sync_coverage where source_key = $1 and status = 'succeeded' order by account_id, covered_from, covered_to",
     params: () => [ACTIVE_ADS_SOURCE_KEY],
   }),
-  Object.freeze({
-    name: "ads_rows",
-    // The durable Ads rows the build reads per account over the EXACT build window (adsBuildWindow of the IN as-of at the
-    // read's `now`): count(*) + max(updated_at) and the EXACT content digest rows_digest ('adr1:', the SHARED
-    // adsRowsDigestSql -- count + max alone is not a content identity, see the header). The window is echoed so the
-    // compose can prove the rows were digested over ITS window (a params/compose clock split across the IN midnight
-    // fails closed). $2 / $3 are only ever cast to date (one deduced parameter type) and echoed through a DateStyle-
-    // independent to_char. An account with no row in the window has no result row (its digest is EMPTY_ADS_ROWS_DIGEST).
-    text: "select account_id, count(*)::text as n, " + TS("max(updated_at)") + " as max_ua, "
-      + adsRowsDigestSql("") + " as rows_digest, "
-      + "to_char($2::date, 'YYYY-MM-DD') as win_from, to_char($3::date, 'YYYY-MM-DD') as win_to "
-      + "from public.ads_daily_source_rows where source_key = $1 and metric_date >= $2::date and metric_date <= $3::date "
-      + "group by account_id order by account_id",
-    params: (ctx = {}) => { const w = adsBuildWindow(portfolioAsOf(nowMsOf(ctx && ctx.now))); return [ACTIVE_ADS_SOURCE_KEY, w.from, w.to]; },
-  }),
+  // The SHARED per-day Ads digest partials (ads-daily-evidence.js; identical text + params for every route x region of a
+  // sweep -> one scan per sweep via the worker's sweep cache). The compose folds them over the IN build window into
+  // EXACTLY the rows PORTFOLIO_ADS_ROWS_SQL returned (accounts with >= 1 row; n, max_ua, rows_digest).
+  ADS_DAILY_STATEMENT,
   Object.freeze({
     name: "campaign_mappings",
     text: "select organization_fingerprint, account_id, marketplace, ads_profile_id, ad_campaign_id, canonical_brand_key "
@@ -320,7 +320,17 @@ export function composeBrandViewPortfolioEvidence(rowsByName, { now, code = PORT
   // fail closed, typed).
   const adsRows = new Map();
   const globalProblems = [];
-  for (const r of rowsOf(rowsByName, "ads_rows")) {
+  // The rows folded from the SHARED per-day partials over the IN build window (every account with >= 1 row -- the old
+  // GROUP BY). FAIL CLOSED, typed global problems: malformed / absent partials -> 'ads-rows-evidence-missing' (never a
+  // silent empty-set digest for every account); the IN window NOT inside the range the statement actually SCANNED (its
+  // echoed sentinel -- a params / compose clock split across the IN midnight) -> 'ads-rows-window-mismatch' (the old
+  // per-row window echo check, unchanged in effect).
+  const daily = splitAdsDailyPartials(rowsByName instanceof Map ? rowsByName.get("ads_daily") : rowsByName && rowsByName.ads_daily);
+  let adsWindowRows = [];
+  if (!daily) globalProblems.push("ads-rows-evidence-missing");
+  else if (!adsWindowCovered(adsWindow, daily.range)) globalProblems.push("ads-rows-window-mismatch");
+  else adsWindowRows = adsWindowRowsFromDaily(daily.rows, [...new Set(daily.rows.map((r) => S(r.account_id)))].sort().map((accountId) => ({ accountId, from: adsWindow.from, to: adsWindow.to })), { includeEmpty: false });
+  for (const r of adsWindowRows) {
     if (S(r.win_from) !== adsWindow.from || S(r.win_to) !== adsWindow.to) { if (!globalProblems.includes("ads-rows-window-mismatch")) globalProblems.push("ads-rows-window-mismatch"); continue; }
     adsRows.set(S(r.account_id), { n: S(r.n) || "0", maxUa: canonicalInstant(r.max_ua), digest: S(r.rows_digest) });
   }
@@ -393,11 +403,18 @@ export function composeBrandViewPortfolioEvidence(rowsByName, { now, code = PORT
  * target). The owners (every member, incl. settingUp accounts) are informational: they never gate the region target
  * (routes.js ownersGateTarget; the per-unit publisher AND gate covers the members).
  */
+// The Ads-evidence problems that make a region's token MEANINGLESS (the Ads digests were not proven over its window):
+// token null + the typed reason, exactly like Brand View's per-account compose (never a token that would equal the
+// "every account has zero Ads rows" token). Other region problems keep today's behaviour.
+const ADS_TOKEN_BLOCKING = Object.freeze(["ads-rows-evidence-missing", "ads-rows-window-mismatch"]);
 export function composeRegionTokens(rowsByName, { now, region: only = null } = {}) {
   const out = new Map();
   for (const [region, ev] of composeBrandViewPortfolioEvidence(rowsByName, { now })) {
     if (!ev.universe.length || (only != null && region !== only)) continue;
-    out.set(REGION_TARGET_PREFIX + region, { token: ev.token, owners: ev.universe.slice(), region, alerts: [] });
+    const blocking = ADS_TOKEN_BLOCKING.find((p) => (ev.problems || []).includes(p)) || null;
+    out.set(REGION_TARGET_PREFIX + region, blocking
+      ? { token: null, owners: ev.universe.slice(), region, alerts: [], reason: blocking }
+      : { token: ev.token, owners: ev.universe.slice(), region, alerts: [] });
   }
   return out;
 }

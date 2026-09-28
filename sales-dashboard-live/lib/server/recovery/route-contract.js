@@ -119,6 +119,14 @@ export function workerRouteProblems(route) {
         names.add(q.name);
         if (!isReadOnlyEvidenceSql(q.text)) p.push("evidence-sql-not-read-only:" + q.name);
         if (!isFn(q.params)) p.push("evidence-sql-params-not-fn:" + q.name);
+        // `shared` (the worker's sweep cache) must be a real boolean: a truthy string must never enable cross-evaluation reuse.
+        if (q.shared !== undefined && typeof q.shared !== "boolean") p.push("evidence-sql-shared-invalid:" + q.name);
+        // `sharedVariant` (run INSTEAD in sweep mode): a read-only `shared: true` statement with its own params; a statement
+        // is either shared itself or carries a shared variant, never both.
+        if (q.sharedVariant !== undefined) {
+          const v = q.sharedVariant;
+          if (!isPlainObject(v) || v.shared !== true || !isReadOnlyEvidenceSql(v.text) || !isFn(v.params) || v.sharedVariant !== undefined || q.shared === true) p.push("evidence-sql-shared-variant-invalid:" + q.name);
+        }
       }
     }
     if (!isFn(ev.compose)) p.push("evidence-compose-not-fn");

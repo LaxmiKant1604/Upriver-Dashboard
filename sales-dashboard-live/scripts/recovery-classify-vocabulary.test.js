@@ -10,7 +10,8 @@
 //      identifier / token prefix / stage / disposition / internal state) -- a new reason literal breaks this suite until
 //      it is classified (like recovery-registry-completeness does for report keys);
 //   V2 the four legacy families' verdicts (class AND alert) are IDENTICAL to the pre-fix classifier (frozen copy below)
-//      over every code literal of the legacy family modules + LEGACY_REASON_CODES, in every execution state;
+//      over every code literal of the legacy family modules + LEGACY_REASON_CODES, in every execution state; the pre-fix
+//      code list is FROZEN by digest and each intentional addition is pinned and asserted separately;
 //   V3 the explicit NOT_ACTIVATED STOP list: every STOP code the five allowed worker CLIs emit is scanned -- none may
 //      look like an activation gate unless listed in NOT_ACTIVATED_STOP_CODES;
 //   V4 every vocabulary entry is a well-formed code and classifies (in the states it arrives in) WITHOUT an unmapped alert;
@@ -20,6 +21,7 @@
 //      leading-'-threw' rule's exception list, WP11 verifier F4).
 // 7-bit ASCII, LF.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, writeSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -226,8 +228,14 @@ function literalsOf(files) {
   const oldDeferral = (r) => (/^controls-(not-opened|unresolved|open-threw|apply-error)|CONTROL_LEASE|lease-lost|leaseLost|control-apply|CONTROL_PLANE|^claim-held/i.test(r) ? CLASSES.CONTENTION : /^deadline-cleanup-reserved/i.test(r) ? CLASSES.NOT_ATTEMPTED : /^deadline|^out-of-time|^aborted/i.test(r) ? CLASSES.TIMEOUT : /^cycle-not-running/i.test(r) ? CLASSES.TERMINAL_CYCLE : null);
   const oldFailure = (st, r) => (/^cycle-not-running/i.test(r) ? CLASSES.TERMINAL_CYCLE : /malformed|conflict|integrity|dangling|mismatch|invalid|payload-unreadable|not-d1|corrupt/i.test(r) ? CLASSES.INTEGRITY : (st === STATES.FAILED_READBACK || /readback/i.test(r)) ? CLASSES.READBACK_MISMATCH : /threw|timeout|ETIMEDOUT|ECONN|EAI_AGAIN|fetch|network|socket|5\d\d|429|failed|error/i.test(r) ? CLASSES.TRANSPORT : null);
   const OLD_PROV_RE = /missing|unavailable|^no-|not-d1|incomplete|unresolved|stale|empty|cold|cache-miss|not-yet-saved|before-inventory|not-primary|raw-seller|directory|provenance|evidence|units-invalid|target-asof|oli-window|sales-asof|inventory-asof|marketplace|org-|account-meta|authorization|creates-exceed|tokens-exceed|membership-exceeds|eligible-without-deps|revision-|request-hash|snapshot|catalog|fba-|oli-|ads-|listings|pricing-revision/i;
-  // (the imported LEGACY_REASON_CODES only ADDED codes the old pattern already admitted, so the old whitelist is exactly this)
-  const oldKnown = (r) => { const code = r.split(":")[0]; return LEGACY_REASON_CODES.has(code) || LEGACY_REASON_CODES.has(code.replace(/^(bundle-|derive-not-ready-)/, "")) || OLD_PROV_RE.test(r); };
+  // The PRE-FIX legacy code list, FROZEN by digest: the live LEGACY_REASON_CODES minus the codes INTENTIONALLY added since
+  // (each asserted as an intentional change below). Any other addition changes the digest and fails here until it is
+  // recorded -- a new code is never absorbed silently into the "old" model (whole-diff review P3).
+  const INTENTIONAL_LEGACY_ADDITIONS = ["zero-row-window-gap"];
+  const OLD_LEGACY_CODES = new Set([...LEGACY_REASON_CODES].filter((c) => !INTENTIONAL_LEGACY_ADDITIONS.includes(c)));
+  ok("V2 (frozen): the pre-fix legacy code list (195 codes) is unchanged except the pinned intentional additions",
+    OLD_LEGACY_CODES.size === 195 && createHash("sha256").update(JSON.stringify([...OLD_LEGACY_CODES].sort())).digest("hex") === "664a526a469ab949592d21a43a824670ad08815d821e6207f40bcd915fda0fe2");
+  const oldKnown = (r) => { const code = r.split(":")[0]; return OLD_LEGACY_CODES.has(code) || OLD_LEGACY_CODES.has(code.replace(/^(bundle-|derive-not-ready-)/, "")) || OLD_PROV_RE.test(r); };
   const OLD = (st, r, ctx) => {
     if (st === STATES.STALE) return { cls: CLASSES.STALE, alert: r.endsWith("source-stale-manual") ? "source-stale-manual" : null };
     for (const rule of OLD_RULES) if (rule.test(r)) return { cls: typeof rule.cls === "function" ? rule.cls(r, st, ctx) : rule.cls, alert: (typeof rule.alert === "function" ? rule.alert(r, st, ctx) : rule.alert) || null };
@@ -250,20 +258,26 @@ function literalsOf(files) {
   let compared = 0;
   for (const routeId of LEGACY_ROUTE_IDS) {
     const ctx = { routeId, routeKind: "legacy-cli" };
-    // 'derive-not-ready:<sub>' is the ONE intentional change (asserted separately below; no legacy family emits it).
-    for (const r of [...codes].filter((x) => !x.startsWith("derive-not-ready:"))) for (const st of states) {
+    // 'derive-not-ready:<sub>' and the INTENTIONAL_LEGACY_ADDITIONS are the intentional changes (asserted separately below).
+    for (const r of [...codes].filter((x) => !x.startsWith("derive-not-ready:") && !INTENTIONAL_LEGACY_ADDITIONS.includes(x.split(":")[0]))) for (const st of states) {
       const n = classifyReason(st, r, ctx); const o = OLD(st, r, ctx); compared += 1;
       if (n.cls !== o.cls || (n.alert || null) !== (o.alert || null)) diffs.push([routeId, st, r, o.cls + "/" + o.alert, n.cls + "/" + n.alert]);
     }
   }
   ok(`V2: the 4 legacy families' verdicts (class AND alert) are IDENTICAL to the pre-fix classifier over ${codes.size} codes x ${states.length} states x ${LEGACY_ROUTE_IDS.length} routes (${compared} comparisons: every legacy module literal, LEGACY_REASON_CODES, ':detail' variants)` + (diffs.length ? " -- DIFFS: " + J([...new Set(diffs.map((d) => d[2] + "@" + d[1] + ":" + d[3] + "->" + d[4]))].slice(0, 400)) : ""), diffs.length === 0 && compared > 4 * 6 * 300);
-  // The TWO intentional legacy-path changes (neither is emitted by a legacy module literal, so V2 above is unaffected):
+  // The THREE intentional legacy-path changes (excluded from the V2 loop above and asserted here):
   // (1) a 'derive-not-ready:<sub>' is no longer blanket-whitelisted; (2) a writer-fence refusal ('REPORT_WRITER_FENCED')
-  // is INTEGRITY + alert 'writer-fenced' (the WP14 first rule) instead of the pre-fix classification.
+  // is INTEGRITY + alert 'writer-fenced' (the WP14 first rule) instead of the pre-fix classification (neither is emitted
+  // by a legacy module literal); (3) 'zero-row-window-gap' (INTENTIONAL_LEGACY_ADDITIONS) is typed missing evidence.
   const dnr = classifyReason(STATES.DEPENDENCY, "derive-not-ready:zz-sub", { routeKind: "legacy-cli" });
   ok("V2: intentional legacy-path change 1 is the 'derive-not-ready:<sub>' blanket (never emitted by a legacy family) -- now an unmapped alert; the class is unchanged", dnr.cls === CLASSES.DEPENDENCY && /^unmapped-reason:/.test(S(dnr.alert)) && OLD(STATES.DEPENDENCY, "derive-not-ready:zz-sub", {}).alert === null && ![...literalsOf(LEGACY_FILES).keys()].some((x) => x.startsWith("derive-not-ready:")));
   const wf = classifyReason(STATES.FAILED_PUBLISH, "REPORT_WRITER_FENCED:brand-sales", { routeKind: "legacy-cli" });
   ok("V2: intentional legacy-path change 2 is the writer-fence refusal ('REPORT_WRITER_FENCED', never a legacy module literal) -- INTEGRITY + alert 'writer-fenced'", wf.cls === CLASSES.INTEGRITY && wf.alert === "writer-fenced" && ![...literalsOf(LEGACY_FILES).keys()].some((x) => /REPORT_WRITER_FENCED/.test(x)));
+  // (3) 'zero-row-window-gap' (observe-only soak 2026-09-28): the pre-fix model raised 'unmapped-reason'; now a typed
+  // missing-evidence deferral WITHOUT an alert. Its class is unchanged in every state.
+  const z = [STATES.PROVENANCE, STATES.DEPENDENCY].map((st) => [classifyReason(st, "zero-row-window-gap", { routeKind: "legacy-cli", routeId: "oli" }), OLD(st, "zero-row-window-gap", {})]);
+  ok("V2: intentional legacy-path change 3 is 'zero-row-window-gap' -- the pre-fix 'unmapped-reason' alert is gone, the class is unchanged",
+    z.every(([n, o]) => n.cls === o.cls && n.alert === null && /^unmapped-reason:zero-row-window-gap/.test(S(o.alert))));
 }
 
 /* V3. the explicit NOT_ACTIVATED STOP list against the CLIs' real STOP codes */
@@ -300,6 +314,21 @@ function literalsOf(files) {
   }
   ok("V4: every vocabulary code classifies WITHOUT an unmapped alert in DEFERRED_PROVENANCE / DEFERRED_DEPENDENCY / FAILED_DERIVE and under each release wrapper (never unclassified)" + (unmapped.length ? " -- UNMAPPED: " + unmapped.slice(0, 10).join(" | ") : ""), unmapped.length === 0);
   ok("V4: a reason merely CONTAINING a vocabulary code as a prefix without the ':' boundary is NOT typed (no blanket prefixes)", !routeVocabularyMatch("payload-too-largeX") && !routeVocabularyMatch("claim-heldY") && routeVocabularyMatch("bundle-evidence-missing") && routeVocabularyMatch("derive-not-ready:no-sales-snapshot") && !routeVocabularyMatch("bundle-") && !routeVocabularyMatch(""));
+}
+
+// V5 (observe-only soak 2026-09-28): the OLI lineage 'zero-row-window-gap' (a zero-sales account whose zero-row exports
+// do not gaplessly cover the window) is MISSING UPSTREAM PROOF -- typed missing-evidence, no alert -- on the legacy oli
+// route; its integrity siblings keep the fail-closed 'unmapped-reason' alert; and on a route-cli it stays untyped.
+{
+  const legacy = { routeKind: "legacy-cli", routeId: "oli" };
+  const gap = classifyReason(STATES.PROVENANCE, "zero-row-window-gap", legacy);
+  ok("V5a legacy oli 'zero-row-window-gap' -> missing-evidence, NO alert (was 'unmapped-reason:zero-row-window-gap')",
+    gap.cls === CLASSES.MISSING_EVIDENCE && gap.alert === null && LEGACY_REASON_CODES.has("zero-row-window-gap") && isKnownLegacyReason("zero-row-window-gap"));
+  const sib = ["positive-row-missing-hash", "zero-row-proof-malformed", "bad-derivation-window"].map((r) => classifyReason(STATES.PROVENANCE, r, legacy));
+  ok("V5b its integrity siblings stay missing-evidence WITH the fail-closed unmapped alert (a malformed proof is a defect signal)",
+    sib.every((v) => v.cls === CLASSES.MISSING_EVIDENCE && /^unmapped-reason:/.test(v.alert)));
+  const rc = classifyReason(STATES.PROVENANCE, "zero-row-window-gap", { routeKind: "route-cli", routeId: "brand-view" });
+  ok("V5c on a route-cli it is NOT typed by the legacy list (route reasons are typed only by the route vocabulary)", rc.alert === "unmapped-reason:zero-row-window-gap" && !routeVocabularyMatch("zero-row-window-gap"));
 }
 
 writeSync(1, `recovery-classify-vocabulary: ${passed} passed\n`);

@@ -88,7 +88,7 @@ export function buildEvidenceContext({ epoch, now, directory, region, organizati
  * region null or ctx.region; a region-grain route yields at most its own 'region:<region>' target). THROWS on a read or
  * a malformed result (the caller defers; never a partial token set).
  */
-export async function evaluateRouteEvidence(route, query, ctx) {
+export async function evaluateRouteEvidence(route, query, ctx, { sweep = false } = {}) {
   const r = typeof route === "string" ? routeById(route) : route;
   if (typeof query !== "function") throw new Error("evaluateRouteEvidence: a read-only query function is required (fail closed).");
   const problems = evidenceContextProblems(ctx); // re-validated: a caller-built ctx is never trusted blindly
@@ -96,11 +96,48 @@ export async function evaluateRouteEvidence(route, query, ctx) {
   const c = ctx; // the SAME object for every params() and the compose
   const rowsByName = {};
   for (const q of r.evidence.sql) {
-    const rows = await query(q.text, q.params(c));
+    // SWEEP MODE (a caller holding a sweep cache: the worker's tier-1 / watermark pass, memcheck --real): a statement
+    // with a `sharedVariant` runs that region-independent `shared: true` variant instead (its rows land under THIS
+    // statement's name -- the compose folds both identically). Without sweep mode the statement's own text runs.
+    const st = sweep === true && q.sharedVariant ? q.sharedVariant : q;
+    // The statement itself is passed as a 3rd argument (ignored by a plain query; read by sweepMemoQuery for `shared`).
+    const rows = await query(st.text, st.params(c), st);
     if (!Array.isArray(rows)) throw new Error(`evaluateRouteEvidence: '${r.id}' statement '${q.name}' returned no rows array (fail closed).`);
     rowsByName[q.name] = rows;
   }
   return validateComposeResult(r.evidence.compose(rowsByName, c), { ctx: c, grain: r.grain, routeId: r.id });
+}
+
+/**
+ * THE SWEEP CACHE (tier-1 performance): wrap a read-only `query(text, values, statement)` so a statement DECLARED
+ * `shared: true` (region-independent text + params: ads-daily-evidence.js ADS_DAILY_STATEMENT) runs ONCE per sweep --
+ * a later route x region evaluation issuing the IDENTICAL (text, values) reuses the first result. Every other statement
+ * runs exactly as before, in its own evaluation's snapshot. The cached rows are FROZEN copies (a compose that mutated a
+ * shared row would throw -> that evaluation defers, fail closed); a non-array result is never cached. A FAILED shared
+ * read fails FAST for the rest of THIS pass (every later evaluation re-throws its code at once instead of re-issuing a
+ * scan that just failed -- up to 6 x the statement timeout); the next pass (a new cache) retries it.
+ * A cached result is at most one sweep older than the evaluation using it -- a write landing mid-sweep is seen by the
+ * next sweep, exactly as for a write landing after a route's own read. No cache (null) -> the query unchanged.
+ */
+export function sweepMemoQuery(query, sweepCache) {
+  if (typeof query !== "function") throw new Error("sweepMemoQuery: a query function is required (fail closed).");
+  if (!(sweepCache instanceof Map)) return query;
+  return async (text, values, statement) => {
+    if (!(statement && statement.shared === true)) return query(text, values, statement);
+    const key = S(text) + "\u0000" + JSON.stringify(values == null ? [] : values);
+    if (sweepCache.has(key)) {
+      const hit = sweepCache.get(key);
+      if (hit && hit.__sweepFailed === true) { const e = new Error("shared evidence read failed earlier in this pass (" + hit.code + ")"); e.code = hit.code; throw e; }
+      return hit;
+    }
+    let rows;
+    try { rows = await query(text, values, statement); }
+    catch (e) { sweepCache.set(key, Object.freeze({ __sweepFailed: true, code: S(e && (e.code || e.name)).slice(0, 40) || "error" })); throw e; }
+    if (!Array.isArray(rows)) return rows;
+    const frozen = Object.freeze(rows.map((row) => (row && typeof row === "object" ? Object.freeze({ ...row }) : row)));
+    sweepCache.set(key, frozen);
+    return frozen;
+  };
 }
 
 /** The pinned tier-1 target of a route target key in a region: { targetKey, accountId?, region } (THROWS if malformed). */

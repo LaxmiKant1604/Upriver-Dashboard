@@ -571,6 +571,27 @@ const drain = async (rig, max = 30) => { let i = 0; while (i < max && (await rig
   await rig.worker.watermarkPass();
   const c = seen[0];
   ok("15a [WP6]: the worker passes the store the ONE pinned evidence ctx -- frozen, exactly { epoch, now, accountIds, directory, region, organizationFingerprint, connectionId }, now === the worker clock (epoch ms), epoch === utcDMinus1(now); worker.js builds it with buildEvidenceContext and store-pg hands that SAME object to evaluateRouteEvidence", !!c && Object.isFrozen(c) && J(Object.keys(c).sort()) === J(["accountIds", "connectionId", "directory", "epoch", "now", "organizationFingerprint", "region"]) && c.now === rig.clk.t && c.epoch === utcDMinus1(c.now) && c.region === "india" && c.connectionId === "primary" && c.organizationFingerprint === "org-fp-test" && J(c.accountIds) === J(["A1", "A2"]) && c.directory instanceof Map && /buildEvidenceContext\(\{ epoch, now, directory, region, organizationFingerprint \}\)/.test(src("lib/server/recovery/worker.js")) && /store\.readRouteEvidence\(route, ctx\)/.test(src("lib/server/recovery/worker.js")) && /evaluateRouteEvidence\(route, q, ctx\)/.test(src("lib/server/recovery/store-pg.js")));
+  // 15t [tier-1 performance] ONE sweep cache per tier-1 pass: every route x region evaluation of a pass gets the SAME Map
+  // (so a `shared: true` statement -- the Ads digest partials -- runs once per pass); the next pass gets a NEW Map (never
+  // a result older than the pass); the watermark pass gets its OWN per-pass Map (never a tier-1 one).
+  {
+    const rig3 = makeRig({ regions: ["india", "europe-au"], dir: { india: ["A1"], "europe-au": ["E1"] } });
+    const calls = [];
+    const orig = rig3.store.readRouteEvidence.bind(rig3.store);
+    rig3.store.readRouteEvidence = async (route, ctx, ...rest) => { calls.push({ ctx, rest }); return orig(route, ctx, ...rest); };
+    await rig3.worker.tier1Scan();
+    const p1 = calls.splice(0);
+    rig3.clk.t += 700 * 1000;
+    await rig3.worker.tier1Scan();
+    const p2 = calls.splice(0);
+    await rig3.worker.watermarkPass();
+    const wm = calls.splice(0);
+    const cacheOf = (c) => (c.rest[0] && c.rest[0].sweepCache) || null;
+    ok("15t [tier-1 perf]: every route x region evaluation of ONE tier-1 pass shares ONE sweep-cache Map; the next pass gets a NEW Map; the watermark pass gets its OWN per-pass Map (never a tier-1 one)",
+      p1.length === PUBLICATION_ROUTES.length * 2 && p1.every((c) => cacheOf(c) instanceof Map && cacheOf(c) === cacheOf(p1[0])) && new Set(p1.map((c) => c.ctx.region)).size === 2
+      && p2.length === p1.length && p2.every((c) => cacheOf(c) === cacheOf(p2[0])) && cacheOf(p2[0]) !== cacheOf(p1[0])
+      && wm.length > 0 && wm.every((c) => cacheOf(c) instanceof Map && cacheOf(c) === cacheOf(wm[0])) && cacheOf(wm[0]) !== cacheOf(p1[0]) && cacheOf(wm[0]) !== cacheOf(p2[0]));
+  }
   // 15b [P2d] a route CLI's current binding WITHOUT its served read-back is never verified.
   const r2 = makeRig({ liveRoutes: ["returns-v3"] });
   setEv(r2, "returns-v3", "india", { A1: "rt-1" }); r2.world.set("returns-v3", "india", "A1", "current-unserved", "rt-1");
