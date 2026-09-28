@@ -11,9 +11,41 @@ async function adminFetch(path, accessToken, options = {}) {
     },
   });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`);
+  if (!response.ok) {
+    // Show the server's human message when it sends one (e.g. the paid-sync refusals explain what changed); keep the
+    // typed code + status + body on the error so a caller can react (re-confirmation on 409/428).
+    const text = body.message ? (body.error ? `${body.error}: ${body.message}` : body.message) : (body.error || `Request failed (${response.status})`);
+    const error = new Error(text);
+    error.status = response.status;
+    error.code = body.error || null;
+    error.body = body;
+    throw error;
+  }
   return body;
 }
+
+// Paid-sync refusals that mean "the approved scope / day / operation changed -- look at the new estimate and confirm
+// again" (nothing was spent by the refused request). The server attaches a fresh estimate but NEVER a token: a new
+// confirmation token only ever comes from an explicit preview request. PAID_SYNC_TOKEN_CONSUMED: a Campaign Ads
+// confirmation step is single-use and this one was already used (e.g. a lost response), so a new preview is required.
+const PAID_RECONFIRM_CODES = new Set([
+  "PAID_SYNC_CONFIRMATION_REQUIRED", "PAID_SYNC_CONFIRMATION_INVALID", "PAID_SYNC_SCOPE_CHANGED", "PAID_SYNC_ASOF_CHANGED",
+  "PAID_SYNC_OPERATION_CHANGED", "PAID_SYNC_OPERATION_FINISHED", "PAID_SYNC_APPROVAL_EXHAUSTED", "PAID_SYNC_TOKEN_CONSUMED",
+]);
+const paidEstimateText = (card, bucket, preview) => {
+  const est = preview.estimate || {};
+  const refreshes = preview.refreshes || {};
+  const release = est.release && est.release.worstCaseTokens ? ` (incl. ${est.release.worstCaseTokens} for the release Catalog export)` : "";
+  return `Request paid sync: ${card.label} (${bucket})\n\n`
+    + `Uses DataDoe tokens (${est.tokensPerCreate ? `standard ${est.tokensPerCreate.standard} / premium ${est.tokensPerCreate.premium} per export` : "registry-priced"}).\n`
+    + `Expected: ${est.expectedCreates ?? "?"} export(s) / ${est.expectedTokens ?? "?"} tokens.\n`
+    + `Worst case: ${est.worstCaseCreates ?? "?"} export(s) / ${est.worstCaseTokens ?? "?"} tokens${release}.\n`
+    + `Approved hard ceiling: ${preview.approvedMaxTokens} tokens${est.accounts != null ? ` across ${est.accounts} account(s)` : ""} (as-of ${(preview.operation && preview.operation.asOf) || "?"}).\n`
+    + `${est.followOnSplit && est.followOnSplit.tokens ? `If an export hits the 50,000-row cap, its re-split needs a separate confirmation (up to ${est.followOnSplit.tokens} more tokens).\n` : ""}\n`
+    + `Publishes now (fenced): ${(refreshes.direct || []).join(", ") || "none"}.\n`
+    + `Then republished from saved data by their routes: ${(refreshes.viaRoutes || []).join(", ") || "none"}.\n\n`
+    + "Existing saved data is preserved if anything fails. Continue?";
+};
 
 const fmtTs = (value) => (value ? new Date(value).toLocaleString() : "—");
 const fmtCeiling = (spent, ceiling) => (ceiling == null ? `${spent} / —` : `${spent} / ${ceiling}`);
@@ -74,9 +106,9 @@ function SourceCard({ card, busyKey, onPause, onSyncMissing }) {
           {card.paused ? <PlayCircle size={14} /> : <PauseCircle size={14} />}
           {pauseBusy ? "Saving…" : card.paused ? "Resume" : "Pause"}
         </button>
-        <button type="button" className="cache-refresh-btn" disabled={!!busyKey || card.paused} onClick={() => onSyncMissing(card)} title="Admin only: spend DataDoe tokens to sync this source">
+        <button type="button" className="cache-refresh-btn" disabled={!!busyKey || card.paused} onClick={() => onSyncMissing(card)} title="Admin only: shows a token estimate, then spends DataDoe tokens to sync this source after you confirm">
           <RefreshCw size={14} className={syncBusy ? "spin" : ""} />
-          {syncBusy ? "Syncing…" : "Sync source"}
+          {syncBusy ? "Syncing…" : "Sync source (paid)"}
         </button>
       </div>
     </section>
@@ -153,19 +185,66 @@ export default function DataSyncCenter({ accessToken }) {
   // publish every affected dashboard from the same evidence, safe-closing controls per slice); the UI POLLS the
   // typed continuation automatically until terminal -- the user never has to re-click, and busyKey guards a
   // double click from starting a second operation. Success is claimed ONLY after the route's live read-back.
+  // PAID SYNC CONFIRMATION (publication recovery WP10b): the route first returns a zero-spend PREVIEW (token estimate:
+  // expected / worst case / approved hard ceiling + the reports this card refreshes + a signed confirmationToken bound to
+  // this ONE operation); the admin must explicitly confirm before any DataDoe token is spent. Each accepted slice returns
+  // a continuationToken (same approval) that the next poll presents. If the server refuses because the scope / day /
+  // operation changed (409) or the confirmation is missing/invalid (428), its message + a FRESH estimate are shown and
+  // the admin must confirm again (a new token comes only from a new explicit preview) -- nothing is ever auto-approved.
   const syncMissing = async (card) => {
     if (busyKey) return; // double-click guard: one operation at a time
     setBusyKey(`sync:${card.sourceKey}`);
     setError(""); setNotice("");
     const startedBucket = bucket;
+    const requestPreview = async () => {
+      const previewBody = await adminFetch("/api/admin/sources", accessToken, {
+        method: "POST",
+        body: JSON.stringify({ bucket: startedBucket, sourceKey: card.sourceKey, preview: true }),
+      });
+      return previewBody.preview || {};
+    };
+    const previewBlocked = (preview) => {
+      const est = preview.estimate || {};
+      return est.unavailable
+        ? `${card.label}: the token estimate is unavailable (${est.unavailable}); nothing was spent. Retry shortly.`
+        : preview.executable === false
+          ? `${card.label}: this source cannot be paid-synced from this card (${preview.reason || "not executable"}); nothing was spent.`
+          : `${card.label}: the paid-sync confirmation is unavailable on this deployment; nothing was spent.`;
+    };
     try {
+      const preview = await requestPreview();
+      if (!preview.confirmationToken) { setError(previewBlocked(preview)); return; }
+      const confirmed = window.confirm(paidEstimateText(card, startedBucket, preview));
+      if (!confirmed) { setNotice(`${card.label}: paid sync cancelled — nothing was spent.`); return; }
+      let confirmationToken = preview.confirmationToken;
+      let reconfirmations = 0;
       const MAX_POLLS = 40;
       let terminalNote = null;
       for (let poll = 1; poll <= MAX_POLLS; poll += 1) {
-        const response = await adminFetch("/api/admin/sources", accessToken, {
-          method: "POST",
-          body: JSON.stringify({ bucket: startedBucket, sourceKey: card.sourceKey }),
-        });
+        let response;
+        try {
+          response = await adminFetch("/api/admin/sources", accessToken, {
+            method: "POST",
+            body: JSON.stringify({ bucket: startedBucket, sourceKey: card.sourceKey, confirmationToken }),
+          });
+        } catch (err) {
+          // 409 scope/day/operation changed or 428 confirmation required/invalid: show WHY (the server message) and the
+          // attached fresh estimate, then ask again. Confirming requests a NEW preview (the only source of a token).
+          if ((err.status === 409 || err.status === 428) && PAID_RECONFIRM_CODES.has(err.code) && reconfirmations < 3) {
+            reconfirmations += 1;
+            const attached = (err.body && err.body.preview) || {};
+            const ask = window.confirm(`${err.message}\n\n`
+              + `Fresh estimate: expected ${attached.estimate?.expectedTokens ?? "?"} tokens, worst case ${attached.estimate?.worstCaseTokens ?? "?"} tokens.\n\nReview and confirm a new paid sync?`);
+            if (!ask) { setNotice(`${card.label}: paid sync stopped — ${err.message}`); return; }
+            const fresh = await requestPreview();
+            if (!fresh.confirmationToken) { setError(previewBlocked(fresh)); return; }
+            if (!window.confirm(paidEstimateText(card, startedBucket, fresh))) { setNotice(`${card.label}: paid sync cancelled — nothing more was spent.`); return; }
+            confirmationToken = fresh.confirmationToken;
+            continue;
+          }
+          throw err;
+        }
+        if (response.continuationToken) confirmationToken = response.continuationToken;
         if (response.status) setData(response.status);
         const op = response.operation || null;
         if (op) {

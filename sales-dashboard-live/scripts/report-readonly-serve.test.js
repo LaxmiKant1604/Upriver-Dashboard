@@ -96,6 +96,19 @@ await (async () => {
 })();
 
 // The legacy (readOnly:false) persist path is retained + still writes (proves the readOnly flag is what gates writes).
+// WP10b: it is retained ONLY for keys that are NOT route-owned (a route-owned live key such as daily-reporting is
+// forced read-only -- proven in scripts/refresh-readonly.test.js), so the probe uses an unfenced report key.
+await (async () => {
+  const store = recordingStore();
+  const res = fakeRes();
+  await selfHealFromDurable({
+    deriveDurable: async () => ({ payload: { rows: [] }, sourceRefreshedAt: "2026-09-05T12:00:00.000Z" }),
+    reportKey: "brand-portfolio", reportVersion: "brand-portfolio-shared-v4", accountId: "acctA", paramsHash: "h",
+    params: { from: "2026-04-01", to: "2026-09-06", brand: "ALL" }, present: (p) => p, res, label: "Brand portfolio", lockSeconds: 60, readOnly: false,
+  }, store);
+  ok("A: the legacy persist path (readOnly:false) DOES write for a NON-route-owned key (the flag is what gates the write)", store.calls.saveReportSnapshot === 1 && store.calls.claimRefreshLock === 1);
+})();
+// WP10b: the same readOnly:false call for a ROUTE-OWNED live key (daily-reporting) is forced read-only: zero writes.
 await (async () => {
   const store = recordingStore();
   const res = fakeRes();
@@ -104,7 +117,7 @@ await (async () => {
     reportKey: "daily-reporting", reportVersion: "daily-reporting-shared-v2", accountId: "acctA", paramsHash: "h",
     params: { from: "2026-04-01", to: "2026-09-06", brand: "ALL" }, present: (p) => p, res, label: "Daily Reporting", lockSeconds: 60, readOnly: false,
   }, store);
-  ok("A: the legacy persist path (readOnly:false) DOES write (the flag is what gates the write)", store.calls.saveReportSnapshot === 1 && store.calls.claimRefreshLock === 1);
+  ok("A: WP10b a ROUTE-OWNED key (daily-reporting) with readOnly:false still writes NOTHING (forced read-only derive + serve)", store.calls.saveReportSnapshot === 0 && store.calls.claimRefreshLock === 0 && res.body && res.body.snapshot && res.body.snapshot.readOnly === true);
 })();
 
 /* ===================== (B) STATIC: the datadoe serve read paths contain NO write call ===================== */

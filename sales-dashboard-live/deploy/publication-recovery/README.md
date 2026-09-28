@@ -1,350 +1,423 @@
 # Publication recovery worker
 
-A small independent Node.js worker, meant for the Oracle Always Free VM (Mumbai, Ubuntu 24.04,
-VM.Standard.E2.1.Micro, 1 GB RAM). It finds saved source evidence that has not yet reached its live dashboard
-report. It then runs the **existing** zero-export reconciler for that account and completes the job only when the
-reconciler's own live read-back check passes.
+A small independent Node.js worker for the Oracle Always Free VM (Mumbai, Ubuntu 24.04, VM.Standard.E2.1.Micro,
+1 GB RAM, 1/8 OCPU). It finds saved source evidence that has not reached its live dashboard report and repairs it
+**zero-export** through the **publication routes**: the four pre-existing zero-export reconciler CLIs and the one
+generic route CLI (`scripts/release/publication-route-reconcile.mjs --route=<id>`). Every live write still goes through
+the existing fenced four-gate publisher. A job completes only when a separate verify child proves the exact binding
+(content identity + lineage + live read-back) **and** the served row, for the same evidence token the job was claimed
+with.
 
-> **Status: repository work only.** Migration `20260934` is **prepared, not applied**. Nothing is installed on the VM,
-> and nothing is live. Every family is observe-only until the two-key activation in [Sign-off gates](#sign-off-gates)
-> is completed.
+> **Status: repository work only.** Migration `20260934` (the worker queue, redesigned for routes) is **prepared, not
+> applied**, and needs its **own** sign-off, separate from `20260935` (the writer fence, section 9). Nothing is installed
+> on the VM and nothing is live. Every flag is OFF by default: the control row is disabled, every route row is
+> `live_enabled = false` with no live region, and `PRW_LIVE_ROUTES` is empty. See [section 6](#6-sign-off-gates-rollout-order-and-canary-order).
 
-## 1. Architecture audit (what exists, and what the worker reuses)
+## 1. The routes the worker drives
 
-### 1.1 Source families and the live reports they feed
+`lib/server/recovery/routes.js` is the **only** registry (the ffb035b four-family view and "detect-only" are gone). It
+lists ten routes in priority order; `topoOrder()` orders them by `awaits`. `lib/server/recovery/registry.js` classifies
+**every** report key the code knows and fails closed on an unclassified or double-classified key.
 
-Nothing below is hand-maintained. `lib/server/recovery/registry.js` derives the table from:
+| Route | CLI | Live report keys | Grain / unit | Awaits | Deadline / hard timeout | Child heap (min) |
+|---|---|---|---|---|---|---|
+| `oli` | `oli-publication-reconcile.mjs` (legacy, TARGETS v1) | brand-sales, brand-inventory, daily-reporting | account | - | 330 s / 420 s | 512 (192) |
+| `listings` | `listing-health-v3-reconcile.mjs` (legacy) | listing-health-v3 | account | - | 720 s / 840 s | 512 (192) |
+| `fba-plan` | route CLI | fba-plan (fill-only) | account | - | 600 s / 720 s | 448 (320) |
+| `returns-v3` | route CLI | returns-leakage (v3) | account | - | 330 s / 420 s | 256 (192) |
+| `ads` | `ads-publication-reconcile.mjs` (legacy) | daily-reporting | account | oli | 330 s / 420 s | 512 (192) |
+| `fba` | `fba-publication-reconcile.mjs` (legacy) | brand-inventory | account | oli | 330 s / 420 s | 512 (192) |
+| `brand-view-brands` | route CLI | brand-view-brands | account | oli, fba-plan | 330 s / 420 s | 448 (192) |
+| `sku-movement` | route CLI | sku-movement | account / brand | brand-view-brands | 330 s / 420 s | 384 (256) |
+| `brand-view` | route CLI | brand-view | account / brand | oli, fba, fba-plan, returns-v3, brand-view-brands | 720 s / 840 s | 448 (320) |
+| `brand-view-portfolio` | route CLI | brand-view-portfolio | region / brand | oli, fba, fba-plan, returns-v3, brand-view-brands | 720 s / 840 s | 448 (448) |
 
-- the four reconcilers' lineage modules (`lib/server/sync/{oli,fba,ads,listing-health-v3}-dependent-reports.js`);
-- `SCHEDULER_LIVE_SNAPSHOT_CONTRACTS` in `report-publisher.js`;
-- `REPORT_MATERIALIZATION` in `report-materialization-registry.js`.
+Every other key is typed **not-applicable** in the owner hand-off: `manual-paid` (reconciliation, sku-pl,
+keyword-rank, content-changes, sales-movers, listing-health v1, buy-box-loss, listing-optimizer, ppc-performance: no
+durable evidence, only a paid refresh), `read-only-self-heal` (brand-directory, oli-quality*: derived on every read),
+plus operational rows and the `scheduler-v2/*` shadow namespace (a shadow is never a publication).
 
-`validateRecoveryRegistry()` fails closed. A new live report that nothing classifies breaks `npm run verify`.
-
-| Worker family | Saved sources (evidence) | Existing zero-export publisher | Live reports it publishes |
-|---|---|---|---|
-| `oli` | order-line-items (`source_coverage`, `source_oli_completeness`) | `scripts/release/oli-publication-reconcile.mjs` | brand-sales, brand-inventory, daily-reporting |
-| `ads` | campaign-ads (`ads_sync_state` `campaign-performance-v1.content_rev`) | `scripts/release/ads-publication-reconcile.mjs` (runs **only** `buildOperation("daily-reporting")`) | daily-reporting |
-| `fba` | fba-inventory-health (`source_snapshots`) | `scripts/release/fba-publication-reconcile.mjs` | brand-inventory (needs live brand-sales at the same as-of) |
-| `listings` | Listings and Listings Raw (`source_listings_snapshot`, `source_listings_raw_snapshot`), plus the FBA, catalog and OLI inputs it folds in | `scripts/release/listing-health-v3-reconcile.mjs` | listing-health-v3 |
-
-All other live and registry keys are classified, not skipped silently:
-
-| Class | Reports | Worker behaviour |
-|---|---|---|
-| **detect-only** (no zero-export publisher) | fba-plan (published only by the paid go-live path) | Records the saved-not-live gap as an observation. Never publishes. |
-| **detect-only** (scheduler-materialized) | sku-movement, returns-leakage, brand-view, brand-view-brands, brand-view-portfolio | Records "behind upstream" when detectable. The scheduler's materializer remains the only writer. |
-| **not-applicable** (read-only or self-healing serve) | brand-directory, brand-portfolio, oli-quality, oli-quality-summary | None. |
-| **not-applicable** (manual-refresh, paid DataDoe) | sales, sales-movers, sku-pl, reconciliation, buy-box-loss, content-changes, keyword-rank, listing-health, listing-optimizer, ppc-performance | None. The worker never fetches source data. |
-
-### 1.2 Existing contracts the worker relies on (unchanged)
-
-- **Completion check.** `evaluatePublicationBinding` (the saved-data-reconciler core) returns `PUBLICATION_NOT_REQUIRED`
-  only when all of these hold:
-  - the latest promotable `sync_report_jobs` revision is covered by `depends_on` / `durable_content_deps`;
-  - the `scheduler-v2/<key>` shadow is present;
-  - the live identity matches;
-  - the publisher's read-back matches (same `source_refreshed_at` and payload).
-
-  **This is the worker's only definition of "live".** It does not use a revision counter or dependency map of its own.
-- **Publication path.** Each reconciler CLI publishes through the existing fenced CAS, under the single global
-  `control_plane_lease`, with owner token `<family>-reconcile:<bucket>:<runToken>`. `--cleanup` with the same token
-  releases a lease the run left behind. The worker never writes `report_snapshots` or any dashboard row itself.
-- **Zero-export adapters.** Each CLI has a DataDoe adapter that refuses creates, plus one account-directory GET that
-  costs zero tokens. The CLIs report `dataDoeCreates` / `dataDoeTokens` themselves.
-- **Not reused, on purpose:**
-  - `report_publication_outbox` is OLI-enqueued, and its claim is not filtered by source or region. Its drain would
-    complete other families' rows.
-  - `sync_targets` / `sync_runs` belong to the legacy path.
-
-  So the worker has its own tables (migration 20260934).
-- **Unchanged:**
-  - scheduler-v2 and its acquisition plan, including the 5-seller batch limit, the 50,000-row Listings request and the
-    shared canonical Listings export;
-  - every GitHub workflow, including the four backstop reconcile workflows;
-  - the outbox and its drain;
-  - the publisher;
-  - the reconcilers' logic.
-
-### 1.3 The only change to existing code
-
-Each of the four reconciler CLIs gains an **opt-in** `--emit-targets` flag. When it is passed, the CLI prints one extra
-line, `TARGETS {json}`: per account, the verdict code for each report, sanitized to `[A-Za-z0-9_.:-]`. The line comes
-from `lib/server/sync/reconcile-targets-output.js`. Without the flag, output is byte-identical to before.
+The worker spawns **only** the allow-listed CLIs through `lib/server/recovery/runner.js` (never a publisher, a fetch
+path, a backfill, a go-live or a materializer; those scripts are refused even if mis-registered). Every child gets the
+runtime zero-export guard preloaded (`NODE_OPTIONS=--import=zero-export-guard.mjs`); the worker's own import graph is
+proven by `scripts/worker-closure.test.js` to load no DataDoe, publisher, CAS, lease or `report_snapshots` writer code,
+and no cycle-finalize RPC.
 
 ## 2. How the worker runs
 
-The worker runs one loop with concurrency 1 and never busy-waits. Each iteration:
+One loop, concurrency 1, no busy-wait (`lib/server/recovery/worker.js`, no report-specific code). Each tick:
 
-1. **Heartbeat.** Upserts `publication_recovery_workers` (redacted stats).
-2. **Watermark pass** (every `PRW_POLL_SECONDS`, default 20s; metadata SQL only, no child process):
-   1. Composes a cheap evidence token per account from the saved-source tables.
-   2. Enqueues a job when the token differs from both the last verified token and the token the last scan observed.
-      So an account the scan saw as missing evidence is not re-enqueued on every poll.
-   3. Covers only the (family, region, account) scope that the last full scan recorded.
-3. **Full consistency scan** (at most every `PRW_SCAN_INTERVAL_SECONDS`, default 600s).
-   - **Single-flight across workers** through the `publication_recovery_scan` lease, with DB-scheduled timing. The
-     lease is renewed before and after every child run. If another worker has taken it over, this worker abandons
-     its scan.
-   - **Evidence tokens** are read per step, before the dry-run. Evidence that lands during a run is therefore newer
-     than the recorded token, and the watermark still reacts to it.
-   - **Stepped:** one family × region dry-run per iteration, so pending jobs still run between steps.
-   - **Coverage:** detects gaps that no watermark can see, such as a live report overwritten or lost after publication.
-   - **Recording:** writes the baseline and per-report observations.
-4. **At most one claimed batch.** The batch is a coherent (family, region, as-of) set of up to `PRW_BATCH` accounts,
-   claimed atomically with `FOR UPDATE SKIP LOCKED`. The claim is a bounded lease that is renewed while work runs.
-   1. **Gates.** None of these consume an attempt:
-      - an as-of older than D-1 → `superseded`;
-      - family not live → deferred 600s;
-      - a scheduler-v2 cycle for the region in flight → deferred 300s;
-      - the global control lease held → deferred 120s;
-      - an awaited family (FBA and Ads await OLI) still open for the account → deferred 180s.
-   2. **Pre-check dry-run** with the exact binding. An account that is already current is **verified without
-      publishing**. This is what makes a crash after publish safe: the job is not published twice.
-   3. **Live run** of the existing reconciler, for only the accounts still stale:
-      - with a unique run token;
-      - never in immediate mode;
-      - never as a full-region live pass.
+1. **Heartbeat** (`publication_recovery_workers`, redacted counters; also every 60 s while a child runs).
+2. **Watermark** (per route, every `route.evidence.everySeconds`; **live** (route, region) pairs only). The route's own
+   metadata-only evidence SQL + compose (`evaluateRouteEvidence`, one repeatable-read read-only snapshot, the ONE
+   evidence context of `routes.js`: the region's durable-directory accounts, the primary organization fingerprint, one
+   clock) gives a token per target. A target whose token is neither the verified nor the observed token of its state row
+   (including a target with no state row) is enqueued (`origin = watermark`).
+3. **Tier-1 consistency scan** (every `PRW_SCAN_INTERVAL_SECONDS` = 600 s, claimed in the DB so one worker per interval;
+   **all** routes and regions; metadata SQL only, in-process):
+   - evidence token vs state (`token-advanced`, `token-unobserved`, `target-missing`, `no-token`);
+   - live rows written after the verification (`max(updated_at)` per `tier1.liveRowScope`: exact account, a
+     `brand-view:<acct>::%` prefix, or the portfolio's own `params->>'region'`) -> `served-row-foreign`;
+   - identity as-of rollover (`identityAsOf(target)` vs `verified_rows[].asOf`, e.g. Brand View at IN midnight);
+   - findings are enqueued (`origin = scan`) for a live route, otherwise only observed. A foreign served-row write on a
+     **legacy** family is **detection-only** (its own backstops also write that key -- never fought in a loop);
+   - the served read-back proof of a legacy family (`served_confirmed`: no live row in scope written after the
+     verification);
+   - global checks: the scheduler gate facts, the writer-fence state per key, the unregistered-live-report-key detector;
+   - the duration is recorded (`tier1_summary.durationMs`).
+4. **Deep sweep step** (single-flight through the scan lease; one child per step). Once per epoch after the scheduler gate
+   clears, then every `PRW_DEEP_SWEEP_HOURS` (fba-plan and the portfolio only when their tokens changed): one read-only
+   child per (region, route) over the full region (`--verify-exact` for a route CLI -- the manifest backstop that catches
+   drift a metadata token cannot see; the legacy CLIs' dry-run). It records the unit baseline (`verified_rows`) and
+   enqueues stale targets (`origin = deep-scan`).
+5. **One claimed batch** (up to `PRW_BATCH` targets of ONE route, region and epoch; `FOR UPDATE SKIP LOCKED`):
+   1. an older epoch (UTC D-1) -> `superseded`;
+   2. **route live?** `control.enabled` AND `route.live_enabled` AND region in `route.live_regions` AND `PRW_LIVE_ROUTES`
+      AND not tripped -> else deferred `route-not-live` (600 s, no attempt, state untouched);
+   3. **the global scheduler gate** -> deferred `scheduler-window-global` (300 s, no attempt, state untouched);
+   4. the control-plane lease held -> `contention` (120 s, no attempt). A **read failure** of the control row, the
+      scheduler gate, the control lease (or, below, the durable directory / the upstream blockers / the claim renewal)
+      never consumes an attempt: every job is deferred `gate-unreadable` (300 s, alert `gate-unreadable`, state untouched)
+      -- never the batch-exception attempt path, so a flaky metadata read can never dead-letter a job;
+   5. capacity: the route's `minChildHeapMb` above `PRW_CHILD_MAX_OLD_SPACE_MB` -> `capacity-exceeded` (6 h, alert, no
+      spawn); a missing owner attestation (section 5) -> `route-not-activated` (deferred, alert, no spawn);
+   6. **scope** (account routes): a target that is no longer in the region's **durable directory** (the worker's
+      directory == the route CLI's `buildDurableDirectory`, the same `accountInScope` rule) is **superseded**
+      (`superseded-target-out-of-scope`, alert `target-out-of-scope`, no attempt, no child) -- it is never handed to the
+      CLI (which would `STOP ROUTE_TARGET_OUT_OF_SCOPE` for the whole batch), and unlike a dead job the same token can open
+      a new job if the account comes back;
+   7. **live-state awaits**: an owner is blocked only by an OPEN upstream job (a deferred one only with a class that will
+      converge) or an upstream state whose class is `stale` this epoch; a dead or missing-evidence upstream never blocks.
+      A region target (the portfolio) is blocked by any upstream in its region (its owners never gate it). Past
+      `PRW_AWAIT_MAX_MINUTES` since the job's creation it proceeds with alert `await-timeout`;
+   8. **pre-check** child (`--verify-exact` for a route CLI). Current with the token echo -> **verified without a
+      publish** (what makes a crash after publish safe). **Any** stale unit -> the live pass (the worst class decides only
+      the final outcome: one integrity unit never blocks a region target's other stale units);
+   9. **re-check immediately before the live child** (the pre-check may have run for its whole hard timeout): the claim is
+      renewed for exactly the jobs to publish -- a job whose claim was **lost** (lease expired and reclaimed by another
+      worker) is dropped from the batch **without a finish** (the new owner finishes it); then the epoch (a newer UTC D-1
+      -> `superseded`), the trip, `control.enabled` / the route switch / `PRW_LIVE_ROUTES`, the scheduler gate and the
+      control lease are all **re-read**. Any gate now closed -> the same typed outcome as at the batch start (no attempt)
+      and **no** live child;
+   10. **live** child for the stale targets only (unique run token; `--live --verify-exact` = `repair` for a
+      `manifest-differs` unit); an abnormal exit is followed by a `--cleanup` child with the **same** run token;
+   11. **verify** child (`--verify-exact`). **Verified only when** the verdict is current **and** the child's evaluated
+      token equals the job's token. A legacy CLI (TARGETS v1 carries no evaluated token) is verified on its binding and
+      the worker then re-reads its own token: evidence that moved during the run **re-arms** the job;
+   12. after a verified **publish**, the dependents are enqueued (`origin = dependency`: the owner scope for account
+       routes, the region target for the portfolio) -- so a fba-plan repair cascades fba-plan -> brand-view-brands ->
+       sku-movement -> brand-view -> brand-view-portfolio.
 
-      An abnormal exit (timeout, kill, or unresolved control) is followed by `--cleanup` with the same token.
-   4. **Zero-export tripwire**, checked on **every** child (scan, pre-check, live, cleanup, verify). If a child reports
-      a DataDoe create or token, its jobs are dead-lettered and the family is switched off for the rest of the process.
-   5. **Verify dry-run.** Only `PUBLICATION_NOT_REQUIRED` verifies a job.
-   6. **Every finish carries the job's claim-time evidence token.** If an enqueue refreshed the evidence while the job
-      ran, a verified, retry, deferred or dead verdict is about old evidence. The job is **re-armed** instead, with
-      attempts and claims reset, so evidence the reconciler never evaluated is never dead-lettered.
-   7. **Exceptions.** An exception mid-batch counts as one attempt (transport retry with backoff). It never becomes an
-      instant hand-back that loops at the head of the queue.
+   Capacity and the owner attestations are process configuration (they cannot change mid-batch) and are checked once.
 
-**Shutdown** (SIGTERM from `systemctl stop`, a reboot, or `rollback.sh`):
+**Token mismatch.** When a child evaluated a different token than the job was claimed with: if the worker now reads the
+child's token, the evidence advanced -> the job adopts it and is **re-armed** (`finish(evaluatedToken)`); if the worker
+still reads the claim-time token, it is a worker/CLI **token disagreement** (a context or code defect) -> deferred 1800 s
+with alert `token-disagreement`, never a hot loop. Every re-arm is counted per job (`rearms`); past `PRW_MAX_REARMS` the
+job is alerted `evidence-rearm-bound` and backs off 600 s.
 
-- The worker stops claiming and starting children.
-- A running **dry-run** child is terminated after `PRW_STOP_GRACE_SECONDS`, and its jobs are handed back without
-  using an attempt.
-- A **live** or **cleanup** child is never killed. The reconcilers finalize a cycle before they publish, so a kill in
-  that window would strand the cycle (`cycle-not-running:succeeded`). The child ends within its own deadline (330 s,
-  LHv3 720 s), bounded by the runner's hard timeout (420 s / 840 s). The unit's `TimeoutStopSec=1200` covers that.
+**The global scheduler gate** (`store-pg.js evaluateSchedulerGate`; the bucket grammar is EXHAUSTIVE against
+`sync_cycles_bucket_check`, `supabase/migrations/20260924_priority_partial_cycle_bucket.sql:40-42`, pinned by the worker
+suite). It blocks in **any** region when a scheduler-owned or paid cycle is pending/running and started within 4 h, or had
+any activity (the cycle or its report/source jobs) within `PRW_SCHEDULER_COOLDOWN_SECONDS` (900 s; covers the gap between
+the run and fba jobs), or the clock is inside `PRW_SCHEDULER_WINDOWS`:
 
-**Timezone.** The unit pins `TZ=UTC`. The store also reads the Postgres `date` column as exact text, so an as-of can
-never shift a day on a host east of UTC.
-
-### 2.1 Outcome classes (`lib/server/recovery/classify.js`)
-
-| Class | Meaning | Job outcome |
+| Bucket | Kind | Opened by |
 |---|---|---|
-| current | binding proves live is current | verified |
-| stale | saved evidence not live yet | publish attempt |
-| missing-evidence | the saved source is absent or incomplete; the worker will **not** fetch it | deferred 1800s, reported |
-| dependency-deferral | the reconciler deferred on provenance, or an upstream family is not live yet | deferred 900s |
-| contention | the global lease is held, or a reconciler reported a lease conflict | deferred 120s |
-| not-attempted | the reconciler kept its remaining deadline for cleanup (`deadline-cleanup-reserved`) | deferred 120s |
-| timeout / transport | child timeout, spawn failure, DB or network, exception mid-batch | retry with exponential backoff (60s → max 3600s) |
-| run-failed | the whole reconciler run failed before any per-account result (`outcome: failed` plus a typed code) | retry with backoff; the scan step counts as an error (partial) |
-| readback-mismatch | publish reported success but the binding is still stale | retry with backoff |
-| superseded-newer-live | `publish-newer-live` / `shadow-newer-live`: the live row is strictly newer than anything this evidence can publish | dead for this evidence (benign; a new token opens a new job) |
-| terminal-cycle-stuck | `cycle-not-running:*`: the revision's cycle is already terminal | dead for this evidence |
-| permanent-integrity, zero-export-violation | will not be fixed by retrying | dead-letter |
+| `india`, `europe-au`, `us-ca`; legacy `us`, `non-us` | scheduler | the natural scheduler-v2 cycle; the Data Sync Center source sync (us / non-us) |
+| `<scope>-fba` (`india-fba`, `europe-au-fba`, `us-ca-fba`; legacy `us-fba`, `non-us-fba`) | **paid-fba** | `fba-plan-operation.js:41` `fbaCycleBucket` (`:219-220`): `scripts/release/fba-plan-golive.mjs` (scheduler fba job) and the Data Sync Center paid FBA sync `api/admin/sources.js:436-448` (bucket us / non-us at `:313-314`) |
+| `bootstrap-fba-<region>-<hex16>` | **paid-fba** | `account-onboarding.js:377-386`; `fba-plan-golive.mjs` bootstrap waves |
+| `bootstrap-<region>-<hex16>`, `listing-health-v3-<region>` | scheduler | onboarding bootstrap; the LHv3 ingestion |
+| `priority-partial-<region>-<hex16>` | **excluded** | the route / priority release cycles (never block) |
+| anything else | unknown -> **blocks** + alert `unknown-cycle-bucket` | fail closed |
 
-Bounded everywhere, so there is no infinite loop:
+Nothing else opens an fba-plan paid job: `manual-source-sync.mjs` has no FBA; `fba-inventory-recovery.mjs` and
+`fba-durable-source-replay.mjs` open no fba-plan cycle (the operator should hold the worker's kill switch while running
+them). A paid cycle open for more than 4 h and idle for 15 min no longer blocks (else one stuck cycle would starve every
+route); it is alerted instead, and the fba-plan route's own `paid-cycle-open` / `paid-job-in-flight` check plus the
+control-plane lease still protect the write itself.
 
-- `PRW_MAX_ATTEMPTS` (6) caps executed failures.
-- `PRW_MAX_CLAIMS` (8) dead-letters a crash-loop. The counter counts **consecutive** claims that never reached a
-  finish, and every normal finish resets it. Routine deferrals therefore never accumulate toward it.
-- A dead job with the same evidence is not re-enqueued. New evidence starts a new job.
-- Deferrals (missing evidence, dependency, contention, scheduler window) do not use up attempts. They are still
-  bounded, because the next D-1 rollover supersedes the job. A deferred job is **never** marked complete while its
-  saved evidence still awaits publication.
+**Shutdown** (SIGTERM from `systemctl stop`, a reboot, or `rollback.sh`): no new claims or children. A running
+read-only child (sweep step, pre-check, verify) is terminated after `PRW_STOP_GRACE_SECONDS` and its jobs are handed back
+without an attempt. A `live`, `repair` or `cleanup` child is **never** killed (the releases finalize a cycle before they
+publish); it ends within its own deadline, bounded by the runner's hard timeout (<= 840 s). The unit's
+`TimeoutStopSec=1200` covers that.
 
-### 2.2 Safety properties and the tests that pin them
+**Dates and timeouts.** The unit pins `TZ=UTC`; Postgres `date`s are read as exact text and instants as epoch-ms
+computed in SQL. Every statement runs inside a short transaction that first sets `SET LOCAL statement_timeout` (the
+proven `reconciliation-runner.mjs` pattern) plus a client-side `query_timeout`; **no** `statement_timeout` startup
+parameter is sent through the pooler.
+
+### 2.1 Classes and the owner hand-off
+
+`lib/server/recovery/classify.js` maps every typed reason a route emits to a worker class (unknown -> a typed deferral +
+alert, never current). Deferrals (gate, `gate-unreadable`, contention, dependency, missing evidence, route-not-activated,
+capacity, config) **never** consume an attempt; retries back off exponentially and dead-letter at `PRW_MAX_ATTEMPTS`; a
+dead job is never re-enqueued for the same evidence token; `PRW_MAX_CLAIMS` dead-letters a crash loop. Route-CLI
+specifics (the legacy families' verdicts are unchanged, pinned by `recovery-classify-vocabulary.test.js` V2):
+
+- a typed reason whose **leading** code ends `-threw` (`lineage-read-threw:<message>`, `bundle-resolve-threw:<message>`,
+  `revision-threw`, ...) is classified by that code alone -- its tail is an error **message**, so text such as
+  `brand-not-sold` / `superseded-newer-live` in it can never make it not-applicable / superseded: a bounded transport
+  retry + alert `route-step-threw`. The two contract-thrown tails keep their class (`derive-threw:fba-plan-route-fence-not-
+  attested:` -> route-not-activated; `derive-threw:fba-plan-derive-invalid:` -> integrity);
+- the race-prone failures `preflight-not-successful`, `reconcile-lease-lost`, `claim-terminal`, `finalize-open-work` (a
+  concurrent twin run / paid job causes them) are a bounded transport retry + alert `race-transient`, never an integrity
+  dead-letter;
+- a route CLI `STOP ROUTE_TARGET_OUT_OF_SCOPE` (the residual race between the worker's cached directory, TTL 600 s, and
+  the CLI's fresh read) defers the batch as a dependency deferral (900 s, **no attempt**) + alert
+  `route-target-out-of-scope`; the next claim sees the refreshed directory and supersedes the stale target (step 6).
+  Every other STOP is `run-failed` + alert;
+- a current unit is verified only with its own served read-back unless the caller explicitly says `legacy-cli` (an
+  omitted route kind is strict).
+
+The owner **hand-off matrix** (per region x account x report; `status --matrix`) uses EXACTLY these classes:
+
+| Hand-off | Meaning |
+|---|---|
+| `repaired` | this worker published and a separate verify child proved content + lineage + live read-back **and** the served row |
+| `already-current` | the binding proved content + lineage + live read-back **and** the served row, with no publish |
+| `deferred` (typed) | stale-pending, superseded, preempted, capacity, contention, dependency, not activated, `current-unserved` (a current binding whose served read-back is not yet proven, or was revoked), `evidence-advanced` / `identity-rollover` (a tier-1 finding recorded **after** the verification says the token advanced / the identity as-of rolled), `job-open` (a pending / claimed / deferred job exists for the target: the worker is re-checking it), `not-yet-evaluated` |
+| `missing-source` (typed) | the saved evidence is absent or ineligible (the worker never fetches it) |
+| `failed` (typed) | integrity, zero-export violation, terminal cycle, read-back mismatch, exhausted retries |
+| `not-applicable` (typed) | `manual-paid`, `read-only-self-heal`, `source-absent` (no evidence material at all) |
+
+Two routes feeding one report (daily-reporting: oli + ads) combine worst-first. The matrix reads the status RPC's state
+rows, which carry `served_confirmed`, `open_job` and `tier1_state` (the tier-1 finding only when newer than the
+verification).
+
+**The served proof** (`publication_recovery_state.served_confirmed`). A route CLI proves it per unit at verification (the
+served row carries the unit's own content hash). A legacy family's proof is the tier-1 check "no live row in scope
+written after the verification". A tier-1 **revocation** (`false`, a foreign served-row write after the verification) is
+**sticky for the verified token**: a re-verification of the same token (the deep sweep, a pre-check) without a republish
+keeps it `false`, and a later tier-1 "no newer write" never flips it back (each tier-1 row also names the verified token it
+evaluated, so it never lands on a newer verification). Only a **new** verified token, a **republish by this worker**
+(finish `verified` with `published`), or a route CLI's own positive unit-level served proof resets it.
+
+### 2.2 Status alerts (`publication_recovery_status`, `status.mjs`, `health.mjs`)
+
+Dead letters **by class**; `missing-evidence-over-6h`; `served-row-preempted`; `zero-export-violation`;
+`capacity-exceeded`; `source-stale-manual`; `await-timeout`; `served-row-foreign`; `token-disagreement`;
+`evidence-rearm-bound`; `scheduler-gate-starvation` (a job held by the gate > 12 h); `gate-unreadable` (a gate / lease /
+claim / directory / blocker read failed -- deferred, no attempt); `target-out-of-scope` (an account target left the
+region's durable directory -- superseded); `route-target-out-of-scope` (the route CLI's scope STOP race -- deferred, no
+attempt); `route-step-threw` and `race-transient` (bounded route retries, see 2.1); and the tier-1 global alerts:
+`stranded-partial-cycle` (a running priority-partial cycle older than 2 x the longest hard timeout that holds a job),
+`paid-cycle-stale-open` (an open paid fba cycle idle > 6 h, the fba-plan route's own staleness rule),
+`paid-job-stale-in-flight` (an open fba-plan job older than 6 h), `scheduler-cycle-relaxed-open` (an open scheduler /
+paid cycle past the 4 h in-flight bound and the cooldown: it no longer blocks the gate, and is alerted AT ONCE),
+`scheduler-gate-truncated` (the gate read hit its row limit: the gate fails CLOSED), `unknown-cycle-bucket`,
+`unregistered-live-report-key`,
+`writer-fenced` (a `REPORT_WRITER_FENCED` rejection reported by a worker child -- from a fenced route writer this is a
+defect), `writer-fence-invalid|unreadable`. A job-less running priority-partial cycle (a crash between the cycle claim
+and the job upsert) is an ignored orphan, never a stall. The status also shows the writer fence **per key**
+(`fenceStatusSummary`: fenced / open / unknown; `absent` until 20260935 is applied).
+
+### 2.3 Safety properties and the tests that pin them
 
 | Property | Test |
 |---|---|
-| Normal save: watermark → claim → pre-check → live → verify | worker 1a–1d |
-| Missed GitHub trigger: the full scan finds a gap with no watermark change | worker 2a–2c |
-| Timeout / retry with backoff, `--cleanup` with the same token | worker 3a–3c |
-| Crash, then lease reclaim by another worker; a stale token cannot finish | worker 4a–4c, SQL self-test |
-| Crash after publish: pre-check verifies, no second publish | worker 5 |
-| Two workers: disjoint claims, each job verified once, single-flight scan | worker 6a–6c, SQL self-test (SKIP LOCKED) |
-| Dependency ordering (FBA/Ads wait for OLI) | worker 7a–7c |
-| Missing evidence reported and deferred, never fetched | worker 8 |
-| Read-back mismatch is never verified; bounded dead-letter | worker 9, units D3 |
-| Newer live / as-of rollover / lease held / scheduler window / observe-only / evidence advancing mid-run | worker 10–12d |
-| Zero-export tripwire (any reported create or token trips the family) | worker 12c, units D7 |
-| New report registration fails closed until classified | units A6–A8 |
-| Every source handler (oli, ads, fba, listings): argv, dry-run and cleanup shape, no immediate or outbox mode, the TARGETS hook is present | units B1–B4 per family, B9 (Ads daily-only), B10 (deadlines), F1–F5 |
-| Structural zero-export: allow-listed scripts only, no DataDoe export or lease or CAS code in worker modules, import closure is `pg` only | units C1–C3, H1 |
-| Migration: expand-only, SECURITY DEFINER, RLS and grants, control disabled by default, rollback outside the ledger | units G1–G6 |
-| SIGTERM mid-batch releases jobs; a crash-loop is dead-lettered | worker 13a / 13b |
-| Adversarial-review regressions: consecutive-claim crash-loop guard, re-arm of untried evidence, run-level failure, not-attempted, exception retry, dry-run zero-export trip, watermark observed-token, live child never killed on stop, scan lease takeover | worker 14a–14i, units I1–I10 |
-| Real SQL semantics (enqueue, claim, reclaim, finish, re-arm, crash-loop, baseline observed token, status, grants) | `publication-recovery-sql-selftest.mjs` (PGlite, 33 assertions) |
+| Normal save: watermark -> pre-check STALE -> live -> verify -> verified with the token echo; legacy argv byte-identical | worker 1a-1i |
+| Missed GitHub run: tier-1 token change / identity rollover / foreign served write enqueues and the worker publishes | worker 2a-2h |
+| Global scheduler gate (cross-region, cooldown, paid DSC / bootstrap-fba, unknown bucket, windows, priority-partial excluded) | worker 3a-3h, SQL Q1-Q2 |
+| Live-state awaits (stale upstream blocks; missing-evidence / dead do not; await-timeout proceeds + alert) | worker 4a-4e, SQL Q5 |
+| Dependency repair order fba-plan -> brand-view-brands -> sku-movement -> brand-view -> portfolio | worker 5a-5c |
+| Token re-arm (verify mismatch, mid-run refresh), disagreement alert, re-arm bound | worker 6a-6e, SQL V3 / D4 |
+| Crash-loop guard, stale claim lease reclaimed, graceful stop releases | worker 7a-7c, SQL L1-L3 |
+| capacity-exceeded; route-not-activated never burns an attempt | worker 8a-8b |
+| Zero-export violation trips the route + dead-letters; writer-fenced event + fence state per key | worker 9a-9d |
+| Any stale unit is repaired; manifest drift -> repair pass | worker 10a-10b |
+| Deep sweep cadence (after the gate; token-change-only routes) | worker 11a-11e |
+| Observe-only, epoch rollover, retry / cleanup, missing evidence, read-back mismatch, crash after publish | worker 12a-12f |
+| Hand-off matrix classes (served read-back required) | worker 13a-13f |
+| Migration seed == registry; gate grammar == the sync_cycles CHECK; worker directory == the CLI's; no startup statement_timeout | worker 14a-14g |
+| Every gate re-checked right before the live child (switches, scheduler gate, lease, epoch, a lost claim dropped without a finish) | worker 16a-16d |
+| A gate / lease / directory / blocker read error defers without an attempt | worker 16d-16e |
+| The matrix never says repaired / already-current past a newer token-advanced finding or an open job | worker 16f-16g, SQL ST4 |
+| A served-proof revocation is sticky for the verified token (new token / republish reset it); the pre-verification foreign row stays a known limit | worker 16h-16k, SQL SV1-SV3 |
+| An out-of-scope target never poisons its batch (superseded before the child; the scope STOP race defers without an attempt) | worker 16l-16m, SQL SS1, units K5 |
+| Leading `-threw` / race-prone / strict-default classification; the guard's leading newline | units K1-K6, vocabulary V1c / V3 / V5, zero-export-guard G10 |
+| Real SQL of the redesigned 20260934 + the store's own SQL + exact rollback | `publication-recovery-sql-selftest.mjs` (PGlite, 55 assertions) |
+| Structural zero-export (import closure, allow-list) | `worker-closure.test.js`, `publication-recovery-units.test.js` C1-C9 |
 
-**Honest limit:** PGlite is a single connection. The SQL self-test proves the semantics, but it cannot contend two
-sessions on `FOR UPDATE SKIP LOCKED` or the advisory lock. Concurrency safety rests on those standard Postgres
-primitives, the in-memory two-worker scenarios, and review. It has not been exercised against a real multi-session
-Postgres.
+**Honest limit:** PGlite is a single connection: `FOR UPDATE SKIP LOCKED` and the advisory lock are not contended by two
+sessions there. Concurrency safety rests on those standard Postgres primitives and the in-memory two-worker scenarios.
 
 ## 3. Resource fit (1 GB Micro)
 
-Both checks are repeatable. Commands and measured results are below.
-
 ```bash
-# The worker loop alone: an in-memory store plus a fake reconciler world. Re-runs itself under the unit's
-# --max-old-space-size=160 with --expose-gc and judges the retained heap after GC.
-node scripts/worker/publication-recovery-memcheck.mjs [--iterations=40000]
-
-# The real workload: runs the existing reconciler CLIs in DRY-RUN (zero writes, zero DataDoe creates and tokens),
-# exactly as one full scan does, and samples each child's peak RSS. Needs the worker's env.
-node scripts/worker/publication-recovery-memcheck.mjs --real [--regions=...] [--families=...]
+node scripts/worker/publication-recovery-memcheck.mjs [--iterations=40000]     # synthetic: the worker loop, all 10 routes
+node scripts/worker/publication-recovery-memcheck.mjs --real [--regions=...] [--routes=...] [--sql-only]   # ON THE VM
 ```
 
-**Measured on 2026-09-25, on the development machine (Windows x64, Node 24.14.1), NOT on the VM:**
+**Synthetic, measured 2026-09-26 on the development machine (Windows x64, Node 24.14.1), NOT on the VM:** 40,000 ticks
+(about 9.3 simulated days: 1,334 tier-1 scans, 118 deep sweeps, 162k verified jobs, all 10 routes x 3 regions) under
+`--max-old-space-size=160`: retained heap after GC 13.3 MB at the end, steady-state drift **0.7 MB** (no heap drift),
+RSS peak 221 MB (V8 lets garbage accumulate up to the old-space cap before a major GC; heapTotal ~145 MB while the
+retained heap stays ~13 MB). **PASS** against the 240 MB worker envelope. The real budget therefore uses 240 MB for the
+worker.
 
-Synthetic run, 40,000 ticks (about 9.3 simulated days, 930 full scans, 167k verified jobs), under
-`--max-old-space-size=160`:
+**The VM measurement is REQUIRED before any live route** (`--real`, read-only: zero writes, zero DataDoe creates or
+tokens). It must measure, and the verdict lines print:
 
-| Measure | Result |
-|---|---|
-| Retained heap after GC | 7.5 MB at start, 9.6 MB at end |
-| Steady-state drift | 0.2 MB |
-| RSS peak | 190 MB (tight loop with no idle time) |
-| Verdict | **PASS** |
+- per-child peak RSS and duration for **all 10 routes x 3 regions**, run exactly as the deep sweep runs them
+  (`--verify-exact` for a route CLI). This includes the **fba-plan extra reads** (the latest paid job, its shadow if
+  promotable, the live row / payload of a foreign pending job, and the publish guard's re-reads) and the **brand-view
+  per-unit reads** (about 18 evidence queries + 25 REST reads per brand unit; the per-target seconds are printed);
+- the **tier-1 duration**: every route's evidence SQL per region with per-statement timings -- in particular the
+  **`ads_rows` digest scans** of brand-view and the portfolio (a 6-month `ads_daily_source_rows` scan for every region
+  account) and the **legacy GLOBAL evidence SQL** (`oli_coverage`, `fba_pointers`, `listings_pointers`, ... are not
+  region-filtered) -- plus the served-row write scan, the gate, the fence and the report-key universe;
+- the per-epoch deep-sweep total.
 
-Real run, as-of 2026-09-23, all 12 family × region dry-runs, 51 accounts (india 8, europe-au 32, us-ca 11). It
-exercises the existing reconciler CLIs, which the review fixes did not change:
+PASS thresholds: max child peak <= 448 MB; worker 240 + largest child + OS 250 <= 85% of 1024 MB (870 MB); tier-1 <= 60 s;
+per-epoch deep sweep <= 4 h. Otherwise the check prints the measured value and the required change (a longer
+`PRW_SCAN_INTERVAL_SECONDS` / `PRW_DEEP_SWEEP_HOURS`, fewer `PRW_REGIONS`, or a larger shape such as OCI A1.Flex). A
+route that fails stays **capacity-exceeded** on the VM and keeps being published by its GitHub run. Reference (the four
+legacy families only, 2026-09-25, development machine): a full scan took 312 s, the largest child 186 MB.
 
-| Region | oli | ads | fba | listings |
-|---|---|---|---|---|
-| india | 49.9 s / 186 MB | 7.0 s / 73 MB | 5.9 s / 68 MB | 28.8 s / 135 MB |
-| europe-au | 40.7 s / 108 MB | 16.5 s / 71 MB | 13.5 s / 72 MB | 81.3 s / 150 MB |
-| us-ca | 23.7 s / 133 MB | 9.6 s / 74 MB | 6.7 s / 70 MB | 28.6 s / 112 MB |
-
-- **One full scan took 312 s**, within the 600 s interval.
-- **Memory budget:** worker ceiling 200 + largest child 186 + OS reserve 250 = **636 MB**, against 870 MB (85% of
-  1 GB). **PASS.**
-- **DataDoe:** every step reported **zero** creates and zero tokens.
-
-**Caveat, a gate before activation:** the E2.1.Micro has 1/8 OCPU, far slower than the machine these numbers came
-from.
-
-- Memory should be similar. Durations may be several times longer.
-- If europe-au Listings (81 s here) slows to about 8×, it approaches the reconciler's own 720 s deadline (hard
-  timeout 840 s).
-- Run the `--real` check **on the VM** (handoff step 4) before enabling any live family.
-- If a step times out, or the budget verdict FAILs there, **do not activate**. Instead, either:
-  - raise `PRW_SCAN_INTERVAL_SECONDS` and restrict `PRW_REGIONS`; or
-  - move the worker to a larger shape.
-
-## 4. Files
+## 4. Files and secrets
 
 | Path | Purpose |
 |---|---|
 | `scripts/worker/publication-recovery-worker.mjs` | Entrypoint (`--check-config`, `--once`, graceful SIGTERM/SIGINT) |
-| `scripts/worker/publication-recovery-health.mjs` | Health check: exit 0 healthy, 1 unhealthy, 2 config, 3 DB; redacted JSON |
-| `scripts/worker/publication-recovery-status.mjs` | Redacted operational status (for a future Delivery Status details panel) |
-| `scripts/worker/publication-recovery-memcheck.mjs` | Memory and throughput check (synthetic and `--real`) |
-| `scripts/worker/publication-recovery-sql-selftest.mjs` | Real-SQL self-test of the migration (PGlite; exit 3 = SKIPPED, not a pass) |
-| `lib/server/recovery/{registry,classify,runner,worker,store-pg,config,memory-store}.js` | Worker modules (`memory-store` is test-only) |
-| `lib/server/sync/reconcile-targets-output.js` | `TARGETS` line builder and parser (the `--emit-targets` hook) |
-| `supabase/migrations/20260934_publication_recovery_worker.sql` | **Prepared, not applied.** Six tables and 12 RPCs, expand-only, idempotent |
-| `deploy/publication-recovery/ROLLBACK_20260934.sql` | Contract rollback (drops only the 20260934 objects) |
-| `deploy/publication-recovery/publication-recovery.service` | systemd unit (no listening port; `prw` user; hardened; `MemoryMax=850M`) |
-| `deploy/publication-recovery/{install,rollback}.sh` | Immutable release install, update and rollback on the VM |
-| `deploy/publication-recovery/worker.env.example` | Env template (no secret values) |
-| `scripts/publication-recovery-{units,worker}.test.js` | Unit and scenario suites (registered in `npm run verify`) |
+| `scripts/worker/publication-recovery-health.mjs` | Health check: exit 0 healthy, 1 unhealthy (incl. a critical alert), 2 config, 3 DB |
+| `scripts/worker/publication-recovery-status.mjs` | Redacted status, alerts, writer fence per key, hand-off matrix (`--summary`, `--matrix`) |
+| `scripts/worker/publication-recovery-memcheck.mjs` | Memory / throughput check (synthetic and `--real` on the VM) |
+| `scripts/worker/publication-recovery-sql-selftest.mjs` | Real-SQL self-test of 20260934 + the store's SQL (PGlite; exit 3 = SKIPPED, not a pass) |
+| `scripts/worker/publication-recovery-reaper.mjs` | Operator tool: stuck-cycle candidates (read-only) / finalize ONE with sign-off (section 8) |
+| `lib/server/recovery/{routes,route-contract,registry,classify,runner,worker,store-pg,config,memory-store}.js` | Worker modules (`memory-store` is test-only) |
+| `supabase/migrations/20260934_publication_recovery_worker.sql` | **Prepared, not applied.** 7 tables, 12 RPCs, expand-only, idempotent |
+| `deploy/publication-recovery/ROLLBACK_20260934.sql` | Contract rollback (drops exactly the 20260934 objects) |
+| `deploy/publication-recovery/publication-recovery.service`, `{install,rollback}.sh`, `worker.env.example` | systemd unit, release install / rollback, env template |
 
-## 5. Secrets
+**Secrets.** The worker needs `POSTGRES_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and `DATADOE_API_KEY` (the
+account-directory GET the CLIs make costs zero tokens; the worker derives the non-reversible organization fingerprint
+from it). They live **only** in `/etc/publication-recovery/worker.env` (`root:prw`, `0640`, created empty by
+`install.sh`, edited with `sudoedit`). Never put a secret in Git, the unit file, a command line, shell history, a log, a
+ticket or chat; `--check-config`, health and status print only presence booleans and redacted codes. No inbound port.
+Rotation: `sudoedit` the env file, then `sudo systemctl restart publication-recovery`.
 
-- The worker needs the same four secrets as the GitHub reconcile workflows: `POSTGRES_URL`, `SUPABASE_URL`,
-  `SUPABASE_SERVICE_ROLE_KEY` and `DATADOE_API_KEY`. The DataDoe key is used only for the zero-token account-directory
-  GET.
-- They live **only** in `/etc/publication-recovery/worker.env` on the VM:
-  - owner `root:prw`, mode `0640`;
-  - `install.sh` creates it empty;
-  - edit it with `sudoedit` only.
-- Never put a secret in Git, the unit file, a command-line argument, shell history, a log, a ticket or chat.
-  `--check-config`, the health check and status print only **presence** booleans and redacted codes.
-- The VM has no Git credentials. Releases arrive as a `git archive` tarball over the existing SSH.
-- No public HTTP port. The worker makes outbound connections only: the Postgres pooler, Supabase REST and the DataDoe
-  account GET. Do not open any ingress rule for it.
-- Rotation: `sudoedit` the env file, then `sudo systemctl restart publication-recovery`.
+**Supabase CA rotation (Postgres TLS trust).** Every Postgres connection (worker, route CLI, reconcilers) verifies the
+chain against the Supabase root(s) pinned in `lib/server/pg-tls.js` (`SUPABASE_PG_TRUSTED_ROOTS`; the current root,
+"Supabase Root 2021 CA", is valid until 2031-04-26) AND checks the hostname. Rotate it only by overlap, never by
+disabling verification:
 
-## 6. Sign-off gates
+1. When Supabase publishes a new root, ADD it to `SUPABASE_PG_TRUSTED_ROOTS` next to the old one (official download,
+   cross-checked against the chain the pooler presents), and pin its sha256 in `scripts/pg-tls.test.js` (T1b requires
+   every listed root to hash to its declared fingerprint).
+2. Deploy that release (app + VM `install.sh`). Both roots now verify; nothing else changes.
+3. After Supabase switches the pooler to the new chain, prove ONE verified connection against it (an owner-approved,
+   read-only check such as the worker's `--check-config` on the VM). A failure here means the new root is wrong: stop.
+4. Only then REMOVE the old root (and its pin) in a follow-up release.
 
-Each gate needs explicit owner sign-off. None of them have been done.
+At no step is `rejectUnauthorized` false, `sslmode=no-verify` used, the hostname check overridden or a CA read from the
+environment. A root that expires or is revoked without a published successor is an owner escalation, not a workaround.
 
-**Gate A: apply the migration (production schema change).**
+## 5. Pre-live checklist and attestations
 
-- Expand-only and idempotent. It adds six tables and 12 RPCs and touches nothing existing.
-- The control row is created **disabled, with no live families**.
-- Apply it from a trusted machine with the repo env, **exactly this one file**:
+**Pre-live checklist** (read-only; run once against production before ANY live route; record the output):
 
-  ```bash
-  cd sales-dashboard-live
-  MIGRATE_ONLY=20260934_publication_recovery_worker.sql npm run db:migrate
-  ```
+1. `memcheck --real` on the VM (section 3). Its tier-1 part runs **every route's evidence SQL read-only once** on real
+   Postgres (param typing, `to_char(max)`, `rank()` ties -> `latest-row-ambiguous`, jsonb extraction, collations) and
+   also runs **`FBA_PLAN_FOREIGN_JOB_SQL`** (`lib/server/sync/routes/fba-plan.release.js`) and
+   **`LISTING_HEALTH_V3_FOREIGN_JOB_SQL`** (`lib/server/sync/listing-health-v3-release.js`) read-only once per region.
+   `--sql-only` runs just these reads. Any `ok:false` line blocks activation of that route.
+2. Migration `20260923` is applied (the portfolio evidence reads `ads_sync_state.content_rev`).
+3. `--check-config` answers `db: ok` through the pooler (the SET LOCAL timeout path).
+4. Before `SKU_MOVEMENT_SERVE_TOKEN_ATTESTED`: `EXPLAIN ANALYZE` the opunits `count=exact` + `max(updated_at)` window query
+   on the largest account.
+5. The brand directory hydration exposure check from the WP10a hand-off returns 0 rows (or is understood).
+6. `status --summary` shows the writer fence state per key and no `unregistered-live-report-key`.
+7. `FBA_PLAN_PAID_CYCLE_SQL` (`lib/server/sync/routes/fba-plan.release.js`) runs read-only once per region (the fba-plan
+   route's in-lease open-paid-cycle check) in an owner-approved read-only session -- `memcheck --sql-only` does NOT run
+   it today; a read failure blocks fba-plan.
+8. `select count(*) from public.report_snapshots where payload_storage_path like 'source-cache/v1/%'` returns 0.
 
-  Or use the manual-only GitHub workflow. It applies exactly the named file, once the commit is on the default
-  branch: `gh workflow run db-migrate.yml -f migration=20260934_publication_recovery_worker.sql`. No workflow applies
-  migrations automatically, so merging this change applies nothing.
+**Owner attestations** (only the literal `true` attests; anything else is not attested). Set each in the worker env
+(`/etc/publication-recovery/worker.env`) **and** in the route CLI's GitHub environment, only after its condition holds;
+revoke by removing the line and restarting. Without it the worker defers that route's live jobs `route-not-activated`
+(no attempt, no spawn) and the route CLI refuses the live write itself.
 
-- Verify (read-only):
+| Variable | Route | Set only when |
+|---|---|---|
+| `FBA_PLAN_ROUTE_FENCE_ATTESTED` | fba-plan | WP10b (read-only `refresh=1`) is deployed **and** the 20260935 fence has `fba-plan` `fenced_only = true` |
+| `SKU_MOVEMENT_SERVE_TOKEN_ATTESTED` | sku-movement | the WP10 serve (the `sms2:` serve token) is **deployed** and smoke-tested |
+| `LHV3_SERVE_GATE_ATTESTED` | listings | both Vercel production flags `LHV3_PUBLISH_LIVE` and `LISTING_HEALTH_V3` are `true` |
 
-  ```sql
-  select enabled, live_families from public.publication_recovery_control;   -- expect: false, {}
-  select count(*) from pg_proc where proname like '%publication_recovery%';   -- expect: 12
-  ```
+## 6. Sign-off gates, rollout order and canary order
 
-- Rollback: run `deploy/publication-recovery/ROLLBACK_20260934.sql` in the SQL editor. It drops only these objects
-  and removes the ledger row. Stop the worker first.
+Each gate needs explicit owner sign-off. None has been done.
 
-**Gate B: install on the VM, observe-only** (see the VM handoff below).
+**Gate A -- apply 20260934** (its own sign-off; it enables nothing):
 
-- With `PRW_LIVE_FAMILIES=` empty and the control row disabled, the worker can only:
-  - write its heartbeat;
-  - run scans (dry-runs);
-  - record baselines and observations.
-- **It cannot publish.** The status then shows what it would do.
-- Soak this for at least one full day, covering all three regional cycles. Confirm with the status script:
-  - heartbeat fresh;
-  - scans complete;
-  - `stale` counts plausible;
-  - zero `zero-export-violation`.
-
-  Then confirm, from the DataDoe `/usage-logs` ledger, that the VM caused **zero creates** (retention is about 24h).
-
-**Gate C: canary one family (two-key).**
-
-1. On the VM, set `PRW_LIVE_FAMILIES=oli` (optionally also `PRW_REGIONS=india`) and restart.
-2. In the DB:
-
-   ```sql
-   update public.publication_recovery_control
-      set enabled = true, live_families = array['oli'], updated_at = now(), updated_by = '<approver>'
-    where id = true;
-   ```
-
-3. Watch at least one natural cycle.
-4. Proof required:
-   - jobs `verified` with `verified-live-readback`;
-   - the live dashboard reports match;
-   - DataDoe `/usage-logs` shows zero creates from the worker's runs.
-
-**Gate D: widen** to `oli,fba,ads,listings` and all regions, one family at a time, with the same evidence at each step.
-
-**DB kill switch** (no restart needed; takes effect on the next claim):
-
-```sql
-update public.publication_recovery_control set enabled = false, updated_at = now(), updated_by = '<who>' where id = true;
+```bash
+cd sales-dashboard-live
+MIGRATE_ONLY=20260934_publication_recovery_worker.sql npm run db:migrate
 ```
 
-**Not resolved end to end** until an unattended VM run has proven saved-to-live convergence **and** zero DataDoe
-creates.
+Verify (read-only):
+
+```sql
+select enabled from public.publication_recovery_control;                                   -- false
+select route_id, grain, live_enabled, live_regions from public.publication_recovery_routes; -- 10 rows, all false / {}
+select count(*) from pg_proc where proname like '%publication_recovery%';                   -- 12
+```
+
+Rollback: `deploy/publication-recovery/ROLLBACK_20260934.sql` in the SQL editor, after the worker is stopped.
+
+**Gate B -- install on the VM, observe-only** (section 7). With `PRW_LIVE_ROUTES` empty and the control disabled the
+worker only beats, runs tier-1 and deep sweeps, and records baselines / observations -- **it cannot publish**. Soak at
+least one full day covering all three regional cycles; run the pre-live checklist; confirm from the DataDoe
+`/usage-logs` ledger that the VM caused **zero creates**.
+
+**Gate C -- preconditions for ANY live route** (all required):
+
+1. the WP13 scheduler control-envelope hardening (`--lease-wait-seconds=600` on the scheduler's control applies) is
+   deployed -- without it a worker publish in the run -> fba gap can abort a paid fetch;
+2. the WP10 / WP10b serve + read-only `refresh=1` are deployed (paid sync stays available only through the admin Data
+   Sync Center action);
+3. the writer fence (20260935, its **own** sign-off) is applied and the route's live keys are **fenced** (section 9),
+   so no rollout window exists in which an unfenced legacy writer and a route both write a route-owned key;
+4. the route's `memcheck --real` verdicts PASS and its pre-live SQL ran `ok`;
+5. its attestation (section 5) where one is listed.
+
+**Gate D -- canary, one route x one region at a time, india first.** Per step, two keys (the DB row AND the VM env):
+
+```sql
+update public.publication_recovery_control set enabled = true, updated_at = now(), updated_by = '<approver>' where id = true;
+update public.publication_recovery_routes
+   set live_enabled = true, live_regions = array['india'], updated_at = now(), updated_by = '<approver>'
+ where route_id = '<route>';
+```
+
+then add the route to `PRW_LIVE_ROUTES` and restart. **Canary order:**
+
+1. `oli` (the existing legacy CLI, lowest risk);
+2. `listings` (needs `LHV3_SERVE_GATE_ATTESTED`);
+3. `ads`, then `fba`;
+4. `returns-v3`;
+5. `fba-plan` (fill-only; needs `FBA_PLAN_ROUTE_FENCE_ATTESTED`);
+6. `brand-view-brands` (only after the WP10a serve and the retirement of the legacy directory materializer);
+7. `sku-movement` (needs `SKU_MOVEMENT_SERVE_TOKEN_ATTESTED`);
+8. `brand-view` (only with a VM memcheck PASS for it);
+9. `brand-view-portfolio` **last**, and only if the VM memcheck passes; otherwise it stays on its GitHub run.
+
+Then widen each proven route region by region: `india` -> `us-ca` -> `europe-au` (the largest last). Evidence required at
+each step: jobs `verified` (`verified-live-readback`) and the hand-off matrix `repaired` / `already-current` **with the
+served read-back**; the live dashboard values match; zero `writer-fenced`; zero `zero-export-violation`; no
+`scheduler-gate-starvation`; DataDoe `/usage-logs` shows zero creates from the worker's runs.
+
+**Kill switches** (fastest first): `update public.publication_recovery_control set enabled = false ...` (next claim);
+`update public.publication_recovery_routes set live_enabled = false ... where route_id = '<route>'`; empty
+`PRW_LIVE_ROUTES` + restart; `sudo systemctl disable --now publication-recovery`. **Not resolved end to end** until an
+unattended VM run has proven saved-to-live-to-served convergence and zero DataDoe creates for every applicable account x
+marketplace x report.
 
 ## 7. VM handoff (for Codex; only after Gate A is signed off)
 
-On a trusted machine (the repo checkout). The archive **must be of the repository root**: `git archive` run inside
-`sales-dashboard-live/` drops the directory prefix, and `install.sh` refuses such a tarball. `.gitattributes` pins
-LF line endings for `*.sh`, `*.service` and `*.example`, so an archive built on Windows is still valid on Ubuntu.
+On a trusted machine (the repo checkout). The archive **must be of the repository root**; `.gitattributes` pins LF for
+`*.sh`, `*.service` and `*.example`.
 
 ```bash
 SHA=$(git rev-parse HEAD)            # the reviewed commit containing this worker
@@ -353,92 +426,451 @@ sha256sum "/tmp/prw-$SHA.tar.gz"
 scp "/tmp/prw-$SHA.tar.gz" "$(git rev-parse --show-toplevel)/sales-dashboard-live/deploy/publication-recovery/install.sh" <vm>:/tmp/
 ```
 
-On the VM (Ubuntu 24.04). Manual commands run through `systemd-run` as the `prw` user. It reads the env file
-**exactly as the unit does**. Never `source` the env file into a shell: values such as the pooler URL contain `&`,
-which bash would misparse, and `$` would be expanded.
+On the VM (Ubuntu 24.04). Manual commands run through `systemd-run` as `prw`, reading the env file exactly as the unit
+does. Never `source` the env file into a shell.
 
 ```bash
-# 0) Node 24 at /usr/bin/node is required (the unit runs /usr/bin/node; the workflows pin 24). NodeSource installs it there.
-/usr/bin/node -v
-
-# 1) Install the release. Creates the prw user, a 2G swapfile if there is no swap, an EMPTY env file, and the unit.
-#    It builds a self-contained release (its own pg closure pinned to package-lock.json) and does NOT start the worker.
-sha256sum /tmp/prw-<sha>.tar.gz      # must match the value printed on the trusted machine
+/usr/bin/node -v                     # Node 24 at /usr/bin/node
+sha256sum /tmp/prw-<sha>.tar.gz      # must match the trusted machine
 sudo bash /tmp/install.sh /tmp/prw-<sha>.tar.gz <sha>
-
-# 2) Fill the secrets and settings (observe-only: leave PRW_LIVE_FAMILIES empty). Template:
-#    /opt/publication-recovery/app/sales-dashboard-live/deploy/publication-recovery/worker.env.example
-sudoedit /etc/publication-recovery/worker.env
-
-# Helper for this shell session: run a worker script as prw with the unit's exact environment.
+sudoedit /etc/publication-recovery/worker.env   # template: deploy/publication-recovery/worker.env.example; PRW_LIVE_ROUTES empty
 prw() { sudo systemd-run --quiet --wait --pipe --collect --uid=prw --gid=prw \
   -p EnvironmentFile=/etc/publication-recovery/worker.env -p EnvironmentFile=-/etc/publication-recovery/version.env \
   -p Environment=TZ=UTC -p WorkingDirectory=/opt/publication-recovery/app/sales-dashboard-live \
   /usr/bin/node "$@"; }
-
-# 3) Validate config, registry and DB reachability (prints presence booleans + redacted codes only).
-#    Expect "db": "ok", exit 0. "error:42P01" (exit 3) means TLS and auth work but migration 20260934 is not applied
-#    (Gate A). A TLS or certificate code means the connection string is wrong.
-prw scripts/worker/publication-recovery-worker.mjs --check-config; echo "exit=$?"
-
-# 4) Before enabling: measure the real workload ON THE VM (read-only dry-runs, zero DataDoe creates; ~15+ minutes).
-prw scripts/worker/publication-recovery-memcheck.mjs --real; echo "exit=$?"
-
-# 5) Start observe-only.
-sudo systemctl enable --now publication-recovery
-systemctl status publication-recovery --no-pager
-journalctl -u publication-recovery -n 100 --no-pager
-
-# 6) Health and status (redacted).
+prw scripts/worker/publication-recovery-worker.mjs --check-config; echo "exit=$?"   # "db": "ok"; 42P01 = Gate A pending
+prw scripts/worker/publication-recovery-memcheck.mjs --real; echo "exit=$?"         # section 3 + pre-live SQL (read-only)
+sudo systemctl enable --now publication-recovery                                     # observe-only
 prw scripts/worker/publication-recovery-health.mjs; echo "exit=$?"
 prw scripts/worker/publication-recovery-status.mjs --summary
 ```
 
-Update to a new release: build and copy the new tarball as above, then run
-`sudo bash /tmp/install.sh /tmp/prw-<newsha>.tar.gz <newsha> --restart`.
+Update: `sudo bash /tmp/install.sh /tmp/prw-<newsha>.tar.gz <newsha> --restart`. Rollback: `... rollback.sh release`
+(previous release) or `... rollback.sh disable` (stop entirely); schema: `ROLLBACK_20260934.sql` after the worker is
+stopped. Report back: `--check-config`, `systemctl status`, the health JSON, `status --summary` after one tier-1 and one
+deep sweep, and the `--real` memcheck verdict lines. Do **not** set `PRW_LIVE_ROUTES` or enable any route row without
+Gate D sign-off.
 
-Rollback:
+## 8. Stuck cycles, known limits and risks
 
-- Previous release (code **and** its own pinned `node_modules`; `version.env` is rewritten to match):
-  `sudo bash /opt/publication-recovery/app/sales-dashboard-live/deploy/publication-recovery/rollback.sh release`.
-- Stop the worker entirely: `... rollback.sh disable`. The GitHub scheduler and the backstop reconcilers are unaffected.
-- DB kill switch: the SQL above.
-- Schema: `ROLLBACK_20260934.sql`, after the worker is stopped.
+**Stuck cycles.** The worker never writes a sync table and its graph never names a cycle-finalize RPC; it **surfaces**
+`stranded-partial-cycle`, `paid-cycle-stale-open` and `paid-job-stale-in-flight`. Closing is an explicit, signed-off
+operator action with `scripts/worker/publication-recovery-reaper.mjs`:
 
-Report back to the owner:
+```bash
+prw scripts/worker/publication-recovery-reaper.mjs                                  # read-only candidate list
+prw scripts/worker/publication-recovery-reaper.mjs --apply --cycle-id=<id> --confirm=<id>   # ONE cycle, after sign-off
+```
 
-- `--check-config` output;
-- `systemctl status`;
-- the health JSON;
-- `status --summary` after at least one full scan;
-- the `--real` memcheck verdict lines from the VM.
+It finalizes (through the guarded `finalize_sync_cycle`, which re-checks the whole cycle under `FOR UPDATE`) only a
+job-less orphan priority-partial cycle of a **past** epoch (`cycle_date` < the current UTC D-1; -> `succeeded`,
+`report_total` 0) or a drained stuck cycle. A **current-epoch** orphan is `never`: the next run with the same evidence
+resumes it, while finalizing it would dead-letter that target (`cycle-not-running`) for the rest of the day. It **never** finalizes
+a priority-partial cycle holding a pending or failed job (e.g. the LHv3 salted foreign-retry cycle) nor any cycle with an
+open job. A stuck **paid** fba cycle with an open fba-plan job keeps the fba-plan route deferred for that account
+(`paid-job-in-flight` / `paid-job-stale-in-flight`) until the next natural paid cycle supersedes it or the operator
+re-runs the paid publish phase.
 
-Do **not** set `PRW_LIVE_FAMILIES` or enable the control row without Gate C sign-off.
+**Known limits and risks.**
 
-## 8. Known limits and risks
+- **Capacity is unproven** for brand-view and the portfolio on 1/8 OCPU until the VM memcheck passes (the plan's
+  PARTIAL). A failing route stays capacity-exceeded on the VM and keeps its GitHub run.
+- **Tier-1 is metadata-only**; the exact child-verified binding runs per job and in the deep sweep (once per epoch, then
+  every `PRW_DEEP_SWEEP_HOURS`). An every-10-minute exact verification of every route does not fit the VM.
+- **Legacy served read-back** is the tier-1 check "no live row in scope written after the verification": it cannot see
+  a foreign row written **before** the verification with a newer `updated_at` than the verified row (the served
+  selector would pick it); the legacy CLIs do not report their served row. A "the newest served-scope row IS the
+  verified row" check is not expressible from metadata alone (the TARGETS v1 line carries no served-row identity), so
+  this limit stands (pinned as a known limit by worker 16k). What IS closed: once tier-1 revokes the proof (a foreign
+  write AFTER the verification) the revocation is sticky for that verified token (2.1) -- a later re-verification of the
+  same token can no longer re-anchor it back to `already-current` while the foreign row stays newest. A **new** token
+  or a republish by the worker resets the proof and re-opens the before-verification window for that new verification.
+- **Scope races**: the worker's durable directory is cached for 600 s; a target the route CLI's fresh directory no
+  longer lists makes the CLI STOP the batch (`route-target-out-of-scope`, deferred 900 s, no attempt) until the cache
+  refreshes and the worker supersedes that target.
+- **Gate re-check window**: the gates are re-read immediately before the live child, but a gate can still close during
+  the live child itself; the release's own fenced CAS under the control-plane lease (and the fba-plan route's in-lease
+  paid-cycle check) protect that window.
+- **Scheduler-gate starvation**: the gate removes live repair from part of each day (alerted after 12 h). A paid cycle
+  open > 4 h and idle 15 min no longer blocks (alerted), so one stuck cycle cannot stop every route.
+- **Evidence-token exactness** of sku-movement / returns depends on every writer bumping a folded column; the
+  `--verify-exact` deep sweep is the backstop.
+- **Growth**: priority-partial cycles and content-addressed shadows grow `sync_cycles`, `sync_report_jobs` and
+  `report_snapshots` (the shadow prune is off by default, `PRW_SHADOW_PRUNE`).
+- **Slow stops**: `systemctl stop` can take up to ~15 minutes while a live child finishes (deliberate).
+- **Env-only settings**: restart after changing them. The DB switches take effect on the next claim.
+- The fence trigger (20260935) also blocks DELETE / TRUNCATE of a fenced key: scheduler-v1 prune / 30-day retention stop
+  working for a fenced key (retention swallows the error; rows kept) -- expected.
 
-- **Cost of detection.** Every scan step and every batch pre-check or verify is a real reconciler dry-run. Each one:
-  - reads Supabase (service role; egress counts against the plan);
-  - makes **one zero-token DataDoe account-directory GET**.
+## 9. Writer fence cutover
 
-  At the default 600s interval, a full scan is 12 dry-runs. If egress or the DataDoe GET rate matters, raise
-  `PRW_SCAN_INTERVAL_SECONDS` (maximum 3600). The watermark pass (metadata SQL only) still catches new saves every
-  poll.
-- **Detect-only reports are not recovered.**
-  - fba-plan has no zero-export publisher (only the paid go-live path).
-  - The scheduler-materialized reports stay with the scheduler's materializer.
+> **Status: repository work only.** Migration `20260935_report_publication_writer_fence.sql` is **prepared, not
+> applied**. It needs its own sign-off, separate from `20260934`. No key is fenced, nothing is live.
 
-  The worker reports these gaps; it never fixes them.
-- **Deferral windows.** While a scheduler-v2 cycle for a region is running (within 4h), that region's jobs are
-  deferred. This includes the natural, `-fba`, LHv3, `bootstrap-*` and `priority-partial-*` cycles. During the global
-  control lease, all jobs are deferred.
-- **Scheduler materializer races.** `superseded-newer-live` dead-letters are expected and benign: the scheduler's
-  materializer kept that live row fresher than the saved evidence. They appear in the dead-letter count, so read
-  `last_class` before alerting on `--max-dead`.
-- **Slow stops.** `systemctl stop` or a reboot can take up to about 15 minutes while a live Listings reconcile
-  finishes. That is deliberate (see Shutdown).
-- **Pre-existing, not introduced here.** A latent defect in the LHv3 operation: replaying a terminal cycle can fail
-  the natural v3 job. When the Listings family cannot converge, it reports the reconciler's own reason code and
-  dead-letters after bounded attempts.
-- **Env-only settings.** The worker's own settings (poll, scan interval, batch size) are env-only. Restart after
-  changing them.
+### 9.1 What the fence is
+
+A code cutover alone cannot stop a scheduler job that is **already running** old code, or any other stale writer
+(a `refresh=1` builder, a backfill script, the retired brand-inventory rebuild, a reverted deploy). So the fence is
+enforced **inside Postgres**, whatever code is deployed:
+
+- `public.report_publication_writer_fence` has one row per route-owned live key: `brand-sales`, `daily-reporting`,
+  `brand-inventory`, `listing-health-v3`, `fba-plan`, `sku-movement`, `returns-leakage`, `brand-view`,
+  `brand-view-portfolio`, `brand-view-brands`. Every row is seeded `fenced_only = false`, so applying the migration
+  changes nothing. `scheduler-v2/*` shadow keys can never be fenced (a CHECK constraint forbids them).
+- A `BEFORE INSERT OR UPDATE OR DELETE` row trigger (plus a `BEFORE TRUNCATE` statement trigger) on
+  `public.report_snapshots` refuses any write of a key whose row is `fenced_only = true`. The error is SQLSTATE `RWF01`
+  with the message `REPORT_WRITER_FENCED:<key>`. The live row is left byte-identical (last-known-good). The trigger
+  checks both the old and the new `report_key`, so an `UPDATE` that moves a row into or out of a fenced key is refused
+  too.
+- The only writer allowed through is `public.cas_report_snapshot_if_newer_fenced`, the fenced CAS behind the four-gate
+  publisher. `20260935` re-creates it **byte-identical to 20260919 except one line**:
+  `perform set_config('app.report_publication_fenced', 'on', true);`. That line runs only after every lease check
+  (owner token, generation, not expired) has passed. The setting is **transaction-local**, so it ends at
+  `COMMIT`/`ROLLBACK` and can never leak into another transaction or another pooled connection.
+- A `DELETE` of a fenced key is refused as well. The fenced publisher never deletes a live row, and the guarded
+  route-shadow prune deletes only `scheduler-v2/*` rows, so the only thing a fenced `DELETE` could stop is a stale
+  retention or prune destroying last-known-good.
+- **One exemption: deleting a dashboard user.** `report_snapshots.created_by` references `auth.users` with
+  `ON DELETE SET NULL`, so deleting a user issues an `UPDATE` of its rows. That `UPDATE` is allowed on a fenced key
+  only when `created_by` goes from a user to `NULL` and **every other column** (whole-row comparison, except
+  `updated_at`) is unchanged; the trigger then restores `updated_at`, so the row stays byte-identical except
+  `created_by`. Any other change in the same `UPDATE` is refused. Proven in PGlite with the real foreign key.
+- **A flip is seen by every new statement at once.** Under `READ COMMITTED` (PostgREST and every `pg` writer here)
+  each statement, and each query inside the trigger function, takes a fresh snapshot. Only a `REPEATABLE READ` /
+  `SERIALIZABLE` transaction that began before the flip keeps the old snapshot until it ends; step 4 below waits for
+  those.
+
+`lib/server/sync/report-writer-fence.js` holds the shared contract: the error classifier (`writer-fenced`, LKG
+preserved, never retried), the read-only fence reader (zero visible rows is `invalid: no-rows-visible`, never `ok`)
+and the per-key status summary for the worker status.
+
+Proof, all offline:
+
+```bash
+node scripts/report-writer-fence.test.js                                          # contract, byte identity, writer inventory
+PRW_PGLITE_DIR=/tmp/pglite node scripts/worker/report-writer-fence-selftest.mjs  # real SQL in PGlite (exit 3 = SKIPPED)
+```
+
+The PGlite self-test also runs the SQL blocks of this section marked `wp15-sql` (trigger check, negative probe,
+barrier, mark check), so the documented SQL is proven on real Postgres.
+
+### 9.2 Which writers must be gone before a key is fenced
+
+`scripts/report-writer-fence.test.js` contains the **fail-closed writer inventory**. A new writer that is not listed
+fails the test. Writes that are proven to target an unfenced key, or the `scheduler-v2/*` shadow namespace, need no
+entry. Section 9.5 says what the scan can and cannot see.
+
+The **machine-checked readiness gate** decides each key. It runs the whole suite, then fails if any inventory entry
+other than a fenced-publisher path (a `blocked-by-fence` writer, or any other non-fenced writer) still lists the key:
+
+```bash
+REPORT_WRITER_FENCE_READY_KEY=<key> node scripts/report-writer-fence.test.js    # exit 0 = ready; it prints the blockers
+REPORT_WRITER_FENCE_DUMP=readiness node scripts/report-writer-fence.test.js     # every key at once (never fails)
+```
+
+Snapshot of the gate on 2026-09-28, after WP10b (read-only `refresh=1`; scheduler-v1 APIs refuse route-owned keys) and
+WP13 (the scheduler materializers call the fenced route CLI; every legacy unfenced writer retired): **all 10 keys are
+ready** (`REPORT_WRITER_FENCE_READY_KEY` exits 0 for each, and for the whole list at once).
+
+| Key | Ready | Retired by | Fenced writers that keep publishing |
+|---|---|---|---|
+| brand-sales | **yes** | WP13: the scheduler-v1 LIBRARY (`run-sync.js`, `adapters/report-adapter.js`) refuses route-owned keys itself; `backfill-brand-sales.mjs` is an exit-2 stub | OLI reconciler, priority dashboards (scheduler, Data Sync Center, bootstrap, manual-source-sync) |
+| daily-reporting | **yes** | WP13: `backfill-daily-v2.mjs`, `backfill-daily-named-brands.mjs` are exit-2 stubs | OLI + Ads reconcilers, priority dashboards |
+| brand-inventory | **yes** | WP13: the legacy Brand View materializer and its compact **rebuild** are gone from the workflow and bind no writer | OLI + FBA reconcilers, priority dashboards |
+| listing-health-v3 | **yes** | (none needed) | LHv3 reconciler |
+| fba-plan | **yes** | (none needed) | `fba-plan-golive.mjs`, `fba-inventory-recovery.mjs`, `fba-durable-source-replay.mjs`, Data Sync Center paid sync (`buildFbaPlanRelease`), fba-plan route |
+| sku-movement | **yes** | WP13: legacy `materializeOne` retired | sku-movement route (its LIVE writes are deferred until `SKU_MOVEMENT_SERVE_TOKEN_ATTESTED` is exactly `true`) |
+| returns-leakage | **yes** | WP13: legacy `materializeOne` retired | returns-v3 route (the scheduler `materialize` job; `returns-leakage-golive.mjs` spawns it) |
+| brand-view, brand-view-portfolio | **yes** | WP13: legacy Brand View materializer retired | brand-view and brand-view-portfolio routes (the scheduler `materialize-inventory` job) |
+| brand-view-brands | **yes** | WP13: legacy `materializeOne` retired | brand-view-brands route (the scheduler `materialize` job) |
+
+A key becomes ready when its blockers are deleted or reduced to read-only and their inventory entries go away. A
+blocker that is still reachable after a flip corrupts nothing: it fails closed.
+
+**The gate is a static inventory; some writers are proven not-a-writer at RUNTIME.** The scheduler-v1 library and
+`report-store.js` keep their generic sinks for the manual-paid keys and refuse route-owned keys by a runtime check. That
+refusal is pinned by `scripts/scheduler-v2-route-switch.test.js` and `scripts/refresh-readonly.test.js`, not by the fence
+test, so readiness (step 2 below) requires all three suites green on the deployed commit.
+
+**Order matters for `refresh=1`.** WP10b must be **deployed** before any key is flipped. Otherwise a dashboard
+`refresh=1` or a scheduler-v1 run of a fenced key spends a paid DataDoe export first and then fails on save (tokens
+spent, LKG kept).
+
+### 9.3 Procedure
+
+Each step needs explicit owner sign-off. All SQL here is read-only except the migration, the flip and the probe
+(which always rolls back).
+
+1. **Apply the schema** (it enables nothing). Apply `20260934` first if it is not already applied, then:
+
+   ```bash
+   cd sales-dashboard-live
+   MIGRATE_ONLY=20260935_report_publication_writer_fence.sql npm run db:migrate
+   ```
+
+   Verify:
+
+   ```sql
+   select report_key, fenced_only, updated_by from public.report_publication_writer_fence order by 1;  -- 10 rows, all false
+   select position('set_config(''app.report_publication_fenced'', ''on'', true)' in prosrc) > 0
+     from pg_proc where proname = 'cas_report_snapshot_if_newer_fenced';                                -- true
+   select count(*) from pg_db_role_setting where array_to_string(setconfig, ',') like '%report_publication_fenced%';  -- 0
+   ```
+
+   And **exactly** the expected triggers on `report_snapshots`, all enabled (`tgenabled = 'O'`), with the expected
+   timing/events (`tgtype`) and functions:
+
+   <!-- wp15-sql:triggers -->
+   ```sql
+   select coalesce(array_agg(t.tgname::text || ':' || t.tgenabled::text || ':' || t.tgtype::text || ':' || p.proname::text
+                             order by t.tgname::text collate "C"), '{}'::text[])
+          = array['report_snapshots_touch_updated_at:O:19:touch_updated_at',
+                  'report_snapshots_zz_writer_fence:O:31:enforce_report_publication_writer_fence',
+                  'report_snapshots_zz_writer_fence_truncate:O:34:enforce_report_publication_writer_fence']::text[] as exact_triggers
+     from pg_trigger t join pg_proc p on p.oid = t.tgfoid
+    where t.tgrelid = 'public.report_snapshots'::regclass and not t.tgisinternal;  -- true
+   ```
+
+   `false` means stop. **Ordering assumption:** PostgreSQL fires `BEFORE` row triggers of the same event in name order,
+   so `report_snapshots_zz_writer_fence` runs last and sees the final `report_key`. A future `BEFORE` trigger that sorts
+   after it and rewrites `report_key` would bypass the fence; that is why the set must be exact. The touch trigger runs
+   first and only sets `updated_at`. A disabled (`D`) or replica-only (`R`) fence trigger does not fire.
+
+   The migration sets `lock_timeout = 10s`. If it times out behind a long transaction, re-run it later. Nothing is
+   half-applied, because the runner wraps it in one transaction.
+
+2. **Deploy code whose only writers for the key are fenced** (section 9.2): WP10b and the WP10 serve on Vercel; WP13 per
+   section 9.6 (recommended FENCE-FIRST: the gate then runs on the WP13 commit that is about to be merged). On that
+   commit, for **each** key you intend to flip:
+
+   ```bash
+   REPORT_WRITER_FENCE_READY_KEY=<key> node scripts/report-writer-fence.test.js   # must exit 0
+   node scripts/scheduler-v2-route-switch.test.js && node scripts/refresh-readonly.test.js   # the runtime refusals (9.2)
+   ```
+
+   A key that is not ready is not flipped. Also prove that no writer connection carries the mark:
+
+   - database/role level: the `pg_db_role_setting` query in step 1 returns `0` (this also covers the PostgREST roles);
+   - connection level: in each `pg` writer runtime (the VM worker env file, and locally with the same `POSTGRES_URL`
+     secret value the workflows use), check that neither `PGOPTIONS` nor the URL's `options` parameter sets an `app.*`
+     setting. This prints no secret:
+
+     ```bash
+     node -e "const u=new URL(process.env.POSTGRES_URL);const o=(u.searchParams.get('options')||'')+' '+(process.env.PGOPTIONS||'');console.log(/app\.|report_publication_fenced/i.test(o)?'STOP: a startup option sets an app.* setting':'ok: no app.* startup option')"
+     ```
+
+     The workflows and deploy files are machine-checked for `PGOPTIONS` / `options=` / the mark by the test (F8);
+   - runtime: through the same connection path a writer uses, the mark must be empty:
+
+     <!-- wp15-sql:mark -->
+     ```sql
+     select coalesce(current_setting('app.report_publication_fenced', true), '') as mark;  -- '' (anything else: STOP)
+     ```
+
+     For the `pg` runtimes, for example:
+
+     ```bash
+     cd sales-dashboard-live
+     node --input-type=module -e "import pg from 'pg'; import { verifiedPgConfig } from './lib/server/pg-tls.js'; const c = new pg.Client(verifiedPgConfig(process.env.POSTGRES_URL)); await c.connect(); const r = await c.query(\"select coalesce(current_setting('app.report_publication_fenced', true), '') as mark\"); console.log(JSON.stringify(r.rows[0])); await c.end();"
+     # expected: {"mark":""}
+     ```
+
+3. **Flip one key** with one approved `UPDATE`, run **on its own** (so it commits by itself):
+
+   ```sql
+   update public.report_publication_writer_fence
+      set fenced_only = true, updated_by = '<approver>'
+    where report_key = '<key>'
+   returning report_key, fenced_only, updated_at;
+   ```
+
+   Then, in a **separate** run, record a timestamp that is certainly after the flip committed:
+
+   <!-- wp15-sql:barrier-time -->
+   ```sql
+   select clock_timestamp()::text as flip_committed_by;
+   ```
+
+   At the same moment, record the in-flight runs as evidence:
+
+   ```bash
+   gh run list --status in_progress --limit 50
+   ```
+
+   **No drain is needed once the key is flipped.** A scheduler job that is already running old code fails closed on
+   its next write of that key: `RWF01 REPORT_WRITER_FENCED:<key>`, with the live row unchanged. Writes that go through
+   the fenced path are unaffected. (Before the flip there is no such protection -- see section 9.6 for the WP13 code
+   cutover window.)
+
+4. **Flip barrier.** Repeat this read-only query, with the timestamp from step 3, until **both** numbers are `0`:
+
+   <!-- wp15-sql:barrier -->
+   ```sql
+   select count(*) filter (where a.xact_start < '<flip_committed_by>'::timestamptz) as pre_flip_transactions,
+          count(*) filter (where a.query = '<insufficient privilege>') as invisible_backends
+     from pg_stat_activity a
+    where a.backend_type = 'client backend' and a.pid <> pg_backend_pid();
+   ```
+
+   `0 / 0` proves that no transaction that could still hold a pre-flip snapshot is open. If `invisible_backends` stays
+   above `0`, the viewing role cannot see other sessions (run it as the `postgres` role in the SQL editor). If that is
+   not possible, use the bounded window instead: only a `REPEATABLE READ` / `SERIALIZABLE` transaction that began
+   before the flip is exposed, no current writer of a route-owned key uses one, and every run is bounded by its
+   workflow `timeout-minutes`. So wait until every run in the `gh run list` from step 3 has finished.
+
+5. **Verify:**
+   - the fence row is `true` and the trigger check from step 1 is still `true`;
+   - the **per-key negative probe** is refused with `RWF01`. It runs inside `begin`/`rollback` and never leaves a row:
+
+     <!-- wp15-sql:probe -->
+     ```sql
+     begin;
+     do $probe$
+     begin
+       insert into public.report_snapshots (report_key, account_id, params_hash, payload)
+       values ('<key>', '__writer_fence_probe__', '__writer_fence_probe__', '{}'::jsonb);
+       raise exception using errcode = 'P0001', message = 'WRITER_FENCE_NOT_ENFORCED:<key>';
+     end
+     $probe$;
+     rollback;
+     ```
+
+     Expected: `ERROR: REPORT_WRITER_FENCED:<key>` (SQLSTATE `RWF01`). `WRITER_FENCE_NOT_ENFORCED:<key>`, or any other
+     error, means the fence is **not** enforced for that key: stop and investigate. In every case the transaction
+     rolls back, so the probe row never persists;
+   - the next scheduler cycle, or zero-export reconcile or route run, writes the key through the fenced path. Its
+     publish outcomes are `inserted` / `replaced` / `already-current`, and the exact live read-back and served-row
+     checks pass;
+   - **zero** `REPORT_WRITER_FENCED` / `writer-fenced` from any fenced writer, in the workflow logs and the Postgres
+     logs.
+
+   A `REPORT_WRITER_FENCED` from a legacy writer is the fence working. Record which writer produced it and retire it.
+   Never "fix" it by opening the fence.
+
+   Then repeat steps 2 to 5 for the next key.
+
+### 9.4 Rollback
+
+- **A code rollback never disables the fence.** A `git revert` or a redeploy of an older release leaves the fence
+  **on**, so a reverted legacy writer fails closed and LKG is preserved. This is the rollback path WP13 relies on --
+  **only for keys already flipped**: a revert of WP13 BEFORE its keys are fenced re-enables the retired unfenced writers
+  (section 9.6: never revert WP13 before the flip; fence-first avoids the question).
+- **Opening a key again is a separate, explicitly approved DB change**, recorded as *re-enabling unfenced writers for
+  `<key>`*. Do it only after proving that no known-unsafe writer of that key is deployed or running:
+
+  ```sql
+  update public.report_publication_writer_fence set fenced_only = false, updated_by = '<approver>' where report_key = '<key>';
+  ```
+
+- **Schema rollback:** `deploy/publication-recovery/ROLLBACK_20260935.sql`, in the SQL editor. It sets
+  `lock_timeout = 10s` (fails fast behind a long transaction; nothing half-applied), restores the 20260919 fenced CAS
+  byte-identical, then drops the triggers, the trigger function and the table, and deletes the ledger row. It
+  re-enables unfenced writers for **every** key, so it needs the same approval.
+- **Re-apply after a schema rollback.** The migration file stays in `supabase/migrations`, so a later full
+  `npm run db:migrate` (without `MIGRATE_ONLY`) re-applies it. That is behaviour-neutral: every key comes back
+  `fenced_only = false`, so nothing is refused until a new approved per-key flip.
+
+### 9.5 Honest limits
+
+- **The database trigger is authoritative.** The fence protects against stale **application** writers. It does not
+  protect against a privileged database operator: a superuser can disable triggers, set
+  `session_replication_role = replica`, or set the marker by hand.
+- The marker stays set until the end of the fenced CAS's **own** transaction. Its only caller is the single-statement
+  PostgREST RPC in `supabase.js`; the test pins that there is no `pg`-direct caller and that no application code,
+  workflow or deploy config sets the marker.
+- The created_by exemption is shape-based, not caller-based: anyone may null `created_by` on a fenced row. It cannot
+  change content or which row is served (every other column, including `updated_at`, is unchanged).
+- Scheduler-v1 retention of a fenced key stops: its errors are swallowed and the rows are kept. If table growth for
+  that key ever matters, clean it up with a separate, approved maintenance step.
+- Storage objects are outside the fence. The fenced publisher writes inline payloads, and no current code writes a
+  report-snapshot payload object.
+- **What the static inventory catches.** It scans `lib/`, `api/` and `scripts/` (not the offline `*.test.js` suites;
+  `src/` is checked separately and never names the table, and no JS outside these trees may name it or the sinks).
+  It follows the `supabase.js` sinks through imports, aliases, namespaces, dynamic imports, `require` and wrappers;
+  direct SQL, REST, RPC and supabase-js writes, also when the table or RPC name is built from concatenated or
+  templated literal fragments or string constants (local, module-level or imported), in upper case, `%5F`- or
+  `\x5f`-encoded, or schema-quoted (`"public"."report_snapshots"`), and when the method comes from an options object.
+  Shadow-key proofs must cover the whole key expression, and a DI forwarder stays tainted on any reference other than
+  a proven call. A **coarse tripwire** then requires every file whose code mentions `report_snapshot*`, or makes a
+  non-GET REST call with a computed path, a `.from(x)` write, a `.rpc(x)` call, SQL DML on a computed target or an
+  `import(x)` / `require(x)` with a computed specifier, to be listed with its exact hit count.
+- **What it does not catch.** A table name assembled by other means (array `join`, character codes, base64,
+  environment variables or files), `eval` / `new Function`, a DI function reached without its name (generic iteration
+  over a deps object, or a computed property name built from separate variables), a spawned process running a file
+  outside the scan, inline code in workflow YAML, and SQL run by hand. The scan is a review aid for honest mistakes,
+  not a security boundary. PGlite is single-session,
+  so concurrent sessions are not exercised; the trigger itself is per-row and holds no state.
+
+### 9.6 The WP13 scheduler cutover (deploy order and the rollout window)
+
+WP13 makes the scheduler-v2 `materialize` (brand-view-brands, sku-movement, returns-v3) and `materialize-inventory`
+(brand-view, brand-view-portfolio) jobs call the fenced route CLI unconditionally, removes the unfenced brand-inventory
+rebuild from the workflow, and retires every legacy unfenced writer (9.2). Owner decisions are marked **(owner)**.
+
+**Preconditions before WP13 reaches the default branch:**
+
+1. WP10b and the WP10 serve are deployed on Vercel and smoke-tested. brand-view-brands relies on the WP10 hydrated serve. The
+   sku-movement route DEFERS every live write (`sku-movement-serve-not-attested:route-not-activated`, zero writes) until
+   `SKU_MOVEMENT_SERVE_TOKEN_ATTESTED` is exactly `true`, so a merge-order slip leaves SKU Movement on the read-only serve
+   (correct, but slower) and never pushes a row the deployed serve cannot serve. Set the variable only after the WP10
+   serve is live.
+2. 20260934 and 20260935 are applied (every key `fenced_only = false`).
+3. On the WP13 commit: `REPORT_WRITER_FENCE_READY_KEY=<key>` passes for every key, and `scheduler-v2-route-switch` +
+   `refresh-readonly` pass.
+4. **(owner)** brand-inventory freshness is accepted after this read-only check. Without the rebuild, the same-day
+   conversion of the cycle's `inventoryAvailable:false` placeholder depends on the `fba` job's immediate FBA reconcile
+   (`FBA_RECONCILE_LIVE`) and the once-daily `fba-publication-reconcile.yml` backstop (20:48 UTC). The serve always picks
+   the newest AVAILABLE compact (never a fabricated zero), so the risk is staleness, not wrong data:
+
+   ```sql
+   -- per recent D-1: brand-inventory rows that are available / placeholders / out-of-line, and how many the (retired)
+   -- rebuild wrote (params.depFingerprint). 'available' should be ~ every FBA-active account WITHOUT the rebuild.
+   select params->>'to' as to_date,
+          count(*) filter (where payload->>'inventoryAvailable' = 'true')  as available,
+          count(*) filter (where payload->>'inventoryAvailable' = 'false') as placeholder,
+          count(*) filter (where nullif(btrim(payload_storage_path), '') is not null) as out_of_line,
+          count(*) filter (where params ? 'depFingerprint') as rebuild_written
+     from public.report_snapshots
+    where report_key = 'brand-inventory' and params->>'to' >= (current_date - 4)::text
+    group by 1 order by 1;
+   ```
+
+**The rollout window (owner rule: no window in which an unfenced legacy writer and a route can both write a key,
+including an already-running old job).** GitHub Actions keeps the OLD workflow file and the OLD checkout for every run
+that was in flight or queued when WP13 merged, and for any manual "Re-run" of such a run. Until a key is fenced, those
+runs still execute the retired unfenced writers (the legacy materializers, the brand-inventory rebuild), while new-code
+runs publish the same keys through the routes. Within one region the per-region concurrency group serializes the runs,
+but another workflow (e.g. `returns-leakage.yml`) can overlap. Two orderings:
+
+- **FENCE-FIRST (recommended; closes the window).** With preconditions 1-3 met, IMMEDIATELY BEFORE merging WP13 run, for
+  every key, section 9.3 step 3 (flip), step 4 (barrier) and the step-5 per-key NEGATIVE PROBE; then merge WP13 and run
+  the rest of step 5 (the fenced publish through the new code) AFTER the merge -- it cannot pass earlier for the five
+  scheduler route keys, and for sku-movement only once `SKU_MOVEMENT_SERVE_TOKEN_ATTESTED` is set. From the flip on,
+  every old-code writer fails closed (`RWF01`, LKG kept). Between the flip and the merge the old `materialize` /
+  `materialize-inventory` jobs MAY go red (a legacy run exits 1 only when every unit errored; a run with any 'unchanged'
+  unit still exits 0), so keep that gap short -- note that step 4's bounded fallback (when `pg_stat_activity` is not
+  visible) can take up to the longest in-flight run's timeout. Re-runs of pre-cutover runs are then harmless (they fail
+  closed), and a WP13 revert can never re-enable an unsafe writer.
+- **Merge-first (accepted window).** Record `gh run list --workflow scheduler-v2.yml --status in_progress` (and
+  `queued`) at merge, never re-run a pre-cutover run, flip every key promptly (9.3), and never revert WP13 before the
+  flip. Low practical harm (a legacy row always precedes the route row in a region and the route overwrites it; the
+  rebuild's content matched the reconcilers'), but the owner rule holds only after the flip.
+
+**Lease fairness.** A live route run holds the GLOBAL control lease in windows of up to 90 s and now leaves it free for
+30 s between windows (`ROUTE_CLI_INTER_WINDOW_PAUSE_MS`, twice the 15 s retry interval of every bounded lease-waiter).
+The run job's control applies and `fba-plan-golive` wait up to 600 s; the immediate Ads (`ads_reconcile`), Listing
+Health v3 and FBA (the `fba` job's step) reconcilers, the evening OLI / FBA / Ads / LHv3 backstops and the half-hourly
+OLI outbox drain now wait too (`--lease-wait-seconds=600` on their PERIODIC controls apply, never past their own start
+cutoff -- the safe-close reserve stays intact, though a long wait can use up a run's work window and defer its accounts
+with LKG kept), instead of deferring every account on one `CONTROL_LEASE_HELD`. Still single-attempt:
+`manual-source-sync` (an operator tool -- retry it) and any immediate-mode reconcile (it renews the scheduler's fence). The critical path is longer (`materialize` now runs
+after `fba`): worst case run 180 + fba 120 + materialize 80 + materialize-inventory 90 = 470 min, against 330 min between
+the india and europe-au starts; the typical case is far shorter, and a region that overruns only waits on the lease.
+
+**Cleanup edge cases (unchanged WP4 pattern).** The always() cleanup uses the SAME run token as the route step, i.e. the
+SAME lease owner: `acquire_control_plane_lease` grants a same-owner renew (without bumping the fencing generation), so
+it reclaims IMMEDIATELY, rolls the controls back and releases the lease -- safe because the cleanup starts only after the
+route step's process has exited; a fenced CAS still in flight server-side either landed before the release (validated
+prepared content) or is refused lease-lost after it. A cleanup (or any caller) with a FOREIGN token reclaims only a FREE
+or EXPIRED lease. A cleanup that finds another operation's live lease goes red and leaves that lease untouched -- read the
+log before acting on it.

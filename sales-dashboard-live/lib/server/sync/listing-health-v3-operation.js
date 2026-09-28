@@ -16,12 +16,17 @@
 //      freshnessNotBefore (date-free request_hash; freshness travels as a NON-hash field);
 //   7  validate the frozen plan fingerprint + the per-region create ceiling + pricing/reservation support +
 //      DataDoe usable balance (minus an emergency reserve) BEFORE any POST -- abort on any drift/unknown/shortfall;
+//   7a (WP16, live, opt-in) a base cycle that is ALREADY terminal is decided read-only here -- never appended to, never
+//      re-acquired: each account must PROVE already-current (content + lineage + live/served read-back), else a typed
+//      real failure (see the WP16 block below);
 //   8  run source jobs through the existing resumable source worker (listings + listings-raw CREATE within the frozen
 //      budget; inventory is REUSE-ONLY -- adopt the current FBA Plan inventory cache, never a v3 create);
 //   9  materialize validated batch results into isolated per-account aliases (newer-only overwrite);
 //  10  run report jobs -> save ONLY the scheduler-v2/listing-health-v3 shadow snapshot (never a live snapshot), and
 //      DEFER the derive if current FBA inventory is unavailable (never publish stale inventory as current);
-//  11  return structured per-region evidence.
+//  10b (WP16, opt-in) a 'partial' finalize caused ONLY by failed shadow saves succeeds only when every such account is
+//      PROVEN already-current against the durable evidence this run persisted;
+//  11  return structured per-region evidence (incl. alreadyCurrent + refusedReal on the WP16 paths).
 //
 // PURE orchestration over INJECTED collaborators (offline-testable; ZERO DataDoe unless the caller wires + enables a
 // live run). Dry-run performs ZERO creates/writes/tokens. Live mode refuses while the gate is disabled.
@@ -46,6 +51,9 @@ import {
   computeListingHealthV3AuthorizationBinding,
   verifyListingHealthV3ReplayBinding,
 } from "./listing-health-v3-authorization.js";
+// WP16 already-current proof: the SHARED publisher-identical binding primitives + the pure served-row verdict (no I/O).
+import { PUBLICATION_STATE, jobIsPromotable, revisionCoveredByJob, evaluatePublicationBinding, hydrateSnapshotPayload } from "./publication-binding.js";
+import { defaultServedVerdict, servedRowIdentity } from "../recovery/serve-selectors.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(S(v));
@@ -126,6 +134,293 @@ export async function planListingHealthV3IngestionCost({ plan, getSourceExportCa
   };
 }
 
+// ===================== WP16: TERMINAL-CYCLE REPLAY + REFUSED-SHADOW SEMANTICS (ZERO acquisition change) =====================
+// Two PROVEN production failures of the natural scheduler `listing-health-v3` job:
+//   (a) TERMINAL-CYCLE REPLAY (us-ca 2026-09-24): the dedicated base cycle listing-health-v3-<region>/<cycle_date> had
+//       ALREADY been finalized 'succeeded' by an earlier (owner-authorized, Listings-only) operation. The live path still
+//       ran runSources -> materialize -> runReports BEFORE finalize, and runReports' report-job upsert hit the durable
+//       reject_append_to_terminal_cycle trigger (400 "sync cycle ... is terminal (succeeded); refusing to append/alter
+//       child work") -- so the documented "already-terminal succeeded replay = zero-create success" (finalize step) was
+//       UNREACHABLE and the job failed although listing-health-v3 was already current.
+//   (b) REFUSED / FAILED SHADOW SAVE (india 2026-09-25): one account's natural shadow save failed (report-worker records
+//       EVERY saver throw as save-stage SNAPSHOT_SAVE_FAILED with a static message) after the zero-export reconciler had
+//       already published that account's to=<cycle_date> -> reportFailed=1 -> cycle 'partial' -> job exit 1.
+// The fix NEVER appends to a terminal cycle and NEVER re-acquires: a terminal base cycle is detected up front (live only,
+// opt-in readBaseCycle) and short-circuits BEFORE any gate / balance read / cycle / reservation / source / materialize /
+// report / finalize call. Instead, for each account, and for each account whose natural shadow save failed, the SAME
+// three-part ALREADY-CURRENT proof decides (owner rule -- timestamp / date / job row / shadow row alone never count):
+//   (i)   CONTENT IDENTITY: the listing-health-v3 manifest token (the complete-dependency fingerprint of
+//         resolveListingHealthV3DependencyBundle; equal token => byte-identical derived payload, see
+//         listing-health-v3-fingerprint-invariant) of the durable evidence this run would publish EQUALS the content
+//         identity recorded by the newest publication lineage (its job's durable_content_deps). On the refused-shadow path
+//         the durable Listings + Listings-Raw pointers must ALSO be exactly what THIS run persisted (materialize's per-
+//         account durable ack 'replaced'|'unchanged' + the same content sha) -- never an older/newer pointer;
+//   (ii)  LINEAGE: that newest publication job (the latest sync_report_jobs row for (listing-health-v3, account) OUTSIDE
+//         this run's own base cycle, whose natural-shape jobs -- batch depends_on, no durable_content_deps -- are never a
+//         listing-health-v3 publication lineage) is PROMOTABLE and revisionCoveredByJob covers the evidence, and its
+//         scheduler-v2 shadow is publisher-valid for EXACTLY requestedAsOf (evaluatePublicationBinding);
+//   (iii) LIVE READ-BACK: the canonical live row IS that shadow's promotion (the shared publisher read-back + exact stamp
+//         + equal hydrated payload, evaluatePublicationBinding) AND the dashboard's served selector returns EXACTLY that
+//         live row (defaultServedVerdict).
+// All match -> 'already-current' (counted, never 'published'); any mismatch / read error -> a REAL typed failure
+// ('base-cycle-terminal:not-current:<check>' / 'shadow-refused:<check>'), fail closed. The zero-export reconciler /
+// recovery worker repairs publication from durable evidence; the natural job never re-acquires. Every WP16 collaborator
+// is OPTIONAL and default-absent, so a run without them is byte-identical to the pre-WP16 operator.
+const TERMINAL_CYCLE_STATUSES = Object.freeze(["succeeded", "partial", "failed"]);
+export const LHV3_ALREADY_CURRENT_CHECKS = Object.freeze(["content", "lineage", "readback"]);
+const LHV3_REPORT_KEY = "listing-health-v3";
+const LHV3_SHADOW_KEY = "scheduler-v2/" + LHV3_REPORT_KEY;
+// The two DURABLE families the natural run persists (materialize WORK B); inventory is reuse-only (already durable).
+const LHV3_RUN_EVIDENCE_KEYS = Object.freeze({ listings: "listing-health-v3:listings", listingsRaw: "listing-health-v3:listings-raw" });
+// Only these acks prove the durable pointer IS this run's batch ('replaced' = written now; 'unchanged' = equal
+// validated_at + payload_sha + object_path already durable). 'stale-save' (a strictly-newer pointer won), 'conflict',
+// 'schema-missing', 'write-failed', 'skipped-evidence' or no record at all never do.
+const LHV3_RUN_EVIDENCE_ACKS = new Set(["replaced", "unchanged"]);
+// evaluatePublicationBinding STALE reasons that are LIVE READ-BACK failures (check iii); every other reason is LINEAGE.
+const LHV3_READBACK_BINDING_REASON = /^(live-unpromoted|live-identity-mismatch|live-readback|live-refresh-differs|live-payload-unavailable|live-payload-differs|live-params-extra-differs)(:|$)/;
+
+// A SAFE, bounded diagnostic token from a typed reason: the leading code segment (plus ONE following segment only when
+// it is itself a static token), lowercased to [a-z0-9-]. A thrown message / URL / id tail is never carried.
+function reasonToken(v) {
+  const parts = S(v).split(":");
+  const head = S(parts[0]).trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64) || "unknown";
+  const second = parts.length > 1 ? S(parts[1]).trim() : "";
+  return /^[a-z0-9-]{1,48}$/.test(second) ? head + ":" + second : head;
+}
+const uniqSorted = (a) => [...new Set((Array.isArray(a) ? a : []).map((x) => S(x)).filter((x) => x.trim() !== ""))].sort();
+
+// ---- WP16 fixer: PURE helpers the ingestion CLI wires (no I/O; exported so the CLI wiring is offline-testable) ----
+
+// SERVE-GATE ATTESTATION (P2-A). Check (iii) runs the dashboard's OWN served selector (selectLhv3), which serves the
+// live row ONLY when the VERCEL production flags LHV3_PUBLISH_LIVE + LISTING_HEALTH_V3 are both exactly 'true'. The
+// scheduler never sees Vercel's env, and the workflow must NEVER set LISTING_HEALTH_V3 (the build-time UI flag; pinned by
+// scheduler-v2-lhv3-workflow.test.js C). So the CLI reads ONE dedicated owner ATTESTATION variable instead:
+// LHV3_SERVE_GATE_ATTESTED exactly 'true' attests that BOTH Vercel prod flags are 'true' -> the selector env carries
+// both flags; ANY other value ('TRUE' / '1' / ' true' / unset / ...) -> an EMPTY env -> selectLhv3 'serve-flag-off' ->
+// the proof fails closed ('served-serve-flag-off') exactly as before. The literal flag names in the caller's env are
+// NEVER read, so a stray LHV3_PUBLISH_LIVE / LISTING_HEALTH_V3 in the scheduler env can never fake the attestation.
+// Owner procedure: change the repository variable together with the Vercel flags (WP13 wires it into the job env).
+export const LHV3_SERVE_GATE_ATTESTATION_VAR = "LHV3_SERVE_GATE_ATTESTED";
+export function lhv3ServeEnvFromAttestation(env) {
+  const attested = !!env && typeof env === "object" && env[LHV3_SERVE_GATE_ATTESTATION_VAR] === "true";
+  return attested ? { LHV3_PUBLISH_LIVE: "true", LISTING_HEALTH_V3: "true" } : {};
+}
+
+// GITHUB_OUTPUT lines of one ingestion run (WP13 gates the immediate listing-health-v3 reconcile on them):
+//   lhv3_phase             = the evidence phase ('complete' | 'base-cycle-terminal' | 'partial' | ...), a bounded
+//                            [a-z0-9-] token, else 'unknown' (never a free-form / multi-line value);
+//   lhv3_durable_persisted = 'true' ONLY when THIS run's materialize acked at least one durable Listings / Listings-Raw
+//                            pointer 'replaced' | 'unchanged' (the durable evidence the zero-export reconciler publishes
+//                            from includes this run's batch) -- read from the per-account durableByAccount record (the
+//                            SAME acks the refused-shadow proof uses), else from the durableWritten + durableUnchanged
+//                            counters; 'false' for a dry-run, a stop before materialize, the read-only terminal
+//                            base-cycle path, or zero durable acks.
+export function lhv3IngestionGithubOutputs(evidence) {
+  const e = evidence && typeof evidence === "object" ? evidence : {};
+  const phase = /^[a-z0-9-]{1,64}$/.test(S(e.phase)) ? S(e.phase) : "unknown";
+  const mat = e.aliases && typeof e.aliases === "object" ? e.aliases : null;
+  let persisted = false;
+  if (mat && mat.durableByAccount && typeof mat.durableByAccount === "object") {
+    persisted = Object.values(mat.durableByAccount).some((rec) => rec && typeof rec === "object"
+      && Object.values(LHV3_RUN_EVIDENCE_KEYS).some((k) => rec[k] && LHV3_RUN_EVIDENCE_ACKS.has(S(rec[k].ack))));
+  }
+  if (!persisted && mat) {
+    const acked = Number(mat.durableWritten || 0) + Number(mat.durableUnchanged || 0);
+    persisted = Number.isFinite(acked) && acked > 0;
+  }
+  return [["lhv3_phase", phase], ["lhv3_durable_persisted", persisted ? "true" : "false"]];
+}
+
+// The CLI's ONE long-lived READ-ONLY pg client for the publication-job read (P3-B), as a pure factory over an injected
+// (sync or async) client constructor -- offline-testable with a fake. Lazily connected on first use. A construction /
+// connect failure is MEMOIZED (every later read fails FAST, closed). The client's 'error' event (an idle-connection drop /
+// pooler restart; WITHOUT a listener Node raises it as an UNCAUGHT exception that kills the CLI before its EVIDENCE line)
+// is listened and MEMOIZED (lib/server/recovery/store-pg.js convention): every later read throws a typed
+// 'pg-client-error:<code>' -> the proof fails closed (content 'published-identity-unreadable') and the EVIDENCE line
+// still prints. The CLI's client config carries statement_timeout + query_timeout so a hung query cannot stall the run.
+export function buildLhv3ReadOnlyPgReader({ makeClient } = {}) {
+  if (typeof makeClient !== "function") throw new Error("buildLhv3ReadOnlyPgReader requires makeClient (fail closed).");
+  let clientPromise = null;
+  let failure = null;
+  const code = (e) => S(e && (e.code || e.name)).replace(/[^A-Za-z0-9_-]+/g, "").slice(0, 40) || "error";
+  async function rows(sql, params) {
+    if (failure) throw new Error(failure);
+    if (!clientPromise) {
+      clientPromise = (async () => {
+        let client = null;
+        try {
+          client = await makeClient();
+          if (!client || typeof client.query !== "function" || typeof client.connect !== "function") throw new Error("malformed pg client");
+          if (typeof client.on === "function") client.on("error", (e) => { if (!failure) failure = "pg-client-error:" + code(e); });
+          await client.connect();
+          return client;
+        } catch (e) {
+          if (!failure) failure = "pg-connect-failed:" + code(e);
+          throw new Error(failure);
+        }
+      })();
+    }
+    const client = await clientPromise;
+    if (failure) throw new Error(failure);
+    const res = await client.query(sql, params);
+    return Array.isArray(res && res.rows) ? res.rows : [];
+  }
+  async function close() {
+    if (!clientPromise) return;
+    try { const client = await clientPromise; await client.end(); } catch (_e) { /* never affects the exit code */ }
+  }
+  return Object.freeze({ rows, close, failure: () => failure });
+}
+
+/**
+ * Build the per-account ALREADY-CURRENT proof (pure orchestration over INJECTED read-only collaborators; ZERO writes,
+ * ZERO DataDoe). Collaborators (production wiring: scripts/release/listing-health-v3-ingestion.mjs):
+ *   resolveBundle({ accountId, country, requestedAsOf }) -> resolveListingHealthV3DependencyBundle result (the SAME
+ *       resolver + readers the zero-export listing-health-v3 reconciler uses, so the manifest token is byte-identical)
+ *   readPublicationJob({ reportKey, accountId, excludeCycleId }) -> the LATEST sync_report_jobs lineage row for
+ *       (reportKey, accountId) whose cycle_id != excludeCycleId (getLatestReportJobLineage shape) | null
+ *   readSnapshot({ reportKey, accountId, paramsHash }) -> report_snapshots row | null  (getReportSnapshot)
+ *   loadStoragePayload(path) -> payload                                                 (storage-first hydration)
+ *   verifyLiveReadback({ reportKey, liveReportKey, accountId, paramsHash }) -> { ok, reason } (buildLiveReadback)
+ *   selectServed({ accountId, requestedAsOf }) -> { row, reason, via }                  (serve-selectors selectLhv3)
+ *   liveContracts, computeHash, reportDerivations                                       (the publisher's own)
+ * Returns async ({ accountId, country, requestedAsOf, excludeCycleId?, runEvidence? }) ->
+ *   { ok:true, check:null, reason:null } | { ok:false, check:'content'|'lineage'|'readback', reason:<safe token> }.
+ * Checks run in order content -> lineage -> read-back; the first failing check is reported. Any read error fails closed.
+ */
+export function buildListingHealthV3AlreadyCurrentProof({
+  resolveBundle, readPublicationJob, readSnapshot, loadStoragePayload, verifyLiveReadback, selectServed,
+  liveContracts, computeHash, reportDerivations,
+} = {}) {
+  for (const [name, fn] of [["resolveBundle", resolveBundle], ["readPublicationJob", readPublicationJob], ["readSnapshot", readSnapshot], ["loadStoragePayload", loadStoragePayload], ["verifyLiveReadback", verifyLiveReadback], ["selectServed", selectServed], ["computeHash", computeHash]]) {
+    if (typeof fn !== "function") throw new Error(`buildListingHealthV3AlreadyCurrentProof requires ${name} (fail closed).`);
+  }
+  const contract = liveContracts && liveContracts[LHV3_REPORT_KEY];
+  if (!contract || typeof contract.liveParams !== "function" || !S(contract.liveReportKey).trim()) throw new Error("buildListingHealthV3AlreadyCurrentProof requires the listing-health-v3 live contract (fail closed).");
+  const derivation = reportDerivations && reportDerivations[LHV3_REPORT_KEY];
+  if (!derivation || typeof derivation.validatePayload !== "function") throw new Error("buildListingHealthV3AlreadyCurrentProof requires the listing-health-v3 derivation (fail closed).");
+  const hydrate = (row) => hydrateSnapshotPayload(row, loadStoragePayload);
+
+  return async function proveListingHealthV3AlreadyCurrent({ accountId, country = null, requestedAsOf, excludeCycleId = null, runEvidence = null } = {}) {
+    const no = (check, reason) => ({ ok: false, check, reason: reasonToken(reason) });
+    const acct = S(accountId);
+    if (acct.trim() === "" || !isDate(requestedAsOf)) return no("content", "bad-args");
+
+    // ---- (i) CONTENT IDENTITY ----
+    // The identity of the evidence this run would publish: the complete-dependency manifest token of the DURABLE
+    // evidence (the only evidence a listing-health-v3 live row is ever promoted from).
+    let b;
+    try { b = await resolveBundle({ accountId: acct, country, requestedAsOf: S(requestedAsOf) }); }
+    catch (_e) { return no("content", "evidence-unreadable"); }
+    if (!b || b.eligible !== true) return no("content", "evidence-" + S(b && b.reason));
+    const contentDeps = uniqSorted(b.contentDeps);
+    if (!contentDeps.length) return no("content", "evidence-identity-empty");
+    const revision = { eligible: true, revisionId: b.revisionId || null, deps: Array.isArray(b.deps) ? b.deps : [], contentDeps, status: b.status || null };
+    // Refused-shadow path: the durable Listings + Listings-Raw pointers must be EXACTLY what THIS run persisted (content
+    // sha), so the identity is this run's evidence -- never an older pointer a failed persist left behind, nor a newer one.
+    if (runEvidence) {
+      const bb = (b.bundle && typeof b.bundle === "object") ? b.bundle : {};
+      const lSha = S(bb.listingsSnapshot && bb.listingsSnapshot.payload_sha);
+      const rSha = S(bb.rawSnapshot && bb.rawSnapshot.payload_sha);
+      if (!S(runEvidence.listingsPayloadSha) || lSha !== S(runEvidence.listingsPayloadSha)) return no("content", "run-evidence-not-durable:listings");
+      if (!S(runEvidence.rawPayloadSha) || rSha !== S(runEvidence.rawPayloadSha)) return no("content", "run-evidence-not-durable:listings-raw");
+    }
+    // The existing live/shadow content identity: the manifest token recorded by the NEWEST publication lineage (a
+    // listing-health-v3 live row is only ever promoted from a job carrying its manifest in durable_content_deps).
+    let job;
+    try { job = await readPublicationJob({ reportKey: LHV3_REPORT_KEY, accountId: acct, excludeCycleId }); }
+    catch (_e) { return no("content", "published-identity-unreadable"); }
+    if (!job) return no("content", "published-identity-absent");
+    if (excludeCycleId != null && S(job.cycleId) === S(excludeCycleId)) return no("lineage", "job-in-excluded-cycle"); // defensive: the reader must exclude it
+    if (uniqSorted(job.durableContentDeps).join("\n") !== contentDeps.join("\n")) return no("content", "published-identity-differs");
+
+    // ---- (ii) LINEAGE ----
+    // The newest publication job must ITSELF be promotable (a newer in-flight / failed derivation is never skipped over)
+    // and cover the evidence; its shadow is then proven publisher-valid for EXACTLY requestedAsOf by the shared binding.
+    if (!jobIsPromotable(job)) return no("lineage", "latest-job-not-promotable");
+    if (!revisionCoveredByJob(revision, job)) return no("lineage", "job-does-not-cover-evidence");
+    let shadow = null; let hydShadow = null; let live = null; let hydLive = null; let liveReadback = null;
+    try { shadow = await readSnapshot({ reportKey: LHV3_SHADOW_KEY, accountId: acct, paramsHash: S(job.snapshotParamsHash) }); } catch (_e) { shadow = null; }
+    hydShadow = await hydrate(shadow);
+    const shadowParams = shadow && shadow.params && typeof shadow.params === "object" && !Array.isArray(shadow.params) ? shadow.params : null;
+    if (shadowParams) {
+      let liveParams = null;
+      try { liveParams = contract.liveParams(shadowParams); } catch (_e) { liveParams = null; }
+      const candHash = liveParams ? computeHash(contract.liveReportVersion, liveParams) : null;
+      if (candHash) {
+        try { live = await readSnapshot({ reportKey: contract.liveReportKey, accountId: acct, paramsHash: candHash }); } catch (_e) { live = null; }
+        hydLive = await hydrate(live);
+        try { liveReadback = await verifyLiveReadback({ reportKey: LHV3_REPORT_KEY, liveReportKey: contract.liveReportKey, accountId: acct, paramsHash: candHash }); }
+        catch (_e) { liveReadback = { ok: false, reason: "readback-threw" }; }
+      }
+    }
+    let binding;
+    try {
+      binding = evaluatePublicationBinding({
+        revision, accountId: acct, reportKey: LHV3_REPORT_KEY, requestedAsOf: S(requestedAsOf), expectedShadowKey: LHV3_SHADOW_KEY,
+        job, shadow, hydratedShadowPayload: hydShadow, live, hydratedLivePayload: hydLive, liveReadback,
+        contract, computeHash, reportDerivations, revisionChangedReason: "job-does-not-cover-evidence",
+      });
+    } catch (_e) { binding = { state: PUBLICATION_STATE.STALE, reason: "binding-threw" }; }
+    if (!binding || binding.state !== PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED) {
+      const r = S(binding && binding.reason) || "binding-malformed";
+      return no(LHV3_READBACK_BINDING_REASON.test(r) ? "readback" : "lineage", r);
+    }
+
+    // ---- (iii) LIVE READ-BACK: the dashboard's served selector must return EXACTLY that proven live row ----
+    let served;
+    try { served = await selectServed({ accountId: acct, requestedAsOf: S(requestedAsOf) }); } catch (_e) { served = { row: null, reason: "read-failed", via: null }; }
+    let verdict;
+    try { verdict = defaultServedVerdict(served, servedRowIdentity(live)); } catch (_e) { verdict = { ok: false, reason: "verdict-threw" }; }
+    if (!verdict || verdict.ok !== true) return no("readback", "served-" + S(verdict && verdict.reason));
+    return { ok: true, check: null, reason: null };
+  };
+}
+
+// Run the already-current proof for each account, SEQUENTIALLY (deterministic order, bounded read load). A missing
+// proof / thrown proof / malformed result is a REAL failure (fail closed). `runEvidenceOf(accountId)` (refused path)
+// must prove the run's own durable evidence first. -> [{ accountId, current, check, reason, detail }]
+async function evaluateAlreadyCurrent({ accounts, prove, requestedAsOf, excludeCycleId, prefix, runEvidenceOf = null }) {
+  const out = [];
+  for (const a of accounts) {
+    const accountId = S(a && a.accountId);
+    const realFailure = (check, detail) => out.push({ accountId, current: false, check, reason: `${prefix}:${check}`, detail: reasonToken(detail) });
+    if (typeof prove !== "function") { realFailure("content", "proof-unavailable"); continue; }
+    let runEvidence = null;
+    if (typeof runEvidenceOf === "function") {
+      const re = runEvidenceOf(accountId);
+      if (!re || re.ok !== true) { realFailure("content", (re && re.reason) || "run-evidence-not-durable"); continue; }
+      runEvidence = re.evidence;
+    }
+    let r;
+    try { r = await prove({ accountId, country: a && a.country != null ? a.country : null, requestedAsOf, excludeCycleId, runEvidence }); }
+    catch (_e) { r = { ok: false, check: "content", reason: "proof-threw" }; }
+    if (r && r.ok === true) { out.push({ accountId, current: true, check: null, reason: null, detail: null }); continue; }
+    realFailure(LHV3_ALREADY_CURRENT_CHECKS.includes(r && r.check) ? r.check : "content", (r && r.reason) || "proof-malformed");
+  }
+  return out;
+}
+
+// The run's OWN durable evidence for one account (refused path): BOTH durable families were persisted by THIS pass as
+// 'replaced' | 'unchanged' with a content sha (materialize summary.durableByAccount). Anything else fails closed.
+function runEvidenceFromMaterialize(matSummary, accountId) {
+  const byAcct = matSummary && matSummary.durableByAccount && typeof matSummary.durableByAccount === "object" ? matSummary.durableByAccount : null;
+  const rec = byAcct && Object.prototype.hasOwnProperty.call(byAcct, accountId) ? byAcct[accountId] : null;
+  const l = rec ? rec[LHV3_RUN_EVIDENCE_KEYS.listings] : null;
+  const r = rec ? rec[LHV3_RUN_EVIDENCE_KEYS.listingsRaw] : null;
+  const good = (e) => !!e && LHV3_RUN_EVIDENCE_ACKS.has(S(e.ack)) && S(e.payloadSha).trim() !== "";
+  if (!good(l)) return { ok: false, reason: "run-evidence-not-durable:" + (l ? reasonToken(l.ack) : "missing") };
+  if (!good(r)) return { ok: false, reason: "run-evidence-not-durable:" + (r ? reasonToken(r.ack) : "missing") };
+  return { ok: true, evidence: { listingsPayloadSha: S(l.payloadSha), rawPayloadSha: S(r.payloadSha) } };
+}
+
+// Aggregate per-account results into the evidence counters. refusedReal = accounts whose write was refused (the
+// terminal base cycle refuses every append; a failed shadow save) and that did NOT prove already-current.
+function alreadyCurrentCounts(results) {
+  const refusals = results.filter((r) => !r.current).map((r) => ({ accountId: r.accountId, reason: r.reason, detail: r.detail }));
+  return { alreadyCurrent: results.filter((r) => r.current).length, refusedReal: refusals.length, refusals };
+}
+
 /**
  * Run (or dry-run) the dedicated Listing Health v3 ingestion for ONE region + cycle. INJECTABLE collaborators:
  *   discoverAccounts()                    -> [{ accountId, country, currency, name }]  (authoritative primary directory)
@@ -136,11 +431,19 @@ export async function planListingHealthV3IngestionCost({ plan, getSourceExportCa
  *   materialize({plans,connections})      -> materialization summary                    (per-account aliases)
  *   runReports({plan,region,cycleDate})   -> { succeeded, blocked, failed, drained }    (shadow snapshot derive/save)
  *   finalizeCycle({region,cycleDate})     -> { disposition, status, cycleId }            (guarded finalize_sync_cycle)
+ * WP16 OPTIONAL collaborators (all default null => byte-identical pre-WP16 behaviour):
+ *   readBaseCycle({region,cycleDate})     -> { id, status } | null  (the dedicated base cycle head; read-only)
+ *   readCycleJobs({region,cycleDate})     -> { cycleId, reportJobs:[...], sourceJobs:[...] } (durable rows; read-only)
+ *   proveAlreadyCurrent(args)             -> buildListingHealthV3AlreadyCurrentProof(...) result
  * Config: region, cycleDate, mode ("dry-run"|"live"), authorized (bool), gate ({enabled}), connections,
  *   ceiling (override), emergencyReserveTokens, reservationSupported (store capability), pricingKnown.
  * A LIVE scheduled operation is a SUCCESS (ok:true, phase:"complete") ONLY when the dedicated cycle finalizes to a
  * DURABLE terminal status "succeeded" (zero source/report failures). partial/failed/open-work/deferred all return
- * ok:false so the CLI exits nonzero, while last-known-good is preserved (no snapshot is rolled back).
+ * ok:false so the CLI exits nonzero, while last-known-good is preserved (no snapshot is rolled back). WP16 adds exactly
+ * two further successes, both requiring EVERY account to be published or PROVEN already-current: (1) a base cycle that
+ * was ALREADY terminal before this run (zero appends, zero exports, every account proven already-current); (2) a
+ * 'partial' finalize whose ONLY non-successes are failed natural shadow saves each proven already-current (no source
+ * failure, no other report failure).
  */
 export async function runListingHealthV3Ingestion({
   region, cycleDate, mode = "dry-run",
@@ -160,6 +463,9 @@ export async function runListingHealthV3Ingestion({
   readAuthorization = readListingHealthV3Authorization,
   pricingRevision = LISTING_HEALTH_V3_PRICING_REVISION,
   reservationSupported = true, pricingKnown = true,
+  // WP16 (terminal-cycle replay + refused-shadow semantics): OPTIONAL read-only collaborators, default ABSENT so every
+  // existing caller/test is byte-identical. See buildListingHealthV3AlreadyCurrentProof.
+  readBaseCycle = null, readCycleJobs = null, proveAlreadyCurrent = null,
   now = () => Date.now(), log = () => {},
 } = {}) {
   const dryRun = mode !== "live";
@@ -233,6 +539,61 @@ export async function runListingHealthV3Ingestion({
   // account's inventory is not adoptable" gate is REMOVED: it blocked every account on one account's FBA gap. The
   // paid-create budget/ceiling/identity/authorization/balance gates below are UNCHANGED (they gate listings/
   // listings-raw creates only), and inventory stays REUSE-ONLY (the inventoryCreated hard-guard still fails closed).
+
+  // 7a) WP16 TERMINAL BASE CYCLE (LIVE only; opt-in -- readBaseCycle absent => byte-identical). The dedicated base cycle
+  //     listing-health-v3-<region>/<cycleDate> can already be TERMINAL before this run (an earlier operation -- e.g. an
+  //     owner-authorized Listings-only ingestion -- finalized it). Every child append to it is refused by the durable
+  //     reject_append_to_terminal_cycle trigger, so the run must NEVER reach runSources / materialize / runReports /
+  //     finalize (nor the authorization / binding / DataDoe balance reads that only guard paid work): it is decided HERE,
+  //     read-only -- ZERO creates, ZERO DataDoe exports/polls/downloads/balance reads, ZERO cycle/job/shadow writes. Each
+  //     regional account is 'already-current' ONLY by the three-part proof (content + lineage + live/served read-back);
+  //     any other account is a REAL typed failure 'base-cycle-terminal:not-current:<check>' (LKG preserved; the zero-
+  //     export reconciler / recovery worker republishes from durable evidence -- the natural job never re-acquires).
+  //     A base-cycle read error fails closed. A pending/running/absent base cycle continues on the UNCHANGED path.
+  //     KNOWN LIMITATION (WP16 P3-A, decided with evidence -- materialize is deliberately NOT run on this path): a cycle
+  //     that finalized with a MISSING / stale durable Listings or Listings-Raw pointer (materialize's FAIL-SOFT durable
+  //     write: schema-missing / write-failed / skipped-evidence / stale-save) is NOT repaired by a same-date rerun. Running
+  //     materialize here is NOT provably safe: (1) the Listings / Listings-Raw batch request_hash is DATE-FREE (freshness
+  //     travels as a non-hash field), so the export-cache entry under it is proven fresh for THIS cycle only by runSources
+  //     (a create, or an adoption only when fetched_at >= freshnessNotBefore) -- which this read-only path never runs, so
+  //     nothing here proves a cached entry under a planned hash is not OLDER than this cycle's boundary; and (2) the durable
+  //     record RPC is as_of-DOMINANT (p_as_of > existing.as_of -> 'replaced' REGARDLESS of validated_at; migrations
+  //     20260926/20260927), so persisting such an older cached batch under as_of = cycleDate would FALSELY advance -- and
+  //     could REGRESS -- the durable pointer. Instead each account is proven against the durable evidence AS IT STANDS:
+  //     truthfully typed 'base-cycle-terminal:not-current:content' when it is absent / differs, LKG preserved; the next
+  //     cycle date's natural run re-persists the durable pointer from a runSources-proven fresh batch (materialize
+  //     persists durable on the alias skippedStale path too), and the zero-export reconciler publishes from it.
+  if (!dryRun && typeof readBaseCycle === "function") {
+    let base;
+    try { base = await readBaseCycle({ region: S(region), cycleDate: S(cycleDate) }); }
+    catch (e) { return fail("base-cycle", "base cycle unreadable (fail closed; zero appends, zero exports): " + safe(e)); }
+    const baseStatus = base ? S(base.status) : "";
+    if (base && TERMINAL_CYCLE_STATUSES.includes(baseStatus)) {
+      const results = await evaluateAlreadyCurrent({
+        accounts: regionAccounts, prove: proveAlreadyCurrent, requestedAsOf: S(cycleDate),
+        excludeCycleId: base.id == null ? null : S(base.id), prefix: "base-cycle-terminal:not-current",
+      });
+      const counts = alreadyCurrentCounts(results);
+      emit("LHV3_ALREADY_CURRENT", {
+        runId: ev.operationId, region: ev.region, cycleDate: ev.cycleDate, path: "base-cycle-terminal", baseCycleStatus: baseStatus,
+        accounts: results.length, alreadyCurrent: counts.alreadyCurrent, refusedReal: counts.refusedReal,
+        refusals: counts.refusals.map((x) => ({ account: x.accountId, reason: x.reason, detail: x.detail })),
+      });
+      const out = {
+        ...ev, dryRun: false, creates: 0, tokens: 0, snapshots: 0,
+        baseCycleTerminal: true, baseCycleStatus: baseStatus, cycleStatus: baseStatus, ...counts,
+      };
+      if (counts.refusedReal === 0 && counts.alreadyCurrent === results.length) {
+        return { ...out, phase: "complete", ok: true, note: `base cycle already terminal (${baseStatus}) before this run: every one of ${results.length} account(s) PROVEN already-current (content + lineage + live/served read-back); zero appends, zero exports.` };
+      }
+      return {
+        ...out, phase: "base-cycle-terminal", ok: false,
+        problems: [...ev.problems, `base-cycle-terminal:not-current for ${counts.refusedReal} of ${results.length} account(s)`],
+        note: `base cycle already terminal (${baseStatus}) before this run: ${counts.alreadyCurrent} account(s) proven already-current, ${counts.refusedReal} NOT current (typed); zero appends, zero exports; last-known-good preserved -- the zero-export listing-health-v3 reconciler republishes from durable evidence (the natural job never re-acquires).`,
+      };
+    }
+  }
+
   if (!dryRun) {
     if (pricingKnown !== true) return fail("budget", "DataDoe pricing state is unknown; refusing to create (fail closed)");
     if (reservationSupported !== true) return fail("budget", "atomic pre-POST create reservation is unavailable; refusing to create (fail closed)");
@@ -416,6 +777,51 @@ export async function runListingHealthV3Ingestion({
   }
   if (fin && fin.disposition === "open-work") {
     return { ...ev, phase: "incomplete", ok: false, note: "source/report work still open (cycle not drained) -- a retry will resume; last-known-good preserved" };
+  }
+  // 12b) WP16 REFUSED / FAILED SHADOW SAVE (opt-in -- readCycleJobs + proveAlreadyCurrent absent => byte-identical). The
+  //      cycle finalized 'partial' with report failures. Read the now-TERMINAL (hence immutable) cycle's durable job rows:
+  //      a report job whose derive SUCCEEDED but whose shadow save failed (save-stage SNAPSHOT_SAVE_FAILED -- the report
+  //      worker records EVERY saver throw, incl. a refusal, that way) is re-evaluated with the three-part already-current
+  //      proof, bound to the durable evidence THIS run persisted (materialize durableByAccount). The run is a SUCCESS
+  //      only when EVERY such account is proven already-current AND there is no source failure and no other report
+  //      failure; otherwise each unproven account is a REAL typed failure 'shadow-refused:<check>' (never counted by
+  //      timestamp). The job rows are never rewritten (the cycle stays honestly 'partial').
+  if (finalized && fin.status === "partial" && ev.reportFailed > 0 && typeof readCycleJobs === "function" && typeof proveAlreadyCurrent === "function") {
+    let jobs = null;
+    try { jobs = await readCycleJobs({ region: S(region), cycleDate: S(cycleDate) }); } catch (_e) { jobs = null; }
+    const reportJobs = jobs && Array.isArray(jobs.reportJobs) ? jobs.reportJobs : null;
+    const sourceJobs = jobs && Array.isArray(jobs.sourceJobs) ? jobs.sourceJobs : null;
+    if (!reportJobs || !sourceJobs) {
+      Object.assign(ev, { alreadyCurrent: 0, refusedReal: ev.reportFailed, refusals: [], refusalAudit: { read: "failed" } });
+    } else {
+      const f = (j, a, b) => (j ? (j[a] ?? j[b] ?? null) : null);
+      const isSucceeded = (j) => f(j, "derive_status", "deriveStatus") === "succeeded" && f(j, "save_status", "saveStatus") === "succeeded";
+      const isRefusedSave = (j) => f(j, "report_key", "reportKey") === LHV3_REPORT_KEY && f(j, "derive_status", "deriveStatus") === "succeeded"
+        && f(j, "save_status", "saveStatus") === "failed" && f(j, "error_stage", "errorStage") === "save" && f(j, "error_code", "errorCode") === "SNAPSHOT_SAVE_FAILED";
+      const refusedJobs = reportJobs.filter((j) => !isSucceeded(j) && isRefusedSave(j));
+      const otherFailures = reportJobs.filter((j) => !isSucceeded(j) && !isRefusedSave(j)).length;
+      const sourceFailed = sourceJobs.filter((j) => f(j, "fetch_status", "fetchStatus") === "failed").length;
+      const byId = new Map(regionAccounts.map((a) => [S(a.accountId), a]));
+      const results = await evaluateAlreadyCurrent({
+        accounts: refusedJobs.map((j) => byId.get(S(f(j, "account_id", "accountId"))) || { accountId: S(f(j, "account_id", "accountId")), country: null }),
+        prove: proveAlreadyCurrent, requestedAsOf: S(cycleDate),
+        excludeCycleId: S(jobs.cycleId || (fin && fin.cycleId) || "") || null, prefix: "shadow-refused",
+        runEvidenceOf: (accountId) => runEvidenceFromMaterialize(matSummary, accountId),
+      });
+      const counts = alreadyCurrentCounts(results);
+      Object.assign(ev, counts, { refusalAudit: { read: "ok", reportJobs: reportJobs.length, refusedSaves: refusedJobs.length, otherReportFailures: otherFailures, sourceFailed } });
+      emit("LHV3_ALREADY_CURRENT", {
+        runId: ev.operationId, region: ev.region, cycleDate: ev.cycleDate, path: "shadow-refused", cycleStatus: S(fin.status),
+        accounts: results.length, alreadyCurrent: counts.alreadyCurrent, refusedReal: counts.refusedReal, otherReportFailures: otherFailures, sourceFailed,
+        refusals: counts.refusals.map((x) => ({ account: x.accountId, reason: x.reason, detail: x.detail })),
+      });
+      if (refusedJobs.length > 0 && counts.refusedReal === 0 && counts.alreadyCurrent === refusedJobs.length && otherFailures === 0 && sourceFailed === 0) {
+        return {
+          ...ev, phase: "complete", ok: true, dryRun: false, cycleStatus: "partial",
+          note: `cycle finalized partial ONLY because ${refusedJobs.length} natural shadow save(s) failed; every one PROVEN already-current (content + lineage + live/served read-back) -- every account is published or already-current; job rows unchanged (honest partial).`,
+        };
+      }
+    }
   }
   // partial | failed | not-found | invalid-status | finalized-but-not-succeeded -> honest non-success.
   return {

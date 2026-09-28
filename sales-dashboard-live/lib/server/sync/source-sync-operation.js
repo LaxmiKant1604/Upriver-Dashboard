@@ -76,6 +76,36 @@ const OK_FINALIZE = new Set(["finalized", "already-terminal"]);
 const OK_PUBLISH = new Set(["published", "already-current"]);
 
 /**
+ * WP10b: the release's REMAINING paid exposure under an owner-approved ceiling (read-only). The priority release can
+ * create at most ONE org Catalog export per operation key, authorized only by winning the durable reservation: ANY
+ * existing reservation row (created, or reserved-but-unrecorded / hash-mismatch, both of which the guard refuses to
+ * re-create) means ZERO further spend; no row means one standard create. Returns a typed zero-create refusal when that
+ * exposure exceeds the remaining approval (or the approval / reservation cannot be read), else null.
+ */
+export async function releaseApprovalRefusal({ release, approvedTokenCeiling } = {}) {
+  const remainingTokens = Number(approvedTokenCeiling && approvedTokenCeiling.remainingTokens);
+  if (!Number.isFinite(remainingTokens)) {
+    return { phase: "approval", ok: false, refused: true, code: "PAID_APPROVAL_EXCEEDED", reason: "approval-malformed", problems: ["paid approval ceiling malformed; refusing before the derive (zero creates)"] };
+  }
+  if (typeof release.catalogReservation !== "function") {
+    return { phase: "approval", ok: false, refused: true, code: "PAID_APPROVAL_UNVERIFIABLE", problems: ["release exposes no catalog reservation reader; the paid exposure cannot be proven (zero creates)"] };
+  }
+  let reservation;
+  try { reservation = await release.catalogReservation(null); }
+  catch (e) {
+    return { phase: "approval", ok: false, refused: true, code: "PAID_APPROVAL_UNVERIFIABLE", problems: ["catalog reservation unreadable: " + S(e && e.message).slice(0, 200) + " (zero creates)"] };
+  }
+  const exposureTokens = reservation ? 0 : PRIORITY_DASHBOARDS.catalogTokenCost;
+  if (exposureTokens > remainingTokens) {
+    return {
+      phase: "approval", ok: false, refused: true, code: "PAID_APPROVAL_EXCEEDED", exposureTokens, remainingTokens,
+      problems: ["the release Catalog export (" + exposureTokens + " tokens) exceeds the remaining approved " + remainingTokens + " token(s); refusing before the derive (zero creates)"],
+    };
+  }
+  return null;
+}
+
+/**
  * ONE bounded slice of the post-sync RELEASE for a bucket: derive (resumable) -> runner-grade consistency
  * assertion -> finalize -> preflight EVERY account -> open controls, publish until the slice budget runs out,
  * ALWAYS safe-close -> exact live read-back. Stateless-resumable: every phase re-proves from DURABLE state
@@ -93,11 +123,20 @@ const OK_PUBLISH = new Set(["published", "already-current"]);
  *   log            -- optional narration sink (safe strings only).
  * }
  */
-export async function runReleaseSlice({ bucket, release, controls, readbackLive, outOfTime = () => false, log = () => {} } = {}) {
+export async function runReleaseSlice({ bucket, release, controls, readbackLive, outOfTime = () => false, log = () => {},
+  // PUBLICATION RECOVERY WP10b -- OPTIONAL owner-approved paid-sync ceiling { remainingTokens } (admin Data Sync Center
+  // only; the operators / scheduler never pass it). The release's ONLY possible paid create is the date's one priority
+  // Catalog export (durable reservation, PRIORITY_DASHBOARDS.catalogTokenCost); when set, that exposure must fit the
+  // remaining approval BEFORE the derive runs, else a typed zero-create refusal. null => byte-identical (no read).
+  approvedTokenCeiling = null } = {}) {
   if (bucket !== "us" && bucket !== "non-us") return { phase: "validate", ok: false, problems: ["bad-bucket"] };
   if (!release || typeof release.deriveBucket !== "function") return { phase: "validate", ok: false, problems: ["release-surface-missing"] };
   if (!controls || typeof controls.apply !== "function" || typeof controls.close !== "function") return { phase: "validate", ok: false, problems: ["controls-missing"] };
   if (typeof readbackLive !== "function") return { phase: "validate", ok: false, problems: ["readback-missing"] };
+  if (approvedTokenCeiling != null) {
+    const refusal = await releaseApprovalRefusal({ release, approvedTokenCeiling });
+    if (refusal) return refusal;
+  }
 
   // (1) DERIVE (resumable). A stopped derive is a typed failure with LKG intact; an out-of-budget derive is a
   // continuation, never a failure.

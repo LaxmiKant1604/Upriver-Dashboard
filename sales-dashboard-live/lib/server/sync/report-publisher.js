@@ -84,6 +84,36 @@ const portfolioMembers = (p) => {
 };
 const semOk = { ok: true };
 const semFail = (reason) => ({ ok: false, reason });
+
+// ---- SKU Movement ROUTE target identity (WP1 follow-up F2) -----------------------------------------------------------
+// The ONE canonical target id of a SKU Movement (owner account, brand) unit: "sku-movement:<owner>::<canonical brand>".
+// The canonical brand is the serve's scope brand (api/datadoe.js serveSelfHealingSkuMovement + report-materialization-
+// operation.js canonicalBrand): trimmed, blank -> "ALL", case PRESERVED (the stored scope is case-sensitive). The owner
+// is taken VERBATIM and must be a canonical id (nonblank, untrimmed-equal) -- a padded/blank/non-string owner yields
+// null (never trimmed into another account's target). Used by the sku-movement contract's targetIdentity below AND by
+// the route that keys its jobs + shadows, so both sides derive the SAME id from one helper.
+export const SKU_MOVEMENT_TARGET_PREFIX = "sku-movement:";
+export function skuMovementCanonicalBrand(brand) {
+  const s = String(brand ?? "").trim();
+  return s === "" ? "ALL" : s;
+}
+export function skuMovementTargetId(ownerAccountId, brand) {
+  if (typeof ownerAccountId !== "string" || ownerAccountId.trim() === "" || ownerAccountId !== ownerAccountId.trim()) return null;
+  return SKU_MOVEMENT_TARGET_PREFIX + ownerAccountId + "::" + skuMovementCanonicalBrand(brand);
+}
+// SKU Movement payload self-identity (sku-movement-core skuMovementPayload, built by rederiveSkuMovement with the owner
+// account): its OWN honest as-of, account and brand scope must equal the live identity it is promoted under -- the
+// effectiveAsOf is the identity asOf, the accountId is the LIVE (owner) account, the brand is the identity brand, and
+// brandFiltered agrees with that brand (a named brand is filtered; "ALL" in any case is not). A structurally-valid
+// payload derived for another account / brand / day / scope is never promoted (and never read back as current).
+const skuMovementSemanticIdentity = (payload, { accountId, liveParams } = {}) => {
+  if (!payload || typeof payload !== "object" || !liveParams || typeof liveParams !== "object") return semFail("payload-not-object");
+  if (!isDate(payload.effectiveAsOf) || payload.effectiveAsOf !== liveParams.asOf) return semFail("payload-effective-asof-mismatch");
+  if (typeof payload.accountId !== "string" || payload.accountId === "" || payload.accountId !== accountId) return semFail("payload-account-mismatch");
+  if (typeof payload.brand !== "string" || payload.brand !== liveParams.brand) return semFail("payload-brand-mismatch");
+  if (payload.brandFiltered !== (String(liveParams.brand).toUpperCase() !== "ALL")) return semFail("payload-brand-scope-mismatch");
+  return semOk;
+};
 // Brand View payload self-identity (assembleBrandViewPayload): the payload's OWN scope/brand/asOf (and, for the
 // single-account view, its accountId) must equal the live identity it is promoted under.
 const brandViewSemanticIdentity = (scope) => (payload, { liveParams } = {}) => {
@@ -194,7 +224,8 @@ export const SCHEDULER_LIVE_SNAPSHOT_CONTRACTS = Object.freeze({
   // row the page reads. The shadow is saved at scheduler-v2/<publisher key> keyed by the route TARGET id (params
   // .accountId === targetId); the hooks map that target onto the live account + the gate accounts.
   // SKU Movement (api/datadoe.js sharedSnapshotSpec "sku-movement": params { asOf, brand } at the RAW account). The
-  // target is one (account, brand) unit ("sku-movement:<acct>::<brand>"); the live row + both gates are the owner.
+  // target is one (account, brand) unit (skuMovementTargetId: "sku-movement:<acct>::<brand>"); the live row + both gates
+  // are the owner.
   "sku-movement": Object.freeze({
     liveReportKey: "sku-movement", liveReportVersion: "sku-movement/v2",
     liveParams: (p) => (isDate(p.asOf) && nb(p.brand) ? { asOf: p.asOf, brand: norm(p.brand) } : null),
@@ -202,10 +233,12 @@ export const SCHEDULER_LIVE_SNAPSHOT_CONTRACTS = Object.freeze({
     // Ids are passed through VERBATIM: the shared helpers refuse a noncanonical id (never trimmed into another account).
     liveAccountId: (p) => p.ownerAccountId,
     gateAccountIds: (p) => [p.ownerAccountId],
+    // F2: the job/shadow TARGET must BE the canonical target of the shadow's (owner, brand) -- a job keyed for target X
+    // can never promote another account's or another brand's shadow (invalid-snapshot BEFORE any gate read / write).
+    targetIdentity: (p, targetId) => nb(p.brand) && typeof targetId === "string" && skuMovementTargetId(p.ownerAccountId, p.brand) === targetId,
     liveParamsExtra: pickExtra("evidenceToken", "serveToken", "manifestToken"),
-    // The payload's own honest as-of must be the identity as-of (sku-movement-core skuMovementPayload.effectiveAsOf).
-    semanticIdentity: (payload, { liveParams } = {}) => (payload && typeof payload === "object" && liveParams
-      && isDate(payload.effectiveAsOf) && payload.effectiveAsOf === liveParams.asOf ? semOk : semFail("payload-effective-asof-mismatch")),
+    // The payload's own as-of + account + brand scope must be the live identity (skuMovementSemanticIdentity above).
+    semanticIdentity: skuMovementSemanticIdentity,
   }),
   // Returns & Refund Leakage v3 (api/datadoe.js serveSelfHealingReturns: report_key "returns-leakage", version
   // RETURNS_ADVANCED_VERSION, params { to }). A PUBLISHER key distinct from the v2 dispatch contract above (which is
@@ -258,7 +291,9 @@ export const SCHEDULER_LIVE_SNAPSHOT_CONTRACTS = Object.freeze({
       const members = Array.isArray(p.members) ? portfolioMembers(p) : null;
       return !!members && nb(p.brand) && targetId === brandViewPortfolioScopeId(members, norm(p.brand));
     },
-    liveParamsExtra: pickExtra("depFingerprint", "evidenceToken"),
+    // manifestToken = the route's PER-UNIT manifest (only this brand unit's inputs): stored so a region-token advance
+    // that leaves the unit's inputs unchanged is provably current from the live row itself (never re-published).
+    liveParamsExtra: pickExtra("depFingerprint", "evidenceToken", "manifestToken"),
     semanticIdentity: brandViewSemanticIdentity("portfolio"),
   }),
 });
@@ -537,8 +572,12 @@ export async function publishSchedulerV2Snapshot(deps, { reportKey, accountId, p
     const disposition = res && CAS_OUTCOME_DISPOSITION[res.outcome];
     if (disposition) return { disposition, ...out };
     return { disposition: "publish-failed", ...base };
-  } catch (_e) {
-    // NEVER a raw error in the result; live LKG untouched (the CAS write either fully happened or did not).
-    return { disposition: "publish-failed", ...base };
+  } catch (e) {
+    // NEVER a raw error in the result; live LKG untouched (the CAS write either fully happened or did not). ONE typed bit
+    // is surfaced (WP14 final review P2-1): a refusal by the DB WRITER FENCE (SQLSTATE RWF01 / 'REPORT_WRITER_FENCED:<key>'
+    // -- from a FENCED writer a defect or a fence / deploy mismatch) sets writerFenced:true so a caller can type it; the
+    // disposition and every other field are exactly as before (absent for any other error: byte-identical).
+    const fenced = !!e && (String(e.code || "") === "RWF01" || /REPORT_WRITER_FENCED/.test(String(e.message || "")));
+    return fenced ? { disposition: "publish-failed", writerFenced: true, ...base } : { disposition: "publish-failed", ...base };
   }
 }

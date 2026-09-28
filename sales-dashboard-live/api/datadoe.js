@@ -40,11 +40,13 @@ import {
   getInventorySnapshotCandidates,
   getLatestSourceProvenance,
   getReportSnapshot,
+  getReportSnapshotStoragePayload,
   getReportSnapshotsOlderThan,
   getTrustedAccountBrands,
   getSourceCoverageWindows,
   getSourceOliHistoryRows,
   getSourceOliOperationalUnitRows,
+  getSourceOliOperationalUnitStats,
   getSourceOliSalesEstimateRows,
   getOliSkuAsinResolutionRows,
   getAccountDirectorySnapshotAccounts,
@@ -117,7 +119,11 @@ import {
   MANUAL_CONTINUATION_IN_PROGRESS,
   isManualSourceContinuationError,
 } from "../lib/server/manual-source-continuation.js";
-import { beginSharedRefresh, paramsHashFor, serveSharedReport, wantsRefresh } from "../lib/server/report-store.js";
+import {
+  beginSharedRefresh, paramsHashFor, serveSharedReport, wantsRefresh,
+  // Publication recovery WP10b: the refresh=1 READ-ONLY contract for route-owned live reports + the paid-sync descriptor.
+  isRouteOwnedLiveReportKey, routeOwnedPaidSync, ROUTE_OWNED_REPORT_READ_ONLY,
+} from "../lib/server/report-store.js";
 import { makeCompletenessAugment, makePortfolioCompletenessAugment } from "../lib/server/reports/oli-completeness-serve.js";
 
 // The primary connection's org fingerprint (for the serve-time two-layer completeness augments). Null if no primary.
@@ -151,25 +157,25 @@ function campaignMappingsReader() {
 // the same dependency set with the same readers, the serve's `contributingDepFingerprint` and the stored snapshot's
 // `params.depFingerprint` agree by construction: they match iff nothing changed, and differ (either direction --
 // including an optional dependency that became available/unavailable) the moment any dependency advances (Defect B).
+// Publication recovery WP10: the readers object is built by the ONE shared factory (brand-view-dependency-readers.js
+// makeBrandViewDepReaders -- the materializer's composition and the brand-view / brand-view-portfolio recovery routes
+// use it too), over this serve's own REST readers. A PURE refactor: every reader is the former inline one verbatim --
+// the snapshot meta / Ads coverage / inventory candidates read with the same fail-soft .catch(() => null), the org
+// campaign mappings through makeCampaignMappingsReader (== campaignMappingsReader: [] without a primary org or on a read
+// failure), the catalog validated_at through makeCatalogValidatedAtReader (a failed or absent pointer -> null), and
+// Round-4 Defect 2's SELECTED authoritative inventory compact (getInventorySnapshotCandidates ->
+// selectAuthoritativeInventorySnapshot), so a selected-row change still flips the serve fingerprint.
 function brandViewDepFingerprintReaders() {
-  const fp = primaryOrgFingerprintOrNull();
-  const mappings = campaignMappingsReader();
-  return {
-    getSnapshotMeta: ({ reportKey, accountId }) => getLatestReportSnapshotMeta({ reportKey, accountId }).catch(() => null),
-    getAdsCoverage: (accountId) => getDailyAdsCoverage(accountId, ACTIVE_ADS_SOURCE_KEY).catch(() => null),
-    getMappingRev: async (accountId) => campaignMappingRevision(await mappings({ accountId }).catch(() => [])),
-    getCatalogValidatedAt: async () => {
-      if (!fp) return null;
-      const read = await getSourceSnapshot({ organizationFingerprint: fp, connectionId: "primary", sourceKey: "product-catalog", scopeKey: "__organization" }).catch(() => null);
-      const ptr = read && typeof read === "object" && "snapshot" in read ? read.snapshot : read;
-      return (ptr && (ptr.validated_at || ptr.payload_sha)) || null;
+  return makeBrandViewDepReaders({
+    orgFp: primaryOrgFingerprintOrNull(),
+    readers: {
+      getSnapshotMeta: getLatestReportSnapshotMeta,
+      getAdsCoverageState: getDailyAdsCoverage,
+      getInventoryCandidates: getInventorySnapshotCandidates,
+      getMappings: getCampaignBrandMappings,
+      getSourceSnap: getSourceSnapshot,
     },
-    // Round-4 Defect 2: fingerprint the SELECTED authoritative compact (available LKG the builder serves), NOT the
-    // latest brand-inventory row -- so a selected-row change flips the serve fingerprint even when the latest
-    // placeholder is unchanged. Identical selection to the materializer => writer + serve agree.
-    getInventorySelected: (accountId) => getInventorySnapshotCandidates({ reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, accountId, reportVersion: BRAND_INVENTORY_REPORT_VERSION })
-      .then((rows) => selectAuthoritativeInventorySnapshot(rows)).catch(() => null),
-  };
+  });
 }
 import { makeRouteDeadline } from "../lib/server/sync/source-bucket-sync-runtime.js";
 // Regional Brand View: server-side region validation + trusted-metadata membership filter (pure helpers over the
@@ -207,19 +213,26 @@ import {
   buildBrandViewPortfolioSnapshot,
   buildBrandViewSnapshot,
   buildBrandInventorySnapshot,
-  selectAuthoritativeInventorySnapshot,
 } from "../lib/server/reports/brand-view.js";
 import {
-  selectorBrandsForAccount, buildBrandAccountMembership, brandKey, brandDisplay,
+  selectorBrandsForAccount, brandKey, brandDisplay,
   serialiseBrandAccountMembership, membershipFingerprint, primaryAccountIdsOnly,
 } from "../lib/server/reports/brand-membership.js";
-import { canonicalizeAdRows } from "../lib/server/sync/daily-ads-loader.js";
-import { refreshCorrectedBrandSalesForAccount } from "../lib/server/reports/brand-sales-live.js";
+// Publication recovery WP10: the portfolio directory MEMBERSHIP (+ its brand-name read of a saved payload) is the ONE
+// pure implementation the brand-view-portfolio recovery route shares, and the Brand View dependency-fingerprint readers
+// come from the ONE shared factory -- so writer, route and serve can never drift.
+import { snapshotBrandNames, computeBrandDirectoryMembership } from "../lib/server/reports/brand-directory-membership.js";
+import { makeBrandViewDepReaders } from "../lib/server/sync/brand-view-dependency-readers.js";
 import { summarizeExplicitZeroOli, brandByAsinFromCatalog } from "../lib/server/reports/oli-quality.js";
 import { rederiveDailyV2, latestProvenDailyTo, DAILY_OLI_SOURCE_KEY } from "../lib/server/reports/daily-durable-rederive.js";
 import { campaignMappingRevision } from "../lib/server/reports/campaign-ads-aggregation.js";
 import { collectBrandViewDependencyFingerprint } from "../lib/server/reports/brand-view-dependency-fingerprint.js";
 import { rederiveSkuMovement, skuMovementProvenDates, skuMovementRefreshedAt } from "../lib/server/reports/sku-movement-durable-rederive.js";
+// SKU Movement serve token (publication recovery WP10; THE SERVE-SIDE CONTRACT in sku-movement-evidence.js): the ONE
+// definition the sku-movement recovery route stamps into params.serveToken and this serve recomputes.
+import {
+  computeSkuServeToken, skuServeOpunitsWindow, skuMovementStoredIsCurrent, stripStoredExtras,
+} from "../lib/server/reports/sku-movement-evidence.js";
 import { gatherReturnsEvidence } from "../lib/server/reports/returns-publish.js";
 import { RETURNS_ADVANCED_VERSION } from "../lib/server/reports/returns-advanced.js";
 import { organizationFingerprint } from "../lib/server/source-identity.js";
@@ -272,6 +285,95 @@ function singleAccountId(req, res, label) {
     return null;
   }
   return ids;
+}
+
+/* =====================================================================================================================
+   PUBLICATION RECOVERY WP10b -- refresh=1 INVENTORY + the READ-ONLY contract for ROUTE-OWNED live reports.
+
+   INVENTORY of every refresh=1 / force-refresh path of this route (line numbers = the pre-WP10b file):
+     :2764  brand-inventory refresh=1 admin gate (it guarded the retired PAID export)  -> REMOVED (refresh=1 is read-only).
+     :2786-2803 + :3325-3366  brand-directory sync: DataDoe accounts GET + PAID Product Catalog exports (<=1 per
+            invocation) -> writes brand-catalog / brand-catalog-attempt / brand-catalog-action / account-directory /
+            brand-directory (all UNFENCED keys)                                         -> unchanged (manual-paid).
+     :2832  brand-portfolio serveSharedReport(refresh) -> zero-export rebuild -> writes brand-portfolio (unfenced)
+                                                                                        -> unchanged.
+     :2876  brand-view-brands brandViewDirectory({ rebuild }) -> read-only re-derive (no write)  -> READ-ONLY + notice.
+     :2949  brand-view serveSharedReport(refresh) -> zero-export build -> lock + saveReportSnapshot(brand-view)
+                                                                                        -> READ-ONLY (latest row).
+     :3060  brand-view-portfolio serveSharedReport(refresh, 52s deadline) -> zero-export build -> lock + save
+            (brand-view-portfolio)                                                      -> READ-ONLY (latest row).
+     :3266  sku-movement serveSelfHealingSkuMovement (refresh ignored; read-only re-derive) -> READ-ONLY + notice.
+     :3284  legacy shared refresh (report-store beginSharedRefresh: lock, then sendLegacyPayload -> finish ->
+            saveReportSnapshot) for:
+              :3298 accounts (DataDoe accounts GET; zero tokens) -> account-directory   -> unchanged.
+              :3420 sales (PAID dashboard export) -> "sales"                            -> unchanged (manual-paid).
+              :3436 brand-sales: lock released, then refreshCorrectedBrandSalesForAccount (zero-export durable derive +
+                    UNFENCED saveReportSnapshot of brand-sales, brand-sales-live.js)    -> READ-ONLY; writer REMOVED.
+              :3464 brand-inventory (PAID FBA Inventory Health export) -> brand-inventory -> READ-ONLY; builder RETIRED.
+              :3524 daily (PAID OLI + Product Catalog exports) -> daily-reporting      -> READ-ONLY; builder RETIRED.
+              :3581 reconciliation / :3625 sku-pl / :3663 keyword-rank / :3763 content-changes (PAID) -> their own
+                    unfenced keys                                                      -> unchanged (manual-paid).
+              :3812 fba-plan (PAID OLI slices + Catalog + FBA Inventory Health + AWD Listings) -> fba-plan
+                                                                                        -> READ-ONLY; builder RETIRED.
+     :4104-4265 insight serveSharedReport(refresh): sales-movers / listing-health / buy-box-loss / ppc-performance /
+            listing-optimizer (PAID builders -> their own unfenced keys)                -> unchanged (manual-paid).
+     :4146  listing-health-v3 (refresh ignored; live resolver / read-only preview)     -> READ-ONLY + notice.
+     :4222  returns-leakage serveSelfHealingReturns(refresh) -> read-only re-derive (no write) -> READ-ONLY + notice.
+     :4307  sample (admin diagnostic export; not a refresh path)                        -> unchanged.
+
+   CONTRACT (default code, no flag): for every ROUTE-OWNED live key a refresh=1 is a READ -- it serves the latest
+   published row (or the serve's existing read-only derive from durable evidence), performs NO DataDoe call and NO
+   report_snapshots write (no beginSharedRefresh / lock / save / persist), keeps authn/authz + brand/account scoping
+   byte-identical, and answers the normal payload PLUS { refreshReadOnly: true, paidSync: { available (admin), how,
+   cards, surface, endpoint, confirmation } }. The explicit, owner-approved PAID sync is the admin Data Sync Center
+   (api/admin/sources.js POST: preview -> token estimate -> confirmation token -> fenced publish). The report-store
+   write paths refuse route-owned keys too (structural backstop), and the four retired paid builders below are a
+   defensive typed refusal (no DataDoe, no write) if ever reached. Manual-paid insight reports keep their
+   paid refresh (classified 'manual-paid / not-applicable': never counted as published).
+   ===================================================================================================================== */
+export const ROUTE_OWNED_ACTION_REPORT_KEYS = Object.freeze({
+  "brand-sales": "brand-sales",
+  daily: "daily-reporting",
+  "brand-inventory": "brand-inventory",
+  "listing-health-v3": "listing-health-v3",
+  "fba-plan": "fba-plan",
+  "sku-movement": "sku-movement",
+  "returns-leakage": "returns-leakage",
+  "brand-view": "brand-view",
+  "brand-view-portfolio": "brand-view-portfolio",
+  "brand-view-brands": "brand-view-brands",
+});
+export function routeOwnedReportKeyForAction(action) {
+  const key = Object.prototype.hasOwnProperty.call(ROUTE_OWNED_ACTION_REPORT_KEYS, action) ? ROUTE_OWNED_ACTION_REPORT_KEYS[action] : null;
+  return key && isRouteOwnedLiveReportKey(key) ? key : null;
+}
+
+// A response facade for a READ-ONLY refresh: every 2xx JSON object body gets { refreshReadOnly, paidSync } merged in;
+// status codes, error bodies and everything else pass through unchanged, so the served payload is exactly the
+// non-refresh read's payload plus the two fields.
+export function refreshReadOnlyResponse(res, notice) {
+  let statusCode = 200;
+  const facade = {
+    status(code) { statusCode = code; res.status(code); return facade; },
+    json(body) {
+      const decorate = statusCode >= 200 && statusCode < 300 && body && typeof body === "object" && !Array.isArray(body);
+      return res.json(decorate ? { ...body, ...notice } : body);
+    },
+    setHeader(...args) { return typeof res.setHeader === "function" ? res.setHeader(...args) : undefined; },
+  };
+  return facade;
+}
+
+// The typed refusal of a RETIRED paid builder of a route-owned key (a defensive stop: every well-formed request is served
+// read-only before it): no DataDoe call, no write -- the paid sync is the Data Sync Center action.
+function respondRouteOwnedBuilderRetired(res, reportKey, access) {
+  res.status(409).json({
+    error: "This report is published from saved data only; the dashboard refresh no longer runs a DataDoe export for it. An administrator can request a paid sync from the Data Sync Center.",
+    code: ROUTE_OWNED_REPORT_READ_ONLY,
+    reportKey,
+    refreshReadOnly: true,
+    paidSync: routeOwnedPaidSync(reportKey, { isAdmin: !!access && access.role === "admin" }),
+  });
 }
 
 function reportAsOf(req, res) {
@@ -857,21 +959,13 @@ async function buildBrandPortfolioSnapshot({ brand, accountIds, asOf }) {
   };
 }
 
-function snapshotBrandNames(payload) {
-  const names = new Set((payload?.catalogBrands || []).map((brand) => String(brand || "").trim()).filter(Boolean));
-  // Older Dashboard and SKU P&L snapshots predate catalogBrands on every
-  // payload, but their row records still carry the joined brand. This keeps
-  // the directory recoverable after a schema upgrade without any DataDoe call.
-  (payload?.rows || []).forEach((row) => {
-    const brand = row?.product_brand || row?.brand;
-    if (String(brand || "").trim()) names.add(String(brand).trim());
-  });
-  return [...names];
-}
-
+// snapshotBrandNames (the directory's brand-name read of a saved payload; it keeps "Unassigned") and the MEMBERSHIP
+// computation are imported from lib/server/reports/brand-directory-membership.js (publication recovery WP10: MOVED
+// verbatim -- the brand-view-portfolio recovery route computes the SAME membership, so a route-published portfolio row
+// carries exactly the account set + brand label this directory makes the page request).
 async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAttemptState = defaultGetCatalogAttemptState } = {}) {
   const selectorByKey = new Map();    // SELECTOR list (canonical key -> display): catalog(complete) UNION sales (+ fallbacks); never pins
-  const perAccountSales = [];         // MEMBERSHIP evidence: [{accountId, salesBrands}] -> buildBrandAccountMembership (canonical-key based)
+  const perAccountSales = [];         // MEMBERSHIP evidence: [{accountId, salesBrands}] -> computeBrandDirectoryMembership (canonical-key based)
   const salesMeta = [];               // fingerprint parts: [{accountId, updatedAt, paramsHash}] over the latest brand-sales identity per account
   const coveredAccountIds = new Set();
   const catalogPendingAccountIds = new Set();
@@ -883,8 +977,11 @@ async function sharedSnapshotBrandAccounts(accountIds, { actionId = null, getAtt
   // each other's summaries.
   const catalogActionFailures = new Map();
   const addSelector = (entries) => { for (const e of (entries || [])) if (e && e.key && !selectorByKey.has(e.key)) selectorByKey.set(e.key, e.display); };
+  // computeBrandDirectoryMembership == buildBrandAccountMembership over the primaryAccountIdsOnly-scoped entries: every
+  // entry pushed below is already a trimmed, de-duplicated, unprefixed id carrying its extracted salesBrands array, so
+  // its scope filter is a no-op here and the membership Map is byte-identical (the builder sorts by account id).
   const finalise = () => ({
-    membership: buildBrandAccountMembership(perAccountSales),
+    membership: computeBrandDirectoryMembership(perAccountSales).membership,
     selectorEntries: [...selectorByKey.entries()].map(([key, display]) => ({ key, display })),
     fingerprint: membershipFingerprint(salesMeta),
     coveredAccountIds, catalogPendingAccountIds, catalogUnavailable, catalogActionFailures,
@@ -1129,24 +1226,46 @@ async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, co
   };
 
   // CHEAP freshness probe (coverage + catalog metadata only -- NO history load, NO DataDoe): the current proven
-  // as-of + the provenance the derive WOULD stamp. Used to decide "serve stored" vs "re-derive".
+  // as-of + the provenance the derive WOULD stamp. Used to decide "serve stored" vs "re-derive". The coverage windows
+  // (each { from, to, updatedAt }) and the catalog payload_sha are kept for the WP10 serve token below.
   let effectiveAsOf = null;
   let freshRefreshedAt = null;
+  let oliWindows = [];
+  let catalogPayloadSha = null;
   try {
     const cov = await getSourceCoverageWindows({ organizationFingerprint: orgFp, connectionId: "primary", accountId, sourceKey: SKU_MOVEMENT_OLI_SOURCE_KEY });
-    const oliWindows = cov && cov.read === "ok" ? (cov.windows || []) : [];
+    oliWindows = cov && cov.read === "ok" ? (cov.windows || []) : [];
     ({ effectiveAsOf } = skuMovementProvenDates(oliWindows, ceiling));
     const catRead = await getSourceSnapshot({ organizationFingerprint: orgFp, connectionId: "primary", sourceKey: SKU_MOVEMENT_CATALOG_SOURCE_KEY, scopeKey: SKU_MOVEMENT_ORG_SCOPE });
     const catalogSnapshot = catRead && typeof catRead === "object" && "snapshot" in catRead ? catRead.snapshot : catRead;
+    catalogPayloadSha = catalogSnapshot ? catalogSnapshot.payload_sha : null;
     freshRefreshedAt = skuMovementRefreshedAt({ catalogSnapshot, effectiveAsOf });
   } catch (_e) { /* fall through: treat as evidence-advanced and let the derive make the honest decision */ }
 
   const stored = await getLatestReportSnapshotForScope({ reportKey, accountId, reportVersion, scope: brandScope }).catch(() => null);
+
+  // WP10 SERVE TOKEN (sku-movement-evidence.js THE SERVE-SIDE CONTRACT): a ROUTE-published row carries
+  // params.serveToken ('sms2:' over effectiveAsOf + the coverage windows WITH updated_at + the catalog payload_sha + the
+  // operational-units row count / max(updated_at) over skuServeOpunitsWindow(effectiveAsOf) + the canonical brand); it is
+  // current ONLY when the token this serve recomputes from its OWN reads is equal. The operational-units stats read (one
+  // cheap count query) runs ONLY for such a row -- a legacy row (no serveToken) is judged by the pre-route predicate
+  // VERBATIM, so until route rows exist this serve is read-for-read and byte-for-byte unchanged. A failed stats read or
+  // any malformed input -> no token (computeSkuServeToken fails closed) -> the read-only re-derive below.
+  let serveToken = null;
+  const storedParamsObject = stored && stored.params && typeof stored.params === "object" && !Array.isArray(stored.params) ? stored.params : null;
+  if (stored && stored.payload && storedParamsObject && Object.prototype.hasOwnProperty.call(storedParamsObject, "serveToken") && storedParamsObject.serveToken !== undefined) {
+    const opunitsWindow = skuServeOpunitsWindow(effectiveAsOf);
+    const opunits = opunitsWindow
+      ? await getSourceOliOperationalUnitStats({ organizationFingerprint: orgFp, connectionId: "primary", accountId, from: opunitsWindow.from, to: opunitsWindow.to }).catch(() => null)
+      : null;
+    serveToken = computeSkuServeToken({ effectiveAsOf, coverageWindows: oliWindows, catalogPayloadSha, opunits, brand: brandScope.brand });
+  }
+
   const serveStored = async (snap, extra = {}) => {
-    const storedParams = snap.params && typeof snap.params === "object"
-      ? Object.fromEntries(Object.entries(snap.params).filter(([k]) => k !== "reportVersion"))
-      : params;
-    const paramsHash = paramsHashFor(reportVersion, storedParams);
+    // The response identity is the CANONICAL { asOf, brand } hash: the stored params minus reportVersion AND the route's
+    // stored-only extras (depFingerprint / evidenceToken / serveToken / manifestToken ride OUTSIDE the identity hash). A
+    // legacy row ({ reportVersion, asOf, brand }) strips to exactly what this serve always hashed.
+    const paramsHash = paramsHashFor(reportVersion, stripStoredExtras(snap.params) || params);
     const extraAug = await augment({ accountId, params, payload: snap.payload }).catch(() => ({}));
     res.status(200).json({
       ...withIdentifiers(snap.payload), reportKey, reportVersion, paramsHash,
@@ -1156,11 +1275,11 @@ async function serveSelfHealingSkuMovement({ res, legacyShared, accountScope, co
     });
   };
 
-  // Stored snapshot is CURRENT (its provenance matches the freshly-probed evidence for the SAME effectiveAsOf) ->
-  // serve it immediately, no re-derive, no history load.
-  if (stored && stored.payload && effectiveAsOf && freshRefreshedAt
-      && String(stored.source_refreshed_at || "") === String(freshRefreshedAt)
-      && stored.payload.effectiveAsOf === effectiveAsOf) {
+  // Stored snapshot is CURRENT -> serve it immediately, no re-derive, no history load. A route row: its 'sms2:'
+  // serveToken equals the recomputed one at the SAME effectiveAsOf (a retired 'sms1:' / blank / mismatching token is
+  // never current); a legacy row: its provenance matches the freshly-probed evidence for the SAME effectiveAsOf (the
+  // pre-route predicate, verbatim -- skuMovementLegacyStoredIsCurrent).
+  if (skuMovementStoredIsCurrent({ stored, effectiveAsOf, serveToken, legacyProvenance: freshRefreshedAt })) {
     await serveStored(stored);
     return;
   }
@@ -1670,8 +1789,39 @@ async function brandViewDirectory(accountId, { rebuild = false } = {}) {
   // WITHOUT persisting. The regional scheduler materializer owns the stored brand-view-brands snapshot; a page load or
   // an explicit reload never writes. The build always reflects current brand-sales membership, so a newly-recorded
   // brand still appears (from the durable evidence) without a page-open write.
-  const payload = await buildBrandViewBrandDirectory({ accountId, getSnapshot: getLatestReportSnapshot });
+  // STORAGE-FIRST (publication recovery WP10 -- the brand-view-brands recovery route derives through the SAME hydrated
+  // reader, so a route-published directory IS what this build returns): each brand source (brand-sales / fba-plan /
+  // sku-pl) is read with getLatestReportSnapshotHydrated, so a large OUT-OF-LINE payload (a payload_storage_path whose
+  // inline payload is an unusable stub) contributes its brands instead of silently reading as "no brands". A source whose
+  // storage object is ABSENT or unreadable cannot be read faithfully: the directory is then typed UNAVAILABLE (the
+  // callers answer 503) -- never an empty or reduced brand list built from the inline stub.
+  const storageProblems = [];
+  const getSnapshot = ({ reportKey, accountId: id }) => getLatestReportSnapshotHydrated({ reportKey, accountId: id }, {
+    readStorage: async (objectPath, options) => {
+      let hydrated;
+      try { hydrated = await getReportSnapshotStoragePayload(objectPath, options); }
+      catch (storageError) { storageProblems.push("hydrate-failed:" + reportKey); throw storageError; }
+      if (hydrated == null) storageProblems.push("storage-missing:" + reportKey);
+      return hydrated;
+    },
+  });
+  const payload = await buildBrandViewBrandDirectory({ accountId, getSnapshot });
+  if (storageProblems.length) {
+    return { payload: null, savedAt: null, shared: false, unavailable: { reason: storageProblems[0], message: BRAND_VIEW_DIRECTORY_UNAVAILABLE_MESSAGE } };
+  }
   return { payload, savedAt: null, shared: false, rederived: true };
+}
+
+// The typed UNAVAILABLE answer of a brand directory brandViewDirectory could not build faithfully (a brand source's
+// out-of-line storage object is absent or unreadable): an honest 503 naming the typed reason -- never a 200 with an
+// empty or reduced brand list (the page would render it as "this account records no such brand").
+const BRAND_VIEW_DIRECTORY_UNAVAILABLE_MESSAGE = "This account's saved brand list is temporarily unavailable: a saved report it is built from could not be read from storage. No partial list is shown; please try again shortly.";
+function respondBrandViewDirectoryUnavailable(res, directory) {
+  res.status(503).json({
+    error: BRAND_VIEW_DIRECTORY_UNAVAILABLE_MESSAGE, unavailable: true,
+    reason: directory && directory.unavailable ? directory.unavailable.reason : "brand-directory-unavailable",
+    reportKey: BRAND_VIEW_BRANDS_REPORT_KEY, reportVersion: BRAND_VIEW_BRANDS_VERSION,
+  });
 }
 
 // The first dashboard reports predate the shared snapshot layer. Keep their
@@ -2632,7 +2782,13 @@ async function handleDataDoe(req, res) {
     const access = await getDashboardAccess(req);
     const connections = getDataDoeConnections();
     const action = req.query.action;
-    let publicAccountIds = String(req.query.ids || "").split(",").map((id) => id.trim()).filter(Boolean);
+    // WP10b: a refresh=1 of a ROUTE-OWNED live report is READ-ONLY (see the contract above ROUTE_OWNED_ACTION_REPORT_KEYS):
+    // every successful answer carries { refreshReadOnly: true, paidSync } and no path below may lock, build or write it.
+    const routeOwnedRefreshKey = wantsRefresh(req) ? routeOwnedReportKeyForAction(action) : null;
+    if (routeOwnedRefreshKey) {
+      res = refreshReadOnlyResponse(res, { refreshReadOnly: true, paidSync: routeOwnedPaidSync(routeOwnedRefreshKey, { isAdmin: access.role === "admin" }) });
+    }
+    let publicAccountIds =String(req.query.ids || "").split(",").map((id) => id.trim()).filter(Boolean);
     let accountScope = null;
     let brandDirectoryAccounts = null;
     let discoveredDirectoryAccounts = null;
@@ -2699,10 +2855,11 @@ async function handleDataDoe(req, res) {
 
     const apiKey = accountScope?.connection.apiKey || connections[0].apiKey;
     if (action === "fields" || action === "sample") assertAdmin(access);
-    // The Brand View inventory SOURCE fetch spends a DataDoe export, so it is
-    // admin-only on the SERVER, not merely hidden in the UI. A non-refresh read of
-    // the saved snapshot stays available to any authorised user (Supabase-only).
-    if (action === "brand-inventory" && wantsRefresh(req)) assertAdmin(access);
+    // WP10b fix (P3-4): brand-inventory refresh=1 no longer fetches anything -- it is the READ-ONLY serve of the latest
+    // published row (zero DataDoe, zero writes; the retired paid builder is a typed refusal). The former admin-only
+    // gate protected a PAID export that no longer exists, so it is dropped: a member's refresh=1 gets the SAME read-only
+    // serve (+ paidSync.available:false) as every other route-owned key; the paid acquisition stays the admin-only Data
+    // Sync Center action. Account authorisation (above) is unchanged.
     // The Brand Directory manual refresh spends Product Catalog exports (one per
     // eligible account), so the SOURCE-fetch path is admin-only on the SERVER. A
     // non-refresh read of the shared directory stays available to any authorised user.
@@ -2814,7 +2971,11 @@ async function handleDataDoe(req, res) {
         });
         return;
       }
-      const { payload, savedAt, shared } = await brandViewDirectory(accountId, { rebuild: wantsRefresh(req) });
+      const brandDirectory = await brandViewDirectory(accountId, { rebuild: wantsRefresh(req) });
+      // A directory that could not be built faithfully (an out-of-line brand source's storage object is absent /
+      // unreadable) is typed UNAVAILABLE -- never answered with an empty or reduced list.
+      if (brandDirectory.unavailable) { respondBrandViewDirectoryUnavailable(res, brandDirectory); return; }
+      const { payload, savedAt, shared } = brandDirectory;
       // BRAND-SCOPE: a brand-restricted user's per-account brand list shows only their permitted brands.
       let brandPayload = payload;
       if (brandScope && brandScope.restricted) {
@@ -2853,10 +3014,14 @@ async function handleDataDoe(req, res) {
       // Cache-first, then one rebuild only if the brand is not in the saved
       // list. That covers a brand added since the directory was last derived
       // without paying for a rebuild on the common path.
-      let { payload: directory } = await brandViewDirectory(accountId);
-      if (!directory.brands.includes(brand)) {
-        ({ payload: directory } = await brandViewDirectory(accountId, { rebuild: true }));
+      let brandDirectory = await brandViewDirectory(accountId);
+      if (!brandDirectory.unavailable && !brandDirectory.payload.brands.includes(brand)) {
+        brandDirectory = await brandViewDirectory(accountId, { rebuild: true });
       }
+      // The brand cannot be validated against a directory that could not be built faithfully: typed UNAVAILABLE (503),
+      // never a "not a brand recorded in this account" refusal derived from an incomplete list.
+      if (brandDirectory.unavailable) { respondBrandViewDirectoryUnavailable(res, brandDirectory); return; }
+      const directory = brandDirectory.payload;
       if (!directory.brands.includes(brand)) {
         res.status(400).json({
           error: directory.brands.length
@@ -2879,9 +3044,24 @@ async function handleDataDoe(req, res) {
         scope: "account", brand, accountIds: [accountId], reportVersion: BRAND_VIEW_VERSION,
         readers: brandViewDepFingerprintReaders(),
       }).catch(() => null);
+      const buildSingleBrandView = () => buildBrandViewSnapshot({
+        accountId,
+        brand,
+        asOf,
+        account: accountMeta,
+        getSnapshot: getLatestReportSnapshotHydrated,
+        getAdsRows: getAdsDailySourceRows,
+        getCampaignMappings: campaignMappingsReader(),
+        // Round-4 Defect 2: SELECT the authoritative compact inventory from two indexed reads (newest AVAILABLE
+        // compact + newest overall; NO recent-N cutoff) so a fresh unavailable placeholder cannot shadow a lagging
+        // available LKG and a long run of placeholders can never bury it. The SAME reader backs the materializer,
+        // so writer + serve select identically.
+        getInventorySnapshots: ({ reportKey, accountId: id }) => getInventorySnapshotCandidates({ reportKey, accountId: id, reportVersion: BRAND_INVENTORY_REPORT_VERSION }),
+      });
       await serveSharedReport({
         res,
-        refresh: wantsRefresh(req),
+        // WP10b: route-owned -> a refresh=1 is READ-ONLY (the latest published row; never a lock / build / save).
+        refresh: false,
         reportKey: BRAND_VIEW_REPORT_KEY,
         reportVersion: BRAND_VIEW_VERSION,
         // The brand is part of the snapshot's account key, not only its params
@@ -2894,20 +3074,11 @@ async function handleDataDoe(req, res) {
         contributingProvenanceAt: singleProvenanceAt,
         contributingDepFingerprint: singleDepFingerprint,
         augmentResponse: oliCompletenessAugmentSingle(),
-        build: () => buildBrandViewSnapshot({
-          accountId,
-          brand,
-          asOf,
-          account: accountMeta,
-          getSnapshot: getLatestReportSnapshotHydrated,
-          getAdsRows: getAdsDailySourceRows,
-          getCampaignMappings: campaignMappingsReader(),
-          // Round-4 Defect 2: SELECT the authoritative compact inventory from two indexed reads (newest AVAILABLE
-          // compact + newest overall; NO recent-N cutoff) so a fresh unavailable placeholder cannot shadow a lagging
-          // available LKG and a long run of placeholders can never bury it. The SAME reader backs the materializer,
-          // so writer + serve select identically.
-          getInventorySnapshots: ({ reportKey, accountId: id }) => getInventorySnapshotCandidates({ reportKey, accountId: id, reportVersion: BRAND_INVENTORY_REPORT_VERSION }),
-        }),
+        build: buildSingleBrandView,
+        // WP10b fix (P3-5): an explicit reload (refresh=1) of a brand / as-of with NO published row builds it READ-ONLY
+        // from saved evidence (the zero-DataDoe builder above) and serves it -- never a lock / save / publish; the
+        // fenced route publishes it later. A plain read is unchanged (no build); an existing row is served as is.
+        ...(wantsRefresh(req) ? { readOnlyBuildOnMissingExact: true, deriveDurable: async () => ({ payload: await buildSingleBrandView(), sourceRefreshedAt: null }) } : {}),
       });
       return;
     }
@@ -2990,10 +3161,15 @@ async function handleDataDoe(req, res) {
       const portfolioProvenanceAt = await getLatestSourceProvenance({ reportKey: BRAND_SALES_REPORT_KEY, accountIds }).catch(() => null);
       // A refresh (rebuild) is bounded by the serverless budget: a slow multi-account rebuild returns typed
       // "updating" before the deadline (LKG served meanwhile) instead of a 504. Reads never build (deferred).
-      const portfolioRefresh = wantsRefresh(req);
+      // WP10b: brand-view-portfolio is route-owned -> a refresh=1 is READ-ONLY (LKG + `updating`; never a rebuild/save),
+      // so the bounded-rebuild branch below is never taken from the dashboard.
+      const portfolioRefresh = false;
+      // WP10b fix (P3-5): an explicit reload (refresh=1) with NO published row for this identity builds it READ-ONLY
+      // (served, never stored), bounded by the same 52s build budget so a slow build degrades to the LKG / waiting state.
+      const portfolioReadOnlyBuild = wantsRefresh(req);
       // The function's maxDuration is 60s; give the bounded rebuild 52s of build budget with 6s reserved for the
       // response so a slow rebuild returns typed "updating" (LKG served) rather than a 504.
-      const portfolioDeadline = portfolioRefresh ? makeRouteDeadline({ budgetMs: 52_000, reserveMs: 6_000 }) : null;
+      const portfolioDeadline = (portfolioRefresh || portfolioReadOnlyBuild) ? makeRouteDeadline({ budgetMs: 52_000, reserveMs: 6_000 }) : null;
       // Dependency fingerprint over the region's contributing account set (Defect B) -- same readers the
       // materializer uses, so a serve mismatch means the compact inventory / Ads / mapping advanced for some account
       // and the next scheduled publish converges it (no page-open write).
@@ -3039,6 +3215,7 @@ async function handleDataDoe(req, res) {
         contributingProvenanceAt: portfolioProvenanceAt,
         contributingDepFingerprint: portfolioDepFingerprint,
         routeDeadline: portfolioDeadline,
+        ...(portfolioReadOnlyBuild ? { readOnlyBuildOnMissingExact: true, deriveDurable: async () => ({ payload: await buildPortfolio(), sourceRefreshedAt: null }) } : {}),
       });
       return;
     }
@@ -3200,7 +3377,9 @@ async function handleDataDoe(req, res) {
         await serveSelfHealingSkuMovement({ res, legacyShared, accountScope, connections, userScope: brandScope });
         return;
       }
-      if (!wantsRefresh(req)) {
+      // WP10b: a refresh=1 of a ROUTE-OWNED key (brand-sales / daily / brand-inventory / fba-plan here) takes the READ
+      // branch -- never beginSharedRefresh (lock + paid builder + save).
+      if (!wantsRefresh(req) || routeOwnedRefreshKey) {
         // Brand Directory READ: a generic ZERO-EXPORT self-heal. The stored map is served immediately when its
         // membership fingerprint still matches the live brand-sales evidence; otherwise it is rebuilt from the
         // latest validated brand-sales (storage-first) under the shared lock -- so a new scheduler brand-sales
@@ -3372,91 +3551,41 @@ async function handleDataDoe(req, res) {
         res.status(400).json({ error: "Dashboard refresh requires exactly one selected account and a from/to window." });
         return;
       }
-      // Brand Sales business totals ALWAYS derive from the CORRECTED durable rollup (source_oli_daily_history;
-      // cancelled + zero-value excluded) -- NEVER the raw ORDER_SALES projection. This spends ZERO DataDoe export,
-      // and a raw/legacy cancelled-inclusive payload can never be published. Release the legacy refresh lock WITHOUT
-      // a raw save; the corrected publish goes through the CAS-guarded durable saver (never overwrites a newer LKG).
-      const brandSalesAccountId = accountScope.accountIds[0];
-      if (legacySharedRefresh) await legacySharedRefresh.release();
-      const refreshed = await refreshCorrectedBrandSalesForAccount({ accountId: brandSalesAccountId, from, to });
-      if (refreshed.notReady || !refreshed.payload) {
-        // Never overwrite the corrected last-known-good with nothing: serve the saved snapshot as-is (zero export).
-        await serveSharedReport({ ...sharedOptions, refresh: false });
-        return;
-      }
-      res.status(200).json({ ...refreshed.payload, reportKey: "brand-sales", reportVersion: refreshed.reportVersion, shared: true, corrected: true });
+      // WP10b: brand-sales is route-owned. Its refresh=1 used to re-derive + write the live key UNFENCED
+      // (refreshCorrectedBrandSalesForAccount, removed); it is now published only through the fenced publisher.
+      // Every well-formed request (refresh or not) was already served READ-ONLY above, so this point is a DEFENSIVE
+      // stop (reachable only if the legacy shared descriptor could not be formed although the checks above passed).
+      // The former PAID builder is RETIRED (no DataDoe export, no write): refuse typed and point at the paid sync.
+      respondRouteOwnedBuilderRetired(res, "brand-sales", access);
       return;
     }
 
-    // Compact FBA inventory for Brand View. A non-refresh read was already served
-    // above from the saved snapshot (Supabase-only, zero DataDoe). A refresh is
-    // admin-gated above and creates at most ONE FBA Inventory Health export; it
-    // reuses the Product Catalog source cache from the preceding brand-sales
-    // refresh (or the saved brand-sales asinBrand map) instead of a duplicate
-    // catalog export. Truncated/failed source is refused so a good snapshot survives.
+    // Compact FBA inventory for Brand View. Every well-formed read AND refresh=1 was already served above from the
+    // saved snapshot (Supabase-only, zero DataDoe; a refresh stays admin-gated). WP10b retired the paid FBA Inventory
+    // Health refresh builder: the live key is published only through the fenced publisher.
     if (action === "brand-inventory") {
       if (!accountScope || accountScope.accountIds.length !== 1) {
         res.status(400).json({ error: "Brand View inventory requires exactly one selected account." });
         return;
       }
-      const publicAccountId = accountScope.accountIds[0];
       const to = String(req.query.to || "");
       if (!isDateStr(to)) {
         res.status(400).json({ error: "Brand View inventory requires an asOf date (to=YYYY-MM-DD)." });
         return;
       }
-      // PRIMARY-ONLY: a legacy dd-secondary mapping is skipped, never stripped and
-      // routed through the primary DataDoe key (the secondary key was removed).
-      if (String(publicAccountId).startsWith("dd-secondary:") || accountScope.connection?.id !== "primary" || !apiKey) {
-        res.status(409).json({
-          error: "This account is still mapped to the legacy Secondary DataDoe organization, which is no longer connected. Move it to the primary organization, then reload the account and brand directories.",
-        });
-        return;
-      }
-      const sellerOrVendorIds = accountScope.rawAccountIds;
-      // Best-effort account country for the rare inventory row that omits a
-      // marketplace code. A directory miss is non-fatal (the rows carry it).
-      const inventoryDirectory = await getLatestReportSnapshot({ reportKey: "account-directory", accountId: "__account-directory__" }).catch(() => null);
-      const accountCountry = (inventoryDirectory?.payload?.accounts || []).find((entry) => String(entry.id) === publicAccountId)?.country || null;
-
-      // The EXACT expected inventory window the fold validates every row against: the single canonical
-      // previous UTC day (D-1), the same snapshot-day identity the scheduler fetches.
-      const inventoryDay = planInventoryDay();
-      let payload;
-      try {
-        // No live Product Catalog fallback: brand-inventory uses ONLY the saved
-        // brand-sales asinBrand map. A missing map fails BEFORE the FBA export, so a
-        // just-failed Brand Sales catalog can never cause a second Catalog export.
-        ({ payload } = await buildBrandInventorySnapshot({
-          accountId: publicAccountId,
-          accountCountry,
-          from: inventoryDay,
-          to: inventoryDay,
-          rowLimit: PLAN_INVENTORY_ROW_LIMIT,
-          getSnapshot: getLatestReportSnapshotHydrated,
-          fetchInventoryRows: () => fetchExportRows(
-            apiKey, FBA_HEALTH_SOURCE_ID, FBA_HEALTH_COLUMNS, sellerOrVendorIds,
-            inventoryDay, inventoryDay, PLAN_INVENTORY_ROW_LIMIT,
-            { orderByColumn: "date", orderByDirection: "DESC" }
-          ),
-        }));
-      } catch (buildError) {
-        // Never surface a raw DataDoe/Supabase body. A validated refusal (missing brand
-        // map, truncation, invalid row) is already an admin-safe message; anything else
-        // becomes a generic operational message so the browser only learns the account
-        // failed, not the upstream detail.
-        if (buildError && buildError.brandInventorySafe) throw buildError;
-        throw new Error("FBA inventory could not be refreshed from DataDoe for this account. The previous saved inventory snapshot is preserved.");
-      }
-      await sendLegacyPayload(payload);
+      // WP10b: brand-inventory is route-owned. Its refresh=1 used to create ONE PAID FBA Inventory Health export and
+      // write the live key unfenced; it is now published only through the fenced publisher (FBA reconciler / priority release).
+      // Every well-formed request (refresh or not) was already served READ-ONLY above, so this point is a DEFENSIVE
+      // stop (reachable only if the legacy shared descriptor could not be formed although the checks above passed).
+      // The former PAID builder is RETIRED (no DataDoe export, no write): refuse typed and point at the paid sync.
+      respondRouteOwnedBuilderRetired(res, "brand-inventory", access);
       return;
     }
 
-    // Daily Reporting data. All brands stay compact at account/date grain;
-    // a named brand is joined through the catalog at ASIN/day grain first.
+    // Daily Reporting data. Every well-formed read AND refresh=1 was already served above (READ-ONLY, zero DataDoe,
+    // with the zero-export durable self-heal). WP10b retired the paid OLI/Catalog refresh builder.
     if (action === "daily") {
       const { ids, from, to } = req.query;
-      const brand = String(req.query.brand || "ALL");
       if (!ids || !from || !to) {
         res.status(400).json({ error: "Missing required params: ids, from, to" });
         return;
@@ -3467,44 +3596,12 @@ async function handleDataDoe(req, res) {
         return;
       }
 
-      if (brand !== "ALL") {
-        const salesRaw = await fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to);
-        const catalog = await fetchExportRows(
-          apiKey,
-          PRODUCT_CATALOG_SOURCE_ID,
-          PRODUCT_CATALOG_COLUMNS,
-          sellerOrVendorIds,
-          from,
-          to,
-          CATALOG_ROW_LIMIT,
-          { orderByColumn: "child_asin" }
-        );
-        // Advertising data is account-level in the current source. Omitting it
-        // is safer than presenting the whole account's spend as one brand's.
-        await sendLegacyPayload({ rows: dailyRowsForBrand(salesRaw, catalog, brand), brandFiltered: true });
-        return;
-      }
-
-      // Blocker 1: derive all-brand from the SAME canonical Order Line Items superset the named-brand path
-      // fetches (no separate compact all-brand export). rollupSupersetToDaily folds the ASIN-level superset
-      // to one row per (date, seller, currency) exactly like the scheduler's dailyReportingPayload ALL
-      // branch, so the live route == the scheduler for BOTH modes.
-      const salesRaw = await fetchDailyBrandSalesRows(apiKey, sellerOrVendorIds, from, to);
-      const rows = normalizeDailySalesRows(rollupSupersetToDaily(salesRaw));
-      for (const r of rows) r.total_units_sold = r.total_units;
-      // The scheduled Ads worker owns the durable ACTIVE Ads dataset. After the ASIN->Campaign cutover Daily reads the
-      // durable CAMPAIGN grain (campaign-performance-v1) -- its total ad_sales (ACoS/TACoS/ROI now mean total-attributed,
-      // not same-SKU) -- via the same active reader + dispatcher Brand View shares (rollback flips both back to ASIN).
-      // canonicalizeAdRows folds to per-(date, currency) totals stamped with the authoritative seller key so
-      // mergeSalesAndAds behaves identically. Post-cutover there is NO live ASIN fallback: when the durable store is
-      // unavailable, ads are reported unavailable (honest) rather than read from the retired ASIN source.
-      let ads = [];
-      if (isSupabaseConfigured()) {
-        const adDurableRows = await getActiveAdsDailyRows(accountScope.accountIds[0], from, to);
-        ads = normalizeAdRows(canonicalizeAdRows(adDurableRows, accountScope.accountIds[0]));
-      }
-      mergeSalesAndAds(rows, ads);
-      await sendLegacyPayload({ rows, brandFiltered: false });
+      // WP10b: daily-reporting is route-owned. Its refresh=1 used to create PAID Order Line Items (+ Product Catalog)
+      // exports and write the live key unfenced; it is now published only through the fenced publisher.
+      // Every well-formed request (refresh or not) was already served READ-ONLY above, so this point is a DEFENSIVE
+      // stop (reachable only if the legacy shared descriptor could not be formed although the checks above passed).
+      // The former PAID builder is RETIRED (no DataDoe export, no write): refuse typed and point at the paid sync.
+      respondRouteOwnedBuilderRetired(res, "daily-reporting", access);
       return;
     }
 
@@ -3737,11 +3834,10 @@ async function handleDataDoe(req, res) {
       return;
     }
 
-    // FBA Shipment Plan: one selected account only. Combines per-ASIN unit
-    // velocity (3 completed months + current-month MTD) with the latest FBA
-    // inventory-health snapshot and (US only) AWD available inventory. All
-    // derived planning metrics are computed in the browser so filter/target
-    // changes never trigger a DataDoe request.
+    // FBA Shipment Plan: one selected account only. Every well-formed read AND refresh=1 was already served above from
+    // the saved snapshot (READ-ONLY, zero DataDoe); derived planning metrics are computed in the browser so
+    // filter/target changes never trigger a DataDoe request. WP10b retired the paid refresh builder (the durable
+    // derivation lives in the scheduler-v2 fba-plan report derivation + the zero-export fba-plan route).
     if (action === "fba-plan") {
       const { ids, to } = req.query;
       if (!ids || !to) {
@@ -3753,274 +3849,13 @@ async function handleDataDoe(req, res) {
         res.status(400).json({ error: "FBA Shipment Plan requires exactly one selected account." });
         return;
       }
-      const { completed, current } = planMonthWindows(String(to));
-
-      // Authoritative account country (drives US-only AWD logic).
-      const accounts = await fetchAccountsRaw(apiKey);
-      const account = accounts.find((a) => a.id === sellerOrVendorIds[0]) || null;
-      const isUS = String(account?.country || "").toUpperCase() === "US";
-      // AWD is fetched/folded for the AWD-capable marketplaces (US + EU5); US byte-identical. awdMarket is the account's
-      // OWN canonical marketplace so AWD never attaches to another marketplace. See lib/server/reports/awd-capability.js.
-      const awdEligible = awdCapableMarketplace(account?.country);
-      const awdMarket = canonicalAwdMarketplace(account?.country) || (isUS ? "US" : "");
-
-      // 1) ONE canonical Order Line Items sales fragment over [completed[0].from .. asOf] (Blocker 1).
-      // Per-ASIN ordered units per month AND the current-month latest sales date are DERIVED from this
-      // single shared fragment (byte-identical spec to the other OLI reports, so overlapping calendar
-      // slices reuse one export). Units are a currency-agnostic count, so this sums total_units_sum
-      // ACROSS currencies (the canonical rows still carry currency for the money-keyed reports).
-      // Blocker 1: slice by canonicalOliSlices so the fba fragment's interior + asOf-boundary slices are
-      // byte-identical in request identity to the scheduler + daily + the other OLI reports (one export,
-      // many owners). Per-slice strict cap: a slice at the row cap is indistinguishable from a truncated
-      // one, so it is rejected BEFORE appending (an understated velocity would misplan shipments).
-      const oliSalesRows = [];
-      for (const slice of canonicalOliSlices(completed[0].from, current.to)) {
-        const sliceRows = await fetchExportRows(
-          apiKey, PLAN_SALES_SOURCE_ID, OLI_SALES_COLUMNS, sellerOrVendorIds, slice.from, slice.to, OLI_SALES_ROW_LIMIT,
-          { groupBy: OLI_SALES_GROUP_BY, aggregations: OLI_SALES_AGGREGATIONS, orderByColumn: "date", orderByDirection: "ASC" }
-        );
-        if (sliceRows.length >= OLI_SALES_ROW_LIMIT) {
-          throw new Error(`FBA Shipment Plan sales export reached the ${OLI_SALES_ROW_LIMIT.toLocaleString("en-US")} row cap for ${slice.from} to ${slice.to}. The report was not saved because a partial slice would understate demand velocity.`);
-        }
-        oliSalesRows.push(...sliceRows);
-      }
-      const asinSet = new Set();
-      const unitsByAsinByMonth = {}; // asin -> { monthKey: units }
-      const mtdByAsin = new Map();   // asin -> current-month units
-      const unitsByDate = new Map(); // current-month date -> summed units (latest-date probe)
-      const completedMonthKeys = new Set(completed.map((m) => m.key));
-      for (const r of oliSalesRows) {
-        const date = String(r.date || "");
-        const mk = date.slice(0, 7);
-        const asin = String(r.child_asin || "").trim();
-        const units = num(r.total_units_sum ?? r.quantity);
-        if (asin && (mk === current.key || completedMonthKeys.has(mk))) {
-          asinSet.add(asin);
-          const byMonth = unitsByAsinByMonth[asin] || (unitsByAsinByMonth[asin] = {});
-          byMonth[mk] = (byMonth[mk] || 0) + units;
-          if (mk === current.key) mtdByAsin.set(asin, (mtdByAsin.get(asin) || 0) + units);
-        }
-        if (mk === current.key && date) unitsByDate.set(date, (unitsByDate.get(date) || 0) + units);
-      }
-      // 2b) Latest current-month date whose summed units > 0. Elapsed days are measured to this date so
-      // the MTD projection is not diluted by dates the source has not populated yet.
-      let salesLatestDate = null;
-      for (const [date, units] of unitsByDate) {
-        if (units > 0 && (!salesLatestDate || date > salesLatestDate)) salesLatestDate = date;
-      }
-      // Elapsed days = day-of-month of the latest completed sales date, so the
-      // MTD projection uses the true covered days rather than the raw calendar
-      // day (the sales source can lag a few days).
-      const elapsedDays = (salesLatestDate && salesLatestDate >= current.from && salesLatestDate <= current.to)
-        ? Number(salesLatestDate.slice(8, 10))
-        : 0;
-
-      // 3) Catalog brand + product name. Use the full 3-month + MTD window so a
-      // product released before the current month is still resolved to a brand.
-      const catalog = await fetchExportRows(
-        apiKey, PRODUCT_CATALOG_SOURCE_ID, PRODUCT_CATALOG_COLUMNS, sellerOrVendorIds, completed[0].from, current.to, CATALOG_ROW_LIMIT,
-        { orderByColumn: "child_asin" }
-      );
-      const brandByAsin = new Map();
-      const nameByAsin = new Map();
-      const catalogAsinSet = new Set();
-      for (const c of catalog) {
-        const asin = String(c.child_asin || "").trim();
-        if (!asin) continue;
-        catalogAsinSet.add(asin);
-        const brand = String(c.product_brand || "").trim();
-        if (brand && !brandByAsin.has(asin)) brandByAsin.set(asin, brand);
-        const name = String(c.product_name || "").trim();
-        if (name && !nameByAsin.has(asin)) nameByAsin.set(asin, name);
-      }
-
-      // 4) The EXACT single previous-UTC-day (D-1) FBA inventory-health snapshot, folded from SKU to ASIN.
-      const planInvDay = planInventoryDay();
-      const invRows = await fetchExportRows(
-        apiKey, FBA_HEALTH_SOURCE_ID, FBA_HEALTH_COLUMNS, sellerOrVendorIds,
-        planInvDay, planInvDay, PLAN_INVENTORY_ROW_LIMIT,
-        { orderByColumn: "date", orderByDirection: "DESC" }
-      );
-      let inventoryDate = null;
-      for (const r of invRows) {
-        if (r.date && (!inventoryDate || r.date > inventoryDate)) inventoryDate = r.date;
-      }
-      const invByAsin = {};
-      const skusByAsin = {};
-      const invProductName = new Map();
-      // ADDITIVE ONLY. FBA Inventory Health is per marketplace, but the per-ASIN
-      // rows below intentionally fold that dimension away for the shipment plan.
-      // The account-scoped Brand View needs FBA inventory per country, so the
-      // same rows are also folded to (marketplace, brand) here. Nothing existing
-      // reads this key, so the FBA Shipment Plan report is unchanged.
-      const invByCountryBrand = new Map();
-      for (const r of invRows) {
-        if (inventoryDate && r.date !== inventoryDate) continue; // latest snapshot only
-        const asin = String(r.child_asin || "").trim();
-        if (!asin) continue;
-        asinSet.add(asin);
-        const cur = invByAsin[asin] || (invByAsin[asin] = {
-          available: 0, customerOrderReserved: 0, fcTransfer: 0, fcProcessing: 0,
-          inboundShipped: 0, inboundReceived: 0, inboundWorking: 0,
-        });
-        cur.available += num(r.available);
-        cur.customerOrderReserved += num(r.reserved_customer_order); // display-only; never usable stock
-        cur.fcTransfer += num(r.reserved_fc_transfer);
-        cur.fcProcessing += num(r.reserved_fc_processing);
-        cur.inboundShipped += num(r.inbound_shipped);
-        cur.inboundReceived += num(r.inbound_received);
-        cur.inboundWorking += num(r.inbound_working);
-        const sku = String(r.sku || "").trim();
-        if (sku) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
-        const nm = String(r.product_name || "").trim();
-        if (nm && !invProductName.has(asin)) invProductName.set(asin, nm);
-        // Per-marketplace roll-up for Brand View. `brandByAsin` is the same
-        // catalog map the per-ASIN rows use, so a brand's country inventory can
-        // never disagree with its shipment-plan inventory.
-        const invCountry = String(r.marketplace_country_code || account?.country || "").trim().toUpperCase();
-        const invBrand = brandByAsin.get(asin) || null;
-        const countryBrandKey = `${invCountry}|${invBrand || ""}`;
-        const bucket = invByCountryBrand.get(countryBrandKey)
-          || { country: invCountry || null, brand: invBrand, fbaAvailable: 0, skus: new Set() };
-        bucket.fbaAvailable += num(r.available);
-        if (sku) bucket.skus.add(sku);
-        invByCountryBrand.set(countryBrandKey, bucket);
-      }
-      const inventoryAvailable = invRows.length > 0;
-
-      // 5) AWD available + inbound (AWD-capable marketplaces: US + EU5), folded from SKU to ASIN. Defensive
-      //    own-marketplace guard so one marketplace's AWD never attaches to another (US byte-identical: awdMarket "US").
-      const awdByAsin = {};
-      const awdInboundByAsin = {};
-      let awdAvailable = false;
-      let awdRows = [];
-      if (awdEligible) {
-        awdRows = await fetchExportRows(
-          apiKey, LISTINGS_SOURCE_ID, LISTINGS_AWD_COLUMNS, sellerOrVendorIds,
-          null, null, CATALOG_ROW_LIMIT,
-          { orderByColumn: "child_asin" }
-        );
-        awdAvailable = awdRows.length > 0;
-        for (const r of awdRows) {
-          const mkt = canonicalAwdMarketplace(r.marketplace_country_code);
-          if (mkt && awdMarket && mkt !== awdMarket) continue; // never let another marketplace's AWD row leak in
-          const asin = String(r.child_asin || "").trim();
-          if (!asin) continue;
-          awdByAsin[asin] = (awdByAsin[asin] || 0) + num(r.awd_available_distributable_quantity);
-          awdInboundByAsin[asin] = (awdInboundByAsin[asin] || 0) + num(r.awd_total_inbound_quantity);
-          const sku = String(r.sku || "").trim();
-          if (sku) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
-        }
-      }
-
-      // 5b) The durable ACCOUNT SKU DIRECTORY -- one entry per SKU proven in an ACCOUNT-scoped source (inventory, AWD,
-      // sales), enriched with the org-wide Product Catalog's ASIN -> brand/name. A SUPERSET of the representative SKUs
-      // the per-ASIN rows show, so a dropped/warehouse-only SKU keeps its identity + canonical brand. Priority (first
-      // writer sets provenance): inventory > AWD > sales. A SKU maps to exactly one child ASIN.
-      const skuDir = new Map();
-      const skuAsinConflicts = new Map(); // sku -> {a, b}  (two DIFFERENT nonblank ASINs for one SKU)
-      const putSku = (sku, asin, marketplace, provenance, invName) => {
-        const s = String(sku || "").trim();
-        if (!s) return;
-        const a = String(asin || "").trim() || null;
-        const mkt = String(marketplace || "").trim().toUpperCase() || null;
-        let e = skuDir.get(s);
-        if (!e) { e = { sku: s, childAsin: a, productName: null, brand: null, marketplace: mkt, provenance }; skuDir.set(s, e); }
-        // Two DIFFERENT nonblank child ASINs for one SKU is an unresolvable identity error (never a silent pick).
-        if (e.childAsin && a && a !== e.childAsin) { if (!skuAsinConflicts.has(s)) skuAsinConflicts.set(s, { a: e.childAsin, b: a }); }
-        if (!e.childAsin && a) e.childAsin = a;
-        if (!e.marketplace && mkt) e.marketplace = mkt;
-        const ca = e.childAsin;
-        if (ca) {
-          if (!e.brand) e.brand = brandByAsin.get(ca) || null;
-          if (!e.productName) e.productName = nameByAsin.get(ca) || invName || invProductName.get(ca) || null;
-        } else if (!e.productName && invName) { e.productName = invName; }
-      };
-      for (const r of invRows) { if (inventoryDate && r.date !== inventoryDate) continue; putSku(r.sku, r.child_asin, r.marketplace_country_code || account?.country, "inventory", String(r.product_name || "").trim() || null); }
-      for (const r of awdRows) { const mkt = canonicalAwdMarketplace(r.marketplace_country_code); if (mkt && awdMarket && mkt !== awdMarket) continue; putSku(r.sku, r.child_asin, awdMarket || mkt, "awd", null); }
-      for (const r of oliSalesRows) putSku(r?.sku, r?.child_asin, account?.country, "sales", null);
-      if (skuAsinConflicts.size > 0) {
-        const [conflictSku, c] = [...skuAsinConflicts.entries()][0];
-        const err = new Error(`fba-plan: SKU ${conflictSku} maps to conflicting child ASINs (${c.a} vs ${c.b}) across sources; snapshot blocked (last-known-good preserved).`);
-        err.code = "FBA_PLAN_SKU_ASIN_CONFLICT";
-        throw err;
-      }
-      const accountSkuDirectory = [...skuDir.values()].sort((a, b) => a.sku.localeCompare(b.sku));
-
-      // 6) Assemble one row per ASIN. Representative SKU = first non-empty SKU
-      // in ascending (localeCompare) order, so it is stable across refreshes.
-      // Only ASINs with real activity are kept: any unit sales in the window, or
-      // any live FBA/AWD stock. This drops the large tail of zero-sales,
-      // zero-stock ASINs that the Product Catalog lists but Order Line Items never sold.
-      const rows = [];
-      for (const asin of asinSet) {
-        const inv = invByAsin[asin] || null;
-        const skus = skusByAsin[asin] ? [...skusByAsin[asin]].sort((a, b) => a.localeCompare(b)) : [];
-        const unitsByMonth = {};
-        let salesTotal = 0;
-        for (const mo of completed) {
-          const u = num(unitsByAsinByMonth[asin]?.[mo.key]);
-          unitsByMonth[mo.key] = u;
-          salesTotal += u;
-        }
-        const mtdUnits = num(mtdByAsin.get(asin));
-        salesTotal += mtdUnits;
-        // Activity total for the drop check (customer-order-reserved kept as activity). All states are DISTINCT per the
-        // source metadata (inbound_quantity = sum of the 3 inbound states; reserved_fc_transfer is a separate reserved
-        // state), so there is NO transfer/shipped overlap to subtract -- reserved_fc_transfer is stored RAW.
-        const invTotal = inv
-          ? inv.available + inv.customerOrderReserved + inv.fcTransfer + inv.fcProcessing + inv.inboundShipped + inv.inboundReceived + inv.inboundWorking
-          : 0;
-        const awdUnits = awdEligible ? num(awdByAsin[asin]) : 0;
-        const awdInboundUnits = awdEligible ? num(awdInboundByAsin[asin]) : 0;
-        if (salesTotal <= 0 && invTotal <= 0 && awdUnits <= 0 && awdInboundUnits <= 0) continue;
-        rows.push({
-          asin,
-          productName: nameByAsin.get(asin) || invProductName.get(asin) || null,
-          brand: brandByAsin.get(asin) || null,
-          sku: skus[0] || null,
-          unitsByMonth,
-          mtdUnits,
-          // Inventory numbers: when the snapshot exists but this ASIN is absent,
-          // it genuinely holds no FBA stock (0). When the whole snapshot is
-          // unavailable, inventory fields are null so the UI can flag it.
-          fbaAvailable: inventoryAvailable ? num(inv?.available) : null,
-          customerOrderReserved: inventoryAvailable ? num(inv?.customerOrderReserved) : null,
-          reservedFcTransfer: inventoryAvailable ? num(inv?.fcTransfer) : null,
-          reservedFcProcessing: inventoryAvailable ? num(inv?.fcProcessing) : null,
-          inboundShipped: inventoryAvailable ? num(inv?.inboundShipped) : null,
-          inboundReceived: inventoryAvailable ? num(inv?.inboundReceived) : null,
-          inboundWorking: inventoryAvailable ? num(inv?.inboundWorking) : null,
-          awdAvailable: awdEligible ? awdUnits : null,
-          awdInbound: awdEligible ? awdInboundUnits : null,
-        });
-      }
-
-      await sendLegacyPayload({
-        asOf: String(to),
-        accountName: account?.name || null,
-        marketCountry: account?.country || null,
-        isUS,
-        awdEligible,
-        months: completed,
-        currentMonth: current,
-        salesLatestDate,
-        elapsedDays,
-        inventoryDate,
-        inventoryAvailable,
-        awdAvailable,
-        rows,
-        accountSkus: accountSkuDirectory.map((e) => e.sku), // backward compat for readers of the old string-only allowlist
-        accountSkuDirectory,
-        catalogByAsin: Object.fromEntries([...catalogAsinSet].map((a) => [a, { brand: brandByAsin.get(a) || null, productName: nameByAsin.get(a) || null }])),
-        // Additive: consumed only by the account-scoped Brand View. Bounded by
-        // (marketplaces x brands), so it stays small for accounts with
-        // thousands of SKUs.
-        inventoryByBrandCountry: [...invByCountryBrand.values()].map(({ skus, ...entry }) => ({
-          ...entry,
-          skuCount: skus.size,
-        })),
-      });
+      // WP10b: fba-plan is route-owned. Its refresh=1 used to create PAID OLI + Product Catalog + FBA Inventory Health +
+      // AWD Listings exports and write the live key unfenced; it is now published only through the fenced publisher
+      // (the Data Sync Center FBA source cards run the fba-plan operation under the bucket token ceiling).
+      // Every well-formed request (refresh or not) was already served READ-ONLY above, so this point is a DEFENSIVE
+      // stop (reachable only if the legacy shared descriptor could not be formed although the checks above passed).
+      // The former PAID builder is RETIRED (no DataDoe export, no write): refuse typed and point at the paid sync.
+      respondRouteOwnedBuilderRetired(res, "fba-plan", access);
       return;
     }
 

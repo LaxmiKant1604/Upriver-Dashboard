@@ -16,7 +16,11 @@
 // h, sra, served }. A unit's targetId (which may carry brand text) is NEVER emitted. The line is bounded to
 // TARGETS_MAX_LINE_BYTES by dropping WHOLE targets (never a partial unit set a consumer could misread as "all units
 // current"), flagged truncated:true + omittedTargets:n. parseTargetsLine accepts v1 and v2; normalizeTargets lifts a v1
-// line into the v2 shape (one unit per report, u '-') so a consumer handles a single shape.
+// line into the v2 shape (one unit per report, u '-') so a consumer handles a single shape. A target with NO unit rows
+// (e.g. an empty unit expansion, the core's rec.unitsReason 'units-empty') carries r:'units-empty' EXPLICITLY -- a
+// consumer must treat an empty unit list as NOT verified (nothing was proven current). Owners are filtered by
+// TARGETS_OWNER_ID_RE, the SAME grammar the reconciler core enforces on every unit owner (ROUTE_OWNER_ID_RE), so an owner
+// a unit opened controls for is never missing from the line.
 
 export const TARGETS_LINE_PREFIX = "TARGETS ";
 export const TARGETS_FORMAT_VERSION = 1;
@@ -24,9 +28,13 @@ export const TARGETS_FORMAT_VERSION_V2 = 2;
 export const TARGETS_MAX_LINE_BYTES = 256 * 1024;
 
 const S = (v) => (v == null ? "" : String(v));
-// The job target key grammar (the recovery jobs' target_key CHECK) + a rollout-owner id (no ':').
+// The job target key grammar (the recovery jobs' target_key CHECK) + a rollout-owner id (no ':'). The owner grammar is
+// exported so the reconciler core's ROUTE_OWNER_ID_RE can be pinned IDENTICAL to it (saved-data-reconciler-routes.test).
 const TARGET_ID_RE = /^[A-Za-z0-9._:-]{1,160}$/;
-const OWNER_ID_RE = /^[A-Za-z0-9._-]{1,120}$/;
+export const TARGETS_OWNER_ID_RE = /^[A-Za-z0-9._-]{1,120}$/;
+const OWNER_ID_RE = TARGETS_OWNER_ID_RE;
+// The explicit target-level mark of an EMPTY unit list (equal to the core's UNITS_EMPTY_REASON).
+export const TARGETS_UNITS_EMPTY = "units-empty";
 const UNIT_KEY_RE = /^[A-Za-z0-9._:-]{1,64}$/;
 const CODE_RE = /^[A-Za-z0-9._:-]+$/;
 const ISO_RE = /^[0-9TZ:.+-]{1,40}$/;
@@ -126,7 +134,11 @@ export function buildTargetsPayloadV2({ route, family, summary }) {
     const units = TARGET_ID_RE.test(id) ? v2UnitRows(rec, epoch) : null;
     if (!units) { omitted += 1; continue; }
     const tokRaw = S(rec.evidenceToken) || S(rec.revisionId);
-    targets.push({ id, owners: v2Owners(rec, id), tok: tokRaw && tokRaw.length <= 512 && PRINTABLE_RE.test(tokRaw) ? tokRaw : null, units });
+    const target = { id, owners: v2Owners(rec, id), tok: tokRaw && tokRaw.length <= 512 && PRINTABLE_RE.test(tokRaw) ? tokRaw : null, units };
+    // An EMPTY unit list (the core's rec.unitsReason 'units-empty', or any record yielding no unit rows) is flagged
+    // EXPLICITLY -- never an implicit "every unit current". Absent on every non-empty target (shape unchanged).
+    if (units.length === 0 || S(rec.unitsReason) === TARGETS_UNITS_EMPTY) target.r = TARGETS_UNITS_EMPTY;
+    targets.push(target);
   }
   const payload = {
     v: TARGETS_FORMAT_VERSION_V2,

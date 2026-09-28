@@ -132,14 +132,38 @@ export const DEFAULT_UNIT_KEY = "-";
 export const DEFAULT_CHUNK_MAX_TARGETS = 20; // units per control window (two-phase)
 export const DEFAULT_CHUNK_MAX_SECONDS = 90; // no new publish STARTS in a window older than this (lease held <= ~90 s)
 const UNIT_KEY_RE = /^[A-Za-z0-9._:-]{1,64}$/;
-const MAX_TARGET_ID_CHARS = 512;
-const MAX_OWNER_ID_CHARS = 200;
+// A unit targetId / liveAccountId is stored ONLY in report_snapshots.account_id + sync_report_jobs.account_id and never
+// in argv or a TARGETS line (those carry the short scope target + the unit key). Those text columns have NO length check
+// but ARE btree-indexed: report_snapshots UNIQUE (report_key, account_id, params_hash) + report_snapshots_scope_idx
+// (20260728_shared_dashboard.sql), sync_report_jobs UNIQUE (cycle_id, report_key, account_id) + sync_report_jobs_report_idx
+// (20260807_scheduler_v2.sql), dashboard_events_scope_idx -- and Postgres refuses a btree index tuple over 2704 BYTES. An
+// id the guard below accepted but an index refuses would fail at the job upsert AFTER the cycle is opened + claimed (a
+// hard 'lineage-upsert-threw' + a dangling running cycle on every run), so the bound is in UTF-8 BYTES (never UTF-16
+// .length: a non-ASCII brand is up to 3 bytes per char) and leaves headroom for the widest composite key (a 33-byte
+// shadow report_key + a 64-char params_hash + tuple/varlena overhead stay far below 2704). The longest real id is a
+// region portfolio scope id, brandViewPortfolioScopeId(members, brand) = prefix + one 36-char UUID per member + the brand
+// -- ~1.2 KB for a brand sold by all 32 europe-au accounts -- so real ids stay publishable. A route that can produce a
+// longer id defers it typed BEFORE any write through the SAME bound + measure (targetIdByteLength).
+export const MAX_TARGET_ID_BYTES = 2048;
+/** The UTF-8 byte length of a unit target / live account id (the measure MAX_TARGET_ID_BYTES bounds). */
+export function targetIdByteLength(id) {
+  return Buffer.byteLength(S(id), "utf8");
+}
+// The rollout-OWNER id grammar -- IDENTICAL to the TARGETS v2 owner grammar (reconcile-targets-output.js
+// TARGETS_OWNER_ID_RE; pinned equal by saved-data-reconciler-routes.test.js). The v2 line DROPS any owner outside it, so
+// the core refuses (typed) every such owner: a unit can never open controls for an owner the line does not report. No
+// ':' (a prefixed dd-secondary / scope id is never a rollout account), no whitespace, <= 120 chars.
+export const ROUTE_OWNER_ID_RE = /^[A-Za-z0-9._-]{1,120}$/;
+// The typed mark of a scope target whose unit expansion was EMPTY (valid at the core level -- nothing to publish -- but
+// carried explicitly on the record + the TARGETS v2 line, because an empty unit list proves NOTHING current).
+export const UNITS_EMPTY_REASON = "units-empty";
 // The states a currentPredicate may return (the pure-classifier vocabulary + the retryable deferral). Anything else --
 // including an execution state it could never have proven -- fails CLOSED as a deferral.
 const PREDICATE_STATES = new Set([PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED, PUBLICATION_STATE.STALE, RECONCILE_STATUS.DEFERRED_PROVENANCE, RECONCILE_STATUS.DEFERRED_DEPENDENCY]);
 const UNIT_DEFER_STATES = new Set([RECONCILE_STATUS.DEFERRED_PROVENANCE, RECONCILE_STATUS.DEFERRED_DEPENDENCY]);
-// A canonical id: a nonblank string that is its own trim (never trimmed INTO another id), bounded.
-const canonicalId = (v, max) => typeof v === "string" && v.trim() !== "" && v === v.trim() && v.length <= max;
+// A canonical unit target / live account id: a nonblank string that is its own trim (never trimmed INTO another id),
+// bounded in UTF-8 BYTES (MAX_TARGET_ID_BYTES -- the btree index bound above).
+const canonicalTargetId = (v) => typeof v === "string" && v.trim() !== "" && v === v.trim() && targetIdByteLength(v) <= MAX_TARGET_ID_BYTES;
 const boundedStr = (v, max) => (typeof v === "string" && v.trim() !== "" && v.length <= max ? v : null);
 // The stable machine code of a free-form reason (the part before the first disallowed character) -- never a message.
 const reasonCode = (r) => { const m = S(r).trim().match(/^[A-Za-z0-9_.:-]+/); return (m ? m[0].slice(0, 120) : "") || "unclassified"; };
@@ -150,12 +174,18 @@ const sortedUnion = (lists) => [...new Set(lists.flat().map(S).filter(Boolean))]
  * target then defers (never a partial, silently-shrunk unit set that the worker could read as "every unit current").
  * Defaults (per unit): targetId = the scope accountId; liveAccountId = targetId; ownerAccountIds = [accountId];
  * targetAsOf = requestedAsOf (null allowed ONLY for an asOfField:null contract -- checked per report); reportKeys = all.
- * Owners are rollout accounts: canonical, no ':' (a prefixed scope id can never own controls). Duplicate unit keys or
- * target ids are refused. An optional unit.deferred = { state: DEFERRED_PROVENANCE|DEFERRED_DEPENDENCY, reason } marks a
- * KNOWN-but-unpublishable unit (e.g. a named brand whose brand list is unavailable) -- typed, zero reads, zero writes.
+ * targetId / liveAccountId are canonical (untrimmed-equal, nonblank) and at most MAX_TARGET_ID_BYTES UTF-8 bytes, else
+ * "unit-target-invalid" / "unit-live-account-invalid" (typed, before any write). Owners are rollout accounts matching ROUTE_OWNER_ID_RE (the TARGETS v2 owner grammar: no ':', no whitespace, <= 120)
+ * -- anything else is refused "unit-owners-invalid" (a prefixed scope id can never own controls, and no owner can be
+ * one the v2 line would silently drop). Duplicate unit keys or target ids are refused. An optional unit.deferred =
+ * { state: DEFERRED_PROVENANCE|DEFERRED_DEPENDENCY, reason } marks a KNOWN-but-unpublishable unit (e.g. a named brand
+ * whose brand list is unavailable) -- typed, zero reads, zero writes. An EMPTY array stays VALID (ok:true, zero units)
+ * but is MARKED reason UNITS_EMPTY_REASON, which the core carries onto the target record (rec.unitsReason) + the TARGETS
+ * v2 line; a non-empty valid set returns reason null.
  */
 export function normalizeRouteUnits(raw, { accountId, requestedAsOf, reportKeys }) {
   if (!Array.isArray(raw)) return { ok: false, reason: "units-not-array", units: [] };
+  if (raw.length === 0) return { ok: true, reason: UNITS_EMPTY_REASON, units: [] };
   const known = Array.isArray(reportKeys) ? reportKeys : [];
   const units = []; const unitKeys = new Set(); const targetIds = new Set();
   for (const u of raw) {
@@ -163,11 +193,11 @@ export function normalizeRouteUnits(raw, { accountId, requestedAsOf, reportKeys 
     const unitKey = S(u.unitKey);
     if (!UNIT_KEY_RE.test(unitKey)) return { ok: false, reason: "unit-key-invalid", units: [] };
     const targetId = u.targetId === undefined ? accountId : u.targetId;
-    if (!canonicalId(targetId, MAX_TARGET_ID_CHARS)) return { ok: false, reason: "unit-target-invalid", units: [] };
+    if (!canonicalTargetId(targetId)) return { ok: false, reason: "unit-target-invalid", units: [] };
     const liveAccountId = u.liveAccountId === undefined ? targetId : u.liveAccountId;
-    if (!canonicalId(liveAccountId, MAX_TARGET_ID_CHARS)) return { ok: false, reason: "unit-live-account-invalid", units: [] };
+    if (!canonicalTargetId(liveAccountId)) return { ok: false, reason: "unit-live-account-invalid", units: [] };
     const owners = u.ownerAccountIds === undefined ? [accountId] : u.ownerAccountIds;
-    if (!Array.isArray(owners) || owners.length === 0 || !owners.every((o) => canonicalId(o, MAX_OWNER_ID_CHARS) && !o.includes(":"))) return { ok: false, reason: "unit-owners-invalid", units: [] };
+    if (!Array.isArray(owners) || owners.length === 0 || !owners.every((o) => typeof o === "string" && ROUTE_OWNER_ID_RE.test(o))) return { ok: false, reason: "unit-owners-invalid", units: [] };
     const targetAsOf = u.targetAsOf === undefined ? requestedAsOf : u.targetAsOf;
     if (targetAsOf !== null && !isCalendarDate(targetAsOf)) return { ok: false, reason: "unit-asof-invalid", units: [] };
     const rks = u.reportKeys === undefined ? known : u.reportKeys;
@@ -218,15 +248,19 @@ export function normalizeRouteUnits(raw, { accountId, requestedAsOf, reportKeys 
  *       replaces evaluatePublicationBinding for THIS reconciler's route (ctx carries the loaded job/shadow/live rows and
  *       a lazy ctx.binding()); null/undefined falls back to the exact binding; a throw / foreign state DEFERS.
  *   adapter.servedCheck({ unit, rk, ... }) -> { ok, fixable, reason, served: { id, h, sra } }
- *       consulted ONLY when the verdict is PUBLICATION_NOT_REQUIRED: not ok + fixable -> STALE "served-row-differs";
+ *       consulted ONLY when the verdict is PUBLICATION_NOT_REQUIRED: not ok + fixable -> STALE "served-row-differs"
+ *       (reason "manifest-differs" is kept verbatim: the verify-exact content-drift verdict);
  *       not ok + not fixable -> DEFERRED_DEPENDENCY "served-row-preempted:<code>"; a throw DEFERS.
  *   runPrepareForUnit / runPublishForUnit (INSTEAD of runReleaseForAccount; both or neither) -> the TWO-PHASE release:
  *       phase 1 prepares every stale unit with NO controls open; phase 2 publishes the prepared units in control windows
  *       of <= chunkMaxTargets units / chunkMaxSeconds, each openControls({ owners, publisherKeys }) ... closeControls in
  *       a finally. Both runners return the SAME typed result statusFromRelease reads; a prepare succeeds ONLY with
- *       { ok:true, prepared:true }.
+ *       { ok:true, prepared:true } AND a code that is absent or exactly 0. An openControls THROW in ANY window keeps
+ *       every earlier window's results, defers the remaining prepared units "controls-open-threw" and returns the
+ *       summary (non-green: the apply's commit state is unknown); a window never proven open is never safe-closed.
  * With any hook present the perAccount records ALSO carry units[] (and report entries h / sra / served); the outcome and
- * count semantics are unchanged (a count is one (unit, report)).
+ * count semantics are unchanged (a count is one (unit, report)). A target whose expansion was EMPTY also carries
+ * unitsReason UNITS_EMPTY_REASON (zero counts; the TARGETS v2 line flags it -- an empty unit list is never "verified").
  */
 export function buildSavedDataReconciler({
   resolveOrg, bucketAccounts, adapter,
@@ -243,6 +277,12 @@ export function buildSavedDataReconciler({
   makeAbortController = () => new AbortController(),
   awaitSettled = async (p) => { try { await p; } catch { /* a rejection is a settlement -- the op stopped */ } return { settled: true }; },
   withTimeout = (p) => p, clock = () => new Date(), log = noop, family = "saved-data",
+  // OPT-IN two-phase LEASE FAIRNESS (publication recovery WP13 verifier P2-1): a pause between two consecutive control
+  // windows, so a BOUNDED lease-waiter (runControlPackageCli retries CONTROL_LEASE_HELD every 15 s: the scheduler's
+  // control applies, a reconciler's lease-wait) finds the global lease FREE between windows instead of losing every race
+  // to an immediate re-open. 0 (the default) => no pause and no sleep call at all (byte-identical for every caller that
+  // does not pass it). Never inside a window, never after the last one, never past the deadline (outOfTime re-checked).
+  interWindowPauseMs = 0, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 } = {}) {
   if (!adapter || typeof adapter.readScopeEvidence !== "function" || typeof adapter.computeAccountRevision !== "function") {
     throw new Error("buildSavedDataReconciler requires an adapter with readScopeEvidence + computeAccountRevision (fail closed).");
@@ -255,6 +295,8 @@ export function buildSavedDataReconciler({
     if (runReleaseForAccount != null) throw new Error("buildSavedDataReconciler takes EITHER runReleaseForAccount OR runPrepareForUnit + runPublishForUnit, never both (fail closed).");
     if (!Number.isInteger(chunkMaxTargets) || chunkMaxTargets < 1 || chunkMaxTargets > 1000) throw new Error("buildSavedDataReconciler chunkMaxTargets must be an integer in [1, 1000] (fail closed).");
     if (!Number.isFinite(chunkMaxSeconds) || chunkMaxSeconds <= 0) throw new Error("buildSavedDataReconciler chunkMaxSeconds must be a positive number (fail closed).");
+    if (!Number.isInteger(interWindowPauseMs) || interWindowPauseMs < 0 || interWindowPauseMs > 120000) throw new Error("buildSavedDataReconciler interWindowPauseMs must be an integer in [0, 120000] (fail closed).");
+    if (interWindowPauseMs > 0 && typeof sleep !== "function") throw new Error("buildSavedDataReconciler sleep must be a function when interWindowPauseMs > 0 (fail closed).");
   }
   for (const [name, fn] of [["resolveOrg", resolveOrg], ["bucketAccounts", bucketAccounts], ["readLatestReportJob", readLatestReportJob], ["readShadowSnapshot", readShadowSnapshot], ["readLiveSnapshot", readLiveSnapshot], ["loadStoragePayload", loadStoragePayload], ["verifyLiveReadback", verifyLiveReadback], ...(twoPhase ? [] : [["runReleaseForAccount", runReleaseForAccount]])]) {
     if (typeof fn !== "function") throw new Error(`buildSavedDataReconciler requires ${name} (fail closed).`);
@@ -348,6 +390,8 @@ export function buildSavedDataReconciler({
         units = [aliasDefaultUnit(accountId, requestedAsOf, rec.reports)];
       }
       attachUnits(rec, units, revision);
+      // An EMPTY (valid) expansion is MARKED on the record so the TARGETS v2 line carries it explicitly.
+      if (resolved.ok && resolved.mark === UNITS_EMPTY_REASON) rec.unitsReason = UNITS_EMPTY_REASON;
       let anyStale = false;
       if (resolved.ok) {
         for (const unit of units) {
@@ -558,7 +602,8 @@ export function buildSavedDataReconciler({
     try { raw = await adapter.expandUnits({ accountId, revision, evidence, requestedAsOf, bucket }); }
     catch { return { ok: false, state: RECONCILE_STATUS.DEFERRED_DEPENDENCY, reason: "expand-units-threw" }; }
     const n = normalizeRouteUnits(raw, { accountId, requestedAsOf, reportKeys });
-    return n.ok ? { ok: true, units: n.units } : { ok: false, state: RECONCILE_STATUS.DEFERRED_PROVENANCE, reason: "units-invalid:" + n.reason };
+    // An ok result's reason is its MARK (UNITS_EMPTY_REASON for an empty expansion, else null).
+    return n.ok ? { ok: true, units: n.units, mark: n.reason } : { ok: false, state: RECONCILE_STATUS.DEFERRED_PROVENANCE, reason: "units-invalid:" + n.reason };
   }
 
   // ONE (unit, report) verdict in EXTENDED mode: a declared unit deferral, the per-target as-of guard, the exact binding
@@ -587,7 +632,9 @@ export function buildSavedDataReconciler({
       if (sc.ok !== true) {
         // fixable: the canonical row exists but the serve picks another row this route CAN supersede -> re-publish.
         // not fixable: a foreign/newer row holds the served slot -> typed deferral (alerted), never a publish loop.
-        if (sc.fixable === true) { entry.state = PUBLICATION_STATE.STALE; entry.reason = "served-row-differs"; }
+        // The ONE typed exception: 'manifest-differs' (the route adapter's verify-exact content check) keeps its reason
+        // -- it is a content drift, not a served-row mismatch, and the recovery worker must see it as such.
+        if (sc.fixable === true) { entry.state = PUBLICATION_STATE.STALE; entry.reason = sc.reason === "manifest-differs" ? "manifest-differs" : "served-row-differs"; }
         else { entry.state = RECONCILE_STATUS.DEFERRED_DEPENDENCY; entry.reason = "served-row-preempted:" + reasonCode(sc.reason); }
         entry.h = null; entry.sra = null;
       }
@@ -606,6 +653,18 @@ export function buildSavedDataReconciler({
     const markUnit = (su, state, reason, extra) => { for (const rk of su.unit.reportKeys) { const cur = su.unit.reports[rk]; if (cur && cur.state === PUBLICATION_STATE.STALE) su.unit.reports[rk] = { state, reason, lkgPreserved: true, ...(extra || {}) }; } };
     const applyResult = (su, result, phase) => {
       const execStatus = statusFromRelease(result);
+      // WP4 (owner rule): a unit runner that PROVED the unit already current with ZERO live writes -- the fenced CAS
+      // 'already-current', or a REFUSED write whose content identity + lineage + served read-back all matched -- returns
+      // alreadyCurrent:true. It counts as PUBLICATION_NOT_REQUIRED (already current), NEVER as published. Two-phase
+      // only (the four live families never reach runTwoPhase), so every pre-WP4 path is unchanged.
+      if (execStatus === RECONCILE_STATUS.READBACK_VERIFIED && result && result.alreadyCurrent === true) {
+        // The proof included the served-row check: h / sra / served are the proven served (== canonical live) row.
+        const sv = result.served && typeof result.served === "object" ? result.served : null;
+        const h = sv ? boundedStr(sv.params_hash, 128) : null;
+        const sra = sv ? boundedStr(sv.source_refreshed_at, 64) : null;
+        for (const rk of su.staleRks) su.unit.reports[rk] = { state: PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED, reason: "already-current", h, sra, served: sv ? { id: boundedStr(sv.id == null ? null : S(sv.id), 64), h, sra } : null };
+        return;
+      }
       if (execStatus === RECONCILE_STATUS.READBACK_VERIFIED) {
         for (const rk of su.staleRks) su.unit.reports[rk] = { state: RECONCILE_STATUS.READBACK_VERIFIED, reason: null };
         if (membershipSourceReport && su.staleRks.includes(membershipSourceReport)) promoted.push(su.rec.accountId);
@@ -652,11 +711,14 @@ export function buildSavedDataReconciler({
         continue;
       }
       let result = op.result;
-      if (result && result.ok === true && result.prepared === true) { prepared.push({ ...su, prepared: result }); continue; }
-      // FAIL CLOSED: an "ok" that does not affirm prepared:true is never published (it could be a no-op or a runner that
-      // skipped the shadow); a hard derive failure, not a silent success. A missing result is likewise a derive failure.
+      // A prepare SUCCEEDS only when ok===true AND prepared===true AND its code is absent or exactly 0 (the typed release
+      // contract: a nonzero code is a failure whatever else the result claims).
+      if (result && result.ok === true && result.prepared === true && (result.code === undefined || result.code === 0)) { prepared.push({ ...su, prepared: result }); continue; }
+      // FAIL CLOSED: an "ok" that does not affirm prepared:true with a zero/absent code is never published (it could be a
+      // no-op, a runner that skipped the shadow, or a contradictory ok+error); a hard derive failure, not a silent
+      // success. A missing result is likewise a derive failure.
       if (!result || typeof result !== "object") result = { ok: false, code: 1, stage: "derive", reason: "prepare-result-malformed", problems: [] };
-      else if (result.ok === true) result = { ok: false, code: 1, stage: "derive", reason: "prepare-unconfirmed", problems: ["prepare-unconfirmed: ok without prepared:true"] };
+      else if (result.ok === true) result = { ok: false, code: 1, stage: "derive", reason: "prepare-unconfirmed", problems: [result.prepared === true ? "prepare-unconfirmed: ok+prepared with a nonzero code" : "prepare-unconfirmed: ok without prepared:true"] };
       applyResult(su, result, "prepare");
     }
 
@@ -670,9 +732,22 @@ export function buildSavedDataReconciler({
       const publisherKeys = sortedUnion(chunk.map((p) => p.staleRks));
       let windowOpened = false, halt = false, processed = 0;
       try {
-        const opened = await openControls({ owners, publisherKeys });
-        control.reason = S(opened && opened.reason);
-        if (opened && opened.commitUnknown === true) {
+        let opened, openThrew = false;
+        try { opened = await openControls({ owners, publisherKeys }); }
+        catch { openThrew = true; }
+        if (!openThrew) control.reason = S(opened && opened.reason);
+        if (openThrew) {
+          // An openControls THROW (in ANY window): the apply's commit state is UNKNOWN (it may have opened before
+          // failing), so NOTHING publishes in this window and it is NEVER safe-closed (never proven open -- the finally
+          // below is unchanged). Every earlier window's results are KEPT (the run returns its summary); the remaining
+          // prepared units DEFER (retryable, LKG preserved); the run is NON-GREEN (control state unproven -> the separate
+          // cleanup reclaims). Never the thrown message (it may carry a secret).
+          control.applyCommitUnknown = true;
+          control.reason = "controls-open-threw";
+          for (const p of prepared.slice(idx)) markUnit(p, RECONCILE_STATUS.DEFERRED_DEPENDENCY, "controls-open-threw");
+          log(`SAVED_DATA_RECONCILE controls-open THREW -- commit state UNKNOWN; deferring ${prepared.length - idx} prepared unit(s), ZERO publication writes in this window; run is NON-GREEN (read-only control reconciliation required).`);
+          halt = true;
+        } else if (opened && opened.commitUnknown === true) {
           control.applyCommitUnknown = true;
           for (const p of prepared.slice(idx)) markUnit(p, RECONCILE_STATUS.FAILED_PUBLISH, "control-apply-commit-unknown", { reconcileRequired: true });
           log("SAVED_DATA_RECONCILE control-apply COMMIT_UNKNOWN -- NO rollback, NO retry; read-only control reconciliation required.");
@@ -722,6 +797,10 @@ export function buildSavedDataReconciler({
         for (const p of prepared.slice(idx)) markUnit(p, RECONCILE_STATUS.DEFERRED_DEPENDENCY, "controls-close-unresolved");
         break;
       }
+      // LEASE FAIRNESS (opt-in): the window just CLOSED (proven above); before re-opening for the rest, leave the lease free
+      // for longer than a waiter's retry interval. Skipped when nothing remains or the deadline is already reached (the
+      // loop head then defers the rest exactly as without a pause).
+      if (interWindowPauseMs > 0 && idx < prepared.length && !deadlineHit && !outOfTime()) await sleep(interWindowPauseMs);
     }
   }
 

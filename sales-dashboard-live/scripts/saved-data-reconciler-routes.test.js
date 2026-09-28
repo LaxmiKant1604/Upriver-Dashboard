@@ -6,14 +6,18 @@
 // safe-close failures / immediate scope / post-promotion hook / every fail-closed entry / build-time refusals) is run
 // through the REAL core with injected fakes, and the canonical JSON of {summary, logs, every injected call + args} must
 // hash to the value recorded from the PRE-WP3 module (git HEAD). The scenario function sits between the GOLDEN markers
-// so the same code can be re-run against the pristine module. Offline; zero network; zero DataDoe. 7-bit ASCII, LF.
+// so the same code can be re-run against the pristine module. F4 (the WP3 verifier follow-ups): a prepare succeeds only
+// with ok + prepared + a zero/absent code; an openControls THROW in a later window keeps the earlier windows' results
+// (remaining units DEFERRED 'controls-open-threw', summary returned, non-green); an empty unit expansion stays valid but
+// is marked 'units-empty' on the record + the TARGETS v2 line; the core's owner grammar IS the TARGETS v2 owner grammar.
+// Offline; zero network; zero DataDoe. 7-bit ASCII, LF.
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { buildSavedDataReconciler, RECONCILE_STATUS, normalizeRouteUnits, DEFAULT_CHUNK_MAX_TARGETS, DEFAULT_CHUNK_MAX_SECONDS } from "../lib/server/sync/saved-data-reconciler.js";
+import { buildSavedDataReconciler, RECONCILE_STATUS, normalizeRouteUnits, DEFAULT_CHUNK_MAX_TARGETS, DEFAULT_CHUNK_MAX_SECONDS, ROUTE_OWNER_ID_RE, UNITS_EMPTY_REASON, MAX_TARGET_ID_BYTES, targetIdByteLength } from "../lib/server/sync/saved-data-reconciler.js";
 import {
   formatTargetsLine, parseTargetsLine, normalizeTargets, buildTargetsPayload, buildTargetsPayloadV2,
-  TARGETS_MAX_LINE_BYTES, TARGETS_LINE_PREFIX,
+  TARGETS_MAX_LINE_BYTES, TARGETS_LINE_PREFIX, TARGETS_OWNER_ID_RE, TARGETS_UNITS_EMPTY,
 } from "../lib/server/sync/reconcile-targets-output.js";
 
 let passed = 0;
@@ -636,6 +640,97 @@ test("T5 normalizeTargets(v1): one unit per report (u '-'), owners [id], tok nul
   ok("T5: an ineligible account keeps its typed provenance reason", n.targets[1].units[0].s === "DEFERRED_PROVENANCE" && n.targets[1].units[0].r === "oli-coverage-short");
   ok("T5: a normalized v1 re-validates as a well-formed v2 payload (round trip through the v2 parser)", parseTargetsLine(TARGETS_LINE_PREFIX + JSON.stringify(n)) !== null);
   ok("T5: garbage normalizes to null; the v1 builder is unchanged for a null summary", normalizeTargets(null) === null && normalizeTargets({ v: 1 }) === null && normalizeTargets({ v: 9, targets: [] }) === null && buildTargetsPayload({ family: "oli", summary: null }).accounts.length === 0);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// F4 -- the WP3 verifier follow-ups.
+test("F4a two-phase: a prepare succeeds ONLY with ok===true AND prepared===true AND a code that is absent or exactly 0", async () => {
+  const cases = [
+    ["code 1", { ok: true, code: 1, prepared: true }, false],
+    ["code '0' (string)", { ok: true, code: "0", prepared: true }, false],
+    ["code null", { ok: true, code: null, prepared: true }, false],
+    ["code 0", { ok: true, code: 0, prepared: true }, true],
+    ["code absent", { ok: true, prepared: true }, true],
+  ];
+  for (const [label, res, publishes] of cases) {
+    const store = makeStore(); seedSm(store, "ACC1", "A");
+    const r = makeRoute({ store, expandUnits: ({ accountId }) => [smUnit(accountId, "A")], prepare: () => res });
+    const out = await run(r);
+    const e = unitEntry(out, "ACC1", "u-a", "sm");
+    if (publishes) ok("F4a: " + label + " -> prepared, published, READBACK_VERIFIED", e.state === RECONCILE_STATUS.READBACK_VERIFIED && r.events.some((x) => x[0] === "publish"));
+    else ok("F4a: " + label + " -> FAILED_DERIVE prepare-unconfirmed, NEVER published, ZERO controls opened", e.state === RECONCILE_STATUS.FAILED_DERIVE && e.reason === "prepare-unconfirmed" && e.lkgPreserved === true && !r.events.some((x) => x[0] === "open" || x[0] === "publish") && out.ok === false);
+  }
+});
+
+test("F4b two-phase: an openControls THROW in window >= 2 keeps earlier windows' results; the rest DEFER 'controls-open-threw'; the summary is returned (non-green)", async () => {
+  const setup = (throwAt) => {
+    const store = makeStore(); for (const b of ["b1", "b2", "b3"]) seedSm(store, "ACC1", b);
+    let opens = 0;
+    return makeRoute({ store, chunkMaxTargets: 1, expandUnits: ({ accountId }) => ["b1", "b2", "b3"].map((b) => smUnit(accountId, b)), openControls: () => { opens += 1; if (opens === throwAt) throw new Error("open-boom password=secret"); return { ok: true, reason: "opened" }; } });
+  };
+  const r2 = setup(2);
+  let out2 = null, rejected = null;
+  try { out2 = await run(r2); } catch (e) { rejected = e; }
+  ok("F4b: the run RESOLVES with a summary (never rejects, never loses window 1)", rejected === null && out2 && Array.isArray(out2.perAccount));
+  ok("F4b: window 1's unit stays READBACK_VERIFIED; b2 + b3 DEFERRED_DEPENDENCY controls-open-threw (LKG preserved)", unitEntry(out2, "ACC1", "u-b1", "sm").state === RECONCILE_STATUS.READBACK_VERIFIED
+    && ["u-b2", "u-b3"].every((u) => unitEntry(out2, "ACC1", u, "sm").state === RECONCILE_STATUS.DEFERRED_DEPENDENCY && unitEntry(out2, "ACC1", u, "sm").reason === "controls-open-threw" && unitEntry(out2, "ACC1", u, "sm").lkgPreserved === true));
+  ok("F4b: safe-close semantics unchanged -- window 1 opened + closed once; the thrown window is never 'closed'; no publish after the throw", r2.events.filter((e) => e[0] === "open").length === 2 && r2.events.filter((e) => e[0] === "close").length === 1 && r2.events.filter((e) => e[0] === "publish").length === 1);
+  ok("F4b: counts keep window 1 (1 published, 2 deferred); the run is NON-GREEN (commit state unknown -> CONTROL_CLEANUP_UNRESOLVED, controlReason controls-open-threw)", out2.counts.targetsPublished === 1 && out2.counts.targetsDeferred === 2 && out2.controlCleanupUnresolved === true && out2.code === "CONTROL_CLEANUP_UNRESOLVED" && out2.ok === false && out2.controlReason === "controls-open-threw");
+  ok("F4b: the thrown message never reaches a log line", !r2.events.some((e) => e[0] === "log" && /open-boom|secret/.test(e[1])) && r2.events.some((e) => e[0] === "log" && e[1].startsWith("SAVED_DATA_RECONCILE controls-open THREW")));
+  const r1 = setup(1);
+  const out1 = await run(r1);
+  ok("F4b: a throw in window 1 -> every prepared unit DEFERRED controls-open-threw, ZERO publish, ZERO close, summary returned", unitsOf(out1, "ACC1").every((u) => u.reports.sm.reason === "controls-open-threw") && !r1.events.some((e) => e[0] === "publish" || e[0] === "close") && out1.controlCleanupUnresolved === true);
+});
+
+test("F4c normalizeRouteUnits: [] stays VALID at the core level but the target is marked 'units-empty' (record + TARGETS v2)", async () => {
+  const n = normalizeRouteUnits([], { accountId: "ACC1", requestedAsOf: ASOF, reportKeys: ["sm"] });
+  ok("F4c: normalizeRouteUnits([]) -> ok:true, zero units, reason 'units-empty' (a non-empty set keeps reason null)", n.ok === true && n.units.length === 0 && n.reason === "units-empty" && UNITS_EMPTY_REASON === "units-empty" && TARGETS_UNITS_EMPTY === UNITS_EMPTY_REASON
+    && normalizeRouteUnits([{ unitKey: "ALL" }], { accountId: "ACC1", requestedAsOf: ASOF, reportKeys: ["sm"] }).reason === null);
+  const store = makeStore(); seedSm(store, "ACC2", "A");
+  const r = makeRoute({ store, accounts: ["ACC1", "ACC2"], expandUnits: ({ accountId }) => (accountId === "ACC1" ? [] : [smUnit(accountId, "A")]) });
+  const out = await run(r);
+  const rec1 = out.perAccount.find((x) => x.accountId === "ACC1");
+  const rec2 = out.perAccount.find((x) => x.accountId === "ACC2");
+  ok("F4c: the empty target is marked rec.unitsReason 'units-empty' (zero units, zero counts); a non-empty target carries no mark", rec1.units.length === 0 && rec1.unitsReason === "units-empty" && !("unitsReason" in rec2) && out.counts.targetsExamined === 1 && out.counts.targetsPublished === 1);
+  const t = parseTargetsLine(formatTargetsLine({ family: "sku-movement", summary: out, v: 2 }));
+  const t1 = t.targets.find((x) => x.id === "ACC1"), t2 = t.targets.find((x) => x.id === "ACC2");
+  ok("F4c: TARGETS v2 carries the empty target EXPLICITLY (r 'units-empty', units []); a non-empty target's shape is unchanged", t1.r === "units-empty" && t1.units.length === 0 && !("r" in t2) && Object.keys(t2).join(",") === "id,owners,tok,units");
+  const bare = buildTargetsPayloadV2({ route: "x", summary: { requestedAsOf: ASOF, perAccount: [{ accountId: "B1", units: [] }] } });
+  ok("F4c: ANY target with no unit rows is flagged (never an implicit 'every unit current')", bare.targets[0].r === "units-empty");
+});
+
+test("F4d owner grammar: the core refuses (typed) every owner the TARGETS v2 grammar would drop -- the two grammars are IDENTICAL", async () => {
+  ok("F4d: ROUTE_OWNER_ID_RE is exactly TARGETS_OWNER_ID_RE (source + flags)", ROUTE_OWNER_ID_RE.source === TARGETS_OWNER_ID_RE.source && ROUTE_OWNER_ID_RE.flags === TARGETS_OWNER_ID_RE.flags && ROUTE_OWNER_ID_RE.source === "^[A-Za-z0-9._-]{1,120}$");
+  const probe = ["ACC1", "a1b2-c3d4.e_f", "x".repeat(120), "x".repeat(121), "owner with space", "dd:ACC1", "region:india", "ACC1/x", "caf" + String.fromCharCode(233), "ACC1\n", "A\tB", "+acc", ""];
+  const coreOk = (o) => normalizeRouteUnits([{ unitKey: "u", ownerAccountIds: [o] }], { accountId: "ACC1", requestedAsOf: ASOF, reportKeys: ["sm"] }).ok === true;
+  const lineKeeps = (o) => buildTargetsPayloadV2({ route: "x", summary: { requestedAsOf: ASOF, perAccount: [{ accountId: "T1", ownerAccountIds: [o], units: [] }] } }).targets[0].owners.includes(o);
+  ok("F4d: for every probe id, the core accepts it IFF the TARGETS v2 line keeps it", probe.every((o) => coreOk(o) === lineKeeps(o)));
+  ok("F4d: the probes exercise both sides (accepted + refused)", probe.filter(coreOk).length === 3 && probe.filter((o) => !coreOk(o)).length === probe.length - 3);
+  const bad = normalizeRouteUnits([{ unitKey: "u", ownerAccountIds: ["ACC1", "owner with space"] }], { accountId: "ACC1", requestedAsOf: ASOF, reportKeys: ["sm"] });
+  ok("F4d: one bad owner refuses the WHOLE set, typed unit-owners-invalid", bad.ok === false && bad.reason === "unit-owners-invalid" && bad.units.length === 0);
+  const store = makeStore(); seedSm(store, "ACC1", "A");
+  const r = makeRoute({ store, expandUnits: ({ accountId }) => [smUnit(accountId, "A", { ownerAccountIds: ["owner with space"] })] });
+  const out = await run(r);
+  ok("F4d: end-to-end, such a unit NEVER opens controls (DEFERRED_PROVENANCE units-invalid:unit-owners-invalid, zero prepare/open/publish)", out.perAccount[0].reports.sm.state === RECONCILE_STATUS.DEFERRED_PROVENANCE && out.perAccount[0].reports.sm.reason === "units-invalid:unit-owners-invalid" && !r.events.some((e) => ["prepare", "open", "publish"].includes(e[0])));
+});
+
+test("F5 unit target bound: UTF-8 BYTES (MAX_TARGET_ID_BYTES 2048, under Postgres's 2704-byte btree tuple cap), never UTF-16 length", async () => {
+  const norm = (u) => normalizeRouteUnits([{ unitKey: "u", ownerAccountIds: ["ACC1"], ...u }], { accountId: "ACC1", requestedAsOf: ASOF, reportKeys: ["sm"] });
+  const EURO = String.fromCharCode(0x20ac); // 3 UTF-8 bytes, 1 UTF-16 unit
+  const GRIN = String.fromCodePoint(0x1f600); // 4 UTF-8 bytes, 2 UTF-16 units
+  ok("F5: the exported bound is 2048 BYTES and targetIdByteLength is the UTF-8 byte length", MAX_TARGET_ID_BYTES === 2048 && targetIdByteLength("abc") === 3 && targetIdByteLength(EURO) === 3 && targetIdByteLength(GRIN) === 4);
+  ok("F5: ASCII -- exactly 2048 bytes accepted, 2049 refused (unit-target-invalid)", norm({ targetId: "x".repeat(2048) }).ok === true && norm({ targetId: "x".repeat(2049) }).reason === "unit-target-invalid");
+  const over = EURO.repeat(683); // 2049 bytes, UTF-16 length 683
+  const exact = EURO.repeat(682) + "ab"; // 2048 bytes
+  ok("F5: a non-ASCII id of 2049 BYTES but only 683 UTF-16 units is REFUSED (a .length check would pass it); 2048 bytes is accepted",
+    over.length < 2049 && targetIdByteLength(over) === 2049 && norm({ targetId: over }).ok === false && norm({ targetId: over }).reason === "unit-target-invalid" && norm({ targetId: exact }).ok === true);
+  ok("F5: astral characters count 4 bytes (512 accepted, 513 refused)", norm({ targetId: GRIN.repeat(512) }).ok === true && norm({ targetId: GRIN.repeat(513) }).reason === "unit-target-invalid");
+  ok("F5: the SAME byte bound applies to liveAccountId (unit-live-account-invalid)", norm({ targetId: "T1", liveAccountId: over }).reason === "unit-live-account-invalid" && norm({ targetId: "T1", liveAccountId: exact }).ok === true);
+  const store = makeStore(); seedSm(store, "ACC1", "A");
+  const r = makeRoute({ store, expandUnits: ({ accountId }) => [smUnit(accountId, "A", { targetId: "sm:" + accountId + "::" + EURO.repeat(700) })] });
+  const out = await run(r);
+  ok("F5: end-to-end, an over-bound unit id is typed BEFORE any write (DEFERRED_PROVENANCE units-invalid:unit-target-invalid; zero prepare / open / publish)",
+    out.perAccount[0].reports.sm.state === RECONCILE_STATUS.DEFERRED_PROVENANCE && out.perAccount[0].reports.sm.reason === "units-invalid:unit-target-invalid" && !r.events.some((e) => ["prepare", "open", "publish"].includes(e[0])));
 });
 
 async function main() {

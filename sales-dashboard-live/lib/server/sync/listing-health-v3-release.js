@@ -19,7 +19,9 @@
 //      reviewed FENCED publisher + CAS + buildLiveReadback.
 //   A retry whose dedicated cycle is already TERMINAL (a crash after step 5's finalize, before the publish) resumes at
 //   preflight/publish ONLY when the latest job is provably this exact derivation (resumableAtTerminalCycle); anything
-//   else still defers 'cycle-not-running'. A publish 'newer-live' is a retryable NEWER_LIVE deferral (zero rows written).
+//   else still defers 'cycle-not-running' -- plus, ONLY when the OPTIONAL readNewestForeignJob collaborator is wired and
+//   a FOREIGN job exists, a retryBucketSalt so the caller retries ONCE in a fresh salted cycle (WP16 P2-B, below). A
+//   publish 'newer-live' is a retryable NEWER_LIVE deferral (zero rows written).
 //
 // TERMINATION BOUNDARY: the caller's AbortSignal is threaded into EVERY supported read/write (the bundle resolver
 // forwards it through pointer reads, storage hydration, AND the durable OLI/catalog loader), abort is rechecked AFTER
@@ -30,10 +32,13 @@
 // publisher + control fence. It imports NO provider export transport. The returned per-account result is the SAME typed
 // shape the release runner returns. 7-bit ASCII, LF.
 
-import { jobIsPromotable, revisionCoveredByJob } from "./publication-binding.js";
+import { createHash } from "node:crypto";
+import { resumableAtTerminalCycle } from "./publication-binding.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
+// Byte-identical to source-identity.js sha256 (hex of String(value)); inlined so this module stays a leaf.
+const sha256 = (v) => createHash("sha256").update(String(v)).digest("hex");
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const LIVE_REPORT_KEY = "listing-health-v3";
 const LISTINGS_REQUEST_KEY = "listing-health-v3:listings";
@@ -69,13 +74,75 @@ const defaultReadLatestJob = async (reportKey, accountId, opt) => (await import(
 // promotable (validated + succeeded in a terminal cycle + nonblank hash), carries EXACTLY this derive's shadow params
 // hash, and its lineage covers EXACTLY this derive's deps + content deps. Anything else (another cycle's job, another
 // revision, an unreadable job) keeps today's defer. The publisher re-proves every gate + the shadow hash provenance +
-// the payload contract before the fenced CAS, so a resume never trusts the job row alone.
-function resumableAtTerminalCycle(job, { cycleId, paramsHash, dependsOn, durableContentDeps }) {
-  return !!job && nb(cycleId)
-    && S(job.cycleId) === S(cycleId)
-    && jobIsPromotable(job)
-    && S(job.snapshotParamsHash) === S(paramsHash)
-    && revisionCoveredByJob({ eligible: true, deps: dependsOn, contentDeps: durableContentDeps }, job);
+// the payload contract before the fenced CAS, so a resume never trusts the job row alone. The predicate itself is the
+// SHARED resumableAtTerminalCycle (publication-binding.js, hoisted in WP4) -- one definition for every release.
+
+// FOREIGN-JOB STRAND (WP16 P2-B; pre-existing). The dedicated cycle bucket is deterministic over {accountId, revisionId}
+// and the publisher (report-publisher.js SOURCE-OF-TRUTH gate) promotes ONLY the LATEST sync_report_jobs row for
+// (listing-health-v3, account). When that latest row is a FOREIGN job -- a natural listing-health-v3 base-cycle job
+// (the scheduler's dedicated ingestion) that either FAILED its shadow save (job-not-promotable; india 2026-09-25) or
+// SUCCEEDED without this revision's manifest in durable_content_deps ('listings-manifest-changed') -- created AFTER this
+// reconciler already published revision R, an UNCHANGED R re-derives into its OWN already-terminal bucket, the latest
+// job is not this cycle's (resumableAtTerminalCycle false) and EVERY pass deferred 'cycle-not-running:succeeded' until
+// the revision / as-of changed (the WP2 crash-strand resume was disabled too). The same strand follows an A -> B -> A
+// manifest revert (A's bucket is terminal; the latest job is B's).
+// FIX (opt-in): the OPTIONAL collaborator readNewestForeignJob(reportKey, accountId, durableContentDeps, { signal })
+// returns the NEWEST sync_report_jobs row for (listing-health-v3, account) whose durable_content_deps do NOT contain this
+// revision's manifest token (or null). ONLY when resumableAtTerminalCycle(latest) is false (and the latest job was
+// readable) AND such a foreign job exists, the release returns the SAME typed 'cycle-not-running:<status>' deferral plus
+// retryBucketSalt = foreignJob.id; the caller (runListingHealthV3ReleaseWithForeignRetry) retries ONCE in the salted
+// bucket listingHealthV3ReleaseCycleBucket({..., salt}) -- a FRESH cycle that has never held a job for this account, so
+// the normal open -> job -> shadow -> finalize -> publish path converges in ONE pass. Keyed on the newest FOREIGN job
+// (never on "the latest job") it is CRASH-STABLE: a salted cycle that dies after finalize is re-reached next pass with
+// the SAME salt (its own job carries the manifest, so it is never "foreign"), and there the latest job IS that cycle's
+// own -> the WP2 resume publishes (no third cycle). Cycles are bounded by the number of DISTINCT foreign jobs. Absent
+// the collaborator (default null) every result is byte-identical to before. The salted bucket stays inside the
+// migration-20260924 namespace (sync_cycles_bucket_check + open_sync_cycle: ^priority-partial-(india|europe-au|us-ca)-
+// [0-9a-f]{16}$); the report JOB keeps the real region bucket (unchanged).
+
+/**
+ * The dedicated priority-partial CYCLE bucket of one (region, account, revision[, salt]). salt null/"" -> EXACTLY the
+ * pre-WP16 expression 'priority-partial-<region>-' + sha256(JSON.stringify([accountId, revisionId || ""])).slice(0,16)
+ * (byte-identical); a salt -> sha256(JSON.stringify([accountId, revisionId || "", salt])).slice(0,16).
+ */
+export function listingHealthV3ReleaseCycleBucket({ region, accountId, revisionId, salt = null } = {}) {
+  const key = salt == null || S(salt) === "" ? [accountId, revisionId || ""] : [accountId, revisionId || "", S(salt)];
+  return "priority-partial-" + region + "-" + sha256(JSON.stringify(key)).slice(0, 16);
+}
+
+/**
+ * Run ONE account's dedicated release in its deterministic bucket and, ONLY when that attempt deferred with a
+ * retryBucketSalt (the foreign-job strand above), retry ONCE in the salted bucket. Never more than two attempts per
+ * call; the second attempt's own retryBucketSalt (a newer foreign job appeared mid-pass) is NOT followed -- the next
+ * pass converges. The release re-checks the abort signal at entry, so an aborted pass never starts the retry's work.
+ */
+export async function runListingHealthV3ReleaseWithForeignRetry({ release, region, accountId, requestedAsOf, revisionId, signal = null } = {}) {
+  if (!release || typeof release.runForAccount !== "function") throw new Error("runListingHealthV3ReleaseWithForeignRetry requires a release (fail closed).");
+  const first = await release.runForAccount({ accountId, requestedAsOf, cycleBucket: listingHealthV3ReleaseCycleBucket({ region, accountId, revisionId }), revisionId, signal });
+  const salt = first && first.ok !== true && typeof first.retryBucketSalt === "string" ? first.retryBucketSalt : "";
+  if (!nb(salt)) return first;
+  return release.runForAccount({ accountId, requestedAsOf, cycleBucket: listingHealthV3ReleaseCycleBucket({ region, accountId, revisionId, salt }), revisionId, signal });
+}
+
+// The production readNewestForeignJob: ONE read-only select over sync_report_jobs (durable_content_deps is jsonb,
+// migration 20260925 -- jsonb array containment, so "does NOT contain every manifest token of this revision"), newest by
+// created_at (ties by id). `query(sql, params, { signal })` -> rows is the caller's read-only pg client.
+export const LISTING_HEALTH_V3_FOREIGN_JOB_SQL = `select j.id::text as id, j.cycle_id::text as cycle_id, j.durable_content_deps
+  from public.sync_report_jobs j
+ where j.report_key = $1 and j.account_id = $2
+   and not (coalesce(j.durable_content_deps, '[]'::jsonb) @> $3::jsonb)
+ order by j.created_at desc, j.id desc
+ limit 1`;
+export function buildListingHealthV3ForeignJobReader({ query } = {}) {
+  if (typeof query !== "function") throw new Error("buildListingHealthV3ForeignJobReader requires query (fail closed).");
+  return async function readNewestForeignJob(reportKey, accountId, durableContentDeps, { signal = null } = {}) {
+    const tokens = Array.isArray(durableContentDeps) ? durableContentDeps.map((t) => S(t)).filter(nb) : [];
+    if (!nb(reportKey) || !nb(accountId) || tokens.length === 0) return null; // nothing can be foreign to an empty identity
+    const rows = await query(LISTING_HEALTH_V3_FOREIGN_JOB_SQL, [S(reportKey), S(accountId), JSON.stringify(tokens)], { signal });
+    const row = Array.isArray(rows) ? rows[0] : null;
+    if (!row || !nb(row.id)) return null;
+    return { id: S(row.id), cycleId: row.cycle_id == null ? null : S(row.cycle_id), durableContentDeps: Array.isArray(row.durable_content_deps) ? row.durable_content_deps.map((t) => S(t)) : [] };
+  };
 }
 
 // A single-owner no-date fragment source (Listings / Listings-Raw): the derive's noDateFragmentRows requires EXACTLY one
@@ -103,6 +170,9 @@ function noDateSource(requestKey, rows, rawSellerId) {
  *   readbackLive({ reportKey, liveReportKey, accountId, paramsHash, signal }) -> { ok, reason? }
  *   readLatestJob(reportKey, accountId, { signal }) -> lineage | null   (default getLatestReportJobLineage; read ONLY
  *       by the terminal-cycle resume)
+ *   readNewestForeignJob(reportKey, accountId, durableContentDeps, { signal }) -> { id, ... } | null   OPTIONAL (default
+ *       null = pre-WP16 behaviour); read ONLY on a terminal cycle whose latest job is not resumable (the foreign-job
+ *       strand above; buildListingHealthV3ForeignJobReader is the production reader)
  *   verifyLease() -> { ok, reason? } ; snapshotBytes(payload) ; leaseSeconds ; log
  */
 export function buildListingHealthV3Release({
@@ -114,6 +184,7 @@ export function buildListingHealthV3Release({
   finalizeCycle,
   publisher, readbackLive,
   readLatestJob = defaultReadLatestJob,
+  readNewestForeignJob = null,
   verifyLease = async () => ({ ok: true }),
   snapshotBytes = (p) => Buffer.byteLength(JSON.stringify(p == null ? null : p), "utf8"),
   leaseSeconds = 300,
@@ -122,6 +193,7 @@ export function buildListingHealthV3Release({
   for (const [name, fn] of [["resolveBundle", resolveBundle], ["openCycle", openCycle], ["getCycleByBucketDate", getCycleByBucketDate], ["claimCycle", claimCycle], ["deriveSnapshot", deriveSnapshot], ["computeHash", computeHash], ["upsertReportJob", upsertReportJob], ["claimLease", claimLease], ["saveShadow", saveShadow], ["reconcileSuccess", reconcileSuccess], ["finalizeCycle", finalizeCycle], ["readbackLive", readbackLive], ["readLatestJob", readLatestJob]]) {
     if (typeof fn !== "function") throw new Error(`buildListingHealthV3Release requires ${name} (fail closed).`);
   }
+  if (readNewestForeignJob != null && typeof readNewestForeignJob !== "function") throw new Error("buildListingHealthV3Release readNewestForeignJob must be a function when provided (fail closed).");
   if (!liveContracts || !reportDerivations) throw new Error("buildListingHealthV3Release requires liveContracts + reportDerivations (fail closed).");
   if (!publisher || typeof publisher.preflight !== "function" || typeof publisher.publish !== "function") throw new Error("buildListingHealthV3Release requires a publisher with preflight + publish (fail closed).");
   const derivation = reportDerivations[LIVE_REPORT_KEY];
@@ -226,9 +298,23 @@ export function buildListingHealthV3Release({
         // Terminal: read the latest job (signal-threaded, read-only). An unreadable job never resumes (fail closed).
         if (aborted()) return DEADLINE();
         let latest = null;
-        try { latest = await readLatestJob(LIVE_REPORT_KEY, accountId, opt); } catch { latest = null; }
+        let latestReadable = true;
+        try { latest = await readLatestJob(LIVE_REPORT_KEY, accountId, opt); } catch { latest = null; latestReadable = false; }
         if (aborted()) return DEADLINE();
-        if (!resumableAtTerminalCycle(latest, { cycleId, paramsHash, dependsOn, durableContentDeps })) return defer("cycle-not-running:" + cycleStatus);
+        if (!resumableAtTerminalCycle(latest, { cycleId, paramsHash, dependsOn, durableContentDeps })) {
+          const terminal = defer("cycle-not-running:" + cycleStatus);
+          // WP16 P2-B (opt-in): a FOREIGN job strands this revision's own terminal bucket -> the SAME deferral + a salt
+          // for ONE retry in a fresh salted cycle. An unreadable latest job / foreign read / abort keeps today's defer.
+          if (typeof readNewestForeignJob !== "function" || !latestReadable) return terminal;
+          let foreign = null;
+          try { foreign = await readNewestForeignJob(LIVE_REPORT_KEY, accountId, durableContentDeps, opt); } catch { foreign = null; }
+          if (aborted()) return DEADLINE();
+          const foreignId = foreign && typeof foreign === "object" ? S(foreign.id) : "";
+          // Defensive (the reader's contract): a job carrying EVERY manifest token of this revision is never foreign.
+          const carriesManifest = !!foreign && Array.isArray(foreign.durableContentDeps) && durableContentDeps.every((t) => foreign.durableContentDeps.map((x) => S(x)).includes(S(t)));
+          if (!nb(foreignId) || carriesManifest) return terminal;
+          return { ...terminal, retryBucketSalt: foreignId };
+        }
         resumed = true; // zero job/shadow/finalize writes: the terminal cycle already holds this derivation's validated job
       }
     }

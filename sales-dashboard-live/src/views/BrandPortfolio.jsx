@@ -14,16 +14,18 @@
    export.
 
    WHAT MAY CALL A SOURCE
-     Reads and the normal Refresh action use shared Supabase snapshots only.
-     A separate temporary, admin-only action may refresh the mapped account
-     snapshots from DataDoe before rebuilding this shared Brand View.         */
+     Nothing on this page. Reads and "Reload saved data" (refresh=1, answered
+     READ-ONLY by the server since publication recovery WP10b) use shared
+     Supabase snapshots only. Admins get "Request paid sync (uses DataDoe
+     tokens)", which opens the Data Sync Center: its source cards show a token
+     estimate and require explicit confirmation before any DataDoe token is
+     spent, and the fenced publisher then republishes this Brand View.        */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Boxes, CalendarRange, Coins, DatabaseZap, Inbox, Info, Layers, RefreshCw, Tag } from "lucide-react";
 
 import { DataQualityAlert, EmptyState, ErrorState, SkeletonMetricGrid, SkeletonTable } from "../components/ui.jsx";
 import { fmtRangeLabel, monthKeyLabel, nInt } from "../lib/format.js";
-import { partitionBrandSourceAccounts, refreshBrandSourceAccounts } from "../lib/brand-source-refresh.js";
 import { marketplaceToday } from "../../lib/marketplaces.js";
 import { CURRENCY_OPTIONS, brandViewModel, isConvertedMode, shareOf, hasAdsCoverage, hasUnmappedAds } from "../lib/brand-view.js";
 import { DASH, buildBrandTables, countryTitle, coverLabel, money, ratePct } from "../lib/brand-view-tables.js";
@@ -205,7 +207,9 @@ function BvJumpNav({ brandNote }) {
 export default function BrandPortfolio({
   brand, region = "", accountIds, accountsKnown, loadReport, refreshReport,
   directoryLoading, directoryError, onLoadBrandDirectory,
-  isAdmin = false, sourceAccounts = [],
+  // sourceAccounts is accepted for call-site compatibility; the former admin "Fetch latest data" (which re-ran the
+  // now READ-ONLY brand-sales / brand-inventory refresh=1 per account) is replaced by onRequestPaidSync.
+  isAdmin = false, sourceAccounts = [], onRequestPaidSync = null,
 }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -219,11 +223,7 @@ export default function BrandPortfolio({
   const [updating, setUpdating] = useState(false);
   const rebuildAttempts = useRef(0);
   const [refreshing, setRefreshing] = useState(false);
-  const [sourceRefreshing, setSourceRefreshing] = useState(false);
-  const [sourceProgress, setSourceProgress] = useState(null);
-  const [sourceOutcome, setSourceOutcome] = useState(null);
   const refreshGuard = useRef(false);
-  const sourceRefreshGuard = useRef(false);
 
   // A stable, sorted account signature keeps the snapshot key deterministic no
   // matter what order the directory returned the accounts in.
@@ -279,10 +279,10 @@ export default function BrandPortfolio({
   // scheduler now OWNS materialization, so converging a page never triggers a server rebuild, snapshot write, lock,
   // or DataDoe activity. When the scheduler republishes the fresh snapshot, this bounded read-only poll replaces
   // the LKG with no user action; if it does not converge within the bounded attempts, the LKG stays on screen and
-  // the explicit Refresh button (the only rebuild path, and only on a real click) remains available.
+  // "Reload saved data" re-reads it (read-only since WP10b: the scheduled route publication is the only rebuild path).
   useEffect(() => {
     if (!updating || !reportParams || refreshGuard.current) return undefined;
-    if (rebuildAttempts.current >= 6) return undefined; // give up auto-poll; the Refresh button still works
+    if (rebuildAttempts.current >= 6) return undefined; // give up auto-poll; "Reload saved data" still re-reads
     let active = true;
     const delay = rebuildAttempts.current === 0 ? 400 : 3500;
     const timer = setTimeout(async () => {
@@ -307,8 +307,6 @@ export default function BrandPortfolio({
     setStaleScope(null);
     setUpdating(false);
     rebuildAttempts.current = 0;
-    setSourceProgress(null);
-    setSourceOutcome(null);
     resetRange();
   }, [brand, idsKey, region, resetRange]);
 
@@ -340,87 +338,6 @@ export default function BrandPortfolio({
       setRefreshing(false);
     }
   }, [applyReport, displayCurrency, refreshReport, reloadFx, reportParams]);
-
-  const sourceAccountPartition = useMemo(
-    () => partitionBrandSourceAccounts(sourceAccounts),
-    [sourceAccounts]
-  );
-
-  const onFetchLatestData = useCallback(async () => {
-    if (!isAdmin || !reportParams || sourceRefreshGuard.current) return;
-    const eligibleCount = sourceAccountPartition.eligible.length;
-    const skippedCount = sourceAccountPartition.skipped.length;
-    if (!eligibleCount) {
-      setSourceOutcome({
-        tone: "warning",
-        title: "No primary DataDoe accounts are ready",
-        detail: skippedCount
-          ? "The mapped accounts still use legacy Secondary DataDoe ids. Reload the account and brand directories after moving them to the primary organization."
-          : "No mapped account is available for this brand.",
-      });
-      return;
-    }
-
-    const confirmed = window.confirm(
-      `Fetch latest DataDoe data for ${eligibleCount} mapped account${eligibleCount === 1 ? "" : "s"}?\n\n`
-      + "This temporary admin action runs accounts sequentially with no automatic retry. "
-      + "Each account refreshes Brand Sales (up to two DataDoe exports) and then compact FBA inventory "
-      + "(one FBA Inventory Health export, reusing the Product Catalog it just fetched). "
-      + "Existing saved data is preserved when an account fails."
-    );
-    if (!confirmed) return;
-
-    sourceRefreshGuard.current = true;
-    setSourceRefreshing(true);
-    setSourceOutcome(null);
-    setError(null);
-    try {
-      const outcome = await refreshBrandSourceAccounts({
-        accounts: sourceAccounts,
-        refreshReport,
-        todayForCountry: marketplaceToday,
-        onProgress: setSourceProgress,
-      });
-
-      // Rebuild the shared portfolio whenever any account saved new sales OR
-      // inventory, so a fresh FBA snapshot shows up even if that account's sales
-      // step failed.
-      if (outcome.succeeded.length) {
-        const { body, cachedAt } = await refreshReport(reportParams);
-        applyReport(body, cachedAt);
-        if (isConvertedMode(displayCurrency)) await reloadFx();
-      }
-
-      // Report each source outcome distinctly. Only account NAMES are shown; raw
-      // upstream DataDoe/Supabase error bodies are never surfaced in the browser.
-      const nameOf = (account) => account.name || account.id;
-      const details = [
-        `${outcome.salesSucceeded.length} of ${outcome.attempted} account${outcome.attempted === 1 ? "" : "s"} refreshed sales; ${outcome.inventorySucceeded.length} refreshed FBA inventory.`,
-      ];
-      if (outcome.salesFailed.length) details.push(`Sales failed: ${outcome.salesFailed.map(({ account }) => nameOf(account)).join(", ")}.`);
-      if (outcome.inventoryFailed.length) details.push(`FBA inventory failed: ${outcome.inventoryFailed.map(({ account }) => nameOf(account)).join(", ")}.`);
-      if (outcome.salesFailed.length || outcome.inventoryFailed.length) details.push("Previous saved data was preserved.");
-      if (outcome.skipped.length) {
-        details.push(`${outcome.skipped.length} legacy Secondary DataDoe mapping${outcome.skipped.length === 1 ? " was" : "s were"} skipped. Move those sellers to the primary DataDoe organization, then reload the account and brand directories.`);
-      }
-      const hasExceptions = outcome.salesFailed.length || outcome.inventoryFailed.length || outcome.skipped.length;
-      setSourceOutcome({
-        tone: hasExceptions ? "warning" : "success",
-        title: hasExceptions ? "Latest data fetched with exceptions" : "Latest data fetched",
-        detail: details.join(" "),
-      });
-    } catch {
-      setSourceOutcome({
-        tone: "warning",
-        title: "Latest data could not be fetched",
-        detail: "The refresh sequence stopped before completion. Existing saved snapshots were preserved.",
-      });
-    } finally {
-      sourceRefreshGuard.current = false;
-      setSourceRefreshing(false);
-      setSourceProgress(null);
-    }
-  }, [applyReport, displayCurrency, isAdmin, refreshReport, reloadFx, reportParams, sourceAccountPartition, sourceAccounts]);
 
   /* ------------------------------- exports ------------------------------ */
   const converted = isConvertedMode(displayCurrency);
@@ -511,11 +428,9 @@ export default function BrandPortfolio({
   // priority. The panel shows the top one and exposes the rest through "View details".
   // Nothing is invented or suppressed; each item is an existing page message.
   const statusItems = [];
-  if (sourceProgress) statusItems.push({ tone: "info", busy: true, title: `Fetching latest account data (${Math.min(sourceProgress.completed + 1, sourceProgress.total)} of ${sourceProgress.total})`, detail: sourceProgress.account?.name || sourceProgress.account?.id || "Saving refreshed account snapshots" });
   if (converted && fxError) statusItems.push({ tone: "error", title: "Currency conversion is unavailable", detail: fxError });
-  if (updating && model) statusItems.push({ tone: "warning", badge: "Rebuild in progress", title: "Updating to the newest saved data", detail: "The figures shown are the last complete Brand View. A newer account snapshot arrived, so it is being rebuilt from saved data (no export) and refreshes here automatically." });
-  if (sourceOutcome) statusItems.push({ tone: sourceOutcome.tone, title: sourceOutcome.title, detail: sourceOutcome.detail });
-  if (staleScope) statusItems.push({ tone: "info", title: "Showing the most recent saved report for this brand", detail: `It was saved for ${staleScope.asOf || "an earlier date"}. Refresh rebuilds it from the newest saved account snapshots.` });
+  if (updating && model) statusItems.push({ tone: "warning", badge: "Update pending", title: "A newer saved snapshot is waiting to be published", detail: "The figures shown are the last complete Brand View. A newer account snapshot arrived; the next scheduled publication rebuilds it from saved data (no export). Use Reload saved data to check for it." });
+  if (staleScope) statusItems.push({ tone: "info", title: "Showing the most recent saved report for this brand", detail: `It was saved for ${staleScope.asOf || "an earlier date"}. The scheduled publication republishes it from the newest saved account snapshots.` });
   if (directoryError) statusItems.push({ tone: "warning", title: "Some portfolio brands could not be loaded", detail: directoryError });
   if (converted && fx?.fallback) statusItems.push({ tone: "warning", title: "Using cached exchange rates", detail: fx.message || "The exchange-rate provider was unreachable, so the last rates saved in Supabase are being used." });
   if (converted && !fxError && tables?.missingRates?.length) statusItems.push({ tone: "warning", title: `No exchange rate for ${tables.missingRates.join(", ")}`, detail: `Those marketplaces cannot be converted to ${displayCurrency} and are shown as unavailable rather than with a substituted rate. Switch to Original marketplace currency to see their real figures.` });
@@ -584,27 +499,26 @@ export default function BrandPortfolio({
             type="button"
             className="plan-export-btn"
             onClick={onRefresh}
-            disabled={!reportParams || refreshing || sourceRefreshing}
+            disabled={!reportParams || refreshing}
             title={reportParams
-              ? "Rebuild this brand across its mapped accounts from the shared saved snapshots. No new source export is created."
+              ? "Reload the latest published Brand View for this brand (read-only). No export is created and nothing is saved."
               : "Choose a brand first"}
           >
             <RefreshCw size={14} className={refreshing ? "spin" : ""} aria-hidden="true" />
-            Refresh
+            Reload saved data
           </button>
           <ExportMenu disabled={!exportModel} busy={exportBusy} error={exportError} onExport={runExport} />
-          {/* Admin-only source action — kept distinct and secondary (not the default action),
-              flagged ADMIN, with its exact existing handler and availability preserved. */}
-          {isAdmin && (
+          {/* Admin-only PAID sync entry -- kept distinct and secondary (not the default action), flagged ADMIN. It only
+              navigates: the Data Sync Center source cards show the token estimate and require explicit confirmation. */}
+          {isAdmin && onRequestPaidSync && (
             <button
               type="button"
               className="plan-export-btn bv-admin-btn"
-              onClick={onFetchLatestData}
-              disabled={!reportParams || sourceRefreshing || refreshing}
-              title="Temporary admin action: refresh the mapped primary accounts from DataDoe, then rebuild this Brand View from their saved snapshots."
+              onClick={onRequestPaidSync}
+              title="Admin only: open the Data Sync Center, where each source card shows a token estimate and asks you to confirm before any DataDoe token is spent."
             >
-              <DatabaseZap size={14} className={sourceRefreshing ? "spin" : ""} aria-hidden="true" />
-              Fetch latest data
+              <DatabaseZap size={14} aria-hidden="true" />
+              Request paid sync (uses DataDoe tokens)
               <span className="bv-admin-tag">Admin</span>
             </button>
           )}
@@ -659,7 +573,7 @@ export default function BrandPortfolio({
         </div>
       ) : error ? (
         <div className="panel">
-          <ErrorState title="Brand View could not be built" message={error} onRetry={onRefresh} busy={refreshing} retryLabel="Rebuild from saved data" />
+          <ErrorState title="Brand View could not be loaded" message={error} onRetry={onRefresh} busy={refreshing} retryLabel="Reload saved data" />
         </div>
       ) : loading && !model ? (
         <><SkeletonMetricGrid count={4} /><div className="panel panel-flush"><SkeletonTable rows={8} /></div></>
@@ -670,21 +584,21 @@ export default function BrandPortfolio({
             title={updating ? "Preparing Brand View from saved data…" : "No saved Brand View for this brand yet"}
             actions={(
               <>
-                {isAdmin && (
-                  <button className="plan-export-btn" type="button" onClick={onFetchLatestData} disabled={sourceRefreshing || refreshing}>
-                    <DatabaseZap size={14} className={sourceRefreshing ? "spin" : ""} aria-hidden="true" />
-                    Fetch latest data
+                {isAdmin && onRequestPaidSync && (
+                  <button className="plan-export-btn" type="button" onClick={onRequestPaidSync}>
+                    <DatabaseZap size={14} aria-hidden="true" />
+                    Request paid sync (uses DataDoe tokens)
                   </button>
                 )}
-                <button className="plan-export-btn" type="button" onClick={onRefresh} disabled={refreshing || sourceRefreshing}>
+                <button className="plan-export-btn" type="button" onClick={onRefresh} disabled={refreshing}>
                   <RefreshCw size={14} className={refreshing ? "spin" : ""} aria-hidden="true" />
-                  Build from saved data
+                  Reload saved data
                 </button>
               </>
             )}
           >
-            {notice} Build from saved data creates no source export. The temporary admin action fetches each mapped primary
-            account sequentially, then rebuilds this shared Brand View.
+            {notice} It is published from the mapped accounts' saved data by the scheduled publication; Reload saved data
+            re-reads it and never creates a source export.
           </EmptyState>
         </div>
       ) : model ? (

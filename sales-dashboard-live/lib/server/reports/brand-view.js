@@ -483,7 +483,8 @@ export function isCompactInventorySnapshot(snapshot) {
 // SERVE SELECTION (Round-4 Defect 2): pick the AUTHORITATIVE compact brand-inventory snapshot for an account from a
 // set of recent brand-inventory rows, instead of blindly trusting the latest-by-updated_at row. The priority run
 // republishes an inventoryAvailable:false PLACEHOLDER at params {to: cycle D-1} every cycle (newest updated_at), while
-// the zero-export rebuild publishes a REAL available compact at params {to: its real inventory date} -- which, when
+// the fenced FBA reconciler (formerly also the WP13-retired zero-export rebuild) publishes a REAL available compact at
+// params {to: its real inventory date} -- which, when
 // the fba inventory LAGS the cycle (LKG / LATEST_SNAPSHOT_INCOMPLETE), is a DIFFERENT row than the placeholder. A
 // latest-by-updated_at read lets the fresh placeholder SHADOW that available compact, regressing Brand View to
 // unavailable. So selection PREFERS a genuinely-available compact (the newest real inventory date; updated_at breaks a
@@ -639,9 +640,11 @@ export async function buildBrandInventorySnapshot({
  * Health to the EXACT compact shape (inventoryByBrandCountry [{country, brand, fbaAvailable, skuCount}] +
  * inventorySnapshotDate + inventoryAvailable), so there is ONE inventory definition and NO second paid export.
  *
- * The priority run publishes the compact BEFORE the FBA job runs, so it is inventoryAvailable:false; the FBA-aware
- * materialize-inventory job (which runs AFTER fba) uses this adapter to REBUILD the compact from the fresh fba-plan,
- * making Brand View's exclusive-compact consumer serve real inventory the SAME day.
+ * The priority run publishes the compact BEFORE the FBA job runs, so it is inventoryAvailable:false. The FBA-aware
+ * materialize-inventory job USED to call this adapter to REBUILD the compact from the fresh fba-plan (an UNFENCED write);
+ * publication recovery WP13 RETIRED that rebuild: the available compact is now published only by the FENCED FBA / OLI
+ * reconcilers (the fba job's immediate FBA reconcile + the daily backstop) and the priority publication. The adapter stays
+ * a pure function (the DI-only rebuild core report-materialization-brandview-operation.js and its test still exercise it).
  *
  * Returns null (never a fabricated zero) when the fba-plan carries no available inventory or no strict snapshot
  * date -- the caller then leaves the existing (unavailable) compact untouched, preserving per-account
@@ -1173,8 +1176,13 @@ export async function buildBrandViewSnapshot({ accountId, brand, asOf, account, 
  * Accounts are read sequentially rather than in parallel on purpose: each read
  * can return a multi-megabyte saved Dashboard payload, and a serverless function
  * holding a dozen of those at once is how this route would run out of memory.
+ *
+ * `sliceConcurrency` (optional) caps how many account slices are read at once. Omitted (or not a positive
+ * integer) it is PORTFOLIO_SLICE_CONCURRENCY -- byte-identical to before for every existing caller (the serve and
+ * the scheduler materializer). The zero-export recovery route passes 1 on the small recovery VM, so at most ONE
+ * account's saved payloads are held at a time. Slice ORDER (and therefore the assembled payload) never depends on it.
  */
-export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf, accountsById, getSnapshot, getAdsRows, getCatalogRows = null, deadline = null, getCampaignMappings = async () => [], getInventorySnapshots = null }) {
+export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf, accountsById, getSnapshot, getAdsRows, getCatalogRows = null, deadline = null, getCampaignMappings = async () => [], getInventorySnapshots = null, sliceConcurrency = PORTFOLIO_SLICE_CONCURRENCY }) {
   // The reusable Product Catalog is org-scoped, so read it ONCE and reuse across every account slice (child_asin
   // -> product_brand is what maps each account's ad ASINs to this brand).
   const catalogRows = typeof getCatalogRows === "function" ? await getCatalogRows().catch(() => null) : null;
@@ -1183,10 +1191,11 @@ export async function buildBrandViewPortfolioSnapshot({ accountIds, brand, asOf,
   // holds at most that many payloads at once (memory-safe) while cutting wall time several-fold; slice ORDER is
   // preserved. The route deadline is checked BETWEEN chunks (never inside the swallow-on-missing slice) so a
   // timeout can never be misread as an unavailable account and published as an incomplete portfolio.
+  const step = Number.isInteger(sliceConcurrency) && sliceConcurrency >= 1 ? sliceConcurrency : PORTFOLIO_SLICE_CONCURRENCY;
   const slices = new Array(accountIds.length);
-  for (let i = 0; i < accountIds.length; i += PORTFOLIO_SLICE_CONCURRENCY) {
+  for (let i = 0; i < accountIds.length; i += step) {
     if (deadline && typeof deadline.ensureTime === "function") await deadline.ensureTime("brand-view-portfolio-slice");
-    const chunk = accountIds.slice(i, i + PORTFOLIO_SLICE_CONCURRENCY);
+    const chunk = accountIds.slice(i, i + step);
     const built = await Promise.all(chunk.map((accountId) => buildAccountBrandSlice({
       accountId,
       brand,

@@ -12,10 +12,11 @@
 //      statusFromRelease DEFERRED_DEPENDENCY (was a hard FAILED_PUBLISH); the strictly-newer live row is never touched.
 //   D. getLatestReportJobLineage is ADDITIVE: every pre-WP2 field keeps its name, value and order; id / cycleId /
 //      createdAt are appended (both the primary read and the schema-missing fallback).
-//   E. deleteRouteShadowSnapshots refuses a non-allowlisted / live / scheduler-prefixed key and every malformed argument
-//      with ZERO requests, and its ONE DELETE -- evaluated by a faithful PostgREST filter model -- never removes a row
-//      without params.route or params.rev, a live (non scheduler-v2) row, another route/account/key, a kept hash, or a
-//      row newer than the cutoff.
+//   E. deleteRouteShadowSnapshots refuses a non-allowlisted / live / scheduler-prefixed key, every malformed argument
+//      AND a cutoff later than now - 24 h (the in-flight-safety window; F3) with ZERO requests, and its ONE DELETE --
+//      evaluated by a faithful PostgREST filter model -- never removes a row without params.route or params.rev, a live
+//      (non scheduler-v2) row, another route/account/key, a kept hash, or a row newer than the cutoff; it returns
+//      { deleted, payloadStoragePaths } (the deleted rows' distinct nonblank storage paths, for storage cleanup).
 // Offline: a stubbed global fetch stands in for PostgREST (never the network); zero DataDoe. 7-bit ASCII, LF.
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
@@ -495,10 +496,15 @@ function snapshotTableRoute(table, seen) {
 }
 const OLD = "2026-09-01T00:00:00.000Z";
 const CUTOFF = "2026-09-20T00:00:00.000Z";
+// A FIXED clock for every prune that must proceed (clock-independent): CUTOFF is 5 days before it, well outside the 24 h
+// in-flight-safety window.
+const PRUNE_NOW = () => Date.parse("2026-09-25T00:00:00.000Z");
+const DAY_MS = 24 * 60 * 60 * 1000;
+const DEL1_PATH = "report-snapshots/scheduler-v2/fba-plan/A01/r1.json";
 function pruneTable() {
-  const row = (id, report_key, account_id, params, params_hash, updated_at = OLD) => ({ id, report_key, account_id, params, params_hash, updated_at, payload: { big: id } });
+  const row = (id, report_key, account_id, params, params_hash, updated_at = OLD, payload_storage_path = null) => ({ id, report_key, account_id, params, params_hash, updated_at, payload: { big: id }, payload_storage_path });
   return { rows: [
-    row("del-1", "scheduler-v2/fba-plan", A, { route: "fba-plan", rev: "r1", reportVersion: "v" }, H("1")),
+    row("del-1", "scheduler-v2/fba-plan", A, { route: "fba-plan", rev: "r1", reportVersion: "v" }, H("1"), OLD, DEL1_PATH),
     row("kept-hash", "scheduler-v2/fba-plan", A, { route: "fba-plan", rev: "r2" }, H("2")),
     row("fresh", "scheduler-v2/fba-plan", A, { route: "fba-plan", rev: "r3" }, H("3"), "2026-09-24T12:00:00.000Z"),
     row("paid-shadow", "scheduler-v2/fba-plan", A, { reportVersion: "fba-plan/v", accountId: A, to: ASOF }, H("4")),
@@ -509,16 +515,16 @@ function pruneTable() {
     row("other-account", "scheduler-v2/fba-plan", "A02", { route: "fba-plan", rev: "r9" }, H("9")),
     row("live-row", "fba-plan", A, { route: "fba-plan", rev: "r10" }, H("a")),
     row("other-key", "scheduler-v2/brand-inventory", A, { route: "fba-plan", rev: "r11" }, H("b")),
-    row("del-2", "scheduler-v2/fba-plan", A, { route: "fba-plan", rev: "r12" }, H("c")),
-    row("bv-live", "brand-view", A, { route: "brand-view", rev: "r13" }, H("d")),
-    row("bv-shadow", "scheduler-v2/brand-view", A, { route: "brand-view", rev: "r14" }, H("e")),
+    row("del-2", "scheduler-v2/fba-plan", A, { route: "fba-plan", rev: "r12" }, H("c"), OLD, "  "),
+    row("bv-live", "brand-view", A, { route: "brand-view", rev: "r13" }, H("d"), OLD, "report-snapshots/brand-view/live.json"),
+    row("bv-shadow", "scheduler-v2/brand-view", A, { route: "brand-view", rev: "r14" }, H("e"), OLD, "report-snapshots/scheduler-v2/brand-view/A01/r14.json"),
   ] };
 }
 const VALID = () => ({ routeId: "fba-plan", publisherKey: "fba-plan", targetId: A, keepParamsHashes: [H("2")], olderThanIso: CUTOFF });
-async function expectRefused(label, args) {
+async function expectRefused(label, args, opts) {
   const before = net.calls.length;
   let err = null;
-  try { await sb.deleteRouteShadowSnapshots(args); } catch (e) { err = e; }
+  try { await sb.deleteRouteShadowSnapshots(args, opts); } catch (e) { err = e; }
   ok("refused: " + label + " (ROUTE_SHADOW_PRUNE_REFUSED, ZERO requests)", !!err && err.code === "ROUTE_SHADOW_PRUNE_REFUSED" && net.calls.length === before);
 }
 test("E: deleteRouteShadowSnapshots refuses non-allowlisted / live / scheduler-prefixed keys and malformed arguments with ZERO requests", async () => {
@@ -532,25 +538,46 @@ test("E: deleteRouteShadowSnapshots refuses non-allowlisted / live / scheduler-p
   for (const older of ["not-a-date", "", undefined, 1758326400000]) await expectRefused("olderThanIso " + JSON.stringify(older), { ...VALID(), olderThanIso: older });
   await expectRefused("no arguments at all", undefined);
 });
+test("E (F3): a cutoff LATER than now - 24 h (the in-flight-safety window) is refused with ZERO requests; the boundary is inclusive", async () => {
+  ok("the window constant is exactly 24 h", sb.ROUTE_SHADOW_PRUNE_MIN_AGE_MS === DAY_MS);
+  const cutoffMs = Date.parse(CUTOFF);
+  await expectRefused("a cutoff 1 ms inside the window (now = cutoff + 24 h - 1 ms)", VALID(), { now: () => cutoffMs + DAY_MS - 1 });
+  await expectRefused("a cutoff equal to now (a fresh in-flight shadow could match)", VALID(), { now: () => cutoffMs });
+  await expectRefused("a FUTURE cutoff (real clock)", { ...VALID(), olderThanIso: new Date(Date.now() + 60 * 1000).toISOString() });
+  await expectRefused("a cutoff 23 h ago (real clock)", { ...VALID(), olderThanIso: new Date(Date.now() - 23 * 60 * 60 * 1000).toISOString() });
+  await expectRefused("an unreadable clock", VALID(), { now: () => NaN });
+  const table = pruneTable(); const seen = [];
+  net.routes = [snapshotTableRoute(table, seen)];
+  const r = await sb.deleteRouteShadowSnapshots(VALID(), { now: () => cutoffMs + DAY_MS });
+  ok("a cutoff EXACTLY now - 24 h proceeds (one DELETE)", seen.length === 1 && r.deleted === 2);
+  const r2 = await sb.deleteRouteShadowSnapshots({ ...VALID(), olderThanIso: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString() });
+  ok("a cutoff 25 h ago on the REAL clock proceeds (production default clock)", seen.length === 2 && typeof r2.deleted === "number");
+  net.routes = [];
+});
 test("E: ONE guarded DELETE removes ONLY old, un-kept, route+rev shadows of the exact scheduler-v2 key + account + route", async () => {
   const table = pruneTable(); const seen = [];
   net.routes = [snapshotTableRoute(table, seen)];
-  const n = await sb.deleteRouteShadowSnapshots(VALID());
-  ok("returns the deleted count (2)", n === 2);
+  const n = await sb.deleteRouteShadowSnapshots(VALID(), { now: PRUNE_NOW });
+  ok("returns { deleted, payloadStoragePaths } -- the deleted count (2) + ONLY the nonblank storage paths of the DELETED rows (F3)", n && n.deleted === 2 && JSON.stringify(n.payloadStoragePaths) === JSON.stringify([DEL1_PATH]) && Object.keys(n).join(",") === "deleted,payloadStoragePaths");
   ok("exactly the two deletable rows are gone; every guarded row survives", JSON.stringify(table.rows.map((r) => r.id).sort()) === JSON.stringify(["bv-live", "bv-shadow", "fresh", "kept-hash", "live-row", "other-account", "other-key", "other-route", "paid-shadow", "rev-no-route", "rev-null", "route-no-rev"]));
   ok("rows without params.route or params.rev (incl. the paid fba-plan shadow + a null rev) are NEVER deleted", ["paid-shadow", "route-no-rev", "rev-no-route", "rev-null"].every((id) => table.rows.some((r) => r.id === id)));
   ok("the live (non scheduler-v2) row is NEVER deleted", table.rows.some((r) => r.id === "live-row"));
   const p = seen[0] && seen[0].params;
-  ok("exactly ONE DELETE carrying every restriction (key, account, route, rev not null, keep, cutoff) + return=representation of params_hash only",
-    seen.length === 1 && seen[0].prefer === "return=representation" && p.get("select") === "params_hash" && p.get("report_key") === "eq.scheduler-v2/fba-plan" && p.get("account_id") === "eq." + A
+  ok("exactly ONE DELETE carrying every restriction (key, account, route, rev not null, keep, cutoff) + return=representation of params_hash + payload_storage_path only",
+    seen.length === 1 && seen[0].prefer === "return=representation" && p.get("select") === "params_hash,payload_storage_path" && p.get("report_key") === "eq.scheduler-v2/fba-plan" && p.get("account_id") === "eq." + A
     && p.get("params->>route") === "eq.fba-plan" && p.get("params->>rev") === "not.is.null" && p.get("params_hash") === "not.in.(" + H("2") + ")" && p.get("updated_at") === "lt." + CUTOFF);
 
   // brand-view is BOTH a route publisher key AND a live report_key: only its scheduler-v2 shadow can ever match.
-  const n2 = await sb.deleteRouteShadowSnapshots({ routeId: "brand-view", publisherKey: "brand-view", targetId: A, keepParamsHashes: [H("0")], olderThanIso: CUTOFF });
-  ok("publisherKey brand-view deletes ONLY scheduler-v2/brand-view (the live brand-view row with route+rev survives)", n2 === 1 && !table.rows.some((r) => r.id === "bv-shadow") && table.rows.some((r) => r.id === "bv-live"));
+  const n2 = await sb.deleteRouteShadowSnapshots({ routeId: "brand-view", publisherKey: "brand-view", targetId: A, keepParamsHashes: [H("0")], olderThanIso: CUTOFF }, { now: PRUNE_NOW });
+  ok("publisherKey brand-view deletes ONLY scheduler-v2/brand-view (the live brand-view row with route+rev survives)", n2.deleted === 1 && !table.rows.some((r) => r.id === "bv-shadow") && table.rows.some((r) => r.id === "bv-live"));
+  ok("the storage paths returned are the DELETED shadow's only (never the surviving live row's)", JSON.stringify(n2.payloadStoragePaths) === JSON.stringify(["report-snapshots/scheduler-v2/brand-view/A01/r14.json"]));
+
+  net.routes = [(method, u) => (method === "DELETE" && u.pathname === "/rest/v1/report_snapshots" ? resp(200, [{ params_hash: H("1"), payload_storage_path: "p/x.json" }, { params_hash: H("3"), payload_storage_path: "p/x.json" }, { params_hash: H("5"), payload_storage_path: null }, { params_hash: H("6") }]) : null)];
+  const dup = await sb.deleteRouteShadowSnapshots(VALID(), { now: PRUNE_NOW });
+  ok("every deleted row is counted; storage paths are DISTINCT + nonblank (null / missing paths contribute none)", dup.deleted === 4 && JSON.stringify(dup.payloadStoragePaths) === JSON.stringify(["p/x.json"]));
 
   net.routes = [(method, u) => (method === "DELETE" && u.pathname === "/rest/v1/report_snapshots" ? resp(200, null) : null)];
-  let err = null; try { await sb.deleteRouteShadowSnapshots(VALID()); } catch (e) { err = e; }
+  let err = null; try { await sb.deleteRouteShadowSnapshots(VALID(), { now: PRUNE_NOW }); } catch (e) { err = e; }
   ok("a non-array DELETE acknowledgement fails closed (ROUTE_SHADOW_PRUNE_ACK_INVALID), never a guessed count", !!err && err.code === "ROUTE_SHADOW_PRUNE_ACK_INVALID");
   net.routes = [];
 });

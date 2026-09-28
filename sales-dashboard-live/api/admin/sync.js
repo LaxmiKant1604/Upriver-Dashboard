@@ -23,8 +23,18 @@ import { primaryOrganizationFingerprint } from "../../lib/server/datadoe-connect
 import { loadDeliveryStatus } from "../../lib/server/delivery-status.js";
 import { controlledReport, reportControlCatalog, SOURCE_PROMOTED_REPORT_KEYS } from "../../lib/server/sync/report-controls.js";
 import { runScheduledSync } from "../../lib/server/sync/run-sync.js";
+// Publication recovery WP10b: the route-owned live keys are REFUSED by every Scheduler-v1 entry point (typed 409).
+import { isRouteOwnedLiveReportKey, schedulerV1RouteOwnedRefusal } from "../../lib/server/report-store.js";
 
 export const config = { maxDuration: 60 };
+
+// Production collaborators, injectable for narrowly-scoped API-boundary tests (the established handler(req,res,deps)
+// pattern of api/admin/sources.js). The default export wires exactly these; authorization is never weakened.
+const DEFAULT_DEPS = Object.freeze({
+  getDashboardAccess, assertAdmin, insertAuditLog, setReportSyncSetting, setSourcePromotedPublishControl,
+  getReportSyncSettings, getSourcePromotedPublishSettings, getSyncTargets, getAccountDirectoryRows,
+  runScheduledSync,
+});
 
 const RATE = new Map();
 function allowManualRun(userId, now = Date.now()) {
@@ -44,7 +54,8 @@ function bodyFor(req) {
   return req.body;
 }
 
-async function statusPayload() {
+async function statusPayloadWith(deps = DEFAULT_DEPS) {
+  const { getReportSyncSettings, getSourcePromotedPublishSettings, getSyncTargets, getAccountDirectoryRows } = deps;
   const [settings, promoted, targets, accounts] = await Promise.all([
     getReportSyncSettings(),
     getSourcePromotedPublishSettings(),
@@ -77,7 +88,9 @@ async function statusPayload() {
   };
 }
 
-export default async function handler(req, res) {
+export async function handler(req, res, deps = DEFAULT_DEPS) {
+  const { getDashboardAccess, assertAdmin, insertAuditLog, setReportSyncSetting, setSourcePromotedPublishControl, runScheduledSync } = { ...DEFAULT_DEPS, ...deps };
+  const statusPayload = () => statusPayloadWith({ ...DEFAULT_DEPS, ...deps });
   try {
     const access = await getDashboardAccess(req);
     assertAdmin(access);
@@ -145,6 +158,18 @@ export default async function handler(req, res) {
       res.status(400).json({ error: "Unknown report." });
       return;
     }
+
+    // WP10b SCHEDULER-V1 REFUSAL: a manual v1 run (runScheduledSync -> run-sync.js / report-adapter.js, an UNFENCED
+    // writer: save + prune + retention DELETE) of a ROUTE-OWNED live report (brand-sales, daily-reporting, fba-plan,
+    // returns-leakage among the controlled keys) is refused typed BEFORE the rate limiter, the audit row and any
+    // DataDoe work -- it would spend tokens and then fail at the DB writer fence (or write the key unfenced before the
+    // fence is flipped). The paid sync is the Data Sync Center source cards (preview -> confirm -> fenced publish).
+    // The schedule toggle (PATCH) is a control write, not a report write, and is unchanged; v1 scheduled runs
+    // (api/sync.js, api/cron/sync.js) never dispatch a route-owned key either.
+    if (req.method === "POST" && isRouteOwnedLiveReportKey(entry.reportKey)) {
+      res.status(409).json(schedulerV1RouteOwnedRefusal([entry.reportKey], { isAdmin: true }));
+      return;
+    }
     if (!entry.enabled) {
       res.status(409).json({ error: "This report is locked until its Scheduler v2 adapter passes verification." });
       return;
@@ -194,3 +219,7 @@ export default async function handler(req, res) {
     res.status(error?.status || 500).json({ error: error?.message || "Sync-control request failed." });
   }
 }
+
+// Vercel serverless entry: the production handler wired to the real collaborators (DEFAULT_DEPS). This adds NO new
+// api/*.js function -- it is the same single endpoint, now with the established handler(req, res, deps) test seam.
+export default function (req, res) { return handler(req, res); }

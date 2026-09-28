@@ -128,7 +128,10 @@ jobs:
             # --deadline-seconds=330 makes the reconciler stop new accounts + bound the in-flight one + safe-close BEFORE
             # the 420s hard kill (cooperative reserve). The SEPARATE always() cleanup job below reclaims + proves the
             # control plane closed if a region was still hard-killed (a step here would be killed with the job).
-            timeout 420 node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=330 $LIVE $DRAIN || { echo "region $REGION reconcile exited nonzero (isolated; continuing)"; rc=1; }
+            # --lease-wait-seconds=600 (WP13 verifier P2-A, control envelope ONLY): the controls APPLY retries on the typed
+            # CONTROL_LEASE_HELD refusal (the scheduler's route CLI holds the global lease in windows), never past this run's start
+            # cutoff (deadline 330 s - 120 s reserve), instead of deferring every stale account on one refusal.
+            timeout 420 node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=330 --lease-wait-seconds=600 $LIVE $DRAIN || { echo "region $REGION reconcile exited nonzero (isolated; continuing)"; rc=1; }
             echo "::endgroup::"
           done
           exit $rc

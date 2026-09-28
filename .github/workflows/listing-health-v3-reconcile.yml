@@ -111,7 +111,10 @@ jobs:
             # 32 accounts; at ~12s/account the 330s deadline only published ~14/run, so a full region took several daily
             # runs to converge (2->14->26 observed). 720s lets europe-au fully converge in ONE run while the reserve fix
             # still safe-closes before the 840s kill; india/europe-au/us-ca that finish early exit immediately (no waste).
-            timeout 840 node scripts/release/listing-health-v3-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=720 $LIVE || { echo "region $REGION reconcile exited nonzero (isolated; continuing)"; rc=1; }
+            # --lease-wait-seconds=600 (WP13 verifier P2-A, control envelope ONLY): the controls APPLY retries on the typed
+            # CONTROL_LEASE_HELD refusal (the scheduler's route CLI holds the global lease in windows), never past this run's start
+            # cutoff (deadline 720 s - 120 s reserve), instead of deferring every stale account on one refusal.
+            timeout 840 node scripts/release/listing-health-v3-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=720 --lease-wait-seconds=600 $LIVE || { echo "region $REGION reconcile exited nonzero (isolated; continuing)"; rc=1; }
             echo "::endgroup::"
           done
           exit $rc

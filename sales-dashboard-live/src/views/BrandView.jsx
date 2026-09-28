@@ -22,7 +22,7 @@
    portfolio page, so the two reports can never disagree.                     */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CalendarRange, Coins, Inbox, RefreshCw, Store, Tag } from "lucide-react";
+import { CalendarRange, Coins, DatabaseZap, Inbox, RefreshCw, Store, Tag } from "lucide-react";
 
 import { DataQualityAlert, EmptyState, ErrorState, ObservedUnitsBreakdown, SkeletonMetricGrid, SkeletonTable } from "../components/ui.jsx";
 import { FLAGS, fmtRangeLabel } from "../lib/format.js";
@@ -38,7 +38,10 @@ import {
 const REPORT_VERSION = "brand-view-account-scoped-v2";
 const BRANDS_VERSION = "brand-view-brands-v1";
 
-export default function BrandView({ accounts, accountsLoading, accountsError, loadReport, refreshReport }) {
+// onRequestPaidSync (admins only): opens the Data Sync Center, whose source cards run the explicit, confirmed PAID sync.
+// Brand View itself is route-owned: its Reload sends refresh=1, which the server now answers READ-ONLY (publication
+// recovery WP10b) -- it re-reads the latest published row and never builds, saves or calls DataDoe.
+export default function BrandView({ accounts, accountsLoading, accountsError, loadReport, refreshReport, onRequestPaidSync = null }) {
   const [accountId, setAccountId] = useState("");
   const [brand, setBrand] = useState("");
 
@@ -268,8 +271,8 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
         <div>
           <div className="page-title">Brand View</div>
           <div className="page-sub">
-            One account, one brand, every marketplace. Reads shared saved data only — Refresh rebuilds this account and
-            brand from snapshots that already exist and never starts a new source export.
+            One account, one brand, every marketplace. Reads shared saved data only — the scheduled publication rebuilds
+            it from snapshots that already exist (never a new source export); Reload saved data re-reads the latest one.
           </div>
         </div>
       </div>
@@ -332,13 +335,25 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
             onClick={onRefresh}
             disabled={!accountId || refreshing}
             title={accountId
-              ? "Rebuild this account's brand list and this brand's report from the shared saved snapshots. No new source export is created."
+              ? "Reload this account's brand list and this brand's latest published report (read-only). No export is created and nothing is saved."
               : "Select an account first"}
           >
             <RefreshCw size={14} className={refreshing ? "spin" : ""} aria-hidden="true" />
-            Refresh
+            Reload saved data
           </button>
           <ExportMenu disabled={!exportModel} busy={exportBusy} error={exportError} onExport={runExport} />
+          {onRequestPaidSync && (
+            <button
+              type="button"
+              className="plan-export-btn bv-admin-btn"
+              onClick={onRequestPaidSync}
+              title="Admin only: open the Data Sync Center, where each source card shows a token estimate and asks you to confirm before any DataDoe token is spent."
+            >
+              <DatabaseZap size={14} aria-hidden="true" />
+              Request paid sync (uses DataDoe tokens)
+              <span className="bv-admin-tag">Admin</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -369,14 +384,14 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
         <DataQualityAlert
           tone="info"
           title="Showing the most recent saved Brand View for this account and brand"
-          detail={`It was saved for ${staleScope.asOf || "an earlier date"}. Click Refresh to rebuild it from the newest saved account snapshots.`}
+          detail={`It was saved for ${staleScope.asOf || "an earlier date"}. The next scheduled publication rebuilds it from the newest saved account snapshots; use Reload saved data to check for it.`}
         />
       )}
       {updating && model && (
         <DataQualityAlert
           tone="info"
           title="Updating to the newest saved data…"
-          detail="The figures below are the last complete Brand View. A newer account snapshot arrived, so it is being rebuilt from saved data (no export) and will refresh here automatically."
+          detail="The figures below are the last complete Brand View. A newer account snapshot arrived; the next scheduled publication rebuilds it from saved data (no export). Use Reload saved data to check for it."
         />
       )}
       {/* Two-layer PROVISIONAL/FINAL D-1: real itemized brand sales are shown, honestly labelled while some order
@@ -416,7 +431,7 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
         </div>
       ) : error ? (
         <div className="panel">
-          <ErrorState title="Brand View could not be built" message={error} onRetry={onRefresh} busy={refreshing} retryLabel="Rebuild from saved data" />
+          <ErrorState title="Brand View could not be loaded" message={error} onRetry={onRefresh} busy={refreshing} retryLabel="Reload saved data" />
         </div>
       ) : loading && !model ? (
         <><SkeletonMetricGrid count={4} /><div className="panel panel-flush"><SkeletonTable rows={8} /></div></>
@@ -428,12 +443,12 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
             actions={(
               <button className="plan-export-btn" type="button" onClick={onRefresh} disabled={refreshing}>
                 <RefreshCw size={14} className={refreshing ? "spin" : ""} aria-hidden="true" />
-                Build from saved data
+                Reload saved data
               </button>
             )}
           >
-            {notice} This build reads only snapshots that already exist for this account, so it does not create a new
-            source export.
+            {notice} It is published from this account's saved data by the scheduled publication; Reload saved data
+            re-reads it and never creates a source export.
           </EmptyState>
         </div>
       ) : model ? (

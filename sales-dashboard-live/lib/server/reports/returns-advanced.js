@@ -27,7 +27,12 @@ import {
   returnsLeakageOrderedFold,
   assembleReturnsLeakageRows,
 } from "./derivation-core.js";
-import { addDaysStr, isDateStr } from "../datadoe.js";
+// Date helpers WITHOUT the transport module (publication recovery WP5): addDaysStr from the dependency-free leaf
+// date-windows.js (the very function datadoe.js re-exports), and isDateStr inlined BYTE-IDENTICAL to datadoe.js
+// isDateStr (pinned by scripts/returns-v3-route.test.js) -- so this pure builder, and the zero-export returns-v3 route
+// that derives through it, never reach lib/server/datadoe.js (the route CLI closure proof).
+import { addDaysStr } from "../date-windows.js";
+const isDateStr = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
 
 export const RETURNS_ADVANCED_VERSION = "returns-leakage-v3";
 export const RETURNS_WINDOW_DAY_OPTIONS = [7, 14, 30, 60];

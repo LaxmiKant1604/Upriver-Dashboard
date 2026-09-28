@@ -431,6 +431,53 @@ const safeMessage = (e) => String(e && e.message ? e.message : e || "").slice(0,
 const CONTINUATION_FAMILIES = Object.freeze([OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY]);
 const rowHash = (r) => String((r && (r.request_hash ?? r.requestHash)) ?? "").trim();
 
+// WP10b: the frozen tranche's token ceiling + persisted spend, captured from the budget row the strict continuation
+// ALREADY reads (no extra I/O). max_tokens falls back to the sum of the frozen per-hash costs; an unknown spend is 0
+// (the remaining exposure is then the full ceiling -- never under-stated). Read ONLY by the optional approval gate.
+function frozenBudgetTokens(row, hashRows) {
+  const n = (v) => (v == null || v === "" ? NaN : Number(v));
+  let maxTokens = n(row && (row.max_tokens ?? row.maxTokens));
+  if (!Number.isFinite(maxTokens)) {
+    const costs = (Array.isArray(hashRows) ? hashRows : []).map((h) => n(h && (h.token_cost ?? h.tokenCost)));
+    maxTokens = costs.length && costs.every(Number.isFinite) ? costs.reduce((t, c) => t + c, 0) : null;
+  }
+  const spent = n(row && (row.spent_tokens ?? row.spentTokens));
+  return { maxTokens, spentTokens: Number.isFinite(spent) ? spent : 0 };
+}
+
+/**
+ * WP10b: the REMAINING paid exposure of the families a bucket-sync step would execute (pure; zero I/O). A continuation
+ * family with a frozen budget can still spend (max_tokens - spent_tokens) -- the reservation RPC refuses beyond it; any
+ * other family (fresh cycle, or an originally-planned family frozen now) spends at most its deterministic frozen
+ * ceiling (computeFrozenTrancheBudget over the SAME planned jobs the loop freezes: one create per unique canonical
+ * request hash, registry-priced). Returns { exposureTokens, byFamily:[{ sourceKey, basis, maxTokens, spentTokens,
+ * exposureTokens }] }. Exported for the Data Sync Center preview parity test.
+ */
+export function paidApprovalExposure({ families = [], executeSet = null, continuation = null } = {}) {
+  const byFamily = [];
+  let exposureTokens = 0;
+  for (const family of families) {
+    if (!family || !Array.isArray(family.plannedJobs) || family.plannedJobs.length === 0) continue;
+    if (executeSet && !executeSet.has(family.sourceKey)) continue; // freeze-only: creates nothing this step
+    const trancheKey = `source-sync:${family.sourceKey}`;
+    const frozen = continuation && continuation.frozenByFamily ? continuation.frozenByFamily.get(family.sourceKey) : null;
+    let entry;
+    if (frozen && frozen.trancheKey === trancheKey && Number.isFinite(frozen.maxTokens)) {
+      const spentTokens = Number.isFinite(frozen.spentTokens) ? frozen.spentTokens : 0;
+      entry = { sourceKey: family.sourceKey, basis: "frozen-remaining", maxTokens: frozen.maxTokens, spentTokens, exposureTokens: Math.max(0, frozen.maxTokens - spentTokens) };
+    } else {
+      const f = computeFrozenTrancheBudget({
+        plannedJobs: family.plannedJobs, sourceTranche: makeSourceTranche({ name: family.sourceKey, sourceKeys: [family.sourceKey] }),
+        isPremiumOf: registryIsPremiumOf, trancheKey,
+      });
+      entry = { sourceKey: family.sourceKey, basis: "frozen-plan", maxTokens: f.maxTokens, spentTokens: 0, exposureTokens: f.maxTokens };
+    }
+    byFamily.push(entry);
+    exposureTokens += entry.exposureTokens;
+  }
+  return { exposureTokens, byFamily };
+}
+
 /**
  * RUN one bucket's source sync end to end (the ONE operator action). Collaborators are all injected --
  * store + dataDoe (the proven worker backends), durable-model sinks (persistHistory / recordCoverage /
@@ -504,6 +551,14 @@ export async function runBucketSourceSync({
   // daily-cycle plan before the first paid create"), and left OPEN on the cycle for a later step (the priority step
   // drains the frozen Catalog as a case-(a) continuation). null => execute every planned family (byte-identical).
   executeSourceKeys = null,
+  // PUBLICATION RECOVERY WP10b -- OPTIONAL owner-approved PAID-SYNC ceiling (ONLY the admin Data Sync Center passes it;
+  // the scheduler / operators / reconcilers never do). { remainingTokens, reserveTokens }: the approval still unspent
+  // (approved ceiling minus the PERSISTED spend already debited to this operation) and the tokens reserved for a later
+  // step of the same operation (the priority release Catalog). When set, the REMAINING frozen tranche exposure of every
+  // family this step executes (frozen max_tokens - spent_tokens on a continuation; the deterministic freeze on a fresh
+  // plan) plus reserveTokens must fit remainingTokens, or the run refuses typed (PAID_APPROVAL_EXCEEDED) with ZERO
+  // creates and ZERO cycle / budget / job / run-status writes. null => byte-identical (no gate).
+  approvedTokenCeiling = null,
 } = {}) {
   if (!store || typeof store.listSourceJobs !== "function") throw new Error("runBucketSourceSync requires the injected store (fail closed).");
   if (Number(cooldownMs) > 0 && typeof wait !== "function") {
@@ -623,7 +678,7 @@ export async function runBucketSourceSync({
         try { hashRows = await store.getBudgetHashes({ cycleId: activeCycleId, trancheKey }); } catch (e) { return deferredFrozenScope(bucket, activeCycleId, "budget-read-failed", { detail: sourceKey + " hashes: " + safeMessage(e) }); }
         const hashes = new Set((Array.isArray(hashRows) ? hashRows : []).map(rowHash).filter(Boolean));
         if (hashes.size === 0) return deferredFrozenScope(bucket, activeCycleId, "frozen-budget-malformed", { detail: sourceKey + ": no frozen request hashes" });
-        frozenByFamily.set(sourceKey, { trancheKey, planFingerprint: String(row.plan_fingerprint ?? row.planFingerprint), hashes });
+        frozenByFamily.set(sourceKey, { trancheKey, planFingerprint: String(row.plan_fingerprint ?? row.planFingerprint), hashes, ...frozenBudgetTokens(row, hashRows) });
       }
       // Reproduce the frozen READINESS split on this continuation from the DURABLE owners (never re-resolved evidence,
       // which could drift mid-cycle). An OLI slice request_hash owned by EXACTLY ONE account was a single-seller
@@ -773,6 +828,31 @@ export async function runBucketSourceSync({
     const executed = plan.families.filter((f) => executeSet.has(f.sourceKey));
     plan.families = [...freezeOnly, ...executed];
   }
+  // WP10b OPTIONAL PAID-APPROVAL GATE (admin Data Sync Center only; absent => this block never runs). Evaluated on the
+  // FINAL plan (fresh, or the frozen continuation) BEFORE the family loop -- i.e. before openCycle / persistBudget /
+  // runSourceJobs / updateRunStatus -- so a refusal is proven zero-create AND zero-write. Every continuation slice
+  // re-evaluates it against the caller's cumulative (persisted) debit, so a slice that could cross the approval stops
+  // before its first create; within an admitted slice the frozen tranche reservation RPC caps every create.
+  let approvedExposure = null;
+  if (approvedTokenCeiling != null) {
+    approvedExposure = paidApprovalExposure({ families: plan.families, executeSet, continuation });
+    const remainingTokens = Number(approvedTokenCeiling.remainingTokens);
+    const reserveTokens = Number(approvedTokenCeiling.reserveTokens || 0);
+    const malformed = !Number.isFinite(remainingTokens) || !Number.isFinite(reserveTokens) || reserveTokens < 0;
+    if (malformed || approvedExposure.exposureTokens + reserveTokens > remainingTokens) {
+      return {
+        bucket, cycleId: activeCycleId || null, plan: plan.summary, skippedPaused: plan.skippedPaused,
+        families: [], stopped: true, approvalRefused: true,
+        stopReason: Object.freeze({
+          code: "PAID_APPROVAL_EXCEEDED", reason: malformed ? "approval-malformed" : "exposure-exceeds-remaining-approval",
+          exposureTokens: approvedExposure.exposureTokens, reserveTokens: malformed ? null : reserveTokens,
+          remainingTokens: malformed ? null : remainingTokens, byFamily: approvedExposure.byFamily,
+        }),
+        globalDrained: false, deadlineReached: false, continuationRequired: false,
+        history: { rowsPersisted: 0, accountsCovered: 0 }, snapshots: { recorded: [], rejected: [] },
+      };
+    }
+  }
   const allPlannedJobs = plan.families.flatMap((f) => f.plannedJobs);
   const ownerIds = [...new Set(allPlannedJobs.map((j) => j.owner.ownerId))];
 
@@ -782,6 +862,7 @@ export async function runBucketSourceSync({
     deadlineReached: false, continuationRequired: false,
     history: { rowsPersisted: 0, accountsCovered: 0 }, snapshots: { recorded: [], rejected: [] },
   };
+  if (approvedExposure) rollup.approvedExposure = approvedExposure; // WP10b observability (only when the gate is set)
 
   let lastFamilyCompletedAt = null;
   const enforceCooldown = async () => {

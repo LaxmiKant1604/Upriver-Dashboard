@@ -1061,6 +1061,9 @@ await asyncTest("a normal read never builds: it serves the shared snapshot or re
 });
 
 await asyncTest("a refresh claims the cross-user lock, saves the shared snapshot and releases the lock", async () => {
+  // Publication recovery WP10b: brand-view is a ROUTE-OWNED live key (refresh=1 is read-only; proven in
+  // scripts/refresh-readonly.test.js). The generic refresh contract is unchanged for every NON-route-owned key, so this
+  // probe uses the unfenced legacy brand-portfolio key (same brand-scoped account id + params).
   let buildCount = 0;
   const stub = installFetchStub((request) => {
     if (request.url.includes("claim_report_refresh_lock")) return { body: true };
@@ -1076,7 +1079,7 @@ await asyncTest("a refresh claims the cross-user lock, saves the shared snapshot
     const res = makeRes();
     await serveSharedReport({
       res, refresh: true,
-      reportKey: "brand-view", reportVersion: BRAND_VIEW_VERSION,
+      reportKey: "brand-portfolio", reportVersion: BRAND_VIEW_VERSION,
       accountId: brandViewScopeId(ACCOUNT_A, "Bebi Born"),
       params: { accountId: ACCOUNT_A, brand: "Bebi Born", asOf: "2026-07-28" },
       label: "Brand View",
@@ -1103,6 +1106,7 @@ await asyncTest("a refresh claims the cross-user lock, saves the shared snapshot
 });
 
 await asyncTest("a second simultaneous refresh is refused by the lock instead of duplicating the work", async () => {
+  // WP10b: probed on an unfenced key (see above); a route-owned key never claims the lock at all.
   let buildCount = 0;
   const stub = installFetchStub((request) => {
     if (request.url.includes("claim_report_refresh_lock")) return { body: false };
@@ -1113,7 +1117,7 @@ await asyncTest("a second simultaneous refresh is refused by the lock instead of
     const res = makeRes();
     await serveSharedReport({
       res, refresh: true,
-      reportKey: "brand-view", reportVersion: BRAND_VIEW_VERSION,
+      reportKey: "brand-portfolio", reportVersion: BRAND_VIEW_VERSION,
       accountId: brandViewScopeId(ACCOUNT_A, "Bebi Born"),
       params: { accountId: ACCOUNT_A, brand: "Bebi Born", asOf: "2026-07-28" },
       label: "Brand View",
@@ -1151,10 +1155,22 @@ await asyncTest("a Brand Sales build that throws (unusable Catalog) writes ZERO 
     const res = makeRes();
     // The same typed, admin-safe error buildBrandSalesPayload throws when the Product
     // Catalog has no usable brand mappings. serveSharedReport saves ONLY on build success.
+    // WP10b: brand-sales is ROUTE-OWNED -- a refresh=1 never runs its build (served read-only). The build-failure
+    // contract below is therefore probed on an unfenced key with the same builder error.
+    let routeOwnedBuilds = 0;
+    await serveSharedReport({
+      res: makeRes(), refresh: true,
+      reportKey: "brand-sales", reportVersion: "brand-sales-shared-v1",
+      accountId: ACCOUNT_A, params: { from: "2025-05-01", to: "2026-08-01" },
+      label: "Dashboard",
+      build: () => { routeOwnedBuilds += 1; throw new Error("must never run"); },
+    });
+    assert.equal(routeOwnedBuilds, 0, "a route-owned brand-sales refresh never runs its (paid) build");
+    assert.equal(snapshotPosts, 0, "... and writes nothing");
     await assert.rejects(
       () => serveSharedReport({
         res, refresh: true,
-        reportKey: "brand-sales", reportVersion: "brand-sales-shared-v1",
+        reportKey: "sales", reportVersion: "brand-sales-shared-v1",
         accountId: ACCOUNT_A, params: { from: "2025-05-01", to: "2026-08-01" },
         label: "Dashboard",
         build: () => {

@@ -4331,6 +4331,13 @@ function DashboardApp({ session, access, onSignOut }) {
     : view === "skumovement" ? (skuMovement.loading || skuMovement.updating)
     : rowsLoading;
   const accountLabel = refreshScopeAccount?.name || "selected account";
+  // Publication recovery WP10b: every ROUTE-OWNED report page (Sales Dashboard = brand-sales, Daily Reporting, FBA
+  // Plan, SKU Movement, Returns, Listing Health v3; Brand View pages below) only RELOADS saved data. Admins additionally
+  // get "Request paid sync (uses DataDoe tokens)", which opens the Data Sync Center: its source cards show a token
+  // estimate and require explicit confirmation before any DataDoe token is spent. Manual-paid insight reports keep theirs.
+  const openPaidSync = () => { setView("sync-center"); setDashboardMode("account"); };
+  const routeOwnedView = (view === "dashboard" && dashboardMode === "account") || view === "daily" || view === "fbaplan"
+    || view === "skumovement" || view === "returns" || view === "listinghealth-v3" || view === "listinghealth";
   const refreshScopeLabel = showingBrandPortfolio ? (selectedPortfolioBrand || "portfolio brand") : accountLabel;
   const refreshDescriptor = {
     // In portfolio mode this button refreshes the BRAND LIST only. Rebuilding
@@ -4365,7 +4372,10 @@ function DashboardApp({ session, access, onSignOut }) {
       ? "The Priority Feed combines the six saved reports. Each updates automatically from its saved data."
       : showingBrandPortfolio
         ? "Reload the portfolio brand list from the accounts you may access."
-        : "Reload the latest saved data. This never calls DataDoe — refreshes run automatically on schedule or from the Data Sync Center.",
+        : "Reload saved data. This never calls DataDoe — refreshes run automatically on schedule or from the Data Sync Center.",
+    paidSync: isAdmin && routeOwnedView && !onFeed
+      ? { label: "Request paid sync (uses DataDoe tokens)", onClick: openPaidSync }
+      : undefined,
   };
 
   // Brand View owns its own account/brand/date/currency control bar, so the
@@ -4455,6 +4465,7 @@ function DashboardApp({ session, access, onSignOut }) {
           accountsError={accountsError}
           loadReport={loadSharedReport}
           refreshReport={refreshSharedReport}
+          onRequestPaidSync={isAdmin ? openPaidSync : null}
         />
       )}
 
@@ -4471,6 +4482,7 @@ function DashboardApp({ session, access, onSignOut }) {
           onLoadBrandDirectory={fetchBrandDirectory}
           isAdmin={isAdmin}
           sourceAccounts={portfolioSourceAccounts}
+          onRequestPaidSync={isAdmin ? openPaidSync : null}
         />
       ) : (
       <div className="container dashboard-page">

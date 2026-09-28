@@ -12,6 +12,13 @@
 //   - One account/report failure is isolated (logged to sync_errors, target marked
 //     failed) and never stops the rest.
 //   - Unknown marketplace country is logged and skipped, never mis-bucketed.
+//   - PUBLICATION RECOVERY WP13: the v1 LIBRARY itself never writes a ROUTE-OWNED live report key (brand-sales,
+//     daily-reporting, brand-inventory, listing-health-v3, fba-plan, sku-movement, returns-leakage, brand-view,
+//     brand-view-portfolio, brand-view-brands -- published ONLY through the fenced publisher). An EXPLICIT reportKeys
+//     list naming one is refused with the typed ROUTE_OWNED_REPORT_V1_REFUSED BEFORE any Supabase read, lock, audit or
+//     DataDoe call (no partial run of a mixed list); a schedule-enabled route-owned key is EXCLUDED from the work list;
+//     the 30-day retention DELETE skips route-owned keys; and runReportAdapter refuses them before its build. Every v1
+//     API caller already refuses them (WP10b); this makes the library fail closed on its own.
 
 import { getDataDoeConnections, publicAccountId } from "../datadoe-connections.js";
 import { fetchAccounts, isDataDoeDeadlineError, withDataDoeDeadline } from "../datadoe.js";
@@ -28,7 +35,7 @@ import { bucketForCountry, entriesForBucket, orderedWork } from "./registry.js";
 import { enabledReportKeys } from "./report-controls.js";
 import { expandSyncWork, targetDisposition } from "./planner.js";
 import { getReportBuild } from "./adapters/index.js";
-import { runReportAdapter } from "./adapters/report-adapter.js";
+import { runReportAdapter, assertSchedulerV1ReportKeys, isSchedulerV1WritableReportKey } from "./adapters/report-adapter.js";
 import { runAdsAdapter } from "./adapters/ads.js";
 
 const WORK_BUDGET_MS = 50_000;       // leave ~10s headroom under the 60s function cap
@@ -44,6 +51,7 @@ async function runRetention(entries) {
   const now = Date.now();
   for (const entry of entries) {
     if (entry.domain === "ads" || !entry.retentionDays) continue; // ads history is preserved
+    if (!isSchedulerV1WritableReportKey(entry.reportKey)) continue; // WP13: never age-prune a route-owned live key
     const cutoffIso = new Date(now - entry.retentionDays * 86_400_000).toISOString();
     await deleteReportSnapshotsOlderThan({ reportKey: entry.reportKey, cutoffIso });
   }
@@ -54,6 +62,8 @@ export async function runScheduledSync({
   reportKeys = null, accountIds = null,
 }) {
   if (bucket !== "us" && bucket !== "non-us") throw new Error("bucket must be 'us' or 'non-us'.");
+  // WP13: an explicit route-owned key is refused (typed) BEFORE any Supabase read / lock / audit / DataDoe call.
+  if (reportKeys) assertSchedulerV1ReportKeys(reportKeys, "scheduler-v1 runScheduledSync");
   const requestedReportKeys = reportKeys ? new Set(reportKeys.map(String)) : null;
   const requestedAccountIds = accountIds ? new Set(accountIds.map(String)) : null;
   const counts = { accounts: 0, targets: 0, succeeded: 0, failed: 0, terminalFailed: 0, deferred: 0, skipped: 0, discoveryFailed: 0 };
@@ -67,8 +77,13 @@ export async function runScheduledSync({
   // A report-scoped manual action supplies its explicit key and bypasses only
   // the schedule setting, never the registry's runtime-readiness flag.
   const selectedKeys = requestedReportKeys || enabledReportKeys(await getReportSyncSettings());
-  const selectedEntries = entriesForBucket(bucket).filter((entry) => selectedKeys.has(entry.reportKey));
+  // WP13: a schedule-enabled route-owned key is EXCLUDED (never built, saved, pruned or retained by v1).
+  const bucketSelected = entriesForBucket(bucket).filter((entry) => selectedKeys.has(entry.reportKey));
+  const selectedEntries = bucketSelected.filter((entry) => isSchedulerV1WritableReportKey(entry.reportKey));
   if (!selectedEntries.length) {
+    if (bucketSelected.length) {
+      return { bucket, drained: true, skipped: "route-owned-refused", refusedReportKeys: [...new Set(bucketSelected.map((e) => e.reportKey))].sort(), counts };
+    }
     return { bucket, drained: true, skipped: "all-reports-paused", counts };
   }
 

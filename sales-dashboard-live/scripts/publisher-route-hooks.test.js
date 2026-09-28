@@ -13,7 +13,13 @@
 //       brand-view OWNER gate (never the scope id) + targetIdentity, liveParamsExtra stored but never hashed (resolver
 //       provenance still passes), the equal-stamp replay/conflict semantics, and the fba-plan promotedGateKey;
 //   (C) the binding: asOfField 'asOf' / null and liveAccountId != targetId give the correct PUBLICATION_NOT_REQUIRED /
-//       STALE reasons in evaluatePublicationBinding AND resolveValidatedLiveCandidate.
+//       STALE reasons in evaluatePublicationBinding AND resolveValidatedLiveCandidate;
+//   (D) the verifier follow-ups: F1 -- for a liveParamsExtra contract the live row's STORED extras must equal the extras
+//       the latest promotable shadow derives (an OLD-token live at the same hash + stamp + payload is STALE
+//       'live-params-extra-differs' and the resolver fails closed, while the fenced CAS refuses the re-promotion as a
+//       conflict); hook-free contracts never consult stored extras. F2 -- the ONE canonical skuMovementTargetId helper,
+//       the sku-movement targetIdentity (a job keyed for target X can never publish another account's / brand's live
+//       row) and the strengthened payload account / brand-scope semantic identity.
 // 7-bit ASCII, LF, no top-level await; dynamic imports after a dummy Supabase env.
 
 import assert from "node:assert/strict";
@@ -378,6 +384,140 @@ async function main() {
     ok("C5 returns-leakage-v3 (default 'to'): NOT_REQUIRED at live report_key 'returns-leakage'; an older requestedAsOf -> STALE candidate-asof-not-exact", r.bind().state === NR && r.bind({ requestedAsOf: "2026-09-25" }).reason === "candidate-asof-not-exact");
     ok("C6 contractAsOfField: default 'to'; 'asOf'; null; anything else is a malformed contract (undefined)", B.contractAsOfField({}) === "to" && B.contractAsOfField({ asOfField: "asOf" }) === "asOf" && B.contractAsOfField({ asOfField: null }) === null && B.contractAsOfField({ asOfField: "from" }) === undefined);
     ok("C6 a contract with a malformed asOfField fails CLOSED in the binding and the resolver", b.bind({ contract: { ...K2["brand-view-brands"], asOfField: "from" } }).reason === "live-contract-asof-field-invalid" && (await b.cand({ liveContracts: { ...K2, "brand-view-brands": { ...K2["brand-view-brands"], asOfField: "from" } } })).reason === "live-contract-asof-field-invalid");
+  }
+
+  // =============================================================================================================
+  out("== D. follow-up fixes: stored-extras binding (F1) + sku-movement target/payload identity (F2)");
+  {
+    const K3 = P.SCHEDULER_LIVE_SNAPSHOT_CONTRACTS;
+    const NR = B.PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED;
+    const ST = B.PUBLICATION_STATE.STALE;
+    // Bind the LATEST promotable job's shadow (params / payload / stamp) against a GIVEN live row (e.g. the row the CAS
+    // model actually holds), through BOTH the binding and the candidate resolver (the real shared read-back included).
+    const bindAgainst = ({ key, targetId, params, payload, liveRow, sra = TS, requestedAsOf = ASOF }) => {
+      const contract = K3[key];
+      const hash = paramsHashFor(params.reportVersion, params);
+      const shadow = { report_key: "scheduler-v2/" + key, account_id: targetId, params_hash: hash, params: { ...params }, payload, payload_storage_path: null, source_refreshed_at: sra };
+      const tokens = [params.evidenceToken].filter(Boolean);
+      const job = { deriveStatus: "succeeded", saveStatus: "succeeded", validated: true, cycleStatus: "partial", snapshotParamsHash: hash, dependsOn: ["req-1"], durableContentDeps: tokens };
+      const revision = { eligible: true, deps: ["req-1"], contentDeps: tokens };
+      const rows = new Map([["scheduler-v2/" + key + "|" + targetId + "|" + hash, shadow]]);
+      if (liveRow) rows.set(liveRow.report_key + "|" + liveRow.account_id + "|" + liveRow.params_hash, liveRow);
+      const readSnapshot = async ({ reportKey, accountId, paramsHash }) => rows.get(reportKey + "|" + accountId + "|" + paramsHash) || null;
+      const verifyLiveReadback = buildLivePromotedResolver({ getReportSnapshot: readSnapshot, loadStoragePayload: async () => null, liveContracts: K3, reportDerivations: D.REPORT_DERIVATIONS, computeHash: paramsHashFor });
+      const bind = async () => {
+        const lp = contract.liveParams(params);
+        const candHash = paramsHashFor(contract.liveReportVersion, lp);
+        const liveAcct = B.contractLiveAccountId(contract, params, targetId);
+        const live = await readSnapshot({ reportKey: contract.liveReportKey, accountId: liveAcct, paramsHash: candHash });
+        const liveReadback = await verifyLiveReadback({ reportKey: key, liveReportKey: contract.liveReportKey, accountId: liveAcct, paramsHash: candHash });
+        return B.evaluatePublicationBinding({
+          revision, accountId: targetId, reportKey: key, requestedAsOf, expectedShadowKey: "scheduler-v2/" + key,
+          job, shadow, hydratedShadowPayload: payload, live, hydratedLivePayload: live ? live.payload : null, liveReadback,
+          contract, computeHash: paramsHashFor, reportDerivations: D.REPORT_DERIVATIONS,
+        });
+      };
+      const cand = () => B.resolveValidatedLiveCandidate({ reportKey: key, accountId: targetId, requestedAsOf, readReportJob: async () => job, readSnapshot, loadStoragePayload: async () => null, verifyLiveReadback, liveContracts: K3, computeHash: paramsHashFor, reportDerivations: D.REPORT_DERIVATIONS });
+      return { bind, cand };
+    };
+
+    // ---- F1 unit: liveParamsExtraMatches ----
+    const skc = K3["sku-movement"];
+    const want = { evidenceToken: TOK("sm1"), serveToken: TOK("sms1") };
+    ok("D1 liveParamsExtraMatches: a hook-free contract ALWAYS matches (stored extras are never consulted -> byte-identical)", B.liveParamsExtraMatches(K3["brand-sales"], {}, { params: { reportVersion: "v", evidenceToken: "x" } }) === true && B.liveParamsExtraMatches(null, want, null) === true);
+    ok("D1 liveParamsExtraMatches: equal stored extras match; order-independent", B.liveParamsExtraMatches(skc, want, { params: { reportVersion: "v", serveToken: TOK("sms1"), evidenceToken: TOK("sm1") } }) === true);
+    ok("D1 liveParamsExtraMatches: a DIFFERENT, a MISSING or an ADDITIONAL stored token never matches", B.liveParamsExtraMatches(skc, want, { params: { evidenceToken: TOK("sm2"), serveToken: TOK("sms1") } }) === false
+      && B.liveParamsExtraMatches(skc, want, { params: { evidenceToken: TOK("sm1") } }) === false
+      && B.liveParamsExtraMatches(skc, want, { params: { ...want, manifestToken: TOK("mf1") } }) === false
+      && B.liveParamsExtraMatches(K3["fba-plan"], {}, { params: { reportVersion: "fba-plan-shared-v1", to: ASOF, depFingerprint: "d" } }) === false);
+    ok("D1 liveParamsExtraMatches: a live row without params carries NO extras (matches only an empty expectation)", B.liveParamsExtraMatches(skc, {}, { params: null }) === true && B.liveParamsExtraMatches(skc, want, {}) === false && B.liveParamsExtraMatches(skc, want, { params: ["x"] }) === false);
+
+    // ---- F1 the verifier's case: live promoted from the OLD-token shadow; the latest job's shadow carries NEW tokens at
+    //      the SAME stamp + the SAME payload + the SAME identity hash ----
+    const cas = makeCasStore();
+    const target = skuTarget(OWNER, "ALL");
+    const oldP = skuParams();
+    const newP = skuParams({ evidenceToken: TOK("sm2"), serveToken: TOK("sms2"), manifestToken: TOK("mf2") });
+    const first = await harness({ key: "sku-movement", targetId: target, params: oldP, payload: PAY.sku, cas }).run();
+    const liveRow = [...cas.rows.values()][0];
+    const before = B.stableJson(liveRow);
+    const vOld = bindAgainst({ key: "sku-movement", targetId: target, params: oldP, payload: PAY.sku, liveRow });
+    ok("D2 sanity: the live row promoted from the OLD-token shadow binds to THAT shadow (PUBLICATION_NOT_REQUIRED, resolver ok)", first.disposition === "published" && (await vOld.bind()).state === NR && (await vOld.cand()).ok === true);
+    const vNew = bindAgainst({ key: "sku-movement", targetId: target, params: newP, payload: PAY.sku, liveRow });
+    const bNew = await vNew.bind();
+    ok("D2 NEW-token shadow vs the OLD-token live (same params_hash, same stamp, same payload) -> STALE live-params-extra-differs", bNew.state === ST && bNew.reason === "live-params-extra-differs" && paramsHashFor(newP.reportVersion, newP) !== paramsHashFor(oldP.reportVersion, oldP) && K3["sku-movement"].liveParams(newP).asOf === K3["sku-movement"].liveParams(oldP).asOf);
+    const cNew = await vNew.cand();
+    ok("D2 the candidate resolver FAILS CLOSED on the same pair (live-params-extra-differs; no payload, no dependsOn)", cNew.ok === false && cNew.reason === "live-params-extra-differs" && cNew.payload === null && cNew.dependsOn.length === 0);
+    const withNewExtras = { ...liveRow, params: { ...liveRow.params, evidenceToken: TOK("sm2"), serveToken: TOK("sms2"), manifestToken: TOK("mf2") } };
+    const vSwap = bindAgainst({ key: "sku-movement", targetId: target, params: newP, payload: PAY.sku, liveRow: withNewExtras });
+    ok("D2 the stored extras are the ONLY difference: the same live row carrying the NEW tokens binds (NOT_REQUIRED) + resolves", (await vSwap.bind()).state === NR && (await vSwap.cand()).ok === true);
+    const conflict = await harness({ key: "sku-movement", targetId: target, params: newP, payload: PAY.sku, cas }).run();
+    ok("D2 ...and the fenced CAS REFUSES re-promoting the NEW-token shadow at the equal stamp (publish-conflict), live row byte-identical", conflict.disposition === "publish-conflict" && B.stableJson([...cas.rows.values()][0]) === before && cas.rows.size === 1);
+    const newer = await harness({ key: "sku-movement", targetId: target, params: newP, payload: PAY.sku, cas, ts: TS_LATER }).run();
+    const vAfter = bindAgainst({ key: "sku-movement", targetId: target, params: newP, payload: PAY.sku, liveRow: [...cas.rows.values()][0], sra: TS_LATER });
+    ok("D2 once the NEW-token shadow is promoted at a newer stamp, the binding proves it current again", newer.disposition === "published" && (await vAfter.bind()).state === NR && (await vAfter.cand()).ok === true);
+
+    // ---- F1 fba-plan (paid shadow: empty pick) + a hook-free contract ----
+    const fbaLive = (extra = {}) => { const lp = { to: ASOF }; return { report_key: "fba-plan", account_id: OWNER, params_hash: paramsHashFor("fba-plan-shared-v1", lp), params: { reportVersion: "fba-plan-shared-v1", ...lp, ...extra }, payload: FBA_PAYLOAD, payload_storage_path: null, source_refreshed_at: TS }; };
+    const fPaid = bindAgainst({ key: "fba-plan", targetId: OWNER, params: fbaPaidParams(), payload: FBA_PAYLOAD, liveRow: fbaLive() });
+    ok("D3 fba-plan PAID shadow vs the paid live { reportVersion, to } -> NOT_REQUIRED (the paid path is unchanged)", (await fPaid.bind()).state === NR && (await fPaid.cand()).ok === true);
+    const fStray = bindAgainst({ key: "fba-plan", targetId: OWNER, params: fbaPaidParams(), payload: FBA_PAYLOAD, liveRow: fbaLive({ evidenceToken: TOK("fp1"), manifestToken: TOK("mf1") }) });
+    ok("D3 fba-plan PAID shadow vs a ROUTE-promoted live (tokens stored) -> STALE live-params-extra-differs (binding + resolver)", (await fStray.bind()).reason === "live-params-extra-differs" && (await fStray.cand()).reason === "live-params-extra-differs");
+    const fRoute = bindAgainst({ key: "fba-plan", targetId: OWNER, params: { ...fbaPaidParams(), evidenceToken: TOK("fp1"), manifestToken: TOK("mf1") }, payload: FBA_PAYLOAD, liveRow: fbaLive() });
+    ok("D3 fba-plan ROUTE shadow (tokens) vs a PAID live (no tokens) -> STALE live-params-extra-differs", (await fRoute.bind()).reason === "live-params-extra-differs");
+    const bsParams = { reportVersion: D.REPORT_DERIVATIONS["brand-sales"].snapshotVersion, accountId: OWNER, from: "2026-08-01", to: ASOF };
+    const bsPayload = { rows: [], catalogBrands: [], asinBrand: { A1: "Acme" } };
+    const bsLp = { from: "2026-08-01", to: ASOF };
+    const bsLive = { report_key: "brand-sales", account_id: OWNER, params_hash: paramsHashFor("brand-sales-shared-v1", bsLp), params: { reportVersion: "brand-sales-shared-v1", ...bsLp, evidenceToken: TOK("zz") }, payload: bsPayload, payload_storage_path: null, source_refreshed_at: TS };
+    const bs = bindAgainst({ key: "brand-sales", targetId: OWNER, params: bsParams, payload: bsPayload, liveRow: bsLive });
+    ok("D3 a HOOK-FREE contract (brand-sales) never consults stored extras: a stray stored token still binds (byte-identical path)", (await bs.bind()).state === NR && (await bs.cand()).ok === true);
+
+    // ---- F2 skuMovementTargetId: ONE canonical helper ----
+    ok("D4 skuMovementTargetId: 'sku-movement:<owner>::<canonical brand>' (trimmed brand, blank -> ALL, case preserved)",
+      P.skuMovementTargetId(OWNER, "ALL") === "sku-movement:IN1::ALL" && P.skuMovementTargetId(OWNER, " Acme ") === "sku-movement:IN1::Acme"
+      && P.skuMovementTargetId(OWNER, "") === "sku-movement:IN1::ALL" && P.skuMovementTargetId(OWNER, null) === "sku-movement:IN1::ALL"
+      && P.skuMovementTargetId(OWNER, "acme") !== P.skuMovementTargetId(OWNER, "Acme") && P.SKU_MOVEMENT_TARGET_PREFIX === "sku-movement:");
+    ok("D4 skuMovementTargetId: a blank / padded / non-string owner -> null (never trimmed into another account's target)", [" IN1", "IN1 ", "", "  ", null, undefined, 7].every((o) => P.skuMovementTargetId(o, "ALL") === null));
+    ok("D4 the test's target helper IS the canonical helper for canonical inputs", ["ALL", "Acme", "Brand B"].every((b) => skuTarget(OWNER, b) === P.skuMovementTargetId(OWNER, b)));
+
+    // ---- F2 publisher: a job keyed for target X can never publish another account's or brand's live row ----
+    const X = skuTarget(OWNER, "ALL");
+    const otherAcct = harness({ key: "sku-movement", targetId: X, params: skuParams({ ownerAccountId: IN2 }), payload: skuMovementPayload({ oliRows: [], catalogRows: [], effectiveAsOf: ASOF, brand: "ALL", accountId: IN2 }), rollout: [OWNER, IN2] });
+    const oa = await otherAcct.run();
+    ok("D5 a job keyed for X whose shadow names ANOTHER owner account -> invalid-snapshot, ZERO publishLive, ZERO gate reads", oa.disposition === "invalid-snapshot" && otherAcct.calls.publish.length === 0 && otherAcct.calls.rollout === 0 && otherAcct.calls.approvals.length === 0);
+    const acmePayload = skuMovementPayload({ oliRows: [], catalogRows: [], effectiveAsOf: ASOF, brand: "Acme", accountId: OWNER });
+    const otherBrand = harness({ key: "sku-movement", targetId: X, params: skuParams({ brand: "Acme" }), payload: acmePayload });
+    ok("D5 a job keyed for X (brand ALL) whose shadow names ANOTHER brand -> invalid-snapshot, ZERO publishLive, ZERO gate reads", (await otherBrand.run()).disposition === "invalid-snapshot" && otherBrand.calls.publish.length === 0 && otherBrand.calls.rollout === 0);
+    const padded = harness({ key: "sku-movement", targetId: X, params: skuParams({ ownerAccountId: " " + OWNER }), payload: PAY.sku });
+    ok("D5 a padded owner never matches the canonical target (invalid-snapshot, zero writes)", (await padded.run()).disposition === "invalid-snapshot" && padded.calls.publish.length === 0);
+    const named = harness({ key: "sku-movement", targetId: skuTarget(OWNER, "Acme"), params: skuParams({ accountId: skuTarget(OWNER, "Acme"), brand: "Acme" }), payload: acmePayload });
+    const nm = await named.run();
+    ok("D5 the CANONICAL named-brand target publishes at the owner with the { asOf, brand } identity", nm.disposition === "published" && named.calls.publish[0].accountId === OWNER && named.calls.publish[0].paramsHash === paramsHashFor("sku-movement/v2", { asOf: ASOF, brand: "Acme" }));
+
+    // ---- F2 semanticIdentity: the payload's own account + brand scope ----
+    const semCase = async (payload) => { const h = harness({ key: "sku-movement", targetId: X, params: skuParams(), payload }); const r = await h.run(); return r.disposition === "invalid-snapshot" && h.calls.publish.length === 0; };
+    ok("D6 a payload derived for ANOTHER account (payload.accountId != owner) -> invalid-snapshot, zero writes", await semCase({ ...PAY.sku, accountId: IN2 }));
+    ok("D6 a payload with NO account (accountId null / absent) -> invalid-snapshot (never an unscoped payload)", (await semCase({ ...PAY.sku, accountId: null })) && (await semCase(Object.fromEntries(Object.entries(PAY.sku).filter(([k]) => k !== "accountId")))));
+    ok("D6 a payload for ANOTHER brand under the ALL identity -> invalid-snapshot", await semCase(skuMovementPayload({ oliRows: [], catalogRows: [], effectiveAsOf: ASOF, brand: "Acme", accountId: OWNER })));
+    ok("D6 a brand-scope contradiction (brand ALL but brandFiltered true) -> invalid-snapshot", await semCase({ ...PAY.sku, brandFiltered: true }));
+    const skSem = K3["sku-movement"].semanticIdentity;
+    ok("D6 semanticIdentity typed reasons (account / brand / scope / as-of / non-object)",
+      skSem({ ...PAY.sku, accountId: IN2 }, { accountId: OWNER, liveParams: { asOf: ASOF, brand: "ALL" } }).reason === "payload-account-mismatch"
+      && skSem(acmePayload, { accountId: OWNER, liveParams: { asOf: ASOF, brand: "ALL" } }).reason === "payload-brand-mismatch"
+      && skSem({ ...acmePayload, brandFiltered: false }, { accountId: OWNER, liveParams: { asOf: ASOF, brand: "Acme" } }).reason === "payload-brand-scope-mismatch"
+      && skSem({ ...PAY.sku, effectiveAsOf: "2026-09-23" }, { accountId: OWNER, liveParams: { asOf: ASOF, brand: "ALL" } }).reason === "payload-effective-asof-mismatch"
+      && skSem(null, { accountId: OWNER, liveParams: { asOf: ASOF, brand: "ALL" } }).reason === "payload-not-object"
+      && skSem(acmePayload, { accountId: OWNER, liveParams: { asOf: ASOF, brand: "Acme" } }).ok === true);
+    // The shared read-back applies the same identity to a LIVE row: another account's payload at the owner's identity.
+    const rbRows = new Map();
+    const lpAll = { asOf: ASOF, brand: "ALL" };
+    const hAll = paramsHashFor("sku-movement/v2", lpAll);
+    rbRows.set("sku-movement|" + OWNER + "|" + hAll, { report_key: "sku-movement", account_id: OWNER, params_hash: hAll, params: { reportVersion: "sku-movement/v2", ...lpAll }, payload: { ...PAY.sku, accountId: IN2 }, payload_storage_path: null, source_refreshed_at: TS });
+    const rb = await buildLivePromotedResolver({ getReportSnapshot: async ({ reportKey, accountId, paramsHash }) => rbRows.get(reportKey + "|" + accountId + "|" + paramsHash) || null, loadStoragePayload: async () => null, liveContracts: K3, reportDerivations: D.REPORT_DERIVATIONS, computeHash: paramsHashFor })({ reportKey: "sku-movement", liveReportKey: "sku-movement", accountId: OWNER, paramsHash: hAll });
+    ok("D6 the shared live read-back refuses a live sku-movement row carrying ANOTHER account's payload (semantic-identity:payload-account-mismatch)", rb.ok === false && rb.reason === "semantic-identity:payload-account-mismatch");
+    // Binding + candidate resolver: a self-consistent job + shadow keyed by a target that is not its (owner, brand).
+    const tm = bindAgainst({ key: "sku-movement", targetId: skuTarget(OWNER, "Other"), params: skuParams({ accountId: skuTarget(OWNER, "Other") }), payload: PAY.sku, liveRow: null });
+    ok("D7 binding + resolver: a shadow whose (owner, brand) is not the target's canonical id -> STALE / fail shadow-target-identity", (await tm.bind()).reason === "shadow-target-identity" && (await tm.cand()).reason === "shadow-target-identity");
   }
 
   out(`publisher-route-hooks: ${passed} assertions passed`);

@@ -50,7 +50,7 @@ import { computeAdsReportRevision, subUtcDaysStr } from "./ads-publication-revis
 import { ADS_CAMPAIGN_SOURCE_KEY, adsGrainsForReport, adsRequiredCoverageDays } from "./ads-dependent-reports.js";
 import { CAMPAIGN_ADS_SOURCE_KEY } from "../active-ads-source.js";
 import { monthBackStr } from "../date-windows.js";
-import { jobIsPromotable, revisionCoveredByJob } from "./publication-binding.js";
+import { resumableAtTerminalCycle } from "./publication-binding.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
@@ -85,14 +85,8 @@ const defaultReadLatestJob = async (reportKey, accountId, opt) => (await import(
 // promotable (validated + succeeded in a terminal cycle + nonblank hash), carries EXACTLY this derive's shadow params
 // hash, and its lineage covers EXACTLY this derive's deps (catalog + OLI provenance) + the Campaign Ads content token.
 // Anything else (another cycle's job, another revision, an unreadable job) keeps today's defer. The publisher re-proves
-// every gate + the shadow hash provenance + the payload contract before the fenced CAS.
-function resumableAtTerminalCycle(job, { cycleId, paramsHash, dependsOn, durableContentDeps }) {
-  return !!job && nb(cycleId)
-    && S(job.cycleId) === S(cycleId)
-    && jobIsPromotable(job)
-    && S(job.snapshotParamsHash) === S(paramsHash)
-    && revisionCoveredByJob({ eligible: true, deps: dependsOn, contentDeps: durableContentDeps }, job);
-}
+// every gate + the shadow hash provenance + the payload contract before the fenced CAS. The predicate itself is the
+// SHARED resumableAtTerminalCycle (publication-binding.js, hoisted in WP4) -- one definition for every release.
 
 /**
  * Build the dedicated daily-reporting release. Injected collaborators (production wired by the entrypoint); every

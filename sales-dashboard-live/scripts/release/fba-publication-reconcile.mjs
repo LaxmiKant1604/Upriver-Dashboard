@@ -40,6 +40,26 @@ const runToken = (argOf("run-token") || "").trim();
 const rawOwnerGen = (argOf("owner-generation") || "").trim();
 const ownerGeneration = /^\d+$/.test(rawOwnerGen) ? Number(rawOwnerGen) : NaN;
 const ghOut = (k, v) => { const f = process.env.GITHUB_OUTPUT; if (f) { try { appendFileSync(f, k + "=" + v + "\n"); } catch { /* ignore */ } } };
+// OPTIONAL bounded LEASE-WAIT for this run's PERIODIC controls APPLY (publication recovery WP13 verifier P2-1 / round-2
+// P2-A; the control envelope ONLY -- what is published is unchanged). The scheduler's route CLI holds the GLOBAL
+// control-plane lease in windows (with a 30 s fairness pause between them), so a single-attempt apply could lose to it and
+// defer every stale account -- and brand-inventory's same-day convergence now depends on this reconciler. --lease-wait-
+// seconds=N (an integer 0..900): runControlPackageCli retries the apply ONLY on the typed CONTROL_LEASE_HELD refusal (a
+// zero-write, rolled-back transaction) every 15 s, and never past this run's start cutoff (--deadline-seconds minus
+// START_RESERVE), so the ALWAYS safe-close reserve stays intact (a long wait can use up the work window: the stale
+// accounts then defer, LKG kept). Immediate mode never applies (it renews the scheduler's fence), so it never waits.
+// ABSENT or 0 => the apply call is BYTE-IDENTICAL (no leaseWaitSeconds key; one attempt). Malformed => STOP (exit 2)
+// before any connection.
+const rawLeaseWait = argOf("lease-wait-seconds");
+if (rawLeaseWait != null && (!/^\d{1,3}$/.test(rawLeaseWait) || Number(rawLeaseWait) > 900)) { console.error("STOP FBA_RECONCILE_LEASE_WAIT: --lease-wait-seconds must be an integer in [0, 900]; got " + String(rawLeaseWait).slice(0, 20)); process.exit(2); }
+const LEASE_WAIT_SECONDS = rawLeaseWait != null ? Number(rawLeaseWait) : 0;
+// The lease-wait actually granted to an apply starting NOW: never past the start cutoff (none once it is reached).
+const applyLeaseWait = () => {
+  if (!(LEASE_WAIT_SECONDS > 0)) return {};
+  const cap = deadlineSec > 0 ? Math.max(0, Math.floor(startCutoffSec - (Date.now() - runStartMs) / 1000)) : LEASE_WAIT_SECONDS;
+  const n = Math.min(LEASE_WAIT_SECONDS, cap);
+  return n > 0 ? { leaseWaitSeconds: n } : {};
+};
 
 if (!isRegionScope(bucket)) { console.error("STOP FBA_RECONCILE_REGION_UNSUPPORTED: --bucket must be india|europe-au|us-ca (region-scoped); got " + bucket); process.exit(2); }
 if (!DATE_RE.test(String(asOf))) { console.error("STOP FBA_RECONCILE_AS_OF: --as-of=YYYY-MM-DD is required; got " + asOf); process.exit(2); }
@@ -155,6 +175,7 @@ async function openControls(staleAccountIds) {
       connectStore: connectPriorityControlStore,
       ownerToken: OPERATOR, operationKey: CONTROL_OP_KEY, leaseTtlSeconds: 900,
       log: (m) => console.log("fba-reconcile controls: " + m),
+      ...applyLeaseWait(),
     });
     if (r && Number(r.code) === 3) return { ok: false, commitUnknown: true, reason: "control-apply COMMIT_UNKNOWN (code 3) -- read-only reconciliation required (NO rollback/retry)" };
     if (!r || r.committed !== true) return { ok: false, reason: "controls apply did not commit (code " + (r && r.code) + (r && r.problem ? "/" + r.problem : "") + ")" };

@@ -1663,6 +1663,45 @@ export async function insertAuditLog({ actorUserId = null, action, target = {} }
   }).catch(() => {});
 }
 
+// WP10b (re-verify P1) -- the DURABLE SINGLE-USE RECEIPT for one Campaign-Ads paid-sync slice (api/admin/sources.js).
+// An insert into the EXISTING public.audit_log (20260805_scheduled_sync.sql: id uuid PRIMARY KEY) with an EXPLICIT,
+// deterministic id (report-store.js paidSyncAdsReceiptId(nonce, aq)) is an atomic, permanent insert-if-absent: the
+// first insert claims the step; any later insert of the same id is a primary-key conflict (Postgres 23505, surfaced by
+// PostgREST as HTTP 409) -> the step was already used. No migration, no new table, nothing ever deletes audit_log rows.
+// UNLIKE insertAuditLog (best-effort, swallows errors) this NEVER swallows a failure: { claimed:true } only on a
+// confirmed commit; { claimed:false, reason:"consumed" } only on a unique/PK conflict (code 23505, or a bare 409 that
+// carries no other Postgres code); EVERY other outcome THROWS (network / 5xx / 400 / a 409 carrying a DIFFERENT SQLSTATE
+// such as 23503 -- a foreign-key failure is not "already used") so the caller refuses typed with zero spend. The id is
+// validated as a canonical lowercase UUID BEFORE any request (a malformed id never reaches the network). Single attempt
+// (mutating request: no retry); an in-flight failure is commit-unknown and the caller treats it as unverifiable -- a
+// retry of the same step then either claims it or finds it consumed (both fail closed).
+const PAID_SYNC_RECEIPT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export async function claimPaidSyncReceipt({ receiptId, actorUserId = null, action, target = {} } = {}, { signal = null } = {}) {
+  if (typeof receiptId !== "string" || !PAID_SYNC_RECEIPT_ID_RE.test(receiptId)) {
+    const err = new Error("PAID_SYNC_RECEIPT_ID_INVALID: the receipt id must be a canonical lowercase UUID (fail closed; nothing was sent).");
+    err.code = "PAID_SYNC_RECEIPT_ID_INVALID";
+    throw err;
+  }
+  if (typeof action !== "string" || !action.trim()) {
+    const err = new Error("PAID_SYNC_RECEIPT_ACTION_INVALID: a receipt needs an audit action (fail closed; nothing was sent).");
+    err.code = "PAID_SYNC_RECEIPT_ACTION_INVALID";
+    throw err;
+  }
+  try {
+    await request("/rest/v1/audit_log", {
+      method: "POST",
+      signal,
+      headers: { Prefer: "return=minimal" },
+      body: { id: receiptId, actor_user_id: actorUserId, action, target: target && typeof target === "object" ? target : {} },
+    });
+  } catch (error) {
+    const code = error && typeof error.code === "string" ? error.code : null;
+    if (code === "23505" || (error && error.status === 409 && code == null)) return { claimed: false, reason: "consumed" };
+    throw error;
+  }
+  return { claimed: true };
+}
+
 export async function getReportSyncSettings({ signal = null } = {}) {
   return request("/rest/v1/report_sync_settings?select=report_key,schedule_enabled,updated_at&order=report_key.asc", { signal });
 }
@@ -2718,6 +2757,65 @@ export async function getSourceOliOperationalUnitRows({ organizationFingerprint,
   return out;
 }
 
+/**
+ * CHEAP, READ-ONLY operational-unit STATS for ONE account over sale_date in [from, to] (inclusive): the EXACT row count
+ * and max(updated_at) over ALL of the account's rows in the window (NO additiveOnly / or-filter). This is the SKU
+ * Movement serve token's operational-units input (sku-movement-evidence.js THE SERVE-SIDE CONTRACT (4), publication
+ * recovery WP10): a standalone operational-units backfill (no coverage change) moves the count or max(updated_at), so
+ * the serve stops serving an older stored route row. ONE request -- select=updated_at&order=updated_at.desc&limit=1
+ * with Prefer: count=exact (PostgREST reports the exact total in Content-Range "<range>/<total>"; updated_at is NOT
+ * NULL per migration 20260901). No payload, no pagination, never a write.
+ * -> { windowFrom: from, windowTo: to, rows, maxUpdatedAt } -- maxUpdatedAt is PostgREST's own timestamptz text (the
+ * serve token digests it offset-agnostically via canonicalSkuInstant), null exactly when rows === 0.
+ * THROWS (fail closed) on a malformed argument or ANY read problem: transport, a non-2xx (a missing table included), an
+ * absent / unparseable total, or a total that disagrees with the returned row -- the caller turns it into "no token"
+ * (the serve then re-derives read-only). Never a guessed count.
+ */
+export async function getSourceOliOperationalUnitStats({ organizationFingerprint, connectionId = "primary", accountId, from, to, signal = null } = {}) {
+  const isDay = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+  if (!organizationFingerprint || String(accountId ?? "").trim() === "" || !isDay(from) || !isDay(to) || from > to) {
+    throw new Error("getSourceOliOperationalUnitStats requires organizationFingerprint + accountId + a from <= to YYYY-MM-DD window (fail closed).");
+  }
+  requireConfiguration();
+  const query = new URLSearchParams({
+    select: "updated_at",
+    organization_fingerprint: `eq.${organizationFingerprint}`,
+    connection_id: `eq.${connectionId}`,
+    account_id: `eq.${accountId}`,
+    sale_date: `gte.${from}`,
+    order: "updated_at.desc",
+    limit: "1",
+  });
+  query.append("sale_date", `lte.${to}`);
+  const response = await fetchReadOnly(`${SUPABASE_URL}/rest/v1/source_oli_operational_units?${query}`, {
+    method: "GET",
+    headers: { apikey: SUPABASE_SECRET_KEY, Authorization: `Bearer ${SUPABASE_SECRET_KEY}`, Prefer: "count=exact" },
+    ...(signal ? { signal } : {}),
+  });
+  const result = await response.json().catch(() => null);
+  if (!response.ok) {
+    // The SAME safe structured error `request` raises: the HTTP status + PostgREST's own code only.
+    const error = new Error(`Supabase request failed (${response.status}): ${result?.message || result?.hint || "Unknown error"}`);
+    error.status = response.status;
+    error.code = result && typeof result.code === "string" ? result.code : null;
+    throw error;
+  }
+  const statsError = (detail) => {
+    const error = new Error(`OLI_OPUNITS_STATS_UNREADABLE: ${detail} (fail closed).`);
+    error.code = "OLI_OPUNITS_STATS_UNREADABLE";
+    return error;
+  };
+  const total = /\/(\d+)\s*$/.exec(String((response.headers && typeof response.headers.get === "function" && response.headers.get("content-range")) || ""));
+  if (!total) throw statsError("the exact total (Content-Range) is missing");
+  const rows = Number(total[1]);
+  if (!Number.isSafeInteger(rows) || rows < 0 || !Array.isArray(result)) throw statsError("the exact total or the row list is malformed");
+  if ((rows === 0) !== (result.length === 0) || result.length > 1) throw statsError("the exact total disagrees with the returned row");
+  if (rows === 0) return { windowFrom: from, windowTo: to, rows: 0, maxUpdatedAt: null };
+  const maxUpdatedAt = result[0] && typeof result[0].updated_at === "string" && result[0].updated_at.trim() !== "" ? result[0].updated_at : null;
+  if (maxUpdatedAt == null) throw statsError("max(updated_at) is missing");
+  return { windowFrom: from, windowTo: to, rows, maxUpdatedAt };
+}
+
 // STANDALONE atomic replace of ONLY the operational-unit window (used by the zero-export backfill that recomputes
 // operational units from dimensional history WITHOUT touching the priced rollup / dimensional / audit / coverage).
 export async function replaceOliOperationalUnitsWindow({ organizationFingerprint, connectionId = "primary", accountId, coveredFrom, coveredTo, unitRows, signal = null }) {
@@ -2888,7 +2986,12 @@ export async function getReturnsHistoryRows({ organizationFingerprint, connectio
         organization_fingerprint: `eq.${organizationFingerprint}`,
         connection_id: `eq.${connectionId}`,
         return_date: `gte.${from}`,
-        order: "return_date.asc,account_id.asc,child_asin.asc,sku.asc",
+        // a TOTAL order over the durable PRIMARY KEY (source_returns_hist_pk, migration 20260914: org + connection --
+        // pinned by the eq filters above -- then account, return_date, sku, child_asin, amazon_return_reason,
+        // fulfillment_channel, request_status, label_payer) so offset pagination never returns a tied row twice or
+        // skips one at a page boundary (the former 4-column order left the last four key columns tied). The leading
+        // columns keep their former order, so rows that were already distinct keep their relative sequence.
+        order: "return_date.asc,account_id.asc,child_asin.asc,sku.asc,amazon_return_reason.asc,fulfillment_channel.asc,request_status.asc,label_payer.asc",
         limit: String(PAGE),
         offset: String(offset),
       });
@@ -2974,7 +3077,11 @@ export async function getSettlementHistoryRows({ organizationFingerprint, connec
         organization_fingerprint: `eq.${organizationFingerprint}`,
         connection_id: `eq.${connectionId}`,
         settlement_date: `gte.${from}`,
-        order: "settlement_date.asc,account_id.asc,child_asin.asc,sku.asc",
+        // a TOTAL order over the durable PRIMARY KEY (source_settle_hist_pk, migration 20260914: org + connection --
+        // pinned by the eq filters above -- then account, settlement_date, sku, child_asin, currency, settlement_type)
+        // so offset pagination never duplicates or skips a tied row at a page boundary (the former 4-column order left
+        // currency + settlement_type tied: an ORDER and a REFUND row of one SKU-day). Leading columns unchanged.
+        order: "settlement_date.asc,account_id.asc,child_asin.asc,sku.asc,currency.asc,settlement_type.asc",
         limit: String(PAGE),
         offset: String(offset),
       });
@@ -3249,10 +3356,15 @@ export async function getAccountOliQualityCounts({ organizationFingerprint, conn
 }
 
 // Proven successful coverage windows for one (account|__organization, source). Typed like getDailyAdsCoverage.
+// Each window is { from, to, updatedAt } -- updatedAt (the row's updated_at, PostgREST's own timestamptz rendering) is
+// ADDITIVE (publication recovery WP10): every OLI history / dimensional writer RPC re-acknowledges its coverage window
+// (updated_at = now()) in the SAME transaction, so the SKU Movement serve token (sku-movement-evidence.js
+// computeSkuServeToken) sees a same-effectiveAsOf OLI correction. Every other consumer reads only from / to (or maps
+// through mergeCoverageWindows / an explicit { from, to } projection) and ignores the extra field.
 export async function getSourceCoverageWindows({ organizationFingerprint, connectionId = "primary", accountId, sourceKey, signal = null }) {
   try {
     const query = new URLSearchParams({
-      select: "covered_from,covered_to",
+      select: "covered_from,covered_to,updated_at",
       organization_fingerprint: `eq.${organizationFingerprint}`,
       connection_id: `eq.${connectionId}`,
       account_id: `eq.${accountId}`,
@@ -3261,7 +3373,7 @@ export async function getSourceCoverageWindows({ organizationFingerprint, connec
       order: "covered_from.asc",
     });
     const rows = await request(`/rest/v1/source_coverage?${query}`, { signal });
-    return { windows: (rows || []).map((r) => ({ from: r.covered_from, to: r.covered_to })), read: "ok", error: null };
+    return { windows: (rows || []).map((r) => ({ from: r.covered_from, to: r.covered_to, updatedAt: r.updated_at })), read: "ok", error: null };
   } catch (readError) {
     if (isSchemaMissingError(readError)) return { windows: [], read: "schema-missing", error: "SOURCE_COVERAGE_SCHEMA_MISSING" };
     return { windows: [], read: "read-failed", error: "SOURCE_COVERAGE_READ_FAILED" };
@@ -4820,6 +4932,9 @@ export const ROUTE_SHADOW_PRUNE_PUBLISHER_KEYS = Object.freeze([
 ]);
 const ROUTE_SHADOW_ROUTE_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const ROUTE_SHADOW_PARAMS_HASH_RE = /^[0-9a-f]{40}$/; // exactly paramsHashFor's output (sha256 hex, first 40)
+// The documented IN-FLIGHT-SAFETY window (plan WP4 step 8 / WP12 shadow retention: "anything within 24 h" is kept): a
+// cutoff LATER than now - 24 h could delete a shadow a concurrent prepare/publish is still binding, so it is refused.
+export const ROUTE_SHADOW_PRUNE_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 
 function routeShadowPruneRefused(detail) {
   const error = new Error(`deleteRouteShadowSnapshots refused (fail closed, zero rows deleted): ${detail}`);
@@ -4838,9 +4953,13 @@ function routeShadowPruneRefused(detail) {
  *                                                     any in-flight revision)
  *   updated_at   < olderThanIso                      (a concurrent prepare's fresh shadow is never touched)
  * Every argument is validated BEFORE any request; a bad argument throws ROUTE_SHADOW_PRUNE_REFUSED with ZERO network.
- * Returns the deleted row count (return=representation of the deleted params_hash only; never a payload).
+ * olderThanIso must ALSO be at or before now - ROUTE_SHADOW_PRUNE_MIN_AGE_MS (24 h, the in-flight-safety window): a
+ * later cutoff is refused the same way (`now` is injectable for tests; production uses the wall clock).
+ * Returns { deleted, payloadStoragePaths } -- the deleted row count and the DISTINCT nonblank payload_storage_path values
+ * of the deleted rows (return=representation of params_hash + payload_storage_path only; never a payload), so a caller
+ * can remove the offloaded storage objects the pruned rows referenced. Still unused by any path.
  */
-export async function deleteRouteShadowSnapshots({ routeId, publisherKey, targetId, keepParamsHashes, olderThanIso } = {}, { signal = null } = {}) {
+export async function deleteRouteShadowSnapshots({ routeId, publisherKey, targetId, keepParamsHashes, olderThanIso } = {}, { signal = null, now = () => Date.now() } = {}) {
   const key = typeof publisherKey === "string" ? publisherKey : "";
   if (!ROUTE_SHADOW_PRUNE_PUBLISHER_KEYS.includes(key)) throw routeShadowPruneRefused("publisherKey is not one of the route publisher keys");
   if (typeof routeId !== "string" || !ROUTE_SHADOW_ROUTE_ID_RE.test(routeId)) throw routeShadowPruneRefused("routeId is blank or malformed");
@@ -4851,8 +4970,11 @@ export async function deleteRouteShadowSnapshots({ routeId, publisherKey, target
   }
   const olderMs = typeof olderThanIso === "string" ? Date.parse(olderThanIso) : NaN;
   if (!Number.isFinite(olderMs)) throw routeShadowPruneRefused("olderThanIso is not a timestamp");
+  const nowMs = typeof now === "function" ? Number(now()) : NaN;
+  if (!Number.isFinite(nowMs)) throw routeShadowPruneRefused("the clock is unreadable");
+  if (olderMs > nowMs - ROUTE_SHADOW_PRUNE_MIN_AGE_MS) throw routeShadowPruneRefused("olderThanIso is inside the 24 h in-flight-safety window");
   const query = new URLSearchParams({
-    select: "params_hash",
+    select: "params_hash,payload_storage_path",
     report_key: `eq.scheduler-v2/${key}`,
     account_id: `eq.${targetId}`,
     "params->>route": `eq.${routeId}`,
@@ -4870,7 +4992,10 @@ export async function deleteRouteShadowSnapshots({ routeId, publisherKey, target
     error.code = "ROUTE_SHADOW_PRUNE_ACK_INVALID";
     throw error;
   }
-  return rows.length;
+  const payloadStoragePaths = [...new Set(rows
+    .map((r) => (r && typeof r.payload_storage_path === "string" ? r.payload_storage_path.trim() : ""))
+    .filter((p) => p !== ""))];
+  return { deleted: rows.length, payloadStoragePaths };
 }
 
 // Hard budget for one PPC read. PostgREST returns at most 1,000 rows per

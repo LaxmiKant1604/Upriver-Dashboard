@@ -73,6 +73,23 @@ export function jobIsPromotable(job) {
     && nb(job.snapshotParamsHash);
 }
 
+// NARROW CRASH-STRAND RESUME predicate (publication-recovery WP2; hoisted here in WP4 so the three dedicated releases
+// AND the generic route release share ONE definition). A pass killed AFTER finalize and BEFORE the live publish leaves
+// its dedicated cycle TERMINAL; the retry (same revision -> same bucket) can never claim it. It may resume at preflight
+// -> verifyLease -> publish -> read-back ONLY when the latest job for (report, target) PROVABLY is this exact derivation
+// already completed: it belongs to EXACTLY this cycle, is promotable (validated + succeeded in a terminal cycle +
+// nonblank hash), carries EXACTLY this derive's shadow params hash, and its lineage covers EXACTLY this derive's deps +
+// content deps. Anything else (another cycle's job, another revision, an unreadable/absent job, a blank cycle id) is
+// false -- the caller keeps its fail-closed 'cycle-not-running' deferral. The publisher re-proves every gate + the
+// shadow hash provenance + the payload contract before the fenced CAS, so a resume never trusts the job row alone.
+export function resumableAtTerminalCycle(job, { cycleId, paramsHash, dependsOn, durableContentDeps } = {}) {
+  return !!job && nb(cycleId)
+    && S(job.cycleId) === S(cycleId)
+    && jobIsPromotable(job)
+    && S(job.snapshotParamsHash) === S(paramsHash)
+    && revisionCoveredByJob({ eligible: true, deps: dependsOn, contentDeps: durableContentDeps }, job);
+}
+
 // ---- OPTIONAL live-contract ROUTE hooks (publication recovery WP1) --------------------------------------------------
 // A live contract (report-publisher.js SCHEDULER_LIVE_SNAPSHOT_CONTRACTS) MAY declare these hooks. ALL are ABSENT on
 // the 15 pre-existing contracts except fba-plan's promotedGateKey + liveParamsExtra (whose pick is EMPTY for a paid
@@ -158,6 +175,26 @@ export function contractTargetIdentityOk(contract, shadowParams, targetId) {
   try { return contract.targetIdentity(shadowParams, targetId) === true; } catch { return false; }
 }
 
+// STORED-extras equality (WP1 follow-up F1). For a contract WITH liveParamsExtra an equal live params_hash no longer
+// implies equal STORED params: the extras ride the stored params OUTSIDE the identity hash, so a live row promoted from
+// an OLDER shadow (old evidence/serve/manifest tokens) at the same stamp + payload still matches every hash/stamp/payload
+// check. The live row is THIS shadow's promotion only when, for EVERY allowlisted extra key (LIVE_PARAMS_EXTRA_KEYS),
+// the live row's stored value equals EXACTLY the extra the contract derives from the shadow: a missing, an additional or
+// a different token -> false. `expectedExtra` is contractLiveParamsExtra(...).extra (already validated). A live row
+// whose params are absent/non-object is read as carrying NO extras (the shared read-back separately requires its params).
+// No hook -> always true (every hook-free contract is byte-identical).
+export function liveParamsExtraMatches(contract, expectedExtra, liveRow) {
+  if (!contract || typeof contract.liveParamsExtra !== "function") return true;
+  const want = expectedExtra && typeof expectedExtra === "object" && !Array.isArray(expectedExtra) ? expectedExtra : {};
+  const stored = liveRow && liveRow.params && typeof liveRow.params === "object" && !Array.isArray(liveRow.params) ? liveRow.params : {};
+  const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+  for (const k of LIVE_PARAMS_EXTRA_KEYS) {
+    if (own(stored, k) !== own(want, k)) return false;
+    if (own(want, k) && stored[k] !== want[k]) return false;
+  }
+  return true;
+}
+
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 // A REAL calendar date (YYYY-MM-DD): the regex shape alone is NOT enough -- an impossible day (2026-02-30, 2026-13-01)
@@ -192,7 +229,9 @@ export function isCalendarDate(v) {
  * skips ONLY that gate); the shadow must satisfy the publisher's targetIdentity + liveParamsExtra checks; and the live
  * row is expected at contractLiveAccountId (the owner for sku-movement, the scope id for brand-view) -- `accountId`
  * stays the TARGET the job + shadow are keyed by. An optional caller `liveAccountId` must EQUAL the contract-derived
- * value (a caller can never re-point the live identity).
+ * value (a caller can never re-point the live identity). For a liveParamsExtra contract the live row's STORED extras
+ * must also equal the extras derived from this shadow (liveParamsExtraMatches) -- else STALE "live-params-extra-differs"
+ * (checked LAST, so every pre-existing reason for a multi-difference row is unchanged).
  */
 export function evaluatePublicationBinding({ revision, accountId, reportKey, requestedAsOf, expectedShadowKey, job, shadow, hydratedShadowPayload, live, hydratedLivePayload, liveReadback, contract, computeHash, reportDerivations, revisionChangedReason = "source-revision-changed", liveAccountId = null } = {}) {
   const stale = (reason) => ({ state: PUBLICATION_STATE.STALE, reason });
@@ -242,7 +281,8 @@ export function evaluatePublicationBinding({ revision, accountId, reportKey, req
   // PUBLISHER-IDENTICAL route checks (no-ops without the hooks): the target IS the shadow's scope, and the stored extras
   // are well-formed -- a shadow the publisher would refuse can never be "already promoted".
   if (!contractTargetIdentityOk(contract, shadowParams, accountId)) return stale("shadow-target-identity");
-  if (!contractLiveParamsExtra(contract, shadowParams, liveParams).ok) return stale("shadow-live-params-extra-invalid");
+  const extra = contractLiveParamsExtra(contract, shadowParams, liveParams);
+  if (!extra.ok) return stale("shadow-live-params-extra-invalid");
   const candHash = computeHash(contract.liveReportVersion, liveParams);
   // The live row's account: targetId verbatim without the hook (byte-identical), else the contract-derived id.
   const liveAcct = contractLiveAccountId(contract, shadowParams, accountId);
@@ -256,6 +296,9 @@ export function evaluatePublicationBinding({ revision, accountId, reportKey, req
   if (S(live.source_refreshed_at) !== S(shadow.source_refreshed_at)) return stale("live-refresh-differs");
   if (hydratedLivePayload == null) return stale("live-payload-unavailable");
   if (stableJson(hydratedLivePayload) !== stableJson(hydratedShadowPayload)) return stale("live-payload-differs");
+  // STORED extras (F1; a no-op without the liveParamsExtra hook): the same hash + stamp + payload with OTHER stored tokens
+  // is a promotion of ANOTHER shadow, never this one (the fenced CAS would refuse re-promoting this one as a conflict).
+  if (!liveParamsExtraMatches(contract, extra.extra, live)) return stale("live-params-extra-differs");
   return { state: PUBLICATION_STATE.PUBLICATION_NOT_REQUIRED, reason: null };
 }
 
@@ -290,7 +333,9 @@ export async function hydrateSnapshotPayload(row, loadStoragePayload, { signal =
  * ROUTE hooks (WP1; absent => byte-identical): the opt-in requested-as-of gate compares liveParams[contractAsOfField]
  * (an asOfField:null contract skips that gate entirely); the shadow must pass the publisher's targetIdentity +
  * liveParamsExtra checks; and the live row is read + proven at contractLiveAccountId (`accountId` stays the TARGET the
- * job + shadow are keyed by). An optional caller `liveAccountId` must EQUAL the contract-derived value.
+ * job + shadow are keyed by). An optional caller `liveAccountId` must EQUAL the contract-derived value. For a
+ * liveParamsExtra contract the live row's STORED extras must equal the shadow-derived extras, else it fails CLOSED with
+ * "live-params-extra-differs" (never an older-token live paired with the newer job's dependsOn).
  */
 export async function resolveValidatedLiveCandidate({
   reportKey, accountId, signal = null, requestedAsOf = null,
@@ -348,7 +393,8 @@ export async function resolveValidatedLiveCandidate({
   }
   // PUBLISHER-IDENTICAL route checks (no-ops without the hooks) + the live account (targetId verbatim by default).
   if (!contractTargetIdentityOk(contract, shadowParams, accountId)) return fail("shadow-target-identity");
-  if (!contractLiveParamsExtra(contract, shadowParams, liveParams).ok) return fail("shadow-live-params-extra-invalid");
+  const extra = contractLiveParamsExtra(contract, shadowParams, liveParams);
+  if (!extra.ok) return fail("shadow-live-params-extra-invalid");
   const liveAcct = contractLiveAccountId(contract, shadowParams, accountId);
   if (typeof contract.liveAccountId === "function" && liveAcct === null) return fail("live-account-underivable");
   if (liveAccountId != null && S(liveAccountId) !== S(liveAcct)) return fail("live-account-mismatch");
@@ -368,6 +414,8 @@ export async function resolveValidatedLiveCandidate({
   if (aborted()) return fail("aborted");
   if (hydLive == null) return fail("live-payload-unavailable");
   if (stableJson(hydLive) !== stableJson(hydShadow)) return fail("live-payload-differs");
+  // STORED extras (F1; a no-op without the liveParamsExtra hook): other stored tokens => another shadow's promotion.
+  if (!liveParamsExtraMatches(contract, extra.extra, live)) return fail("live-params-extra-differs");
   // PROVEN: the canonical live IS the promotion of the latest promotable job's shadow. Use ITS payload + ITS dependsOn.
   return { ok: true, payload: hydShadow, dependsOn: Array.isArray(job.dependsOn) ? job.dependsOn.map((h) => String(h)) : [], reason: null };
 }
