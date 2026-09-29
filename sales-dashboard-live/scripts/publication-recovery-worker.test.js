@@ -17,7 +17,7 @@ import {
 import { PUBLICATION_ROUTES, routeById, utcDMinus1, sweepMemoQuery, ADS_CHANGE_PROBE_FIELDS } from "../lib/server/recovery/routes.js";
 import { buildRouteArgs } from "../lib/server/recovery/runner.js";
 import { CLASSES, HANDOFF_CLASSES } from "../lib/server/recovery/classify.js";
-import { ROUTE_LIVE_ATTESTATIONS, missingLiveAttestation } from "../lib/server/recovery/config.js";
+import { ROUTE_LIVE_ATTESTATIONS, missingLiveAttestation, parseSchedulerWindows, inSchedulerWindow } from "../lib/server/recovery/config.js";
 import { buildDurableDirectory } from "../lib/server/sync/route-publication-release.js";
 import { FBA_PLAN_STALE_IN_FLIGHT_MS } from "../lib/server/sync/fba-plan-dependency-bundle.js";
 import { marketplaceToday } from "../lib/marketplaces.js";
@@ -1040,6 +1040,18 @@ const drain = async (rig, max = 30) => { let i = 0; while (i < max && (await rig
   for (let k = 0; k < 6; k += 1) { rig.clk.t += 5 * 60 * 1000; await rig.worker.deepSweepStep(); }
   ok("19k [review round 3]: a route whose LAST region's deep-sweep evidence read keeps failing is still marked swept (epoch recorded, token not a subset digest) and is NOT re-swept (no loop of the other regions' children)",
     c1 === 19 && !!b["fba-plan"] && b["fba-plan"].epoch === EPOCH && b["fba-plan"].tok === null && rig.world.calls.length === c1);
+}
+// 19l [review round 4] the SOAK scheduler windows (worker.env.example) keep an unblocked slot for EVERY region between its
+// own cycle and the 00:00 UTC epoch roll (else its own epoch is never deep-swept / repaired), and cover the evening
+// backstop crons (20:13-21:58 UTC).
+{
+  const line = src("deploy/publication-recovery/worker.env.example").split(String.fromCharCode(10)).find((l) => l.startsWith("PRW_SCHEDULER_WINDOWS="));
+  const errs = []; const w = parseSchedulerWindows(line ? line.slice("PRW_SCHEDULER_WINDOWS=".length) : "", errs);
+  const blocked = (h, m) => inSchedulerWindow(w, Date.UTC(2026, 8, 29, h, m));
+  const freeBetween = (fromH, fromM) => { for (let t = fromH * 60 + fromM; t < 1440; t += 1) if (!blocked(Math.floor(t / 60), t % 60)) return true; return false; };
+  ok("19l [review round 4]: the soak PRW_SCHEDULER_WINDOWS parse; india (after 05:00), europe-au (after 10:30) and us-ca (after 18:00) each keep an unblocked slot before the 00:00 UTC epoch roll; the backstop crons 20:13 / 20:48 / 21:23 / 21:58 are inside a window",
+    !!line && errs.length === 0 && w.length >= 3 && freeBetween(5, 0) && freeBetween(10, 30) && freeBetween(18, 0)
+    && blocked(20, 13) && blocked(20, 48) && blocked(21, 23) && blocked(21, 58));
 }
 // 19h [DB load] the deep sweep PAUSES while the scheduler gate is blocked (before, the gate was read only at sweep START,
 // so a running sweep stepped -- evidence reads + heavy children -- straight through a scheduler cycle); it resumes with

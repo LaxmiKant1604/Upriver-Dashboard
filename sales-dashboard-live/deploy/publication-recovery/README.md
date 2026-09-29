@@ -330,9 +330,12 @@ route-CLI change):
 - **Deep sweep pause**: a sweep in progress re-checks the scheduler gate before EVERY step (before, only at sweep start)
   and pauses -- no evidence read, no child, step not consumed, scan lease kept -- while the gate is blocked. The
   sync_cycles gate cannot see scheduler-v2's downstream route jobs (materialize / materialize-inventory run under
-  priority-partial buckets), so the soak sets `PRW_SCHEDULER_WINDOWS=03:00-07:30,08:30-13:00,16:30-02:30`
-  (worker.env.example): each region's cycle incl. its downstream jobs, and the evening backstops (crons 20:13-21:58 UTC,
-  started by GitHub as late as 01:47). A route whose LAST region's sweep evidence read fails is still marked swept (no
+  priority-partial buckets), so the soak sets
+  `PRW_SCHEDULER_WINDOWS=03:00-07:30,08:30-13:00,16:30-18:30,20:00-02:30` (worker.env.example): each region's cycle incl.
+  its downstream jobs, and the evening backstops (crons 20:13-21:58 UTC, started by GitHub as late as 01:47). The
+  18:30-20:00 gap is REQUIRED: the epoch (UTC D-1) rolls at 00:00, so us-ca's own epoch can only be deep-swept (and,
+  once live, repaired) between its cycle and midnight -- a blanket 16:30-02:30 window would never verify us-ca. A us-ca
+  cycle overrunning 18:30 is still covered while its sync_cycles row is running; only its downstream tail can overlap. A route whose LAST region's sweep evidence read fails is still marked swept (no
   re-sweep loop of the other regions' children), and a sweep token is a digest over every region only when every
   region's evidence was read.
 - The token digest of the deep sweep's token-change rule is taken over every region's parts from the CURRENT epoch only
@@ -467,7 +470,10 @@ least one full day covering all three regional cycles; run the pre-live checklis
 3. the writer fence (20260935, its **own** sign-off) is applied and the route's live keys are **fenced** (section 9),
    so no rollout window exists in which an unfenced legacy writer and a route both write a route-owned key;
 4. the route's `memcheck --real` verdicts PASS and its pre-live SQL ran `ok`;
-5. its attestation (section 5) where one is listed.
+5. its attestation (section 5) where one is listed;
+6. `PRW_SCHEDULER_WINDOWS` re-checked against the scheduler's actual cycle / downstream / backstop times (GitHub cron
+   delays drift): every region must keep an unblocked slot between its own cycle and the 00:00 UTC epoch roll, or its
+   own epoch is never repaired (the soak's windows are in section 3).
 
 **Gate D -- canary, one route x one region at a time, india first.** Per step, two keys (the DB row AND the VM env):
 
