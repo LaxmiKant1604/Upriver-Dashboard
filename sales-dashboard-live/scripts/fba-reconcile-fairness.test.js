@@ -263,7 +263,7 @@ test("F12 serve-parity of the served date: a fresh PLACEHOLDER never hides an ol
 test("F13 workflow pins: the fba job's reconcile deadline is 900 s; the evening backstop stays 330/420 (the recovery worker's fba argv pins it)", () => {
   const sched = src("../../.github/workflows/scheduler-v2.yml");
   const back = src("../../.github/workflows/fba-publication-reconcile.yml");
-  ok("F13a scheduler-v2 fba step: --mode=periodic --deadline-seconds=900 --lease-wait-seconds=600", /fba-publication-reconcile\.mjs --bucket=\$\{\{ needs\.run\.outputs\.region \}\} --as-of=\$\{\{ needs\.run\.outputs\.inventory_asof \}\} --mode=periodic --deadline-seconds=900 --lease-wait-seconds=600 \$LIVE\n/.test(sched));
+  ok("F13a scheduler-v2 fba step: --mode=periodic, its OWN --run-token lease owner, --deadline-seconds=900 --lease-wait-seconds=600", /fba-publication-reconcile\.mjs --bucket=\$\{\{ needs\.run\.outputs\.region \}\} --as-of=\$\{\{ needs\.run\.outputs\.inventory_asof \}\} --mode=periodic --run-token=\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}-fba-reconcile --deadline-seconds=900 --lease-wait-seconds=600 \$LIVE\n/.test(sched));
   ok("F13b the fba job timeout stays 120 minutes", /\n  fba:\n[\s\S]{0,2400}?timeout-minutes: 120\n/.test(sched));
   ok("F13c the backstop keeps timeout 420 + --deadline-seconds=330", /timeout 420 node scripts\/release\/fba-publication-reconcile\.mjs [^\n]*--deadline-seconds=330 /.test(back));
 });

@@ -3,8 +3,9 @@
 // selftest.mjs). Proves: folding per-day partials reproduces the JS twin adsRowsDigest over the SAME window EXACTLY (the
 // digest is additive), incl. the empty set ('adr1:0:0:0'), boundaries, BigInt sums past 2^53 and max(updated_at);
 // malformed partials / sentinels fail closed; the union window covers every marketplace's build window at timezone and
-// month edges; the shared statement is region-independent; sweepMemoQuery runs a shared statement once per sweep, never
-// caches a failure, freezes what it shares and leaves every other statement alone; the route contract types `shared`.
+// month edges; the shared statement is region-independent; sweepMemoQuery runs a shared statement once per sweep, caches
+// a failure for the rest of THAT pass only (re-thrown with the same code, tagged sweepReplay), freezes what it shares and
+// leaves every other statement alone; the route contract types `shared`.
 // Zero network. 7-bit ASCII, LF.
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
@@ -162,6 +163,13 @@ const mkRow = (acct, d, i) => ({
   ok("D5c a non-shared (or unflagged) statement is NEVER cached", calls.filter((c) => c === "select 2|[]").length === 3);
   let threw = 0; try { await q("FAIL", [], S1); } catch { threw += 1; } try { await q("FAIL", [], S1); } catch (e) { threw += /earlier in this pass/.test(String(e && e.message)) ? 1 : 0; }
   ok("D5d a FAILED shared read fails FAST for the rest of the pass (ONE underlying read; later evaluations re-throw at once)", threw === 2 && calls.filter((c) => c === "FAIL|[]").length === 1);
+  // The FIRST failure is the real error (no replay tag); every re-throw carries the SAME code and sweepReplay = true, so
+  // tier-1 can report ONE failure plus its replays (review P3: the code used to be dropped).
+  const base2 = async (text) => { if (text === "TIMEOUT") { const e = new Error("canceling statement due to statement timeout"); e.code = "57014"; throw e; } return []; };
+  const q2 = sweepMemoQuery(base2, new Map());
+  let first = null, again = null; try { await q2("TIMEOUT", [], S1); } catch (e) { first = e; } try { await q2("TIMEOUT", [], S1); } catch (e) { again = e; }
+  ok("D5e the first failure is the REAL error (its code, no replay tag); a later re-throw in the pass has the SAME code and sweepReplay === true",
+    !!first && first.code === "57014" && first.sweepReplay !== true && !!again && again.code === "57014" && again.sweepReplay === true);
   let retried = 0; try { await sweepMemoQuery(base, new Map())("FAIL", [], S1); } catch { retried = calls.filter((c) => c === "FAIL|[]").length; }
   ok("D5d' ... and the NEXT pass (a new cache) retries it", retried === 2);
   const na1 = await q("NOTARR", [], S1); await q("NOTARR", [], S1);

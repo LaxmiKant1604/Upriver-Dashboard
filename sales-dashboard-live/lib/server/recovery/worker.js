@@ -323,7 +323,16 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
         const route = routeOf.get(id);
         let ev;
         try { ev = await evidenceFor(route, region, epoch, t0, sweepCache); }
-        catch (e) { errors += 1; stats.evidenceErrors += 1; alerts.add(S(e && e.code) === "DIRECTORY_EMPTY" ? "directory-empty" : "evidence-read-failed", `${id}/${region}`); continue; }
+        catch (e) {
+          errors += 1; stats.evidenceErrors += 1;
+          // The error CODE is kept (sample + log): a statement timeout (57014) is transient, a compose throw is a defect.
+          // A 'replay' is this pass's earlier failed shared read re-thrown by the sweep cache -- ONE failure, not many.
+          const code = S(e && (e.code || e.name)).replace(/[^A-Za-z0-9._-]/g, "").slice(0, 40) || "error";
+          const replay = !!(e && e.sweepReplay === true);
+          alerts.add(code === "DIRECTORY_EMPTY" ? "directory-empty" : replay ? "evidence-read-failed-replayed" : "evidence-read-failed", `${id}/${region}:${code}`);
+          log(`tier-1 ${id}/${region} evidence read failed: ${code}${replay ? " (replay of this pass's failed shared read)" : ""}`);
+          continue;
+        }
         const live = isLive(ctl, id, region);
         const st = await store.readState({ route: id, region, epoch });
         const scopes = [];
@@ -505,7 +514,7 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
       // Tokens are read BEFORE the child: evidence landing during the run is newer than what is recorded, so the
       // watermark / tier-1 still react to it (never records newer evidence as already evaluated).
       let ev;
-      try { ev = await evidenceFor(route, region, sweep.epoch, t0); } catch (e) { sweep.summary.errors += 1; sweep.summary.steps[key] = { error: "evidence-read-failed" }; return true; }
+      try { ev = await evidenceFor(route, region, sweep.epoch, t0); } catch (e) { sweep.summary.errors += 1; sweep.summary.steps[key] = { error: "evidence-read-failed", code: S(e && (e.code || e.name)).replace(/[^A-Za-z0-9._-]/g, "").slice(0, 40) || "error" }; return true; }
       const parts = sweep.parts.get(id) || []; sweep.parts.set(id, parts);
       for (const [tk, e] of ev.map) parts.push(`${region}|${tk}|${S(e.token)}`);
       const r = await spawn({ route: id, region, asOf: sweep.epoch, kind: supportsVerifyExact(route) ? "verify" : "dry-run", targets: null });

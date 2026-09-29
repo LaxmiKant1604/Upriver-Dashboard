@@ -530,7 +530,7 @@ jobs:
         continue-on-error: true
         run: |
           if [ "${{ vars.FBA_RECONCILE_LIVE }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
-          node scripts/release/fba-publication-reconcile.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --mode=periodic --deadline-seconds=900 --lease-wait-seconds=600 $LIVE
+          node scripts/release/fba-publication-reconcile.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --mode=periodic --run-token=${{ github.run_id }}-${{ github.run_attempt }}-fba-reconcile --deadline-seconds=900 --lease-wait-seconds=600 $LIVE
           # ^ --lease-wait-seconds=600 (WP13 verifier P2-A, control envelope ONLY): the controls APPLY retries on the typed
           # CONTROL_LEASE_HELD refusal (another region's route-CLI materialize may hold the global lease), capped at this
           # run's start cutoff (deadline 900 s - 120 s reserve); brand-inventory's same-day convergence depends on this step.
@@ -538,6 +538,9 @@ jobs:
           # dedicated fenced release, so the old 300 s (180 s start cutoff) reached only the first 8 of europe-au's 32
           # accounts; 780 s covers the whole region, and the reconciler's fair order (fbaFairOrder) starts with the
           # most-starved accounts whenever the deadline still cuts. The fba job's 120-minute timeout is unchanged.
+          # --run-token (control envelope ONLY): this run's OWN lease owner. Without it the owner was
+          # 'fba-reconcile:<region>:<as-of>', the SAME as the evening backstop's and a manual dispatch's for this region and
+          # D-1, so an overlapping run would share this fence (same-owner renew) and could release it under this step.
 
   # IMMEDIATE post-save Campaign-Ads publication reconcile (WORK A item 6). The run job's `campaign` step refreshes the
   # durable Campaign Ads coverage for this region BEFORE its priority daily publish, so the normal run already reflects

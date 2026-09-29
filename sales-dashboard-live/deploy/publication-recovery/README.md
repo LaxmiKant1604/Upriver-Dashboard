@@ -8,10 +8,11 @@ the existing fenced four-gate publisher. A job completes only when a separate ve
 (content identity + lineage + live read-back) **and** the served row, for the same evidence token the job was claimed
 with.
 
-> **Status: repository work only.** Migration `20260934` (the worker queue, redesigned for routes) is **prepared, not
-> applied**, and needs its **own** sign-off, separate from `20260935` (the writer fence, section 9). Nothing is installed
-> on the VM and nothing is live. Every flag is OFF by default: the control row is disabled, every route row is
-> `live_enabled = false` with no live region, and `PRW_LIVE_ROUTES` is empty. See [section 6](#6-sign-off-gates-rollout-order-and-canary-order).
+> **Status (2026-09-29): observe-only, nothing live.** Migrations `20260934` (the worker queue) and `20260935` (the
+> writer fence, section 9) were **applied 2026-09-28** with owner sign-off (Gate A done); every key is still
+> `fenced_only = false`. The VM observer (Gate B, observe-only) ran `c30ff11` and failed the tier-1 capacity gate (section
+> 3), so no route is activatable. Every flag is OFF: the control row is disabled, every route row is `live_enabled =
+> false` with no live region, and `PRW_LIVE_ROUTES` is empty. See [section 6](#6-sign-off-gates-rollout-order-and-canary-order).
 
 ## 1. The routes the worker drives
 
@@ -314,7 +315,7 @@ legacy families only, 2026-09-25, development machine): a full scan took 312 s, 
 | `scripts/worker/ads-digest-equivalence-selftest.mjs` | Real-SQL proof that the Ads digest partials equal the old per-window digests (`PRW_PGLITE_DIR=<dir> node scripts/worker/ads-digest-equivalence-selftest.mjs`; exit 3 = SKIPPED, not a pass) |
 | `scripts/worker/publication-recovery-reaper.mjs` | Operator tool: stuck-cycle candidates (read-only) / finalize ONE with sign-off (section 8) |
 | `lib/server/recovery/{routes,route-contract,registry,classify,runner,worker,store-pg,config,memory-store}.js` | Worker modules (`memory-store` is test-only) |
-| `supabase/migrations/20260934_publication_recovery_worker.sql` | **Prepared, not applied.** 7 tables, 12 RPCs, expand-only, idempotent |
+| `supabase/migrations/20260934_publication_recovery_worker.sql` | **Applied 2026-09-28** (Gate A). 7 tables, 12 RPCs, expand-only, idempotent |
 | `deploy/publication-recovery/ROLLBACK_20260934.sql` | Contract rollback (drops exactly the 20260934 objects) |
 | `deploy/publication-recovery/publication-recovery.service`, `{install,rollback}.sh`, `worker.env.example` | systemd unit, release install / rollback, env template |
 
@@ -374,7 +375,9 @@ revoke by removing the line and restarting. Without it the worker defers that ro
 
 ## 6. Sign-off gates, rollout order and canary order
 
-Each gate needs explicit owner sign-off. None has been done.
+Each gate needs explicit owner sign-off. As of 2026-09-29: Gate A (20260934) and the 9.3 step-1 schema (20260935) are
+applied (2026-09-28); Gate B
+(the VM observe-only run) is in progress and has NOT passed (tier-1 capacity, section 3); no later gate is signed off.
 
 **Gate A -- apply 20260934** (its own sign-off; it enables nothing):
 
@@ -533,8 +536,8 @@ re-runs the paid publish phase.
 
 ## 9. Writer fence cutover
 
-> **Status: repository work only.** Migration `20260935_report_publication_writer_fence.sql` is **prepared, not
-> applied**. It needs its own sign-off, separate from `20260934`. No key is fenced, nothing is live.
+> **Status (2026-09-29):** migration `20260935_report_publication_writer_fence.sql` was **applied 2026-09-28** (every
+> key `fenced_only = false`: no key is fenced yet, nothing is live). Each flip is its own sign-off (section 9.3).
 
 ### 9.1 What the fence is
 
@@ -862,8 +865,15 @@ rebuild from the workflow, and retires every legacy unfenced writer (9.2). Owner
    gets its OWN budget (`fba-publication-reconcile.mjs ACCOUNT_DEADLINE_SECONDS`: a quarter of the run deadline within
    [60, 180] s -- 180 s in the 900 s `fba` step, 82 s in the 330 s backstop and the recovery worker's fba child; ~4-9x the
    typical ~20 s): a hung account is aborted (its fence goes null: the fenced CAS writes nothing), deferred `deadline-account-in-flight` with LKG
-   kept, and the run CONTINUES -- so the account the fair order puts first can never consume the whole window (an
-   unconfirmed termination still stops the run and leaves lease + controls for cleanup, exactly as before). Trade-offs to
+   kept, and the run CONTINUES -- so ONE account whose abort is confirmed can never consume the whole window. **Honest
+   limit (review 2026-09-29):** the fair order has no memory of earlier attempts, and an account that never publishes
+   keeps the oldest served date, so it LEADS every run. The fairness bound therefore assumes every account a run starts
+   completes: (a) an account whose termination is NOT confirmed within the 8 s grace stops the run (as before, the lease
+   and controls are left for cleanup), and at the head of the order that now stops every run for the region; (b) about 3
+   accounts that keep exceeding the 82 s budget exhaust the 330 s backstop (about 5 over 180 s for the 900 s step). The
+   recovery worker is protected (a timed-out target backs off and dead-letters after PRW_MAX_ATTEMPTS; the others run in
+   their own batches). A recurring `deadline-account-in-flight` / `deadline-termination-unconfirmed` for the same account
+   is therefore an operator signal: investigate that account. Trade-offs to
    know: the europe-au step now holds the GLOBAL control lease up to ~11-15 min (32 x ~20 s, renewed with a 900 s TTL
    before every account's publish; the LHv3 reconciler's 720 s hold is the precedent). EVERY bounded lease-waiter that
    starts inside that hold waits at most its own cap -- another region's `materialize` / `materialize-inventory` route
@@ -875,7 +885,9 @@ rebuild from the workflow, and retires every legacy unfenced writer (9.2). Owner
    up to ~15 min of reconcile. If the timeout ever cuts the reconcile step (continue-on-error; the step has NO in-job
    cleanup): no partial row is possible (each account is one fenced CAS), unreached accounts keep LKG, the lease lapses
    within its 900 s TTL, and controls left open are rolled back by a `--cleanup` (the 20:48 UTC backstop runs one as a
-   separate always() job; a live owner is never touched); the next reconcile that opens its controls (the backstop, or
+   separate always() job; it reclaims only a free or expired lease -- the `fba` step runs under its OWN `--run-token`
+   lease owner, never the backstop's or a manual dispatch's shared `fba-reconcile:<region>:<as-of>`, so an overlapping
+   backstop waits on `CONTROL_LEASE_HELD` instead of sharing the step's fence); the next reconcile that opens its controls (the backstop, or
    the next cycle's `fba` step in fair order: the unreached accounts first) converges them. To converge sooner, dispatch
    `fba-publication-reconcile.yml` (`mode=live`, the region's bucket; zero export) -- never re-run the `fba` job for it. The backstop keeps its 330 / 420 s (the recovery worker's fba argv pins
    it). After the WP13

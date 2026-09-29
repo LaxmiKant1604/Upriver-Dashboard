@@ -127,7 +127,7 @@ export function sweepMemoQuery(query, sweepCache) {
     const key = S(text) + "\u0000" + JSON.stringify(values == null ? [] : values);
     if (sweepCache.has(key)) {
       const hit = sweepCache.get(key);
-      if (hit && hit.__sweepFailed === true) { const e = new Error("shared evidence read failed earlier in this pass (" + hit.code + ")"); e.code = hit.code; throw e; }
+      if (hit && hit.__sweepFailed === true) { const e = new Error("shared evidence read failed earlier in this pass (" + hit.code + ")"); e.code = hit.code; e.sweepReplay = true; throw e; }
       return hit;
     }
     let rows;

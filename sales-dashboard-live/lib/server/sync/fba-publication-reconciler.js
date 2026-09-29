@@ -35,13 +35,17 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 //      snapshot -> an honest UNAVAILABLE placeholder) before anything else;
 //   2. ONLY among 'available' accounts: the brand-inventory date the dashboard SERVES today, OLDEST first (null = never
 //      served / unavailable / unread = the most starved). Publishing a stocked account advances its served date, so the
-//      next run starts with whoever the last one left behind: no STOCKED account waits more than ceil(stale / per-run
-//      capacity) runs. (A proven-empty account's served date never advances -- its publish is a placeholder the serve
+//      next run starts with whoever the last one left behind: while every account a run starts COMPLETES, no STOCKED
+//      account waits more than ceil(stale / per-run capacity) runs. (A proven-empty account's served date never advances -- its publish is a placeholder the serve
 //      never prefers over an older available compact -- so that group is ordered by the per-day tie alone.)
 //   3. a per-day hash of (requestedAsOf, account): deterministic within a day (the evening backstop continues exactly
 //      where the morning run stopped) and reshuffled across days (no fixed tail among equals).
-// A hung account cannot monopolize the order it leads: the FBA CLI gives every account its own time budget
-// (fba-publication-reconcile.mjs ACCOUNT_DEADLINE_SECONDS -> the core's per-account deadline, 'deadline-account-in-flight').
+// One hung account whose abort is CONFIRMED cannot consume the whole window: the FBA CLI gives every account its own time
+// budget (fba-publication-reconcile.mjs ACCOUNT_DEADLINE_SECONDS -> the core's per-account deadline,
+// 'deadline-account-in-flight'). Honest limit: the order keeps no memory of earlier attempts, so an account that never
+// publishes keeps the oldest served date and LEADS every run -- an UNCONFIRMED termination at the head stops every run
+// (as before, lease + controls left for cleanup), and a few accounts that always exceed their budget can use up a short
+// (330 s) run. A recurring per-account deadline for the same account is an operator signal (README 9.6).
 // It only ORDERS: which accounts are stale, what is derived, and what the fenced CAS publishes are unchanged.
 export const FBA_FAIR_STATUS_RANK = Object.freeze({ [FBA_REVISION_STATUS.AVAILABLE]: 0, [FBA_REVISION_STATUS.PROVEN_EMPTY]: 1 });
 const fairTie = (requestedAsOf, accountId) => createHash("sha256").update("fba-fair-order/v1\u0000" + S(requestedAsOf) + "\u0000" + S(accountId)).digest("hex");

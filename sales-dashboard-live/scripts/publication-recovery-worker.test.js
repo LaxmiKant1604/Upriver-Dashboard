@@ -615,6 +615,19 @@ const drain = async (rig, max = 30) => { let i = 0; while (i < max && (await rig
       && p2.length === p1.length && p2.every((c) => cacheOf(c) === cacheOf(p2[0])) && cacheOf(p2[0]) !== cacheOf(p1[0])
       && wm.length > 0 && wm.every((c) => cacheOf(c) instanceof Map && cacheOf(c) === cacheOf(wm[0])) && cacheOf(wm[0]) !== cacheOf(p1[0]) && cacheOf(wm[0]) !== cacheOf(p2[0]));
   }
+  // 15u [review P3] tier-1 keeps the evidence error CODE in the alert sample, and a sweep-cache replay of this pass's
+  // failed shared read is reported as a REPLAY ('evidence-read-failed-replayed'), never as another independent failure.
+  {
+    const rig4 = makeRig({ regions: ["india"], dir: { india: ["A1"] } });
+    const boom = (code, replay) => () => { const e = new Error("x"); e.code = code; if (replay) e.sweepReplay = true; throw e; };
+    rig4.store.env.evidence.set("brand-view|india", boom("57014", false));
+    rig4.store.env.evidence.set("brand-view-portfolio|india", boom("57014", true));
+    await rig4.worker.tier1Scan();
+    const al = (rig4.store.scanRow.tier1Summary && rig4.store.scanRow.tier1Summary.alerts) || [];
+    const real = al.find((a) => a.code === "evidence-read-failed"), rep = al.find((a) => a.code === "evidence-read-failed-replayed");
+    ok("15u [review P3]: tier-1 records the evidence error CODE ('brand-view/india:57014') and a sweep-cache replay as 'evidence-read-failed-replayed' (one real failure, not two)",
+      !!real && real.n === 1 && J(real.samples) === J(["brand-view/india:57014"]) && !!rep && rep.n === 1 && J(rep.samples) === J(["brand-view-portfolio/india:57014"]));
+  }
   // 15b [P2d] a route CLI's current binding WITHOUT its served read-back is never verified.
   const r2 = makeRig({ liveRoutes: ["returns-v3"] });
   setEv(r2, "returns-v3", "india", { A1: "rt-1" }); r2.world.set("returns-v3", "india", "A1", "current-unserved", "rt-1");
