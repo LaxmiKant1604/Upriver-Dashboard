@@ -34,9 +34,10 @@ const TABS = [
 ];
 const DATE_OPTIONS = [...CAMPAIGN_DATE_PRESETS.map((p) => ({ value: p.key, label: p.label })), { value: "CUSTOM", label: "Custom" }];
 
-export default function CampaignAds({ accountId, accountName, selectedBrand = "ALL", accessToken, isAdmin = false }) {
+export default function CampaignAds({ accountId, accountName, selectedBrand = "ALL", accessToken, isAdmin = false, reloadSignal = 0, onStatus }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [loadedAt, setLoadedAt] = useState(null); // when THIS workspace last read its saved rows (header status)
   const [error, setError] = useState(null);
   const [canEdit, setCanEdit] = useState(false);
   const [brands, setBrands] = useState([]); // trusted brands for mapping
@@ -58,7 +59,7 @@ export default function CampaignAds({ accountId, accountName, selectedBrand = "A
   // Load the FULL per-campaign daily history ONCE per (account, brand). No date params: the server returns every
   // campaign's complete `daily` breakdown + proven coverage, and the browser windows it locally. This never calls DataDoe.
   const load = useCallback(async () => {
-    if (!accountId || !accessToken) { setData(null); return; }
+    if (!accountId || !accessToken) { setData(null); setLoadedAt(null); return; }
     const my = ++reqRef.current;
     setLoading(true); setError(null);
     try {
@@ -69,11 +70,27 @@ export default function CampaignAds({ accountId, accountName, selectedBrand = "A
       const body = await r.json();
       if (my !== reqRef.current) return;
       setData(body);
+      setLoadedAt(new Date());
       const curs = [...new Set((body.campaigns || []).map((c) => c.currency).filter(Boolean))];
       setCurrency((c) => (c && curs.includes(c) ? c : curs[0] || ""));
-    } catch (e) { if (my === reqRef.current) { setError(e.message || "Failed to load Campaign Ads."); } }
+    } catch (e) { if (my === reqRef.current) { setError(e.message || "Failed to load Campaign Ads."); setLoadedAt(null); } }
     finally { if (my === reqRef.current) setLoading(false); }
   }, [accountId, accessToken, brandParam]);
+
+  // The header's read-only Reload re-reads THIS workspace's saved rows. reloadSignal is a counter owned by the App; only
+  // a CHANGE after mount is a request (remounting with an old count must not read twice). A ref keeps the latest `load`
+  // so an account/brand change (which re-runs `load` below) never triggers a second read from here.
+  const loadRef = useRef(load);
+  useEffect(() => { loadRef.current = load; }, [load]);
+  const seenReloadSignal = useRef(reloadSignal);
+  useEffect(() => {
+    if (reloadSignal === seenReloadSignal.current) return;
+    seenReloadSignal.current = reloadSignal;
+    loadRef.current();
+  }, [reloadSignal]);
+  // Report loading / loaded time up so the header status describes Campaign Ads (and clear it when leaving the page).
+  useEffect(() => { if (onStatus) onStatus({ loading, loadedAt }); }, [onStatus, loading, loadedAt]);
+  useEffect(() => () => { if (onStatus) onStatus({ loading: false, loadedAt: null }); }, [onStatus]);
 
   // Editing capability + trusted brands: the mapping API's brands endpoint is capability-gated, so a 200 proves the
   // user may edit; a 403 leaves the workspace read-only (viewing still works).

@@ -104,6 +104,10 @@ import {
   splitDateRangeByMonth,
   canonicalOliSlices,
   withDataDoeDeadline,
+  withPaidExportAuthorization,
+  allowPaidExportsForThisRequest,
+  assertPaidExportAuthorized,
+  isPaidExportNotAuthorizedError,
 } from "../lib/server/datadoe.js";
 import {
   connectionForApiKey,
@@ -275,6 +279,10 @@ const ACCOUNT_SCOPED_ACTIONS = new Set([
   // rollup + Product Catalog only. Never spends a token on a read/derive/reload/account-change/brand-change.
   "sku-movement",
 ]);
+
+// The legacy handlers that call DataDoe directly (the account-directory discovery GET and the paid export builders).
+// A non-admin never reaches them outside a refresh session (see the defense-in-depth check before them).
+const LEGACY_DATADOE_BUILDER_ACTIONS = new Set(["accounts", "sales", "reconciliation", "sku-pl", "keyword-rank", "content-changes"]);
 
 // Every insight report is strictly one selected account: the shared snapshot,
 // the refresh lock, and the permission check are all keyed by a single account.
@@ -2738,7 +2746,8 @@ export function mergeSalesAndAds(salesRows, adRows) {
 const ROUTE_DATADOE_BUDGET_MS = 55_000;
 
 export default function handler(req, res) {
-  return withDataDoeDeadline(Date.now() + ROUTE_DATADOE_BUDGET_MS, () => handleDataDoe(req, res));
+  // Every request starts with paid DataDoe exports NOT allowed; handleDataDoe allows them only for a confirmed admin.
+  return withDataDoeDeadline(Date.now() + ROUTE_DATADOE_BUDGET_MS, () => withPaidExportAuthorization(() => handleDataDoe(req, res)));
 }
 
 // Typed-error -> HTTP mapping for the route's final catch. FIXED safe messages only (no raw
@@ -2780,6 +2789,9 @@ async function handleDataDoe(req, res) {
   let legacySharedRefresh = null;
   try {
     const access = await getDashboardAccess(req);
+    // The export-boundary backstop: from here on, createExport (and the admin sample's direct POST) refuse unless this
+    // request belongs to a confirmed admin -- whatever path a request takes below.
+    allowPaidExportsForThisRequest(access.role === "admin");
     const connections = getDataDoeConnections();
     const action = req.query.action;
     // WP10b: a refresh=1 of a ROUTE-OWNED live report is READ-ONLY (see the contract above ROUTE_OWNED_ACTION_REPORT_KEYS):
@@ -2804,6 +2816,9 @@ async function handleDataDoe(req, res) {
       // The public, connection-scoped ID remains available in accountScope for
       // Supabase and response metadata.
       if (accountScope) req.query.ids = accountScope.rawAccountIds.join(",");
+      // An ids value that names NO account (e.g. only whitespace) skipped assertAccountAccess above; never let a builder
+      // below see it -- every builder then answers its own "missing ids" 400 instead of calling DataDoe.
+      else if (accountScopedAction) req.query.ids = "";
     }
 
     // ============================ BRAND-SCOPE ENFORCEMENT (Phase 6) ============================
@@ -2864,6 +2879,23 @@ async function handleDataDoe(req, res) {
     // eligible account), so the SOURCE-fetch path is admin-only on the SERVER. A
     // non-refresh read of the shared directory stays available to any authorised user.
     if (action === "brand-directory" && wantsRefresh(req)) assertAdmin(access);
+    // ===== PAID-BUILD + SHARED-DIRECTORY WRITE GATE (server-enforced: admin only) =====
+    // Any refresh=1 that is NOT a route-owned read-only refresh can reach a PAID DataDoe builder (serveSharedReport /
+    // beginSharedRefresh -> build -> unfenced save) or overwrite the shared account directory. Only an admin may do that.
+    // For a non-admin, BEFORE any lock, DataDoe call or write: the account list is answered from the SAVED directory (the
+    // plain read, tagged refreshReadOnly) and every other such refresh is refused with a typed 403. Plain reads, the
+    // route-owned read-only refreshes and every admin request are unchanged.
+    if (wantsRefresh(req) && !routeOwnedRefreshKey && access.role !== "admin") {
+      if (action !== "accounts") {
+        res.status(403).json({
+          error: "Only an admin can refresh this report from DataDoe (it uses DataDoe tokens). Reload shows the saved copy.",
+          code: "ADMIN_REQUIRED_FOR_DATADOE_REFRESH",
+        });
+        return;
+      }
+      delete req.query.refresh;
+      res = refreshReadOnlyResponse(res, { refreshReadOnly: true });
+    }
     // A new browser may not yet have the shared account directory. Brand View
     // remains usable: on its explicit manual refresh only, discover the
     // accounts the user may access and use them to seed the brand directory.
@@ -3406,6 +3438,13 @@ async function handleDataDoe(req, res) {
       }
       res.status(200).json(payload);
     };
+    // Defense in depth: the legacy DataDoe builders below may run for a non-admin ONLY inside a refresh session opened
+    // above -- and the paid-build gate never opens one for a non-admin. Any request that reaches them without one (e.g.
+    // no shared snapshot identity could be formed) is refused BEFORE any DataDoe call.
+    if (!legacySharedRefresh && access.role !== "admin" && LEGACY_DATADOE_BUILDER_ACTIONS.has(action)) {
+      res.status(403).json({ error: "Only an admin can fetch this report from DataDoe. Reload shows the saved copy.", code: "ADMIN_REQUIRED_FOR_DATADOE_REFRESH" });
+      return;
+    }
 
     if (action === "accounts") {
       const accounts = await discoverConnectedAccounts(connections);
@@ -4105,6 +4144,7 @@ async function handleDataDoe(req, res) {
       // Sources without a date column need a different orderBy and no date
       // range; pass ?orderBy=<col> and omit from/to for those.
       const orderByColumn = req.query.orderBy || "date";
+      assertPaidExportAuthorized(); // the direct export POST below must also pass the admin-only backstop
       const createRes = await ddFetch(ENDPOINTS.exportsCreate, {
         method: "POST",
         headers: authHeaders(apiKey),
@@ -4146,6 +4186,11 @@ async function handleDataDoe(req, res) {
 
     res.status(400).json({ error: "Unknown action. Use ?action=accounts, ?action=brand-directory, ?action=brand-portfolio, ?action=brand-view-brands, ?action=brand-view, ?action=brand-view-portfolio, ?action=fx-rates, ?action=sales, ?action=brand-sales, ?action=daily, ?action=reconciliation, ?action=sku-pl, ?action=keyword-rank, ?action=content-changes, ?action=fba-plan, ?action=fields, or ?action=sample" });
   } catch (err) {
+    // The export-boundary backstop refused a paid DataDoe export for a non-admin request (typed, never retryable).
+    if (isPaidExportNotAuthorizedError(err)) {
+      res.status(403).json({ error: "Only an admin can fetch this report from DataDoe. Reload shows the saved copy.", code: "ADMIN_REQUIRED_FOR_DATADOE_REFRESH" });
+      return;
+    }
     // Typed DataDoe deadline / poll-pending / continuation signals get fixed safe messages and a
     // retryable flag that is true ONLY when a durable continuation exists (see the classifier).
     const mapped = classifyDataDoeRouteError(err);

@@ -210,8 +210,12 @@ export default function BrandPortfolio({
   // sourceAccounts is accepted for call-site compatibility; the former admin "Fetch latest data" (which re-ran the
   // now READ-ONLY brand-sales / brand-inventory refresh=1 per account) is replaced by onRequestPaidSync.
   isAdmin = false, sourceAccounts = [], onRequestPaidSync = null,
+  // STATUS ONLY: reports the snapshot facts of the copy on screen (or null when none is shown) to the header status.
+  onServedMeta = null,
 }) {
   const [data, setData] = useState(null);
+  useEffect(() => { if (onServedMeta) onServedMeta(data ? { snapshot: data.snapshot || null } : null); }, [onServedMeta, data]);
+  useEffect(() => () => { if (onServedMeta) onServedMeta(null); }, [onServedMeta]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);

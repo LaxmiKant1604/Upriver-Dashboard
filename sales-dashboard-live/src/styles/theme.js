@@ -323,6 +323,9 @@ body{ overflow-x:hidden; }
 .refresh-status-value{ display:flex; align-items:center; gap:6px; font-size:11.5px; font-weight:700; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:230px; }
 .live-dot{ width:7px; height:7px; border-radius:50%; background:var(--positive); flex-shrink:0; box-shadow:0 0 0 3px var(--positive-soft); }
 .live-dot.idle{ background:var(--text-muted); box-shadow:0 0 0 3px var(--bg-sunken); }
+/* Status-only data-source label (not a control): how the report on screen gets its data. */
+.data-status-chip{ flex-shrink:0; font-size:10.5px; font-weight:700; line-height:1.2; padding:3px 7px; border-radius:var(--radius-sm); border:1px solid var(--border-default); background:var(--bg-sunken); color:var(--text-secondary); white-space:nowrap; cursor:help; }
+.data-status-chip.paid-manual{ background:var(--warning-soft); color:var(--warning); border-color:var(--warning-border); }
 .refresh-btn{
   border:1px solid var(--border-default); background:var(--bg-surface); border-radius:var(--radius-sm);
   min-width:30px; min-height:30px; padding:0 7px; cursor:pointer; display:inline-flex; align-items:center;

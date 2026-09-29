@@ -264,6 +264,8 @@ const SUITES = [
   "test:recovery-classify-vocabulary",
   "test:report-writer-fence",
   "test:refresh-readonly",
+  "test:paid-refresh-authz",
+  "test:report-status",
   "test:scheduler-v2-route-switch",
   "test:publication-recovery-e2e",
   "build:check",

@@ -87,6 +87,7 @@ import ReturnsLeakage from "./views/ReturnsLeakage.jsx";
 import PpcPerformance from "./views/PpcPerformance.jsx";
 import CampaignAds from "./views/CampaignAds.jsx";
 import { CAMPAIGN_ADS_TAB } from "./lib/feature-flags.js";
+import { viewDataStatus, formatLoadedStamp } from "./lib/report-status.js";
 import ListingOptimizer from "./views/ListingOptimizer.jsx";
 import PriorityFeed from "./views/PriorityFeed.jsx";
 // Account-scoped Brand View (Account -> Brand -> Brand Reports). Deliberately a
@@ -2007,6 +2008,11 @@ function DashboardApp({ session, access, onSignOut }) {
   // Every report reads this single account/brand scope from the header.
   const [dailyRows, setDailyRows] = useState([]);
   const [dailyLoading, setDailyLoading] = useState(false);
+  // When THIS page last loaded Daily Reporting (header status). Kept separate from lastFetchedAt, which the Sales
+  // Dashboard loader also writes on every account change, so the Daily header never shows the Sales Dashboard's time.
+  const [dailyCachedAt, setDailyCachedAt] = useState(null);
+  // The served Daily copy's snapshot facts (e.g. rederived: built at read time for a named brand), for the header status.
+  const [dailyServedMeta, setDailyServedMeta] = useState(null);
   const [dailyError, setDailyError] = useState(null);
   // true when dailyError is the server's honest "no snapshot yet" state (a typed waiting/unavailable message),
   // false when it is a genuine request failure. The waiting state renders as info, never as a failed refresh.
@@ -2141,6 +2147,33 @@ function DashboardApp({ session, access, onSignOut }) {
       })
       .finally(() => setAccountsLoading(false));
   }, [applyAccounts]);
+
+  // READ-ONLY re-read of the SAVED account directory: zero DataDoe, zero writes. Only an admin may ask DataDoe for the
+  // directory (the server enforces it: a non-admin refresh=1 is answered from the saved directory), so every
+  // "reload the account list" control uses this for non-admins.
+  const reloadAccounts = useCallback(() => {
+    setAccountsLoading(true);
+    setAccountsError(null);
+    return loadSharedReport({ action: "accounts" })
+      .then(({ body }) => {
+        const next = applyAccounts(body);
+        if (body.snapshotMissing) setAccountsError(body.message);
+        return next;
+      })
+      .catch((err) => {
+        setAccountsError(err.message);
+        return [];
+      })
+      .finally(() => setAccountsLoading(false));
+  }, [applyAccounts]);
+  const reloadAccountList = isAdmin ? fetchAccounts : reloadAccounts;
+
+  // Campaign Ads owns its data: the header's read-only Reload asks it to re-read via this counter, and the workspace
+  // reports its loading state / loaded time back so the header status describes Campaign Ads, not another report.
+  const [campaignAdsReload, setCampaignAdsReload] = useState(0);
+  const [campaignAdsStatus, setCampaignAdsStatus] = useState({ loading: false, loadedAt: null });
+  // The Brand View portfolio's on-screen copy facts (null = no copy shown), reported by BrandPortfolio for the header.
+  const [brandPortfolioServed, setBrandPortfolioServed] = useState(null);
 
   useEffect(() => {
     let active = true;
@@ -2567,29 +2600,35 @@ function DashboardApp({ session, access, onSignOut }) {
     if (!dailyParams) {
       bumpReq("daily");
       setDailyRows([]);
+      setDailyCachedAt(null);
+      setDailyServedMeta(null);
       setDailyLoading(false);
       return;
     }
     const myId = bumpReq("daily");
     // No cached copy yet => first paint shows a skeleton (dailyLoading); a revalidation with rows already shown
-    // keeps them visible and flips the header to a compact "Updating…" instead of clearing the report.
+    // keeps them visible and flips the header to a compact "Loading…" instead of clearing the report.
     setDailyLoading(true);
     const cached = await readLargeApiCache(dailyParams);
     if (!isCurrentReq("daily", myId)) return;
     if (cached) {
       setDailyRows(cached.body.rows || []);
-      setLastFetchedAt(new Date(cached.cachedAt));
+      setDailyCachedAt(new Date(cached.cachedAt));
+      setDailyServedMeta({ snapshot: cached.body.snapshot || null, snapshotMissing: Boolean(cached.body.snapshotMissing) });
       setDailyError(null);
       setDailyCompleteness(cached.body.completeness || null);
     } else {
       setDailyRows([]);
+      setDailyCachedAt(null);
+      setDailyServedMeta(null);
       setDailyError(null);
     }
     try {
       const { body, cachedAt } = await loadSharedReport(dailyParams);
       if (!isCurrentReq("daily", myId)) return;
       setDailyRows(body.rows || []);
-      setLastFetchedAt(new Date(cachedAt));
+      setDailyCachedAt(new Date(cachedAt));
+      setDailyServedMeta({ snapshot: body.snapshot || null, snapshotMissing: Boolean(body.snapshotMissing) });
       setDailyError(body.snapshotMissing ? body.message : null);
       setDailyMissing(Boolean(body.snapshotMissing));
       setDailyCompleteness(body.completeness || null);
@@ -4296,7 +4335,7 @@ function DashboardApp({ session, access, onSignOut }) {
           <div style={{ fontSize: 12.5, color: "var(--ink-soft)", marginTop: 8 }}>
             The dashboard loads the latest saved data automatically. Reports never call DataDoe on open.
           </div>
-          <button className="cache-refresh-btn" onClick={fetchAccounts} disabled={accountsLoading}>
+          <button className="cache-refresh-btn" onClick={reloadAccountList} disabled={accountsLoading}>
             <RefreshCw size={14} className={accountsLoading ? "spin" : ""} />
             Retry loading accounts
           </button>
@@ -4305,16 +4344,34 @@ function DashboardApp({ session, access, onSignOut }) {
     );
   }
 
-  /* ===== The header Reload control =====
-     One button drives every view. It now RELOADS the latest saved data (read-only)
-     and never calls DataDoe -- DataDoe refreshes are owned by Scheduler-v2 and by
-     explicit admin syncs in the Data Sync Center. This descriptor keeps the routing
-     in one place. The Priority Feed owns no data of its own and updates from the six
-     saved reports, so it is deliberately not reloadable from here. */
+  /* ===== The header Reload control + status =====
+     One button drives every view. It RELOADS the latest saved data of the report ON SCREEN (read-only) and never
+     calls DataDoe -- DataDoe refreshes are owned by Scheduler-v2 and by explicit admin syncs in the Data Sync Center.
+     The status shows when this page last loaded the saved copy ("Loaded") plus a STATUS-ONLY data-source label
+     (src/lib/report-status.js) -- neither publishes anything. This descriptor keeps the routing in one place. The
+     Priority Feed owns no data of its own and updates from the six saved reports, so it is not reloadable from here. */
   const showingBrandPortfolio = view === "dashboard" && dashboardMode === "brand";
+  // Pages whose data does not come from the default Sales Dashboard loader: each must reload and report ITS OWN data.
+  const onCampaignAds = view === "campaign-ads" || (view === "ppc" && CAMPAIGN_ADS_TAB);
+  const onListingHealthV3 = view === "listinghealth-v3" || view === "listinghealth";
+  const reloadSalesDashboard = () => { loadCachedRows(); loadOliQuality(); };
+  // The served body of the report on screen, for pages that keep it. Status only. Listing Health windows other than the
+  // default 30 days are ALWAYS built at read time (the scheduler publishes only the 30-day row), so they are described
+  // as such even before (or without) a served body.
+  const lhv3Window = listingHealthV3Window || {};
+  const lhv3DefaultWindow = (!lhv3Window.preset || lhv3Window.preset === "30D") && !lhv3Window.month && !lhv3Window.from && !lhv3Window.to;
+  const servedStatusBody = showingBrandPortfolio ? brandPortfolioServed
+    : onListingHealthV3 ? (listingHealthV3.data || (lhv3DefaultWindow ? null : { preview: true }))
+    : view === "daily" ? dailyServedMeta
+    : view === "skumovement" ? skuMovement.data
+    : activeInsightReport && !onCampaignAds ? activeInsightReport.data
+    : null;
   const activeStamp = onFeed ? null
     : showingBrandPortfolio ? brandDirectoryFetchedAt
+    : onCampaignAds ? campaignAdsStatus.loadedAt
+    : onListingHealthV3 ? listingHealthV3.cachedAt
     : activeInsightReport ? activeInsightReport.cachedAt
+    : view === "daily" ? dailyCachedAt
     : view === "fbaplan" ? planCachedAt
     : view === "reconciliation" ? reconciliationCachedAt
     : view === "skupl" ? skuPlCachedAt
@@ -4323,6 +4380,8 @@ function DashboardApp({ session, access, onSignOut }) {
     : view === "skumovement" ? skuMovement.cachedAt
     : lastFetchedAt;
   const activeBusy = showingBrandPortfolio ? brandDirectoryLoading
+    : onCampaignAds ? campaignAdsStatus.loading
+    : onListingHealthV3 ? listingHealthV3.loading
     : activeInsightReport ? activeInsightReport.loading
     : view === "daily" ? dailyLoading
     : view === "fbaplan" ? planLoading
@@ -4332,6 +4391,11 @@ function DashboardApp({ session, access, onSignOut }) {
     : view === "contentchanges" ? contentChangesLoading
     : view === "skumovement" ? (skuMovement.loading || skuMovement.updating)
     : rowsLoading;
+  // Is a saved copy actually ON SCREEN? (Not while loading, after an error, in a waiting state or with no account.) The
+  // status only claims a visible copy when there is one. Declared after activeStamp, which it reads.
+  const copyOnScreen = showingBrandPortfolio ? Boolean(brandPortfolioServed)
+    : Boolean(activeStamp) && !(servedStatusBody && servedStatusBody.snapshotMissing)
+      && !(view === "dashboard" && rowsCacheMissing) && !(view === "daily" && dailyMissing);
   const accountLabel = refreshScopeAccount?.name || "selected account";
   // Publication recovery WP10b: every ROUTE-OWNED report page (Sales Dashboard = brand-sales, Daily Reporting, FBA
   // Plan, SKU Movement, Returns, Listing Health v3; Brand View pages below) only RELOADS saved data. Admins additionally
@@ -4342,39 +4406,45 @@ function DashboardApp({ session, access, onSignOut }) {
     || view === "skumovement" || view === "returns" || view === "listinghealth-v3" || view === "listinghealth";
   const refreshScopeLabel = showingBrandPortfolio ? (selectedPortfolioBrand || "portfolio brand") : accountLabel;
   const refreshDescriptor = {
-    // In portfolio mode this button refreshes the BRAND LIST only. Rebuilding
-    // the report itself is the Refresh inside the Brand View page, so the two
-    // actions stay distinct instead of one button meaning two things.
-    label: onFeed ? "Combined feed" : activeInsightReport ? "Shared snapshot" : showingBrandPortfolio ? "Brand directory" : "Last updated",
+    // In portfolio mode this button re-reads the saved BRAND LIST only (read-only). Re-reading the portfolio report
+    // itself is "Reload saved data" inside the Brand View page, so the two actions stay distinct.
+    label: onFeed ? "Combined feed" : activeInsightReport && !onCampaignAds && !onListingHealthV3 ? "Shared snapshot" : showingBrandPortfolio ? "Brand directory" : "Loaded",
     value: onFeed
       ? accountLabel
       : activeBusy
-        ? "Updating…"
+        ? "Loading…"
         : activeStamp
-          ? `${activeStamp.toLocaleTimeString()} · ${refreshScopeLabel}`
+          ? `${formatLoadedStamp(activeStamp)} · ${refreshScopeLabel}`
           : showingBrandPortfolio ? "Not yet loaded" : selectedAccountId ? "Not yet loaded" : "Select an account",
-    live: Boolean(activeStamp) || onFeed,
+    // The dot shows that THIS page has loaded a saved copy; the feed has no copy of its own, so it stays idle.
+    live: Boolean(activeStamp),
     busy: activeBusy,
     // READ-ONLY reload: re-reads the latest saved snapshot (self-healing for Daily). It NEVER calls DataDoe or
     // spends a token -- scheduled refreshes are owned by Scheduler-v2 and explicit admin syncs in the Data Sync
-    // Center. Every report page routes to its cache-first loader; the brand directory reloads the brand list.
+    // Center. Every report page routes to ITS OWN cache-first loader; in brand mode the saved brand list is re-read
+    // (reloadBrandDirectory -- never the paid Product Catalog sync fetchBrandDirectory).
     onRefresh: onFeed ? undefined
-      : showingBrandPortfolio ? fetchBrandDirectory
+      : showingBrandPortfolio ? reloadBrandDirectory
+      : onCampaignAds ? () => setCampaignAdsReload((n) => n + 1)
+      : onListingHealthV3 ? listingHealthV3.reload
       : activeInsightReport ? activeInsightReport.reload
       : view === "daily" ? loadCachedDaily
-      : view === "fbaplan" ? loadCachedPlan
+      : view === "fbaplan" ? () => { loadCachedPlan(); fbaDemand.reload(); } // the plan AND its demand (SKU Movement) input
       : view === "reconciliation" ? loadCachedReconciliation
       : view === "skupl" ? loadCachedSkuPl
       : view === "keywordrank" ? loadCachedKeywordRank
       : view === "contentchanges" ? loadCachedContentChanges
       : view === "skumovement" ? skuMovement.reload
-      : loadCachedRows,
+      : reloadSalesDashboard,
     disabled: onFeed || (showingBrandPortfolio && !accounts.length && !isAdmin && !allowedAccountIds.size),
     hint: onFeed
       ? "The Priority Feed combines the six saved reports. Each updates automatically from its saved data."
       : showingBrandPortfolio
-        ? "Reload the portfolio brand list from the accounts you may access."
+        ? "Reload the saved portfolio brand list for the accounts you may access. This never calls DataDoe."
         : "Reload saved data. This never calls DataDoe — refreshes run automatically on schedule or from the Data Sync Center.",
+    // STATUS ONLY: how the report on screen gets its data (never a control, never "update"). Where the page keeps the
+    // served body, a copy the server rebuilt at read time (preview / rederived) is labelled as such.
+    dataStatus: viewDataStatus(view, { dashboardMode, campaignAdsTab: CAMPAIGN_ADS_TAB, served: servedStatusBody, hasCopy: copyOnScreen }),
     paidSync: isAdmin && routeOwnedView && !onFeed
       ? { label: "Request paid sync (uses DataDoe tokens)", onClick: openPaidSync }
       : undefined,
@@ -4424,8 +4494,9 @@ function DashboardApp({ session, access, onSignOut }) {
             accounts={accounts}
             selectedAccountId={selectedAccountId}
             onAccountChange={(id) => { setSelectedAccountId(id); setSelectedBrand("ALL"); }}
-            onRefreshAccounts={fetchAccounts}
+            onRefreshAccounts={reloadAccountList}
             accountsRefreshing={accountsLoading}
+            accountsRefreshTitle={isAdmin ? "Refresh account list from DataDoe" : "Reload the saved account list"}
             brands={view === "fbaplan" ? planBrandOptions : brandList}
             selectedBrand={selectedBrand}
             onBrandChange={setSelectedBrand}
@@ -4481,9 +4552,10 @@ function DashboardApp({ session, access, onSignOut }) {
           refreshReport={refreshSharedReport}
           directoryLoading={brandDirectoryLoading}
           directoryError={brandDirectoryError}
-          onLoadBrandDirectory={fetchBrandDirectory}
+          onLoadBrandDirectory={isAdmin ? fetchBrandDirectory : reloadBrandDirectory /* the Catalog sync is admin-only on the server */}
           isAdmin={isAdmin}
           sourceAccounts={portfolioSourceAccounts}
+          onServedMeta={setBrandPortfolioServed}
           onRequestPaidSync={isAdmin ? openPaidSync : null}
         />
       ) : (
@@ -4617,7 +4689,7 @@ function DashboardApp({ session, access, onSignOut }) {
               icon={<Inbox size={19} aria-hidden="true" />}
               title="No account selected"
               actions={accounts.length ? null : (
-                <button className="plan-export-btn" type="button" onClick={fetchAccounts} disabled={accountsLoading}>
+                <button className="plan-export-btn" type="button" onClick={reloadAccountList} disabled={accountsLoading}>
                   <RefreshCw size={14} className={accountsLoading ? "spin" : ""} aria-hidden="true" />
                   Load account directory
                 </button>
@@ -4644,7 +4716,7 @@ function DashboardApp({ session, access, onSignOut }) {
               )}
             >
               Opening a report, switching account or brand, and changing the date range all read saved data only.
-              Refresh is the one action that calls DataDoe.
+              Reload re-reads the saved data and never calls DataDoe; new data arrives from the scheduled refresh.
             </EmptyState>
           </div>
         ) : salesWindowStatus === "unavailable" ? (
@@ -5640,6 +5712,8 @@ function DashboardApp({ session, access, onSignOut }) {
           selectedBrand={selectedBrand}
           accessToken={session?.access_token}
           isAdmin={isAdmin}
+          reloadSignal={campaignAdsReload}
+          onStatus={setCampaignAdsStatus}
         />
       )}
 

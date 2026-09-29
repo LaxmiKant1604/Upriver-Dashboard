@@ -375,7 +375,7 @@ export function SearchableSelect({
  * short native <select> (three fixed regions, no search needed). All keep the
  * exact change semantics the app relies on.
  */
-export function AccountSelector({ accounts, value, onChange, flags, onRefresh, refreshing = false }) {
+export function AccountSelector({ accounts, value, onChange, flags, onRefresh, refreshing = false, refreshTitle = "Refresh account list from DataDoe" }) {
   const options = useMemo(() => accounts.map((account) => ({
     value: account.id,
     // The visible label keeps the flag + name + currency; search also matches marketplace + currency.
@@ -390,8 +390,8 @@ export function AccountSelector({ accounts, value, onChange, flags, onRefresh, r
       type="button"
       onClick={onRefresh}
       disabled={refreshing}
-      title="Refresh account list from DataDoe"
-      aria-label="Refresh account list from DataDoe"
+      title={refreshTitle}
+      aria-label={refreshTitle}
     >
       <RefreshCw size={14} className={refreshing ? "spin" : ""} aria-hidden="true" />
     </button>
@@ -475,7 +475,7 @@ function DashboardModeSelector({ value, onChange }) {
 
 export function TopBar({
   viewTitle, onOpenMenu, mobileOpen, showScope,
-  accounts, selectedAccountId, onAccountChange, onRefreshAccounts, accountsRefreshing,
+  accounts, selectedAccountId, onAccountChange, onRefreshAccounts, accountsRefreshing, accountsRefreshTitle,
   brands, selectedBrand, onBrandChange, flags, brandAllLabel = "All brands",
   dashboardMode = "account", onDashboardModeChange, portfolioBrands = [], selectedPortfolioBrand = "", onPortfolioBrandChange,
   regions = [], selectedRegion = "", onRegionChange,
@@ -516,10 +516,19 @@ export function TopBar({
               flags={flags}
               onRefresh={onRefreshAccounts}
               refreshing={accountsRefreshing}
+              refreshTitle={accountsRefreshTitle}
             />
             <BrandSelector brands={brands} value={selectedBrand} onChange={onBrandChange} allLabel={brandAllLabel} />
           </>}
           <div className="refresh-cluster">
+            {/* STATUS ONLY: how the report on screen gets its data (src/lib/report-status.js, mirrored from the report
+                registry). It is not a control -- it publishes nothing and never calls DataDoe. */}
+            {refresh.dataStatus && (
+              <span className={"data-status-chip " + refresh.dataStatus.status} title={refresh.dataStatus.detail}>
+                {refresh.dataStatus.label}
+                <span className="sr-only"> — {refresh.dataStatus.detail}</span>
+              </span>
+            )}
             <div className="refresh-status">
               <div className="refresh-status-label">{refresh.label}</div>
               <div className="refresh-status-value">

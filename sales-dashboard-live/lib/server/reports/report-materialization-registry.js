@@ -43,11 +43,20 @@ export const SERVE_MODES = Object.freeze([
 export const GRAINS = Object.freeze(["account", "account-brand", "account-region", "region", "organization"]);
 export const LKG_POLICIES = Object.freeze(["serve-last-known-good", "waiting-if-missing", "derive-fresh-each-read"]);
 export const REGIONAL_SCHEDULING = Object.freeze(["per-region-daily", "shadow", "on-demand", "manual-only"]);
+// HOW the page a user sees gets its data -- the honest, user-facing status class the header shows (status only: it
+// describes the existing owner; nothing here publishes or refreshes anything). Cross-checked against the recovery route
+// registry's class kind by scripts/report-status.test.js: route -> "scheduled", read-only-self-heal -> "read-time",
+// manual-paid -> "paid-manual", dormant -> "dormant".
+//   scheduled    the scheduler publishes the shared copy; the page shows the latest published copy (last-known-good)
+//   read-time    rebuilt from already-saved data every time the page reads it; nothing is published
+//   paid-manual  only an admin paid sync (DataDoe tokens) refreshes it; the page shows the saved copy
+//   dormant      no page uses it
+export const DATA_STATUS = Object.freeze(["scheduled", "read-time", "paid-manual", "dormant"]);
 
 export const REQUIRED_DECLARATION_FIELDS = Object.freeze([
   "reportKey", "reportVersion", "requiredSources", "optionalSources", "sourceOwner", "materializationOwner",
   "grain", "freshness", "provenanceFields", "lkgPolicy", "regionalScheduling", "capability", "serveMode",
-  "bucket", "pageOpenWrite", "clientOpenTriggeredWrite", "notes",
+  "bucket", "pageOpenWrite", "clientOpenTriggeredWrite", "dataStatus", "notes",
 ]);
 
 // GRANDFATHERED page-open writes. EMPTY as of Phase 3 Increment 2 -- every report GET is now read-only (the five
@@ -92,7 +101,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at", "salesSource", "currencies"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["brand-sales"],
-    serveMode: "read-snapshot", bucket: "A", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot", bucket: "A", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "scheduled",
     notes: "Dashboard/Account. Ads is optional (merged at account grain in Daily; brand attribution needs campaign_brand_mapping).",
   },
   "daily": {
@@ -102,7 +111,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at", "salesWindowStatus", "coverage"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["daily"],
-    serveMode: "read-snapshot-or-derive", bucket: "A", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-or-derive", bucket: "A", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "scheduled",
     notes: "ALL-brand is scheduler-published (priority path) at the exact serve identity {from:monthBack(asOf,5),to:asOf,brand:ALL}; a named-brand read DERIVES read-only from durable OLI/Catalog and serves WITHOUT writing (Phase 3). GET performs zero backend mutations; the refresh=1 DataDoe path stays click-only.",
   },
   "brand-inventory": {
@@ -112,7 +121,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "latest-snapshot" },
     provenanceFields: ["source_refreshed_at", "inventorySnapshotDate"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["brand-inventory"],
-    serveMode: "read-snapshot", bucket: "A", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot", bucket: "A", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "scheduled",
     notes: "Compact FBA inventory snapshot (SOURCE_PROMOTED). Latest inventory date only; never summed across dates.",
   },
   "fba-plan": {
@@ -122,7 +131,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 24, coverage: "latest-snapshot" },
     provenanceFields: ["source_refreshed_at", "inventorySnapshotDate", "asOf"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["fba-plan"],
-    serveMode: "read-snapshot-else-waiting", bucket: "A", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "A", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "scheduled",
     notes: "Published by the scheduler-v2 fba job per region (AWD optional, US+EU5). Also the FBA fallback for Brand View.",
   },
   "sku-movement": {
@@ -132,7 +141,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "selectable-window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["sku-movement"],
-    serveMode: "read-snapshot-or-derive", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-or-derive", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "scheduled",
     notes: "Scheduler materializer (report-materialization job) publishes ALL + each named brand at {asOf,brand}; the client re-windows N days from the canonical payload. A read serves the stored snapshot, or on a stale/miss derives read-only from durable OLI/Catalog -- zero DataDoe, zero write (Phase 3).",
   },
   "returns-leakage": {
@@ -142,7 +151,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 168, coverage: "durable-history" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["returns-leakage"],
-    serveMode: "read-snapshot-or-derive", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-or-derive", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "scheduled",
     notes: "SOURCE (Returns/Settlement history) stays manual-only (crons removed); the scheduler materializer re-publishes the REPORT daily from whatever durable evidence exists, stamping the SOURCE provenance (not the materialization time) so stale Returns data is never marked fresh. A read serves stored or derives read-only -- zero write (Phase 3).",
   },
   "brand-view": {
@@ -152,7 +161,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["adsAvailable", "fbaAvailable", "inventoryScope", "updating", "depFingerprint"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["brand-view"],
-    serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "scheduled",
     notes: "Published by the FBA-aware Brand View materializer (report-materialization-brandview job) per (account,brand) at the exact serve identity {accountId,brand,asOf=marketplaceToday(country)}. FRESHNESS is a DEPENDENCY FINGERPRINT over the COMPLETE contributing set (brand-sales + compact brand-inventory + fba-plan + Ads coverage + campaign->brand mapping + catalog + version), computed identically by the writer and the serve: a read serves the stored snapshot and flags updating when ANY dependency changed (inventory became available, Ads advanced, a mapping was edited) -- not just when brand-sales advanced -- converging on the next scheduled publish with no page-open write. The compact brand-inventory is REBUILT from the fresh fba-plan by the materialize-inventory job AFTER fba, so fbaAvailable reflects same-day D-1 inventory (null only when no inventory snapshot); missing Ads mappings -> adsAvailable:false. Refresh=1 stays click-only.",
   },
   "brand-view-portfolio": {
@@ -162,7 +171,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-region", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["adsAvailable", "fbaAvailable", "updating", "depFingerprint"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["brand-view-portfolio"],
-    serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "scheduled",
     notes: "The BACKEND PRODUCER that fixes non-convergence: the FBA-aware Brand View materializer publishes the CANONICAL region-brand account set (accountsForBrand(brand-sales membership) intersect region) at the exact serve identity {sortedAccountIds,brand,asOf=marketplaceToday(\"IN\"),region}. deferRebuildOnRead read serves the stored snapshot; a source advance flags updating and the next scheduled publish converges it WITHOUT a user Refresh. A restricted-subset user's different account set is a different identity (never served the canonical LKG; assertAccountAccess gates it) -- no unauthorized payload is precomputed.",
   },
   "brand-portfolio": {
@@ -172,7 +181,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["brand-portfolio"],
-    serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "dormant",
     notes: "Legacy brand portfolio aggregation of brand-sales + fba-plan.",
   },
   "brand-view-brands": {
@@ -182,7 +191,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["brand-view-brands"],
-    serveMode: "read-snapshot-or-derive", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-or-derive", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "scheduled",
     notes: "Brand dropdown directory; the scheduler materializer publishes it per account from brand-sales membership. A read serves stored or builds read-only from durable membership -- zero DataDoe, zero write (Phase 3).",
   },
   "brand-directory": {
@@ -192,7 +201,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "organization", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["brand-directory"],
-    serveMode: "read-snapshot-or-derive", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-or-derive", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "read-time",
     notes: "Account/brand selector, keyed by the viewer's authorized selection. A read serves the stored directory when the brand-sales membership fingerprint matches, else rebuilds READ-ONLY from the scheduler-materialized per-account brand-sales membership (zero DataDoe, zero write) and applies authorization projection on serve. Because a read never writes, concurrent regional runs can never overwrite one region's membership with another's (Phase 3). Refresh (Catalog export) stays admin-gated.",
   },
   "oli-quality": {
@@ -202,7 +211,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "derive-fresh-each-read",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["oli-quality"],
-    serveMode: "derive-at-serve", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "derive-at-serve", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "read-time",
     notes: "Pure read-derive from the durable OLI table; never stored, never DataDoe.",
   },
   "oli-quality-summary": {
@@ -212,7 +221,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "derive-fresh-each-read",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["oli-quality-summary"],
-    serveMode: "derive-at-serve", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "derive-at-serve", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "read-time",
     notes: "Account-wide OLI quality summary; pure read-derive, never stored.",
   },
   "listing-health-v3": {
@@ -226,7 +235,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 24, coverage: "latest-snapshot" },
     provenanceFields: ["inventory", "salesWindowStatus", "coverage", "evidence"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "shadow", capability: REPORT_CAPABILITIES["listing-health-v3"],
-    serveMode: "derive-at-serve", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "derive-at-serve", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "scheduled",
     notes: "SHADOW ingestion writes durable per-account aliases; serve derives read-only from them + durable OLI. Inventory is OPTIONAL: an account whose FBA inventory failed still publishes listings/OLI with inventory.available:false (D-1 pin kept when inventory IS present). The region-wide FBA-completeness prerequisite (scheduler-v2.yml job gate + operation.js region-wide inventory defer) remains a SEPARATELY-REVIEWED rollout change. UI flag LISTING_HEALTH_V3 is OFF.",
   },
   // ----- reports with NO live scheduler owner: materialized only by an explicit user Refresh (DataDoe) today. Declared
@@ -238,7 +247,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["sales"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "dormant",
     notes: "Multi-account dashboard aggregate; no live scheduler owner -> only a user Refresh (DataDoe) materializes it.",
   },
   "reconciliation": {
@@ -248,7 +257,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "6-month" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["reconciliation"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "paid-manual",
     notes: "registry enabled:false; materialized only by a user Refresh (6 monthly settlement batches, DataDoe).",
   },
   "sku-pl": {
@@ -258,7 +267,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["sku-pl"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "paid-manual",
     notes: "registry enabled:false; user-Refresh only.",
   },
   "keyword-rank": {
@@ -268,7 +277,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "shadow", capability: REPORT_CAPABILITIES["keyword-rank"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "paid-manual",
     notes: "Search Query Performance; enabled:false + shadow cycle only; user-Refresh materializes it.",
   },
   "content-changes": {
@@ -278,7 +287,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["content-changes"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "paid-manual",
     notes: "registry enabled:false; user-Refresh only.",
   },
   "sales-movers": {
@@ -288,7 +297,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "7d-compare" },
     provenanceFields: ["source_refreshed_at", "salesLatestDate"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "shadow", capability: REPORT_CAPABILITIES["sales-movers"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "paid-manual",
     notes: "enabled:false + shadow cycle; user-Refresh materializes it.",
   },
   "listing-health": {
@@ -298,7 +307,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "latest-snapshot" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["listing-health"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "paid-manual",
     notes: "v1 Listing Health; enabled:false; user-Refresh only. (v3 is the scheduled successor, UI-off.)",
   },
   "buy-box-loss": {
@@ -308,7 +317,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "on-demand", capability: REPORT_CAPABILITIES["buy-box-loss"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "paid-manual",
     notes: "enabled:false; user-Refresh only.",
   },
   "ppc-performance": {
@@ -318,7 +327,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "shadow", capability: REPORT_CAPABILITIES["ppc-performance"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "paid-manual",
     notes: "Ads source IS scheduled; the ppc-performance snapshot itself has no live publisher (superseded by the Campaign Ads workspace view).",
   },
   "listing-optimizer": {
@@ -328,7 +337,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     grain: "account", freshness: { maxAgeHours: 168, coverage: "window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
     regionalScheduling: "shadow", capability: REPORT_CAPABILITIES["listing-optimizer"],
-    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false,
+    serveMode: "read-snapshot-else-waiting", bucket: "D", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "paid-manual",
     notes: "enabled:false + shadow cycle; user-Refresh only.",
   },
 });
@@ -386,6 +395,15 @@ export function validateReportMaterializationRegistry({
     if (!GRAINS.includes(e.grain)) problems.push(`"${a}" grain "${e.grain}" is not an allowed value`);
     if (!LKG_POLICIES.includes(e.lkgPolicy)) problems.push(`"${a}" lkgPolicy "${e.lkgPolicy}" is not an allowed value`);
     if (!REGIONAL_SCHEDULING.includes(e.regionalScheduling)) problems.push(`"${a}" regionalScheduling "${e.regionalScheduling}" is not an allowed value`);
+    if (!DATA_STATUS.includes(e.dataStatus)) problems.push(`"${a}" dataStatus "${e.dataStatus}" is not an allowed value (${DATA_STATUS.join(" | ")})`);
+    // The status must describe the DECLARED owner (it is how the page gets its data): a scheduler owner is "scheduled",
+    // a serve-time derive is "read-time" (or "dormant"), a manual paid refresh is "paid-manual" (or "dormant").
+    const statusForOwner = String(e.materializationOwner || "").startsWith("scheduler-v2:") ? ["scheduled"]
+      : e.materializationOwner === "serve:derive-durable" ? ["read-time", "dormant"]
+      : e.materializationOwner === "manual-refresh" ? ["paid-manual", "dormant"] : [];
+    if (DATA_STATUS.includes(e.dataStatus) && !statusForOwner.includes(e.dataStatus)) {
+      problems.push(`"${a}" dataStatus "${e.dataStatus}" contradicts its materializationOwner "${e.materializationOwner}" (allowed: ${statusForOwner.join(" | ") || "none"})`);
+    }
     if (typeof e.pageOpenWrite !== "boolean") problems.push(`"${a}" pageOpenWrite must be a boolean (does a plain GET write a snapshot?)`);
     // 4. a backend materialization path + a real required-source list + shape.
     if (!Array.isArray(e.requiredSources) || e.requiredSources.length === 0) problems.push(`"${a}" must declare at least one required durable source`);

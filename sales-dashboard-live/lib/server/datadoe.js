@@ -118,6 +118,41 @@ export function withDataDoeDeadline(deadlineAt, callback) {
   return dataDoeDeadline.run(Number(deadlineAt), callback);
 }
 
+// PAID-EXPORT AUTHORIZATION for browser-triggered work (api/datadoe.js). The route runs every request inside
+// withPaidExportAuthorization (default: NOT allowed) and allows paid exports only once the caller is a confirmed admin
+// (allowPaidExportsForThisRequest). createExport -- the export-create POST every api/datadoe.js builder reaches -- and
+// the admin sample's direct POST call assertPaidExportAuthorized FIRST, so a non-admin request can never create a
+// DataDoe export, whatever code path it takes. Callers that never enter this store (the scheduler, the admin Data Sync
+// Center runtime, the Ads sync) are unaffected. The store is a per-request object, so one request can never widen another.
+const paidExportAuthorization = new AsyncLocalStorage();
+
+export class PaidExportNotAuthorizedError extends Error {
+  constructor() {
+    super("Only an admin can start a paid DataDoe export.");
+    this.name = "PaidExportNotAuthorizedError";
+    this.code = "PAID_EXPORT_NOT_AUTHORIZED";
+    this.status = 403;
+  }
+}
+
+export function isPaidExportNotAuthorizedError(error) {
+  return error?.code === "PAID_EXPORT_NOT_AUTHORIZED" || error instanceof PaidExportNotAuthorizedError;
+}
+
+export function withPaidExportAuthorization(callback) {
+  return paidExportAuthorization.run({ allowed: false }, callback);
+}
+
+export function allowPaidExportsForThisRequest(allowed) {
+  const store = paidExportAuthorization.getStore();
+  if (store) store.allowed = allowed === true;
+}
+
+export function assertPaidExportAuthorized() {
+  const store = paidExportAuthorization.getStore();
+  if (store && store.allowed !== true) throw new PaidExportNotAuthorizedError();
+}
+
 function remainingDeadlineMs() {
   const deadlineAt = dataDoeDeadline.getStore();
   return Number.isFinite(deadlineAt) ? deadlineAt - Date.now() : null;
@@ -252,6 +287,7 @@ export async function fetchAccounts(apiKey, attempt = 0) {
 }
 
 export async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit, options = {}) {
+  assertPaidExportAuthorized(); // before ANY network call (see withPaidExportAuthorization)
   const { groupBy, aggregations, orderByColumn = "date", orderByDirection = "ASC" } = options;
   const r = await ddFetch(ENDPOINTS.exportsCreate, {
     method: "POST",
