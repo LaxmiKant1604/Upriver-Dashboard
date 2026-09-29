@@ -142,16 +142,19 @@ function rig(responses) {
   const okP = new Promise((res) => { releaseOk = () => res({ access: ACCESS }); });
   const errP = new Promise((_, rej) => { releaseErr = () => rej(err(500, "late")); });
   const a = rig([() => okP]);
-  a.loader.load(); await a.flush();
+  a.loader.load(); await a.flush();                // success request IN FLIGHT
   a.loader.dispose(); releaseOk(); await a.flush();
-  const b = rig([err(500), () => errP]);
-  b.loader.load(); await b.flush();               // fail -> retry scheduled
-  const timersBefore = b.state.timers.size;
-  const errBefore = b.state.error;
-  b.loader.dispose();
-  releaseErr(); await b.flush();
-  ok("B9 dispose() while a request is in flight: its late SUCCESS never applies, its late FAILURE never changes the error; the scheduled retry is cancelled",
-    a.state.applied === null && a.state.error === "" && timersBefore === 1 && b.state.timers.size === 0 && b.state.error === errBefore && b.state.fetches === 1);
+  const b = rig([() => errP]);
+  b.loader.load(); await b.flush();                // failing request IN FLIGHT
+  b.loader.dispose(); releaseErr(); await b.flush();
+  const c = rig([err(500)]);
+  c.loader.load(); await c.flush();                // fail -> automatic retry scheduled
+  const timersBefore = c.state.timers.size;
+  c.loader.dispose();
+  ok("B9 dispose() while a request is in flight: its late SUCCESS never applies and its late FAILURE never shows (no error, no retry); a scheduled retry is cancelled",
+    a.state.applied === null && a.state.error === "" && a.state.fetches === 1
+    && b.state.error === "" && b.state.timers.size === 0 && b.state.retry === null && b.state.fetches === 1
+    && timersBefore === 1 && c.state.timers.size === 0);
 }
 {
   // B10 ONE request at a time: 10 Retry presses + a focus/visibility double-fire during a pending cold request share it;
