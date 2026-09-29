@@ -164,38 +164,61 @@ export function isAuthorizedAccessBody(body) {
  * drive the cold error screen; hasAppliedAccess() -> true once authorized access is on screen.
  * -> { load(), retryNow(), dispose() }. load() is the first load AND every focus / visibility revalidation.
  */
-export function createAccessLoader({ fetchAccess, applyAccess, showError, showRetry, hasAppliedAccess, setTimer = setTimeout, clearTimer = clearTimeout }) {
-  let active = true, timer = null, retries = 0;
+export function createAccessLoader({ fetchAccess, applyAccess, showError, showRetry, showBusy = () => {}, hasAppliedAccess, setTimer = setTimeout, clearTimer = clearTimeout }) {
+  // `applied`: this loader has already applied an authorized access -- a later failure is then never shown, even if the
+  // caller's own applied-state was reset meanwhile (e.g. inside the sign-out window before dispose()).
+  let active = true, timer = null, retries = 0, applied = false, inFlight = null;
   const cancel = () => { if (timer !== null) { clearTimer(timer); timer = null; } };
-  const load = () => Promise.resolve()
-    .then(() => fetchAccess())
-    .then((body) => {
-      if (!active) return;
-      if (!isAuthorizedAccessBody(body)) { const e = new Error("Dashboard access response was incomplete."); e.status = 502; throw e; }
-      cancel(); retries = 0;
-      // The ONLY place the error screen is cleared: a successful, authorized access response.
-      showError(""); showRetry(null);
-      applyAccess(body.access);
-    })
-    .catch((error) => {
-      if (!active) return;
-      // A working dashboard is never blanked: once authorized access is applied, a failure changes nothing.
-      if (hasAppliedAccess()) return;
-      showError((error && error.message) || "Unable to load dashboard access.");
-      if (timer !== null) return; // an automatic retry is already scheduled
-      if (shouldAutoRetryAccess(error, retries)) {
-        retries += 1;
-        const inMs = accessRetryDelayMs(retries);
-        showRetry({ attempt: retries, of: ACCESS_AUTO_RETRY_LIMIT, inMs });
-        timer = setTimer(() => { timer = null; if (active) load(); }, inMs);
-      } else {
-        showRetry(null);
-      }
-    });
+  const cold = () => !applied && !hasAppliedAccess();
+  const onSuccess = (body) => {
+    if (!active) return;
+    if (!isAuthorizedAccessBody(body)) { const e = new Error("Dashboard access response was incomplete."); e.status = 502; throw e; }
+    cancel(); retries = 0; applied = true;
+    // The ONLY place the error screen is cleared: a successful, authorized access response.
+    showError(""); showRetry(null);
+    applyAccess(body.access);
+  };
+  const onFailure = (error) => {
+    if (!active) return;
+    // A working dashboard is never blanked: once authorized access is applied, a failure changes nothing.
+    if (!cold()) return;
+    showError((error && error.message) || "Unable to load dashboard access.");
+    if (timer !== null) return; // an automatic retry is already scheduled
+    if (shouldAutoRetryAccess(error, retries)) {
+      retries += 1;
+      const inMs = accessRetryDelayMs(retries);
+      showRetry({ attempt: retries, of: ACCESS_AUTO_RETRY_LIMIT, inMs });
+      timer = setTimer(() => { timer = null; if (active) load(); }, inMs);
+    } else {
+      showRetry(null);
+    }
+  };
+  // ONE access request at a time: a focus + visibilitychange double-fire, repeated Retry presses and a retry timer landing
+  // during a request all share the request already in flight (never a burst against an overloaded backend). The busy
+  // signal is raised only in the COLD state (the error / loading screen), so a background revalidation stays silent.
+  const load = () => {
+    if (!active) return Promise.resolve();
+    if (inFlight) return inFlight;
+    const busy = cold();
+    if (busy) showBusy(true);
+    const request = Promise.resolve()
+      .then(() => fetchAccess())
+      .then(onSuccess)
+      .catch(onFailure)
+      .finally(() => { if (inFlight === request) inFlight = null; if (busy && active) showBusy(false); });
+    inFlight = request;
+    return request;
+  };
   return {
     load,
-    // The Retry button: load now and restart the bounded automatic retries (never signs out).
-    retryNow() { if (!active) return Promise.resolve(); cancel(); retries = 0; showRetry(null); return load(); },
+    // The Retry button: load now and restart the bounded automatic retries (never signs out). While a request is in
+    // flight it joins that request (the button is disabled meanwhile).
+    retryNow() {
+      if (!active) return Promise.resolve();
+      if (inFlight) return inFlight;
+      cancel(); retries = 0; showRetry(null);
+      return load();
+    },
     dispose() { active = false; cancel(); },
   };
 }
