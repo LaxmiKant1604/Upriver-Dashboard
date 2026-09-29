@@ -102,10 +102,15 @@ export function reuseTextPin(text) {
 export function reuseTableValid(q) {
   if (!isPlainObject(q) || q.shared !== true || !SHARED_REUSE_TABLES.includes(q.reuseTable)) return false;
   if (!(SHARED_REUSE_PINS[q.reuseTable] || []).includes(reuseTextPin(q.text))) return false;
-  // Defence in depth (the pin is the gate): every public.<name> is the table, and no time function.
-  const tables = new Set((S(q.text).toLowerCase().match(/public.[a-z_][a-z0-9_]*/g) || []).map((x) => x.slice(7)));
-  return tables.size === 1 && tables.has(q.reuseTable)
-    && !/(now|clock_timestamp|statement_timestamp|transaction_timestamp|current_date|current_time|current_timestamp|localtime|localtimestamp|timeofday|random|txid_current|current_setting)/i.test(S(q.text));
+  return reuseTextSafe(q.text, q.reuseTable);
+}
+// Defence in depth (the pin is the gate): every public.<name> the text names is the reuse table, and it calls no time
+// function. Exported so a test exercises it on its own (a dead regex must fail a test, not hide behind the pin).
+export function reuseTextSafe(text, table) {
+  const t = S(text);
+  const tables = new Set((t.toLowerCase().match(/public\.[a-z_][a-z0-9_]*/g) || []).map((x) => x.slice(7)));
+  return tables.size === 1 && tables.has(table)
+    && !/\b(now|clock_timestamp|statement_timestamp|transaction_timestamp|current_date|current_time|current_timestamp|localtime|localtimestamp|timeofday|random|txid_current|current_setting)\b/i.test(t);
 }
 
 /** Every problem with a WORKER-side route declaration ([] when valid). */

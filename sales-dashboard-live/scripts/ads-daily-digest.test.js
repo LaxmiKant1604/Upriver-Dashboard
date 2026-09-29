@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import * as D from "../lib/server/sync/brand-view-dependency-readers.js";
 import * as A from "../lib/server/recovery/routes/ads-daily-evidence.js";
 import { sweepMemoQuery, buildEvidenceContext, evaluateRouteEvidence, reusableEntriesOf, seedReusable } from "../lib/server/recovery/routes.js";
-import { workerRouteProblems, reuseTableValid } from "../lib/server/recovery/route-contract.js";
+import { workerRouteProblems, reuseTableValid, reuseTextSafe } from "../lib/server/recovery/route-contract.js";
 import { marketplaceToday } from "../lib/marketplaces.js";
 import BV_ROUTE from "../lib/server/recovery/routes/brand-view.route.js";
 import PF_ROUTE from "../lib/server/recovery/routes/brand-view-portfolio.route.js";
@@ -194,6 +194,9 @@ const mkRow = (acct, d, i) => ({
       cS.length === 0 && hit === ents[0].rows && reusableEntriesOf(m2).length === 1);
     let rejected = 0; for (const bad of [{ key: "\u0000x", table: "t", rows: Object.freeze([]) }, { key: "k", table: "t", rows: [] }, { key: 1, table: "t", rows: Object.freeze([]) }]) { try { seedReusable(new Map(), bad); } catch { rejected += 1; } }
     ok("D5t seedReusable fails closed on a reserved key, unfrozen rows or a non-string key", rejected === 3);
+    ok("D5v the contract's DEFENCE-IN-DEPTH check on its own (not hidden behind the pin): the real text passes; now() / random() / current_setting(), a second public table and a non-dotted lookalike are refused",
+      reuseTextSafe(A.ADS_DAILY_STATEMENT.text, "ads_daily_source_rows") && !reuseTextSafe("select now(), random() from public.ads_daily_source_rows", "ads_daily_source_rows") && !reuseTextSafe("select current_setting('x') from public.ads_daily_source_rows", "ads_daily_source_rows")
+      && !reuseTextSafe("select 1 from public.ads_daily_source_rows a join public.report_snapshots b on true", "ads_daily_source_rows") && !reuseTextSafe("select 1 from publicXads_daily_source_rows", "ads_daily_source_rows") && reuseTextSafe("select nowhere_col from public.ads_daily_source_rows", "ads_daily_source_rows"));
     ok("D5u the contract: the Ads statement's reuseTable is valid (its text is PINNED; shared, ONE table, no time function); a non-shared statement, a second (even unqualified) table, now(), or ANY text change is refused",
       reuseTableValid(A.ADS_DAILY_STATEMENT) && reuseTableValid(A.ADS_DAILY_SCOPED_STATEMENT.sharedVariant)
       && !reuseTableValid({ ...A.ADS_DAILY_STATEMENT, shared: false }) && !reuseTableValid({ ...A.ADS_DAILY_STATEMENT, text: A.ADS_DAILY_STATEMENT.text + " join public.report_snapshots r on true" })

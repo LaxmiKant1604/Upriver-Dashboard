@@ -572,6 +572,16 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
     return store.readSchedulerGate({ cooldownSeconds: config.schedulerCooldownSeconds });
   }
 
+  // The route is swept once its LAST region step ran -- whatever the outcome (a child failure, an evidence-read failure,
+  // a tripped route): a failing route must not be re-swept every tick (tier-1 + the next period / epoch cover it). Its
+  // token is a digest over EVERY configured region's parts only when every region's evidence was read in this sweep;
+  // otherwise tier-1's current digest (epoch-scoped, or none) -- never a subset digest that looks like a token change.
+  function markSweptIfLast(id) {
+    if (!sweep || sweep.steps.slice(sweep.idx).some((x) => x.route === id)) return;
+    const seen = sweep.partsRegions.get(id) || new Set();
+    const complete = config.regions.every((g) => seen.has(g));
+    sweep.byRoute[id] = { lastAtMs: clock(), epoch: sweep.epoch, tok: complete ? tokenDigestOf(sweep.parts.get(id) || []) : (tokenDigest.get(id) || null) };
+  }
   async function deepSweepStep() {
     if (!sweep) {
       const now = clock();
@@ -596,7 +606,7 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
       if (!(await store.tryBeginScan({ holder: workerId, kind: "deep", leaseSeconds: config.scanLeaseSeconds, minIntervalSeconds: 60 }))) return false;
       const steps = [];
       for (const region of config.regions) for (const id of due) steps.push({ region, route: id });
-      sweep = { epoch, steps, idx: 0, startedAt: now, byRoute: { ...byRoute }, parts: new Map(), ctl: await store.control(), summary: { epoch, steps: {}, errors: 0, stale: 0, current: 0, enqueued: 0 } };
+      sweep = { epoch, steps, idx: 0, startedAt: now, byRoute: { ...byRoute }, parts: new Map(), partsRegions: new Map(), ctl: await store.control(), summary: { epoch, steps: {}, errors: 0, stale: 0, current: 0, enqueued: 0 } };
       log(`deep sweep start epoch=${epoch} steps=${steps.length} routes=[${due.join(",")}]`);
       return true;
     }
@@ -620,14 +630,15 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
       if (!(await keepScanLease())) return true;
       const route = routeOf.get(id);
       const key = `${region}/${id}`;
-      if (tripped.has(id)) { sweep.summary.steps[key] = { skipped: "tripped" }; return true; }
+      if (tripped.has(id)) { sweep.summary.steps[key] = { skipped: "tripped" }; markSweptIfLast(id); return true; }
       const t0 = clock();
       // Tokens are read BEFORE the child: evidence landing during the run is newer than what is recorded, so the
       // watermark / tier-1 still react to it (never records newer evidence as already evaluated).
       let ev;
-      try { ev = await evidenceFor(route, region, sweep.epoch, t0); } catch (e) { sweep.summary.errors += 1; sweep.summary.steps[key] = { error: "evidence-read-failed", code: S(e && (e.code || e.name)).replace(/[^A-Za-z0-9._-]/g, "").slice(0, 40) || "error" }; return true; }
+      try { ev = await evidenceFor(route, region, sweep.epoch, t0); } catch (e) { sweep.summary.errors += 1; sweep.summary.steps[key] = { error: "evidence-read-failed", code: S(e && (e.code || e.name)).replace(/[^A-Za-z0-9._-]/g, "").slice(0, 40) || "error" }; markSweptIfLast(id); return true; }
       const parts = sweep.parts.get(id) || []; sweep.parts.set(id, parts);
       for (const [tk, e] of ev.map) parts.push(`${region}|${tk}|${S(e.token)}`);
+      const seen = sweep.partsRegions.get(id) || new Set(); sweep.partsRegions.set(id, seen); seen.add(region);
       const r = await spawn({ route: id, region, asOf: sweep.epoch, kind: supportsVerifyExact(route) ? "verify" : "dry-run", targets: null });
       stats.deepSteps += 1;
       if (!sweep || !(await keepScanLease())) return true;
@@ -640,9 +651,7 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
         sweep.summary.stale += stale; sweep.summary.current += current; sweep.summary.enqueued += rec.enqueued;
         sweep.summary.steps[key] = { targets: rec.byTarget.size, stale, current, enqueued: rec.enqueued, ms: r.durationMs };
       }
-      // The route is swept once its LAST region step ran (whatever the child's outcome: a failing route must not be
-      // re-swept every tick -- tier-1 + the next epoch cover it).
-      if (!sweep.steps.slice(sweep.idx).some((s) => s.route === id)) sweep.byRoute[id] = { lastAtMs: clock(), epoch: sweep.epoch, tok: sweep.parts.has(id) ? tokenDigestOf(sweep.parts.get(id)) : (tokenDigest.get(id) || null) };
+      markSweptIfLast(id);
       return true;
     }
     await finishSweep(sweep.summary.errors ? "partial" : "complete");

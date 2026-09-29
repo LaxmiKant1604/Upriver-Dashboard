@@ -1004,6 +1004,43 @@ const drain = async (rig, max = 30) => { let i = 0; while (i < max && (await rig
     && !!lr && lr.samples.includes("oli/india:57014") && sum.errors >= 1
     && m.some((r) => r.accountId === "A1" && r.reportKey === "brand-sales" && r.handoff === "deferred"));
 }
+// 19j' [review round 3] the REAL 'served-unknown' case: a legacy target CONFIRMED by an earlier tier-1 pass (matrix
+// repaired) whose live-row read then FAILS keeps served_confirmed (no revocation without the read) but the matrix shows
+// deferred / 'served-unknown' -- never 'repaired' on a pass that could not re-check it.
+{
+  const lg = makeRig({ liveRoutes: ["oli"] });
+  setEv(lg, "oli", "india", { A1: "cov:1" });
+  lg.world.set("oli", "india", "A1", "stale");
+  await lg.worker.watermarkPass(); await lg.worker.processOneBatch();
+  await lg.worker.tier1Scan();
+  const m1 = buildHandoffMatrix({ stateRows: (await lg.store.status()).state, directory: await lg.store.readDirectory(), regions: ["india"] });
+  const confirmed = stateOf(lg.store, "oli", "A1").served_confirmed === true && m1.some((r) => r.accountId === "A1" && r.reportKey === "brand-sales" && r.handoff === "repaired");
+  lg.store.readLiveRowWritesSince = async () => { const e = new Error("canceling statement due to statement timeout"); e.code = "57014"; throw e; };
+  lg.clk.t += 700 * 1000;
+  await lg.worker.tier1Scan();
+  const m2 = buildHandoffMatrix({ stateRows: (await lg.store.status()).state, directory: await lg.store.readDirectory(), regions: ["india"] });
+  const row = m2.find((r) => r.accountId === "A1" && r.reportKey === "brand-sales");
+  ok("19j' [review round 3]: a CONFIRMED legacy row whose next live-row read FAILS stays served_confirmed (no revocation without the read) and the matrix shows deferred / 'served-unknown' (was repaired)",
+    confirmed && stateOf(lg.store, "oli", "A1").served_confirmed === true && !!row && row.handoff === "deferred" && row.type === "served-unknown");
+}
+// 19k [review round 3] a route whose LAST region's deep-sweep evidence read keeps failing is still marked swept (no
+// re-sweep loop of the other regions' heavy children for the rest of the epoch); its token is not a subset digest.
+{
+  const rig = makeRig({ liveRoutes: ["returns-v3"], regions: ["india", "europe-au"], dir: { india: ["A1"], "europe-au": ["E1"] } });
+  for (const g of ["india", "europe-au"]) {
+    const acct = g === "india" ? "A1" : "E1";
+    for (const r of PUBLICATION_ROUTES) { if (r.grain === "region") setEv(rig, r.id, g, { ["region:" + g]: r.id + "-t" }); else setEv(rig, r.id, g, { [acct]: r.id + "-t" }); }
+    for (const r of PUBLICATION_ROUTES) rig.world.set(r.id, g, r.grain === "region" ? "region:" + g : acct, "current", r.id + "-t");
+  }
+  const orig = rig.store.readRouteEvidence.bind(rig.store);
+  rig.store.readRouteEvidence = async (route, ctx, ...rest) => { if (route.id === "fba-plan" && ctx.region === "europe-au") { const e = new Error("canceling statement due to statement timeout"); e.code = "57014"; throw e; } return orig(route, ctx, ...rest); };
+  let steps = 0; while ((await rig.worker.deepSweepStep()) && steps < 80) steps += 1;
+  const c1 = rig.world.calls.length;
+  const b = (rig.store.scanRow.deepSweep || {}).byRoute || {};
+  for (let k = 0; k < 6; k += 1) { rig.clk.t += 5 * 60 * 1000; await rig.worker.deepSweepStep(); }
+  ok("19k [review round 3]: a route whose LAST region's deep-sweep evidence read keeps failing is still marked swept (epoch recorded, token not a subset digest) and is NOT re-swept (no loop of the other regions' children)",
+    c1 === 19 && !!b["fba-plan"] && b["fba-plan"].epoch === EPOCH && b["fba-plan"].tok === null && rig.world.calls.length === c1);
+}
 // 19h [DB load] the deep sweep PAUSES while the scheduler gate is blocked (before, the gate was read only at sweep START,
 // so a running sweep stepped -- evidence reads + heavy children -- straight through a scheduler cycle); it resumes with
 // the step not consumed once the gate clears, and keeps its scan lease meanwhile.

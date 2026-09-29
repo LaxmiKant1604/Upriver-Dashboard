@@ -178,7 +178,7 @@ The owner **hand-off matrix** (per region x account x report; `status --matrix`)
 |---|---|
 | `repaired` | this worker published and a separate verify child proved content + lineage + live read-back **and** the served row |
 | `already-current` | the binding proved content + lineage + live read-back **and** the served row, with no publish |
-| `deferred` (typed) | stale-pending, superseded, preempted, capacity, contention, dependency, not activated, `current-unserved` (a current binding whose served read-back is not yet proven, or was revoked), `evidence-advanced` / `identity-rollover` (a tier-1 finding recorded **after** the verification says the token advanced / the identity as-of rolled), `job-open` (a pending / claimed / deferred job exists for the target: the worker is re-checking it), `not-yet-evaluated` |
+| `deferred` (typed) | stale-pending, superseded, preempted, capacity, contention, dependency, not activated, `current-unserved` (a current binding whose served read-back is not yet proven, or was revoked), `evidence-advanced` / `identity-rollover` (a tier-1 finding recorded **after** the verification says the token advanced / the identity as-of rolled), `served-unknown` (the tier-1 live-row read FAILED after the verification, so the served proof could not be re-checked; nothing is confirmed or revoked), `job-open` (a pending / claimed / deferred job exists for the target: the worker is re-checking it), `not-yet-evaluated` |
 | `missing-source` (typed) | the saved evidence is absent or ineligible (the worker never fetches it) |
 | `failed` (typed) | integrity, zero-export violation, terminal cycle, read-back mismatch, exhausted retries |
 | `not-applicable` (typed) | `manual-paid`, `read-only-self-heal`, `source-absent` (no evidence material at all) |
@@ -312,7 +312,9 @@ route-CLI change):
   oid, relfilenode, the stats-reset stamps and the postmaster start, in its own transaction BEFORE any evidence read) and
   reuses the previous pass's partials only while the probe is byte-identical and the entry is younger than
   `PRW_SHARED_EVIDENCE_REUSE_SECONDS` (default and maximum 3600; 0 = off). A statement opts in with `reuseTable`; the
-  contract admits it only on a shared statement that reads that table alone and no time function. Exactness: every
+  contract admits it only on a shared statement whose exact TEXT is pinned by a content hash (`route-contract.js
+  SHARED_REUSE_PINS`: any change needs a reviewed pin update), with a defence-in-depth check that it names only that
+  table and no time function (`reuseTextSafe`). Exactness: every
   committed write moves the probe (PGlite-proven in `ads-change-probe-selftest.mjs`, incl. a no-op upsert, a delete and
   TRUNCATE); a write not yet flushed to the statistics can make one pass reuse rows older by that flush delay; the 1 h
   cap bounds everything else. Only tier-1 / watermark see reused rows: every verification, per-job, dependency,
@@ -328,8 +330,11 @@ route-CLI change):
 - **Deep sweep pause**: a sweep in progress re-checks the scheduler gate before EVERY step (before, only at sweep start)
   and pauses -- no evidence read, no child, step not consumed, scan lease kept -- while the gate is blocked. The
   sync_cycles gate cannot see scheduler-v2's downstream route jobs (materialize / materialize-inventory run under
-  priority-partial buckets), so the soak sets `PRW_SCHEDULER_WINDOWS` (worker.env.example) to cover each region's cycle
-  incl. its downstream jobs and the nightly backstops.
+  priority-partial buckets), so the soak sets `PRW_SCHEDULER_WINDOWS=03:00-07:30,08:30-13:00,16:30-02:30`
+  (worker.env.example): each region's cycle incl. its downstream jobs, and the evening backstops (crons 20:13-21:58 UTC,
+  started by GitHub as late as 01:47). A route whose LAST region's sweep evidence read fails is still marked swept (no
+  re-sweep loop of the other regions' children), and a sweep token is a digest over every region only when every
+  region's evidence was read.
 - The token digest of the deep sweep's token-change rule is taken over every region's parts from the CURRENT epoch only
   (otherwise it is dropped and the per-epoch sweep covers the route), so a partial pass never looks like a token change.
 
