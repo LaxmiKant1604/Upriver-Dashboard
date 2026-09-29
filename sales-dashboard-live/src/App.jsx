@@ -5763,6 +5763,8 @@ export default function App() {
   const [accessError, setAccessError] = useState("");
   // { attempt, of, inMs } while an automatic retry of a failed cold access load is scheduled (null otherwise).
   const [accessRetry, setAccessRetry] = useState(null);
+  // True while a COLD access request is in flight (disables Retry; never set by a silent background revalidation).
+  const [accessChecking, setAccessChecking] = useState(false);
   // The current identity's access loader (the Retry button calls its retryNow()).
   const accessLoaderRef = useRef(null);
   // The current session is mirrored into a ref so a background access
@@ -5822,7 +5824,7 @@ export default function App() {
   // or a genuine identity change cold-boots (the one place a full-page access
   // screen is allowed).
   useEffect(() => {
-    if (!session?.access_token) { setAccess(null); setAccessRetry(null); accessFpRef.current = null; return undefined; }
+    if (!session?.access_token) { setAccess(null); setAccessError(""); setAccessRetry(null); setAccessChecking(false); accessFpRef.current = null; return undefined; }
     setAccess(null); setAccessError(""); setAccessRetry(null); accessFpRef.current = null;
     // The access loader (session-lifecycle.js createAccessLoader): a TRANSIENT failure of the cold load (network, 5xx)
     // recovers on its own -- bounded automatic retries + the Retry button, never a sign-out -- and the error screen is
@@ -5840,6 +5842,7 @@ export default function App() {
       },
       showError: setAccessError,
       showRetry: setAccessRetry,
+      showBusy: setAccessChecking,
       hasAppliedAccess: () => accessFpRef.current !== null,
     });
     accessLoaderRef.current = loader;
@@ -5884,7 +5887,7 @@ export default function App() {
   if (!authReady) return <div className="auth-root"><style>{STYLE}</style><div className="loading-screen">Loading secure session…</div></div>;
   if (!session) return <LoginScreen passwordSetup={passwordSetup} />;
   if (passwordSetup) return <LoginScreen passwordSetup />;
-  if (accessError) return <div className="auth-root"><style>{STYLE}</style><div className="auth-panel"><div className="auth-logo">UR</div><div className="auth-title">Access unavailable</div><div className="auth-error"><AlertTriangle size={15} />{accessError}</div>{accessRetry ? <div className="auth-note">Retrying automatically (attempt {accessRetry.attempt} of {accessRetry.of})…</div> : null}<button type="button" className="auth-submit" onClick={retryAccess}>Retry</button><button type="button" className="auth-link" onClick={signOut}>Sign out</button></div></div>;
+  if (accessError) return <div className="auth-root"><style>{STYLE}</style><div className="auth-panel"><div className="auth-logo">UR</div><div className="auth-title">Access unavailable</div><div className="auth-error"><AlertTriangle size={15} />{accessError}</div>{accessRetry ? <div className="auth-note">Retrying automatically (attempt {accessRetry.attempt} of {accessRetry.of})…</div> : null}<button type="button" className="auth-submit" onClick={retryAccess} disabled={accessChecking}>{accessChecking ? "Checking access…" : "Retry"}</button><button type="button" className="auth-link" onClick={signOut}>Sign out</button></div></div>;
   if (!access) return <div className="auth-root"><style>{STYLE}</style><div className="loading-screen">Loading your dashboard access…</div></div>;
   // F3: key DashboardApp by the access-scope FINGERPRINT. A permission change (account/brand-scope/role) changes the
   // fingerprint, so React atomically replaces the whole subtree with a fresh one -- discarding ALL previous-scope

@@ -43,13 +43,14 @@ ok("A5 an access body is AUTHORIZED only with an access object carrying a userId
 // A harness with a fake clock: the scripted responses are consumed in order (a function is called; an Error rejects).
 function rig(responses) {
   const q = [...responses];
-  const state = { error: "", retry: null, applied: null, fetches: 0, timers: new Map(), nextId: 1, signOuts: 0 };
+  const state = { error: "", retry: null, applied: null, fetches: 0, timers: new Map(), nextId: 1, busy: [], externalApplied: true };
   const loader = createAccessLoader({
     fetchAccess: () => { state.fetches += 1; const r = q.length ? q.shift() : err(500); if (r instanceof Error) return Promise.reject(r); return Promise.resolve(typeof r === "function" ? r() : r); },
     applyAccess: (a) => { state.applied = a; },
     showError: (m) => { state.error = m; },
     showRetry: (r) => { state.retry = r; },
-    hasAppliedAccess: () => state.applied !== null,
+    showBusy: (b) => { state.busy.push(b); },
+    hasAppliedAccess: () => state.externalApplied && state.applied !== null,
     setTimer: (fn, ms) => { const id = state.nextId++; state.timers.set(id, { fn, ms }); return id; },
     clearTimer: (id) => { state.timers.delete(id); },
   });
@@ -124,31 +125,80 @@ function rig(responses) {
     afterBad.error === "Dashboard access response was incomplete." && afterBad.applied === null && afterBad.timers === 1);
 }
 {
-  // B8 once access is applied, NO failure sets the error: a background revalidation failure, or a LATE failure of an
-  // earlier request, never blanks the working dashboard.
-  let releaseLate;
-  const late = new Promise((_, rej) => { releaseLate = () => rej(err(500, "late")); });
-  const { loader, state, flush } = rig([() => late, { access: ACCESS }, err(500, "bg")]);
-  loader.load();                         // request 1 (hangs, fails later)
-  await flush();
-  loader.load(); await flush();          // request 2 succeeds -> access applied
-  loader.load(); await flush();          // request 3 (background) fails
-  releaseLate(); await flush();          // request 1 fails LATE
-  ok("B8 once authorized access is applied, a background failure and a LATE failure of an earlier request change nothing (no error, no retry timer)",
-    state.applied === ACCESS && state.error === "" && state.retry === null && state.timers.size === 0);
+  // B8 once access is applied, NO failure sets the error: background revalidation failures (transient AND definitive)
+  // never blank the working dashboard. (Requests never overlap -- B10 -- so a "late" earlier request cannot exist.)
+  const { loader, state, flush } = rig([{ access: ACCESS }, err(500, "bg"), err(403, "revoked?"), new TypeError("offline")]);
+  loader.load(); await flush();          // cold load succeeds -> access applied
+  loader.load(); await flush();          // background 500
+  loader.load(); await flush();          // background 403
+  loader.load(); await flush();          // background network failure
+  ok("B8 once authorized access is applied, background failures (500, 403, network) change nothing: no error, no retry timer, access kept",
+    state.applied === ACCESS && state.error === "" && state.retry === null && state.timers.size === 0 && state.fetches === 4);
 }
 {
-  // B9 dispose (identity change / unmount) cancels the pending retry and ignores late results.
-  let releaseOk;
-  const pending = new Promise((res) => { releaseOk = () => res({ access: ACCESS }); });
-  const { loader, state, flush } = rig([err(500), () => pending]);
+  // B9 dispose (identity change / unmount) while a request is IN FLIGHT: its late success never applies, its late
+  // failure never shows; a pending automatic retry is cancelled.
+  let releaseOk, releaseErr;
+  const okP = new Promise((res) => { releaseOk = () => res({ access: ACCESS }); });
+  const errP = new Promise((_, rej) => { releaseErr = () => rej(err(500, "late")); });
+  const a = rig([() => okP]);
+  a.loader.load(); await a.flush();
+  a.loader.dispose(); releaseOk(); await a.flush();
+  const b = rig([err(500), () => errP]);
+  b.loader.load(); await b.flush();               // fail -> retry scheduled
+  const timersBefore = b.state.timers.size;
+  const errBefore = b.state.error;
+  b.loader.dispose();
+  releaseErr(); await b.flush();
+  ok("B9 dispose() while a request is in flight: its late SUCCESS never applies, its late FAILURE never changes the error; the scheduled retry is cancelled",
+    a.state.applied === null && a.state.error === "" && timersBefore === 1 && b.state.timers.size === 0 && b.state.error === errBefore && b.state.fetches === 1);
+}
+{
+  // B10 ONE request at a time: 10 Retry presses + a focus/visibility double-fire during a pending cold request share it;
+  // the busy signal brackets the request (Retry disabled meanwhile).
+  let release;
+  const pend = new Promise((_, rej) => { release = () => rej(err(503, "down")); });
+  const { loader, state, flush } = rig([() => pend, { access: ACCESS }]);
   loader.load(); await flush();
-  const timersBefore = state.timers.size;
-  loader.dispose();
-  const r = loader.retryNow(); await flush(); await r;
-  releaseOk(); await flush();
-  ok("B9 dispose() cancels the scheduled retry; after it nothing loads or applies (a late success of another identity never lands)",
-    timersBefore === 1 && state.timers.size === 0 && state.applied === null && state.fetches === 1);
+  for (let i = 0; i < 10; i += 1) loader.retryNow();
+  loader.load(); loader.load();
+  await flush();
+  const fetchesWhilePending = state.fetches;
+  const busyWhilePending = state.busy.slice();
+  release(); await flush();
+  ok("B10 ONE access request at a time: 10 Retry presses + a focus/visibility double-fire during a pending cold request start NO extra fetch; busy is raised once and cleared after; the failure schedules exactly one retry",
+    fetchesWhilePending === 1 && JSON.stringify(busyWhilePending) === JSON.stringify([true]) && JSON.stringify(state.busy) === JSON.stringify([true, false]) && state.timers.size === 1 && state.error === "down");
+}
+{
+  // B11 a background revalidation after access is applied is SILENT: no busy signal, no error, no retry.
+  const { loader, state, flush } = rig([{ access: ACCESS }, err(500, "bg"), { access: ACCESS }]);
+  loader.load(); await flush();
+  const busyAfterCold = state.busy.length;
+  loader.load(); await flush();
+  loader.load(); await flush();
+  ok("B11 a background revalidation after access is applied raises NO busy signal and shows nothing (silent); the cold load did bracket busy",
+    busyAfterCold === 2 && state.busy.length === 2 && state.error === "" && state.timers.size === 0);
+}
+{
+  // B12 the sign-out window: the caller's applied-state is reset BEFORE dispose(); a background failure landing then
+  // must not raise a stale error (the loader remembers it already applied access).
+  let release;
+  const pend = new Promise((_, rej) => { release = () => rej(err(500, "stale")); });
+  const { loader, state, flush } = rig([{ access: ACCESS }, () => pend]);
+  loader.load(); await flush();
+  loader.load(); await flush();          // background request in flight
+  state.externalApplied = false;         // SIGNED_OUT handler reset the fingerprint; dispose() not yet run
+  release(); await flush();
+  ok("B12 [sign-out window] once THIS loader applied access, a failure landing after the caller's applied-state was reset (before dispose) shows no error and schedules no retry",
+    state.error === "" && state.timers.size === 0 && state.retry === null);
+}
+{
+  // B13 a failure while an automatic retry is ALREADY scheduled keeps exactly one timer.
+  const { loader, state, flush } = rig([err(500), err(502)]);
+  loader.load(); await flush();          // fail -> timer #1
+  loader.load(); await flush();          // focus revalidation fails too (no request in flight)
+  ok("B13 a second failure while an automatic retry is already scheduled keeps exactly ONE timer (no duplicate chain)",
+    state.timers.size === 1 && state.fetches === 2 && state.retry && state.retry.attempt === 1);
 }
 
 /* ========================= C. App.jsx wiring (static) ========================= */
@@ -163,11 +213,18 @@ ok("C2 the access effect drives createAccessLoader (fetchAccess = /api/access?ac
 ok("C3 the old error-pinning path is gone (no `if (active && initial) setAccessError` catch)", !/if \(active && initial\) setAccessError/.test(app));
 const screen = (app.match(/if \(accessError\) return [^\n]*/) || [""])[0];
 ok("C4 the 'Access unavailable' screen offers Retry (retryAccess) AND Sign out, plus the automatic-retry status",
-  /onClick=\{retryAccess\}>Retry<\/button>/.test(screen) && /onClick=\{signOut\}>Sign out<\/button>/.test(screen) && /Retrying automatically/.test(screen));
+  /onClick=\{retryAccess\} disabled=\{accessChecking\}>\{accessChecking \? "Checking access[^"]*" : "Retry"\}<\/button>/.test(screen) && /onClick=\{signOut\}>Sign out<\/button>/.test(screen) && /Retrying automatically/.test(screen));
 const firstEarlyReturn = app.indexOf("if (!supabase) return <div");
 const retryHook = app.indexOf("const retryAccess = useCallback(");
 ok("C5 retryAccess is a hook declared BEFORE every early return of App (#310 hook order)", retryHook > 0 && firstEarlyReturn > 0 && retryHook < firstEarlyReturn);
 ok("C6 nothing in the recovery path signs the user out automatically (signOut only on the button / auth events)",
   !/createAccessLoader\(\{[\s\S]{0,1500}signOut/.test(app.slice(app.indexOf("const loader = createAccessLoader"), app.indexOf("const loader = createAccessLoader") + 1600)));
+
+ok("C7 App.jsx wires the loader to the real state: showError=setAccessError, showRetry=setAccessRetry, showBusy=setAccessChecking; focus + visibilitychange revalidate through loader.load(); retryAccess calls retryNow(); sign-out / no session clears the error",
+  /showError: setAccessError,/.test(app) && /showRetry: setAccessRetry,/.test(app) && /showBusy: setAccessChecking,/.test(app)
+  && /const revalidate = \(\) => \{[^\n]*loader\.load\(\); \};/.test(app) && /window\.addEventListener\("focus", revalidate\);/.test(app) && /document\.addEventListener\("visibilitychange", revalidate\);/.test(app)
+  && /const retryAccess = useCallback\(\(\) => \{ if \(accessLoaderRef\.current\) accessLoaderRef\.current\.retryNow\(\); \}, \[\]\);/.test(app)
+  && /if \(!session\?\.access_token\) \{ setAccess\(null\); setAccessError\(""\); setAccessRetry\(null\); setAccessChecking\(false\);/.test(app)
+  && /if \(authEventClearsAccess\(event\)\) \{ setAccess\(null\); setAccessError\(""\);/.test(app));
 
 writeSync(1, `\naccess-recovery: ${passed} assertions passed\n`);
