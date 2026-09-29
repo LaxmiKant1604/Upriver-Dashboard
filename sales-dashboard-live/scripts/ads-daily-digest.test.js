@@ -194,10 +194,11 @@ const mkRow = (acct, d, i) => ({
       cS.length === 0 && hit === ents[0].rows && reusableEntriesOf(m2).length === 1);
     let rejected = 0; for (const bad of [{ key: "\u0000x", table: "t", rows: Object.freeze([]) }, { key: "k", table: "t", rows: [] }, { key: 1, table: "t", rows: Object.freeze([]) }]) { try { seedReusable(new Map(), bad); } catch { rejected += 1; } }
     ok("D5t seedReusable fails closed on a reserved key, unfrozen rows or a non-string key", rejected === 3);
-    ok("D5u the contract: the Ads statement's reuseTable is valid (shared, ONE table, no time function); a non-shared, a second table or now() is refused",
+    ok("D5u the contract: the Ads statement's reuseTable is valid (its text is PINNED; shared, ONE table, no time function); a non-shared statement, a second (even unqualified) table, now(), or ANY text change is refused",
       reuseTableValid(A.ADS_DAILY_STATEMENT) && reuseTableValid(A.ADS_DAILY_SCOPED_STATEMENT.sharedVariant)
       && !reuseTableValid({ ...A.ADS_DAILY_STATEMENT, shared: false }) && !reuseTableValid({ ...A.ADS_DAILY_STATEMENT, text: A.ADS_DAILY_STATEMENT.text + " join public.report_snapshots r on true" })
       && !reuseTableValid({ ...A.ADS_DAILY_STATEMENT, text: "select now() from public.ads_daily_source_rows" }) && !reuseTableValid({ ...A.ADS_DAILY_STATEMENT, reuseTable: "report_snapshots" })
+      && !reuseTableValid({ ...A.ADS_DAILY_STATEMENT, text: A.ADS_DAILY_STATEMENT.text + " " }) && !reuseTableValid({ ...A.ADS_DAILY_STATEMENT, text: A.ADS_DAILY_STATEMENT.text.replace("public.ads_daily_source_rows", "public.ads_daily_source_rows a join ads_sync_state z using (account_id)") })
       && workerRouteProblems(BV_ROUTE).length === 0 && workerRouteProblems(PF_ROUTE).length === 0
       && workerRouteProblems({ ...PF_ROUTE, evidence: { ...PF_ROUTE.evidence, sql: PF_ROUTE.evidence.sql.map((q) => (q.name === "ads_daily" ? { ...q, reuseTable: "report_snapshots" } : q)) } }).some((x) => x.startsWith("evidence-sql-reuse-table-invalid:")));
   }

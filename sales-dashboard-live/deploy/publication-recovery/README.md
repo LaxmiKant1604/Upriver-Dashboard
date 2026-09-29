@@ -318,16 +318,31 @@ route-CLI change):
   cap bounds everything else. Only tier-1 / watermark see reused rows: every verification, per-job, dependency,
   deep-sweep and route-CLI read stays fresh, so reuse can DELAY a detection, never verify or publish. Quiet passes read
   ~20-95 MB instead of ~300 MB.
-- **Tier-1 circuit breaker**: the first statement timeout (57014) of a pass means the database is starved; the rest of
-  the pass is NOT issued (each counted as a failed evaluation, alert `tier1-circuit-open`, outcome `partial`, never
-  `complete`), the next pass retries. Every evidence failure keeps its SQLSTATE in the alert sample.
+- **Tier-1 circuit breaker**: a SECOND statement timeout (57014) in a pass -- two distinct reads each ran the full 60 s
+  -- means the database is starved; the rest of the pass is NOT issued (each counted as a failed evaluation, alert
+  `tier1-circuit-open`, outcome `partial`, never `complete`), the next pass retries. One slow statement alone fails only
+  its own evaluation (a shared Ads scan's replays are instant). Every pass starts at a rotating (region, route) offset,
+  so a persistent trip never hides the same pairs. Every evidence failure keeps its SQLSTATE in the alert sample. A
+  FAILED live-row read never confirms or revokes a served row: the target's tier-1 state is `served-unknown` (matrix:
+  deferred), the pass is partial.
 - **Deep sweep pause**: a sweep in progress re-checks the scheduler gate before EVERY step (before, only at sweep start)
-  and pauses -- no evidence read, no child, step not consumed, scan lease kept -- while a scheduler cycle runs.
-- The token digest of the deep sweep's token-change rule is now taken over every region's LATEST successful parts, so a
-  pass that could not evaluate a region never looks like a token change.
+  and pauses -- no evidence read, no child, step not consumed, scan lease kept -- while the gate is blocked. The
+  sync_cycles gate cannot see scheduler-v2's downstream route jobs (materialize / materialize-inventory run under
+  priority-partial buckets), so the soak sets `PRW_SCHEDULER_WINDOWS` (worker.env.example) to cover each region's cycle
+  incl. its downstream jobs and the nightly backstops.
+- The token digest of the deep sweep's token-change rule is taken over every region's parts from the CURRENT epoch only
+  (otherwise it is dropped and the per-epoch sweep covers the route), so a partial pass never looks like a token change.
 
-`PRW_SCAN_INTERVAL_SECONDS` stays at 900 or more through the soak. `memcheck --real` protocol (Codex): stop the worker
-service first (or install without `--restart`) so it cannot overlap the measurement; run in a window with the scheduler
+**Before activating `brand-view` or `brand-view-portfolio` (Gate D blocker, review 2026-09-29):** their deep-sweep
+`--verify-exact` child re-resolves every ALREADY-CURRENT unit through a fresh region evidence read (the portfolio's is the
+unscoped Ads partials scan; Brand View's the account-scoped twin). Observe-only today that is ~1 read per child (units are
+not yet route-promotable); once units carry route lineage it is 1 + N reads per child (N = current units, ~30-40 per region
+for the portfolio) -- the same load class this fix removes from tier-1. The verify child must be bounded (one fresh region
+read per run, or a content-equivalence proof) before those two routes go live.
+
+`PRW_SCAN_INTERVAL_SECONDS` stays at 900 or more through the soak. `memcheck --real` protocol (Codex): `sudo systemctl
+stop publication-recovery` and confirm `systemctl is-active` is not `active` BEFORE the run (installing without
+`--restart` does NOT stop an already-running worker) so it cannot overlap the measurement; run in a window with the scheduler
 gate clear AND no scheduler-v2 downstream job or backstop reconciler running; record the gate and the database state
 before and after; the unchanged verdict (tier-1 <= 60 s, zero evidence failures, on a COLD full pass) must PASS in at
 least two separate windows. If the quiet cold pass still fails, activation stays blocked and the owner-approved

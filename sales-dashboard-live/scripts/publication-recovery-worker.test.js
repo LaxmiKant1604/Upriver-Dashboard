@@ -867,6 +867,7 @@ const drain = async (rig, max = 30) => { let i = 0; while (i < max && (await rig
     rig.store.readRouteEvidence = async (route, ctx, opt = {}) => {
       env.calls.push("ev:" + route.id + "/" + ctx.region);
       env.opts.push(opt);
+      if (env.timeoutAt && env.timeoutAt.has(route.id + "/" + ctx.region)) { const e = new Error("canceling statement due to statement timeout"); e.code = "57014"; throw e; }
       if (route.id === "brand-view" || route.id === "brand-view-portfolio") {
         const base = async () => { env.scans += 1; if (env.fail) { const e = new Error("canceling statement due to statement timeout"); e.code = env.fail; env.fail = null; throw e; } return [{ n: "1" }]; };
         const q = opt && opt.sweepCache ? sweepMemoQuery(base, opt.sweepCache) : base;
@@ -885,7 +886,7 @@ const drain = async (rig, max = 30) => { let i = 0; while (i < max && (await rig
     const firstEv = env.calls.findIndex((c) => c.startsWith("ev:"));
     const p2 = await pass(rig, 700);
     ok("19a [DB load]: two tier-1 passes with a byte-identical Ads change probe issue ONE shared scan (the 2nd pass is seeded: reason 'reused'); the probe is read before the pass's first evidence read",
-      p1.ran && p2.ran && env.scans === 1 && env.calls[0] === "probe" && firstEv > 0 && p1.sum.sharedReuse.reason === "empty" && p2.sum.sharedReuse.reason === "reused" && p2.sum.sharedReuse.seeded === 1 && rig.worker.stats.sharedReuseHits === 1 && rig.worker.stats.sharedReuseScans === 1);
+      p1.ran && p2.ran && env.scans === 1 && env.calls[0] === "probe" && firstEv > 0 && p1.sum.sharedReuse.reason === "empty" && p1.sum.sharedReuse.scanned === 1 && p2.sum.sharedReuse.reason === "reused" && p2.sum.sharedReuse.seeded === 1 && p2.sum.sharedReuse.scanned === 0 && rig.worker.stats.sharedReuseHits === 1 && rig.worker.stats.sharedReuseScans === 1);
   }
   // (b) ANY single probe field change -> a rescan (and the fresh rows are carried again).
   {
@@ -931,20 +932,48 @@ const drain = async (rig, max = 30) => { let i = 0; while (i < max && (await rig
     ok("19e [DB load]: PRW_SHARED_EVIDENCE_REUSE_SECONDS=0 turns reuse OFF: every pass scans and the probe is never read",
       env.scans === 2 && !env.calls.includes("probe") && p2.sum.sharedReuse.reason === "disabled");
   }
-  // (f) the CIRCUIT BREAKER: the first statement timeout stops the pass; nothing after it is issued; never 'complete'.
+  // (f) the CIRCUIT BREAKER (review round 2): ONE slow statement fails only its own evaluation (the shared Ads scan's
+  // replays are instant); a SECOND distinct statement timeout means a starved database -> the rest is not issued.
+  const order = [];
+  for (const g of ["india", "europe-au"]) for (const id of ["oli", "listings", "fba-plan", "returns-v3", "ads", "fba", "brand-view-brands", "sku-movement", "brand-view", "brand-view-portfolio"]) order.push(id + "/" + g);
+  {
+    const { rig, env } = mkReuseRig();
+    env.timeoutAt = new Set(["oli/india"]);
+    const p1 = await pass(rig, 0);
+    const evs = env.calls.filter((c) => c.startsWith("ev:"));
+    ok("19f [DB load]: ONE statement timeout does NOT open the circuit: only that evaluation fails; all 20 pairs are still evaluated",
+      p1.sum.circuit === null && p1.sum.skipped === 0 && p1.sum.errors === 1 && evs.length === 20);
+  }
   {
     const { rig, env } = mkReuseRig();
     env.fail = "57014";
+    const p1 = await pass(rig, 0);
+    const rep = (p1.sum.alerts || []).find((a) => a.code === "evidence-read-failed-replayed");
+    ok("19f' [DB load]: a timed-out SHARED Ads scan alone does not open it either (the other Ads evaluations replay at once, errors counted); every pair is evaluated",
+      p1.sum.circuit === null && p1.sum.skipped === 0 && env.calls.filter((c) => c.startsWith("ev:")).length === 20 && !!rep && rep.n === 3 && p1.sum.errors === 4);
+  }
+  {
+    const { rig, env } = mkReuseRig();
+    env.timeoutAt = new Set(["oli/india", "listings/india"]);
     const outs = []; const finish0 = rig.store.finishScan.bind(rig.store);
     rig.store.finishScan = async (a) => { if (a && a.kind === "tier1") outs.push(a.outcome); return finish0(a); };
     const p1 = await pass(rig, 0);
-    const i = env.calls.indexOf("ev:brand-view/india");
+    const i = env.calls.indexOf("ev:listings/india");
     const after = env.calls.slice(i + 1).filter((c) => c.startsWith("ev:"));
     const al = (p1.sum.alerts || []).find((a) => a.code === "tier1-circuit-open");
+    env.timeoutAt = new Set();
     const p2 = await pass(rig, 700);
-    ok("19f [DB load]: a statement timeout (57014) OPENS the tier-1 circuit: no later evaluation is issued (portfolio/india + all 10 europe-au), each is counted ('tier1-circuit-open', errors), the outcome is never 'complete'; a failed shared read is NEVER carried (the next pass scans again and completes)",
-      i >= 0 && after.length === 0 && p1.sum.circuit === "57014" && p1.sum.skipped === 11 && p1.sum.errors === 12 && !!al && al.n === 11 && outs[0] === "partial"
-      && env.scans === 2 && p2.sum.circuit === null && p2.sum.errors === 0 && outs[1] === "complete" && rig.worker.stats.tier1Skipped === 11);
+    ok("19f'' [DB load]: a SECOND distinct statement timeout OPENS the circuit: the other 18 pairs are not issued, each counted ('tier1-circuit-open'), outcome 'partial'; the next pass completes",
+      i >= 0 && after.length === 0 && p1.sum.circuit === "57014" && p1.sum.skipped === 18 && p1.sum.errors === 20 && !!al && al.n === 18 && outs[0] === "partial"
+      && p2.sum.circuit === null && p2.sum.errors === 0 && outs[1] === "complete" && rig.worker.stats.tier1Skipped === 18);
+  }
+  // (i) the pass starts at a ROTATING (region, route) offset, so a persistent trip never hides the same pairs every pass.
+  {
+    const { rig, env } = mkReuseRig();
+    const firsts = [];
+    for (let k = 0; k < 3; k += 1) { const before = env.calls.length; await pass(rig, k === 0 ? 0 : 700); firsts.push(env.calls.slice(before).find((c) => c.startsWith("ev:"))); }
+    ok("19i [DB load]: consecutive tier-1 passes start at a rotating (region, route) offset (oli/india, then listings/india, then fba-plan/india)",
+      JSON.stringify(firsts) === JSON.stringify(["ev:" + order[0], "ev:" + order[1], "ev:" + order[2]]));
   }
   // (g) the watermark pass never probes in observe-only (no live pair); tier-1-only reads carry the sweep cache.
   {
@@ -955,6 +984,25 @@ const drain = async (rig, max = 30) => { let i = 0; while (i < max && (await rig
     ok("19g [DB load]: the watermark pass issues NO probe and no evidence read in observe-only; tier-1 evaluations carry a sweep cache",
       noProbe && env.opts.length > 0 && env.opts.every((o) => o && o.sweepCache instanceof Map));
   }
+}
+// 19j [review round 2] a FAILED tier-1 live-row read never confirms (or revokes) a served row: the verified legacy target
+// stays unproven (served_confirmed null), its tier-1 state is 'served-unknown' (matrix: deferred), the pass is partial.
+{
+  const lg = makeRig({ liveRoutes: ["oli"] });
+  setEv(lg, "oli", "india", { A1: "cov:1" });
+  lg.world.set("oli", "india", "A1", "stale");
+  await lg.worker.watermarkPass(); await lg.worker.processOneBatch();
+  const before = stateOf(lg.store, "oli", "A1");
+  lg.store.readLiveRowWritesSince = async () => { const e = new Error("canceling statement due to statement timeout"); e.code = "57014"; throw e; };
+  await lg.worker.tier1Scan();
+  const sum = lg.store.scanRow.tier1Summary;
+  const obs = [...lg.store.observations.values()].find((o) => o.route_id === "oli" && o.target_key === "A1" && o.tier === 1);
+  const lr = (sum.alerts || []).find((a) => a.code === "live-row-read-failed");
+  const m = buildHandoffMatrix({ stateRows: (await lg.store.status()).state, directory: await lg.store.readDirectory(), regions: ["india"] });
+  ok("19j [review round 2]: a FAILED tier-1 live-row read never confirms a legacy served row (served_confirmed stays null): tier-1 state 'served-unknown' (matrix: deferred), alert 'oli/india:57014', the pass counts the error",
+    before.served_confirmed == null && stateOf(lg.store, "oli", "A1").served_confirmed == null && !!obs && obs.state === "served-unknown"
+    && !!lr && lr.samples.includes("oli/india:57014") && sum.errors >= 1
+    && m.some((r) => r.accountId === "A1" && r.reportKey === "brand-sales" && r.handoff === "deferred"));
 }
 // 19h [DB load] the deep sweep PAUSES while the scheduler gate is blocked (before, the gate was read only at sweep START,
 // so a running sweep stepped -- evidence reads + heavy children -- straight through a scheduler cycle); it resumes with

@@ -68,7 +68,8 @@ export const GATE_CLASSES = Object.freeze({ SCHEDULER: "scheduler-window-global"
 // The class an account target that LEFT its region's durable directory is superseded with (worker.js step 3b).
 export const TARGET_OUT_OF_SCOPE_CLASS = "superseded-target-out-of-scope";
 // Tier-1 findings (newer than the verification) that make a verified target's hand-off 'deferred' in the matrix.
-const TIER1_STALE_HANDOFF = Object.freeze({ "token-advanced": "evidence-advanced", "identity-rollover": "identity-rollover" });
+// 'served-unknown': the tier-1 live-row read FAILED, so the served proof could not be re-checked this pass (never 'ok').
+const TIER1_STALE_HANDOFF = Object.freeze({ "token-advanced": "evidence-advanced", "identity-rollover": "identity-rollover", "served-unknown": "served-unknown" });
 const errCode = (e) => (S(e && (e.code || e.name)) || "error").replace(/[^A-Za-z0-9._-]/g, "").slice(0, 40) || "error";
 // Tier-1 finding codes that need a re-check (enqueue 'scan' when live).
 const ACTIONABLE_TIER1 = new Set(["target-missing", "token-unobserved", "token-advanced", "served-row-foreign", "identity-rollover"]);
@@ -375,13 +376,19 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
     const probe = await probeShared();
     const sweepCache = new Map();
     const { seeded, reason: reuseReason } = seedShared(sweepCache, probe, t0);
-    // CIRCUIT BREAKER (database protection): the first statement timeout (57014) of the pass means the database is
-    // starved -- every later evaluation would likely also run up to the 60 s timeout and add load. The rest of the pass is
-    // NOT issued: each is counted as a failed evaluation ('tier1-circuit-open', outcome 'partial', never 'complete') and
-    // the next pass retries. Only detection is delayed; nothing is verified or published by tier-1.
-    let circuit = null, skipped = 0;
-    for (const region of config.regions) {
-      for (const id of byPriority) {
+    // CIRCUIT BREAKER (database protection): a SECOND statement timeout (57014) in the pass -- two distinct reads each ran
+    // the full 60 s -- means the database is starved: the rest of the pass is NOT issued (each counted as a failed
+    // evaluation, 'tier1-circuit-open', outcome 'partial', never 'complete'); the next pass retries. One slow statement
+    // alone fails only its own evaluation (+ instant sweep-cache replays). The pass STARTS at a rotating (region, route)
+    // offset, so a persistent trip never hides the same pairs every pass. Only detection is delayed; tier-1 never
+    // verifies or publishes.
+    let circuit = null, skipped = 0, timeouts = 0;
+    const noteTimeout = (code, where) => { if (code !== "57014") return; timeouts += 1; if (timeouts >= 2 && !circuit) { circuit = code; log(`tier-1 circuit OPEN after ${where} (second statement timeout): the rest of this pass is not issued`); } };
+    const pairs = [];
+    for (const region of config.regions) for (const id of byPriority) pairs.push([region, id]);
+    const offset = pairs.length ? stats.tier1Scans % pairs.length : 0;
+    for (const [region, id] of [...pairs.slice(offset), ...pairs.slice(0, offset)]) {
+      {
         const route = routeOf.get(id);
         if (circuit) { errors += 1; skipped += 1; stats.tier1Skipped += 1; alerts.add("tier1-circuit-open", `${id}/${region}:${circuit}`); continue; }
         let ev;
@@ -394,7 +401,7 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
           const replay = !!(e && e.sweepReplay === true);
           alerts.add(code === "DIRECTORY_EMPTY" ? "directory-empty" : replay ? "evidence-read-failed-replayed" : "evidence-read-failed", `${id}/${region}:${code}`);
           log(`tier-1 ${id}/${region} evidence read failed: ${code}${replay ? " (replay of this pass's failed shared read)" : ""}`);
-          if (code === "57014" && !circuit) { circuit = code; log(`tier-1 circuit OPEN after ${id}/${region} (statement timeout): the rest of this pass is not issued`); }
+          if (!replay) noteTimeout(code, `${id}/${region}`);
           continue;
         }
         const live = isLive(ctl, id, region);
@@ -405,8 +412,20 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
           let sc; try { sc = liveRowScopesFor(route, tier1Target(route, tk, region)); } catch { continue; }
           for (const x of sc) scopes.push({ key: tk, ...x });
         }
-        let writes = new Map();
-        if (scopes.length) { try { writes = await store.readLiveRowWritesSince(scopes); } catch { alerts.add("live-row-read-failed", `${id}/${region}`); } }
+        // A FAILED live-row read leaves every scoped target's served state UNKNOWN: no confirmation and no revocation is
+        // pushed (a confirmation without the read would be unproven), the pass is 'partial', and a 57014 counts toward the
+        // circuit breaker.
+        let writes = new Map(), liveReadFailed = false;
+        const scopedKeys = new Set(scopes.map((x) => x.key));
+        if (scopes.length) {
+          try { writes = await store.readLiveRowWritesSince(scopes); }
+          catch (e) {
+            liveReadFailed = true; errors += 1;
+            const lc = S(e && (e.code || e.name)).replace(/[^A-Za-z0-9._-]/g, "").slice(0, 40) || "error";
+            alerts.add("live-row-read-failed", `${id}/${region}:${lc}`);
+            noteTimeout(lc, `${id}/${region} live-row read`);
+          }
+        }
         const parts = [];
         const byRegion = digestParts.get(id) || new Map(); digestParts.set(id, byRegion); byRegion.set(region, parts);
         for (const [tk, e] of ev.map) {
@@ -421,7 +440,8 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
           else if (e.token !== s.verified_token) code = "token-advanced";
           else {
             const w = writes.get(tk);
-            if (w && w.maxMs != null && s.verified_ms != null && w.maxMs > s.verified_ms) code = "served-row-foreign";
+            if (liveReadFailed && scopedKeys.has(tk)) code = "served-unknown";
+            else if (w && w.maxMs != null && s.verified_ms != null && w.maxMs > s.verified_ms) code = "served-row-foreign";
             else if (route.identityAsOf) {
               let want = null;
               try { want = identityAsOfFor(route, tier1Target(route, tk, region), { now: t0, directory: ev.directory }); } catch { want = null; }
@@ -457,12 +477,18 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
         }
       }
     }
-    for (const [id, byRegion] of digestParts) {
+    for (const id of byPriority) {
       const known = tokenParts.get(id) || new Map(); tokenParts.set(id, known);
-      for (const [region, parts] of byRegion) known.set(region, parts);
-      // Only once EVERY region has been evaluated at least once: a digest over a subset would look like a token change.
-      if (config.regions.every((g) => known.has(g))) tokenDigest.set(id, tokenDigestOf(config.regions.flatMap((g) => known.get(g))));
+      for (const [region, parts] of digestParts.get(id) || []) known.set(region, { epoch, parts });
+      // Only when EVERY region was evaluated in THIS epoch: a digest over a subset (or an older epoch's parts) would look
+      // like a token change. Otherwise the digest is dropped and the token-change sweep waits (the per-epoch sweep stays).
+      if (config.regions.every((g) => known.has(g) && known.get(g).epoch === epoch)) tokenDigest.set(id, tokenDigestOf(config.regions.flatMap((g) => known.get(g).parts)));
+      else tokenDigest.delete(id);
     }
+    // Honest reuse report: 'scanned' = shared results read FRESH this pass (a seeded key can coexist with a fresh scan of
+    // another key, e.g. a rolled window).
+    const scanned = reusableEntriesOf(sweepCache).filter((e) => !seeded.has(e.key)).length;
+    const reuseOutcome = seeded.size && scanned ? "reused+scanned" : reuseReason;
     harvestShared(sweepCache, seeded, probe);
     // Global checks (metadata only).
     let gate = null, fence = null;
@@ -478,7 +504,7 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
     for (let i = 0; i < baseline.length; i += 500) await store.recordBaseline(baseline.slice(i, i + 500));
     for (let i = 0; i < served.length; i += 500) await store.recordBaseline(served.slice(i, i + 500));
     const durationMs = clock() - t0;
-    const summary = { epoch, durationMs, targets, errors, skipped, circuit, sharedReuse: { reason: reuseReason, seeded: seeded.size, probe: probe ? "ok" : "unavailable" }, enqueued: enq, findings: counts, gate: gate ? { blocked: gate.blocked, reason: gate.reason, orphanPartial: gate.orphanPartial } : null, fence, alerts: alerts.list() };
+    const summary = { epoch, durationMs, targets, errors, skipped, circuit, sharedReuse: { reason: reuseOutcome, seeded: seeded.size, scanned, probe: probe ? "ok" : "unavailable" }, enqueued: enq, findings: counts, gate: gate ? { blocked: gate.blocked, reason: gate.reason, orphanPartial: gate.orphanPartial } : null, fence, alerts: alerts.list() };
     await store.finishScan({ holder: workerId, kind: "tier1", outcome: errors ? "partial" : "complete", summary });
     stats.tier1Scans += 1; stats.tier1Ms = durationMs; stats.tier1Enqueued += enq; stats.lastTier1At = new Date(clock()).toISOString();
     log(`tier-1 ${errors ? "partial" : "complete"} epoch=${epoch} targets=${targets} enqueued=${enq} ms=${durationMs} alerts=${alerts.size}`);
