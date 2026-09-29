@@ -241,6 +241,7 @@ and the job upsert) is an ignored orphan, never a stall. The status also shows t
 | Real SQL of the redesigned 20260934 + the store's own SQL + exact rollback | `publication-recovery-sql-selftest.mjs` (PGlite, 55 assertions) |
 | Ads digest partials: the per-(account, day) partials folded per window == the old per-window `adr1:` digest (both statements) on real Postgres; an empty window is `adr1:0:0:0` | `ads-digest-equivalence-selftest.mjs` (PGlite, 12 assertions), `ads-daily-digest.test.js` |
 | Tier-1 sweep cache: ONE shared Ads scan per tier-1 / watermark pass; every other read stays account-scoped and fresh; a failed shared read fails fast for that pass only | worker 15t (one Map per pass), 1j / 5d / 11f (the per-job, dependency and deep-sweep reads get none), brand-view E11, `ads-daily-digest.test.js` |
+| Database load: cross-pass reuse of the shared Ads partials behind the change probe (every probe field, the 1 h cap from the ORIGINAL scan, a probe that cannot vouch stores nothing, a failure is never carried); the tier-1 circuit breaker; the deep-sweep pause while the gate is blocked | worker 19a-19h, digest D5r-D5u, `ads-change-probe-selftest.mjs` (PGlite, 12 assertions) |
 | FBA reconcile fairness: most-starved accounts first (served inventory date), a hung account defers `deadline-account-in-flight` without stalling the run, the served-date reads are capped (10 s per read, 60 s in total including an in-flight read) | `fba-reconcile-fairness.test.js` (F14, F15) |
 | Structural zero-export (import closure, allow-list) | `worker-closure.test.js`, `publication-recovery-units.test.js` C1-C9 |
 
@@ -297,6 +298,41 @@ never publish; the new path yields the documented empty digest `adr1:0:0:0` (pin
 before, 32.5-33.6 s after (the VM runs ~20% faster than that machine). The VM `--real` re-run on the release is the
 verdict.
 
+**Production database load (2026-09-29).** The observe-only `c30ff11` worker overloaded the production database, a
+small Supabase compute tier (`max_connections` 60, `shared_buffers` 224 MB, shared burstable CPU). Its six full-window
+Ads digest scans per pass read ~43 GB and ~4,900 s of database time in 13.5 h (the busiest production statement uses ~22
+s/h). During the india cycle the database was CPU-throttled (an index-only evidence query ran 57 s on CPU; a 6 MB query
+49.8 s with zero disk reads; dashboard `report_snapshots` reads ~1 s against a 15 ms baseline), tier-1 took 811-1,374 s
+with evidence timeouts, and the india `materialize-inventory` job hit its 90-minute timeout (LKG kept). So the capacity
+gate is the DATABASE's, and the worker must not be its main load. Three worker-only changes (no gate, acquisition or
+route-CLI change):
+
+- **Cross-pass reuse** of the shared Ads digest partials: at the start of every tier-1 / watermark pass the worker reads
+  the Ads table's CHANGE PROBE (`store-pg.js ADS_CHANGE_PROBE_SQL`: the cumulative insert / update / delete counters,
+  oid, relfilenode, the stats-reset stamps and the postmaster start, in its own transaction BEFORE any evidence read) and
+  reuses the previous pass's partials only while the probe is byte-identical and the entry is younger than
+  `PRW_SHARED_EVIDENCE_REUSE_SECONDS` (default and maximum 3600; 0 = off). A statement opts in with `reuseTable`; the
+  contract admits it only on a shared statement that reads that table alone and no time function. Exactness: every
+  committed write moves the probe (PGlite-proven in `ads-change-probe-selftest.mjs`, incl. a no-op upsert, a delete and
+  TRUNCATE); a write not yet flushed to the statistics can make one pass reuse rows older by that flush delay; the 1 h
+  cap bounds everything else. Only tier-1 / watermark see reused rows: every verification, per-job, dependency,
+  deep-sweep and route-CLI read stays fresh, so reuse can DELAY a detection, never verify or publish. Quiet passes read
+  ~20-95 MB instead of ~300 MB.
+- **Tier-1 circuit breaker**: the first statement timeout (57014) of a pass means the database is starved; the rest of
+  the pass is NOT issued (each counted as a failed evaluation, alert `tier1-circuit-open`, outcome `partial`, never
+  `complete`), the next pass retries. Every evidence failure keeps its SQLSTATE in the alert sample.
+- **Deep sweep pause**: a sweep in progress re-checks the scheduler gate before EVERY step (before, only at sweep start)
+  and pauses -- no evidence read, no child, step not consumed, scan lease kept -- while a scheduler cycle runs.
+- The token digest of the deep sweep's token-change rule is now taken over every region's LATEST successful parts, so a
+  pass that could not evaluate a region never looks like a token change.
+
+`PRW_SCAN_INTERVAL_SECONDS` stays at 900 or more through the soak. `memcheck --real` protocol (Codex): stop the worker
+service first (or install without `--restart`) so it cannot overlap the measurement; run in a window with the scheduler
+gate clear AND no scheduler-v2 downstream job or backstop reconciler running; record the gate and the database state
+before and after; the unchanged verdict (tier-1 <= 60 s, zero evidence failures, on a COLD full pass) must PASS in at
+least two separate windows. If the quiet cold pass still fails, activation stays blocked and the owner-approved
+trigger-maintained digest table (a migration) is the next lever; so is a larger database compute tier.
+
 PASS thresholds: max child peak <= 448 MB; worker 240 + largest child + OS 250 <= 85% of 1024 MB (870 MB); tier-1 <= 60 s;
 per-epoch deep sweep <= 4 h. Otherwise the check prints the measured value and the required change (a longer
 `PRW_SCAN_INTERVAL_SECONDS` / `PRW_DEEP_SWEEP_HOURS`, fewer `PRW_REGIONS`, or a larger shape such as OCI A1.Flex). A
@@ -312,6 +348,7 @@ legacy families only, 2026-09-25, development machine): a full scan took 312 s, 
 | `scripts/worker/publication-recovery-status.mjs` | Redacted status, alerts, writer fence per key, hand-off matrix (`--summary`, `--matrix`) |
 | `scripts/worker/publication-recovery-memcheck.mjs` | Memory / throughput check (synthetic and `--real` on the VM) |
 | `scripts/worker/publication-recovery-sql-selftest.mjs` | Real-SQL self-test of 20260934 + the store's SQL (PGlite; exit 3 = SKIPPED, not a pass) |
+| `scripts/worker/ads-change-probe-selftest.mjs` | Real-SQL proof that every Ads-table write kind moves the reuse change probe and a quiet interval does not (`PRW_PGLITE_DIR=<dir> node scripts/worker/ads-change-probe-selftest.mjs`; exit 3 = SKIPPED, not a pass) |
 | `scripts/worker/ads-digest-equivalence-selftest.mjs` | Real-SQL proof that the Ads digest partials equal the old per-window digests (`PRW_PGLITE_DIR=<dir> node scripts/worker/ads-digest-equivalence-selftest.mjs`; exit 3 = SKIPPED, not a pass) |
 | `scripts/worker/publication-recovery-reaper.mjs` | Operator tool: stuck-cycle candidates (read-only) / finalize ONE with sign-off (section 8) |
 | `lib/server/recovery/{routes,route-contract,registry,classify,runner,worker,store-pg,config,memory-store}.js` | Worker modules (`memory-store` is test-only) |

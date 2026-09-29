@@ -25,6 +25,7 @@ import { verifiedPgConfig } from "../pg-tls.js";
 // byte-identical); re-exported here for existing importers.
 import { composeEvidenceTokens } from "./routes/oli.route.js";
 import { evaluateRouteEvidence, sweepMemoQuery } from "./routes.js";
+export { adsChangeProbeSignature, ADS_CHANGE_PROBE_FIELDS } from "./routes.js";
 import { ROUTE_REGIONS } from "./route-contract.js";
 import { normalizeMarketplace } from "../sync/oli-sales-estimate.js";
 import { readReportWriterFence } from "../sync/report-writer-fence.js";
@@ -298,6 +299,17 @@ export const STATE_SQL = "select target_key, owner_account_ids, verified_token, 
   + "verified_rows, last_class, last_reason, handoff, served_confirmed from public.publication_recovery_state where route_id = $1 and region = $2 and requested_as_of = $3::date";
 export const REPORT_KEYS_SQL = "select report_key, count(*)::int as n from public.report_snapshots where report_key not like 'scheduler-v2/%' group by report_key order by report_key";
 export const CONTROL_SQL = "select c.enabled, coalesce((select jsonb_object_agg(r.route_id, jsonb_build_object('liveEnabled', r.live_enabled, 'liveRegions', to_jsonb(r.live_regions))) from public.publication_recovery_routes r), '{}'::jsonb) as routes from public.publication_recovery_control c where c.id = true";
+// The CHANGE PROBE of public.ads_daily_source_rows (the only SHARED_REUSE_TABLES entry): cumulative tuple counters +
+// everything that can move them without a counted write (a rewrite / TRUNCATE -> relfilenode; drop + recreate -> oid;
+// a stats reset -> db_reset / fixed_reset; a restart / failover -> pm_start). All text, so equality is byte-exact. Read
+// in its OWN transaction (the first stats access of that transaction), BEFORE the pass's scan takes its snapshot.
+export const ADS_CHANGE_PROBE_SQL = "select c.oid::text as rel_oid, c.relfilenode::text as rel_filenode, "
+  + "pg_stat_get_tuples_inserted(c.oid)::text as n_ins, pg_stat_get_tuples_updated(c.oid)::text as n_upd, pg_stat_get_tuples_deleted(c.oid)::text as n_del, "
+  + "coalesce((select to_char(d.stats_reset at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') from pg_stat_database d where d.datname = current_database()), 'never') as db_reset, "
+  + "coalesce((select to_char(b.stats_reset at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') from pg_stat_bgwriter b), 'never') as fixed_reset, "
+  + "to_char(pg_postmaster_start_time() at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as pm_start, "
+  + "pg_is_in_recovery()::text as in_recovery, current_setting('track_counts') as track_counts "
+  + "from pg_class c where c.oid = to_regclass('public.ads_daily_source_rows')";
 export const SCAN_STATE_SQL = "select deep_sweep, holder, (extract(epoch from last_tier1_at) * 1000)::bigint as last_tier1_ms from public.publication_recovery_scan where id = true";
 
 /** Split live-row scopes into the eq / like batches (pure). scopes: [{ key, reportKey, accountIdEq | accountIdLike, paramsEq? }]. */
@@ -451,6 +463,8 @@ export function createRecoveryStore({ connectionString, max = 2, poolImpl = null
     },
     /** Every live (non-shadow) report_key with its row count (the unregistered-live-report-key detector). */
     async readReportKeys() { return (await read(REPORT_KEYS_SQL)).map((r) => ({ report_key: S(r.report_key), n: Number(r.n) || 0 })); },
+    /** The Ads table's change probe (ONE own read-only transaction; its first stats access) -> the row, or null. */
+    async readAdsChangeProbe() { return (await read(ADS_CHANGE_PROBE_SQL))[0] || null; },
     /** The scan row's deep-sweep progress + tier-1 cadence. */
     async readScanState() {
       const r = (await read(SCAN_STATE_SQL))[0] || null;

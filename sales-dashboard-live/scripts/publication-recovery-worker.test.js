@@ -14,7 +14,7 @@ import {
   cycleBucketKind, evaluateSchedulerGate, upstreamBlockersFrom, reaperCandidates, buildWorkerDirectory, likeToRegExp, liveWriteBatches, recoveryPoolConfig,
   SCHEDULER_FIXED_CYCLE_BUCKETS, PAID_STALE_SECONDS, GATE_IN_FLIGHT_SECONDS, STRANDED_PARTIAL_SECONDS, SCHEDULER_GATE_SQL, DIRECTORY_SQL, SCHEDULER_GATE_ROW_LIMIT,
 } from "../lib/server/recovery/store-pg.js";
-import { PUBLICATION_ROUTES, routeById, utcDMinus1 } from "../lib/server/recovery/routes.js";
+import { PUBLICATION_ROUTES, routeById, utcDMinus1, sweepMemoQuery, ADS_CHANGE_PROBE_FIELDS } from "../lib/server/recovery/routes.js";
 import { buildRouteArgs } from "../lib/server/recovery/runner.js";
 import { CLASSES, HANDOFF_CLASSES } from "../lib/server/recovery/classify.js";
 import { ROUTE_LIVE_ATTESTATIONS, missingLiveAttestation } from "../lib/server/recovery/config.js";
@@ -113,7 +113,7 @@ function makeWorld() {
 }
 
 const ALL_ATTESTED = { skuMovementServeToken: true, fbaPlanRouteFence: true, lhv3ServeGate: true };
-function makeRig({ liveRoutes = PUBLICATION_ROUTES.map((r) => r.id), regions = ["india"], control = null, attestations = ALL_ATTESTED, childMaxOldSpaceMb = 448, workerId = "w1", world, store, clockRef, dir = { india: ["A1", "A2"] } } = {}) {
+function makeRig({ liveRoutes = PUBLICATION_ROUTES.map((r) => r.id), regions = ["india"], control = null, attestations = ALL_ATTESTED, childMaxOldSpaceMb = 448, workerId = "w1", world, store, clockRef, dir = { india: ["A1", "A2"] }, configExtra = {} } = {}) {
   const clk = clockRef || { t: T0 };
   const st = store || createMemoryStore({ clock: () => clk.t, control });
   if (!store) st.env.directoryAccounts = Object.entries(dir).flatMap(([g, ids]) => ids.map((id) => ({ accountId: id, country: COUNTRY[g], name: "Acct " + id, currency: "INR" })));
@@ -123,7 +123,7 @@ function makeRig({ liveRoutes = PUBLICATION_ROUTES.map((r) => r.id), regions = [
   const config = {
     workerId, host: "test", pollSeconds: 20, scanIntervalSeconds: 600, scanLeaseSeconds: 3600, batch: 5, leaseSeconds: 2700, maxAttempts: 4, maxClaims: 5, maxRearms: 12,
     childMaxOldSpaceMb, keepDays: 14, stopGraceSeconds: 1, schedulerCooldownSeconds: 900, schedulerWindows: [], deepSweepHours: 6, awaitMaxMinutes: 120,
-    liveRoutes, regions, concurrency: 1, attestations,
+    liveRoutes, regions, concurrency: 1, attestations, ...configExtra,
   };
   const logs = [];
   const worker = createRecoveryWorker({ store: st, run: wd.run, config, clock: () => clk.t, sleep: async (ms) => { clk.t += ms; }, randomUUID: () => `00000000-0000-4000-8000-${String(++n).padStart(12, "0")}`, version: "test", organizationFingerprint: "org-fp-test", log: (m) => logs.push(m) });
@@ -620,13 +620,13 @@ const drain = async (rig, max = 30) => { let i = 0; while (i < max && (await rig
   {
     const rig4 = makeRig({ regions: ["india"], dir: { india: ["A1"] } });
     const boom = (code, replay) => () => { const e = new Error("x"); e.code = code; if (replay) e.sweepReplay = true; throw e; };
-    rig4.store.env.evidence.set("brand-view|india", boom("57014", false));
-    rig4.store.env.evidence.set("brand-view-portfolio|india", boom("57014", true));
+    rig4.store.env.evidence.set("brand-view|india", boom("08006", false));
+    rig4.store.env.evidence.set("brand-view-portfolio|india", boom("08006", true));
     await rig4.worker.tier1Scan();
     const al = (rig4.store.scanRow.tier1Summary && rig4.store.scanRow.tier1Summary.alerts) || [];
     const real = al.find((a) => a.code === "evidence-read-failed"), rep = al.find((a) => a.code === "evidence-read-failed-replayed");
-    ok("15u [review P3]: tier-1 records the evidence error CODE ('brand-view/india:57014') and a sweep-cache replay as 'evidence-read-failed-replayed' (one real failure, not two)",
-      !!real && real.n === 1 && J(real.samples) === J(["brand-view/india:57014"]) && !!rep && rep.n === 1 && J(rep.samples) === J(["brand-view-portfolio/india:57014"]));
+    ok("15u [review P3]: tier-1 records the evidence error CODE ('brand-view/india:08006') and a sweep-cache replay as 'evidence-read-failed-replayed' (one real failure, not two)",
+      !!real && real.n === 1 && J(real.samples) === J(["brand-view/india:08006"]) && !!rep && rep.n === 1 && J(rep.samples) === J(["brand-view-portfolio/india:08006"]));
   }
   // 15b [P2d] a route CLI's current binding WITHOUT its served read-back is never verified.
   const r2 = makeRig({ liveRoutes: ["returns-v3"] });
@@ -851,6 +851,133 @@ const drain = async (rig, max = 30) => { let i = 0; while (i < max && (await rig
   ok("18a: a live child that found every unit already current -> verified published:false (hand-off already-current, never 'repaired'); a live child that published -> published:true / 'repaired'",
     J(kindsOf(rig.world)) === J(["verify", "live", "verify"]) && a1.status === "verified" && a1.published !== true && stateOf(rig.store, "returns-v3", "A1").handoff !== "repaired"
     && b1.status === "verified" && b1.published === true && stateOf(rig2.store, "returns-v3", "A1").handoff === "repaired");
+}
+
+// 19. [tier-1 DB load, 2026-09-29] the observe-only worker starved the production database: CROSS-pass reuse of the
+// shared Ads evidence behind the table's change probe (hard cap), the tier-1 CIRCUIT BREAKER, and the deep-sweep PAUSE
+// while the scheduler gate is blocked. Detection may be delayed; nothing is ever verified / published on reused data.
+{
+  const probeRow = (over = {}) => ({ rel_oid: "17626", rel_filenode: "17626", n_ins: "1", n_upd: "2", n_del: "3", db_reset: "2026-07-15T13:16:47.376507Z", fixed_reset: "2026-07-15T13:14:45.039092Z", pm_start: "2026-07-28T08:57:54.589406Z", in_recovery: "false", track_counts: "on", ...over });
+  const SHARED = Object.freeze({ name: "ads_daily", text: "select ads-partials", shared: true, reuseTable: "ads_daily_source_rows", params: () => ["campaign-performance-v1", "2026-04-01", "2026-09-29"] });
+  const mkReuseRig = (opts = {}) => {
+    const rig = makeRig({ regions: ["india", "europe-au"], dir: { india: ["A1"], "europe-au": ["E1"] }, ...opts });
+    const env = { probe: probeRow(), scans: 0, fail: null, calls: [], opts: [] };
+    rig.store.readAdsChangeProbe = async () => { env.calls.push("probe"); if (env.probe instanceof Error) throw env.probe; return env.probe; };
+    const orig = rig.store.readRouteEvidence.bind(rig.store);
+    rig.store.readRouteEvidence = async (route, ctx, opt = {}) => {
+      env.calls.push("ev:" + route.id + "/" + ctx.region);
+      env.opts.push(opt);
+      if (route.id === "brand-view" || route.id === "brand-view-portfolio") {
+        const base = async () => { env.scans += 1; if (env.fail) { const e = new Error("canceling statement due to statement timeout"); e.code = env.fail; env.fail = null; throw e; } return [{ n: "1" }]; };
+        const q = opt && opt.sweepCache ? sweepMemoQuery(base, opt.sweepCache) : base;
+        await q(SHARED.text, SHARED.params(), SHARED);
+      }
+      return orig(route, ctx, opt);
+    };
+    return { rig, env };
+  };
+  const pass = async (rig, advanceS) => { rig.clk.t += advanceS * 1000; const ran = await rig.worker.tier1Scan(); return { ran, sum: rig.store.scanRow.tier1Summary }; };
+
+  // (a) an unchanged probe: the second pass REUSES (one scan for two passes); the probe runs BEFORE any evidence read.
+  {
+    const { rig, env } = mkReuseRig();
+    const p1 = await pass(rig, 0);
+    const firstEv = env.calls.findIndex((c) => c.startsWith("ev:"));
+    const p2 = await pass(rig, 700);
+    ok("19a [DB load]: two tier-1 passes with a byte-identical Ads change probe issue ONE shared scan (the 2nd pass is seeded: reason 'reused'); the probe is read before the pass's first evidence read",
+      p1.ran && p2.ran && env.scans === 1 && env.calls[0] === "probe" && firstEv > 0 && p1.sum.sharedReuse.reason === "empty" && p2.sum.sharedReuse.reason === "reused" && p2.sum.sharedReuse.seeded === 1 && rig.worker.stats.sharedReuseHits === 1 && rig.worker.stats.sharedReuseScans === 1);
+  }
+  // (b) ANY single probe field change -> a rescan (and the fresh rows are carried again).
+  {
+    const moved = [];
+    for (const f of ADS_CHANGE_PROBE_FIELDS.filter((x) => x !== "in_recovery" && x !== "track_counts")) {
+      const { rig, env } = mkReuseRig();
+      await pass(rig, 0);
+      env.probe = probeRow({ [f]: f === "db_reset" || f === "fixed_reset" || f === "pm_start" ? "2026-09-29T06:00:00.000000Z" : "999" });
+      const p2 = await pass(rig, 700);
+      const p3 = await pass(rig, 700);
+      moved.push(env.scans === 2 && p2.sum.sharedReuse.reason === "probe-changed" && p3.sum.sharedReuse.reason === "reused" ? f : "FAIL:" + f);
+    }
+    ok("19b [DB load]: a change of ANY probe field (oid, relfilenode, ins/upd/del counters, db / fixed stats reset, postmaster start) forces a rescan; the fresh rows are carried to the next pass",
+      moved.length === 8 && moved.every((m) => !m.startsWith("FAIL")));
+  }
+  // (c) a probe that cannot vouch (standby, counting off, a blank field, a read error) -> no reuse AND nothing stored.
+  {
+    const bad = [probeRow({ in_recovery: "true" }), probeRow({ track_counts: "off" }), probeRow({ n_upd: "" }), probeRow({ n_del: null }), null, Object.assign(new Error("x"), { code: "57014" })];
+    const res = [];
+    for (const b of bad) {
+      const { rig, env } = mkReuseRig();
+      env.probe = b;
+      const p1 = await pass(rig, 0); const p2 = await pass(rig, 700);
+      env.probe = probeRow();
+      const p3 = await pass(rig, 700);
+      res.push(env.scans === 3 && p1.sum.sharedReuse.probe === "unavailable" && p2.sum.sharedReuse.reason === "probe-unavailable" && p3.sum.sharedReuse.reason === "empty");
+    }
+    ok("19c [DB load]: a probe that cannot vouch (in_recovery, track_counts off, a blank / null field, no row, a read error) disables reuse for that pass and stores NOTHING (every pass scans)", res.length === 6 && res.every(Boolean));
+  }
+  // (d) the HARD cap counts from the ORIGINAL scan (a reused entry is never re-tagged).
+  {
+    const { rig, env } = mkReuseRig();
+    await pass(rig, 0);
+    const p2 = await pass(rig, 3000);
+    const p3 = await pass(rig, 700);
+    ok("19d [DB load]: reuse at +3000 s, then a RESCAN at +3700 s (the 1 h cap counts from the ORIGINAL scan: a reused entry keeps its sig + time)",
+      p2.sum.sharedReuse.reason === "reused" && p3.sum.sharedReuse.reason === "cap" && env.scans === 2);
+  }
+  // (e) cap 0 = reuse OFF (every pass scans, the probe is never read).
+  {
+    const { rig, env } = mkReuseRig({ configExtra: { sharedEvidenceReuseSeconds: 0 } });
+    await pass(rig, 0); const p2 = await pass(rig, 700);
+    ok("19e [DB load]: PRW_SHARED_EVIDENCE_REUSE_SECONDS=0 turns reuse OFF: every pass scans and the probe is never read",
+      env.scans === 2 && !env.calls.includes("probe") && p2.sum.sharedReuse.reason === "disabled");
+  }
+  // (f) the CIRCUIT BREAKER: the first statement timeout stops the pass; nothing after it is issued; never 'complete'.
+  {
+    const { rig, env } = mkReuseRig();
+    env.fail = "57014";
+    const outs = []; const finish0 = rig.store.finishScan.bind(rig.store);
+    rig.store.finishScan = async (a) => { if (a && a.kind === "tier1") outs.push(a.outcome); return finish0(a); };
+    const p1 = await pass(rig, 0);
+    const i = env.calls.indexOf("ev:brand-view/india");
+    const after = env.calls.slice(i + 1).filter((c) => c.startsWith("ev:"));
+    const al = (p1.sum.alerts || []).find((a) => a.code === "tier1-circuit-open");
+    const p2 = await pass(rig, 700);
+    ok("19f [DB load]: a statement timeout (57014) OPENS the tier-1 circuit: no later evaluation is issued (portfolio/india + all 10 europe-au), each is counted ('tier1-circuit-open', errors), the outcome is never 'complete'; a failed shared read is NEVER carried (the next pass scans again and completes)",
+      i >= 0 && after.length === 0 && p1.sum.circuit === "57014" && p1.sum.skipped === 11 && p1.sum.errors === 12 && !!al && al.n === 11 && outs[0] === "partial"
+      && env.scans === 2 && p2.sum.circuit === null && p2.sum.errors === 0 && outs[1] === "complete" && rig.worker.stats.tier1Skipped === 11);
+  }
+  // (g) the watermark pass never probes in observe-only (no live pair); tier-1-only reads carry the sweep cache.
+  {
+    const { rig, env } = mkReuseRig({ liveRoutes: [] });
+    await rig.worker.watermarkPass();
+    const noProbe = !env.calls.includes("probe");
+    await pass(rig, 0);
+    ok("19g [DB load]: the watermark pass issues NO probe and no evidence read in observe-only; tier-1 evaluations carry a sweep cache",
+      noProbe && env.opts.length > 0 && env.opts.every((o) => o && o.sweepCache instanceof Map));
+  }
+}
+// 19h [DB load] the deep sweep PAUSES while the scheduler gate is blocked (before, the gate was read only at sweep START,
+// so a running sweep stepped -- evidence reads + heavy children -- straight through a scheduler cycle); it resumes with
+// the step not consumed once the gate clears, and keeps its scan lease meanwhile.
+{
+  const rig = makeRig({ liveRoutes: ["returns-v3"], dir: { india: ["A1"] } });
+  for (const r of PUBLICATION_ROUTES) { if (r.grain === "region") setEv(rig, r.id, "india", { "region:india": r.id + "-t" }); else setEv(rig, r.id, "india", { A1: r.id + "-t" }); }
+  for (const r of PUBLICATION_ROUTES) rig.world.set(r.id, "india", r.grain === "region" ? "region:india" : "A1", "current", r.id + "-t");
+  const started = await rig.worker.deepSweepStep();
+  await rig.worker.deepSweepStep();
+  const c1 = rig.world.calls.length;
+  rig.store.env.cycles.push({ bucket: "india", status: "running", started_ms: rig.clk.t - 60000, updated_ms: rig.clk.t - 1000 });
+  const evBefore = rig.store.readRouteEvidence;
+  let evReads = 0;
+  rig.store.readRouteEvidence = async (...a) => { evReads += 1; return evBefore.apply(rig.store, a); };
+  const paused1 = await rig.worker.deepSweepStep();
+  const paused2 = await rig.worker.deepSweepStep();
+  const pausedCount = rig.worker.stats.deepPaused;
+  rig.store.env.cycles.length = 0; rig.clk.t += 61 * 1000;
+  let steps = 0; while ((await rig.worker.deepSweepStep()) && steps < 40) steps += 1;
+  ok("19h [DB load]: a deep sweep in progress PAUSES while the scheduler gate is blocked (no evidence read, no child, step not consumed, gate re-read at most every 3 polls) and resumes when it clears (all 10 routes swept exactly once)",
+    started === true && c1 === 1 && paused1 === false && paused2 === false && pausedCount === 1 && rig.world.calls.length === 10 && evReads === 9
+    && new Set(rig.world.calls.map((c) => c.route)).size === 10);
 }
 
 writeSync(1, `publication-recovery-worker: ${passed} passed\n`);

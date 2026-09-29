@@ -96,6 +96,9 @@ export function loadRecoveryConfig(env = process.env) {
   if (env.PRW_LIVE_FAMILIES != null && String(env.PRW_LIVE_FAMILIES).trim() !== "") errors.push("PRW_LIVE_FAMILIES is RETIRED (route registry): set PRW_LIVE_ROUTES to explicit route ids instead (" + ROUTE_IDS.join(",") + ")");
   const pollSeconds = intIn(env.PRW_POLL_SECONDS, 20, 15, 120, "PRW_POLL_SECONDS", errors);
   const scanIntervalSeconds = intIn(env.PRW_SCAN_INTERVAL_SECONDS, 600, 300, 3600, "PRW_SCAN_INTERVAL_SECONDS", errors);
+  // Cross-pass reuse of SHARED evidence (the Ads digest partials) while its table's change probe is unchanged: the hard
+  // cap in seconds (0 = off: every pass scans, as before). Only detection can be delayed by it (never a verification).
+  const sharedEvidenceReuseSeconds = intIn(env.PRW_SHARED_EVIDENCE_REUSE_SECONDS, 3600, 0, 3600, "PRW_SHARED_EVIDENCE_REUSE_SECONDS", errors);
   const batch = intIn(env.PRW_BATCH, 5, 1, 10, "PRW_BATCH", errors);
   const leaseSeconds = intIn(env.PRW_LEASE_SECONDS, 2700, 1500, 7200, "PRW_LEASE_SECONDS", errors);
   const maxAttempts = intIn(env.PRW_MAX_ATTEMPTS, 6, 2, 20, "PRW_MAX_ATTEMPTS", errors);
@@ -124,7 +127,7 @@ export function loadRecoveryConfig(env = process.env) {
   if (!regions.length) errors.push("PRW_REGIONS resolved to an empty set");
   const workerId = String(env.PRW_WORKER_ID || `${os.hostname()}-${process.pid}`).replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 120);
   const config = Object.freeze({
-    workerId, host: os.hostname().slice(0, 120), pollSeconds, scanIntervalSeconds, scanLeaseSeconds: Math.max(900, leaseSeconds),
+    workerId, host: os.hostname().slice(0, 120), pollSeconds, scanIntervalSeconds, sharedEvidenceReuseSeconds, scanLeaseSeconds: Math.max(900, leaseSeconds),
     batch, leaseSeconds, maxAttempts, maxClaims, maxRearms, childMaxOldSpaceMb, keepDays, stopGraceSeconds,
     schedulerCooldownSeconds, schedulerWindows: Object.freeze(schedulerWindows), deepSweepHours, awaitMaxMinutes, shadowPrune,
     liveRoutes: Object.freeze(liveRoutes),

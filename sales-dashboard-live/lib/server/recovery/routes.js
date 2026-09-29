@@ -136,8 +136,46 @@ export function sweepMemoQuery(query, sweepCache) {
     if (!Array.isArray(rows)) return rows;
     const frozen = Object.freeze(rows.map((row) => (row && typeof row === "object" ? Object.freeze({ ...row }) : row)));
     sweepCache.set(key, frozen);
+    // A statement that opted into CROSS-pass reuse (route-contract.js reuseTable) is registered so the worker can carry
+    // its rows to the next pass behind that table's change probe. A failure is never registered.
+    if (typeof statement.reuseTable === "string") registerReusable(sweepCache, key, statement.reuseTable);
     return frozen;
   };
+}
+
+// The sweep cache's registry of cross-pass-reusable entries: key -> reuse table (a reserved key; a statement key never
+// starts with NUL).
+const REUSABLE_KEYS = "\u0000reusable";
+function registerReusable(sweepCache, key, table) {
+  let reg = sweepCache.get(REUSABLE_KEYS);
+  if (!(reg instanceof Map)) { reg = new Map(); sweepCache.set(REUSABLE_KEYS, reg); }
+  reg.set(key, table);
+}
+/** The reusable SUCCESSFUL entries of a pass: [{ key, table, rows }] (frozen rows only; failure markers never). */
+export function reusableEntriesOf(sweepCache) {
+  const reg = sweepCache instanceof Map ? sweepCache.get(REUSABLE_KEYS) : null;
+  if (!(reg instanceof Map)) return [];
+  const out = [];
+  for (const [key, table] of reg) { const rows = sweepCache.get(key); if (Array.isArray(rows) && Object.isFrozen(rows)) out.push({ key, table, rows }); }
+  return out;
+}
+/** Seed a NEW pass's sweep cache with carried rows (they stay registered, so a later pass can carry them again). */
+export function seedReusable(sweepCache, { key, table, rows }) {
+  if (!(sweepCache instanceof Map) || typeof key !== "string" || key.startsWith("\u0000") || !Array.isArray(rows) || !Object.isFrozen(rows)) throw new Error("seedReusable: a frozen reusable entry is required (fail closed)");
+  sweepCache.set(key, rows);
+  registerReusable(sweepCache, key, table);
+}
+
+// The change probe of a SHARED_REUSE_TABLES table (store-pg.js ADS_CHANGE_PROBE_SQL): its fields, and the byte-exact
+// signature the worker compares across passes.
+export const ADS_CHANGE_PROBE_FIELDS = Object.freeze(["rel_oid", "rel_filenode", "n_ins", "n_upd", "n_del", "db_reset", "fixed_reset", "pm_start", "in_recovery", "track_counts"]);
+/** The probe's byte-exact signature, or null when it cannot vouch for "unchanged" (missing row / field, a standby, counting off). */
+export function adsChangeProbeSignature(row) {
+  if (!row || typeof row !== "object") return null;
+  const vals = ADS_CHANGE_PROBE_FIELDS.map((f) => (row[f] == null ? "" : String(row[f])));
+  if (vals.some((v) => v === "")) return null;
+  if (String(row.in_recovery) !== "false" || String(row.track_counts) !== "on") return null;
+  return vals.join("|");
 }
 
 /** The pinned tier-1 target of a route target key in a region: { targetKey, accountId?, region } (THROWS if malformed). */

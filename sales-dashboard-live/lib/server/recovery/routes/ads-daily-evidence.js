@@ -74,6 +74,9 @@ export const ADS_DAILY_STATEMENT = Object.freeze({
   name: "ads_daily",
   text: ADS_DAILY_PARTIALS_SQL,
   shared: true,
+  // Cross-pass reuse (worker tier-1 / watermark only): its rows depend on public.ads_daily_source_rows ALONE (+ params),
+  // so the worker may reuse them while that table's change probe is unchanged (hard cap: 1 h; route-contract.js).
+  reuseTable: "ads_daily_source_rows",
   params: (ctx = {}) => { const u = adsDailyUnionWindow(ctx); return [ACTIVE_ADS_SOURCE_KEY, u.from, u.to]; },
 });
 

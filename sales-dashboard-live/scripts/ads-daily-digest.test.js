@@ -12,8 +12,8 @@ import { writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import * as D from "../lib/server/sync/brand-view-dependency-readers.js";
 import * as A from "../lib/server/recovery/routes/ads-daily-evidence.js";
-import { sweepMemoQuery, buildEvidenceContext, evaluateRouteEvidence } from "../lib/server/recovery/routes.js";
-import { workerRouteProblems } from "../lib/server/recovery/route-contract.js";
+import { sweepMemoQuery, buildEvidenceContext, evaluateRouteEvidence, reusableEntriesOf, seedReusable } from "../lib/server/recovery/routes.js";
+import { workerRouteProblems, reuseTableValid } from "../lib/server/recovery/route-contract.js";
 import { marketplaceToday } from "../lib/marketplaces.js";
 import BV_ROUTE from "../lib/server/recovery/routes/brand-view.route.js";
 import PF_ROUTE from "../lib/server/recovery/routes/brand-view-portfolio.route.js";
@@ -176,6 +176,31 @@ const mkRow = (acct, d, i) => ({
   ok("D5e a non-array result is passed through (evaluateRouteEvidence fails closed on it) and never cached", !Array.isArray(na1) && calls.filter((c) => c === "NOTARR|[]").length === 2);
   ok("D5f a truthy NON-boolean shared flag does not enable reuse", (await (async () => { const c2 = []; const q2 = sweepMemoQuery(async (t) => { c2.push(t); return []; }, new Map()); await q2("x", [], { shared: "true" }); await q2("x", [], { shared: "true" }); return c2.length; })()) === 2);
   ok("D5g no cache -> the query itself (byte-identical path)", sweepMemoQuery(base, null) === base);
+  // D5r-u [DB load, 2026-09-29] the CROSS-pass reuse registry: only a successful statement that opted in (reuseTable) is
+  // carried; a failure never is; a seeded entry is served without a query and stays carriable; the contract admits
+  // reuseTable ONLY on a shared statement that reads that one table and no time function.
+  {
+    const cR = [];
+    const RS = Object.freeze({ shared: true, reuseTable: "ads_daily_source_rows" });
+    const m1 = new Map(); const qR = sweepMemoQuery(async (t) => { cR.push(t); if (t === "BAD") { const e = new Error("x"); e.code = "57014"; throw e; } return [{ v: t }]; }, m1);
+    await qR("GOOD", [1], RS); await qR("PLAIN", [1], { shared: true }); try { await qR("BAD", [1], RS); } catch { /* the failure */ }
+    const ents = reusableEntriesOf(m1);
+    ok("D5r only a SUCCESSFUL statement that opted in (reuseTable) is carriable: not a plain shared one, never a failure",
+      ents.length === 1 && ents[0].key === "GOOD\u0000[1]" && ents[0].table === "ads_daily_source_rows" && Object.isFrozen(ents[0].rows));
+    const m2 = new Map(); seedReusable(m2, ents[0]);
+    const cS = []; const qS = sweepMemoQuery(async (t) => { cS.push(t); return []; }, m2);
+    const hit = await qS("GOOD", [1], RS);
+    ok("D5s a SEEDED entry is served without any query (same frozen rows) and stays carriable for the next pass",
+      cS.length === 0 && hit === ents[0].rows && reusableEntriesOf(m2).length === 1);
+    let rejected = 0; for (const bad of [{ key: "\u0000x", table: "t", rows: Object.freeze([]) }, { key: "k", table: "t", rows: [] }, { key: 1, table: "t", rows: Object.freeze([]) }]) { try { seedReusable(new Map(), bad); } catch { rejected += 1; } }
+    ok("D5t seedReusable fails closed on a reserved key, unfrozen rows or a non-string key", rejected === 3);
+    ok("D5u the contract: the Ads statement's reuseTable is valid (shared, ONE table, no time function); a non-shared, a second table or now() is refused",
+      reuseTableValid(A.ADS_DAILY_STATEMENT) && reuseTableValid(A.ADS_DAILY_SCOPED_STATEMENT.sharedVariant)
+      && !reuseTableValid({ ...A.ADS_DAILY_STATEMENT, shared: false }) && !reuseTableValid({ ...A.ADS_DAILY_STATEMENT, text: A.ADS_DAILY_STATEMENT.text + " join public.report_snapshots r on true" })
+      && !reuseTableValid({ ...A.ADS_DAILY_STATEMENT, text: "select now() from public.ads_daily_source_rows" }) && !reuseTableValid({ ...A.ADS_DAILY_STATEMENT, reuseTable: "report_snapshots" })
+      && workerRouteProblems(BV_ROUTE).length === 0 && workerRouteProblems(PF_ROUTE).length === 0
+      && workerRouteProblems({ ...PF_ROUTE, evidence: { ...PF_ROUTE.evidence, sql: PF_ROUTE.evidence.sql.map((q) => (q.name === "ads_daily" ? { ...q, reuseTable: "report_snapshots" } : q)) } }).some((x) => x.startsWith("evidence-sql-reuse-table-invalid:")));
+  }
   // End to end through evaluateRouteEvidence: two region evaluations of the SAME route share ONE Ads partials read.
   const dir = new Map([["IN1", { country: "IN", name: "a" }], ["US1", { country: "US", name: "b" }]]);
   const now = Date.UTC(2026, 8, 28, 16, 0);

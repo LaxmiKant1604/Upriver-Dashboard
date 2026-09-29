@@ -35,7 +35,7 @@
 import { createHash } from "node:crypto";
 import {
   PUBLICATION_ROUTES, topoOrder, utcDMinus1, buildEvidenceContext, tier1Target, liveRowScopesFor, identityAsOfFor,
-  supportsVerifyExact, deepSweepDue, regionTargetKey, regionEvidenceAccountIds,
+  supportsVerifyExact, deepSweepDue, regionTargetKey, regionEvidenceAccountIds, reusableEntriesOf, seedReusable, adsChangeProbeSignature,
 } from "./routes.js";
 import { jobVerdict, classifyRun, runTargets, cleanupUnresolved, outcomeFor, handoffClass, repairKindFor, awaitVerdict, CLASSES, HANDOFF_CLASSES, STATES } from "./classify.js";
 import { makeRunToken, childHeapFor } from "./runner.js";
@@ -219,12 +219,24 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
     polls: 0, watermarkEnqueued: 0, tier1Scans: 0, tier1Ms: 0, tier1Enqueued: 0, deepSteps: 0, deepSweeps: 0, deepAbandoned: 0, batches: 0, childRuns: 0,
     verified: 0, repaired: 0, deferred: 0, retried: 0, dead: 0, superseded: 0, released: 0, rearmed: 0, dependencyEnqueued: 0,
     gateDeferred: 0, awaitDeferred: 0, awaitTimeouts: 0, tokenDisagreements: 0, writerFenced: 0, evidenceErrors: 0,
-    gateUnreadable: 0, liveGateHeld: 0, claimsLost: 0, outOfScope: 0,
+    gateUnreadable: 0, liveGateHeld: 0, claimsLost: 0, outOfScope: 0, tier1Skipped: 0, sharedReuseHits: 0, sharedReuseScans: 0, deepPaused: 0,
     lastError: null, lastTier1At: null, lastVerifiedAt: null,
   };
   let stopping = false, currentChild = null, sweep = null, claimed = null, nextSweepCheckAt = 0;
   const lastWatermarkAt = new Map();
   const tokenDigest = new Map(); // route -> digest of every region's tokens at the last tier-1 (deep-sweep token-change rule)
+  // route -> region -> that region's token parts at its LAST successful tier-1 evaluation: the digest is taken over every
+  // region's latest parts, so a pass that could not evaluate a region never yields a partial (spuriously 'changed') digest.
+  const tokenParts = new Map();
+  // CROSS-pass reuse of shared evidence (route-contract.js SHARED_REUSE_TABLES; the Ads digest partials): key ->
+  // { rows, table, sig, atMs } -- sig = the table's change-probe signature read BEFORE the scan that produced rows. A new
+  // pass is seeded with rows only while the probe is byte-identical and the entry is younger than the hard cap; a reused
+  // entry keeps its ORIGINAL sig + atMs (staleness never accumulates). Tier-1 / watermark only: every per-job, dependency,
+  // deep-sweep and route-CLI read stays fresh, so a stale entry can only DELAY detection -- never verify or publish.
+  const sharedReuse = new Map();
+  const SHARED_REUSE_MAX = 4;
+  const reuseCapMs = Math.max(0, Math.min(3600, Number(config.sharedEvidenceReuseSeconds ?? 3600) || 0)) * 1000;
+  let deepPauseCheckAt = 0;
 
   // routeKind: the legacy reason whitelist applies ONLY to the four legacy-cli routes (classify.js; a route-cli reason is
   // checked against REASON_RULES + ROUTE_REASON_VOCABULARY alone).
@@ -271,6 +283,44 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
     const ctx = buildEvidenceContext({ epoch, now, directory, region, organizationFingerprint });
     return { ctx, directory, map: sweepCache ? await store.readRouteEvidence(route, ctx, { sweepCache }) : await store.readRouteEvidence(route, ctx) };
   }
+  // ---------------- cross-pass reuse of shared evidence ----------------
+  // probeShared: the change probe in its OWN transaction, BEFORE the pass's first evidence read (so any write missing
+  // from a later scan either moved the probe or is still unflushed -- bounded by the cap). null = cannot vouch -> no reuse.
+  async function probeShared() {
+    if (!(reuseCapMs > 0) || typeof store.readAdsChangeProbe !== "function") return null;
+    const atMs = clock();
+    try { const sig = adsChangeProbeSignature(await store.readAdsChangeProbe()); return sig ? { sig, atMs, table: "ads_daily_source_rows" } : null; }
+    catch { return null; }
+  }
+  // seedShared: carry every still-valid entry into this pass's NEW sweep cache -> { seeded: Set<key>, reason }.
+  function seedShared(sweepCache, probe, now) {
+    const seeded = new Set();
+    if (!probe) return { seeded, reason: reuseCapMs > 0 ? "probe-unavailable" : "disabled" };
+    let reason = sharedReuse.size ? "none-valid" : "empty";
+    for (const [key, ent] of [...sharedReuse]) {
+      const valid = ent.table === probe.table && ent.sig === probe.sig && now >= ent.atMs && now - ent.atMs <= reuseCapMs;
+      if (!valid) { sharedReuse.delete(key); reason = ent.sig !== probe.sig ? "probe-changed" : "cap"; continue; }
+      seedReusable(sweepCache, { key, table: ent.table, rows: ent.rows });
+      seeded.add(key);
+    }
+    if (seeded.size) { reason = "reused"; stats.sharedReuseHits += seeded.size; }
+    return { seeded, reason };
+  }
+  // harvestShared: keep this pass's FRESH successful shared results (tagged with this pass's probe); a seeded entry is
+  // never re-tagged, a failure is never kept, and nothing is kept when the probe could not vouch.
+  function harvestShared(sweepCache, seeded, probe) {
+    if (!probe) return;
+    for (const e of reusableEntriesOf(sweepCache)) {
+      if (seeded.has(e.key) || e.table !== probe.table) continue;
+      sharedReuse.set(e.key, { rows: e.rows, table: e.table, sig: probe.sig, atMs: probe.atMs });
+      stats.sharedReuseScans += 1;
+    }
+    while (sharedReuse.size > SHARED_REUSE_MAX) {
+      let oldest = null; for (const [k, v] of sharedReuse) if (!oldest || v.atMs < oldest[1].atMs) oldest = [k, v];
+      sharedReuse.delete(oldest[0]);
+    }
+  }
+
   // Owners are informational for a region target and bounded by the jobs CHECK (<= 128).
   const boundedOwners = (owners) => (Array.isArray(owners) ? owners.slice(0, 128) : []);
 
@@ -282,12 +332,15 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
     // ONE sweep cache per watermark pass (like tier-1): the live Brand View + portfolio pairs of this pass (one clock)
     // read the shared Ads digest partials once, instead of one scan per live route x region.
     const sweepCache = new Map();
+    // The same cross-pass reuse as tier-1, probed lazily (only when a live pair is evaluated: observe-only issues none).
+    let probe = null, seeded = new Set(), probed = false;
     for (const id of byPriority) {
       const route = routeOf.get(id);
       if ((lastWatermarkAt.get(id) || 0) + route.evidence.everySeconds * 1000 > now) continue;
       const regions = config.regions.filter((g) => isLive(ctl, id, g));
       if (!regions.length) continue;
       lastWatermarkAt.set(id, now);
+      if (!probed) { probed = true; probe = await probeShared(); ({ seeded } = seedShared(sweepCache, probe, now)); }
       for (const region of regions) {
         let ev;
         try { ev = await evidenceFor(route, region, epoch, now, sweepCache); } catch (e) { stats.evidenceErrors += 1; log(`watermark ${id}/${region} evidence read failed: ${S(e && (e.code || e.name))}`); continue; }
@@ -301,6 +354,7 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
         }
       }
     }
+    if (probed) harvestShared(sweepCache, seeded, probe);
     stats.watermarkEnqueued += n;
     return n;
   }
@@ -316,11 +370,20 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
     const obs = []; const baseline = []; const served = [];
     const digestParts = new Map();
     // ONE sweep cache per tier-1 pass (dropped when the pass ends): the shared Ads digest partials scan runs once for
-    // every Brand View + portfolio route x region evaluation of this pass (all at the same t0 clock).
+    // every Brand View + portfolio route x region evaluation of this pass (all at the same t0 clock) -- and is CARRIED from
+    // an earlier pass while the Ads table's change probe is unchanged (seedShared; read BEFORE any evidence read).
+    const probe = await probeShared();
     const sweepCache = new Map();
+    const { seeded, reason: reuseReason } = seedShared(sweepCache, probe, t0);
+    // CIRCUIT BREAKER (database protection): the first statement timeout (57014) of the pass means the database is
+    // starved -- every later evaluation would likely also run up to the 60 s timeout and add load. The rest of the pass is
+    // NOT issued: each is counted as a failed evaluation ('tier1-circuit-open', outcome 'partial', never 'complete') and
+    // the next pass retries. Only detection is delayed; nothing is verified or published by tier-1.
+    let circuit = null, skipped = 0;
     for (const region of config.regions) {
       for (const id of byPriority) {
         const route = routeOf.get(id);
+        if (circuit) { errors += 1; skipped += 1; stats.tier1Skipped += 1; alerts.add("tier1-circuit-open", `${id}/${region}:${circuit}`); continue; }
         let ev;
         try { ev = await evidenceFor(route, region, epoch, t0, sweepCache); }
         catch (e) {
@@ -331,6 +394,7 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
           const replay = !!(e && e.sweepReplay === true);
           alerts.add(code === "DIRECTORY_EMPTY" ? "directory-empty" : replay ? "evidence-read-failed-replayed" : "evidence-read-failed", `${id}/${region}:${code}`);
           log(`tier-1 ${id}/${region} evidence read failed: ${code}${replay ? " (replay of this pass's failed shared read)" : ""}`);
+          if (code === "57014" && !circuit) { circuit = code; log(`tier-1 circuit OPEN after ${id}/${region} (statement timeout): the rest of this pass is not issued`); }
           continue;
         }
         const live = isLive(ctl, id, region);
@@ -343,7 +407,8 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
         }
         let writes = new Map();
         if (scopes.length) { try { writes = await store.readLiveRowWritesSince(scopes); } catch { alerts.add("live-row-read-failed", `${id}/${region}`); } }
-        const parts = digestParts.get(id) || []; digestParts.set(id, parts);
+        const parts = [];
+        const byRegion = digestParts.get(id) || new Map(); digestParts.set(id, byRegion); byRegion.set(region, parts);
         for (const [tk, e] of ev.map) {
           targets += 1;
           parts.push(`${region}|${tk}|${S(e.token)}`);
@@ -392,7 +457,13 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
         }
       }
     }
-    for (const [id, parts] of digestParts) tokenDigest.set(id, tokenDigestOf(parts));
+    for (const [id, byRegion] of digestParts) {
+      const known = tokenParts.get(id) || new Map(); tokenParts.set(id, known);
+      for (const [region, parts] of byRegion) known.set(region, parts);
+      // Only once EVERY region has been evaluated at least once: a digest over a subset would look like a token change.
+      if (config.regions.every((g) => known.has(g))) tokenDigest.set(id, tokenDigestOf(config.regions.flatMap((g) => known.get(g))));
+    }
+    harvestShared(sweepCache, seeded, probe);
     // Global checks (metadata only).
     let gate = null, fence = null;
     try { gate = await store.readSchedulerGate({ cooldownSeconds: config.schedulerCooldownSeconds }); for (const a of gate.alerts) alerts.add(a.code, a); }
@@ -407,7 +478,7 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
     for (let i = 0; i < baseline.length; i += 500) await store.recordBaseline(baseline.slice(i, i + 500));
     for (let i = 0; i < served.length; i += 500) await store.recordBaseline(served.slice(i, i + 500));
     const durationMs = clock() - t0;
-    const summary = { epoch, durationMs, targets, errors, enqueued: enq, findings: counts, gate: gate ? { blocked: gate.blocked, reason: gate.reason, orphanPartial: gate.orphanPartial } : null, fence, alerts: alerts.list() };
+    const summary = { epoch, durationMs, targets, errors, skipped, circuit, sharedReuse: { reason: reuseReason, seeded: seeded.size, probe: probe ? "ok" : "unavailable" }, enqueued: enq, findings: counts, gate: gate ? { blocked: gate.blocked, reason: gate.reason, orphanPartial: gate.orphanPartial } : null, fence, alerts: alerts.list() };
     await store.finishScan({ holder: workerId, kind: "tier1", outcome: errors ? "partial" : "complete", summary });
     stats.tier1Scans += 1; stats.tier1Ms = durationMs; stats.tier1Enqueued += enq; stats.lastTier1At = new Date(clock()).toISOString();
     log(`tier-1 ${errors ? "partial" : "complete"} epoch=${epoch} targets=${targets} enqueued=${enq} ms=${durationMs} alerts=${alerts.size}`);
@@ -505,6 +576,20 @@ export function createRecoveryWorker({ store, run, config, clock = () => Date.no
     }
     if (sweep.idx < sweep.steps.length) {
       if (utcDMinus1(clock()) !== sweep.epoch) { await finishSweep("epoch-rolled"); return true; }
+      // PAUSE while the scheduler gate is blocked (before, it was checked only at sweep START, so a sweep in progress kept
+      // stepping -- evidence reads + heavy children -- straight through a scheduler cycle). The step is NOT consumed, the
+      // scan lease is kept, and the gate is re-checked at most every 3 polls while paused. Unreadable gate = paused.
+      if (sweep.pausedSince && clock() < deepPauseCheckAt) return false;
+      let gate;
+      try { gate = await gateNow(); } catch { gate = { blocked: true, reason: "gate-unreadable" }; stats.gateUnreadable += 1; }
+      if (gate && gate.blocked) {
+        deepPauseCheckAt = clock() + pollMs * 3;
+        stats.deepPaused += 1;
+        if (!sweep.pausedSince) { sweep.pausedSince = clock(); log(`deep sweep PAUSED at step ${sweep.idx}/${sweep.steps.length}: ${S(gate.reason).slice(0, 80)}`); }
+        if (!(await keepScanLease())) return true;
+        return false;
+      }
+      if (sweep.pausedSince) { sweep.summary.pausedMs = (sweep.summary.pausedMs || 0) + (clock() - sweep.pausedSince); sweep.pausedSince = null; }
       const { region, route: id } = sweep.steps[sweep.idx++];
       if (!(await keepScanLease())) return true;
       const route = routeOf.get(id);

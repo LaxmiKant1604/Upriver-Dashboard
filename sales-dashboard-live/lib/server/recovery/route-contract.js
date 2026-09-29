@@ -84,6 +84,16 @@ export function isReadOnlyEvidenceSql(text) {
   return !SQL_FORBIDDEN_RE.test(t);
 }
 
+// The ONLY tables whose shared evidence may be reused ACROSS tier-1 passes: each needs a change probe in the worker's
+// store (store-pg.js readAdsChangeProbe). A statement opts in with `reuseTable`; it must be `shared: true` and read that
+// table ALONE (every `public.<table>` it names), so the probe covers everything its rows depend on.
+export const SHARED_REUSE_TABLES = Object.freeze(["ads_daily_source_rows"]);
+export function reuseTableValid(q) {
+  if (!isPlainObject(q) || q.shared !== true || !SHARED_REUSE_TABLES.includes(q.reuseTable)) return false;
+  const tables = new Set((S(q.text).toLowerCase().match(/public\.[a-z_][a-z0-9_]*/g) || []).map((x) => x.slice(7)));
+  return tables.size === 1 && tables.has(q.reuseTable) && !/\b(now|clock_timestamp|statement_timestamp|transaction_timestamp|current_date|current_timestamp|localtime|localtimestamp|random)\b/i.test(S(q.text));
+}
+
 /** Every problem with a WORKER-side route declaration ([] when valid). */
 export function workerRouteProblems(route) {
   const p = [];
@@ -126,7 +136,9 @@ export function workerRouteProblems(route) {
         if (q.sharedVariant !== undefined) {
           const v = q.sharedVariant;
           if (!isPlainObject(v) || v.shared !== true || !isReadOnlyEvidenceSql(v.text) || !isFn(v.params) || v.sharedVariant !== undefined || q.shared === true) p.push("evidence-sql-shared-variant-invalid:" + q.name);
+          if (v && v.reuseTable !== undefined && !reuseTableValid(v)) p.push("evidence-sql-reuse-table-invalid:" + q.name);
         }
+        if (q.reuseTable !== undefined && !reuseTableValid(q)) p.push("evidence-sql-reuse-table-invalid:" + q.name);
       }
     }
     if (!isFn(ev.compose)) p.push("evidence-compose-not-fn");
