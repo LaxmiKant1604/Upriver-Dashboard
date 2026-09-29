@@ -8,3 +8,13 @@
 *.md  text eol=lf
 *.sql text eol=lf
 *.css text eol=lf
+# Workflows and the served boot page are parsed by `\n`-anchored tests; a fresh Windows
+# checkout (core.autocrlf=true) otherwise gets CRLF copies that differ from the LF blobs.
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.html text eol=lf
+# Deployed to Linux (Ubuntu VM): bash rejects CRLF scripts, and `git archive` applies the
+# checkout conversion (core.autocrlf) unless eol is pinned here.
+*.sh  text eol=lf
+*.service text eol=lf
+*.example text eol=lf

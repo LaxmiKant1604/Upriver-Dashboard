@@ -634,7 +634,10 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     // so the Product Catalog family is durably frozen up front and the priority step drains it as a case-(a)
     // continuation (never the case-(c) newly-enabled deferral that produced not-drained). All three are BUILD/OPERATOR
     // arguments (the trusted scheduled OLI operator), never ordinary reads; null/false => byte-identical prior behavior.
-    planSourceKeys = null, executeSourceKeys = null, forceCatalog = false } = {}) => {
+    planSourceKeys = null, executeSourceKeys = null, forceCatalog = false,
+    // WP10b OPTIONAL owner-approved paid-sync ceiling { remainingTokens, reserveTokens } (admin Data Sync Center only).
+    // Threaded verbatim into runBucketSourceSync's zero-create approval gate; null => byte-identical (never passed on).
+    approvedTokenCeiling = null } = {}) => {
     if (!isRoutingScope(bucket)) {
       throw new Error(`buildBucketSourceSyncRuntime.run requires a routing scope (region india|europe-au|us-ca or legacy us|non-us; got "${bucket}").`);
     }
@@ -911,6 +914,7 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         // P0-A: freeze every planned family but CREATE/DRAIN only these (null => execute all, byte-identical).
         executeSourceKeys: executeSourceKeys != null ? new Set(executeSourceKeys) : null,
         forceFreshOli: forceFreshOli === true,
+        ...(approvedTokenCeiling != null ? { approvedTokenCeiling } : {}),
       });
     } catch (e) { return catchDeadline(e); }
     rollup.excludedAccounts = excluded;
@@ -1681,7 +1685,9 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     };
   };
 
-  const runSourceCardAction = async ({ bucket, sourceKey, reuseOnly = false, deadline = null, preflight = null, forceFreshOli = false, scheduledDaily = false } = {}) => {
+  const runSourceCardAction = async ({ bucket, sourceKey, reuseOnly = false, deadline = null, preflight = null, forceFreshOli = false, scheduledDaily = false,
+    // WP10b OPTIONAL owner-approved paid-sync ceiling (admin Data Sync Center only; see run()). null => byte-identical.
+    approvedTokenCeiling = null } = {}) => {
     const entry = sourceRegistryEntry(sourceKey); // typed UNREGISTERED_SOURCE (fail closed)
     // FORCE-FRESH-OLI is authorized ONLY for the order-line-items family (the D-1 "force latest" re-fetch). It is a
     // trusted operator/composition argument (the admin DSC + the GitHub force-latest job), never an ordinary read.
@@ -1701,6 +1707,17 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         sourceKey, bucket,
       };
     }
+    // WP10b: an owner-approved PAID action carries a token ceiling the cycle-cache tranche composition cannot price
+    // read-only (its report plan needs live discovery), so it can never be bounded by the approval: refuse TYPED before
+    // any preflight / DataDoe / write. Only reached when the optional approval is supplied (never by the scheduler).
+    if (approvedTokenCeiling != null && entry.storage !== "durable-history" && entry.storage !== "durable-snapshot") {
+      return {
+        refused: true, code: "PAID_APPROVAL_UNSUPPORTED_ARCHITECTURE",
+        message: "This source family cannot be bounded by an owner-approved token ceiling from the Data Sync Center (no read-only planner); it is not paid-syncable here.",
+        sourceKey, bucket,
+      };
+    }
+    const approvalArg = approvedTokenCeiling != null ? { approvedTokenCeiling } : {};
     // Round-5 blockers 3+4: ONE route-owned deadline (created by the route BEFORE preflight when this is
     // endpoint-driven) and ONE memoized preflight. A caller that already preflighted passes the bundle
     // through; a direct caller still gets the uniform controls-first guarantee here.
@@ -1713,9 +1730,9 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       // any other family, or an ordinary/admin/manual source-card action (scheduledDaily=false), keeps the byte-
       // identical onlySourceKey path (Catalog paused). This never widens execution -- OLI still creates ONLY OLI.
       if (scheduledDaily === true && sourceKey === OLI_SOURCE_KEY) {
-        return run({ bucket, planSourceKeys: [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY], executeSourceKeys: [OLI_SOURCE_KEY], forceCatalog: true, reuseOnly, deadline: dl, preflight: pf, forceFreshOli: freshOli });
+        return run({ bucket, planSourceKeys: [OLI_SOURCE_KEY, CATALOG_SOURCE_KEY], executeSourceKeys: [OLI_SOURCE_KEY], forceCatalog: true, reuseOnly, deadline: dl, preflight: pf, forceFreshOli: freshOli, ...approvalArg });
       }
-      return run({ bucket, onlySourceKey: sourceKey, reuseOnly, deadline: dl, preflight: pf, forceFreshOli: freshOli });
+      return run({ bucket, onlySourceKey: sourceKey, reuseOnly, deadline: dl, preflight: pf, forceFreshOli: freshOli, ...approvalArg });
     }
     // FINDING 1: a cycle-cache family executes ONLY its own canonical source family -- the trusted
     // per-tranche composition FIXED to exactly this family (the full plan is still upserted; execution

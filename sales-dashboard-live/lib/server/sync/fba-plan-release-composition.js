@@ -17,7 +17,7 @@ import { defaultInventoryBatchesOf, overflowSellersFromTruncated, readRecentTrun
 import { readRecentReadinessRejectionOwnership, readinessIsolationFrom } from "./source-readiness-isolation.js";
 import { getRecentSyncCycleIds, getSyncSourceJobsWithMeta, getSyncSourceJobOwnersForCycle } from "../supabase.js";
 import { organizationFingerprint as orgFingerprintOf } from "../source-identity.js";
-import { runControlPackageCli, buildFbaPlanControlPackage } from "./source-priority-control-package.js";
+import { runControlPackageCli, buildFbaPlanControlPackage, MAX_CONTROL_LEASE_WAIT_SECONDS } from "./source-priority-control-package.js";
 import { CONTROLLED_REPORT_KEYS } from "./report-controls.js";
 import { buildLiveReadback } from "./source-priority-release-runner.js";
 import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "./report-publisher.js";
@@ -51,6 +51,11 @@ export function buildFbaPlanRelease(overrides = {}) {
     controlOperationKey = "",
     // Round-8 blocker 1: the lease TTL (seconds) used by apply/renew. The publish heartbeat renews well within it.
     leaseTtlSeconds = 900,
+    // Publication recovery WP13: OPTIONAL bounded lease-wait for every controls.apply (the control envelope ONLY -- the
+    // fetch plan, batches, token ceiling and exports are untouched). 0 (the default) => the apply call is BYTE-IDENTICAL
+    // (no leaseWaitSeconds key -> exactly one attempt); N > 0 => runControlPackageCli retries the apply ONLY on the typed
+    // CONTROL_LEASE_HELD refusal (a zero-write rolled-back transaction) for at most N seconds. The safe-close never waits.
+    leaseWaitSeconds = 0,
     makeRuntime = buildSchedulerV2Runtime,
     makePublisher = buildSchedulerV2Publisher,
     runControlPackage = runControlPackageCli,
@@ -82,6 +87,12 @@ export function buildFbaPlanRelease(overrides = {}) {
     accountScopeIds = null,
   } = overrides;
 
+  // Fail closed at BUILD time on a malformed bound (never "wait forever", never a silent "no wait").
+  if (!Number.isInteger(leaseWaitSeconds) || leaseWaitSeconds < 0 || leaseWaitSeconds > MAX_CONTROL_LEASE_WAIT_SECONDS) {
+    throw new Error("buildFbaPlanRelease leaseWaitSeconds must be an integer in [0, " + MAX_CONTROL_LEASE_WAIT_SECONDS + "] (fail closed).");
+  }
+  const applyLeaseWait = leaseWaitSeconds > 0 ? { leaseWaitSeconds } : {};
+
   const scoped = Array.isArray(accountScopeIds) && accountScopeIds.length > 0
     ? [...new Set(accountScopeIds.map((x) => String(x).trim()).filter(Boolean))]
     : null;
@@ -105,7 +116,7 @@ export function buildFbaPlanRelease(overrides = {}) {
       // Control discovery is the FROZEN set in scoped mode: the apply opens the publication rollout/approvals
       // for EXACTLY the frozen accounts (the exact-set reconcile leaves every OTHER account's transient
       // controls untouched -- snapshots are never touched -- so no outside-wave control mutation occurs).
-      const r = await runControlPackage({ mode: "apply", operator, discoverAccounts: scopedDiscoverAccounts, connectStore, controlledReportKeys, buildApplyPackage, ownerToken, operationKey: controlOperationKey, leaseTtlSeconds });
+      const r = await runControlPackage({ mode: "apply", operator, discoverAccounts: scopedDiscoverAccounts, connectStore, controlledReportKeys, buildApplyPackage, ownerToken, operationKey: controlOperationKey, leaseTtlSeconds, ...applyLeaseWait });
       if (!r || r.committed !== true) throw new Error("controls apply did not commit (code " + (r && r.code) + ")" + (r && r.problem ? ": " + r.problem : ""));
       // Round-10 (blocker 6): a lease-capable apply MUST return a VALID fencing generation IMMEDIATELY -- never
       // continue with a null/invalid fence and discover it only at the first snapshot write. Fail closed here.

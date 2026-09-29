@@ -12,12 +12,31 @@
 import {
   getDashboardAccess, assertAdmin,
   getSyncTargets, getReportSnapshotsMeta, getAccountDirectoryRows, insertAuditLog,
+  getReportSyncSettings, isSupabaseConfigured,
 } from "../lib/server/supabase.js";
 import { runScheduledSync } from "../lib/server/sync/run-sync.js";
 import { SYNC_REGISTRY } from "../lib/server/sync/registry.js";
 import { shapeSyncStatus } from "../lib/server/sync/status.js";
+// Publication recovery WP10b: Scheduler v1 never dispatches a ROUTE-OWNED live report (typed refusal).
+import { enabledReportKeys } from "../lib/server/sync/report-controls.js";
+import { splitSchedulerV1ReportKeys, schedulerV1RouteOwnedRefusal } from "../lib/server/report-store.js";
 
 export const config = { maxDuration: 60 };
+
+// Production collaborators, injectable for narrowly-scoped API-boundary tests (handler(req,res,deps) seam).
+const DEFAULT_DEPS = Object.freeze({ getDashboardAccess, assertAdmin, insertAuditLog, getReportSyncSettings, isSupabaseConfigured, runScheduledSync });
+
+/**
+ * WP10b: the EXPLICIT report keys a bucket-wide Scheduler-v1 run may dispatch. Today's run (reportKeys = null) selects
+ * enabledReportKeys(report_sync_settings) inside run-sync.js; this computes the SAME selection up front and removes every
+ * ROUTE-OWNED live key (run-sync.js / report-adapter.js are an UNFENCED writer: save + prune + retention DELETE), so the
+ * run is always called with an explicit allow-list (never null -> never a later re-read that could select brand-sales).
+ * Without Supabase run-sync returns 'supabase-not-configured' before reading anything, so [] is passed unchanged.
+ */
+export async function schedulerV1BucketPlan(deps = DEFAULT_DEPS) {
+  const scheduled = deps.isSupabaseConfigured() ? [...enabledReportKeys(await deps.getReportSyncSettings())] : [];
+  return splitSchedulerV1ReportKeys(scheduled);
+}
 
 // Per-instance fixed-window limiter. The per-bucket DB lock already serialises the
 // actual sync; this just blunts accidental double-clicks / abuse.
@@ -59,7 +78,8 @@ async function syncStatusFor(access) {
   });
 }
 
-export default async function handler(req, res) {
+export async function handler(req, res, deps = DEFAULT_DEPS) {
+  const { getDashboardAccess, assertAdmin, insertAuditLog, runScheduledSync } = { ...DEFAULT_DEPS, ...deps };
   let access;
   try {
     access = await getDashboardAccess(req);
@@ -87,10 +107,20 @@ export default async function handler(req, res) {
       res.status(400).json({ error: "Body field 'bucket' must be 'us' or 'non-us'." });
       return;
     }
+    // WP10b: route-owned live keys are REFUSED (typed 409 when nothing else would run -- zero audit / lock / DataDoe);
+    // any non-route-owned scheduled key still runs exactly as before (the refused keys are reported alongside).
+    const plan = await schedulerV1BucketPlan({ ...DEFAULT_DEPS, ...deps });
+    if (plan.refused.length && !plan.allowed.length) {
+      res.status(409).json(schedulerV1RouteOwnedRefusal(plan.refused, { isAdmin: true }));
+      return;
+    }
     await insertAuditLog({ actorUserId: access.userId, action: "sync.now", target: { bucket } });
-    const result = await runScheduledSync({ bucket, trigger: "manual-admin", createdBy: access.userId });
-    res.status(200).json(result);
+    const result = await runScheduledSync({ bucket, trigger: "manual-admin", createdBy: access.userId, reportKeys: plan.allowed });
+    res.status(200).json(plan.refused.length ? { ...result, refusedReportKeys: plan.refused, refusal: "ROUTE_OWNED_REPORT_V1_REFUSED" } : result);
   } catch (err) {
     res.status(err?.status || 500).json({ error: err.message });
   }
 }
+
+// Vercel serverless entry: the production handler wired to the real collaborators (DEFAULT_DEPS). No new api/*.js.
+export default function (req, res) { return handler(req, res); }

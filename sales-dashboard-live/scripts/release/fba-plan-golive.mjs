@@ -7,7 +7,10 @@
 // publish -> read-back -> ownership -> ALWAYS-safe-close envelope, bounded by a hard token ceiling.
 //
 //   node scripts/release/fba-plan-golive.mjs --mode=dry-run   [--as-of=YYYY-MM-DD] [--inventory-as-of=YYYY-MM-DD] [--max-blocked=2] [--region=india|europe-au|us-ca|all] [--bucket=us|non-us|both]
-//   node scripts/release/fba-plan-golive.mjs --mode=go-live   [--as-of=YYYY-MM-DD] [--inventory-as-of=YYYY-MM-DD] [--max-tokens=80] [--max-blocked=2] [--region=...] [--bucket=...]
+//   node scripts/release/fba-plan-golive.mjs --mode=go-live   [--as-of=YYYY-MM-DD] [--inventory-as-of=YYYY-MM-DD] [--max-tokens=80] [--max-blocked=2] [--region=...] [--bucket=...] [--lease-wait-seconds=N]
+//
+// --lease-wait-seconds: OPTIONAL (WP13; the scheduler passes 600). Each fba-plan control-package apply retries ONLY on the
+//   typed CONTROL_LEASE_HELD refusal for <= N seconds. Absent / 0 = exactly one attempt (byte-identical).
 //
 // --inventory-as-of: OPTIONAL. Overrides the inventory snapshot date (default: fbaInventoryAsOf() = the previous
 //   UTC date, D-1). Inventory is requested as EXACTLY [inventory-as-of .. inventory-as-of] (one snapshot day). The
@@ -59,6 +62,17 @@ const scopeLabel = regionArg ? (regionArg === "all" ? "all-regions" : regionArg)
 const log = (m) => console.log("fba-golive[" + mode + (scopeLabel ? "/" + scopeLabel : "") + "]: " + m);
 
 const { buildFbaPlanRelease } = await import("../../lib/server/sync/fba-plan-release-composition.js");
+// Publication recovery WP13 -- OPTIONAL bounded lease-wait for the fba-plan control-package APPLY (the control envelope
+// ONLY: the fetch plan, batches, token ceiling, exports and publish are unchanged). --lease-wait-seconds=N (an integer
+// 0..MAX_CONTROL_LEASE_WAIT_SECONDS) is handed to buildFbaPlanRelease({ leaseWaitSeconds }), whose controls.apply
+// passes it to runControlPackageCli (retry ONLY on the typed CONTROL_LEASE_HELD refusal). ABSENT or 0 => byte-identical
+// (no leaseWaitSeconds key; exactly one attempt). Malformed => STOP (exit 2) before any discovery / DataDoe call.
+const { MAX_CONTROL_LEASE_WAIT_SECONDS } = await import("../../lib/server/sync/source-priority-control-package.js");
+const leaseWaitArg = argOf("lease-wait-seconds");
+if (leaseWaitArg != null && (!/^\d{1,5}$/.test(leaseWaitArg) || Number(leaseWaitArg) > MAX_CONTROL_LEASE_WAIT_SECONDS)) {
+  console.error("STOP --lease-wait-seconds must be an integer in [0, " + MAX_CONTROL_LEASE_WAIT_SECONDS + "]"); process.exit(2);
+}
+const leaseWait = leaseWaitArg != null && Number(leaseWaitArg) > 0 ? { leaseWaitSeconds: Number(leaseWaitArg) } : {};
 const {
   resolveFbaPlanScope, planFbaBucketCost, fbaBucketAccounts, advanceFbaPlanBucket, fbaServerCeiling, fbaInventoryAsOf,
 } = await import("../../lib/server/sync/fba-plan-operation.js");
@@ -117,11 +131,11 @@ if (accountScope === "bootstrap") {
   // BUILD the release SCOPED to exactly the frozen accounts (blocker 1): the runtime rollout override +
   // control discovery + ownership are constrained here, so no outside-wave account is fetched/derived/
   // published/controlled.
-  release = buildFbaPlanRelease({ operator: OPERATOR, accountScopeIds: bootstrapScope.frozenAccountIds, ownerToken: runToken, controlOperationKey: "fba-plan/bootstrap/" + regionArg + "/" + dispatchId.slice(-8) });
+  release = buildFbaPlanRelease({ operator: OPERATOR, accountScopeIds: bootstrapScope.frozenAccountIds, ownerToken: runToken, controlOperationKey: "fba-plan/bootstrap/" + regionArg + "/" + dispatchId.slice(-8), ...leaseWait });
   accounts = bootstrapScope.accounts.map((a) => ({ accountId: String(a.id), country: String(a.country || ""), currency: a.currency || null, name: a.name || null }));
   if (!accounts.length) { log("BOOTSTRAP_SCOPE_EMPTY: no ready bootstrap accounts in " + regionArg + " (deferred " + bootstrapScope.deferred.length + ") -- ZERO creates, ZERO tokens."); process.exit(0); }
 } else {
-  release = buildFbaPlanRelease({ operator: OPERATOR, ownerToken: runToken, controlOperationKey: "fba-plan/" + (scopeLabel || "all") });
+  release = buildFbaPlanRelease({ operator: OPERATOR, ownerToken: runToken, controlOperationKey: "fba-plan/" + (scopeLabel || "all"), ...leaseWait });
   accounts = await release.loadAccounts();
 }
 if (!accounts.length) { console.error("STOP no primary accounts with directory metadata discovered."); process.exit(1); }

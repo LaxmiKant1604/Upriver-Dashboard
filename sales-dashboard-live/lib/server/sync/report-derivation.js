@@ -1422,7 +1422,70 @@ const REGISTRY = {
     // Latest real data date = the honest effectiveAsOf (latest proven OLI date, capped at D-1). Never asOf-now / saved_at.
     latestDataDate: (p) => (p && isValidCalendarDate(p.effectiveAsOf) ? p.effectiveAsOf : null),
   },
+
+  // ---- Publication recovery WP1: PUBLISH-ONLY route derivations. ----
+  // These publisher keys are PRODUCED by their zero-export recovery route (the route derives through the EXISTING pure
+  // builders -- buildReturnsAdvancedPayload / buildBrandViewBrandDirectory / buildBrandViewSnapshot /
+  // buildBrandViewPortfolioSnapshot -- and saves the shadow itself). They exist here ONLY so the reviewed publisher,
+  // the binding and the read-back validate their shadows exactly like every other report: `derive` is null, they own NO
+  // source contract, they are not CONTROLLED (no dispatcher can plan them), and deriveReportSnapshot REFUSES them
+  // ('publish-only', below). The live versions are inlined literals (brand-view.js / returns-advanced.js pull the
+  // transport graph, which this pure module must never import); publisher-route-hooks.test.js pins them to the modules.
+  "returns-leakage-v3": {
+    snapshotVersion: "returns-leakage/v3-route",
+    optionalRequestKeys: [],
+    derivedSourceKeys: [],
+    derive: null,
+    publishOnly: true,
+    // buildReturnsAdvancedPayload (returns-advanced.js): the v3 version + the proven v2 base fields + the advanced
+    // dayAxis / series / freshness blocks the redesigned page recomputes from.
+    validatePayload: (p) => !!p && typeof p === "object" && !Array.isArray(p) && p.version === "returns-leakage-v3"
+      && ("accountId" in p) && isValidCalendarDate(p.asOf) && Array.isArray(p.rows) && Array.isArray(p.currencies)
+      && !!p.window && typeof p.window === "object" && Array.isArray(p.dayAxis)
+      && !!p.series && typeof p.series === "object" && !Array.isArray(p.series)
+      && !!p.freshness && typeof p.freshness === "object" && !Array.isArray(p.freshness),
+    latestDataDate: (p) => (p && isValidCalendarDate(p.latestDataDate) ? p.latestDataDate : null),
+  },
+  "brand-view-brands": {
+    snapshotVersion: "brand-view-brands/route-1",
+    optionalRequestKeys: [],
+    derivedSourceKeys: [],
+    derive: null,
+    publishOnly: true,
+    // buildBrandViewBrandDirectory (brand-view.js): { accountId, brands: string[], sources: [], message }.
+    validatePayload: (p) => !!p && typeof p === "object" && !Array.isArray(p)
+      && typeof p.accountId === "string" && p.accountId.trim() !== ""
+      && Array.isArray(p.brands) && p.brands.every((b) => typeof b === "string") && Array.isArray(p.sources),
+  },
+  "brand-view": {
+    snapshotVersion: "brand-view/route-1",
+    optionalRequestKeys: [],
+    derivedSourceKeys: [],
+    derive: null,
+    publishOnly: true,
+    validatePayload: (p) => isBrandViewPayload(p, "account"),
+  },
+  "brand-view-portfolio": {
+    snapshotVersion: "brand-view-portfolio/route-1",
+    optionalRequestKeys: [],
+    derivedSourceKeys: [],
+    derive: null,
+    publishOnly: true,
+    validatePayload: (p) => isBrandViewPayload(p, "portfolio"),
+  },
 };
+
+// The Brand View payload contract (assembleBrandViewPayload, brand-view.js), shared by the account-scoped and the
+// portfolio route derivations (WP9 reuses THIS validator -- no duplicate). The payload records its own definition
+// version (BRAND_VIEW_VERSION; both scopes are assembled by the same function) and SCOPE, so an account payload can
+// never validate as a portfolio (or vice versa); a nonblank brand, a real as-of date, and the assembled arrays/objects.
+function isBrandViewPayload(p, scope) {
+  return !!p && typeof p === "object" && !Array.isArray(p)
+    && p.brandViewVersion === "brand-view-account-scoped-v2" && p.scope === scope
+    && typeof p.brand === "string" && p.brand.trim() !== "" && isValidCalendarDate(p.asOf)
+    && Array.isArray(p.accounts) && p.accounts.length > 0 && Array.isArray(p.countries) && Array.isArray(p.series)
+    && !!p.coverage && typeof p.coverage === "object" && !Array.isArray(p.coverage) && Array.isArray(p.notes);
+}
 
 // Freeze each entry with computed requiredRequestKeys (declared keys minus optional).
 export const REPORT_DERIVATIONS = Object.freeze(
@@ -1442,6 +1505,8 @@ export const REPORT_DERIVATIONS = Object.freeze(
       derive: entry.derive || null,
       validatePayload: entry.validatePayload || ((p) => p != null),
       latestDataDate: entry.latestDataDate || (() => null),
+      // WP1: present ONLY on a publish-only route entry, so every pre-existing entry's shape is unchanged.
+      ...(entry.publishOnly === true ? { publishOnly: true } : {}),
     })];
   })),
 );
@@ -1474,6 +1539,12 @@ export function deriveReportSnapshot({ reportKey, sources = {}, context = {} }) 
   const entry = REPORT_DERIVATIONS[reportKey];
   if (!entry) {
     return { status: "unmapped", validated: false, payload: null, latestDataDate: null, errorStage: "derive", reason: `no derivation adapter for "${reportKey}"` };
+  }
+  // WP1: a PUBLISH-ONLY route key is never derived here (its route derives from durable evidence and saves the shadow
+  // itself). Refused BEFORE any source is examined, as the typed non-terminal 'not-implemented' (the worker's
+  // derive-pending skip: LKG preserved, never a fabricated/empty snapshot) flagged publishOnly.
+  if (entry.publishOnly === true) {
+    return { status: "not-implemented", validated: false, payload: null, latestDataDate: null, errorStage: "derive", reason: `publish-only: "${reportKey}" is produced only by its zero-export publication route`, publishOnly: true };
   }
 
   // 1) Every REQUIRED source must be a validated saved array. Missing/malformed/failed =>

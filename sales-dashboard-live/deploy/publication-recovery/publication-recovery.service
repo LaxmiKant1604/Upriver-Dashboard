@@ -1,0 +1,62 @@
+# systemd unit for the independent publication recovery worker (Ubuntu 24.04, 1 GB VM.Standard.E2.1.Micro).
+# Install: see deploy/publication-recovery/README.md (install.sh copies this to /etc/systemd/system/).
+# No listening port: the worker only makes OUTBOUND connections (Postgres pooler, Supabase REST, DataDoe account GET).
+
+[Unit]
+Description=Upriver publication recovery worker (zero-export saved-to-live convergence)
+Wants=network-online.target
+After=network-online.target
+# Never stop restarting (RestartSec=30 keeps the rate low); this key belongs in [Unit].
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=prw
+Group=prw
+WorkingDirectory=/opt/publication-recovery/app/sales-dashboard-live
+# Secrets live ONLY here (root:prw 0640), never in Git, the unit, logs, or command lines.
+EnvironmentFile=/etc/publication-recovery/worker.env
+# Written by install.sh: PRW_VERSION=<release sha> (the release dir has no .git).
+EnvironmentFile=-/etc/publication-recovery/version.env
+ExecStartPre=/usr/bin/node scripts/worker/publication-recovery-worker.mjs --check-config
+ExecStart=/usr/bin/node --max-old-space-size=160 scripts/worker/publication-recovery-worker.mjs
+# Graceful stop: the worker stops claiming and starting children. A running DRY-RUN child gets PRW_STOP_GRACE_SECONDS
+# (default 60) and is then SIGTERMed (it writes nothing; its jobs are handed back). A LIVE or CLEANUP child is never
+# killed by the worker (a kill between the reconciler's cycle finalize and its publish would strand that cycle); it ends
+# within its own --deadline-seconds (330 s, LHv3 720 s), bounded by the runner's hard timeout (420 s / 840 s), plus a
+# cleanup run after an abnormal exit. TimeoutStopSec covers that bound; KillMode=mixed sends SIGTERM only to the worker.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=1200
+# Dates and as-of rollover are computed in UTC regardless of the VM's timezone (defence in depth; the store also pins
+# the Postgres date parser).
+Environment=TZ=UTC
+Restart=always
+RestartSec=30
+
+# Resource guard rails for the 1 GB Micro (worker ~70 MB + ONE reconciler child capped by PRW_CHILD_MAX_OLD_SPACE_MB).
+MemoryHigh=700M
+MemoryMax=850M
+TasksMax=64
+Nice=5
+
+# Hardening (the worker needs only its app dir read-only + outbound network).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/publication-recovery
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=publication-recovery
+
+[Install]
+WantedBy=multi-user.target

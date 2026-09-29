@@ -163,10 +163,16 @@ await testAsync("STRUCTURAL: no brand-sales PUBLISHER is wired to the raw ORDER_
   assert.ok(!/buildBrandSalesPayload\s*\(/.test(adapters), "the scheduler adapter must NOT call the raw buildBrandSalesPayload");
   assert.ok(/deriveCorrectedBrandSalesForAccount/.test(adapters), "the scheduler adapter derives brand-sales from durable evidence");
   const datadoe = readFileSync(new URL("../api/datadoe.js", import.meta.url), "utf8");
-  // buildBrandSalesPayload may still be DEFINED (an export used only by legacy tests), but NO caller may INVOKE it,
-  // and the action=brand-sales route must publish via the durable refresher.
+  // buildBrandSalesPayload may still be DEFINED (an export used only by legacy tests), but NO caller may INVOKE it.
   assert.ok(!/await buildBrandSalesPayload\(/.test(datadoe), "no route may call (await) the raw buildBrandSalesPayload");
-  assert.ok(/refreshCorrectedBrandSalesForAccount/.test(datadoe), "the route publishes via the corrected durable refresher");
+  // Publication recovery WP10b: action=brand-sales refresh=1 is READ-ONLY (brand-sales is a route-owned live key,
+  // published only through the fenced publisher) -- the route no longer publishes at all, and the former unfenced
+  // corrected refresher (refreshCorrectedBrandSalesForAccount) is removed from brand-sales-live.js.
+  const live = readFileSync(new URL("../lib/server/reports/brand-sales-live.js", import.meta.url), "utf8");
+  const datadoeCode = datadoe.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+  assert.ok(!/refreshCorrectedBrandSalesForAccount/.test(datadoeCode), "the route neither imports nor calls a brand-sales refresher (refresh=1 is read-only)");
+  const liveCode = live.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+  assert.ok(!/refreshCorrectedBrandSalesForAccount/.test(liveCode) && !/saveReportSnapshot|publishSnapshotUpdate|claimRefreshLock/.test(liveCode), "brand-sales-live.js exports no writer");
 });
 
 out("\n" + passed + " assertions passed");

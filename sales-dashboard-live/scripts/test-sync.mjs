@@ -222,9 +222,12 @@ await asyncTest("adapter build failure does NOT call saveReportSnapshot (last-kn
   );
   assert.equal(saveCalls, 0, "saveReportSnapshot must not run when the build throws");
 });
+// Publication recovery WP13: the v1 adapter REFUSES every route-owned live key (brand-sales included) before its build,
+// so the generic adapter mechanics below are exercised on a NON-route-owned (manual-paid) v1 report key; the refusal
+// itself is pinned right after them (and in depth by scripts/scheduler-v2-route-switch.test.js).
 await asyncTest("adapter blocks the save when validation fails", async () => {
   const entry = {
-    reportKey: "brand-sales", reportVersion: "brand-sales-shared-v1",
+    reportKey: "sku-pl", reportVersion: "sku-pl-shared-v1",
     windowFor: () => ({ from: "2026-01-01", to: "2026-08-04" }),
     validate: (p) => (Array.isArray(p?.rows) ? true : "no rows[]"),
   };
@@ -242,7 +245,7 @@ await asyncTest("adapter blocks the save when validation fails", async () => {
 });
 await asyncTest("successful scheduled snapshots are marked, pruned and report their actual latest row date", async () => {
   const entry = {
-    reportKey: "brand-sales", reportVersion: "brand-sales-shared-v1",
+    reportKey: "sku-pl", reportVersion: "sku-pl-shared-v1",
     windowFor: () => ({ from: "2025-06-01", to: "2026-08-04" }), validate: () => true,
   };
   let savedInput;
@@ -255,8 +258,26 @@ await asyncTest("successful scheduled snapshots are marked, pruned and report th
     publish: async () => {},
   });
   assert.equal(savedInput.params.syncManaged, true);
-  assert.deepEqual(prunedInput, { reportKey: "brand-sales", accountId: "123", keepParamsHash: savedInput.paramsHash });
+  assert.deepEqual(prunedInput, { reportKey: "sku-pl", accountId: "123", keepParamsHash: savedInput.paramsHash });
   assert.equal(result.latestDataDate, "2026-08-03");
+});
+await asyncTest("WP13: the v1 adapter REFUSES a route-owned key (brand-sales) with the typed ROUTE_OWNED_REPORT_V1_REFUSED before its build / save / prune / publish", async () => {
+  const entry = {
+    reportKey: "brand-sales", reportVersion: "brand-sales-shared-v1",
+    windowFor: () => ({ from: "2025-06-01", to: "2026-08-04" }), validate: () => true,
+  };
+  const calls = [];
+  await assert.rejects(
+    () => runReportAdapter({
+      entry, account: { account_id: "123", country: "US" }, asOf: "2026-08-04", connections: CONNS,
+      build: async () => { calls.push("build"); return { rows: [] }; },
+      save: async () => { calls.push("save"); return { id: "x" }; },
+      prune: async () => { calls.push("prune"); },
+      publish: async () => { calls.push("publish"); },
+    }),
+    (e) => e && e.code === "ROUTE_OWNED_REPORT_V1_REFUSED" && e.status === 409 && JSON.stringify(e.refusedReportKeys) === JSON.stringify(["brand-sales"]),
+  );
+  assert.deepEqual(calls, [], "no build (no paid export), no save, no prune, no publish");
 });
 
 /* 8. Ads rolling-correction upsert dedups by natural key (no double-count). */

@@ -98,7 +98,10 @@ jobs:
           rc=0
           for REGION in india europe-au us-ca; do
             echo "::group::oli-outbox-drain $REGION mode=$MODE as-of=$ASOF"
-            timeout 420 node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=330 --outbox-drain $LIVE || { echo "region $REGION drain exited nonzero (isolated; continuing)"; rc=1; }
+            # --lease-wait-seconds=600 (WP13 verifier P2-A, control envelope ONLY): the controls APPLY retries on the typed
+            # CONTROL_LEASE_HELD refusal (the scheduler's route CLI holds the global lease in windows), never past this run's start
+            # cutoff (deadline 330 s - 120 s reserve), instead of deferring every stale account on one refusal.
+            timeout 420 node scripts/release/oli-publication-reconcile.mjs --bucket="$REGION" --as-of="$ASOF" --mode=periodic --deadline-seconds=330 --lease-wait-seconds=600 --outbox-drain $LIVE || { echo "region $REGION drain exited nonzero (isolated; continuing)"; rc=1; }
             echo "::endgroup::"
           done
           exit $rc

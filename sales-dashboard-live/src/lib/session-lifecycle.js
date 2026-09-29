@@ -118,3 +118,107 @@ export function createInFlightCoalescer() {
     get size() { return inFlight.size; },
   };
 }
+
+// ---- Cold access-load recovery (2026-09-29 incident) ----------------------------------------------------------------
+// The first /api/access?action=me of a session can fail TRANSIENTLY: the database behind Supabase Auth was overloaded
+// and the access check returned 500 / timed out. Before this fix that first failure pinned "Access unavailable" for
+// good -- a later successful focus revalidation applied the access but never cleared the error. Rules:
+//   - a TRANSIENT failure (network error / no status, 5xx, 408, 429) is retried automatically, at most
+//     ACCESS_AUTO_RETRY_LIMIT times with a bounded backoff; a definitive answer (401 unauthenticated, 403 / other 4xx)
+//     is NOT retried automatically (fail-closed; the user can still press Retry or sign out). Nothing signs the user out;
+//   - the error is cleared ONLY by a successful, AUTHORIZED response (isAuthorizedAccessBody) -- never by a malformed or
+//     empty body, which counts as a failure;
+//   - once authorized access is applied, NO failure (a background revalidation, or a late response of an earlier
+//     request) sets the error: a working dashboard is never blanked.
+export const ACCESS_AUTO_RETRY_LIMIT = 4;
+
+/** 'transient' | 'unauthenticated' | 'denied' for a failed access load (error.status set by authFetch; none = network). */
+export function accessFailureKind(error) {
+  const status = error && Number.isInteger(error.status) ? error.status : 0;
+  if (status === 0 || status === 408 || status === 429 || (status >= 500 && status <= 599)) return "transient";
+  if (status === 401) return "unauthenticated";
+  return "denied";
+}
+
+/** The delay before automatic retry number `n` (1-based): 2 s, 4 s, 8 s, 16 s -- never more than 30 s. */
+export function accessRetryDelayMs(n) {
+  const k = Math.max(1, Math.floor(Number(n) || 1));
+  return Math.min(30000, 2000 * 2 ** (k - 1));
+}
+
+/** Retry automatically only a TRANSIENT failure, and only while under the bound. */
+export function shouldAutoRetryAccess(error, retriesSoFar) {
+  return accessFailureKind(error) === "transient" && Number(retriesSoFar) < ACCESS_AUTO_RETRY_LIMIT;
+}
+
+/** An access body is AUTHORIZED only with an access object carrying a user id and a role (fail-closed otherwise). */
+export function isAuthorizedAccessBody(body) {
+  const a = body && typeof body === "object" ? body.access : null;
+  return !!(a && typeof a === "object" && !Array.isArray(a) && typeof a.userId === "string" && a.userId !== "" && typeof a.role === "string" && a.role !== "");
+}
+
+/**
+ * The access loader App.jsx drives (one per user identity). fetchAccess() -> the parsed /api/access?action=me body
+ * (rejects with error.status on a non-OK response, or a network error); applyAccess(access) applies an authorized
+ * access (App: only when the scope fingerprint changed); showError(message) / showRetry({ attempt, of, inMs } | null)
+ * drive the cold error screen; hasAppliedAccess() -> true once authorized access is on screen.
+ * -> { load(), retryNow(), dispose() }. load() is the first load AND every focus / visibility revalidation.
+ */
+export function createAccessLoader({ fetchAccess, applyAccess, showError, showRetry, showBusy = () => {}, hasAppliedAccess, setTimer = setTimeout, clearTimer = clearTimeout }) {
+  // `applied`: this loader has already applied an authorized access -- a later failure is then never shown, even if the
+  // caller's own applied-state was reset meanwhile (e.g. inside the sign-out window before dispose()).
+  let active = true, timer = null, retries = 0, applied = false, inFlight = null;
+  const cancel = () => { if (timer !== null) { clearTimer(timer); timer = null; } };
+  const cold = () => !applied && !hasAppliedAccess();
+  const onSuccess = (body) => {
+    if (!active) return;
+    if (!isAuthorizedAccessBody(body)) { const e = new Error("Dashboard access response was incomplete."); e.status = 502; throw e; }
+    cancel(); retries = 0; applied = true;
+    // The ONLY place the error screen is cleared: a successful, authorized access response.
+    showError(""); showRetry(null);
+    applyAccess(body.access);
+  };
+  const onFailure = (error) => {
+    if (!active) return;
+    // A working dashboard is never blanked: once authorized access is applied, a failure changes nothing.
+    if (!cold()) return;
+    showError((error && error.message) || "Unable to load dashboard access.");
+    if (timer !== null) return; // an automatic retry is already scheduled
+    if (shouldAutoRetryAccess(error, retries)) {
+      retries += 1;
+      const inMs = accessRetryDelayMs(retries);
+      showRetry({ attempt: retries, of: ACCESS_AUTO_RETRY_LIMIT, inMs });
+      timer = setTimer(() => { timer = null; if (active) load(); }, inMs);
+    } else {
+      showRetry(null);
+    }
+  };
+  // ONE access request at a time: a focus + visibilitychange double-fire, repeated Retry presses and a retry timer landing
+  // during a request all share the request already in flight (never a burst against an overloaded backend). The busy
+  // signal is raised only in the COLD state (the error / loading screen), so a background revalidation stays silent.
+  const load = () => {
+    if (!active) return Promise.resolve();
+    if (inFlight) return inFlight;
+    const busy = cold();
+    if (busy) showBusy(true);
+    const request = Promise.resolve()
+      .then(() => fetchAccess())
+      .then(onSuccess)
+      .catch(onFailure)
+      .finally(() => { if (inFlight === request) inFlight = null; if (busy && active) showBusy(false); });
+    inFlight = request;
+    return request;
+  };
+  return {
+    load,
+    // The Retry button: load now and restart the bounded automatic retries (never signs out). While a request is in
+    // flight it joins that request (the button is disabled meanwhile).
+    retryNow() {
+      if (!active) return Promise.resolve();
+      if (inFlight) return inFlight;
+      cancel(); retries = 0; showRetry(null);
+      return load();
+    },
+    dispose() { active = false; cancel(); },
+  };
+}

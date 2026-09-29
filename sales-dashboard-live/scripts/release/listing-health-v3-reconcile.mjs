@@ -23,6 +23,7 @@
 // no-op. 7-bit ASCII, LF.
 
 import pg from "pg";
+import { verifiedPgConfig } from "../../lib/server/pg-tls.js";
 import { appendFileSync } from "node:fs";
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
 import { isRegionScope, accountInScope } from "../../lib/server/sync/scheduler-scope.js";
@@ -41,6 +42,25 @@ const runToken = (argOf("run-token") || "").trim();
 const rawOwnerGen = (argOf("owner-generation") || "").trim();
 const ownerGeneration = /^\d+$/.test(rawOwnerGen) ? Number(rawOwnerGen) : NaN;
 const ghOut = (k, v) => { const f = process.env.GITHUB_OUTPUT; if (f) { try { appendFileSync(f, k + "=" + v + "\n"); } catch { /* ignore */ } } };
+// OPTIONAL bounded LEASE-WAIT for this run's controls APPLY (publication recovery WP13 verifier P2-1; the control envelope
+// ONLY -- what is published is unchanged). The scheduler's route CLI now holds the GLOBAL control-plane lease in windows
+// (with a fairness pause between them), so a single-attempt apply here could lose to it and defer every account to the
+// evening backstop. --lease-wait-seconds=N (an integer 0..900): runControlPackageCli retries the apply ONLY on the typed
+// CONTROL_LEASE_HELD refusal (a zero-write, rolled-back transaction) every 15 s, CAPPED at this run's start cutoff
+// (--deadline-seconds minus START_RESERVE), so the ALWAYS safe-close reserve stays intact (a long wait can use up the
+// work window: the stale accounts then defer, LKG kept). Immediate mode never applies (it renews the scheduler's fence),
+// so it never waits. ABSENT or 0 => the apply call is BYTE-IDENTICAL (no leaseWaitSeconds key; exactly one attempt).
+// Malformed => STOP (exit 2) before any connection.
+const rawLeaseWait = argOf("lease-wait-seconds");
+if (rawLeaseWait != null && (!/^\d{1,3}$/.test(rawLeaseWait) || Number(rawLeaseWait) > 900)) { console.error("STOP LISTINGS_RECONCILE_LEASE_WAIT: --lease-wait-seconds must be an integer in [0, 900]; got " + String(rawLeaseWait).slice(0, 20)); process.exit(2); }
+const LEASE_WAIT_SECONDS = rawLeaseWait != null ? Number(rawLeaseWait) : 0;
+// The lease-wait actually granted to an apply starting NOW: never past the start cutoff (none once it is reached).
+const applyLeaseWait = () => {
+  if (!(LEASE_WAIT_SECONDS > 0)) return {};
+  const cap = deadlineSec > 0 ? Math.max(0, Math.floor(startCutoffSec - (Date.now() - runStartMs) / 1000)) : LEASE_WAIT_SECONDS;
+  const n = Math.min(LEASE_WAIT_SECONDS, cap);
+  return n > 0 ? { leaseWaitSeconds: n } : {};
+};
 
 if (!isRegionScope(bucket)) { console.error("STOP LISTINGS_RECONCILE_REGION_UNSUPPORTED: --bucket must be india|europe-au|us-ca (region-scoped); got " + bucket); process.exit(2); }
 if (!DATE_RE.test(String(asOf))) { console.error("STOP LISTINGS_RECONCILE_AS_OF: --as-of=YYYY-MM-DD is required; got " + asOf); process.exit(2); }
@@ -55,7 +75,7 @@ const { buildListingHealthV3PublicationReconciler } = await import("../../lib/se
 const { listingsDependentLiveReportKeys } = await import("../../lib/server/sync/listing-health-v3-dependent-reports.js");
 const { FBA_INVENTORY_SOURCE_KEY } = await import("../../lib/server/sync/source-durable-model.js");
 const { resolvedFbaSnapshot } = await import("../../lib/server/sync/source-bucket-sync.js");
-const { organizationFingerprint, sha256 } = await import("../../lib/server/source-identity.js");
+const { organizationFingerprint } = await import("../../lib/server/source-identity.js");
 const { getDataDoeConnections, classifyDirectoryAccounts, resolveDataDoeAccountIds } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccounts: fetchDirectory } = await import("../../lib/server/datadoe.js");
 const { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } = await import("../../lib/server/sync/report-publisher.js");
@@ -66,7 +86,7 @@ const { REPORT_DERIVATIONS, deriveReportSnapshot } = await import("../../lib/ser
 // deferred EVERY UK account's LHv3 forever. Reuse the SAME normalizer campaign-ads/AWD already apply (UK->GB, else upper).
 const { normalizeMarketplace } = await import("../../lib/server/sync/oli-sales-estimate.js");
 const { paramsHashFor } = await import("../../lib/server/report-store.js");
-const { buildListingHealthV3Release } = await import("../../lib/server/sync/listing-health-v3-release.js");
+const { buildListingHealthV3Release, runListingHealthV3ReleaseWithForeignRetry, buildListingHealthV3ForeignJobReader } = await import("../../lib/server/sync/listing-health-v3-release.js");
 const { resolveListingHealthV3DependencyBundle } = await import("../../lib/server/sync/listing-health-v3-dependency-bundle.js");
 const { makeListingHealthV3DurableContextLoader } = await import("../../lib/server/sync/listing-health-v3-durable-loader.js");
 const { buildSchedulerV2Publisher } = await import("../../lib/server/sync/publisher-composition.js");
@@ -101,8 +121,9 @@ if (!primaryConn) { console.error("STOP LISTINGS_RECONCILE_NO_PRIMARY_CONNECTION
 const orgFp = primaryConn.organizationFingerprint || organizationFingerprint(primaryConn.apiKey);
 
 const withTimeout = (p, label) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timed out after 120000ms")), 120000))]);
-const pgBase = String(process.env.POSTGRES_URL || "").split("?")[0];
-const makePgReadOnly = () => new pg.Client({ connectionString: pgBase, ssl: { rejectUnauthorized: false } });
+// Verified TLS: chain pinned to the Supabase root CA + hostname checked (lib/server/pg-tls.js); never rejectUnauthorized:false.
+const pgConfig = () => verifiedPgConfig(process.env.POSTGRES_URL);
+const makePgReadOnly = () => new pg.Client(pgConfig());
 
 const readbackLive = buildLiveReadback({
   getReportSnapshot: sb.getReportSnapshot,
@@ -118,8 +139,9 @@ const readbackLive = buildLiveReadback({
 // reconcile path imports NO provider export transport, so there is no create / poll / download to reach.
 
 async function assertNoCron() {
-  const client = makePgReadOnly();
+  let client = null; // constructed inside try: an invalid POSTGRES_URL stays a typed {ok:false}, never an uncaught throw
   try {
+    client = makePgReadOnly();
     await client.connect();
     const t = await client.query("select to_regclass('cron.job')::text cron_table");
     if (!t.rows[0].cron_table) return { ok: true };
@@ -134,8 +156,8 @@ const OPERATOR = "listing-health-v3-reconcile:" + bucket + ":" + (runToken || as
 const CONTROL_OP_KEY = "listing-health-v3-reconcile/" + bucket + "/" + asOf;
 
 async function partialNamespacePermitted() {
-  const probe = new pg.Client({ connectionString: pgBase, ssl: { rejectUnauthorized: false } });
-  try { await probe.connect(); const cap = await readPartialCycleCapability((sql) => probe.query(sql).then((r) => r.rows)); return cap; }
+  let probe = null;
+  try { probe = new pg.Client(pgConfig()); await probe.connect(); const cap = await readPartialCycleCapability((sql) => probe.query(sql).then((r) => r.rows)); return cap; }
   catch (e) { return { permitted: false, reason: "capability-unreadable: " + (e && e.message ? e.message : e) }; }
   finally { try { await probe.end(); } catch { /* ignore */ } }
 }
@@ -166,6 +188,7 @@ async function openControls(staleAccountIds) {
       buildApplyPackage: buildListingHealthV3ControlPackage,
       ownerToken: OPERATOR, operationKey: CONTROL_OP_KEY, leaseTtlSeconds: 900,
       log: (m) => console.log("listing-health-v3-reconcile controls: " + m),
+      ...applyLeaseWait(),
     });
     if (r && Number(r.code) === 3) return { ok: false, commitUnknown: true, reason: "control-apply COMMIT_UNKNOWN (code 3) -- read-only reconciliation required (NO rollback/retry)" };
     if (!r || r.committed !== true) return { ok: false, reason: "controls apply did not commit (code " + (r && r.code) + (r && r.problem ? "/" + r.problem : "") + ")" };
@@ -289,16 +312,52 @@ const resolveBundle = async ({ accountId, requestedAsOf, signal = null }) => {
   });
 };
 
+// WP16 P2-B: ONE read-only select per call over a SHORT-LIVED verified-TLS pg client (this CLI's assertNoCron idiom:
+// constructed INSIDE try, an 'error' listener so an idle drop can never crash the reconcile, always ended). Consulted
+// ONLY by the release's terminal-cycle branch when the latest job is not resumable (rare). Bounded by the CLIENT-side
+// query_timeout only: a `statement_timeout` startup parameter is never sent, because the production Supavisor pooler has
+// not been proven to accept it (a rejected startup would silently fail this read closed -> the strand fix inert). The
+// deadline signal ENDS the client, so an in-flight connect/query settles at once instead of outliving SETTLE_GRACE_MS
+// (which would otherwise surface as deadline-termination-unconfirmed and hold the lease for the next region).
+async function pgReadOnlyQuery(sql, params, { signal = null } = {}) {
+  if (signal && signal.aborted) throw new Error("deadline-aborted");
+  let client = null;
+  let onAbort = null;
+  try {
+    client = new pg.Client(verifiedPgConfig(process.env.POSTGRES_URL, { connectionTimeoutMillis: 20000, query_timeout: 30000 }));
+    client.on("error", () => { /* memoized by the rejected query below; never an uncaught exception */ });
+    if (signal && typeof signal.addEventListener === "function") {
+      const c = client;
+      onAbort = () => { c.end().catch(() => {}); };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    await client.connect();
+    if (signal && signal.aborted) throw new Error("deadline-aborted");
+    const r = await client.query(sql, params);
+    return Array.isArray(r && r.rows) ? r.rows : [];
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+    if (client) { try { await client.end(); } catch { /* ignore */ } }
+  }
+}
+// The NEWEST listing-health-v3 job for the account whose durable_content_deps do NOT carry this revision's manifest (the
+// foreign-job strand salt; listing-health-v3-release.js). A read failure -> the release keeps today's deferral.
+const readNewestForeignJob = buildListingHealthV3ForeignJobReader({ query: pgReadOnlyQuery });
+
 // PER-ACCOUNT release execution: each stale account derives + finalizes + publishes + reads back in ITS OWN dedicated
 // priority-partial cycle (deterministic 16-hex over {accountId, Listings revisionId}) with the captured fence. The
 // account's listing-health-v3 is re-derived from the HYDRATED durable Listings/Raw rows + durable OLI/Catalog + reuse-
 // only FBA inventory via the CANONICAL deriveReportSnapshot -- NEVER any sibling report. A lagged / unprovable account
 // defers on its LKG (zero writes). The deadline AbortSignal is threaded into every supported durable read/write, and
 // the publisher is fenced on THIS op's control fence (aborted -> null fence -> the CAS writes zero rows).
+// WP16 P2-B: runListingHealthV3ReleaseWithForeignRetry computes the SAME deterministic bucket
+// (listingHealthV3ReleaseCycleBucket with no salt == the pre-WP16 'priority-partial-<b>-' + sha256(JSON.stringify(
+// [accountId, revisionId || ""])).slice(0,16), byte-identical) and, ONLY when the release returns a retryBucketSalt (a
+// FOREIGN natural job stranded this revision's own terminal cycle), retries ONCE in the salted bucket
+// sha256(JSON.stringify([accountId, revisionId || "", salt])) -- the same migration-20260924 priority-partial namespace.
 async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revisionId, signal }) {
   const aborted = () => !!(signal && signal.aborted);
   if (aborted()) return { code: 1, ok: false, stage: "reconcile", status: "DEADLINE_ABORTED", leaseLost: false, reason: "deadline-aborted", aborted: true, blockerCodes: [], problems: ["deadline-aborted before start (no work performed)"] };
-  const cycleBucket = "priority-partial-" + b + "-" + sha256(JSON.stringify([accountId, revisionId || ""])).slice(0, 16);
   const publisher = buildSchedulerV2Publisher({ getControlFence: () => (aborted() ? null : leaseFence) });
   const verifyLeaseForOp = async () => (aborted() ? { ok: false, reason: "deadline-aborted" } : verifyLease());
   const release = buildListingHealthV3Release({
@@ -316,9 +375,10 @@ async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revis
     reconcileSuccess: (args, opt) => sb.reconcileReportDeriveSuccess(args, opt),
     finalizeCycle: ({ cycleId }, opt) => sb.finalizeSyncCycle(cycleId, opt),
     publisher, readbackLive, verifyLease: verifyLeaseForOp,
+    readNewestForeignJob,
     log: () => {},
   });
-  const result = await release.runForAccount({ accountId, requestedAsOf, cycleBucket, revisionId, signal });
+  const result = await runListingHealthV3ReleaseWithForeignRetry({ release, region: b, accountId, requestedAsOf, revisionId, signal });
   return { code: result.code, ok: result.ok, stage: result.stage, status: result.status || null, leaseLost: result.leaseLost === true, reason: result.reason || null, blockerCodes: result.blockerCodes || [], problems: result.problems || [] };
 }
 
@@ -403,6 +463,12 @@ if (process.env.RECONCILE_DUMP === "1") {
 ghOut("outcome", out.outcome || "unknown");
 ghOut("published_count", String(out.counts ? out.counts.targetsPublished : 0));
 ghOut("failed_count", String(out.counts ? out.counts.targetsFailed : 0));
+// OPT-IN machine-readable per-account states for the independent publication recovery worker (--emit-targets; OFF by
+// default so every existing invocation is byte-identical). Sanitized: ids + state + reason CODE only.
+if (process.argv.includes("--emit-targets")) {
+  const { formatTargetsLine } = await import("../../lib/server/sync/reconcile-targets-output.js");
+  console.log(formatTargetsLine({ family: "listings", summary: { ...out, bucket, requestedAsOf: asOf, dryRun } }));
+}
 console.log("RESULT " + JSON.stringify({
   ok: out.ok, outcome: out.outcome, code: out.code || "OK", bucket, requestedAsOf: asOf, mode, dryRun,
   dataDoeCreates: 0, dataDoeTokens: 0,

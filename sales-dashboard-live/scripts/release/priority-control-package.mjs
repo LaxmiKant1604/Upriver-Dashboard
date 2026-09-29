@@ -3,6 +3,8 @@
 //   node scripts/release/priority-control-package.mjs            -> DRY RUN: print the exact package (NO writes)
 //   node scripts/release/priority-control-package.mjs --apply    -> apply the package in ONE guarded transaction
 //   node scripts/release/priority-control-package.mjs --rollback -> reverse the package in ONE guarded transaction
+//   --apply [--lease-wait-seconds=N] -> retry the apply ONLY on the typed CONTROL_LEASE_HELD refusal for <= N seconds
+//                                       (absent / 0 = exactly one attempt, byte-identical)
 //
 // It opens the publication gates for EXACTLY daily-reporting + brand-sales (dispatch) + brand-inventory (promoted)
 // for ALL freshly discovered PRIMARY accounts, with an audited approval for every (key, account); all_primary
@@ -30,7 +32,7 @@ try {
   process.exit(1);
 }
 
-const { runControlPackageCli, PRIORITY_DISPATCH_ENABLED, PRIORITY_PROMOTED_ENABLED } = await import("../../lib/server/sync/source-priority-control-package.js");
+const { runControlPackageCli, PRIORITY_DISPATCH_ENABLED, PRIORITY_PROMOTED_ENABLED, MAX_CONTROL_LEASE_WAIT_SECONDS } = await import("../../lib/server/sync/source-priority-control-package.js");
 const { CONTROLLED_REPORT_KEYS } = await import("../../lib/server/sync/report-controls.js");
 // The reviewed pg store + primary discovery moved VERBATIM into the shared lib (one implementation for the CLI,
 // the manual source-sync operator, and any other trusted caller -- no drift).
@@ -72,6 +74,20 @@ if ((MODE === "apply" || MODE === "rollback") && !OWNER_TOKEN) {
 // EMITS its acquired generation (below) for the workflow to thread into --rollback.
 const rawOwnerGen = ((process.argv.find((a) => a.startsWith("--owner-generation=")) || "").split("=").slice(1).join("=") || "").trim();
 const OWNER_GENERATION = /^\d+$/.test(rawOwnerGen) ? Number(rawOwnerGen) : null;
+// Publication recovery WP13 -- OPTIONAL bounded LEASE-WAIT for an --apply (the control envelope ONLY; no acquisition,
+// discovery or package change). --lease-wait-seconds=N (an integer 0..MAX_CONTROL_LEASE_WAIT_SECONDS) lets
+// runControlPackageCli retry the apply ONLY on the typed CONTROL_LEASE_HELD refusal (a rolled-back, zero-write
+// transaction), every 15 s on a fresh connection, until N seconds have passed. ABSENT or 0 => the call below is
+// BYTE-IDENTICAL to before (no leaseWaitSeconds key at all -> exactly one attempt). Malformed, or with any mode other
+// than --apply => STOP (exit 2) before any store connection: a bad bound never degrades into "wait forever" or "no wait".
+const rawLeaseWait = process.argv.find((a) => a.startsWith("--lease-wait-seconds="));
+let LEASE_WAIT_SECONDS = 0;
+if (rawLeaseWait != null) {
+  const v = rawLeaseWait.slice("--lease-wait-seconds=".length).trim();
+  if (!/^\d{1,5}$/.test(v) || Number(v) > MAX_CONTROL_LEASE_WAIT_SECONDS) { console.error("STOP --lease-wait-seconds must be an integer in [0, " + MAX_CONTROL_LEASE_WAIT_SECONDS + "] (got: " + v.slice(0, 20) + ")"); process.exit(2); }
+  if (MODE !== "apply") { console.error("STOP --lease-wait-seconds is accepted ONLY with --apply (a safe-close / reclaim never waits for the lease)"); process.exit(2); }
+  LEASE_WAIT_SECONDS = Number(v);
+}
 // reclaim mints its own unique token: it acquires ONLY a free/expired lease (a live owner blocks it), then closes.
 const RECLAIM_TOKEN = "reclaim-stale/" + (BUCKET || "all") + "/" + process.pid + "-" + Date.now();
 const EFFECTIVE_TOKEN = MODE === "reclaim" ? RECLAIM_TOKEN : OWNER_TOKEN;
@@ -114,7 +130,7 @@ const connectStore = connectPriorityControlStore;
 
 let result = { committed: false, code: 1 };
 try {
-  result = await runControlPackageCli({ mode: MODE, operator: OPERATOR, discoverAccounts, connectStore, controlledReportKeys: CONTROLLED_REPORT_KEYS, ownerToken: EFFECTIVE_TOKEN, ownerGeneration: OWNER_GENERATION, operationKey: "priority-control/" + (BUCKET || "all") + "/" + ACCOUNT_SCOPE, log: (m) => console.log("  " + m) });
+  result = await runControlPackageCli({ mode: MODE, operator: OPERATOR, discoverAccounts, connectStore, controlledReportKeys: CONTROLLED_REPORT_KEYS, ownerToken: EFFECTIVE_TOKEN, ownerGeneration: OWNER_GENERATION, operationKey: "priority-control/" + (BUCKET || "all") + "/" + ACCOUNT_SCOPE, log: (m) => console.log("  " + m), ...(LEASE_WAIT_SECONDS > 0 ? { leaseWaitSeconds: LEASE_WAIT_SECONDS } : {}) });
   // Round-9/10 P1-C: EMIT the acquired fencing generation so the workflow threads it into this run's --rollback
   // (and so bootstrap-publish / FBA go-live fence the exact generation). Never inferred downstream. A committed
   // apply ALWAYS carries a valid generation (the transaction fails closed otherwise). Round-10 (blocker 4):

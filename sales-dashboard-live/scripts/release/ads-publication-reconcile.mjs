@@ -31,6 +31,7 @@
 // that account, and daily's re-derive still publishes OLI sales from the durable union. 7-bit ASCII, LF.
 
 import pg from "pg";
+import { verifiedPgConfig } from "../../lib/server/pg-tls.js";
 import { appendFileSync } from "node:fs";
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
 import { isRegionScope, accountInScope } from "../../lib/server/sync/scheduler-scope.js";
@@ -49,6 +50,25 @@ const runToken = (argOf("run-token") || "").trim();
 const rawOwnerGen = (argOf("owner-generation") || "").trim();
 const ownerGeneration = /^\d+$/.test(rawOwnerGen) ? Number(rawOwnerGen) : NaN;
 const ghOut = (k, v) => { const f = process.env.GITHUB_OUTPUT; if (f) { try { appendFileSync(f, k + "=" + v + "\n"); } catch { /* ignore */ } } };
+// OPTIONAL bounded LEASE-WAIT for this run's controls APPLY (publication recovery WP13 verifier P2-1; the control envelope
+// ONLY -- what is published is unchanged). The scheduler's route CLI now holds the GLOBAL control-plane lease in windows
+// (with a fairness pause between them), so a single-attempt apply here could lose to it and defer every account to the
+// evening backstop. --lease-wait-seconds=N (an integer 0..900): runControlPackageCli retries the apply ONLY on the typed
+// CONTROL_LEASE_HELD refusal (a zero-write, rolled-back transaction) every 15 s, CAPPED at this run's start cutoff
+// (--deadline-seconds minus START_RESERVE), so the ALWAYS safe-close reserve stays intact (a long wait can use up the
+// work window: the stale accounts then defer, LKG kept). Immediate mode never applies (it renews the scheduler's fence),
+// so it never waits. ABSENT or 0 => the apply call is BYTE-IDENTICAL (no leaseWaitSeconds key; exactly one attempt).
+// Malformed => STOP (exit 2) before any connection.
+const rawLeaseWait = argOf("lease-wait-seconds");
+if (rawLeaseWait != null && (!/^\d{1,3}$/.test(rawLeaseWait) || Number(rawLeaseWait) > 900)) { console.error("STOP ADS_RECONCILE_LEASE_WAIT: --lease-wait-seconds must be an integer in [0, 900]; got " + String(rawLeaseWait).slice(0, 20)); process.exit(2); }
+const LEASE_WAIT_SECONDS = rawLeaseWait != null ? Number(rawLeaseWait) : 0;
+// The lease-wait actually granted to an apply starting NOW: never past the start cutoff (none once it is reached).
+const applyLeaseWait = () => {
+  if (!(LEASE_WAIT_SECONDS > 0)) return {};
+  const cap = deadlineSec > 0 ? Math.max(0, Math.floor(startCutoffSec - (Date.now() - runStartMs) / 1000)) : LEASE_WAIT_SECONDS;
+  const n = Math.min(LEASE_WAIT_SECONDS, cap);
+  return n > 0 ? { leaseWaitSeconds: n } : {};
+};
 
 if (!isRegionScope(bucket)) { console.error("STOP ADS_RECONCILE_REGION_UNSUPPORTED: --bucket must be india|europe-au|us-ca (region-scoped); got " + bucket); process.exit(2); }
 if (!DATE_RE.test(String(asOf))) { console.error("STOP ADS_RECONCILE_AS_OF: --as-of=YYYY-MM-DD is required; got " + asOf); process.exit(2); }
@@ -103,8 +123,9 @@ if (!primaryConn) { console.error("STOP ADS_RECONCILE_NO_PRIMARY_CONNECTION -- f
 const orgFp = primaryConn.organizationFingerprint || organizationFingerprint(primaryConn.apiKey);
 
 const withTimeout = (p, label) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timed out after 120000ms")), 120000))]);
-const pgBase = String(process.env.POSTGRES_URL || "").split("?")[0];
-const makePgReadOnly = () => new pg.Client({ connectionString: pgBase, ssl: { rejectUnauthorized: false } });
+// Verified TLS: chain pinned to the Supabase root CA + hostname checked (lib/server/pg-tls.js); never rejectUnauthorized:false.
+const pgConfig = () => verifiedPgConfig(process.env.POSTGRES_URL);
+const makePgReadOnly = () => new pg.Client(pgConfig());
 
 const readbackLive = buildLiveReadback({
   getReportSnapshot: sb.getReportSnapshot,
@@ -122,8 +143,9 @@ const readbackLive = buildLiveReadback({
 // and the dedicated release module for transport symbols.)
 
 async function assertNoCron() {
-  const client = makePgReadOnly();
+  let client = null; // constructed inside try: an invalid POSTGRES_URL stays a typed {ok:false}, never an uncaught throw
   try {
+    client = makePgReadOnly();
     await client.connect();
     const t = await client.query("select to_regclass('cron.job')::text cron_table");
     if (!t.rows[0].cron_table) return { ok: true };
@@ -138,8 +160,8 @@ const OPERATOR = "ads-reconcile:" + bucket + ":" + (runToken || asOf);
 const CONTROL_OP_KEY = "ads-reconcile/" + bucket + "/" + asOf;
 
 async function partialNamespacePermitted() {
-  const probe = new pg.Client({ connectionString: pgBase, ssl: { rejectUnauthorized: false } });
-  try { await probe.connect(); return await readPartialCycleCapability((sql) => probe.query(sql).then((r) => r.rows)); }
+  let probe = null;
+  try { probe = new pg.Client(pgConfig()); await probe.connect(); return await readPartialCycleCapability((sql) => probe.query(sql).then((r) => r.rows)); }
   catch (e) { return { permitted: false, reason: "capability-unreadable: " + (e && e.message ? e.message : e) }; }
   finally { try { await probe.end(); } catch { /* ignore */ } }
 }
@@ -166,6 +188,7 @@ async function openControls(staleAccountIds) {
       connectStore: connectPriorityControlStore,
       ownerToken: OPERATOR, operationKey: CONTROL_OP_KEY, leaseTtlSeconds: 900,
       log: (m) => console.log("ads-reconcile controls: " + m),
+      ...applyLeaseWait(),
     });
     if (r && Number(r.code) === 3) return { ok: false, commitUnknown: true, reason: "control-apply COMMIT_UNKNOWN (code 3) -- read-only reconciliation required (NO rollback/retry)" };
     if (!r || r.committed !== true) return { ok: false, reason: "controls apply did not commit (code " + (r && r.code) + (r && r.problem ? "/" + r.problem : "") + ")" };
@@ -368,6 +391,12 @@ const out = await daily.run({ bucket, requestedAsOf: asOf, accountIds: accountsA
 ghOut("outcome", out.outcome || "unknown");
 ghOut("published_count", String(out.counts ? out.counts.targetsPublished : 0));
 ghOut("failed_count", String(out.counts ? out.counts.targetsFailed : 0));
+// OPT-IN machine-readable per-account states for the independent publication recovery worker (--emit-targets; OFF by
+// default so every existing invocation is byte-identical). Sanitized: ids + state + reason CODE only.
+if (process.argv.includes("--emit-targets")) {
+  const { formatTargetsLine } = await import("../../lib/server/sync/reconcile-targets-output.js");
+  console.log(formatTargetsLine({ family: "ads", summary: { ...out, bucket, requestedAsOf: asOf, dryRun } }));
+}
 console.log("RESULT " + JSON.stringify({
   ok: out.ok, outcome: out.outcome, code: out.code || "OK", bucket, requestedAsOf: asOf, mode, dryRun, operation: "daily-reporting",
   dataDoeCreates: 0, dataDoeTokens: 0,

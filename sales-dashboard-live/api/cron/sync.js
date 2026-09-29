@@ -11,10 +11,18 @@
 
 import { verifyCronRequest } from "../../lib/server/ads-sync.js";
 import { runScheduledSync } from "../../lib/server/sync/run-sync.js";
+// Publication recovery WP10b: Scheduler v1 never dispatches a ROUTE-OWNED live report (typed refusal).
+import { getReportSyncSettings, isSupabaseConfigured } from "../../lib/server/supabase.js";
+import { enabledReportKeys } from "../../lib/server/sync/report-controls.js";
+import { splitSchedulerV1ReportKeys, schedulerV1RouteOwnedRefusal } from "../../lib/server/report-store.js";
 
 export const config = { maxDuration: 60 };
 
-export default async function handler(req, res) {
+// Production collaborators, injectable for narrowly-scoped API-boundary tests (handler(req,res,deps) seam).
+const DEFAULT_DEPS = Object.freeze({ verifyCronRequest, runScheduledSync, getReportSyncSettings, isSupabaseConfigured });
+
+export async function handler(req, res, deps = DEFAULT_DEPS) {
+  const { verifyCronRequest, runScheduledSync } = { ...DEFAULT_DEPS, ...deps };
   if (!verifyCronRequest(req, res)) return; // sends 401/500 itself
   if (req.method !== "GET" && req.method !== "POST") {
     res.status(405).json({ error: "Method not allowed." });
@@ -27,9 +35,23 @@ export default async function handler(req, res) {
   }
   const trigger = String(req.query?.trigger || "cron-vercel");
   try {
-    const result = await runScheduledSync({ bucket, trigger });
-    res.status(200).json(result);
+    // WP10b: route-owned live keys are REFUSED (typed 409 when nothing else would run -- zero lock / DataDoe); any
+    // non-route-owned scheduled key still runs exactly as before (the refused keys are reported alongside).
+    // The SAME selection run-sync.js makes for reportKeys = null (enabledReportKeys over report_sync_settings), computed
+    // up front minus every route-owned key and passed EXPLICITLY (never null -> never a later re-read that could select
+    // a route-owned key). Without Supabase run-sync returns 'supabase-not-configured' before reading anything.
+    const d = { ...DEFAULT_DEPS, ...deps };
+    const plan = splitSchedulerV1ReportKeys(d.isSupabaseConfigured() ? [...enabledReportKeys(await d.getReportSyncSettings())] : []);
+    if (plan.refused.length && !plan.allowed.length) {
+      res.status(409).json(schedulerV1RouteOwnedRefusal(plan.refused, { isAdmin: false }));
+      return;
+    }
+    const result = await runScheduledSync({ bucket, trigger, reportKeys: plan.allowed });
+    res.status(200).json(plan.refused.length ? { ...result, refusedReportKeys: plan.refused, refusal: "ROUTE_OWNED_REPORT_V1_REFUSED" } : result);
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : "scheduled sync failed" });
   }
 }
+
+// Vercel serverless entry: the production handler wired to the real collaborators (DEFAULT_DEPS). No new api/*.js.
+export default function (req, res) { return handler(req, res); }

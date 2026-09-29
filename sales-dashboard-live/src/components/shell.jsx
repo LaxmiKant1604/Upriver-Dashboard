@@ -537,6 +537,19 @@ export function TopBar({
             >
               <RefreshCw size={14} className={refresh.busy ? "spin" : ""} aria-hidden="true" />
             </button>
+            {/* Admin-only paid-sync entry (route-owned report pages): navigates to the Data Sync Center, whose source
+                cards show a token estimate and require explicit confirmation before any DataDoe token is spent. */}
+            {refresh.paidSync && (
+              <button
+                className="refresh-btn"
+                type="button"
+                onClick={refresh.paidSync.onClick}
+                title={refresh.paidSync.label}
+                aria-label={refresh.paidSync.label}
+              >
+                <DatabaseZap size={14} aria-hidden="true" />
+              </button>
+            )}
           </div>
         </div>
       )}

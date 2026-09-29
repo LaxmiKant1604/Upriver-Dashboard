@@ -19,7 +19,7 @@
 // correct regardless of what discovery returns at rollback time (a dynamically rediscovered blind disable would
 // NOT be an honest restoration, so we never call it one).
 
-import { CONTROLLED_REPORT_KEYS } from "./report-controls.js";
+import { CONTROLLED_REPORT_KEYS, SOURCE_PROMOTED_REPORT_KEYS } from "./report-controls.js";
 import { PRIORITY_DASHBOARDS } from "./source-priority-dashboards.js";
 
 const S = (v) => (v == null ? "" : String(v));
@@ -163,6 +163,75 @@ export function buildListingHealthV3ControlPackage({ accounts, operator = "", co
   return { accounts: acct, operator, controlled, apply, rollback, post };
 }
 
+// ---- Publication-recovery ROUTE control package (WP4) -----------------------------------------------------------------
+// A zero-export recovery route (publication-route-reconcile.mjs) publishes ONLY through its publisher keys' PROMOTED
+// publish controls (source_promoted_publish_settings) -- NEVER a dispatch control. A source-promoted key
+// (SOURCE_PROMOTED_REPORT_KEYS: sku-movement, returns-leakage-v3, brand-view*, ...) is its own gate key; a DISPATCH key
+// may be opened by a route ONLY through an explicit promotedGateKey (WP1: the fba-plan contract's GATE 2 also passes on
+// the promoted row 'fba-plan', so the route never enables the paid fba-plan dispatch control). Pinned equal to every
+// SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[*].promotedGateKey by scripts/route-publication-release.test.js (kept literal here so
+// this module never imports the publisher graph).
+export const ROUTE_PROMOTED_GATE_KEYS = Object.freeze({ "fba-plan": "fba-plan" });
+
+/** The promoted gate key a route publisher key opens, or null when the key has no promoted gate (fail closed). */
+export function routePromotedGateKey(publisherKey, { sourcePromotedKeys = SOURCE_PROMOTED_REPORT_KEYS } = {}) {
+  const k = S(publisherKey);
+  if (!nb(k)) return null;
+  if (Object.prototype.hasOwnProperty.call(ROUTE_PROMOTED_GATE_KEYS, k)) return ROUTE_PROMOTED_GATE_KEYS[k];
+  return (Array.isArray(sourcePromotedKeys) ? sourcePromotedKeys : []).includes(k) ? k : null;
+}
+
+/**
+ * Build the exact control package for a zero-export recovery ROUTE publish window (WP4). Enables EXACTLY:
+ *   rollout   = the window's owner accounts (GATE 3);
+ *   dispatch  = NONE -- every controlled report_sync_settings row is PAUSED (schedule_enabled:false), and the guarded
+ *               transaction's POST assertion (post.allDispatchPaused) fails the whole apply if ANY dispatch row is
+ *               enabled after the writes (a route can never open a paid/dispatch path, I4);
+ *   promoted  = the publisher keys' gate keys (routePromotedGateKey: fba-plan -> 'fba-plan', otherwise the key itself),
+ *               as a SORTED ARRAY (post.promotedEnabled) -- a key with no promoted gate THROWS (fail closed);
+ *   approvals = publisherKey x account (GATE 4), audited with the operator.
+ * Same guarded transaction + COMPLETE global-set POST assertions + discovery-independent SAFE-CLOSE as every other
+ * package. Fails closed on an empty/dd-secondary/prefixed account set, a blank operator, or an empty publisher set.
+ */
+export function buildRouteControlPackage({ accounts, operator = "", publisherKeys, controlledReportKeys = CONTROLLED_REPORT_KEYS, sourcePromotedKeys = SOURCE_PROMOTED_REPORT_KEYS } = {}) {
+  const acct = uniqSort(accounts);
+  if (!acct.length) throw new Error("buildRouteControlPackage requires >=1 owner account (fail closed).");
+  if (acct.some((a) => a.includes(":"))) throw new Error("buildRouteControlPackage refuses a prefixed (dd-secondary / scope) account id (primary rollout accounts only, fail closed).");
+  if (!nb(operator)) throw new Error("buildRouteControlPackage requires an operator id for the audited approvals (fail closed).");
+  const publishKeys = uniqSort(publisherKeys);
+  if (!publishKeys.length) throw new Error("buildRouteControlPackage requires >=1 publisher key (fail closed).");
+  const gateKeys = [];
+  for (const rk of publishKeys) {
+    const g = routePromotedGateKey(rk, { sourcePromotedKeys });
+    if (!g) throw new Error(`buildRouteControlPackage: publisher key '${rk}' has no promoted publish gate (a route never opens a dispatch control; fail closed).`);
+    gateKeys.push(g);
+  }
+  const promotedEnabled = uniqSort(gateKeys);
+  const controlled = uniqSort(controlledReportKeys);
+  // A route opens NO dispatch control: every controlled report is paused (fba-plan's paid dispatch included).
+  const reportSyncSettings = controlled.map((rk) => ({ report_key: rk, schedule_enabled: false }));
+  const approvals = acct.flatMap((a) => publishKeys.map((rk) => rk + "|" + a)).sort();
+  const apply = {
+    allPrimary: false,
+    rollout: acct.map((a) => ({ account_id: a, enabled: true, note: "publication recovery route" })),
+    reportSyncSettings,
+    promoted: promotedEnabled.map((rk) => ({ report_key: rk, publish_enabled: true })),
+    approvals: acct.flatMap((a) => publishKeys.map((rk) => ({ report_key: rk, account_id: a, approved: true, approved_by: operator }))),
+  };
+  const rollback = { mode: "safe-close", allPrimary: false, disablesAllRollout: true, pausesAllControlledDispatch: true, disablesAllPromoted: true, revokesAllApprovals: true };
+  const post = {
+    allPrimaryFalse: true,
+    rolloutEnabled: [...acct],
+    dispatchEnabled: [], // NO dispatch control enabled -- ever
+    dispatchPaused: [...controlled],
+    promotedEnabled, // a sorted ARRAY (runControlPackageTransaction accepts an array; a string stays byte-identical)
+    approvals,
+    noCron: true,
+    allDispatchPaused: true, // explicit I4 POST assertion: zero enabled dispatch rows GLOBALLY
+  };
+  return { accounts: acct, operator, controlled, publisherKeys: publishKeys, apply, rollback, post };
+}
+
 /**
  * Build the DISCOVERY-INDEPENDENT safe-close package for --rollback. It needs NO account discovery and NO
  * DataDoe call -- the safe-close disables EVERY priority control globally -- only a validated `operator` for the
@@ -210,6 +279,12 @@ export async function runControlPackageTransaction({ store, pkg, mode, controlle
   // Reject a blank/noncanonical operator BEFORE BEGIN -- every audited revocation must carry a real principal.
   if (!isCanonicalOperator(pkg.operator)) throw new Error("runControlPackageTransaction requires a canonical operator id (fail closed, before BEGIN).");
   if (mode === "apply" && (!pkg.post || !Array.isArray(pkg.accounts) || !pkg.accounts.length)) throw new Error("runControlPackageTransaction apply requires a discovered account package (fail closed).");
+  // WP4: post.promotedEnabled may be an ARRAY (a route package opening several promoted gates). Every element must be a
+  // canonical nonblank key -- a blank/non-string entry is refused BEFORE BEGIN (never silently dropped). A STRING keeps
+  // the exact pre-WP4 rule below (blank => no promoted control enabled), byte-identical.
+  if (mode === "apply" && Array.isArray(pkg.post.promotedEnabled) && !pkg.post.promotedEnabled.every((k) => typeof k === "string" && nb(k) && k === k.trim())) {
+    throw new Error("runControlPackageTransaction apply: post.promotedEnabled array must hold canonical nonblank keys (fail closed, before BEGIN).");
+  }
   const operator = S(pkg.operator);
   const controlled = uniqSort(controlledReportKeys);
   let leaseGeneration = null; // the fencing generation captured on apply/reclaim acquire
@@ -300,8 +375,11 @@ export async function runControlPackageTransaction({ store, pkg, mode, controlle
       // ---- WRITES: ACTIVELY produce EXACTLY the approved target (reconcile away any pre-existing extra) ----
       // A blank promotedEnabled means NO promoted control is enabled (the fba-plan go-live is a dispatch report,
       // not a source-promoted one), so setPromotedEnabled([]) disables every promoted control without creating a
-      // blank-keyed row. The priority package supplies "brand-inventory".
-      const promotedTargets = nb(pkg.post.promotedEnabled) ? [pkg.post.promotedEnabled] : [];
+      // blank-keyed row. The priority package supplies "brand-inventory". WP4: a route package supplies a sorted ARRAY
+      // of gate keys (validated canonical before BEGIN); a string input is byte-identical to before.
+      const promotedTargets = Array.isArray(pkg.post.promotedEnabled)
+        ? uniqSort(pkg.post.promotedEnabled)
+        : (nb(pkg.post.promotedEnabled) ? [pkg.post.promotedEnabled] : []);
       await store.setRolloutEnabled(pkg.post.rolloutEnabled);
       await store.setDispatchEnabled(pkg.post.dispatchEnabled, controlled);
       await store.setPromotedEnabled(promotedTargets);
@@ -313,6 +391,9 @@ export async function runControlPackageTransaction({ store, pkg, mode, controlle
       needSet(await pausedDispatch(), pkg.post.dispatchPaused, "dispatch-paused");
       needSet(await enabledPromoted(), promotedTargets, "promoted-enabled");
       needSet(await approvedPairs(), pkg.post.approvals, "approved");
+      // WP4 (I4): a ROUTE package asserts EXPLICITLY that NO dispatch control is enabled anywhere (GLOBAL read, never
+      // filtered). Absent on every pre-WP4 package (the flag is route-only), so their assertion set is unchanged.
+      if (pkg.post.allDispatchPaused === true) needSet(await enabledDispatch(), [], "route-dispatch-must-be-paused");
     } else {
       // ---- WRITES: SAFE-CLOSE every priority control (documented; NOT a restoration). The approval revocation
       //      is audited with the validated operator + now(); no discovery / account list is needed. ----
@@ -369,16 +450,38 @@ export async function runControlPackageTransaction({ store, pkg, mode, controlle
   }
 }
 
+// The typed lease-held refusal of an APPLY (runControlPackageTransaction throws "CONTROL_LEASE_HELD: ..." BEFORE any
+// write and rolls back: committed:false, code 1). The ONLY outcome the opt-in bounded lease-wait below ever retries.
+export const CONTROL_LEASE_HELD_PREFIX = "CONTROL_LEASE_HELD";
+export const MAX_CONTROL_LEASE_WAIT_SECONDS = 3600;
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export function isControlLeaseHeldResult(result) {
+  return !!result && result.committed !== true && result.commitUnknown !== true && Number(result.code) === 1 && S(result.problem).startsWith(CONTROL_LEASE_HELD_PREFIX);
+}
+
 /**
  * Orchestrate ONE control-package operation with every side effect injected, so the .mjs is a thin wrapper and
  * the discovery-independence of --rollback is offline-testable. For "apply"/"dry-run" it discovers primary
  * accounts (discoverAccounts) and builds the exact target; for "rollback" it builds the SAFE-CLOSE package and
  * NEVER calls discoverAccounts (it works even if DataDoe is down -- zero DataDoe calls, no account list).
  * "dry-run" returns the plan with no writes. Returns the transaction result (or { dryRun:true, pkg }).
+ *
+ * BOUNDED LEASE-WAIT (publication-recovery WP4; OPT-IN, default leaseWaitSeconds 0 => exactly ONE attempt, byte-identical
+ * calls + result). With leaseWaitSeconds > 0 an APPLY whose transaction failed ONLY because the global control lease is
+ * held by another operation (problem starting "CONTROL_LEASE_HELD" -- the transaction rolled back with ZERO writes) is
+ * retried every leaseRetryIntervalSeconds (default 15 s) on a FRESH store connection (no idle connection is held across
+ * the wait), until the next attempt would start after start + leaseWaitSeconds; then the LAST result is returned
+ * unchanged. Every other outcome (commit, COMMIT_UNKNOWN, a POST failure, a rollback/reclaim) returns immediately --
+ * the wait never retries a write that may have landed. `sleep` + `now` are injectable (offline tests).
  */
-export async function runControlPackageCli({ mode, operator, discoverAccounts, connectStore, controlledReportKeys = CONTROLLED_REPORT_KEYS, buildApplyPackage = buildPriorityControlPackage, ownerToken = "", ownerGeneration = null, operationKey = "", leaseTtlSeconds = 900, log = () => {} } = {}) {
+export async function runControlPackageCli({ mode, operator, discoverAccounts, connectStore, controlledReportKeys = CONTROLLED_REPORT_KEYS, buildApplyPackage = buildPriorityControlPackage, ownerToken = "", ownerGeneration = null, operationKey = "", leaseTtlSeconds = 900, log = () => {}, leaseWaitSeconds = 0, leaseRetryIntervalSeconds = 15, sleep = defaultSleep, now = () => Date.now() } = {}) {
   if (mode !== "apply" && mode !== "rollback" && mode !== "dry-run" && mode !== "reclaim") throw new Error("runControlPackageCli mode must be apply|rollback|dry-run|reclaim (fail closed).");
   if (!isCanonicalOperator(operator)) throw new Error("runControlPackageCli requires a canonical operator id (fail closed).");
+  // The wait bound is validated BEFORE any discovery / store work (a malformed bound never degrades to "wait forever").
+  const waitSec = Number(leaseWaitSeconds);
+  if (!Number.isFinite(waitSec) || waitSec < 0 || waitSec > MAX_CONTROL_LEASE_WAIT_SECONDS) throw new Error(`runControlPackageCli leaseWaitSeconds must be a number in [0, ${MAX_CONTROL_LEASE_WAIT_SECONDS}] (fail closed).`);
+  const intervalSec = Number(leaseRetryIntervalSeconds);
+  if (waitSec > 0 && (!Number.isFinite(intervalSec) || intervalSec <= 0)) throw new Error("runControlPackageCli leaseRetryIntervalSeconds must be a positive number (fail closed).");
   let pkg;
   if (mode === "rollback" || mode === "reclaim") {
     // DISCOVERY-INDEPENDENT: no DataDoe call, no account list -- the safe-close is global (it closes EVERY control,
@@ -395,10 +498,29 @@ export async function runControlPackageCli({ mode, operator, discoverAccounts, c
   }
   if (mode === "dry-run") return { dryRun: true, mode: "dry-run", committed: false, code: 0, pkg };
   if (typeof connectStore !== "function") throw new Error("runControlPackageCli requires connectStore for a live apply/rollback (fail closed).");
-  const store = await connectStore();
-  try {
-    return await runControlPackageTransaction({ store, pkg, mode, controlledReportKeys, ownerToken, ownerGeneration, operationKey, leaseTtlSeconds });
-  } finally {
-    if (store && typeof store.end === "function") { try { await store.end(); } catch { /* ignore */ } }
+  const attempt = async () => {
+    const store = await connectStore();
+    try {
+      return await runControlPackageTransaction({ store, pkg, mode, controlledReportKeys, ownerToken, ownerGeneration, operationKey, leaseTtlSeconds });
+    } finally {
+      if (store && typeof store.end === "function") { try { await store.end(); } catch { /* ignore */ } }
+    }
+  };
+  // Default (no wait, or a close mode): exactly ONE attempt -- the pre-WP4 call sequence, byte-identical.
+  if (!(mode === "apply" && waitSec > 0)) return attempt();
+  const startedMs = Number(now());
+  const intervalMs = intervalSec * 1000;
+  let attempts = 0;
+  for (;;) {
+    const result = await attempt();
+    attempts += 1;
+    if (!isControlLeaseHeldResult(result)) return result;
+    // Bounded: never START an attempt after start + leaseWaitSeconds.
+    if (Number(now()) - startedMs + intervalMs > waitSec * 1000) {
+      log(`lease-wait: the control lease is still held after ${attempts} attempt(s) -- giving up within the ${waitSec}s bound (zero writes).`);
+      return result;
+    }
+    log(`lease-wait: the control lease is held by another operation -- retrying in ${intervalSec}s (attempt ${attempts}, bound ${waitSec}s, zero writes so far).`);
+    await sleep(intervalMs);
   }
 }

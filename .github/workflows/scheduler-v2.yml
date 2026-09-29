@@ -297,10 +297,15 @@ jobs:
       # Controls open when OLI + strict D-1 pass. On a PARTIAL run they ALSO require the partial-cycle capability
       # preflight to have SUCCEEDED (so a missing/unreadable capability opens NO controls); a COMPLETE run skips the
       # preflight and opens controls as before (byte-identical).
+      # BOUNDED LEASE-WAIT (publication recovery WP13; control envelope ONLY -- acquisition untouched): the global
+      # control-plane lease may be held briefly by a zero-export reconciler / recovery route; --lease-wait-seconds=600
+      # retries the apply ONLY on the typed CONTROL_LEASE_HELD refusal (a zero-write rolled-back transaction), every
+      # 15 s on a fresh connection, for at most 600 s. Any other outcome returns at once (never retries a write that may
+      # have landed). Without the flag the call is byte-identical (exactly one attempt).
       - name: Open publication controls (this region only)
         id: full_controls
         if: steps.cfg.outputs.scope != 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.readiness.outputs.proceed == 'true' && (steps.oli.outputs.full_complete == 'true' || steps.partial_preflight.outcome == 'success')
-        run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.region }} --account-scope=full --owner-token=${{ github.run_id }}-${{ github.run_attempt }}
+        run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.region }} --account-scope=full --owner-token=${{ github.run_id }}-${{ github.run_attempt }} --lease-wait-seconds=600
 
       # (steps 6/8/9/10, FULL scope, COMPLETE region) Catalog reuse/refresh + derive + preflight EVERY account in this
       # region + publish this region x3 + live read-back into the NATURAL daily cycle. Runs ONLY when OLI covered the
@@ -369,7 +374,7 @@ jobs:
       - name: (bootstrap) Open publication controls for EXACTLY the dispatch-wave accounts
         id: bootstrap_controls
         if: steps.cfg.outputs.scope == 'bootstrap' && steps.guard.outputs.run_required == 'true' && steps.tokengate.outputs.proceed == 'true' && steps.oli.outcome == 'success' && steps.campaign.outcome == 'success'
-        run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.region }} --account-scope=bootstrap --dispatch-id=${{ inputs.dispatch_id }} --owner-token=${{ github.run_id }}-${{ github.run_attempt }}
+        run: node scripts/release/priority-control-package.mjs --apply --bucket=${{ steps.cfg.outputs.region }} --account-scope=bootstrap --dispatch-id=${{ inputs.dispatch_id }} --owner-token=${{ github.run_id }}-${{ github.run_attempt }} --lease-wait-seconds=600
 
       # (bootstrap step B) SCOPED publication: derive/finalize/publish/live-read-back EXACTLY the frozen wave
       # accounts over the DEDICATED bootstrap-<region> cycle -- no collision with the natural daily cycle, no
@@ -490,9 +495,11 @@ jobs:
       # --inventory-as-of is the SHARED inventory_asof (D-1) resolved once in the run job, so this FBA inventory
       # fetch (EXACTLY [D-1 .. D-1]) and the downstream Listing Health v3 job adopt ONE inventory identity (v3
       # reuses this exact cache).
+      # --lease-wait-seconds=600 (WP13, control envelope ONLY): each fba-plan control-package APPLY retries on the typed
+      # CONTROL_LEASE_HELD refusal for at most 600 s (the fetch plan, batches, token ceiling and exports are unchanged).
       - name: FBA go-live for this region (batched fetch -> derive -> publish -> ownership -> ALWAYS safe-close)
         id: fba
-        run: node scripts/release/fba-plan-golive.mjs --mode=go-live --region=${{ needs.run.outputs.region }} --max-tokens=${{ steps.fcfg.outputs.maxtok }} --inventory-as-of=${{ needs.run.outputs.inventory_asof }} --account-scope=${{ needs.run.outputs.scope }} --dispatch-id=${{ inputs.dispatch_id }} --run-token=${{ github.run_id }}-${{ github.run_attempt }}
+        run: node scripts/release/fba-plan-golive.mjs --mode=go-live --region=${{ needs.run.outputs.region }} --max-tokens=${{ steps.fcfg.outputs.maxtok }} --inventory-as-of=${{ needs.run.outputs.inventory_asof }} --account-scope=${{ needs.run.outputs.scope }} --dispatch-id=${{ inputs.dispatch_id }} --run-token=${{ github.run_id }}-${{ github.run_attempt }} --lease-wait-seconds=600
 
       # (fba step 2) IMMEDIATE post-save FBA publication reconcile (blocker 4). Right after the FBA inventory drain +
       # fba-plan publish -- i.e. once the durable FBA inventory (source_snapshots, fba-inventory-health) is saved +
@@ -523,7 +530,17 @@ jobs:
         continue-on-error: true
         run: |
           if [ "${{ vars.FBA_RECONCILE_LIVE }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
-          node scripts/release/fba-publication-reconcile.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --mode=periodic --deadline-seconds=300 $LIVE
+          node scripts/release/fba-publication-reconcile.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --mode=periodic --run-token=${{ github.run_id }}-${{ github.run_attempt }}-fba-reconcile --deadline-seconds=900 --lease-wait-seconds=600 $LIVE
+          # ^ --lease-wait-seconds=600 (WP13 verifier P2-A, control envelope ONLY): the controls APPLY retries on the typed
+          # CONTROL_LEASE_HELD refusal (another region's route-CLI materialize may hold the global lease), capped at this
+          # run's start cutoff (deadline 900 s - 120 s reserve); brand-inventory's same-day convergence depends on this step.
+          # --deadline-seconds=900 (publication recovery D3; zero export, NOT acquisition): each stale account is one ~20 s
+          # dedicated fenced release, so the old 300 s (180 s start cutoff) reached only the first 8 of europe-au's 32
+          # accounts; 780 s covers the whole region, and the reconciler's fair order (fbaFairOrder) starts with the
+          # most-starved accounts whenever the deadline still cuts. The fba job's 120-minute timeout is unchanged.
+          # --run-token (control envelope ONLY): this run's OWN lease owner. Without it the owner was
+          # 'fba-reconcile:<region>:<as-of>', the SAME as the evening backstop's and a manual dispatch's for this region and
+          # D-1, so an overlapping run would share this fence (same-owner renew) and could release it under this step.
 
   # IMMEDIATE post-save Campaign-Ads publication reconcile (WORK A item 6). The run job's `campaign` step refreshes the
   # durable Campaign Ads coverage for this region BEFORE its priority daily publish, so the normal run already reflects
@@ -576,7 +593,10 @@ jobs:
         continue-on-error: true
         run: |
           if [ "${{ vars.ADS_RECONCILE_LIVE }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
-          node scripts/release/ads-publication-reconcile.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.effective_asof }} --mode=periodic --deadline-seconds=300 $LIVE
+          node scripts/release/ads-publication-reconcile.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.effective_asof }} --mode=periodic --deadline-seconds=300 --lease-wait-seconds=600 $LIVE
+          # ^ --lease-wait-seconds=600 (WP13 verifier P2-1, control envelope ONLY): the controls APPLY retries on the typed
+          # CONTROL_LEASE_HELD refusal (a concurrent route-CLI materialize holds the global lease in windows), capped at
+          # this run's start cutoff (deadline 300 s - 120 s reserve), instead of deferring every account on one refusal.
 
   # Listing Health v3 SHADOW ingestion -- runs ONLY after THIS region's FBA inventory job SUCCEEDED, so v3's reuse-only
   # inventory tranche adopts the fresh FBA Plan inventory cache (zero inventory creates). It is NOT a new scheduler
@@ -609,6 +629,12 @@ jobs:
     if: always() && needs.run.result == 'success' && needs.run.outputs.region != '' && needs.run.outputs.execute_downstream == 'true' && needs.run.outputs.scope != 'bootstrap'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # WP13 (from WP16): the ingestion CLI's typed machine-readable outcome, written to GITHUB_OUTPUT on every normal exit
+    # (NOT on its STOP exits / an uncaught throw -- then both stay EMPTY). The immediate reconcile job below gates on
+    # lhv3_phase so a TYPED failure (a terminal base cycle / a partial) still gets its zero-export publication repair.
+    outputs:
+      lhv3_phase: ${{ steps.ingest.outputs.lhv3_phase }}
+      lhv3_durable_persisted: ${{ steps.ingest.outputs.lhv3_durable_persisted }}
     defaults:
       run:
         working-directory: sales-dashboard-live
@@ -622,6 +648,11 @@ jobs:
       PRIORITY_OPERATOR: laxmikant@superboring.in
       # The dedicated ingestion gate, enabled ONLY inside this job. It does NOT flip the UI flag LISTING_HEALTH_V3.
       LISTING_HEALTH_V3_INGESTION_ENABLED: "true"
+      # WP13 (from WP16): the owner ATTESTATION that BOTH Vercel production serve flags (LHV3_PUBLISH_LIVE and the UI flag)
+      # are 'true' -- the ingestion CLI's already-current proof models the served selector ONLY from this repo variable
+      # (exactly 'true'; unset / anything else -> the served check fails CLOSED). This job never sets the UI flag itself.
+      # Owner procedure: change this variable TOGETHER with the Vercel flags.
+      LHV3_SERVE_GATE_ATTESTED: ${{ vars.LHV3_SERVE_GATE_ATTESTED }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -641,8 +672,17 @@ jobs:
         run: npm ci
       # --cycle-date AND the --confirm operation id BOTH use the SHARED inventory_asof from the run job (never a locally
       # recomputed date), so the v3 inventory identity matches the FBA cache and a watchdog replay is idempotent.
+      # id `ingest` + continue-on-error (WP13): the step's typed outputs must reach the job outputs even when it exits
+      # nonzero; the NEXT step keeps the job RED on that failure (continue-on-error is sequencing only, never a green).
       - name: Listing Health v3 shadow ingestion for this region (Listings + Listings-Raw only; inventory reuse-only)
+        id: ingest
+        continue-on-error: true
         run: node scripts/release/listing-health-v3-ingestion.mjs --region=${{ needs.run.outputs.region }} --mode=live --cycle-date=${{ needs.run.outputs.inventory_asof }} --confirm=listing-health-v3/${{ needs.run.outputs.region }}/${{ needs.run.outputs.inventory_asof }}
+      - name: Keep the job red when the Listing Health v3 ingestion failed (its typed phase is already exported)
+        if: steps.ingest.outcome == 'failure'
+        run: |
+          echo "LISTING_HEALTH_V3_INGESTION_FAILED phase=${{ steps.ingest.outputs.lhv3_phase }} durable_persisted=${{ steps.ingest.outputs.lhv3_durable_persisted }} -- the job stays RED; a typed phase (base-cycle-terminal | partial) still lets the immediate zero-export reconcile repair publication." >&2
+          exit 1
 
   # IMMEDIATE post-ingestion listing-health-v3 publication reconcile (WORK C item 6). A SEPARATE job (like ads_reconcile)
   # that runs AFTER this region's Listing Health v3 shadow ingestion (needs: listing-health-v3), which persisted the
@@ -664,7 +704,10 @@ jobs:
     # Listings-Raw pointers (source_listings_snapshot / source_listings_raw_snapshot at as_of === inventory_asof). If it
     # failed/was skipped, the durable pointers were NOT advanced this cycle, so the immediate reconcile must NOT fire
     # against stale pointers -- the daily backstop (listing-health-v3-reconcile.yml) remains the recovery path.
-    if: always() && needs.run.outputs.region != '' && needs.run.outputs.execute_downstream == 'true' && needs.run.outputs.scope != 'bootstrap' && needs.run.outputs.inventory_asof != '' && needs.listing-health-v3.result == 'success'
+    # WP13 EXCEPTION: a TYPED ingestion failure whose phase is base-cycle-terminal or partial (the run's OLI D-1 refresh
+    # advanced the manifest tokens, or one account's shadow save was refused) still runs the reconcile at once; an
+    # ABSENT phase (a STOP exit / a throw) is never eligible -- the plain success gate above applies, exactly as before.
+    if: always() && needs.run.outputs.region != '' && needs.run.outputs.execute_downstream == 'true' && needs.run.outputs.scope != 'bootstrap' && needs.run.outputs.inventory_asof != '' && (needs.listing-health-v3.result == 'success' || contains(fromJSON('["base-cycle-terminal","partial"]'), needs.listing-health-v3.outputs.lhv3_phase))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -690,25 +733,47 @@ jobs:
         continue-on-error: true
         run: |
           if [ "${{ vars.LISTINGS_RECONCILE_LIVE }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
-          node scripts/release/listing-health-v3-reconcile.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --mode=periodic --deadline-seconds=720 $LIVE
+          node scripts/release/listing-health-v3-reconcile.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --mode=periodic --deadline-seconds=720 --lease-wait-seconds=600 $LIVE
+          # ^ --lease-wait-seconds=600 (WP13 verifier P2-1, control envelope ONLY): the controls APPLY retries on the typed
+          # CONTROL_LEASE_HELD refusal (a concurrent route-CLI materialize holds the global lease in windows), capped at
+          # this run's start cutoff (deadline 720 s - 120 s reserve), instead of deferring every account on one refusal.
 
-  # Report materialization -- scheduler-OWNED, ZERO-EXPORT derivation of the durable reports that would otherwise
-  # self-heal on a browser GET (brand-view-brands, sku-movement per brand incl. ALL, returns-leakage). It depends ONLY
-  # on the `run` job (the durable brand-sales / daily / OLI / catalog sources), NOT on `fba`, so an FBA failure can
-  # never block these sales/returns reports. `if: always()` + LKG-preserving + idempotent-upsert means it is safe to
-  # run every dispatch: a re-run whose durable evidence has not advanced writes nothing (unchanged), and a watchdog
-  # replay produces no duplicate snapshot. There is NO DataDoe adapter on this path -- it is structurally incapable of
-  # creating an export or spending a token (the runner fails if it observes a non-zero token count). The DataDoe key
-  # is present only so the operator can resolve the primary organization fingerprint for its durable reads.
+  # Report materialization -- scheduler-OWNED, ZERO-EXPORT publication of the durable reports that would otherwise
+  # self-heal on a browser GET: brand-view-brands, sku-movement (per brand incl. ALL) and returns-leakage (v3).
+  # Publication recovery WP13: it runs the FENCED zero-export route CLI (scripts/release/publication-route-reconcile.mjs
+  # --mode=scheduler) UNCONDITIONALLY -- there is NO legacy branch and NO flag. Every live row goes through the reviewed
+  # four-gate publisher -> the fenced CAS under the control-plane lease, with lineage (a priority-partial cycle +
+  # sync_report_jobs), live read-back and the served-row check. The former UNFENCED materializer (report-materialization.mjs
+  # --mode=live -> saveReportSnapshot) is RETIRED: that CLI is now read-only dry-run tooling and refuses --mode=live.
+  # ZERO DataDoe: the route CLI imports the runtime zero-export guard FIRST, and NODE_OPTIONS preloads the same guard
+  # before any module is evaluated (every DataDoe request except the publisher's pinned accounts GET is refused
+  # in-process; the RESULT fails on any block). The DataDoe key is present only for that accounts GET (GATE 3) + the
+  # primary organization fingerprint.
+  #
+  # needs: [run, fba] -- ORDERING only: it runs AFTER the fba job (whose control windows hold the global control-plane
+  # lease), never concurrently with it; `always()` means fba's result never skips it (an FBA failure can never block
+  # these sales/returns reports). --lease-wait-seconds=600 absorbs a brief lease hold by a zero-export reconciler (retried
+  # ONLY on the typed CONTROL_LEASE_HELD refusal, capped at the run deadline minus the start reserve). --run-token is
+  # UNIQUE per invocation (the control lease owner is derived from it) and the always() cleanup step below reuses the
+  # SAME token, so an abnormal exit (timeout / cancel / crash) is safe-closed evidence-based (a live owner of another
+  # operation is never touched). Deferrals keep dated LKG and exit 0 (outcome partial); a HARD failure exits 1 (red).
+  #
+  # CUTOVER / DRAIN (owner procedure -- nothing here flips anything): an ALREADY-RUNNING scheduler run on the OLD code
+  # (the legacy unfenced materializer) is made safe by the WP15 DB writer fence, not by waiting: once a key's fence row is
+  # flipped, that run's next unfenced write fails closed (RWF01 REPORT_WRITER_FENCED; the live row stays last-known-good).
+  # No drain wait is required before a flip; record `gh run list --workflow scheduler-v2.yml --status in_progress` at flip
+  # time as evidence. Rollback = `git revert` of this change; the fence STAYS ON, so a reverted legacy writer fails closed
+  # (LKG preserved) and never re-enables unfenced writes.
   materialize:
-    needs: [run]
+    needs: [run, fba]
     # FULL-region materializers process EVERY region account and are SKIPPED in bootstrap scope (a
     # bootstrap run must write ZERO snapshots outside its immutable wave; the wave's Brand View converges
     # on the next natural run). Byte-identical for the natural (full) path. execute_downstream SKIPS this materializer on
     # a proven duplicate no-op (zero materialization writes), while a genuine run is unchanged (execute_downstream=='true').
     if: always() && needs.run.outputs.region != '' && needs.run.outputs.execute_downstream == 'true' && needs.run.outputs.scope != 'bootstrap'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # route step (<= 60 min: deadline 3000 s + directory read + settle/safe-close) + cleanup (<= 10 min) + setup.
+    timeout-minutes: 80
     defaults:
       run:
         working-directory: sales-dashboard-live
@@ -736,18 +801,48 @@ jobs:
           echo "All required secrets present."
       - name: Install dependencies
         run: npm ci
-      # --as-of uses the SHARED inventory_asof (D-1) from the run job as the future-guard ceiling; the derive
-      # clamps down to each account's latest proven date, so no future or fabricated data can ever be materialized.
-      - name: Materialize durable reports for this region (zero export; idempotent upsert)
-        run: node scripts/release/report-materialization.mjs --region=${{ needs.run.outputs.region }} --mode=live --as-of=${{ needs.run.outputs.inventory_asof }}
+      # --as-of is the SHARED inventory_asof (D-1) from the run job: the route epoch (each route clamps to its own proven
+      # evidence date; nothing future or fabricated is ever published). SKU_MOVEMENT_SERVE_TOKEN_ATTESTED (repo variable,
+      # exactly 'true' ONLY after the WP10 serve is DEPLOYED) selects which serve the sku-movement served-row check models;
+      # unset / anything else -> the LEGACY serve model, so a route row is never read back as served (typed deferral --
+      # fail closed, never counted verified).
+      - name: Publish brand-view-brands + sku-movement + returns-v3 through the fenced zero-export route CLI (scheduler mode)
+        id: route
+        timeout-minutes: 60
+        env:
+          NODE_OPTIONS: "--import=./lib/server/recovery/zero-export-guard.mjs"
+          SKU_MOVEMENT_SERVE_TOKEN_ATTESTED: ${{ vars.SKU_MOVEMENT_SERVE_TOKEN_ATTESTED }}
+        run: node scripts/release/publication-route-reconcile.mjs --route=brand-view-brands,sku-movement,returns-v3 --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --mode=scheduler --live --run-token=${{ github.run_id }}-${{ github.run_attempt }}-materialize --deadline-seconds=3000 --lease-wait-seconds=600 --emit-targets
+      # ALWAYS: evidence-based control safe-close for the SAME run token (inspect -> reclaim ONLY a free/expired lease ->
+      # re-prove closed; a live owner of another operation is left untouched). RED when the route step did not succeed
+      # and the plane cannot be proven closed; after a SUCCESSFUL route step (whose own safe-close was already proven) an
+      # unprovable plane can only belong to another operation -> a warning, never a false red.
+      - name: Route control cleanup (evidence-based safe-close for the same run token; always)
+        if: always() && steps.route.outcome != 'skipped'
+        timeout-minutes: 10
+        env:
+          NODE_OPTIONS: "--import=./lib/server/recovery/zero-export-guard.mjs"
+        run: |
+          set +e
+          node scripts/release/publication-route-reconcile.mjs --route=brand-view-brands,sku-movement,returns-v3 --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --cleanup --run-token=${{ github.run_id }}-${{ github.run_attempt }}-materialize
+          rc=$?
+          if [ "$rc" != "0" ] && [ "${{ steps.route.outcome }}" = "success" ]; then
+            echo "::warning::route control cleanup could not prove the plane closed after a SUCCESSFUL route run (its own safe-close was proven) -- another operation holds the lease; left untouched."
+            exit 0
+          fi
+          exit $rc
 
   # FBA-aware Brand View materialization -- the BACKEND PRODUCER for brand-view + brand-view-portfolio (which serve via
-  # deferRebuildOnRead and previously never converged without a manual Refresh). It depends on [run, fba, materialize]
-  # so it runs AFTER the priority `run` (publishes brand-inventory), the `fba` job (publishes fba-plan), and the base
-  # `materialize` (publishes brand-view-brands, its single-view brand list). `if: always()` -- it runs even when FBA
-  # FAILS, publishing sales/Ads with FBA honestly unavailable (fbaAvailable:null, never a fabricated zero); it never
-  # depends on needs.fba.result. ZERO DataDoe (no adapter); the runner fails on any non-zero token. It reuses the exact
-  # serve builders + identities, so a natural run converges the pages with no user interaction.
+  # deferRebuildOnRead and previously never converged without a manual Refresh). Publication recovery WP13: it runs the
+  # FENCED zero-export route CLI for --route=brand-view,brand-view-portfolio (the same --mode=scheduler flags, run token,
+  # lease-wait, zero-export guard preload and always() cleanup as materialize) UNCONDITIONALLY. The legacy unfenced
+  # Brand View materializer (report-materialization-brandview.mjs --mode=live -> saveReportSnapshot) is RETIRED (read-only
+  # dry-run tooling now), and the UNFENCED compact brand-inventory REBUILD is REMOVED from the workflow path: brand-inventory
+  # is written ONLY by the fenced OLI / FBA reconcilers + the priority publication. It depends on [run, fba, materialize] so
+  # it runs AFTER the priority `run` (brand-sales / brand-inventory), the `fba` job (fba-plan) and the base `materialize`
+  # (brand-view-brands, its single-view brand list). `if: always()` -- it runs even when FBA FAILS, publishing sales/Ads
+  # with FBA honestly unavailable (never a fabricated zero); it never depends on needs.fba.result. The cutover / drain /
+  # rollback note on the materialize job above applies unchanged.
   materialize-inventory:
     needs: [run, fba, materialize]
     # SKIPPED in bootstrap scope (full-region Brand View producer; must write ZERO outside-wave snapshots).
@@ -784,12 +879,28 @@ jobs:
           echo "All required secrets present."
       - name: Install dependencies
         run: npm ci
-      # Brand View asOf is derived per the serve (single: marketplaceToday(account.country); portfolio:
-      # marketplaceToday("IN")); no --as-of override. --inventory-as-of is the shared cycle D-1 (needs.run.outputs.
-      # inventory_asof): the compact brand-inventory rebuild binds its per-account authorization to it, so it only
-      # refreshes a compact the priority run published for THIS cycle (never a stale/old-cycle row). Zero export.
-      - name: Materialize Brand View + Portfolio for this region (zero export; idempotent upsert)
-        run: node scripts/release/report-materialization-brandview.mjs --region=${{ needs.run.outputs.region }} --mode=live --inventory-as-of=${{ needs.run.outputs.inventory_asof }}
+      # --as-of is the shared inventory_asof (D-1) epoch; each Brand View unit derives its own serve asOf
+      # (single: marketplaceToday(account.country); portfolio: marketplaceToday("IN")), exactly as the serve does.
+      - name: Publish brand-view + brand-view-portfolio through the fenced zero-export route CLI (scheduler mode)
+        id: route
+        timeout-minutes: 60
+        env:
+          NODE_OPTIONS: "--import=./lib/server/recovery/zero-export-guard.mjs"
+        run: node scripts/release/publication-route-reconcile.mjs --route=brand-view,brand-view-portfolio --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --mode=scheduler --live --run-token=${{ github.run_id }}-${{ github.run_attempt }}-materialize-inventory --deadline-seconds=3000 --lease-wait-seconds=600 --emit-targets
+      - name: Route control cleanup (evidence-based safe-close for the same run token; always)
+        if: always() && steps.route.outcome != 'skipped'
+        timeout-minutes: 10
+        env:
+          NODE_OPTIONS: "--import=./lib/server/recovery/zero-export-guard.mjs"
+        run: |
+          set +e
+          node scripts/release/publication-route-reconcile.mjs --route=brand-view,brand-view-portfolio --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.inventory_asof }} --cleanup --run-token=${{ github.run_id }}-${{ github.run_attempt }}-materialize-inventory
+          rc=$?
+          if [ "$rc" != "0" ] && [ "${{ steps.route.outcome }}" = "success" ]; then
+            echo "::warning::route control cleanup could not prove the plane closed after a SUCCESSFUL route run (its own safe-close was proven) -- another operation holds the lease; left untouched."
+            exit 0
+          fi
+          exit $rc
 
   # BOOTSTRAP ack (completed | failed) -- the dispatched run's durable FINISH receipt, keyed by the exact
   # dispatch identity. 'completed' is acked ONLY when: the `run` job is green (its honesty step fails it on

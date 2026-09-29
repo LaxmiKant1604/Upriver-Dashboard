@@ -7,6 +7,16 @@
 // logic is duplicated. Construction performs NO I/O; every collaborator is injectable so the composition is
 // offline-testable. There is NO DataDoe adapter, no export cache, no token balance and no cycle/budget on this path:
 // it is structurally incapable of creating an export or spending a token.
+//
+// PUBLICATION RECOVERY WP13 -- RETIRED AS A WRITER. This composition used to bind persistSnapshot to the UNFENCED
+// saveReportSnapshot (+ publishSnapshotUpdate and the refresh locks), so the scheduler's legacy materializer wrote the
+// live brand-view-brands / sku-movement / returns-leakage rows outside the four-gate publisher and the fenced CAS. Those
+// keys are now published ONLY by the fenced zero-export route CLI (publication-route-reconcile.mjs --route=
+// brand-view-brands,sku-movement,returns-v3). It now binds NO writer, NO lock and NO publish -- only the durable READERS
+// the zero-export derives use -- so scripts/release/report-materialization.mjs is a read-only dry-run plan, and the
+// operator core (runReportMaterialization) refuses a live run for want of a persistSnapshot (fail closed). Its former
+// directory derive also used the NON-hydrated brand-sales reader (a reduced directory for an out-of-line account that
+// the hydrated brand-view-brands route would overwrite back and forth): that conflict is gone with the write path.
 
 import { getDataDoeConnections } from "../datadoe-connections.js";
 import { organizationFingerprint } from "../source-identity.js";
@@ -20,14 +30,14 @@ import {
   getSourceOliHistoryRows, getSourceCoverageWindows, getSourceSnapshot, getSourceSnapshotPayload,
   getSourceOliOperationalUnitRows, getOliSkuAsinResolutionRows, getAccountDirectorySnapshotAccounts,
   getReturnsHistoryRows, getSettlementHistoryRows,
-  getReportSnapshot, getLatestReportSnapshot, saveReportSnapshot, publishSnapshotUpdate,
-  claimRefreshLock, releaseRefreshLock,
+  getReportSnapshot, getLatestReportSnapshot,
 } from "../supabase.js";
 
 /**
- * Build the trusted report-materialization collaborators the operator core consumes. `overrides` is a BUILD-TIME
- * test seam only (production passes nothing). Returns { operator, discoverAccounts, deriveBrandViewBrands,
- * deriveSkuMovement, deriveReturns, readSnapshot, persistSnapshot, claimLock, releaseLock }.
+ * Build the READ-ONLY report-materialization collaborators the operator core consumes (dry-run plan only). `overrides` is
+ * a BUILD-TIME test seam only (production passes nothing). Returns { operator, connections, hasPrimary, discoverAccounts,
+ * deriveBrandViewBrands, deriveSkuMovement, deriveReturns, readSnapshot } -- NO persistSnapshot / claimLock / releaseLock
+ * (WP13: the write path is retired; the fenced route CLI is the only writer of these keys).
  */
 export function buildReportMaterializationRelease(overrides = {}) {
   const {
@@ -47,10 +57,6 @@ export function buildReportMaterializationRelease(overrides = {}) {
     readSettlementHistory = getSettlementHistoryRows,
     getSnapshot = getLatestReportSnapshot,
     readExactSnapshot = getReportSnapshot,
-    saveSnapshot = saveReportSnapshot,
-    publishUpdate = publishSnapshotUpdate,
-    claimLockFn = claimRefreshLock,
-    releaseLockFn = releaseRefreshLock,
     rederiveSku = rederiveSkuMovement,
     gatherReturns = gatherReturnsEvidence,
     buildBrandViewBrands = buildBrandViewBrandDirectory,
@@ -99,19 +105,7 @@ export function buildReportMaterializationRelease(overrides = {}) {
 
   const readSnapshot = ({ reportKey, accountId, paramsHash }) => readExactSnapshot({ reportKey, accountId, paramsHash });
 
-  const persistSnapshot = async ({ reportKey, reportVersion, accountId, paramsHash, params, payload, sourceRefreshedAt }) => {
-    const payloadBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
-    const saved = await saveSnapshot({
-      reportKey, accountId, paramsHash, params, payload, payloadBytes,
-      sourceRefreshedAt: sourceRefreshedAt || new Date().toISOString(),
-    });
-    if (saved && saved.id) await publishUpdate({ reportKey, accountId, paramsHash, snapshotId: saved.id }).catch(() => {});
-    return { savedAt: (saved && (saved.source_refreshed_at || saved.updated_at)) || sourceRefreshedAt || new Date().toISOString(), bytes: payloadBytes };
-  };
-
-  const claimLock = ({ reportKey, accountId, paramsHash }) => claimLockFn({ reportKey, accountId, paramsHash, lockSeconds: 300 });
-  const releaseLock = ({ reportKey, accountId, paramsHash }) => releaseLockFn({ reportKey, accountId, paramsHash });
-
+  // WP13: NO persistSnapshot / claimLock / releaseLock -- the write path is retired (read-only dry-run plan only).
   return Object.freeze({
     operator,
     connections,
@@ -121,8 +115,5 @@ export function buildReportMaterializationRelease(overrides = {}) {
     deriveSkuMovement,
     deriveReturns,
     readSnapshot,
-    persistSnapshot,
-    claimLock,
-    releaseLock,
   });
 }

@@ -20,6 +20,7 @@
 // owner/generation. It never acquires a standalone lease without opening the corresponding controls. 7-bit ASCII, LF.
 
 import pg from "pg";
+import { verifiedPgConfig } from "../../lib/server/pg-tls.js";
 import { appendFileSync } from "node:fs";
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
 import { isRegionScope, accountInScope } from "../../lib/server/sync/scheduler-scope.js";
@@ -38,6 +39,25 @@ const runToken = (argOf("run-token") || "").trim();
 const rawOwnerGen = (argOf("owner-generation") || "").trim();
 const ownerGeneration = /^\d+$/.test(rawOwnerGen) ? Number(rawOwnerGen) : NaN;
 const ghOut = (k, v) => { const f = process.env.GITHUB_OUTPUT; if (f) { try { appendFileSync(f, k + "=" + v + "\n"); } catch { /* ignore */ } } };
+// OPTIONAL bounded LEASE-WAIT for this run's PERIODIC controls APPLY (publication recovery WP13 verifier P2-1 / round-2
+// P2-A; the control envelope ONLY -- what is published is unchanged). The scheduler's route CLI holds the GLOBAL
+// control-plane lease in windows (with a 30 s fairness pause between them), so a single-attempt apply could lose to it and
+// defer every stale account. --lease-wait-seconds=N (an integer 0..900): runControlPackageCli retries the apply ONLY on the
+// typed CONTROL_LEASE_HELD refusal (a zero-write, rolled-back transaction) every 15 s, and never past this run's start
+// cutoff (--deadline-seconds minus START_RESERVE), so the ALWAYS safe-close reserve stays intact (a long wait can use up
+// the work window: the stale accounts then defer, LKG kept). Immediate mode never applies (it renews the scheduler's
+// fence), so it never waits. ABSENT or 0 => the apply call is BYTE-IDENTICAL (no leaseWaitSeconds key; one attempt).
+// Malformed => STOP (exit 2) before any connection.
+const rawLeaseWait = argOf("lease-wait-seconds");
+if (rawLeaseWait != null && (!/^\d{1,3}$/.test(rawLeaseWait) || Number(rawLeaseWait) > 900)) { console.error("STOP OLI_RECONCILE_LEASE_WAIT: --lease-wait-seconds must be an integer in [0, 900]; got " + String(rawLeaseWait).slice(0, 20)); process.exit(2); }
+const LEASE_WAIT_SECONDS = rawLeaseWait != null ? Number(rawLeaseWait) : 0;
+// The lease-wait actually granted to an apply starting NOW: never past the start cutoff (none once it is reached).
+const applyLeaseWait = () => {
+  if (!(LEASE_WAIT_SECONDS > 0)) return {};
+  const cap = deadlineSec > 0 ? Math.max(0, Math.floor(startCutoffSec - (Date.now() - runStartMs) / 1000)) : LEASE_WAIT_SECONDS;
+  const n = Math.min(LEASE_WAIT_SECONDS, cap);
+  return n > 0 ? { leaseWaitSeconds: n } : {};
+};
 
 if (!isRegionScope(bucket)) { console.error("STOP OLI_RECONCILE_REGION_UNSUPPORTED: --bucket must be india|europe-au|us-ca (region-scoped); got " + bucket); process.exit(2); }
 if (!DATE_RE.test(String(asOf))) { console.error("STOP OLI_RECONCILE_AS_OF: --as-of=YYYY-MM-DD is required; got " + asOf); process.exit(2); }
@@ -93,8 +113,9 @@ if (!primaryConn) { console.error("STOP OLI_RECONCILE_NO_PRIMARY_CONNECTION -- f
 const orgFp = primaryConn.organizationFingerprint || organizationFingerprint(primaryConn.apiKey);
 
 const withTimeout = (p, label) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timed out after 120000ms")), 120000))]);
-const pgBase = String(process.env.POSTGRES_URL || "").split("?")[0];
-const makePgReadOnly = () => new pg.Client({ connectionString: pgBase, ssl: { rejectUnauthorized: false } });
+// Verified TLS: chain pinned to the Supabase root CA + hostname checked (lib/server/pg-tls.js); never rejectUnauthorized:false.
+const pgConfig = () => verifiedPgConfig(process.env.POSTGRES_URL);
+const makePgReadOnly = () => new pg.Client(pgConfig());
 
 const readbackLive = buildLiveReadback({
   getReportSnapshot: sb.getReportSnapshot,
@@ -124,8 +145,9 @@ const makeNoExportInnerAdapter = () => ({
 });
 
 async function assertNoCron() {
-  const client = makePgReadOnly();
+  let client = null; // constructed inside try: an invalid POSTGRES_URL stays a typed {ok:false}, never an uncaught throw
   try {
+    client = makePgReadOnly();
     await client.connect();
     const t = await client.query("select to_regclass('cron.job')::text cron_table");
     if (!t.rows[0].cron_table) return { ok: true };
@@ -149,8 +171,8 @@ const CONTROL_OP_KEY = "oli-reconcile/" + bucket + "/" + asOf;
 // Read-only exact capability preflight: the priority-partial cycle namespace is permitted ONLY once migration 20260924
 // widened open_sync_cycle + sync_cycles_bucket_check. Fail closed (defer) if not.
 async function partialNamespacePermitted() {
-  const probe = new pg.Client({ connectionString: pgBase, ssl: { rejectUnauthorized: false } });
-  try { await probe.connect(); const cap = await readPartialCycleCapability((sql) => probe.query(sql).then((r) => r.rows)); return cap; }
+  let probe = null;
+  try { probe = new pg.Client(pgConfig()); await probe.connect(); const cap = await readPartialCycleCapability((sql) => probe.query(sql).then((r) => r.rows)); return cap; }
   catch (e) { return { permitted: false, reason: "capability-unreadable: " + (e && e.message ? e.message : e) }; }
   finally { try { await probe.end(); } catch { /* ignore */ } }
 }
@@ -177,6 +199,7 @@ async function openControls(staleAccountIds) {
       connectStore: connectPriorityControlStore,
       ownerToken: OPERATOR, operationKey: CONTROL_OP_KEY, leaseTtlSeconds: 900,
       log: (m) => console.log("oli-reconcile controls: " + m),
+      ...applyLeaseWait(),
     });
     // APPLY COMMIT_UNKNOWN (code 3, blocker 4): the apply's commit ack was lost. NOT a zero-write deferral; the caller
     // must NOT blind-rollback/retry (read-only reconciliation required). Surface it typed so the run exits nonzero.
@@ -487,6 +510,12 @@ if (process.env.OLI_RECONCILE_DUMP === "1") {
     const reports = {}; for (const [rk, v] of Object.entries(rec.reports || {})) reports[rk] = { state: v && v.state, reason: v && v.reason };
     console.log("PERACCT " + JSON.stringify({ accountId: String(rec.accountId).slice(0, 8), eligible: rec.eligible, status: rec.status, revisionId: rec.revisionId ? String(rec.revisionId).slice(0, 12) : null, reports }));
   }
+}
+// OPT-IN machine-readable per-account states for the independent publication recovery worker (--emit-targets; OFF by
+// default so every existing invocation is byte-identical). Sanitized: ids + state + reason CODE only.
+if (process.argv.includes("--emit-targets")) {
+  const { formatTargetsLine } = await import("../../lib/server/sync/reconcile-targets-output.js");
+  console.log(formatTargetsLine({ family: "oli", summary: { ...out, bucket, requestedAsOf: asOf, dryRun } }));
 }
 console.log("RESULT " + JSON.stringify({
   ok: out.ok, outcome: out.outcome, code: out.code || "OK", bucket, requestedAsOf: asOf, mode, dryRun,

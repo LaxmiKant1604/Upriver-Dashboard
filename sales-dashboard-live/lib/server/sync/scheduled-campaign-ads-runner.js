@@ -139,6 +139,24 @@ export async function planCampaignAdsRegionRun({ region, asOf, runKind = "initia
 }
 
 /**
+ * WP10b: the create exposure of ONE region plan (pure). normalCreates = the planned <=5-seller batches (rolling-window
+ * pending + never-covered initial accounts, batched separately exactly as runCampaignAdsRegionSlice does); the
+ * fallback exposure is the runner's own default fallback ceiling = the pending seller count (a create-time 4xx
+ * bisects a rejected batch down to single sellers, each split child one more create). An incompatible-only or fully
+ * covered region plans zero creates.
+ */
+export function campaignAdsPlanExposure(p) {
+  const initialPending = p && Array.isArray(p.initialPending) ? p.initialPending : [];
+  const pending = p && Array.isArray(p.pending) ? p.pending : [];
+  if (!p || !Array.isArray(p.compatible) || !p.compatible.length || !(pending.length + initialPending.length)) {
+    return { normalCreates: 0, fallbackCreates: 0, pendingAccounts: 0 };
+  }
+  const normalCreates = batchAccounts(pending, MAX_SELLERS_PER_BATCH).length + batchAccounts(initialPending, MAX_SELLERS_PER_BATCH).length;
+  const pendingAccounts = pending.length + initialPending.length;
+  return { normalCreates, fallbackCreates: pendingAccounts, pendingAccounts };
+}
+
+/**
  * Run ONE bounded Campaign Ads pass for a region's PENDING accounts. Deterministic <=5-seller batches (mixed
  * marketplaces allowed, as explicitly approved); per-batch ownership + currency isolation enforced inside
  * ads-sync.js. `maxCreates` HARD-CAPS this invocation's creates (checked BEFORE every POST). Returns a typed
@@ -147,7 +165,11 @@ export async function planCampaignAdsRegionRun({ region, asOf, runKind = "initia
  *   { phase: "sync", continuationRequired: true, ... }                     -- worker deferred (slice budget) -> resume;
  *   { phase: "sync", ok: false, problems, creates, tokens }               -- a typed failure (LKG preserved).
  */
-export async function runCampaignAdsRegionSlice({ region, asOf, runKind = "initial", windowOverride = null, maxCreates = null, maxFallbackCreates = null, plan = null, deps = {}, log = () => {} } = {}) {
+export async function runCampaignAdsRegionSlice({ region, asOf, runKind = "initial", windowOverride = null, maxCreates = null, maxFallbackCreates = null, plan = null, deps = {}, log = () => {},
+  // WP10b OPTIONAL combined (normal + fallback + page) create cap derived from an owner-approved token ceiling (admin
+  // Data Sync Center only). Checked in guardedCreate BEFORE every POST, ahead of the two per-kind ceilings. null =>
+  // byte-identical (no third check).
+  maxTotalCreates = null } = {}) {
   const p = plan || await planCampaignAdsRegionRun({ region, asOf, runKind, windowOverride, deps });
   const initialPending = Array.isArray(p.initialPending) ? p.initialPending : [];
   const pendingAll = [...p.pending, ...initialPending];
@@ -173,9 +195,11 @@ export async function runCampaignAdsRegionSlice({ region, asOf, runKind = "initi
   // (depth>0, born from a create-time-4xx) draws from the SEPARATE fallbackCeiling. Both refuse BEFORE the POST (fail
   // closed) so a split can never exhaust the normal budget and no budget can ever be exceeded.
   let normalCreates = 0; let fallbackCreates = 0;
+  const totalCeiling = maxTotalCreates != null ? Math.max(0, Math.trunc(Number(maxTotalCreates)) || 0) : null;
   const isFallbackRef = { value: false };
   const baseCreate = (deps.createExport || PRODUCTION_ADS_SYNC_DEPS.createExport);
   const guardedCreate = async (...args) => {
+    if (totalCeiling != null && normalCreates + fallbackCreates >= totalCeiling) { const e = new Error("CAMPAIGN_ADS_CREATE_CEILING_EXCEEDED: approved total ceiling " + totalCeiling + " reached"); e.code = "CAMPAIGN_ADS_CEILING"; throw e; }
     if (isFallbackRef.value) {
       if (fallbackCreates >= fallbackCeiling) { const e = new Error("CAMPAIGN_ADS_CREATE_CEILING_EXCEEDED: fallback ceiling " + fallbackCeiling + " reached"); e.code = "CAMPAIGN_ADS_CEILING"; throw e; }
       fallbackCreates += 1;
@@ -202,6 +226,9 @@ export async function runCampaignAdsRegionSlice({ region, asOf, runKind = "initi
   if (rec.deferred) return { phase: "sync", region: p.region, continuationRequired: true, creates, tokens };
   if (rec.ceilingExhausted && rec.covered.size === 0) {
     // No account could be refreshed within budget -> a real budget-insufficiency failure (refuse, retain all LKG).
+    // (WP10b: `hardCeiling` was an undefined identifier here -- a ReferenceError on this exact path, which an approved
+    // total cap makes reachable. Report the enforced ceilings instead.)
+    const hardCeiling = totalCeiling != null ? totalCeiling : normalCeiling + fallbackCeiling;
     return { phase: "sync", ok: false, region: p.region, problems: ["create ceiling exhausted before any account covered (hardCeiling=" + hardCeiling + ")"], creates, tokens };
   }
   const covered = [...rec.covered];
@@ -342,14 +369,31 @@ export function assessCampaignAdsRegionCycle({ region, discoveredAccounts, batch
  * scheduled + manual paths share one implementation. Returns a DSC-compatible typed result
  * ({ phase:"complete", creates, tokens, covered } | { phase:"sync", continuationRequired } | { phase:"sync", ok:false, problems }).
  */
-export async function runCampaignAdsBucketSlice({ bucket, asOf, runKind = "daily", maxCreates = null, maxFallbackCreates = null, deps = {}, log = () => {} } = {}) {
+export async function runCampaignAdsBucketSlice({ bucket, asOf, runKind = "daily", maxCreates = null, maxFallbackCreates = null, deps = {}, log = () => {},
+  // WP10b OPTIONAL bucket-wide combined create cap from an owner-approved token ceiling (admin Data Sync Center only).
+  // When set, EVERY region is planned first (zero tokens) and a plan whose normal creates (one per <=5-seller batch)
+  // already exceed the cap is refused typed with ZERO creates; otherwise each region runs under the cap still unspent
+  // (guardedCreate refuses BEFORE the POST that would cross it -- normal, bisection-fallback and page creates alike).
+  // null => byte-identical (per-region plan -> run, per-region ceilings only).
+  maxTotalCreates = null } = {}) {
   const regions = regionsForBucket(bucket);
   if (!regions.length) return { phase: "sync", ok: false, problems: ["bad-bucket:" + S(bucket)], creates: 0, tokens: 0 };
   let creates = 0; let tokens = 0; let covered = 0; let incompatible = 0;
   const rejected = []; const transient = []; const ambiguous = [];
-  for (const region of regions) {
-    const plan = await planCampaignAdsRegionRun({ region, asOf, runKind, deps });
-    const r = await runCampaignAdsRegionSlice({ region, asOf, runKind, plan, maxCreates, maxFallbackCreates, deps, log });
+  const cap = maxTotalCreates != null ? Math.max(0, Math.trunc(Number(maxTotalCreates)) || 0) : null;
+  let preplanned = null;
+  if (cap != null) {
+    preplanned = [];
+    for (const region of regions) preplanned.push(await planCampaignAdsRegionRun({ region, asOf, runKind, deps }));
+    const plannedCreates = preplanned.reduce((t, p) => t + campaignAdsPlanExposure(p).normalCreates, 0);
+    if (plannedCreates > cap) {
+      return { phase: "sync", ok: false, refused: true, code: "CAMPAIGN_ADS_APPROVAL_EXCEEDED", plannedCreates, maxTotalCreates: cap, creates: 0, tokens: 0,
+        problems: ["the Campaign Ads plan needs " + plannedCreates + " create(s) > the " + cap + " the approval still covers; refusing (zero creates)"] };
+    }
+  }
+  for (const [regionIndex, region] of regions.entries()) {
+    const plan = preplanned ? preplanned[regionIndex] : await planCampaignAdsRegionRun({ region, asOf, runKind, deps });
+    const r = await runCampaignAdsRegionSlice({ region, asOf, runKind, plan, maxCreates, maxFallbackCreates, ...(cap != null ? { maxTotalCreates: Math.max(0, cap - creates) } : {}), deps, log });
     creates += r.creates || 0; tokens += r.tokens || 0;
     if (r.phase !== "complete" && r.phase !== "partial") {
       if (r.continuationRequired === true) return { phase: "sync", continuationRequired: true, creates, tokens };

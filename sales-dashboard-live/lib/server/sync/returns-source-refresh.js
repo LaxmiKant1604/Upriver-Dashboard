@@ -11,7 +11,9 @@
 // consume, and owns the batching + token math. Currency is required on settlement money (no money without a currency);
 // nulls stay null; nothing is fabricated. No transport, no DB -- pure.
 
-import { addDaysStr } from "../datadoe.js";
+// The pure date leaf (the SAME function datadoe.js re-exports): this pure module must never drag the DataDoe client into
+// the recovery worker's import graph (scripts/worker-closure.test.js; returns-v3.route.js imports returnsWindow).
+import { addDaysStr } from "../date-windows.js";
 
 // The earliest settlement history we build (task floor). Returns has only ~60 days upstream, so its floor is the
 // 60-day window start, never earlier than this.

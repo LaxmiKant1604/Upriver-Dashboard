@@ -6,15 +6,26 @@
 //        saved snapshot from Supabase. This NEVER calls DataDoe, so opening a
 //        report, changing brand, filtering, sorting or paging costs nothing and
 //        shows exactly what the last refresher fetched.
-//   GET  ?action=<report>&ids=...&refresh=1                -> the one explicit
-//        operation allowed to call DataDoe. It claims a database lock first, so
-//        two people clicking Refresh cannot spend DataDoe tokens twice, then
-//        saves the validated result for every permitted user and publishes a
-//        compact Realtime event.
+//   GET  ?action=<report>&ids=...&refresh=1                -> for a MANUAL-PAID
+//        insight report (NOT route-owned) the one explicit operation allowed to
+//        call DataDoe. It claims a database lock first, so two people clicking
+//        Refresh cannot spend DataDoe tokens twice, then saves the validated
+//        result for every permitted user and publishes a compact Realtime event.
+//
+// PUBLICATION RECOVERY WP10b -- ROUTE-OWNED LIVE REPORTS ARE READ-ONLY HERE (by default code, no flag). The ten
+// route-owned live keys (ROUTE_OWNED_LIVE_REPORT_KEYS == the DB writer-fence seed, report-writer-fence.js) are published
+// ONLY through the fenced four-gate publisher (scheduler / zero-export routes / reconcilers / the admin Data Sync Center
+// paid sync). For them a refresh=1 is a READ (serveSharedReport coerces refresh -> false; beginSharedRefresh refuses
+// typed BEFORE any lock/build; the durable self-heal is forced read-only; persistDerivedSnapshot refuses typed) -- so
+// this module can never write a route-owned key, never claim its refresh lock and never run its (possibly paid) build.
+// The explicit, owner-approved PAID sync stays available ONLY through the admin Data Sync Center (api/admin/sources.js
+// POST: preview -> token estimate -> explicit confirmation token -> fenced publish); routeOwnedPaidSync() describes it.
 //
 // The account is always authorised by api/datadoe.js before this runs.
 
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+// The ONE route-owned live key contract: the DB writer-fence seed (pure, dependency-free module).
+import { FENCED_WRITER_REPORT_KEYS } from "./sync/report-writer-fence.js";
 
 import {
   claimRefreshLock,
@@ -37,21 +48,302 @@ export { MAX_SNAPSHOT_BYTES };
 
 const DEFAULT_LOCK_SECONDS = 240;
 
-export function paramsHashFor(reportVersion, params) {
-  const ordered = {};
-  Object.keys(params || {}).sort().forEach((key) => {
-    const value = params[key];
-    if (value !== undefined && value !== null && value !== "") ordered[key] = String(value);
-  });
-  return createHash("sha256")
-    .update(JSON.stringify({ reportVersion, ...ordered }))
-    .digest("hex")
-    .slice(0, 40);
-}
+// The snapshot identity hash lives in the PURE leaf report-params-hash.js (moved verbatim) so a read-only consumer can
+// compute it without importing this module's supabase.js writers. Imported locally (used below) and re-exported, so
+// every existing `import { paramsHashFor } from "./report-store.js"` is byte-identical.
+import { paramsHashFor } from "./report-params-hash.js";
+export { paramsHashFor };
 
 export function wantsRefresh(req) {
   const value = String(req.query?.refresh ?? "").toLowerCase();
   return value === "1" || value === "true" || value === "yes";
+}
+
+// =====================================================================================================================
+// PUBLICATION RECOVERY WP10b -- the refresh=1 READ-ONLY contract for ROUTE-OWNED live reports + the PAID-SYNC contract.
+// =====================================================================================================================
+// The route-owned live keys: EXACTLY the DB writer-fence seed (brand-sales, daily-reporting, brand-inventory,
+// listing-health-v3, fba-plan, sku-movement, returns-leakage, brand-view, brand-view-portfolio, brand-view-brands).
+export const ROUTE_OWNED_LIVE_REPORT_KEYS = FENCED_WRITER_REPORT_KEYS;
+const ROUTE_OWNED_KEY_SET = new Set(ROUTE_OWNED_LIVE_REPORT_KEYS);
+export function isRouteOwnedLiveReportKey(reportKey) {
+  return typeof reportKey === "string" && ROUTE_OWNED_KEY_SET.has(reportKey);
+}
+
+// The typed refusal every write path of this module raises for a route-owned key (never a generic 500 text): a
+// route-owned live row is written only by the fenced publisher, never by a dashboard refresh / self-heal persist.
+export const ROUTE_OWNED_REPORT_READ_ONLY = "ROUTE_OWNED_REPORT_READ_ONLY";
+export class RouteOwnedReportReadOnlyError extends Error {
+  constructor(reportKey, where) {
+    super(`${ROUTE_OWNED_REPORT_READ_ONLY}: "${reportKey}" is a route-owned live report; ${where} is read-only for it (it is published only through the fenced publisher; the paid sync is the admin Data Sync Center action).`);
+    this.name = "RouteOwnedReportReadOnlyError";
+    this.code = ROUTE_OWNED_REPORT_READ_ONLY;
+    this.status = 409;
+    this.reportKey = reportKey;
+  }
+}
+export function assertNotRouteOwnedWrite(reportKey, where) {
+  if (isRouteOwnedLiveReportKey(reportKey)) throw new RouteOwnedReportReadOnlyError(reportKey, where);
+}
+
+// Which Data Sync Center source cards (api/admin/sources.js POST sync, admin-only, preview -> confirm) refresh each
+// route-owned report's SOURCE EVIDENCE. The cards acquire + persist DURABLE evidence under the existing token ceilings;
+// the report itself is then (re)published only through the fenced publisher -- DIRECTLY in the same card operation
+// (orchestrated OLI / Catalog / Campaign-Ads cards: the priority release publishes daily-reporting + brand-sales +
+// brand-inventory; the FBA Inventory Health / Listings cards: the fba-plan operation publishes fba-plan) or on the next
+// pass of its zero-export fenced route / reconciler (every other dependent). Hand-reviewed; pinned by
+// scripts/refresh-readonly.test.js against the source registry + the card operations.
+export const PAID_SYNC_SURFACE = Object.freeze({
+  surface: "data-sync-center",
+  endpoint: "POST /api/admin/sources",
+  confirmation: "preview (token estimate) -> explicit confirmationToken -> execute",
+});
+const PAID_SYNC_BY_REPORT = Object.freeze({
+  "brand-sales": Object.freeze({
+    cards: Object.freeze(["order-line-items", "product-catalog"]),
+    how: "Data Sync Center > Order Line Items (or Product Catalog) > Sync source: an admin-confirmed paid sync persists durable OLI/Catalog evidence and the SAME operation republishes Brand Sales (with Daily Reporting + Brand View inventory) through the fenced publisher, with exact live read-back.",
+  }),
+  "daily-reporting": Object.freeze({
+    cards: Object.freeze(["order-line-items", "product-catalog", "ads-campaign-date"]),
+    how: "Data Sync Center > Order Line Items, Product Catalog or Campaign Ads > Sync source: an admin-confirmed paid sync persists durable evidence and the SAME operation republishes Daily Reporting (with Brand Sales + Brand View inventory) through the fenced publisher, with exact live read-back.",
+  }),
+  "brand-inventory": Object.freeze({
+    cards: Object.freeze(["fba-inventory-health", "order-line-items", "product-catalog"]),
+    how: "Data Sync Center > FBA Inventory Health > Sync source persists the durable D-1 FBA snapshot (fba-plan operation, fenced) and the zero-export FBA reconciler republishes Brand View inventory through the fenced publisher; an Order Line Items / Product Catalog sync republishes it directly in its priority release.",
+  }),
+  "fba-plan": Object.freeze({
+    cards: Object.freeze(["fba-inventory-health", "listings", "order-line-items", "product-catalog"]),
+    how: "Data Sync Center > FBA Inventory Health (or Listings / AWD) > Sync source runs the fba-plan operation: a batched FBA/AWD fetch under the bucket token ceiling, then FBA Shipment Plan is published through the fenced publisher with exact live read-back. Order Line Items / Product Catalog syncs refresh its durable velocity + brand inputs; the zero-export fba-plan route republishes from durable evidence afterwards.",
+  }),
+  "listing-health-v3": Object.freeze({
+    cards: Object.freeze(["order-line-items", "product-catalog", "fba-inventory-health"]),
+    how: "Its paid Listings + Listings Raw acquisition is the scheduled scheduler-v2 listing-health-v3 job (ONE canonical shared Listings export per <=5-seller batch). The Data Sync Center cards listed refresh its durable OLI / Catalog / FBA inputs; the zero-export Listing Health v3 reconciler then republishes it through the fenced publisher.",
+  }),
+  "sku-movement": Object.freeze({
+    cards: Object.freeze(["order-line-items", "product-catalog"]),
+    how: "Data Sync Center > Order Line Items / Product Catalog > Sync source persists durable evidence; SKU Movement re-derives read-only from it on the next load (zero export) and its zero-export route republishes it through the fenced publisher.",
+  }),
+  "returns-leakage": Object.freeze({
+    cards: Object.freeze(["order-line-items", "product-catalog"]),
+    how: "Returns + Settlements history is acquired by the dedicated Returns workflow; the Data Sync Center Order Line Items / Product Catalog cards refresh its reused inputs, and its zero-export returns route republishes it from durable evidence through the fenced publisher.",
+  }),
+  "brand-view": Object.freeze({
+    cards: Object.freeze(["order-line-items", "product-catalog", "ads-campaign-date", "fba-inventory-health"]),
+    how: "Brand View is built only from saved evidence: a Data Sync Center paid sync of these sources republishes Brand Sales / Brand View inventory (fenced), then the zero-export Brand View route republishes this brand's view through the fenced publisher.",
+  }),
+  "brand-view-portfolio": Object.freeze({
+    cards: Object.freeze(["order-line-items", "product-catalog", "ads-campaign-date", "fba-inventory-health"]),
+    how: "The cross-account Brand View is built only from saved evidence: a Data Sync Center paid sync of these sources republishes Brand Sales / Brand View inventory (fenced), then the zero-export Brand View portfolio route republishes it through the fenced publisher.",
+  }),
+  "brand-view-brands": Object.freeze({
+    cards: Object.freeze(["order-line-items", "product-catalog", "fba-inventory-health"]),
+    how: "The account brand list is built only from saved Brand Sales / FBA Plan evidence: a Data Sync Center paid sync of these sources republishes that evidence (fenced), then the zero-export brand-list route republishes it through the fenced publisher.",
+  }),
+});
+
+/**
+ * The paid-sync descriptor a read-only refresh=1 of a route-owned report returns: { available (the caller is an
+ * admin -- the Data Sync Center is admin-only), surface, endpoint, confirmation, cards, how }. null for any key that is
+ * not route-owned (a manual-paid insight report keeps its own paid refresh).
+ */
+export function routeOwnedPaidSync(reportKey, { isAdmin = false } = {}) {
+  if (!isRouteOwnedLiveReportKey(reportKey)) return null;
+  const entry = PAID_SYNC_BY_REPORT[reportKey];
+  return {
+    available: isAdmin === true,
+    ...PAID_SYNC_SURFACE,
+    cards: [...entry.cards],
+    how: entry.how,
+  };
+}
+
+// The route-owned reports whose source evidence ONE Data Sync Center card refreshes (the inverse of the map above).
+export function routeOwnedReportsForPaidSyncCard(sourceKey) {
+  const k = String(sourceKey || "");
+  return Object.keys(PAID_SYNC_BY_REPORT).filter((rk) => PAID_SYNC_BY_REPORT[rk].cards.includes(k)).sort();
+}
+
+// ---- SCHEDULER-V1 REFUSAL (WP10b). Scheduler v1 (run-sync.js -> report-adapter.js: adapter save + syncManaged prune +
+// 30-day retention DELETE) is an UNFENCED writer. Every v1 entry point (api/admin/sync.js POST manual run, api/sync.js
+// POST, api/cron/sync.js) dispatches ONLY non-route-owned keys; a route-owned key is refused with this typed 409 BEFORE
+// any audit/lock/DataDoe work, so no v1 run can spend tokens and then fail at the DB writer fence. Non-route-owned
+// controlled keys (manual-paid insight reports) keep their behaviour (classified 'manual-paid / not-applicable').
+export const ROUTE_OWNED_REPORT_V1_REFUSED = "ROUTE_OWNED_REPORT_V1_REFUSED";
+export function splitSchedulerV1ReportKeys(reportKeys) {
+  const keys = [...new Set((reportKeys || []).map((k) => String(k)))];
+  return { allowed: keys.filter((k) => !isRouteOwnedLiveReportKey(k)), refused: keys.filter((k) => isRouteOwnedLiveReportKey(k)) };
+}
+export function schedulerV1RouteOwnedRefusal(refusedReportKeys, { isAdmin = false } = {}) {
+  const refused = [...new Set((refusedReportKeys || []).map(String))].filter(isRouteOwnedLiveReportKey).sort();
+  return {
+    error: ROUTE_OWNED_REPORT_V1_REFUSED,
+    code: ROUTE_OWNED_REPORT_V1_REFUSED,
+    refusedReportKeys: refused,
+    message: "Scheduler v1 can no longer run " + refused.join(", ") + ": route-owned live reports are published only through the fenced publisher. Use the Data Sync Center source cards (admin paid sync with a token estimate + explicit confirmation) instead.",
+    paidSync: Object.fromEntries(refused.map((k) => [k, routeOwnedPaidSync(k, { isAdmin })])),
+  };
+}
+
+// ---- The explicit PAID-SYNC CONFIRMATION token (PROJECT_GUIDANCE section 2 + 4: expected spend vs approved ceiling
+// shown BEFORE any spend; user approval required). A stateless HMAC-SHA256 token the Data Sync Center preview issues
+// together with its token estimate and the execute step verifies on EVERY slice/poll. It binds the admin user, bucket,
+// source card, refresh mode and the APPROVED token ceiling, and expires. Key: PAID_SYNC_CONFIRM_SECRET when set, else
+// derived (one-way sha256 with a domain label) from the server-only Supabase service credential -- never sent to the
+// browser, never logged. No key -> no token can be issued or verified (fail closed).
+//
+// v2 (WP10b fix, P2) additionally binds ONE OPERATION: the server-resolved as-of (D-1 at issue: a UTC-midnight roll
+// between preview and execute is a typed 409 + re-preview, never a silent new day's spend), the operation slot
+// (cycle bucket + cycle date), the slot's head cycle the preview observed ("" = none yet) with its PERSISTED spend at
+// preview (the debit baseline), and the token kind: "start" (issued ONLY by an explicit preview) or "cont" (re-issued
+// by an execute slice with the SAME nonce / approval / expiry, now recording the cycle the operation actually runs on,
+// plus the Campaign-Ads phase spend that has no durable per-create ledger). A v1 token is refused (re-preview).
+//
+// v3 (WP10b re-verify P1 fix) additionally carries `aq`, the Campaign-Ads SLICE SEQUENCE, inside the HMAC-signed payload:
+// a start token carries aq=0 and every continuation token issued after an Ads slice carries aq+1 (with the updated Ads
+// spend `sp`). The Ads spend has no durable per-create ledger (the Ads phase opens no sync cycle), so the stateless token
+// alone could be REPLAYED (the start token, or any older continuation, reset the Ads debit). The execute therefore claims
+// a DURABLE SINGLE-USE RECEIPT for (nonce, aq) -- paidSyncAdsReceiptId below, an insert-if-absent into public.audit_log
+// with that deterministic primary key (supabase.js claimPaidSyncReceipt) -- BEFORE any Ads create: each Ads-phase token
+// is usable EXACTLY ONCE, so the signed spend chain is strictly linear and can never be rewound. A v1 or v2 token (minted
+// before aq existed) is REFUSED with reason "version" (re-preview) -- never read as aq=0: every pre-change token of one
+// confirmation (its start token AND each continuation, each carrying a different Ads spend) would then compete for the
+// SAME sequence-0 receipt, and the winner could be the start token, whose sp=0 rewinds the Ads debit.
+export const PAID_SYNC_CONFIRMATION_TTL_MS = 60 * 60 * 1000;
+export function paidSyncConfirmationKey(env = process.env) {
+  const secret = String((env && (env.PAID_SYNC_CONFIRM_SECRET || env.SUPABASE_SERVICE_ROLE_KEY || env.SUPABASE_SECRET_KEY)) || "").trim();
+  return secret ? createHash("sha256").update("upriver/paid-sync-confirmation/v1\u0000" + secret).digest() : null;
+}
+const confirmationScope = ({ userId, bucket, sourceKey, refreshMode }) => ({
+  u: String(userId == null ? "" : userId), b: String(bucket || ""), s: String(sourceKey || "*"), m: String(refreshMode || "normal"),
+});
+const PAID_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const PAID_NONCE_RE = /^[A-Za-z0-9_-]{8,32}$/;
+const nonNegInt = (v) => Number.isSafeInteger(v) && v >= 0;
+/**
+ * Issue a v3 confirmation. `asOf` (YYYY-MM-DD) and `operation` ({ key, cycleId ("" when the slot has no cycle yet),
+ * baselineTokens, previewTerminal, adsSpentTokens, adsSliceSeq }) are REQUIRED; anything malformed -> null (fail closed,
+ * no token). A continuation re-issue passes kind:"cont" + the verified claims' nonce / issuedAt / expiresAtMs so it can
+ * never extend the approval's lifetime or change its ceiling. The Ads slice sequence (`aq`): a START token is always
+ * aq=0 (an explicit non-zero value -> null); a CONTINUATION must pass it EXPLICITLY (a non-negative safe integer) -- there
+ * is deliberately no default, so a caller that forgot to advance it can never silently re-mint an earlier sequence.
+ */
+export function issuePaidSyncConfirmation({ userId, bucket, sourceKey, refreshMode, approvedMaxTokens, asOf = null, operation = null, kind = "start", nonce = null, issuedAt = null, expiresAtMs = null, now = Date.now(), ttlMs = PAID_SYNC_CONFIRMATION_TTL_MS, key = paidSyncConfirmationKey() } = {}) {
+  const approved = Number(approvedMaxTokens);
+  if (!key || !Number.isSafeInteger(approved) || approved < 0) return null;
+  if (!PAID_DATE_RE.test(String(asOf || "")) || !operation || typeof operation !== "object") return null;
+  const o = String(operation.key || "").trim();
+  const c = operation.cycleId == null ? "" : String(operation.cycleId);
+  const sb = Number(operation.baselineTokens ?? 0);
+  const sp = Number(operation.adsSpentTokens ?? 0);
+  if (!o || !nonNegInt(sb) || !nonNegInt(sp) || (kind !== "start" && kind !== "cont")) return null;
+  const aq = kind === "start" ? (operation.adsSliceSeq == null ? 0 : operation.adsSliceSeq) : operation.adsSliceSeq;
+  if (!nonNegInt(aq) || (kind === "start" && aq !== 0)) return null;
+  const e = expiresAtMs != null ? Number(expiresAtMs) : Number(now) + Number(ttlMs);
+  const i = issuedAt != null ? Number(issuedAt) : Number(now);
+  const n = nonce != null ? String(nonce) : randomBytes(9).toString("base64url");
+  if (!Number.isFinite(e) || !Number.isFinite(i) || !PAID_NONCE_RE.test(n)) return null;
+  const payload = {
+    v: 3, ...confirmationScope({ userId, bucket, sourceKey, refreshMode }), t: approved, e, n, i, k: kind,
+    a: String(asOf), o, c, sb, sp, aq, pt: operation.previewTerminal === true ? 1 : 0,
+  };
+  const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const mac = createHmac("sha256", key).update(body).digest("base64url");
+  return { token: body + "." + mac, expiresAt: new Date(payload.e).toISOString(), approvedMaxTokens: approved, kind };
+}
+export function verifyPaidSyncConfirmation(token, { userId, bucket, sourceKey, refreshMode, now = Date.now(), key = paidSyncConfirmationKey() } = {}) {
+  if (!key) return { ok: false, reason: "unavailable" };
+  if (typeof token !== "string" || token.trim() === "") return { ok: false, reason: "missing" };
+  const parts = token.split(".");
+  if (parts.length !== 2 || !/^[A-Za-z0-9_-]+$/.test(parts[0]) || !/^[A-Za-z0-9_-]+$/.test(parts[1]) || parts[0].length > 2048) return { ok: false, reason: "malformed" };
+  const expected = createHmac("sha256", key).update(parts[0]).digest();
+  let given;
+  try { given = Buffer.from(parts[1], "base64url"); } catch { return { ok: false, reason: "malformed" }; }
+  if (given.length !== expected.length || !timingSafeEqual(given, expected)) return { ok: false, reason: "bad-signature" };
+  let payload;
+  try { payload = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")); } catch { return { ok: false, reason: "malformed" }; }
+  // v1 (pre-operation-binding) and v2 (pre-Ads-slice-sequence) tokens: re-preview. A v2 token is NEVER read as aq=0.
+  if (payload && (payload.v === 1 || payload.v === 2)) return { ok: false, reason: "version" };
+  if (!payload || payload.v !== 3 || !Number.isSafeInteger(payload.t) || payload.t < 0 || !Number.isFinite(payload.e) || !Number.isFinite(payload.i)
+      || !PAID_DATE_RE.test(String(payload.a || "")) || typeof payload.o !== "string" || !payload.o || typeof payload.c !== "string"
+      || !nonNegInt(payload.sb) || !nonNegInt(payload.sp) || (payload.k !== "start" && payload.k !== "cont")
+      || typeof payload.n !== "string" || !PAID_NONCE_RE.test(payload.n)
+      // the Ads slice sequence: a non-negative safe integer (missing / string / fractional / negative -> malformed); a
+      // start token is always sequence 0.
+      || !nonNegInt(payload.aq) || (payload.k === "start" && payload.aq !== 0)) return { ok: false, reason: "malformed" };
+  if (Number(now) > payload.e) return { ok: false, reason: "expired" };
+  const want = confirmationScope({ userId, bucket, sourceKey, refreshMode });
+  if (payload.u !== want.u || payload.b !== want.b || payload.s !== want.s || payload.m !== want.m) return { ok: false, reason: "scope-mismatch" };
+  return {
+    ok: true, approvedMaxTokens: payload.t, expiresAt: new Date(payload.e).toISOString(), expiresAtMs: payload.e,
+    nonce: payload.n, issuedAt: payload.i, kind: payload.k, asOf: payload.a, operationKey: payload.o, cycleId: payload.c,
+    baselineTokens: payload.sb, adsSpentTokens: payload.sp, adsSliceSeq: payload.aq, previewTerminal: payload.pt === 1,
+  };
+}
+
+/**
+ * WP10b (re-verify P1) -- the DURABLE SINGLE-USE RECEIPT id for ONE Campaign-Ads paid-sync slice (pure, deterministic).
+ * sha256("paid-sync-ads-receipt|v1|" + nonce + "|" + seq), its first 16 bytes shaped as an RFC 4122 UUID (version
+ * nibble 5, variant bits 10) and printed as the canonical lowercase 8-4-4-4-12 string. `nonce` is the confirmation's own
+ * nonce (random per explicit preview, bound inside the HMAC) and `seq` its Ads slice sequence (`aq`), so the id is the
+ * SAME for every replay of one (confirmation, step) and different for every other one (collision-resistant: 122 hash
+ * bits). The execute inserts it as public.audit_log's explicit primary key (supabase.js claimPaidSyncReceipt): the
+ * first insert claims the step, every later one is a primary-key conflict -> the step is already used. Malformed input
+ * THROWS (fail closed: no id -> no claim -> no Ads create).
+ */
+export function paidSyncAdsReceiptId({ nonce, seq } = {}) {
+  if (typeof nonce !== "string" || !PAID_NONCE_RE.test(nonce)) throw new TypeError("PAID_SYNC_RECEIPT_ID_INPUT_INVALID: nonce must be a confirmation nonce");
+  if (!nonNegInt(seq)) throw new TypeError("PAID_SYNC_RECEIPT_ID_INPUT_INVALID: seq must be a non-negative safe integer");
+  const b = createHash("sha256").update("paid-sync-ads-receipt|v1|" + nonce + "|" + seq, "utf8").digest().subarray(0, 16);
+  b[6] = (b[6] & 0x0f) | 0x50; // version 5 (name-based, SHA-derived)
+  b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant (10xx)
+  const h = b.toString("hex");
+  return h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) + "-" + h.slice(16, 20) + "-" + h.slice(20, 32);
+}
+
+const PAID_TERMINAL_CYCLE = new Set(["succeeded", "partial", "failed"]);
+/**
+ * WP10b (P2) ONE-OPERATION binding (pure). Given the verified claims and the operation slot's CURRENT head cycle (the
+ * durable sync_cycles head for the claims' slot, or null), decide whether this confirmation may drive the execute:
+ *   start token, no cycle at preview ("")  -> ok while the slot has no head (the first execute opens it) or a BASE head
+ *                                             opened since (never a superseding attempt of someone else's cycle);
+ *                                             a TERMINAL head means the approved operation already finished ->
+ *                                             PAID_SYNC_OPERATION_FINISHED (a new confirmation is required);
+ *   start token bound to cycle X            -> ok while X is the head and still open (or X was already terminal at
+ *                                             preview: the admin approved finishing it -- the sync short-circuits);
+ *                                             X finished since -> FINISHED; any other head -> CHANGED;
+ *   cont token bound to X                   -> ok while X is the head (any status: release publish slices run on a
+ *                                             finalized cycle) or the head is the priority release's legacy-recovery
+ *                                             attempt superseding X (the SAME operation continuing); else CHANGED;
+ *   cont token with no cycle yet (Ads phase) -> as the start token.
+ * Returns { ok:true, cycleIds (the cycles whose PERSISTED spend is debited), boundCycleId } | { ok:false, code, message }.
+ */
+export function paidSyncOperationBinding({ claims, head } = {}) {
+  const fail = (code, message) => ({ ok: false, code, message });
+  const c = claims && typeof claims.cycleId === "string" ? claims.cycleId : "";
+  const h = head && head.id != null && String(head.id) !== "" ? head : null;
+  const hid = h ? String(h.id) : "";
+  const terminal = h ? PAID_TERMINAL_CYCLE.has(String(h.status)) : false;
+  const superseding = h ? String(h.supersedes_cycle_id ?? h.supersedesCycleId ?? "") : "";
+  const legacyChildOfBound = !!(h && c && superseding === c && /^priority-legacy-recovery\//.test(String(h.operation_key ?? h.operationKey ?? "")));
+  const changed = () => fail("PAID_SYNC_OPERATION_CHANGED", "The operation this confirmation approved is no longer the active one for this bucket and date (another run owns it now). Review the fresh estimate and confirm again; nothing was spent by this request.");
+  const finished = () => fail("PAID_SYNC_OPERATION_FINISHED", "The operation this confirmation approved has already finished. A new paid sync needs a new confirmation; nothing was spent by this request.");
+  if (!c) {
+    if (!h) return { ok: true, cycleIds: [], boundCycleId: "" };
+    if (superseding) return changed();
+    if (terminal) return finished();
+    return { ok: true, cycleIds: [hid], boundCycleId: hid };
+  }
+  if (claims.kind === "cont") {
+    if (hid === c) return { ok: true, cycleIds: [c], boundCycleId: c };
+    if (legacyChildOfBound) return { ok: true, cycleIds: [c, hid], boundCycleId: c };
+    return changed();
+  }
+  if (hid === c) {
+    if (terminal && claims.previewTerminal !== true) return finished();
+    return { ok: true, cycleIds: [c], boundCycleId: c };
+  }
+  if (legacyChildOfBound) return { ok: true, cycleIds: [c, hid], boundCycleId: c };
+  return changed();
 }
 
 // A stale snapshot is only safe to serve across a date rollover when it was
@@ -100,6 +392,9 @@ export async function beginSharedRefresh({
   res, reportKey, reportVersion, accountId, params, userId, label,
   lockSeconds = DEFAULT_LOCK_SECONDS, present = (payload) => payload,
 }) {
+  // WP10b: a route-owned live report can never open a refresh SESSION (lock + later save): refused typed BEFORE the
+  // lock claim and BEFORE the caller's (possibly paid) builder can run. api/datadoe.js serves those read-only instead.
+  assertNotRouteOwnedWrite(reportKey, "beginSharedRefresh");
   const paramsHash = paramsHashFor(reportVersion, params);
   if (!isSupabaseConfigured()) {
     return {
@@ -125,6 +420,7 @@ export async function beginSharedRefresh({
       if (payloadBytes > MAX_SNAPSHOT_BYTES) {
         throw new Error(`${label} produced ${(payloadBytes / (1024 * 1024)).toFixed(1)} MB, above the ${MAX_SNAPSHOT_BYTES / (1024 * 1024)} MB shared-snapshot limit. It was not saved. Narrow the scope (fewer days or a single brand) or aggregate this report further before relying on it.`);
       }
+      assertNotRouteOwnedWrite(reportKey, "beginSharedRefresh.finish"); // belt and braces (the session was refused above)
       const saved = await saveReportSnapshot({
         reportKey,
         accountId,
@@ -220,6 +516,12 @@ export async function serveSharedReport({
   // falls back to serving the found snapshot as last-known-good (never a blank page). Default null = unchanged for
   // every other report (they never pass it, so the stale-scope/exact behaviour is byte-identical).
   staleWhenParamsToBefore = null,
+  // WP10b fix (P3-5) -- READ-ONLY BUILD ON AN EXPLICIT RELOAD (Brand View single + portfolio refresh=1 only). When true
+  // AND `deriveDurable` is supplied, a read whose EXACT snapshot is missing first derives the requested identity from
+  // saved evidence and SERVES it via the read-only self-heal (no lock, no save, no publish, no DataDoe -- the builders
+  // only read saved snapshots); a not-ready/failed derive falls through to the unchanged last-known-good / missing
+  // states. An existing exact row is served exactly as before. Default false => byte-identical for every caller.
+  readOnlyBuildOnMissingExact = false,
   // ATTRIBUTION-REVISION FRESHNESS (Daily Reporting NAMED brand): the account's CURRENT campaign->brand mapping
   // revision. When set and a found NAMED-brand snapshot recorded a DIFFERENT (or no) `campaignMappingRev`, the
   // snapshot's ad attribution is stale (a campaign was assigned/cleared/reassigned since it was derived): re-derive
@@ -227,6 +529,11 @@ export async function serveSharedReport({
   // touching account-level All-Brands totals (which never carry a rev and never pass this). Default null = unchanged.
   staleWhenMappingRev = null,
 }) {
+  // WP10b READ-ONLY REFRESH (structural, no flag): a refresh of a ROUTE-OWNED live report is served as a READ -- the
+  // latest published row (or the existing read-only durable derive) with NO lock, NO build (the build may be a paid
+  // DataDoe export), NO snapshot write. api/datadoe.js already passes refresh:false for these keys; this is the backstop
+  // so no caller can ever reach the refresh write path below for a route-owned key.
+  if (refresh && isRouteOwnedLiveReportKey(reportKey)) refresh = false;
   const paramsHash = paramsHashFor(reportVersion, params);
   // A found snapshot is stale-by-coverage-advance when the account's proven horizon has moved past the snapshot's
   // own as-of (`params.to`). Gated on `staleWhenParamsToBefore` (only Daily supplies it) + a durable re-derivation.
@@ -306,6 +613,14 @@ export async function serveSharedReport({
       return;
     }
 
+    // WP10b fix (P3-5): an explicit reload of a brand / as-of that has NO published row builds it READ-ONLY from saved
+    // evidence (served, never stored). Only callers that opt in (Brand View refresh=1) reach this; zero writes.
+    let readOnlyBuild = null;
+    if (readOnlyBuildOnMissingExact && deriveDurable) {
+      readOnlyBuild = await selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds, augmentResponse, readOnly: true }, store);
+      if (readOnlyBuild.served) return;
+    }
+
     // Every report's scope includes its as-of date, so the exact key stops
     // matching the moment the date rolls over. Rather than show a blank report
     // every morning, serve the most recent saved snapshot for this report and
@@ -349,6 +664,16 @@ export async function serveSharedReport({
       return;
     }
 
+    // WP10b fix (P3-5): the opt-in read-only build already ran above and could not produce the payload (not ready /
+    // bounded-deadline expiry) and no last-known-good exists -> the honest typed "waiting" state (never a write).
+    if (readOnlyBuild && readOnlyBuild.notReady) {
+      res.status(200).json({
+        snapshotMissing: true, ...(deferRebuildOnRead ? { updating: true } : {}), reportKey, reportVersion, accountId, paramsHash,
+        waitingForScheduledData: true, missingSources: readOnlyBuild.missingSources || [], message: readOnlyBuild.message,
+      });
+      return;
+    }
+
     // 504 GUARD: a slow full-portfolio rebuild must NOT run inline on a read. When deferRebuildOnRead is set and
     // no snapshot exists at all, return a typed `updating` state (never a blank fatal error); the frontend shows
     // the updating state and triggers the bounded rebuild via an explicit refresh.
@@ -364,7 +689,8 @@ export async function serveSharedReport({
     // No exact + no compatible stale snapshot. If a trusted zero-export durable re-derivation exists for this
     // report, recompute the current-version payload from durable evidence and publish it NOW (still zero DataDoe),
     // so a normal page visit auto-populates instead of showing "Nothing saved" while durable evidence is present.
-    if (deriveDurable) {
+    // (Skipped when the opt-in read-only build above already attempted this exact derive.)
+    if (deriveDurable && !readOnlyBuild) {
       const healed = await selfHealFromDurable({
         deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present, res, label, lockSeconds, augmentResponse, readOnly: true,
       }, store);
@@ -390,6 +716,7 @@ export async function serveSharedReport({
     return;
   }
 
+  assertNotRouteOwnedWrite(reportKey, "serveSharedReport refresh"); // unreachable for a route-owned key (coerced above)
   const locked = await claimRefreshLock({ reportKey, accountId, paramsHash, lockSeconds });
   if (!locked) {
     res.status(409).json({
@@ -488,6 +815,8 @@ const DEFAULT_STORE = { claimRefreshLock, releaseRefreshLock, getReportSnapshot,
 // Persist a payload produced by a trusted zero-export re-derivation under the EXACT live identity, and broadcast
 // the compact update event. Mirrors beginSharedRefresh.finish's write, minus any DataDoe involvement.
 async function persistDerivedSnapshot({ reportKey, reportVersion, accountId, paramsHash, params, payload, sourceRefreshedAt, label }, store = DEFAULT_STORE) {
+  // WP10b: a route-owned live key is never persisted by the serve-side self-heal (the fenced publisher owns it).
+  assertNotRouteOwnedWrite(reportKey, "persistDerivedSnapshot");
   const payloadBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
   if (payloadBytes > MAX_SNAPSHOT_BYTES) {
     throw new Error(`${label} re-derived ${(payloadBytes / (1024 * 1024)).toFixed(1)} MB, above the ${MAX_SNAPSHOT_BYTES / (1024 * 1024)} MB shared-snapshot limit; it was not saved.`);
@@ -514,6 +843,9 @@ async function persistDerivedSnapshot({ reportKey, reportVersion, accountId, par
  * `store` is injectable so the concurrency + zero-export contract is provable offline.
  */
 export async function selfHealFromDurable({ deriveDurable, reportKey, reportVersion, accountId, paramsHash, params, present = (p) => p, res, label, lockSeconds, augmentResponse = null, readOnly = false }, store = DEFAULT_STORE) {
+  // WP10b: a ROUTE-OWNED live key only ever takes the read-only derive-and-serve branch (never lock / persist / publish),
+  // whatever the caller passed -- the fenced publisher is its only writer.
+  if (!readOnly && isRouteOwnedLiveReportKey(reportKey)) readOnly = true;
   // Two-layer completeness for the self-heal serve (first visit before a scheduled publish). Advisory; the augment
   // returns {} on any failure, so it never breaks the self-heal.
   const augExtra = augmentResponse ? await augmentResponse({ accountId, params }) : {};

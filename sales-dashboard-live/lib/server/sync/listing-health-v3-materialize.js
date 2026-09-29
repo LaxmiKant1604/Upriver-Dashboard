@@ -199,7 +199,8 @@ export function assertListingHealthV3ExportCeiling({ region, plans, accountCount
  *                      unconditionally (backward compatible).
  *
  * Returns a summary { accounts, aliasesWritten, emptyAliases, rejected, batchMissing, skippedAccounts, skippedStale,
- * aliases[], rejections[] } -- never a secret. One plan's failure never aborts the others.
+ * aliases[], rejections[], durable* counters, durableByAccount } -- never a secret. One plan's failure never aborts the
+ * others.
  */
 export async function materializeListingHealthV3PerAccount({ plans = [], connections = [], readSourceCache, writeSourceCache, readAliasMeta = null, clock = () => Date.now(), saveDurablePayload = null, recordDurableByKey = null, isSchemaMissingError = null, isFunctionSignatureMissingError = null, emit = () => {}, runId = null }) {
   if (typeof readSourceCache !== "function" || typeof writeSourceCache !== "function") {
@@ -217,7 +218,16 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
   // are injected (the ingestion composition binds the real supabase writers). When absent (existing callers/tests), the
   // per-account ALIAS behavior is byte-identical -- persistence is a strictly additive, isolated side effect.
   const durableEnabled = typeof saveDurablePayload === "function" && recordDurableByKey && typeof recordDurableByKey === "object";
-  const summary = { accounts: 0, aliasesWritten: 0, emptyAliases: 0, rejected: 0, batchMissing: 0, skippedAccounts: 0, skippedStale: 0, aliases: [], rejections: [], durableWritten: 0, durableUnchanged: 0, durableStale: 0, durableSkippedEvidence: 0, durableSchemaMissing: 0, durableWriteFailed: 0 };
+  // durableByAccount (WP16, ADDITIVE -- every pre-existing counter/field is unchanged): the PER-ACCOUNT durable outcome of
+  // THIS pass, { [accountId]: { [requestKey]: { ack, payloadSha } } } for the two durable families only (listings +
+  // listings-raw). ack is the RPC acknowledgement ('replaced' | 'unchanged' | 'stale-save' | 'conflict' | ...) or a typed
+  // local outcome ('schema-missing' | 'write-failed' | 'skipped-evidence'); payloadSha is the content-addressed sha of the
+  // isolated rows THIS pass saved (null when nothing was saved). It lets the operator prove, per account, that the
+  // durable evidence the zero-export reconciler publishes from IS this run's evidence (the refused-shadow already-current
+  // proof). Safe metadata only (public account id, request key, ack token, content sha) -- never rows, a raw seller id,
+  // the org fingerprint or a secret.
+  // Stays EMPTY when durable persistence is not injected (existing callers/tests): the operator then fails closed.
+  const summary = { accounts: 0, aliasesWritten: 0, emptyAliases: 0, rejected: 0, batchMissing: 0, skippedAccounts: 0, skippedStale: 0, aliases: [], rejections: [], durableWritten: 0, durableUnchanged: 0, durableStale: 0, durableSkippedEvidence: 0, durableSchemaMissing: 0, durableWriteFailed: 0, durableByAccount: Object.create(null) };
   const connById = new Map((connections || []).map((c) => [String(c.id), c]));
 
   for (const plan of plans || []) {
@@ -248,6 +258,12 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
     // batches are re-adopted from cache each cycle, so every pass hits the guard (skippedStale) and the durable step,
     // sitting AFTER that `continue`, never ran. The RPC's own as_of-dominant + strictly-newer CAS keeps this
     // idempotent: an already-current pointer returns "unchanged" (zero writes) and a late/older batch "stale-save".
+    // Record THIS pass's per-account durable outcome for one family (see summary.durableByAccount). Never throws.
+    const recordDurableOutcome = (src, ack, payloadSha = null) => {
+      const acct = S(owner.accountId);
+      if (!summary.durableByAccount[acct]) summary.durableByAccount[acct] = Object.create(null);
+      summary.durableByAccount[acct][src.requestKey] = { ack: S(ack) || "unknown", payloadSha: payloadSha == null || S(payloadSha) === "" ? null : S(payloadSha) };
+    };
     const persistDurable = async (src, rows, incomingFetchedAt) => {
       const durableSourceKey = durableEnabled ? V3_DURABLE_SOURCE_KEY[src.requestKey] : null;
       if (!durableSourceKey) return; // durable not injected (existing callers/tests) or a reuse-only key -> no-op
@@ -279,15 +295,18 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
           if (ack === "replaced") summary.durableWritten += 1;
           else if (ack === "unchanged") summary.durableUnchanged += 1;
           else if (ack === "stale-save") summary.durableStale += 1;
+          recordDurableOutcome(src, ack, saved && saved.payloadSha);
         } catch (e) {
           const schemaMissing = (typeof isSchemaMissingError === "function" && isSchemaMissingError(e))
             || (typeof isFunctionSignatureMissingError === "function" && isFunctionSignatureMissingError(e));
           if (schemaMissing) summary.durableSchemaMissing += 1; // migration UNAPPLIED -> fail-soft skip (alias stands)
           else summary.durableWriteFailed += 1; // isolated typed failure; the alias (LKG) is untouched
+          recordDurableOutcome(src, schemaMissing ? "schema-missing" : "write-failed");
         }
       } else {
         // Missing/blank marketplace / as_of / validated_at, or an UNPROVEN empty -> NEVER fabricate a durable pointer.
         summary.durableSkippedEvidence += 1;
+        recordDurableOutcome(src, "skipped-evidence");
       }
     };
 

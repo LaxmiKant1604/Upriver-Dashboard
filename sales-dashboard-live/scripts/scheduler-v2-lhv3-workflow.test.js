@@ -91,24 +91,29 @@ ok("D: the workflow-level per-region concurrency group is preserved (shared by a
 ok("E: the region export ceilings are India=4, Europe-AU=8, US-CA=4", LISTING_HEALTH_V3_REGION_EXPORT_CEILING.india === 4 && LISTING_HEALTH_V3_REGION_EXPORT_CEILING["europe-au"] === 8 && LISTING_HEALTH_V3_REGION_EXPORT_CEILING["us-ca"] === 4);
 ok("E: the v3 command creates ONLY via the ingestion CLI (Listings + Listings-Raw; inventory reuse-only by contract)", /listing-health-v3-ingestion\.mjs/.test(v3Job) && !/--as-of=|fba-inventory|order-line|catalog|campaign|awd/i.test(v3Job));
 
-/* ===================== F. the zero-export report materialization job (Phase 3) ===================== */
+/* ===================== F. the zero-export report materialization job (Phase 3; WP13: the FENCED route CLI) ============= */
+// Publication recovery WP13 -- an INTENDED behaviour change: the job calls the fenced route CLI unconditionally and runs
+// AFTER fba (ordering only: `always()`, never gated on the fba RESULT); the legacy unfenced report-materialization.mjs
+// write step is retired. Pinned in depth by scripts/scheduler-v2-route-switch.test.js.
 ok("F: a materialize job exists", matJob.length > 0 && /^\s{2}materialize:\s*$/m.test(matJob));
-ok("F: materialize depends ONLY on run (NOT fba) so an FBA failure never blocks sales/returns reports", /needs:\s*\[run\]/.test(matJob) && !/needs:\s*\[run,\s*fba\]/.test(matJob));
+ok("F: materialize needs [run, fba] (WP13: ORDERING after fba) and never gates on the fba RESULT, so an FBA failure never blocks sales/returns reports", /needs:\s*\[run,\s*fba\]/.test(matJob) && !/needs\.fba\.result/.test(matJob));
 ok("F: materialize runs if:always on a resolved region (independent of fba result)", /if:\s*always\(\)\s*&&\s*needs\.run\.outputs\.region\s*!=\s*''/.test(matJob) && !/needs\.fba\.result/.test(matJob));
-ok("F: materialize invokes the zero-export report-materialization CLI in live mode for the region", /report-materialization\.mjs[^\n]*--mode=live/.test(matJob) && /report-materialization\.mjs[^\n]*--region=\$\{\{\s*needs\.run\.outputs\.region\s*\}\}/.test(matJob));
-ok("F: materialize passes the SHARED inventory_asof ceiling (never recomputes UTC today)", /report-materialization\.mjs[^\n]*--as-of=\$\{\{\s*needs\.run\.outputs\.inventory_asof\s*\}\}/.test(matJob) && !/date -u/.test(matJob));
+ok("F: materialize invokes the FENCED zero-export route CLI (brand-view-brands, sku-movement, returns-v3) in live scheduler mode for the region; the legacy report-materialization.mjs step is GONE",
+  /publication-route-reconcile\.mjs --route=brand-view-brands,sku-movement,returns-v3 --bucket=\$\{\{\s*needs\.run\.outputs\.region\s*\}\}[^\n]*--mode=scheduler --live/.test(matJob) && !/report-materialization(-brandview)?\.mjs/.test(matJob));
+ok("F: materialize passes the SHARED inventory_asof as the route epoch (never recomputes UTC today)", /publication-route-reconcile\.mjs[^\n]*--as-of=\$\{\{\s*needs\.run\.outputs\.inventory_asof\s*\}\}/.test(matJob) && !/date -u/.test(matJob));
 ok("F: materialize creates NO DataDoe export CLI / cron / dispatch (it never spends a token)", !/ingestion\.mjs|fba-plan-golive\.mjs|cron:|schedule:|workflow_dispatch:/.test(matJob));
 ok("F: materialize does NOT enable the ingestion gate or flip the UI flag", !/LISTING_HEALTH_V3_INGESTION_ENABLED/.test(matJob) && !/LISTING_HEALTH_V3\s*:/.test(matJob));
 
-/* ===================== G. the FBA-aware Brand View materialization job (Phase 3 Completion) ===================== */
+/* ===================== G. the FBA-aware Brand View materialization job (Phase 3 Completion; WP13: the FENCED route CLI) = */
 ok("G: a materialize-inventory job exists", matInvJob.length > 0 && /^\s{2}materialize-inventory:\s*$/m.test(matInvJob));
 ok("G: it depends on [run, fba, materialize] (runs AFTER inventory + the base materializer)", /needs:\s*\[run,\s*fba,\s*materialize\]/.test(matInvJob));
 ok("G: it runs if:always on a resolved region and NEVER gates on fba success (so an FBA failure still publishes sales/Ads)",
   /if:\s*always\(\)\s*&&\s*needs\.run\.outputs\.region\s*!=\s*''/.test(matInvJob) && !/needs\.fba\.result/.test(matInvJob));
-ok("G: it invokes the zero-export Brand View materializer CLI in live mode for the region",
-  /report-materialization-brandview\.mjs[^\n]*--mode=live/.test(matInvJob) && /report-materialization-brandview\.mjs[^\n]*--region=\$\{\{\s*needs\.run\.outputs\.region\s*\}\}/.test(matInvJob));
+ok("G: it invokes the FENCED zero-export route CLI (brand-view, brand-view-portfolio) in live scheduler mode for the region; the legacy materializer + the unfenced brand-inventory rebuild are GONE",
+  /publication-route-reconcile\.mjs --route=brand-view,brand-view-portfolio --bucket=\$\{\{\s*needs\.run\.outputs\.region\s*\}\}[^\n]*--mode=scheduler --live/.test(matInvJob)
+  && !/report-materialization(-brandview)?\.mjs|--inventory-as-of|--skip-inventory-rebuild/.test(matInvJob));
 ok("G: it creates NO DataDoe export CLI / cron / dispatch (never spends a token)", !/ingestion\.mjs|fba-plan-golive\.mjs|cron:|schedule:|workflow_dispatch:/.test(matInvJob));
 ok("G: it does NOT enable the ingestion gate or flip the UI flag", !/LISTING_HEALTH_V3_INGESTION_ENABLED/.test(matInvJob) && !/LISTING_HEALTH_V3\s*:/.test(matInvJob));
-ok("G: it recomputes NO date (Brand View asOf is derived from marketplaceToday, not a workflow date)", !/date -u/.test(matInvJob));
+ok("G: it recomputes NO date (the route epoch is the shared inventory_asof; each unit derives its serve asOf from marketplaceToday)", !/date -u/.test(matInvJob));
 
 writeSync(1, `\nscheduler-v2-lhv3-workflow: ${passed} assertions passed\n`);

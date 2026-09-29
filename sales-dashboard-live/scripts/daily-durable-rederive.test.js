@@ -204,7 +204,11 @@ function makeStore() {
   };
 }
 const fakeRes = () => { const cap = {}; return { res: { status: (c) => ({ json: (b) => { cap.code = c; cap.body = b; } }) }, cap }; };
-const HEAL_ARGS = { reportKey: "daily-reporting", reportVersion: "daily-reporting-shared-v2", accountId: ACCOUNT, paramsHash: "ph1", params: { from: FROM, to: TO, brand: "ALL" }, label: "Daily Reporting" };
+// Publication recovery WP10b: daily-reporting is a ROUTE-OWNED live key, so selfHealFromDurable FORCES it read-only
+// (never a lock / save; the production serve always passed readOnly:true anyway). The LEGACY persist path these tests
+// pin (lock -> double-check -> derive -> save under the effective identity) is retained only for NON-route-owned keys,
+// so the probe uses the unfenced legacy brand-portfolio key with the SAME daily v2 payloads/params.
+const HEAL_ARGS = { reportKey: "brand-portfolio", reportVersion: "daily-reporting-shared-v2", accountId: ACCOUNT, paramsHash: "ph1", params: { from: FROM, to: TO, brand: "ALL" }, label: "Daily Reporting" };
 
 await testAsync("(1) self-heal on a missing read: re-derives, SAVES the v2 snapshot, and serves it", async () => {
   const store = makeStore(); const { res, cap } = fakeRes();
@@ -212,7 +216,16 @@ await testAsync("(1) self-heal on a missing read: re-derives, SAVES the v2 snaps
   assert.equal(out2.served, true);
   assert.equal(cap.body.snapshot.rederived, true, "served payload is flagged re-derived");
   assert.equal(store.snaps.size, 1, "exactly one snapshot saved under the exact identity");
-  assert.equal(store.snaps.get("daily-reporting|A01|ph1").params.reportVersion, "daily-reporting-shared-v2", "saved as v2 (never a v1 copy)");
+  assert.equal(store.snaps.get("brand-portfolio|A01|ph1").params.reportVersion, "daily-reporting-shared-v2", "saved as v2 (never a v1 copy)");
+});
+
+await testAsync("WP10b: the ROUTE-OWNED daily-reporting key is forced read-only by the self-heal (derive + serve, ZERO lock / save)", async () => {
+  const store = makeStore(); const { res, cap } = fakeRes();
+  const out2 = await selfHealFromDurable({ ...HEAL_ARGS, reportKey: "daily-reporting", res, deriveDurable: async () => ({ payload: { rows: [{ date: "2026-03-05", total_sales: 160 }], brandFiltered: false, adsAvailability: { status: "validated" } }, sourceRefreshedAt: "2026-03-21T00:00:00Z" }) }, store);
+  assert.equal(out2.served, true);
+  assert.equal(cap.body.snapshot.readOnly, true, "served read-only");
+  assert.equal(store.snaps.size, 0, "ZERO snapshot writes for a route-owned key");
+  assert.equal(store.locks.size, 0, "ZERO locks claimed for a route-owned key");
 });
 
 await testAsync("(6) concurrent page loads produce exactly ONE derivation + ONE save (lock serializes)", async () => {
@@ -229,7 +242,7 @@ await testAsync("(6) concurrent page loads produce exactly ONE derivation + ONE 
 await testAsync("self-heal double-checks inside the lock: if the winner already saved, the loser serves WITHOUT re-deriving", async () => {
   const store = makeStore(); let derivations = 0;
   // Pre-seed the snapshot as if a concurrent winner just saved it.
-  store.snaps.set("daily-reporting|A01|ph1", { payload: { rows: [], brandFiltered: false, adsAvailability: { status: "validated" } }, params: { reportVersion: "daily-reporting-shared-v2" } });
+  store.snaps.set("brand-portfolio|A01|ph1", { payload: { rows: [], brandFiltered: false, adsAvailability: { status: "validated" } }, params: { reportVersion: "daily-reporting-shared-v2" } });
   const { res, cap } = fakeRes();
   const out2 = await selfHealFromDurable({ ...HEAL_ARGS, res, deriveDurable: async () => { derivations += 1; return { payload: { rows: [] } }; } }, store);
   assert.equal(out2.served, true);
@@ -335,7 +348,7 @@ await testAsync("self-heal on a clamped derive persists under the EFFECTIVE hash
   assert.equal(cap.body.snapshot.savedForParams.to, "2026-03-15", "labelled with the real coverage date");
   assert.equal(cap.body.snapshot.requestedParams.to, TO, "and the requested date it was NOT able to cover");
   // The row is stored under the EFFECTIVE identity (its params_hash matches its params), NOT the requested ph1.
-  assert.equal(store.snaps.has("daily-reporting|A01|ph1"), false, "not stored under the requested (mismatched) hash");
+  assert.equal(store.snaps.has("brand-portfolio|A01|ph1"), false, "not stored under the requested (mismatched) hash");
   const stored = [...store.snaps.values()][0];
   assert.equal(stored.params.to, "2026-03-15", "stored params carry the honest effective window");
   assert.equal(stored.params.reportVersion, "daily-reporting-shared-v2", "saved as v2 (never a v1 copy)");
