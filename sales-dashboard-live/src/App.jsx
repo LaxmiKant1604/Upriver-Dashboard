@@ -59,7 +59,7 @@ import { accountsInRegion, regionsForAccounts, resolveSelectedRegion } from "./l
 // resolves). These are the single source of truth wired throughout App.
 import {
   accessFingerprintClient, accessScopeChanged, authEventClearsAccess,
-  isColdAccountState, projectAuthorizedAccounts, createInFlightCoalescer,
+  isColdAccountState, projectAuthorizedAccounts, createInFlightCoalescer, createAccessLoader,
 } from "./lib/session-lifecycle.js";
 // Authorization-scope isolation for the browser report cache + read coalescer: every cache/coalescer key carries the
 // auth fingerprint, an obsolete-scope in-flight response is rejected before it writes/returns, and a failed IndexedDB
@@ -1202,7 +1202,9 @@ function authFetch(path, accessToken, options = {}) {
     },
   }).then(async (response) => {
     const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`);
+    // The HTTP status travels with the error, so a caller can tell a transient 5xx from a definitive 401 / 403 (a
+    // network failure rejects without a status -- also transient; see session-lifecycle.js accessFailureKind).
+    if (!response.ok) { const error = new Error(body.error || `Request failed (${response.status})`); error.status = response.status; throw error; }
     return body;
   });
 }
@@ -5759,6 +5761,10 @@ export default function App() {
   const [passwordSetup, setPasswordSetup] = useState(false);
   const [access, setAccess] = useState(null);
   const [accessError, setAccessError] = useState("");
+  // { attempt, of, inMs } while an automatic retry of a failed cold access load is scheduled (null otherwise).
+  const [accessRetry, setAccessRetry] = useState(null);
+  // The current identity's access loader (the Retry button calls its retryNow()).
+  const accessLoaderRef = useRef(null);
   // The current session is mirrored into a ref so a background access
   // revalidation always uses the FRESH access token even though its effect no
   // longer re-runs on a token refresh (see the user-id-keyed effect below).
@@ -5816,35 +5822,41 @@ export default function App() {
   // or a genuine identity change cold-boots (the one place a full-page access
   // screen is allowed).
   useEffect(() => {
-    if (!session?.access_token) { setAccess(null); accessFpRef.current = null; return undefined; }
-    let active = true;
-    setAccess(null); setAccessError(""); accessFpRef.current = null;
-    const loadAccess = (initial) => authFetch("/api/access?action=me", sessionRef.current?.access_token || session.access_token)
-      .then((body) => {
-        if (!active) return;
-        // Apply revalidated access ONLY when its scope fingerprint changed. An
-        // identical fingerprint is a silent no-op: no setAccess -> no re-render ->
-        // no account/report re-fetch cascade, so a background refresh stays
-        // invisible while valid same-scope content is on screen. A CHANGED
-        // fingerprint DOES setAccess, which fires the DashboardApp purge (clears
-        // now-unauthorized cache) and re-resolves every scope -- security first,
-        // never a stale cross-scope screen.
-        const fp = accessFingerprintClient(body.access);
-        if (accessScopeChanged(accessFpRef.current, fp)) { accessFpRef.current = fp; setAccess(body.access); }
-      })
-      .catch((error) => { if (active && initial) setAccessError(error.message || "Unable to load dashboard access."); });
-    loadAccess(true);
+    if (!session?.access_token) { setAccess(null); setAccessRetry(null); accessFpRef.current = null; return undefined; }
+    setAccess(null); setAccessError(""); setAccessRetry(null); accessFpRef.current = null;
+    // The access loader (session-lifecycle.js createAccessLoader): a TRANSIENT failure of the cold load (network, 5xx)
+    // recovers on its own -- bounded automatic retries + the Retry button, never a sign-out -- and the error screen is
+    // cleared ONLY by a successful, authorized /api/access?action=me response (a later success always clears it). Once
+    // access is applied, no failure blanks the dashboard.
+    const loader = createAccessLoader({
+      fetchAccess: () => authFetch("/api/access?action=me", sessionRef.current?.access_token || session.access_token),
+      // Apply access ONLY when its scope fingerprint changed. An identical fingerprint is a silent no-op: no setAccess
+      // -> no re-render -> no account/report re-fetch cascade, so a background refresh stays invisible while valid
+      // same-scope content is on screen. A CHANGED fingerprint DOES setAccess, which fires the DashboardApp purge
+      // (clears now-unauthorized cache) and re-resolves every scope -- security first, never a stale cross-scope screen.
+      applyAccess: (nextAccess) => {
+        const fp = accessFingerprintClient(nextAccess);
+        if (accessScopeChanged(accessFpRef.current, fp)) { accessFpRef.current = fp; setAccess(nextAccess); }
+      },
+      showError: setAccessError,
+      showRetry: setAccessRetry,
+      hasAppliedAccess: () => accessFpRef.current !== null,
+    });
+    accessLoaderRef.current = loader;
+    loader.load();
     // BRAND-SCOPE cache-invalidation: an admin can narrow a user's account/brand grants while that user's tab stays
     // open. Re-fetch the authoritative access on focus / tab-visible so a mid-session grant change is picked up
     // WITHOUT a manual reload. When the scope actually changed, setAccess fires the DashboardApp purge effect (clears
     // localStorage + IndexedDB report caches) and re-resolves every brand selector from the newly authorized grants;
     // when it is unchanged, nothing re-renders. Server requests are always projected regardless. A refetch failure
-    // keeps the current access (never blanks a working session on a transient network blip).
-    const revalidate = () => { if (active && (typeof document === "undefined" || document.visibilityState === "visible")) loadAccess(false); };
+    // keeps the current access (never blanks a working session on a transient network blip); while the cold error
+    // screen is showing, a focus / visible revalidation is one more recovery attempt.
+    const revalidate = () => { if (typeof document === "undefined" || document.visibilityState === "visible") loader.load(); };
     window.addEventListener("focus", revalidate);
     if (typeof document !== "undefined") document.addEventListener("visibilitychange", revalidate);
     return () => {
-      active = false;
+      loader.dispose();
+      if (accessLoaderRef.current === loader) accessLoaderRef.current = null;
       window.removeEventListener("focus", revalidate);
       if (typeof document !== "undefined") document.removeEventListener("visibilitychange", revalidate);
     };
@@ -5855,6 +5867,9 @@ export default function App() {
     if (supabase) await supabase.auth.signOut();
     setSession(null); setAccess(null); configureApiSession(null); accessFpRef.current = null;
   }, []);
+  // Retry the access load now (keeps the session; restarts the bounded automatic retries). Declared with the other
+  // hooks, BEFORE every early return (#310).
+  const retryAccess = useCallback(() => { if (accessLoaderRef.current) accessLoaderRef.current.retryNow(); }, []);
 
   // The no-access states below (sign-out, session loss, password setup, access error, or still loading) return BEFORE the
   // dashboard renders and before the success-path configureReportCacheScope runs. Invalidate the cache/coalescer scope
@@ -5869,7 +5884,7 @@ export default function App() {
   if (!authReady) return <div className="auth-root"><style>{STYLE}</style><div className="loading-screen">Loading secure session…</div></div>;
   if (!session) return <LoginScreen passwordSetup={passwordSetup} />;
   if (passwordSetup) return <LoginScreen passwordSetup />;
-  if (accessError) return <div className="auth-root"><style>{STYLE}</style><div className="auth-panel"><div className="auth-logo">UR</div><div className="auth-title">Access unavailable</div><div className="auth-error"><AlertTriangle size={15} />{accessError}</div><button className="auth-submit" onClick={signOut}>Sign out</button></div></div>;
+  if (accessError) return <div className="auth-root"><style>{STYLE}</style><div className="auth-panel"><div className="auth-logo">UR</div><div className="auth-title">Access unavailable</div><div className="auth-error"><AlertTriangle size={15} />{accessError}</div>{accessRetry ? <div className="auth-note">Retrying automatically (attempt {accessRetry.attempt} of {accessRetry.of})…</div> : null}<button type="button" className="auth-submit" onClick={retryAccess}>Retry</button><button type="button" className="auth-link" onClick={signOut}>Sign out</button></div></div>;
   if (!access) return <div className="auth-root"><style>{STYLE}</style><div className="loading-screen">Loading your dashboard access…</div></div>;
   // F3: key DashboardApp by the access-scope FINGERPRINT. A permission change (account/brand-scope/role) changes the
   // fingerprint, so React atomically replaces the whole subtree with a fresh one -- discarding ALL previous-scope
