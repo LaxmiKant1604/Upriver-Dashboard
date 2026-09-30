@@ -30,6 +30,7 @@ import { marketplaceToday } from "../../lib/marketplaces.js";
 import { CURRENCY_OPTIONS, brandViewModel, isConvertedMode } from "../lib/brand-view.js";
 import { DASH } from "../lib/brand-view-tables.js";
 import BrandReports, { buildExportModel, freshnessSummaryLine, fxSummaryLine } from "./BrandReports.jsx";
+import SavedDataPublishControl from "../components/SavedDataPublishControl.jsx";
 import {
   BvSelect, CustomRangeInputs, ExportMenu, RANGE_PRESETS,
   useBrandCurrency, useBrandExport, useBrandRange, useFxRates,
@@ -41,7 +42,9 @@ const BRANDS_VERSION = "brand-view-brands-v1";
 // onRequestPaidSync (admins only): opens the Data Sync Center, whose source cards run the explicit, confirmed PAID sync.
 // Brand View itself is route-owned: its Reload sends refresh=1, which the server now answers READ-ONLY (publication
 // recovery WP10b) -- it re-reads the latest published row and never builds, saves or calls DataDoe.
-export default function BrandView({ accounts, accountsLoading, accountsError, loadReport, refreshReport, onRequestPaidSync = null }) {
+// publishRequest (optional): App.jsx publishRequestCall -- the "Publish from saved data" status / request call. The
+// control renders only when the server enables it for this exact account + brand + date.
+export default function BrandView({ accounts, accountsLoading, accountsError, loadReport, refreshReport, onRequestPaidSync = null, publishRequest = null }) {
   const [accountId, setAccountId] = useState("");
   const [brand, setBrand] = useState("");
 
@@ -222,6 +225,14 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
     }
   }, [accountId, applyReport, asOf, brand, displayCurrency, refreshReport, reloadFx]);
 
+  // After a VERIFIED "Publish from saved data" (published / already current), re-read the served report READ-ONLY
+  // (refresh=1 on this route-owned report never builds, saves or calls DataDoe) so the new copy replaces the old one.
+  const reloadPublished = useCallback(async () => {
+    if (!reportParams) return;
+    try { const { body, cachedAt } = await refreshReport(reportParams); applyReport(body, cachedAt); }
+    catch { /* the next read-only poll / reload shows it */ }
+  }, [applyReport, refreshReport, reportParams]);
+
   /* ------------------------------- exports ------------------------------ */
   const converted = isConvertedMode(displayCurrency);
   const currencyLabel = converted ? `Converted to ${displayCurrency}` : "Original marketplace currency";
@@ -342,6 +353,9 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
             Reload saved data
           </button>
           <ExportMenu disabled={!exportModel} busy={exportBusy} error={exportError} onExport={runExport} />
+          {publishRequest && (
+            <SavedDataPublishControl report="brand-view" accountId={accountId} brand={brand} asOf={asOf} call={publishRequest} onVerified={reloadPublished} />
+          )}
           {onRequestPaidSync && (
             <button
               type="button"

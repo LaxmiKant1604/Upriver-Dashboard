@@ -11,6 +11,17 @@
    view id (src/components/shell.jsx) to exactly one entry below, so a newly registered report or view cannot ship
    without an honest status. Pure and framework-free. */
 
+// Mirror of REPORT_MATERIALIZATION[action].savedDataPublish -- ONLY the reports whose single-scope zero-export
+// "Publish from saved data" executor is implemented and tested (pinned EQUAL to the registry by test). The shared
+// control (src/components/SavedDataPublishControl.jsx) renders for these and nothing else.
+export const SAVED_DATA_PUBLISH = Object.freeze({
+  "brand-view": "brand-view",
+});
+/** The recovery route a report publishes through from saved data, or null (no control for this report). */
+export function savedDataPublishRoute(action) {
+  return Object.prototype.hasOwnProperty.call(SAVED_DATA_PUBLISH, action) ? SAVED_DATA_PUBLISH[action] : null;
+}
+
 // Mirror of REPORT_MATERIALIZATION[action].dataStatus -- keyed by the registry's ACTION keys (pinned by test).
 export const REPORT_DATA_STATUS = Object.freeze({
   "brand-sales": "scheduled",

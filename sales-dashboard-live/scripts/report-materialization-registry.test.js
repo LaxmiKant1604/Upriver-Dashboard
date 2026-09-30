@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
 import {
-  REPORT_MATERIALIZATION, MATERIALIZATION_OWNERS, SERVE_MODES, REQUIRED_DECLARATION_FIELDS,
+  REPORT_MATERIALIZATION, MATERIALIZATION_OWNERS, SERVE_MODES, REQUIRED_DECLARATION_FIELDS, OPTIONAL_DECLARATION_FIELDS,
   PAGE_OPEN_WRITE_GRANDFATHERED, CLIENT_OPEN_TRIGGERED_WRITE_GRANDFATHERED,
   validateReportMaterializationRegistry,
 } from "../lib/server/reports/report-materialization-registry.js";
@@ -100,7 +100,7 @@ throwsWith("F: a declared capability that disagrees with REPORT_CAPABILITIES fai
   ok("H: PAGE_OPEN_WRITE_GRANDFATHERED is empty (the allowlist fully shrank)", PAGE_OPEN_WRITE_GRANDFATHERED.length === 0);
   ok("H: CLIENT_OPEN_TRIGGERED_WRITE_GRANDFATHERED is empty", CLIENT_OPEN_TRIGGERED_WRITE_GRANDFATHERED.length === 0);
   ok("H: the removed write serve-mode + owner are gone from the vocabularies", !SERVE_MODES.includes("self-heal-write-on-read") && !MATERIALIZATION_OWNERS.includes("serve:self-heal"));
-  ok("H: every declared field name is one of the required declaration fields (no typos leak in)", Object.values(REPORT_MATERIALIZATION).every((e) => Object.keys(e).every((k) => REQUIRED_DECLARATION_FIELDS.includes(k))));
+  ok("H: every declared field name is one of the required (or the explicit OPTIONAL) declaration fields (no typos leak in)", Object.values(REPORT_MATERIALIZATION).every((e) => Object.keys(e).every((k) => REQUIRED_DECLARATION_FIELDS.includes(k) || OPTIONAL_DECLARATION_FIELDS.includes(k))));
   ok("H: brand-accessible reports remain brand-accessible in the registry (capability parity)", Object.entries(REPORT_MATERIALIZATION).every(([a, e]) => isBrandAccessible(e.capability) === isBrandAccessible(REPORT_CAPABILITIES[a])));
 })();
 

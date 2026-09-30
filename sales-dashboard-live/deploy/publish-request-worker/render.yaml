@@ -1,0 +1,31 @@
+# "Publish from saved data" executor -- Render Blueprint (NOT APPLIED; owner approval required before any Render
+# service exists). ONE background worker, ONE instance, the smallest plan. autoDeploy is OFF: a push to any branch never
+# changes the running executor; every deploy is an explicit manual action on an approved commit.
+services:
+  - type: worker
+    name: upriver-publish-request-worker
+    runtime: node
+    region: singapore            # nearest Render region to the Supabase project (ap-south-1, Mumbai)
+    plan: starter                # 0.5 CPU / 512 MB (measured peak RSS 89 MB for the heaviest Brand View unit)
+    numInstances: 1              # exactly ONE executor (the queue also claims one request at a time)
+    rootDir: sales-dashboard-live
+    branch: feat/publish-from-saved-data
+    autoDeploy: false
+    buildCommand: npm ci            # full install: `pg` is a devDependency in this repo
+    startCommand: node scripts/worker/publish-request-worker.mjs
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: PSR_WORKER_ID
+        value: psr-render-1
+      - key: PSR_PAUSE_DURING_SCHEDULER
+        value: "true"
+      # Secrets: set in the Render dashboard (sync: false = never stored in this file or the repo).
+      - key: POSTGRES_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: DATADOE_API_KEY       # ONLY for the fenced publisher's accounts-list GET; every other DataDoe request is refused in-process
+        sync: false

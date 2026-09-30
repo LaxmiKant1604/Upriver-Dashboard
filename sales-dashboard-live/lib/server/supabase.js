@@ -1440,6 +1440,90 @@ export async function readControlPlaneLease() {
   return await request("/rest/v1/rpc/read_control_plane_lease", { method: "POST", body: {} });
 }
 
+/* ===================== PUBLISH FROM SAVED DATA (user-requested single-scope publication queue) =====================
+ * supabase/migrations/20260936_publish_requests.sql. The dashboard endpoint enqueues + reads status; the executor
+ * claims / renews / finishes. Every write is a SECURITY DEFINER RPC (service_role only); reads are service-role SELECTs
+ * issued server-side after the endpoint authorized the user for the exact scope. */
+const PUBLISH_REQUEST_COLUMNS = "id,report_key,scope_key,account_id,brand,as_of,status,reason,request_count,attempts,max_attempts,"
+  + "claimed_at,lease_expires_at,next_attempt_at,result,created_at,updated_at,finished_at,requested_by";
+
+export async function getPublishRequestControl() {
+  const rows = await request("/rest/v1/publish_request_control?select=enabled,report_keys,canary_scope_keys,worker_seen_at,worker_state&id=eq.true&limit=1");
+  return Array.isArray(rows) && rows[0] ? rows[0] : null;
+}
+export async function enqueuePublishRequest({ reportKey, scopeKey, accountId, brand, asOf, requestedBy }) {
+  return await request("/rest/v1/rpc/enqueue_publish_request", {
+    method: "POST",
+    body: { p_report_key: reportKey, p_scope_key: scopeKey, p_account_id: accountId, p_brand: brand == null ? null : brand, p_as_of: asOf, p_requested_by: requestedBy },
+  });
+}
+export async function publishRequestWorkerBeat({ worker, state }) {
+  return await request("/rest/v1/rpc/publish_request_worker_beat", { method: "POST", body: { p_worker: worker, p_state: state } });
+}
+export async function tripPublishRequestControl({ reason }) {
+  return await request("/rest/v1/rpc/trip_publish_request_control", { method: "POST", body: { p_reason: reason } });
+}
+export async function getPublishRequest(id) {
+  const query = new URLSearchParams({ select: PUBLISH_REQUEST_COLUMNS, id: `eq.${id}`, limit: "1" });
+  const rows = await request(`/rest/v1/publish_requests?${query}`);
+  return Array.isArray(rows) && rows[0] ? rows[0] : null;
+}
+// The newest request for an exact scope + date (every authorized viewer of the scope sees the same request).
+export async function getLatestPublishRequestForScope({ reportKey, scopeKey, asOf }) {
+  const query = new URLSearchParams({
+    select: PUBLISH_REQUEST_COLUMNS, report_key: `eq.${reportKey}`, scope_key: `eq.${scopeKey}`, as_of: `eq.${asOf}`,
+    order: "created_at.desc", limit: "1",
+  });
+  const rows = await request(`/rest/v1/publish_requests?${query}`);
+  return Array.isArray(rows) && rows[0] ? rows[0] : null;
+}
+export async function claimPublishRequest({ worker, claimToken, leaseSeconds }) {
+  return await request("/rest/v1/rpc/claim_publish_request", {
+    method: "POST", body: { p_worker: worker, p_claim_token: claimToken, p_lease_seconds: Number(leaseSeconds) },
+  });
+}
+export async function renewPublishRequest({ id, claimToken, leaseSeconds }) {
+  return await request("/rest/v1/rpc/renew_publish_request", {
+    method: "POST", body: { p_id: id, p_claim_token: claimToken, p_lease_seconds: Number(leaseSeconds) },
+  });
+}
+export async function finishPublishRequest({ id, claimToken, status, reason = null, result = null, retrySeconds = null }) {
+  return await request("/rest/v1/rpc/finish_publish_request", {
+    method: "POST",
+    body: { p_id: id, p_claim_token: claimToken, p_status: status, p_reason: reason, p_result: result, p_retry_seconds: retrySeconds == null ? null : Number(retrySeconds) },
+  });
+}
+// The BASE regional scheduler cycles (and their -fba twins) that are RUNNING for a recent cycle date -- the executor's
+// "scheduler is working, stay off the database" signal. Indexed by sync_cycles_bucket_date_idx (bucket, cycle_date).
+export async function listRunningSchedulerCycles({ sinceDate, createdSince }) {
+  const buckets = ["india", "europe-au", "us-ca", "india-fba", "europe-au-fba", "us-ca-fba"];
+  const query = new URLSearchParams({
+    select: "id,bucket,cycle_date,status,created_at",
+    bucket: `in.(${buckets.join(",")})`,
+    cycle_date: `gte.${sinceDate}`,
+    status: "eq.running",
+    // Server-side recency + newest first: a stranded old "running" row can never crowd out the live one.
+    ...(createdSince ? { created_at: `gte.${createdSince}` } : {}),
+    order: "created_at.desc",
+    limit: "20",
+  });
+  const rows = await request(`/rest/v1/sync_cycles?${query}`);
+  return Array.isArray(rows) ? rows : [];
+}
+// The IDENTITY of the exact report_snapshots row a serve would read (never the payload): the served-row currency check
+// of "Publish from saved data" (brand-view-currency.js). `coverage` is the payload's small coverage object only.
+export async function getReportSnapshotIdentity({ reportKey, accountId, paramsHash }, { signal = null } = {}) {
+  const query = new URLSearchParams({
+    select: "id,report_key,account_id,params_hash,params,payload_storage_path,source_refreshed_at,updated_at,coverage:payload->coverage",
+    report_key: `eq.${reportKey}`,
+    account_id: `eq.${accountId}`,
+    params_hash: `eq.${paramsHash}`,
+    limit: "1",
+  });
+  const rows = await request(`/rest/v1/report_snapshots?${query}`, { signal });
+  return Array.isArray(rows) && rows[0] ? rows[0] : null;
+}
+
 // The dispatch-wave rows (read-only; every write goes through the lease/mark/ack/error/complete RPCs).
 // Fail-soft: null when unreadable -- the worker then skips completion detection for the pass.
 export async function getOnboardingDispatchRows() {

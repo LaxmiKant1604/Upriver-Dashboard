@@ -1570,6 +1570,16 @@ async function apiGet(params) {
   return body;
 }
 
+// "Publish from saved data" (action=publish-request): GET = the exact scope's request status, POST = record ONE request.
+// Never cached (the answer is the live queue state); answers { status, ok, body } so the control can show every state.
+async function publishRequestCall(method, params) {
+  if (!apiAccessToken) throw new Error("Please sign in to access the dashboard.");
+  const qs = new URLSearchParams({ action: "publish-request", ...params }).toString();
+  const r = await fetch(`/api/datadoe?${qs}`, { method, headers: { Authorization: `Bearer ${apiAccessToken}` } });
+  const body = await r.json().catch(() => ({}));
+  return { status: r.status, ok: r.ok, body };
+}
+
 const API_CACHE_PREFIX = "upriver:datadoe:v2:";
 const LARGE_CACHE_DB = "upriver-report-cache";
 const LARGE_CACHE_STORE = "responses";
@@ -4539,6 +4549,7 @@ function DashboardApp({ session, access, onSignOut }) {
           loadReport={loadSharedReport}
           refreshReport={refreshSharedReport}
           onRequestPaidSync={isAdmin ? openPaidSync : null}
+          publishRequest={publishRequestCall}
         />
       )}
 

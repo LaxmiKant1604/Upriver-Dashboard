@@ -15,6 +15,7 @@
 import { REPORT_CAPABILITIES, CAPABILITY } from "../report-authorization.js";
 import { REPORT_DERIVATIONS } from "../sync/report-derivation.js";
 import { REPORT_SOURCE_CONTRACTS } from "../sync/report-source-contracts.js";
+import { SAVED_DATA_PUBLISH_ROUTES } from "../publish-request/routes.js";
 
 // ---- Controlled vocabularies (a declaration field with a value outside its enum fails the guard) ----------------
 
@@ -52,6 +53,11 @@ export const REGIONAL_SCHEDULING = Object.freeze(["per-region-daily", "shadow", 
 //   paid-manual  only an admin paid sync (DataDoe tokens) refreshes it; the page shows the saved copy
 //   dormant      no page uses it
 export const DATA_STATUS = Object.freeze(["scheduled", "read-time", "paid-manual", "dormant"]);
+
+// OPTIONAL declaration fields (the only keys besides the required ones an entry may carry; the typo guard enforces it).
+//   savedDataPublish  the recovery route a user may ask to publish ONE exact scope through, from saved data (validated
+//                     against the tested executors in publish-request/routes.js, both directions -- rule 10b).
+export const OPTIONAL_DECLARATION_FIELDS = Object.freeze(["savedDataPublish"]);
 
 export const REQUIRED_DECLARATION_FIELDS = Object.freeze([
   "reportKey", "reportVersion", "requiredSources", "optionalSources", "sourceOwner", "materializationOwner",
@@ -162,6 +168,9 @@ export const REPORT_MATERIALIZATION = Object.freeze({
     provenanceFields: ["adsAvailable", "fbaAvailable", "inventoryScope", "updating", "depFingerprint"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["brand-view"],
     serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false, dataStatus: "scheduled",
+    // OPTIONAL: a user may request ONE exact (account, brand, today) scope be published from saved data (a durable request
+    // executed by the zero-export executor through this recovery route; lib/server/publish-request/). Never a page-open write.
+    savedDataPublish: "brand-view",
     notes: "Published by the FBA-aware Brand View materializer (report-materialization-brandview job) per (account,brand) at the exact serve identity {accountId,brand,asOf=marketplaceToday(country)}. FRESHNESS is a DEPENDENCY FINGERPRINT over the COMPLETE contributing set (brand-sales + compact brand-inventory + fba-plan + Ads coverage + campaign->brand mapping + catalog + version), computed identically by the writer and the serve: a read serves the stored snapshot and flags updating when ANY dependency changed (inventory became available, Ads advanced, a mapping was edited) -- not just when brand-sales advanced -- converging on the next scheduled publish with no page-open write. The compact brand-inventory is REBUILT from the fresh fba-plan by the materialize-inventory job AFTER fba, so fbaAvailable reflects same-day D-1 inventory (null only when no inventory snapshot); missing Ads mappings -> adsAvailable:false. Refresh=1 stays click-only.",
   },
   "brand-view-portfolio": {
@@ -371,6 +380,7 @@ export function validateReportMaterializationRegistry({
   capabilities = REPORT_CAPABILITIES, capabilityEnum = CAPABILITY,
   derivations = REPORT_DERIVATIONS, sourceContracts = REPORT_SOURCE_CONTRACTS,
   registry = REPORT_MATERIALIZATION, grandfathered = PAGE_OPEN_WRITE_GRANDFATHERED,
+  savedDataPublishRoutes = SAVED_DATA_PUBLISH_ROUTES,
 } = {}) {
   const problems = [];
   const reportActions = Object.entries(capabilities).filter(([, c]) => c !== capabilityEnum.NON_REPORT).map(([a]) => a);
@@ -439,6 +449,22 @@ export function validateReportMaterializationRegistry({
     if (e.clientOpenTriggeredWrite === true && !CLIENT_OPEN_TRIGGERED_WRITE_GRANDFATHERED.includes(a)) {
       problems.push(`"${a}" has clientOpenTriggeredWrite=true but is NOT in CLIENT_OPEN_TRIGGERED_WRITE_GRANDFATHERED (which is empty) -- a browser page-open/converge effect must never call the write endpoint; poll read-only instead`);
     }
+  }
+
+  // 10b. "Publish from saved data": an OPTIONAL savedDataPublish declaration must name a report whose single-scope
+  //      zero-export executor is implemented + tested (publish-request/routes.js) with the SAME route id, on a
+  //      scheduler-owned report -- and every tested executor must be declared (both directions, so neither the control
+  //      nor an executor can ship alone).
+  for (const [a, e] of Object.entries(registry)) {
+    if (!("savedDataPublish" in e) || e.savedDataPublish == null) continue;
+    const r = savedDataPublishRoutes[e.reportKey];
+    if (!r) problems.push(`"${a}" declares savedDataPublish "${e.savedDataPublish}" but no tested single-scope executor exists for "${e.reportKey}"`);
+    else if (r.routeId !== e.savedDataPublish) problems.push(`"${a}" savedDataPublish "${e.savedDataPublish}" != the tested executor route "${r.routeId}"`);
+    if (!String(e.materializationOwner || "").startsWith("scheduler-v2:")) problems.push(`"${a}" declares savedDataPublish but is not scheduler-owned (a publish-from-saved-data route needs a scheduled publication)`);
+  }
+  for (const rk of Object.keys(savedDataPublishRoutes)) {
+    const declared = Object.values(registry).some((e) => e && e.reportKey === rk && e.savedDataPublish === savedDataPublishRoutes[rk].routeId);
+    if (!declared) problems.push(`tested saved-data publish executor "${rk}" has no registry savedDataPublish declaration`);
   }
 
   // 11. the write allowlists must stay in EXACT lockstep with the declared write flags -- the set of reports whose

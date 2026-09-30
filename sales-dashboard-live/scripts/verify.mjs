@@ -265,6 +265,8 @@ const SUITES = [
   "test:report-writer-fence",
   "test:refresh-readonly",
   "test:paid-refresh-authz",
+  "test:publish-request-endpoint",
+  "test:publish-request-executor",
   "test:report-status",
   "test:scheduler-v2-route-switch",
   "test:publication-recovery-e2e",

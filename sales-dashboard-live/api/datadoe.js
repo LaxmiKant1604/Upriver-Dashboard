@@ -66,7 +66,17 @@ import {
   saveReportSnapshot,
   getReturnsHistoryRows,
   getSettlementHistoryRows,
+  getPublishRequestControl,
+  enqueuePublishRequest,
+  getPublishRequest,
+  getLatestPublishRequestForScope,
+  getReportSnapshotIdentity,
 } from "../lib/server/supabase.js";
+// "Publish from saved data" (action=publish-request): the SHORT authorized enqueue / status endpoint -- it never builds,
+// locks or publishes; the queued request is executed by the separate zero-export executor (scripts/worker/).
+import { handlePublishRequestAction, makeBrandAuthorizer } from "../lib/server/publish-request/endpoint.js";
+import { brandViewServedCurrency } from "../lib/server/publish-request/brand-view-currency.js";
+import { marketplaceToday as publishMarketplaceToday } from "../lib/marketplaces.js";
 // CENTRAL account+brand authorization: resolve a SELECTED_BRANDS user's permitted scope + project served payloads.
 // Admin/ALL_BRANDS users resolve to `restricted:false` and every serving path stays byte-identical.
 import {
@@ -2785,6 +2795,32 @@ export function classifyDataDoeRouteError(err) {
   return null;
 }
 
+// The real collaborators of the publish-request endpoint (lib/server/publish-request/endpoint.js).
+function publishRequestDeps() {
+  return {
+    assertAccountAccess,
+    // A SELECTED_BRANDS grant must permit EXACTLY the requested brand (the trusted scope resolver; never rewritten).
+    authorizeBrand: makeBrandAuthorizer({ resolveUserReportScope, getTrustedBrands: getTrustedAccountBrands, brandKey: canonicalBrandKey, BrandAccessError }),
+    // STORED directory only (one indexed row read; never the read-only rebuild brandViewDirectory falls back to): the
+    // brand must be in the account's PUBLISHED brand list -- exactly the unit set the executor's route publishes.
+    brandInDirectory: async ({ accountId, brand }) => {
+      const saved = await getReportSnapshot({ reportKey: BRAND_VIEW_BRANDS_REPORT_KEY, accountId, paramsHash: paramsHashFor(BRAND_VIEW_BRANDS_VERSION, { accountId }) });
+      const brands = saved && saved.payload && Array.isArray(saved.payload.brands) ? saved.payload.brands : null;
+      if (!brands) return { ok: false, unavailable: true };
+      return { ok: brands.includes(brand) };
+    },
+    accountCountry: async (accountId) => { const m = await sharedAccountMetadata(accountId); return m && m.country ? m.country : null; },
+    marketplaceToday: publishMarketplaceToday,
+    now: () => Date.now(),
+    getControl: () => getPublishRequestControl(),
+    enqueue: (a) => enqueuePublishRequest(a),
+    getById: (id) => getPublishRequest(id),
+    getLatestForScope: (a) => getLatestPublishRequestForScope(a),
+    // The serve's OWN freshness rule over the SAME dependency readers the brand-view serve uses.
+    currency: ({ accountId, brand, asOf }) => brandViewServedCurrency({ accountId, brand, asOf, readSnapshotIdentity: (a) => getReportSnapshotIdentity(a), fingerprintReaders: brandViewDepFingerprintReaders() }),
+  };
+}
+
 async function handleDataDoe(req, res) {
   let legacySharedRefresh = null;
   try {
@@ -2794,6 +2830,14 @@ async function handleDataDoe(req, res) {
     allowPaidExportsForThisRequest(access.role === "admin");
     const connections = getDataDoeConnections();
     const action = req.query.action;
+    // "Publish from saved data": its own exact-scope authorization (account grant + permitted brand + saved brand
+    // directory + today's date), then ONE durable request (or the served row proves it already current). Handled
+    // BEFORE every DataDoe / builder path below; zero DataDoe, zero report writes in this request.
+    if (action === "publish-request") {
+      const out = await handlePublishRequestAction({ method: req.method, query: req.query, access, deps: publishRequestDeps() });
+      res.status(out.status).json(out.json);
+      return;
+    }
     // WP10b: a refresh=1 of a ROUTE-OWNED live report is READ-ONLY (see the contract above ROUTE_OWNED_ACTION_REPORT_KEYS):
     // every successful answer carries { refreshReadOnly: true, paidSync } and no path below may lock, build or write it.
     const routeOwnedRefreshKey = wantsRefresh(req) ? routeOwnedReportKeyForAction(action) : null;

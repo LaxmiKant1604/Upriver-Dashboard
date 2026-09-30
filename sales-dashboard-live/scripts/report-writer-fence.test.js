@@ -964,6 +964,10 @@ const INVENTORY = {
     ["<module>", "publisherFor", "runRoute"],
     ["casUpdateReportSnapshotByRev", "deleteReportSnapshotByKey", "deleteReportSnapshotsOlderThan", "insertReportSnapshotIfAbsent", "pruneScheduledReportSnapshots", "publishLiveSnapshotFencedIfNewer", "publishLiveSnapshotIfNewer", "saveReportSnapshot", "saveShadowSnapshotIfNewer"],
     "the recovery ROUTE CLI (WP4): live rows ONLY via publisherFor -> buildSchedulerV2Publisher (fenced CAS). The extra sinks are the CONSERVATIVE whole-namespace rule: it hands the supabase.js namespace to the route release modules, which reach no sink by name (none of lib/server/sync/routes/*, lib/server/recovery/routes/*, route-publication-release.js is a writer in this map) -- only saveShadow (proven scheduler-v2/<publisherKey>) and deleteRouteShadowSnapshots (shadow-only by construction). Its two computed imports (tripwire) load exactly those route modules (cliPath / workerPath from the route registry), none of which is a writer.", "dynimport:2"),
+  "scripts/worker/publish-request-worker.mjs": E(FPP, ["brand-view"],
+    ["<module>", "makeEnv"],
+    ["casUpdateReportSnapshotByRev", "deleteReportSnapshotByKey", "deleteReportSnapshotsOlderThan", "insertReportSnapshotIfAbsent", "pruneScheduledReportSnapshots", "publishLiveSnapshotFencedIfNewer", "publishLiveSnapshotIfNewer", "saveReportSnapshot", "saveShadowSnapshotIfNewer"],
+    "the \"Publish from saved data\" executor (ONE user-requested Brand View unit at a time, lib/server/publish-request/brand-view-executor.js): live rows ONLY via makeEnv.makePublisher -> buildSchedulerV2Publisher (fenced CAS) inside a short route control window; its lineage writers are the route CLI's (cycle / job / scheduler-v2 shadow). The extra sinks are the SAME conservative whole-namespace rule as publication-route-reconcile.mjs (the supabase.js namespace reaches the brand-view route runtime only through readOnlySupabase)."),
 
   // ---- UNFENCED KEYS ONLY (WP10b: refresh=1 read-only + scheduler-v1 refuses route-owned keys) + BLOCKED BY THE FENCE
   // (writes a fenced key WITHOUT the fenced CAS: retire before flipping that key) ------------------------------------------
@@ -1009,6 +1013,7 @@ const INVENTORY = {
     "THIS package's PGlite self-test: in-process WASM Postgres only (it also runs the README section 9 operator SQL; its computed import is the PGlite entry).", "t1:73,dynimport:1"),
 
   // ---- READ-ONLY (tripwire only: they name report_snapshots, the fine-grained analysis finds no write) -----------------------
+  "scripts/worker/publish-request-selftest.mjs": R("dynimport:1", "offline PGlite self-test of migration 20260936 (publish_requests queue) + the executor core; its computed import is the PGlite entry. Never a real database; touches no report_snapshots."),
   "lib/server/recovery/registry.js": R("t1:2", "recovery registry: two reason STRINGS that mention report_snapshots (no I/O)."),
   "lib/server/recovery/store-pg.js": R("t1:4", "recovery worker store: read-only status SELECTs (latest source_refreshed_at / updated_at per account and key)."),
   "lib/server/recovery/routes/brand-view-brands.route.js": R("t1:2", "brand-view-brands route evidence SQL: ranked SELECTs of the live source rows (read-only worker pool)."),

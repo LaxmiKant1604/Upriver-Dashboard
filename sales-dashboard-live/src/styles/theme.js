@@ -1304,6 +1304,14 @@ body{ overflow-x:hidden; }
   font:inherit; font-size:12px;
 }
 .bv-actions{ display:flex; align-items:center; gap:var(--space-2); margin-left:auto; padding-bottom:1px; }
+/* "Publish from saved data" control (SavedDataPublishControl.jsx): the button + ONE honest status line. */
+.psd-control{ display:flex; flex-direction:column; align-items:flex-start; gap:4px; }
+.psd-status{ font-size:11.5px; line-height:1.35; color:var(--op-ink-3, #5b6573); max-width:360px; }
+.psd-status b{ font-weight:700; }
+.psd-status.psd-busy b{ color:var(--op-blue, #1f5fbf); }
+.psd-status.psd-good b{ color:var(--op-green, #1d7a46); }
+.psd-status.psd-warn b{ color:var(--op-warn-ink, #8a5a00); }
+.psd-status.psd-bad b{ color:var(--op-red, #b42318); }
 
 .bv-export{ position:relative; }
 .bv-menu{
