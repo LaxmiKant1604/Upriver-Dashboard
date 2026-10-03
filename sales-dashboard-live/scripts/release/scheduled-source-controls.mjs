@@ -17,7 +17,7 @@ const MODE = process.argv.includes("--apply") ? "apply" : "dry-run";
 const OPERATOR = process.env.PRIORITY_OPERATOR || "laxmikant@superboring.in";
 
 const { SOURCE_REGISTRY } = await import("../../lib/server/sync/source-registry.js");
-const { scheduledSourceControlPlan, SCHEDULED_ENABLED_SOURCE_KEYS } = await import("../../lib/server/sync/source-scheduled-oli.js");
+const { scheduledSourceControlPlan, SCHEDULED_ENABLED_SOURCE_KEYS, OPERATOR_SWITCHED_SOURCE_KEYS } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { getSourceControls, setSourceControl } = await import("../../lib/server/supabase.js");
 
 const registryKeys = SOURCE_REGISTRY.map((r) => r.sourceKey);
@@ -25,7 +25,7 @@ const plan = scheduledSourceControlPlan(registryKeys);
 const log = (m) => console.log("source-controls: " + m);
 
 log("mode=" + MODE + " operator=" + OPERATOR);
-log("schedule-ENABLED + unpaused: " + SCHEDULED_ENABLED_SOURCE_KEYS.join(", ") + "; every other source stays schedule-disabled.");
+log("schedule-ENABLED + unpaused: " + SCHEDULED_ENABLED_SOURCE_KEYS.join(", ") + "; operator-switched (left untouched): " + OPERATOR_SWITCHED_SOURCE_KEYS.join(", ") + "; every other source stays schedule-disabled.");
 
 const before = await getSourceControls();
 if (before.read !== "ok") { console.error("STOP could not read source_controls (" + before.read + "/" + before.error + ")"); process.exit(1); }
@@ -64,7 +64,7 @@ for (const key of SCHEDULED_ENABLED_SOURCE_KEYS) {
   if (!r || r.schedule_enabled !== true || r.paused !== false) problems.push(key + " not enabled+unpaused");
 }
 const stillEnabled = after.rows.filter((r) => r.schedule_enabled === true).map((r) => r.source_key).sort();
-const extra = stillEnabled.filter((k) => !SCHEDULED_ENABLED_SOURCE_KEYS.includes(k));
+const extra = stillEnabled.filter((k) => !SCHEDULED_ENABLED_SOURCE_KEYS.includes(k) && !OPERATOR_SWITCHED_SOURCE_KEYS.includes(k));
 if (extra.length) problems.push("unexpected schedule_enabled: " + extra.join(", "));
 if (problems.length) { console.error("STOP source_controls verification failed: " + problems.join("; ")); process.exit(1); }
 log("COMMITTED. schedule_enabled now EXACTLY [" + stillEnabled.join(", ") + "], both unpaused; every other source schedule-disabled.");

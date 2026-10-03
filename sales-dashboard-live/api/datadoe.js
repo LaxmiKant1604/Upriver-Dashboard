@@ -76,7 +76,7 @@ import { awdCapableMarketplace, canonicalAwdMarketplace } from "../lib/server/re
 // The single ASIN->Campaign cutover authority: block a retired ASIN Ads export create from ANY raw-sourceId path
 // (e.g. the admin discovery `sample` probe) before the DataDoe request, so the browser can never mint an ASIN export;
 // and gate the legacy ASIN-attributed portfolio read to the rollback path so no ASIN ad metrics reach the browser.
-import { isAdsExportRetiredForSourceId, ACTIVE_ADS_SOURCE_KEY, ASIN_ADS_SOURCE_KEY } from "../lib/server/active-ads-source.js";
+import { isAdsExportRunnerOnlyForSourceId, ACTIVE_ADS_SOURCE_KEY, ASIN_ADS_SOURCE_KEY } from "../lib/server/active-ads-source.js";
 // Shared DataDoe transport. Extracted so every report — the seven original ones
 // and the six insight reports — shares one 2-req/sec rate limiter, one export
 // poller, and one row-cap policy.
@@ -4258,12 +4258,12 @@ async function handleDataDoe(req, res) {
       else if (sourceId === ADS_SOURCE_ID) columns = ADS_COLUMNS;
       else columns = ["date", "seller_or_vendor_id"];
 
-      // ASIN Ads EXPORT-RETIREMENT guard: this admin discovery probe takes a browser-supplied sourceId and would
-      // create a DataDoe export for it. After the ASIN->Campaign cutover the retired ASIN Ads source can never mint
-      // a new export from ANY path -- block it here BEFORE the create (single authority; the browser never selects an
-      // ads grain to export). Durable ASIN history stays readable; rolling ADS_ACTIVE_SOURCE back to "asin" clears it.
-      if (isAdsExportRetiredForSourceId(sourceId)) {
-        res.status(409).json({ error: "ASIN_ADS_EXPORT_RETIRED", sourceId, note: "Creating ASIN Ads exports is disabled (Campaign Ads is the only active Ads source); the durable history is retained read-only." });
+      // ASIN Ads RUNNER-ONLY guard: this admin discovery probe takes a browser-supplied sourceId and would create a
+      // DataDoe export for it. While Campaign is the active read grain, an ASIN Ads export may be created ONLY by the
+      // reviewed regional ASIN runner (its exact reduced-grain request, 5-seller batches, coverage + token ceilings) --
+      // block it here BEFORE the create (single authority; the browser never selects an ads grain to export).
+      if (isAdsExportRunnerOnlyForSourceId(sourceId)) {
+        res.status(409).json({ error: "ASIN_ADS_EXPORT_RUNNER_ONLY", sourceId, note: "ASIN Ads exports are created only by the scheduled ASIN Ads runner (or its admin Data Sync Center card); this probe cannot create one." });
         return;
       }
 

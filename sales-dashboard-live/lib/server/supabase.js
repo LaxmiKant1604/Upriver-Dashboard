@@ -1204,6 +1204,54 @@ export async function deleteAdsDailySourceRows({ accountId, sourceKey, from, to,
   }
 }
 
+// CHEAP, READ-ONLY exact row count of ONE account's saved rows for a source over metric_date [from,to] (one request:
+// select=metric_date&limit=1 with Prefer: count=exact -> the PostgREST Content-Range total; never a payload, never a
+// write). Used by the ASIN Ads planner to size an export window from the account's own saved history. THROWS (fail
+// closed) on a malformed argument or any read problem -- the caller then plans without a size estimate.
+export async function getAdsDailySourceRowCount({ accountId, sourceKey, from, to, signal = null } = {}) {
+  const isDay = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+  if (String(accountId ?? "").trim() === "" || String(sourceKey ?? "").trim() === "" || !isDay(from) || !isDay(to) || from > to) {
+    throw new Error("getAdsDailySourceRowCount requires accountId + sourceKey + a from <= to YYYY-MM-DD window (fail closed).");
+  }
+  requireConfiguration();
+  const query = new URLSearchParams({ select: "metric_date", source_key: `eq.${sourceKey}`, account_id: `eq.${accountId}`, metric_date: `gte.${from}`, limit: "1" });
+  query.append("metric_date", `lte.${to}`);
+  const response = await fetchReadOnly(`${SUPABASE_URL}/rest/v1/ads_daily_source_rows?${query}`, {
+    method: "GET",
+    headers: { apikey: SUPABASE_SECRET_KEY, Authorization: `Bearer ${SUPABASE_SECRET_KEY}`, Prefer: "count=exact" },
+    ...(signal ? { signal } : {}),
+  });
+  const result = await response.json().catch(() => null);
+  if (!response.ok) {
+    const error = new Error(`Supabase request failed (${response.status}): ${result?.message || result?.hint || "Unknown error"}`);
+    error.status = response.status;
+    error.code = result && typeof result.code === "string" ? result.code : null;
+    throw error;
+  }
+  const total = /\/(\d+)\s*$/.exec(String((response.headers && typeof response.headers.get === "function" && response.headers.get("content-range")) || ""));
+  const rows = total ? Number(total[1]) : NaN;
+  if (!Number.isSafeInteger(rows) || rows < 0) throw new Error("ADS_ROW_COUNT_UNREADABLE: the exact total (Content-Range) is missing or malformed (fail closed).");
+  return { rows };
+}
+
+// The LKG-preserving counterpart of deleteAdsDailySourceRows, run AFTER the fresh window has been upserted: delete ONE
+// account's rows for a source over [from,to] that THIS run did not refresh (source_refreshed_at absent or different from
+// the run's own stamp) -- stale grain or rows the provider no longer reports. Never touches a row the run just wrote,
+// another window, another account or another source. Returns the same typed ack as the delete.
+export async function pruneAdsDailySourceRows({ accountId, sourceKey, from, to, keepRefreshedAt, signal = null }) {
+  if (!keepRefreshedAt || Number.isNaN(Date.parse(String(keepRefreshedAt)))) return { write: "write-failed", error: "ADS_ROWS_PRUNE_NO_STAMP" };
+  const query = new URLSearchParams({ source_key: `eq.${sourceKey}`, account_id: `eq.${accountId}`, metric_date: `gte.${from}` });
+  query.append("metric_date", `lte.${to}`);
+  query.append("or", `(source_refreshed_at.is.null,source_refreshed_at.neq."${new Date(String(keepRefreshedAt)).toISOString()}")`);
+  try {
+    await request(`/rest/v1/ads_daily_source_rows?${query}`, { method: "DELETE", headers: { Prefer: "return=minimal" }, signal });
+    return { write: "ok", error: null };
+  } catch (writeError) {
+    if (isSchemaMissingError(writeError)) return { write: "schema-missing", error: "ADS_ROWS_SCHEMA_MISSING" };
+    return { write: "write-failed", error: "ADS_ROWS_PRUNE_FAILED" };
+  }
+}
+
 export async function upsertAdDailyMetrics(rows) {
   if (!rows.length) return;
   await request("/rest/v1/ad_daily_metrics?on_conflict=account_id,metric_date,campaign_id,campaign_type,currency", {

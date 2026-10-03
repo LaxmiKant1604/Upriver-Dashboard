@@ -6,6 +6,7 @@ import {
   upsertAdDailyMetrics,
   upsertAdsDailyRows,
   deleteAdsDailySourceRows,
+  pruneAdsDailySourceRows,
   upsertAdsSyncStates,
   recordAdsCoverageWindows,
   getDailyAdsCoverage,
@@ -21,11 +22,11 @@ import { evaluateSourceCoverage } from "./sync/ppc-ads-loader.js";
 // fail closed as ads-currency-missing).
 import { resolveAdRowCurrency } from "./reports/asin-ads-aggregation.js";
 import { marketplaceProfile } from "../marketplaces.js";
-// The single active-Ads-source switch: after the ASIN->Campaign cutover, creating a NEW ASIN Ads export is disabled
-// (Campaign is the only active Ads source). Durable ASIN history + all reader code stay untouched; only the EXPORT
-// path is blocked here at the one chokepoint every entry point (scheduler, watchdog, DSC, manual CLI, cron) flows
-// through. Rolling ADS_ACTIVE_SOURCE back to "asin" clears the retirement.
-import { isAdsExportRetiredFor } from "./active-ads-source.js";
+// The single Ads-source authority: while Campaign is the active READ grain, the ASIN/date grain is a RUNNER-ONLY
+// additional source -- its exports may be created ONLY by the reviewed regional ASIN runner, which presents
+// ASIN_ADS_RUNNER_AUTHORIZATION in coverage mode. Every other entry point (legacy cadence sync, watchdog, cron) is
+// still refused here at the one chokepoint they all flow through, before any lock / DataDoe / Supabase I/O.
+import { isAdsExportRunnerOnlyFor, ASIN_ADS_RUNNER_AUTHORIZATION } from "./active-ads-source.js";
 import { sanitizeExcerpt } from "./sync/source-failure-classifier.js";
 
 // Bounded HTTP retry cap (429 on any method; 5xx on a free idempotent GET only -- a 5xx create POST is ambiguous and
@@ -112,6 +113,14 @@ export const ADS_SOURCES = [
       "ad_units_sold_same_sku", "ad_orders_same_sku",
     ],
     keyFields: ["child_asin"],
+    // A page at EXACTLY the row limit is potentially truncated: this source NEVER skip-paginates (a skip over a
+    // date-only ordering is not a stable cursor) -- it BISECTS the date window instead, every fragment a complete
+    // export under the limit (see fetchWindowBySplit). Its exports also fail closed on a provider loading notice /
+    // data-source issue, an out-of-window row date or a duplicate natural grain, so incomplete coverage is never saved.
+    fullPagePolicy: "split-window",
+    // HARD create-export ceiling for ONE requiredCoverage invocation of this source: the window + two bisection
+    // levels (1 + 2 + 4). The runner's own approved total cap is checked before every POST as well.
+    maxCoverageCreateExports: 7,
     groupBy: ["marketplace_country_code", "seller_or_vendor_id", "date", "child_asin"],
     aggregations: [
       { column: "ad_sales_same_sku", aggregation: "sum", alias: "ad_sales_same_sku_sum" },
@@ -337,7 +346,13 @@ async function downloadExport(apiKey, exportId) {
   // rowCount from the COMPLETED export metadata (accept a top-level or a metadata-nested field; anything else
   // stays null so validateExportPage fails closed on a missing count).
   const rc = completed ? (completed.rowCount ?? (completed.metadata && completed.metadata.rowCount)) : null;
-  return { status: completed ? completed.status : null, rowCount: rc == null ? null : Number(rc), rows };
+  // The provider's own completeness signals (a still-loading history notice / data-source issues), carried verbatim for
+  // the sources that fail closed on them (validateSplitWindowPage); every other source ignores them (unchanged).
+  return {
+    status: completed ? completed.status : null, rowCount: rc == null ? null : Number(rc), rows,
+    loadingNotice: completed ? (completed.historicalDataStillLoadingNotice ?? null) : null,
+    dataSourceIssues: completed && Array.isArray(completed.dataSourceIssues) ? completed.dataSourceIssues : [],
+  };
 }
 
 // Validate one export page using BOTH the metadata rowCount AND the raw array length. Fails closed (throws) on:
@@ -395,6 +410,83 @@ async function fetchAllPages(create, download, apiKey, source, ids, from, to, bu
     skip += EXPORT_LIMIT;                     // a full page => there may be more; fetch the next page
   }
   return dedupeAdsRawRows(source, all);
+}
+
+// ---- "split-window" fetch (the ASIN/date source) ----
+const ymd = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || ""));
+function typedAdsFetchError(code, message) { const e = new Error(code + ": " + message); e.code = code; return e; }
+
+// PURE: validate ONE split-window page beyond validateExportPage -- the provider's completeness signals, the rows' own
+// dates and the DATA SHAPE. Throws a typed error (nothing is persisted) on a still-loading history notice, any data-source
+// issue, a row whose date is missing / outside the fragment window it was requested for, or (when `source` is given) a
+// row missing any requested grain column or summed-metric alias as an own property (a provider shape change -- e.g. the
+// aggregated values no longer returned -- must never be saved as null metrics). Returns the rows.
+export function validateSplitWindowPage(page, from, to, source = null) {
+  const rows = validateExportPage(page);
+  const notice = page && page.loadingNotice;
+  if (notice != null && String(typeof notice === "string" ? notice : JSON.stringify(notice)).trim() !== "") {
+    throw typedAdsFetchError("ADS_EXPORT_HISTORY_STILL_LOADING", "the provider marked this export's history as still loading (fail closed; not persisted)");
+  }
+  if (page && Array.isArray(page.dataSourceIssues) && page.dataSourceIssues.length) {
+    throw typedAdsFetchError("ADS_EXPORT_DATA_SOURCE_ISSUE", page.dataSourceIssues.length + " data-source issue(s) on this export (fail closed; not persisted)");
+  }
+  const expectedKeys = source ? [...(source.dimensions || []), ...((source.aggregations || []).map((a) => a.alias))] : [];
+  for (const row of rows) {
+    const d = row && typeof row === "object" ? String(row.date || "") : "";
+    if (!ymd(d) || d < from || d > to) throw typedAdsFetchError("ADS_EXPORT_ROW_OUTSIDE_WINDOW", "a row dated outside [" + from + ".." + to + "] (fail closed; not persisted)");
+    for (const k of expectedKeys) {
+      if (!Object.prototype.hasOwnProperty.call(row, k)) throw typedAdsFetchError("ADS_EXPORT_SHAPE_MISMATCH", "a row lacks the requested column / alias \"" + k + "\" (provider data shape changed; fail closed; not persisted)");
+    }
+  }
+  return rows;
+}
+
+// PURE: the two contiguous halves of an inclusive [from..to] window (from < to). The left half takes the extra day.
+export function bisectDateWindow(from, to) {
+  const days = inclusiveDaySpan(from, to);
+  if (!(days >= 2)) return null;
+  const leftDays = Math.ceil(days / 2);
+  const leftTo = addDays(from, leftDays - 1);
+  return [{ from, to: leftTo }, { from: addDays(leftTo, 1), to }];
+}
+
+// Fetch the COMPLETE [from,to] window for a "split-window" source. ONE export per fragment (skip is always 0): a
+// fragment returning FEWER rows than EXPORT_LIMIT is complete; one returning EXACTLY the limit is potentially
+// truncated, so its rows are DISCARDED (never persisted) and the fragment is bisected into two contiguous date halves,
+// recursively, within the invocation create budget (checked BEFORE every POST). A single day still at the limit
+// cannot be split by date and fails closed (typed). The fragments are disjoint and contiguous and cover [from,to]
+// exactly; every page passes validateSplitWindowPage, and the concatenated rows must hold NO duplicate natural grain
+// (a duplicate would double count -> fail closed). Returns { rows, fragments: [{ from, to, rowCount, exportId }] }.
+export async function fetchWindowBySplit(create, download, apiKey, source, ids, from, to, budget) {
+  const fragments = [];
+  const all = [];
+  const fetchFragment = async (f, t) => {
+    if (budget) {
+      if (budget.count >= budget.max) throw typedAdsFetchError("ADS_COVERAGE_EXPORT_BUDGET_EXCEEDED", "max " + budget.max + " create-exports per requiredCoverage invocation");
+      budget.count += 1;
+    }
+    const created = await create(apiKey, source, ids, f, t, 0);
+    const exportId = created && (created.exportId || created.id);
+    const page = await download(apiKey, exportId);
+    const rows = validateSplitWindowPage(page, f, t, source);
+    if (page.rowCount >= EXPORT_LIMIT) {
+      const halves = bisectDateWindow(f, t);
+      if (!halves) throw typedAdsFetchError("ADS_EXPORT_DAY_AT_ROW_LIMIT", "a single-day fragment returned the full " + EXPORT_LIMIT + "-row limit (fail closed; not persisted)");
+      for (const h of halves) await fetchFragment(h.from, h.to);
+      return;
+    }
+    fragments.push({ from: f, to: t, rowCount: page.rowCount, exportId: exportId == null ? null : String(exportId) });
+    for (const row of rows) all.push(row);
+  };
+  await fetchFragment(from, to);
+  const seen = new Set();
+  for (const row of all) {
+    const k = adsRawNaturalKey(source, row);
+    if (seen.has(k)) throw typedAdsFetchError("ADS_EXPORT_DUPLICATE_GRAIN", "two rows share one natural grain (fail closed; not persisted)");
+    seen.add(k);
+  }
+  fragments.sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0));
+  return { rows: all, fragments };
 }
 
 function chunks(items, size) {
@@ -801,6 +893,8 @@ export const PRODUCTION_ADS_SYNC_DEPS = Object.freeze({
   // content revision (describes committed durable data, not the fetch batch). Fail-soft: absent/error -> fall back
   // to the batch-rows rev.
   readDurableRows: getAdsDailySourceRows,
+  // LKG-preserving replace for a reduced-grain source: upsert first, then prune only the rows this run did not refresh.
+  pruneAdsDailyRows: pruneAdsDailySourceRows,
   now: () => new Date().toISOString(),
   clock: () => Date.now(), // monotonic ms for the work-budget deadline (injectable so the deferral is testable)
 });
@@ -820,6 +914,9 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
   } = deps;
   const clock = typeof deps.clock === "function" ? deps.clock : () => Date.now();
   const deleteRows = typeof deps.deleteAdsDailyRows === "function" ? deps.deleteAdsDailyRows : async () => ({ write: "ok" });
+  // The post-upsert PRUNE for a reduced-grain (aggregated) source: deletes, within the replaced window, ONLY the rows this
+  // run did not refresh. Absent (older deps/tests) -> the pre-existing delete-then-insert clean replace is used.
+  const pruneRows = typeof deps.pruneAdsDailyRows === "function" ? deps.pruneAdsDailyRows : null;
   // Item 3: durable-rows reader for the committed-state revision. Absent (older deps/tests) -> the rev falls back to
   // the just-persisted batch rows (byte-identical to the pre-item-3 behavior).
   const readDurableRows = typeof deps.readDurableRows === "function" ? deps.readDurableRows : null;
@@ -835,13 +932,15 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
   const selectedSources = ADS_SOURCES.filter((source) => sourceKeys.includes(source.key));
   if (!selectedSources.length) throw new Error("No supported Ads source was requested.");
 
-  // ASIN Ads EXPORT-RETIREMENT guard (hard, BEFORE any lock / discovery / DataDoe / Supabase I/O). After the
-  // ASIN->Campaign cutover the ASIN grain can never create a new export from ANY entry point; the durable
-  // asin-performance-v1 history + every reader stay intact (reads never call this function). Fail closed.
-  const retiredRequested = selectedSources.map((s) => s.key).filter((k) => isAdsExportRetiredFor(k));
-  if (retiredRequested.length) {
-    const e = new Error("ASIN_ADS_EXPORT_RETIRED: creating ASIN Ads exports is disabled (Campaign Ads is the only active Ads source); the durable history is retained read-only. Blocked source(s): " + retiredRequested.join(","));
-    e.code = "ASIN_ADS_EXPORT_RETIRED";
+  // ASIN Ads RUNNER-ONLY guard (hard, BEFORE any lock / discovery / DataDoe / Supabase I/O). While Campaign is the active
+  // read grain, an ASIN Ads export may be created ONLY by the reviewed regional ASIN runner: it must present the
+  // unforgeable ASIN_ADS_RUNNER_AUTHORIZATION capability AND run in coverage mode (an exact <=5-account allowlist and an
+  // exact window). Every other entry point is refused, exactly as the retirement refused it. Fail closed.
+  const runnerOnlyRequested = selectedSources.map((s) => s.key).filter((k) => isAdsExportRunnerOnlyFor(k));
+  const runnerAuthorized = !!options && typeof options === "object" && options.adsRunnerAuthorization === ASIN_ADS_RUNNER_AUTHORIZATION && options.requiredCoverage != null;
+  if (runnerOnlyRequested.length && !runnerAuthorized) {
+    const e = new Error("ASIN_ADS_EXPORT_RUNNER_ONLY: ASIN Ads exports are created only by the reviewed regional ASIN Ads runner (coverage mode, explicit authorization); this entry point cannot create one. Blocked source(s): " + runnerOnlyRequested.join(","));
+    e.code = "ASIN_ADS_EXPORT_RUNNER_ONLY";
     throw e;
   }
 
@@ -893,7 +992,10 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
     if (coverageMode) summary.coverageMode = true;
     // ONE invocation-scoped create-export budget for the whole requiredCoverage run (one source, one batch, so
     // parent + up to two split children). Null in cadence mode => the recursion is unbounded as before.
-    const coverageExportBudget = coverageMode ? { count: 0, max: MAX_REQUIRED_COVERAGE_CREATE_EXPORTS } : null;
+    // A "split-window" source declares its own (larger) per-invocation ceiling for its bisection fragments.
+    const coverageExportBudget = coverageMode
+      ? { count: 0, max: Math.max(MAX_REQUIRED_COVERAGE_CREATE_EXPORTS, ...selectedSources.map((src) => (src.fullPagePolicy === "split-window" && Number.isSafeInteger(src.maxCoverageCreateExports) ? src.maxCoverageCreateExports : 0))) }
+      : null;
 
     for (const source of selectedSources) {
       const work = new Map();
@@ -958,7 +1060,16 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
           const ids = workingBatch.map((entry) => entry.account.rawAccountId);
           try {
             // FIX 2: the recursive fetch honors the invocation create-export budget (checked before every POST).
-            const rows = await fetchAllPages(createExportDep, downloadExportDep, connection.apiKey, source, ids, range.from, range.to, coverageExportBudget);
+            // A "split-window" source (coverage mode only -- it is runner-only) bisects a full page by date instead of
+            // skip-paginating; every other source keeps the unchanged skip pagination.
+            const splitWindow = coverageMode && source.fullPagePolicy === "split-window";
+            const fetched = splitWindow
+              ? await fetchWindowBySplit(createExportDep, downloadExportDep, connection.apiKey, source, ids, range.from, range.to, coverageExportBudget)
+              : null;
+            const rows = splitWindow ? fetched.rows : await fetchAllPages(createExportDep, downloadExportDep, connection.apiKey, source, ids, range.from, range.to, coverageExportBudget);
+            if (splitWindow) {
+              summary.sources[source.key].fragments = (summary.sources[source.key].fragments || []).concat(fetched.fragments.map((fr) => ({ ...fr, accounts: workingBatch.length })));
+            }
             // FIX 1: validate the export against the EXACT working batch BEFORE any row/metric/coverage/state
             // write. Any malformed/cross-account/missing-id/wrong-marketplace evidence rejects the WHOLE batch
             // (typed safe failed state only). A genuine zero-row export ([]) is valid covered-empty evidence.
@@ -1000,7 +1111,13 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
             // still mark the account succeeded. So a failed delete EXCLUDES that account from this batch: its window
             // is NOT re-inserted (its prior durable rows stay intact -> no double-count), it is marked failed, and it
             // retries next cadence. Accounts whose delete was acknowledged proceed normally.
-            if (Array.isArray(source.aggregations) && source.aggregations.length) {
+            // LKG-PRESERVING REPLACE (2026-10-03): with the prune dependency present, the window is replaced by UPSERT
+            // FIRST, then a PRUNE of only the rows this run did not refresh (below, after upsertRows). A failure part-way
+            // through the upsert therefore never leaves the window EMPTY (the previous delete-then-insert could): the
+            // keys not yet re-upserted keep their previous saved values, the account is marked failed, and its coverage
+            // is not re-recorded. End state on success is identical to delete-then-insert. Absent the prune dependency
+            // (older deps), the delete-then-insert below is unchanged.
+            if (Array.isArray(source.aggregations) && source.aggregations.length && !pruneRows) {
               const deleteFailedIds = new Set();
               for (const { account } of workingBatch) {
                 const ack = await deleteRows({ accountId: account.id, sourceKey: source.key, from: range.from, to: range.to });
@@ -1017,6 +1134,25 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
             }
             // DURABLE Ads-row persistence FIRST -- latest_metric_date + successful state are written only after.
             await upsertRows(normalized);
+            if (Array.isArray(source.aggregations) && source.aggregations.length && pruneRows) {
+              // PRUNE (acknowledged, like the delete it replaces): remove, within [from,to], only the rows NOT refreshed
+              // by this run (stale grain / no longer reported). A failed prune EXCLUDES that account (marked failed, no
+              // coverage, no success state) -- its fresh rows are in place but stale rows may remain, so the window is
+              // not claimed complete; it is retried next run.
+              const pruneFailedIds = new Set();
+              for (const { account } of workingBatch) {
+                const ack = await pruneRows({ accountId: account.id, sourceKey: source.key, from: range.from, to: range.to, keepRefreshedAt: now });
+                if (!ack || ack.write !== "ok") pruneFailedIds.add(account.id);
+              }
+              if (pruneFailedIds.size) {
+                const failedEntries = workingBatch.filter(({ account }) => pruneFailedIds.has(account.id));
+                await upsertStates(failedEntries.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, new Error("ADS_ROWS_PRUNE_FAILED"), now)));
+                summary.sources[source.key].failedAccounts.push(...failedEntries.map((e) => e.account.id));
+                workingBatch = workingBatch.filter(({ account }) => !pruneFailedIds.has(account.id));
+                normalized = normalized.filter((r) => !pruneFailedIds.has(r.account_id));
+                if (!workingBatch.length) continue;
+              }
+            }
             if (source.key === "campaign-performance-v1") {
               await upsertMetrics(campaignMetricRecords(normalized));
             }

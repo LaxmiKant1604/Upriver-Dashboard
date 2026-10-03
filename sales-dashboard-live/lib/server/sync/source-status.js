@@ -33,6 +33,37 @@ export const PRIORITY_DASHBOARD_SOURCES = Object.freeze({
 });
 
 const toRow = (rows, sourceKey, bucket) => (rows || []).find((r) => (r.source_key ?? r.sourceKey) === sourceKey && (r.bucket === bucket)) || null;
+
+// Sources whose operator status is written PER REGION (the scheduler-v2 asin_ads job writes (ads-asin-date, region)
+// rows). Their card in a legacy us / non-us bucket FOLDS that bucket's regions when the bucket has no row of its own.
+export const REGIONAL_STATUS_SOURCES = Object.freeze({ "ads-asin-date": Object.freeze({ us: Object.freeze(["us-ca"]), "non-us": Object.freeze(["india", "europe-au"]) }) });
+const STATUS_SEVERITY = ["never", "succeeded", "paused", "running", "partial", "failed"];
+// PURE: fold the region rows of one bucket into ONE card row -- the WORST status, the latest attempt, a success time and
+// covered window only when EVERY region has one (the bucket is covered through its earliest region), summed counts and
+// spend, summed ceilings (null if any region has none), the first safe error. null when no region row exists.
+export function foldRegionalStatusRows(rows) {
+  const xs = (rows || []).filter(Boolean);
+  if (!xs.length) return null;
+  const sev = (st) => Math.max(0, STATUS_SEVERITY.indexOf(String(st || "never")));
+  const worst = xs.reduce((w, r) => (sev(r.last_status) > sev(w) ? r.last_status : w), "never");
+  const all = (k) => xs.every((r) => r[k] != null && r[k] !== "");
+  const minOf = (k) => xs.map((r) => String(r[k])).sort()[0];
+  const maxOf = (k) => xs.map((r) => r[k]).filter((v) => v != null && v !== "").map(String).sort().pop() || null;
+  const sum = (k) => xs.reduce((t, r) => t + (Number(r[k]) || 0), 0);
+  const err = xs.find((r) => r.safe_error_code);
+  return {
+    last_status: worst, last_attempt_at: maxOf("last_attempt_at"), last_success_at: all("last_success_at") ? minOf("last_success_at") : null,
+    safe_error_code: err ? err.safe_error_code : null, safe_error_stage: err ? err.safe_error_stage || null : null,
+    covered_from: all("covered_from") && all("covered_to") ? minOf("covered_from") : null, covered_to: all("covered_to") ? minOf("covered_to") : null,
+    accounts_completed: sum("accounts_completed"), accounts_failed: sum("accounts_failed"), accounts_total: sum("accounts_total"),
+    batch_count: sum("batch_count"), creates_spent: sum("creates_spent"), tokens_spent: sum("tokens_spent"),
+    creates_ceiling: all("creates_ceiling") ? sum("creates_ceiling") : null, tokens_ceiling: all("tokens_ceiling") ? sum("tokens_ceiling") : null,
+  };
+}
+const regionalFold = (rows, sourceKey, bucket) => {
+  const regions = REGIONAL_STATUS_SOURCES[sourceKey] && REGIONAL_STATUS_SOURCES[sourceKey][bucket];
+  return regions ? foldRegionalStatusRows(regions.map((r) => toRow(rows, sourceKey, r))) : null;
+};
 const controlOf = (rows, sourceKey) => (rows || []).find((r) => (r.source_key ?? r.sourceKey) === sourceKey) || null;
 
 /**
@@ -44,15 +75,14 @@ const controlOf = (rows, sourceKey) => (rows || []).find((r) => (r.source_key ??
 export function shapeSourceCards({ bucket, controls = [], runStatuses = [] } = {}) {
   if (!CARD_BUCKETS.includes(bucket)) throw new Error(`shapeSourceCards requires bucket 'us'|'non-us' (got "${bucket}").`);
   return SOURCE_REGISTRY
-    // Hide the RETIRED ads grain's card from the active Data Sync Center (server-side, per the ONE cutover
-    // authority): while Campaign is active the ads-asin-date card is not rendered and exposes no pause/sync action.
-    // Its registry entry, contract, durable history + rollback code are untouched; a forged manual ASIN action is
-    // still refused before any DB/DataDoe/token I/O (durable-ads architecture guard + the ads-sync export guard).
+    // Hide a RETIRED ads grain's card from the active Data Sync Center (server-side, per the ONE Ads-source
+    // authority). None is retired today: Campaign (the active read grain) and ASIN (the additional durable source,
+    // with its own pause + status + admin manual sync) both render. A retirement is again a one-line change there.
     .filter((entry) => !isAdsRegistryKeyRetired(entry.sourceKey))
     .map((entry) => {
     const contract = sourceContractForKey(entry.sourceKey);
     const control = controlOf(controls, entry.sourceKey);
-    const s = toRow(runStatuses, entry.sourceKey, bucket) || {};
+    const s = toRow(runStatuses, entry.sourceKey, bucket) || regionalFold(runStatuses, entry.sourceKey, bucket) || {};
     const paused = control ? control.paused === true : false;
     return Object.freeze({
       sourceKey: entry.sourceKey,

@@ -1,8 +1,9 @@
 // API-BOUNDARY tests for api/admin/sources.js: execute the REAL handler(req,res,deps) with mocked collaborators and
-// the REAL centralized cutover authority (active-ads-source.isAdsRegistryKeyRetired). Proves a forged retired-ASIN
-// POST/PATCH returns 409 SOURCE_RETIRED at the endpoint -- BEFORE runtime construction, preflightEvidence, coverage,
-// discovery, audit, setSourceControl, statusPayload, DataDoe/token -- while Campaign + every non-retired source keep
-// their current behavior, and unauthenticated/non-admin callers keep 401/403 (and never see SOURCE_RETIRED).
+// the REAL centralized Ads-source authority (active-ads-source.isAdsRegistryKeyRetired). 2026-10-03: ASIN Ads
+// (ads-asin-date) is an ADDITIONAL operable source again -- not retired: its PATCH pauses/resumes like every source. On
+// THIS code line there is no admin ASIN create path: its POST is delegated to the bucket runtime's card action, which
+// refuses every durable-ads family before any I/O (source-status.test.js C-ADS3); ASIN exports are created only by the
+// scheduler-v2 asin_ads job's runner. Unauthenticated / non-admin callers keep 401/403.
 // 7-bit ASCII, LF, no top-level await, synchronous writeSync progress, dynamic imports after a dummy env.
 
 import assert from "node:assert/strict";
@@ -72,31 +73,30 @@ const noRetiredIO = (calls, label) => {
   assert.equal(calls.directory, 0, `${label}: no discovery`);
 };
 
-test("1+2. forged admin POST for ads-asin-date -> 409 SOURCE_RETIRED, ZERO preflight/coverage/discovery/audit/create/token/status", async () => {
-  const { deps, calls } = makeDeps();
+test("1+2. admin POST for ads-asin-date is no longer boundary-retired: it is delegated to the runtime (which refuses durable-ads); the endpoint has NO ASIN create path", async () => {
+  const { deps, calls } = makeDeps({ preflightThrows: true });
   const res = fakeRes();
   await handler({ method: "POST", body: { bucket: "us", sourceKey: "ads-asin-date" } }, res, deps);
-  assert.equal(res.statusCode, 409);
-  assert.equal(res.body.error, "SOURCE_RETIRED");
-  assert.equal(res.body.sourceKey, "ads-asin-date");
-  assert.match(res.body.message, /rollback/i);
-  noRetiredIO(calls, "POST ads-asin-date");
+  assert.notEqual(res.body && res.body.error, "SOURCE_RETIRED");
+  assert.equal(calls.preflight.length, 1, "delegated to the bucket runtime (bounded here by the preflight sentinel)");
+  assert.equal(calls.runCardAction.length, 0);
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../api/admin/sources.js", import.meta.url), "utf8");
+  assert.ok(!src.includes("runAsinAdsBucketSlice"), "no admin ASIN create path on this code line");
+  const rt = readFileSync(new URL("../lib/server/sync/source-bucket-sync-runtime.js", import.meta.url), "utf8");
+  assert.match(rt, /SOURCE_ACTION_ADS_ARCHITECTURE/, "the runtime refuses durable-ads card actions");
 });
 
-test("3+4. forged admin PATCH for ads-asin-date -> 409 SOURCE_RETIRED, ZERO setSourceControl/insertAuditLog/status", async () => {
+test("3+4. admin PATCH for ads-asin-date pauses it like every source: setSourceControl + audit, 200 (its OWN control)", async () => {
   const { deps, calls } = makeDeps();
   const res = fakeRes();
   await handler({ method: "PATCH", body: { sourceKey: "ads-asin-date", paused: true } }, res, deps);
-  assert.equal(res.statusCode, 409);
-  assert.equal(res.body.error, "SOURCE_RETIRED");
-  assert.equal(res.body.sourceKey, "ads-asin-date");
-  assert.equal(calls.setSourceControl.length, 0, "no setSourceControl");
-  assert.equal(calls.audit.length, 0, "no insertAuditLog");
-  assert.equal(calls.getSourceControls, 0, "no status refresh");
-  assert.equal(calls.getSourceRunStatuses, 0, "no status refresh");
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  assert.equal(calls.setSourceControl.length, 1); assert.equal(calls.setSourceControl[0].sourceKey, "ads-asin-date"); assert.equal(calls.setSourceControl[0].paused, true);
+  assert.equal(calls.audit.length, 1); assert.equal(calls.audit[0].action, "source.paused");
 });
 
-test("5. unauthenticated -> 401 and non-admin -> 403; neither reaches the retired gate or reveals SOURCE_RETIRED", async () => {
+test("5. unauthenticated -> 401 and non-admin -> 403 for the ASIN card: no control write, no paid path", async () => {
   // Unauthenticated: getDashboardAccess throws a 401.
   const un = makeDeps({ getDashboardAccess: async () => { throw Object.assign(new Error("Not authenticated."), { status: 401 }); } });
   const r1 = fakeRes();
@@ -148,8 +148,8 @@ test("6b. legitimate POST for ads-campaign-date passes the retired gate and REAC
   assert.equal(res.body.error, "REACHED_PREFLIGHT");
 });
 
-test("8. the retirement gate uses the REAL centralized authority (ads-asin-date retired; ads-campaign-date not)", () => {
-  assert.equal(isAdsRegistryKeyRetired("ads-asin-date"), true, "ASIN registry grain is retired while Campaign active");
+test("8. the retirement gate uses the REAL centralized authority (nothing retired: ASIN is an additional operable source)", () => {
+  assert.equal(isAdsRegistryKeyRetired("ads-asin-date"), false, "ASIN registry grain is operable (runner-only exports), not retired");
   assert.equal(isAdsRegistryKeyRetired("ads-campaign-date"), false, "Campaign registry grain is never retired");
   assert.equal(isAdsRegistryKeyRetired("order-line-items"), false);
   assert.equal(isAdsRegistryKeyRetired("fba-inventory-health"), false);

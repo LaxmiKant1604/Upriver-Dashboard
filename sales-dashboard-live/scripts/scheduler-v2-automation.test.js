@@ -9,7 +9,7 @@ import { dirname, resolve } from "node:path";
 import { parseEnvFile, applyEnv } from "./release/env-bootstrap.mjs";
 import { oliBucketPlan, assessScheduledOliCycle, classifyOliPublicationOutcome, NON_FATAL_OLI_PROBLEM_PREFIXES, classifyScheduledOliCycle, assessDurableOliCoverageComplete, OLI_TOKENS_PER_CREATE, scheduledSourceControlPlan, SCHEDULED_ENABLED_SOURCE_KEYS } from "../lib/server/sync/source-scheduled-oli.js";
 import { getDataDoeTokenBalance, confirmUsableTokens, COMBINED_DAILY_TOKEN_CEILING, tokenGateDecision, NON_US_RUN_TOKEN_CEILING, US_RUN_TOKEN_CEILING, LOW_BALANCE_WARN_TOKENS } from "../lib/server/datadoe-usage.js";
-import { asinAdsBucketPlan, asinAdsRefreshWindow, assessScheduledAsinAdsCycle, ASIN_ADS_TOKENS_PER_CREATE, ASIN_ADS_ROLLING_WINDOW_DAYS } from "../lib/server/sync/source-scheduled-asin-ads.js";
+import { asinAdsWindows, asinAdsPlanExposure, ASIN_ADS_TOKENS_PER_CREATE } from "../lib/server/sync/scheduled-asin-ads-runner.js";
 import { fetchCompatibleSourceNames } from "../lib/server/datadoe.js";
 import { ARCHIVE_CYCLES, PROTECTED_TABLES, assessArchivePre, assessArchivePost, runArchiveTransaction, assessFrozenSetCoherent } from "../lib/server/sync/source-archive-collision-cycles.js";
 import { assessNonUsPrerequisites } from "../lib/server/sync/source-scheduled-prerequisites.js";
@@ -118,10 +118,12 @@ test("B5. durable source_controls target (post ASIN->Campaign cutover): ONLY ord
     if (SCHEDULED_ENABLED_SOURCE_KEYS.includes(p.sourceKey)) { assert.equal(p.scheduleEnabled, true); assert.equal(p.paused, false, p.sourceKey + " unpaused"); }
     else { assert.equal(p.scheduleEnabled, false, p.sourceKey + " schedule-disabled"); assert.equal(p.paused, undefined, p.sourceKey + " paused state left untouched"); }
   }
-  // ASIN Ads (retired) / FBA / settlements / returns are NEVER schedule-enabled by this scheduler.
+  // FBA / settlements / returns are NEVER schedule-enabled by this sweep. ASIN Ads is OPERATOR-SWITCHED: its
+  // schedule_enabled is the durable switch the asin_ads job reads, so this sweep never writes (or enables) it.
   for (const forbidden of ["ads-asin-date", "fba-inventory-health", "settlements", "returns"]) {
-    assert.ok(!enabled.includes(forbidden), forbidden + " must never be scheduled (ASIN Ads retired; exports blocked)");
+    assert.ok(!enabled.includes(forbidden), forbidden + " must never be schedule-enabled by the config sweep");
   }
+  assert.ok(!plan.some((p) => p.sourceKey === "ads-asin-date"), "the sweep never writes the operator-switched ASIN Ads control");
 });
 
 group("C. strict post-drain OLI assessment");
@@ -377,7 +379,8 @@ test("D2. workflow shape: INDEPENDENT per-region ordered pipeline -- per-region 
   // The publish (run) job itself never invokes an FBA script (the isolation boundary); ASIN + Vercel-cron stay absent.
   const runJob = yml.slice(idx("jobs:"), idx("\n  fba:"));
   assert.doesNotMatch(runJob, /fba-plan-golive\.mjs/, "the publish job never runs FBA (kept in the isolated job)");
-  assert.doesNotMatch(yml, /scheduled-asin-ads-refresh/, "the retired ASIN Ads refresh operator is never invoked");
+  assert.doesNotMatch(runJob, /scheduled-asin-ads-refresh/, "the publish job never runs ASIN Ads (only the separate asin_ads job does)");
+  assert.equal((yml.match(/scheduled-asin-ads-refresh\.mjs/g) || []).length, 1, "ASIN Ads is refreshed by exactly ONE step (the asin_ads job)");
   assert.doesNotMatch(yml, /api\/cron\/sync/, "never drives the deprecated Vercel cron endpoint");
 });
 
@@ -605,40 +608,15 @@ test("E3. getDataDoeTokenBalance FAILS CLOSED on non-200 / empty / missing key (
   await assert.rejects(() => getDataDoeTokenBalance({ fetchImpl: mkFetch(usageResp([])) }), /apiKey/);
 });
 
-group("F. scheduled ASIN Ads: <=5-seller plan, 21-day rolling window, coverage assessment + per-bucket ceiling");
+group("F. scheduled ASIN Ads (the additional regional source; the full proof is scripts/asin-ads-source.test.js)");
 
-const adsSummary = (n, over = {}) => ({
-  status: "completed", coverageMode: true, coverageComplete: true,
-  expectedCoveragePairs: n, successfulCoveragePairs: n, deferred: false,
-  sources: { "asin-performance-v1": { coverage: n, skipped: 0, rows: 10, failedAccounts: [], coverageFailedAccounts: [] } },
-  ...over,
-});
-const adsBatchesFor = (n) => {
-  const ids = Array.from({ length: n }, (_, i) => acct(i + 1));
-  const out = [];
-  for (let b = 0; b * 5 < n; b += 1) { const batchIds = ids.slice(b * 5, b * 5 + 5); out.push({ accountIds: batchIds, summary: adsSummary(batchIds.length) }); }
-  return out;
-};
-
-test("F1. ASIN Ads plan: Non-US 22 -> 5 batches/10 tokens; US 8 -> 2 batches/4 tokens (standard export = 2 tokens)", () => {
-  const nonus = asinAdsBucketPlan(accountsN(22));
-  assert.equal(nonus.expectedBatches, 5); assert.equal(nonus.maxCreates, 5); assert.equal(nonus.maxTokens, 10);
-  const us = asinAdsBucketPlan(accountsN(8));
-  assert.equal(us.expectedBatches, 2); assert.equal(us.maxCreates, 2); assert.equal(us.maxTokens, 4);
+test("F1. ASIN Ads windows end at D-1: 60-day initial horizon + 21-day rolling window; standard export = 2 tokens", () => {
+  const w = asinAdsWindows("2026-08-24");
+  assert.deepEqual([w.rolling.from, w.rolling.to, w.rolling.days], ["2026-08-04", "2026-08-24", 21]);
+  assert.deepEqual([w.horizon.from, w.horizon.days], ["2026-06-26", 60]);
   assert.equal(ASIN_ADS_TOKENS_PER_CREATE, 2);
-});
-
-test("F2. ASIN Ads rolling window is EXACTLY 21 inclusive days ending at asOf", () => {
-  assert.equal(ASIN_ADS_ROLLING_WINDOW_DAYS, 21);
-  const w = asinAdsRefreshWindow("2026-08-24");
-  assert.equal(w.to, "2026-08-24");
-  assert.equal(w.from, "2026-08-04", "asOf-20 days = 21-day inclusive window");
-});
-
-test("F3. combined full Ads refresh ceiling = 7 exports / 14 tokens (US 2/4 + Non-US 5/10)", () => {
-  const total = asinAdsBucketPlan(accountsN(8)).maxCreates + asinAdsBucketPlan(accountsN(22)).maxCreates;
-  const tokens = asinAdsBucketPlan(accountsN(8)).maxTokens + asinAdsBucketPlan(accountsN(22)).maxTokens;
-  assert.equal(total, 7); assert.equal(tokens, 14);
+  const x = asinAdsPlanExposure({ items: [1, 2, 3, 4, 5].map(() => ({ expectedRows: 10 })) });
+  assert.deepEqual([x.normalCreates, x.expectedTokens, x.worstCaseCreates], [5, 10, 9]);
 });
 
 test("F3c. fetchCompatibleSourceNames: ZERO-TOKEN pre-flight lists an account's compatible source names (fail-closed on a bad read)", async () => {
@@ -651,49 +629,6 @@ test("F3c. fetchCompatibleSourceNames: ZERO-TOKEN pre-flight lists an account's 
   let threw = false;
   try { await fetchCompatibleSourceNames("k", "acc-3", async () => ({ ok: false, status: 500 })); } catch { threw = true; }
   assert.equal(threw, true, "a non-ok read throws (caller fails that account closed)");
-});
-
-test("F3b. pageAllowance adds create/token headroom for skip-pagination (a high-volume batch needs >1 page)", () => {
-  const base = asinAdsBucketPlan(accountsN(17)); // 17 Ads-compatible Non-US accounts -> 4 batches
-  assert.equal(base.expectedBatches, 4); assert.equal(base.maxCreates, 4); assert.equal(base.pageAllowance, 0);
-  const withPage = asinAdsBucketPlan(accountsN(17), new Map(), { pageAllowance: 1 });
-  assert.equal(withPage.expectedBatches, 4); assert.equal(withPage.maxCreates, 5); assert.equal(withPage.maxTokens, 10);
-  // A run that paginated ONE batch (5 creates for 4 batches) is within the pageAllowance:1 ceiling, over the base.
-  const paged = assessScheduledAsinAdsCycle({ bucket: "non-us", discoveredAccounts: accountsN(17), batchResults: adsBatchesFor(17), creates: 5, pageAllowance: 1 });
-  assert.equal(paged.ceilingCreates, 5, "ceiling includes the pagination allowance");
-  assert.ok(!paged.problems.includes("creates-over-ceiling:5>5"), "5 creates within the 4-batch + 1-page ceiling");
-  const overBase = assessScheduledAsinAdsCycle({ bucket: "non-us", discoveredAccounts: accountsN(17), batchResults: adsBatchesFor(17), creates: 5, pageAllowance: 0 });
-  assert.ok(overBase.problems.some((p) => p.startsWith("creates-over-ceiling")), "without the allowance, 5 > 4 is over the ceiling");
-});
-
-test("F4. assessment happy path: every batch completed + full coverage; a WARM run (0 creates, all skipped) is ok", () => {
-  const fresh = assessScheduledAsinAdsCycle({ bucket: "us", discoveredAccounts: accountsN(8), batchResults: adsBatchesFor(8), creates: 2 });
-  assert.equal(fresh.ok, true, JSON.stringify(fresh.problems));
-  assert.equal(fresh.creates, 2); assert.equal(fresh.tokens, 4); assert.equal(fresh.ceilingCreates, 2);
-  // WARM: skipped==covered, zero creates -> still ok.
-  const warmBatches = adsBatchesFor(8).map((b) => ({ ...b, summary: adsSummary(b.accountIds.length, { sources: { "asin-performance-v1": { coverage: b.accountIds.length, skipped: b.accountIds.length, rows: 0, failedAccounts: [], coverageFailedAccounts: [] } } }) }));
-  const warm = assessScheduledAsinAdsCycle({ bucket: "us", discoveredAccounts: accountsN(8), batchResults: warmBatches, creates: 0 });
-  assert.equal(warm.ok, true, JSON.stringify(warm.problems));
-  assert.equal(warm.creates, 0); assert.equal(warm.tokens, 0);
-});
-
-test("F5. assessment rejects every violation: not-completed, coverage-incomplete, non-ASIN source, failed accounts, coverage-failed, over-ceiling, coverage gap, oversized batch", () => {
-  const base = () => adsBatchesFor(8);
-  const cases = [
-    ["a batch not 'completed'", { bucket: "us", discoveredAccounts: accountsN(8), batchResults: base().map((b, i) => i === 0 ? { ...b, summary: adsSummary(b.accountIds.length, { status: "partial" }) } : b), creates: 2 }, /batch-not-completed:partial/],
-    ["coverage incomplete", { bucket: "us", discoveredAccounts: accountsN(8), batchResults: base().map((b, i) => i === 0 ? { ...b, summary: adsSummary(b.accountIds.length, { coverageComplete: false }) } : b), creates: 2 }, /batch-coverage-incomplete/],
-    ["a non-ASIN source leaked into a batch", { bucket: "us", discoveredAccounts: accountsN(8), batchResults: base().map((b, i) => i === 0 ? { ...b, summary: adsSummary(b.accountIds.length, { sources: { "asin-performance-v1": { coverage: b.accountIds.length, skipped: 0, rows: 1, failedAccounts: [], coverageFailedAccounts: [] }, "campaign-performance-v1": { coverage: 1 } } }) } : b), creates: 2 }, /non-asin-source:campaign-performance-v1/],
-    ["a failed account", { bucket: "us", discoveredAccounts: accountsN(8), batchResults: base().map((b, i) => i === 0 ? { ...b, summary: adsSummary(b.accountIds.length, { sources: { "asin-performance-v1": { coverage: b.accountIds.length, skipped: 0, rows: 1, failedAccounts: [b.accountIds[0]], coverageFailedAccounts: [] } } }) } : b), creates: 2 }, /failed-accounts:1/],
-    ["a coverage-failed account", { bucket: "us", discoveredAccounts: accountsN(8), batchResults: base().map((b, i) => i === 0 ? { ...b, summary: adsSummary(b.accountIds.length, { sources: { "asin-performance-v1": { coverage: b.accountIds.length, skipped: 0, rows: 1, failedAccounts: [], coverageFailedAccounts: [b.accountIds[0]] } } }) } : b), creates: 2 }, /coverage-failed-accounts:1/],
-    ["more creates than the ceiling", { bucket: "us", discoveredAccounts: accountsN(8), batchResults: base(), creates: 3 }, /creates-over-ceiling:3>2/],
-    ["a discovered account not covered by any batch", { bucket: "us", discoveredAccounts: accountsN(9), batchResults: adsBatchesFor(8), creates: 2 }, /account-coverage-missing/],
-    ["an oversized (>5) batch", { bucket: "us", discoveredAccounts: accountsN(6), batchResults: [{ accountIds: ["A01", "A02", "A03", "A04", "A05", "A06"], summary: adsSummary(6) }], creates: 1 }, /batch-oversized:6/],
-  ];
-  for (const [name, input, re] of cases) {
-    const a = assessScheduledAsinAdsCycle(input);
-    assert.equal(a.ok, false, name + " must be rejected");
-    assert.ok(a.problems.some((p) => re.test(p)), name + " -> expected " + re + " in " + JSON.stringify(a.problems));
-  }
 });
 
 group("G. scheduled OLI cycle-identity classification (fix: a same-date terminal priority cycle must never be reused)");

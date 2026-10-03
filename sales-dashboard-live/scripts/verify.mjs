@@ -229,7 +229,7 @@ const SUITES = [
   "test:fba-plan-operation",
   "test:fba-regional-inventory",
   "test:plan-brand",
-  "test:asin-ads-backfill-window",
+  "test:asin-ads-source",
   "test:manual-source-continuation",
   "test:cycle-lifecycle",
   "test:cycle-finalize-wiring",

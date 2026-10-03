@@ -25,7 +25,7 @@
 // Scheduler-v1 ads scheduling honors the ONE ASIN->Campaign cutover authority: while Campaign is the active source
 // the retired ASIN grain's Scheduler-v1 entry is disabled (never scheduled/attempted), matching cron [scope].js +
 // source-scheduled-oli.js. Rolling ADS_ACTIVE_SOURCE back to "asin" re-enables it. Reversible; deletes nothing.
-import { isAdsExportRetiredFor } from "../active-ads-source.js";
+import { isAdsExportRunnerOnlyFor } from "../active-ads-source.js";
 
 export const SCHEDULE_BUCKETS = { US: "us", NON_US: "non-us" };
 
@@ -99,10 +99,10 @@ function ads(sourceKey) {
     dependencies: [],
     retentionDays: null, // Ads daily history is preserved (rolling correction upserts)
     sourceKey,
-    // Disabled at the wiring level for a retired ads grain (asin-performance-v1 while Campaign is active), so
-    // Scheduler-v1 (run-sync) never even attempts it -- a clean retirement, not just a guard-caught failure. The
-    // ads-sync.js create guard remains the backstop; durable history + rollback are untouched.
-    enabled: !isAdsExportRetiredFor(sourceKey),
+    // Disabled at the wiring level for a RUNNER-ONLY ads grain (asin-performance-v1 while Campaign is the active read
+    // grain), so Scheduler-v1 (run-sync) never attempts it: the ASIN grain is created ONLY by the reviewed regional ASIN
+    // runner (scheduler-v2 asin_ads job / Data Sync Center). The ads-sync.js runner-only guard remains the backstop.
+    enabled: !isAdsExportRunnerOnlyFor(sourceKey),
   };
 }
 

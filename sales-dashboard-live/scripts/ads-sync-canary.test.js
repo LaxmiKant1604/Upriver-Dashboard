@@ -33,7 +33,7 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 let runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES, buildAdsExportRequestBody, sameMarketplace;
 let MAX_REQUIRED_COVERAGE_DAYS, MAX_IDS_PER_EXPORT, inclusiveDaySpan;
 let evaluateSourceCoverage;
-let ADS_ACTIVE_SOURCE, isAdsExportRetiredFor, isAdsExportRetiredForSourceId, ASIN_ADS_SOURCE_ID, ASIN_ADS_SOURCE_KEY, CAMPAIGN_ADS_SOURCE_KEY;
+let ADS_ACTIVE_SOURCE, isAdsExportRunnerOnlyFor, isAdsExportRunnerOnlyForSourceId, ASIN_ADS_SOURCE_ID, ASIN_ADS_SOURCE_KEY, CAMPAIGN_ADS_SOURCE_KEY;
 
 const G6_US = "26f7a1a6-689a-4084-8260-7add262918e5";
 const G6_IN = "d658442d-6273-4c2d-aeda-f247e638ef98";
@@ -199,31 +199,31 @@ test("the Campaign/PPC source contract is UNCHANGED: raw dimensions+metrics colu
   assert.deepEqual(body.columns, [...camp.dimensions, ...camp.metrics], "campaign columns unchanged (dims + metrics)");
 });
 
-test("ASIN Ads EXPORT RETIREMENT: runAdsSyncWithDeps hard-REFUSES the ASIN grain (create impossibility) with ZERO I/O; history retained", async () => {
-  // Post ASIN->Campaign cutover, creating a new ASIN Ads export is disabled at the single chokepoint every entry
-  // point flows through -- BEFORE any lock / discovery / DataDoe / Supabase call. The durable asin-performance-v1
-  // history + the ASIN reshape/persist code are retained (reachable again only if ADS_ACTIVE_SOURCE rolls back).
+test("ASIN Ads RUNNER-ONLY: runAdsSyncWithDeps refuses the ASIN grain from any caller WITHOUT the runner authorization (ZERO I/O)", async () => {
+  // While Campaign is the active read grain, an ASIN Ads export may be created ONLY by the reviewed regional ASIN runner
+  // (scripts/asin-ads-source.test.js proves the authorized path). Every other caller is refused at the single chokepoint
+  // -- BEFORE any lock / discovery / DataDoe / Supabase call -- exactly as the retirement refused it.
   const { deps, calls } = makeDeps({ rowsFor: () => [] });
   await assert.rejects(
     () => runAdsSyncWithDeps(deps, ["US"], [ASIN], { accountIds: [G6_US], requiredCoverage: REQ }),
-    /ASIN_ADS_EXPORT_RETIRED/,
+    /ASIN_ADS_EXPORT_RUNNER_ONLY/,
   );
   assert.equal((calls.creates || []).length, 0, "no export created");
   assert.equal((calls.upsertRowsData || []).length, 0, "no rows persisted");
   assert.equal((calls.deletes || []).length, 0, "no delete-replace performed (guard is before any I/O)");
 });
 
-test("cutover authority: Campaign is active; the retired ASIN grain is blocked by KEY and by raw DataDoe source ID", () => {
-  // Single source of truth: while Campaign is active, ASIN export is retired -- provable by registry key AND by the
-  // raw DataDoe source ID (the basis of the api/datadoe.js `sample` discovery-probe guard, so a browser-supplied
-  // sourceId can never mint an ASIN export). Durable reads are never affected by these predicates.
+test("cutover authority: Campaign is the active read grain; the ASIN grain is RUNNER-ONLY by KEY and by raw DataDoe source ID", () => {
+  // Single source of truth: while Campaign is the active read grain, an ASIN export is runner-only -- provable by registry
+  // key AND by the raw DataDoe source ID (the basis of the api/datadoe.js `sample` discovery-probe guard, so a
+  // browser-supplied sourceId can never mint an ASIN export). Durable reads are never affected by these predicates.
   assert.equal(ADS_ACTIVE_SOURCE, "campaign", "Campaign is the single active Ads source");
-  assert.equal(isAdsExportRetiredFor(ASIN_ADS_SOURCE_KEY), true, "ASIN export retired by key");
-  assert.equal(isAdsExportRetiredFor(CAMPAIGN_ADS_SOURCE_KEY), false, "Campaign export never retired");
-  assert.equal(isAdsExportRetiredForSourceId(ASIN_ADS_SOURCE_ID), true, "ASIN export retired by DataDoe source ID");
-  assert.equal(isAdsExportRetiredForSourceId("08cdc77d3dc24a7651553e2e926f598188c66172f64cd6512265900af6073a6c"), false, "the Campaign source ID is NOT retired");
-  assert.equal(isAdsExportRetiredForSourceId(""), false, "blank source ID is not treated as retired by the id check");
-  assert.equal(isAdsExportRetiredForSourceId("unknown-source-id"), false, "unknown source ID is not the retired ASIN grain");
+  assert.equal(isAdsExportRunnerOnlyFor(ASIN_ADS_SOURCE_KEY), true, "ASIN export runner-only by key");
+  assert.equal(isAdsExportRunnerOnlyFor(CAMPAIGN_ADS_SOURCE_KEY), false, "Campaign export is never runner-only");
+  assert.equal(isAdsExportRunnerOnlyForSourceId(ASIN_ADS_SOURCE_ID), true, "ASIN export runner-only by DataDoe source ID");
+  assert.equal(isAdsExportRunnerOnlyForSourceId("08cdc77d3dc24a7651553e2e926f598188c66172f64cd6512265900af6073a6c"), false, "the Campaign source ID is NOT runner-only");
+  assert.equal(isAdsExportRunnerOnlyForSourceId(""), false, "blank source ID is not treated as runner-only by the id check");
+  assert.equal(isAdsExportRunnerOnlyForSourceId("unknown-source-id"), false, "unknown source ID is not the ASIN grain");
 });
 
 test("Campaign (the active grain) persists correctly and does NOT delete-replace; ASIN clean-replace path is retired", async () => {
@@ -824,7 +824,7 @@ test("resolveAdsAccountAllowlist: targets exactly the two Gate-6 accounts; fail-
 async function main() {
   ({ runAdsSyncWithDeps, resolveAdsAccountAllowlist, validateAdsSyncOptions, ADS_SOURCES, MAX_REQUIRED_COVERAGE_DAYS, MAX_IDS_PER_EXPORT, inclusiveDaySpan, EXPORT_LIMIT, buildAdsExportRequestBody, sameMarketplace } = await import("../lib/server/ads-sync.js"));
   ({ evaluateSourceCoverage } = await import("../lib/server/sync/ppc-ads-loader.js"));
-  ({ ADS_ACTIVE_SOURCE, isAdsExportRetiredFor, isAdsExportRetiredForSourceId, ASIN_ADS_SOURCE_ID, ASIN_ADS_SOURCE_KEY, CAMPAIGN_ADS_SOURCE_KEY } = await import("../lib/server/active-ads-source.js"));
+  ({ ADS_ACTIVE_SOURCE, isAdsExportRunnerOnlyFor, isAdsExportRunnerOnlyForSourceId, ASIN_ADS_SOURCE_ID, ASIN_ADS_SOURCE_KEY, CAMPAIGN_ADS_SOURCE_KEY } = await import("../lib/server/active-ads-source.js"));
   // A single cap-sized result (>= EXPORT_LIMIT rows) reused to force a row-cap split in the ceiling tests.
   CAP = Array.from({ length: EXPORT_LIMIT }, () => ({ seller_or_vendor_id: G6_US, date: REQ.to, marketplace_country_code: "US" }));
   for (const t of tests) {

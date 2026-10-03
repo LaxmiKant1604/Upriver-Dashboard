@@ -23,6 +23,7 @@ export const SCHEDULER_OWNERS = Object.freeze([
   "scheduler-v2:listing-health-v3",// the shadow v3 ingestion (UI flag off)
   "scheduler-v2:materialize",      // report-materialization.mjs (zero export)
   "scheduler-v2:materialize-inventory", // report-materialization-brandview (zero export)
+  "scheduler-v2:asin-ads",         // scheduled-asin-ads-refresh.mjs (the additional ASIN Ads durable source; own job)
 ]);
 export const FROZEN_PLAN_PARTICIPATION = Object.freeze([
   "freeze-and-execute",                        // frozen + executed in ITS step (OLI)
@@ -35,6 +36,7 @@ export const CEILING_MODELS = Object.freeze([
   "one-org-export",       // exactly one organization export (Catalog)
   "computed-per-account", // one export per account (FBA)
   "zero-export",          // materialization reuses durable evidence; zero DataDoe creates/tokens
+  "capped-per-region",    // the plan is computed per region per run, under an owner-approved hard per-region create cap
 ]);
 export const COMPLETION_OUTPUTS = Object.freeze([
   "oli-assessment-ok",       // the OLI operator's RESULT json ok (drained + within ceiling)
@@ -43,6 +45,7 @@ export const COMPLETION_OUTPUTS = Object.freeze([
   "terminal-succeeded-gate", // only a terminal 'succeeded' ingestion counts (v3 honest finalize)
   "materialize-count",       // the count of materialized snapshots (zero-export jobs)
   "campaign-coverage-ok",    // the Campaign Ads coverage refresh step outcome (covered within ceiling; publication gates on it)
+  "asin-result-and-run-status", // the ASIN operator's RESULT json classification + its (ads-asin-date, region) source_run_status row
 ]);
 export const PARTIAL_BEHAVIORS = Object.freeze([
   "d1-provisional-final-lkg", // publish real itemized D-1 as provisional, promote to final; never fabricate; LKG retained
@@ -85,6 +88,17 @@ export const SCHEDULED_FAMILY_REGISTRY = Object.freeze({
     partialBehavior: "defer-typed-lkg",
     watchdogIdempotency: "operation-key-frozen-budget",
     notes: "P0-A: frozen into the daily cycle by the OLI step; drained by the priority step as a case-(a) continuation (never case-c not-drained). Legacy OLI-only cycles are recovered by finalize + supersede (P0-B).",
+  },
+  "asin-performance": {
+    family: "asin-performance",
+    schedulerOwner: "scheduler-v2:asin-ads",
+    dependencies: [],
+    frozenPlanParticipation: "none",
+    ceiling: "capped-per-region",
+    completionOutput: "asin-result-and-run-status",
+    partialBehavior: "stay-visibly-partial",
+    watchdogIdempotency: "idempotent-replay",
+    notes: "The ADDITIONAL ASIN/date durable source (asin-performance-v1) -- never the active Ads read grain, never a publication prerequisite. Its own asin_ads job after FBA in the same per-region run; runs only while source_controls['ads-asin-date'].schedule_enabled; coverage-derived windows (21-day rolling, one-time catch-up inside the 60-day horizon), <=5-seller batches, full-page date bisection, completed-export reuse, hard per-region cap (4/10/5); already-covered => zero creates.",
   },
   "campaign-performance": {
     family: "campaign-performance",

@@ -247,8 +247,10 @@ export async function runCampaignAdsRegionSlice({ region, asOf, runKind = "initi
  *     budget-deferred (retain LKG); the caller decides if zero coverage is a real budget-insufficiency failure.
  * Returns { covered:Set, rejected, transient, ambiguous, budgetDeferred, diagnostics, batchResults, lockHeld?,
  * deferred?, ceilingExhausted? }.
+ * `grain` / `ceilingCode` (default: the Campaign grain + CAMPAIGN_ADS_CEILING, i.e. byte-identical for every Campaign
+ * caller) let the ASIN Ads runner reuse this SAME recovery engine for its own grain + ceiling code.
  */
-export async function runCampaignAdsBatchesWithRecovery({ batches, runOne, classifyError = classifyThrownSourceError, maxSplitDepth = 4, log = () => {} } = {}) {
+export async function runCampaignAdsBatchesWithRecovery({ batches, runOne, classifyError = classifyThrownSourceError, maxSplitDepth = 4, log = () => {}, grain = CAMPAIGN_ADS_GRAIN, ceilingCode = "CAMPAIGN_ADS_CEILING" } = {}) {
   // Each batch may carry its OWN window (per-account initial-56d vs rolling); splits inherit it.
   const queue = (Array.isArray(batches) ? batches : []).map((b) => ({ ids: [...((b && b.allowlist) || b || [])].map(S).filter(nb), depth: 0, window: (b && b.window) || null }));
   const covered = new Set(); const rejected = []; const transient = []; const ambiguous = []; const budgetDeferred = [];
@@ -262,7 +264,7 @@ export async function runCampaignAdsBatchesWithRecovery({ batches, runOne, class
     try {
       summary = await runOne(ids, depth, window);
     } catch (error) {
-      if (error && error.code === "CAMPAIGN_ADS_CEILING") {
+      if (error && error.code === ceilingCode) {
         ceilingExhausted = true; for (const id of ids) budgetDeferred.push(id);
         log("create ceiling reached; " + ids.length + " account(s) budget-deferred (retain last-known-good)");
         continue;
@@ -283,7 +285,7 @@ export async function runCampaignAdsBatchesWithRecovery({ batches, runOne, class
     if (summary && summary.status === "skipped") return { covered, rejected, transient, ambiguous, budgetDeferred, diagnostics, batchResults, lockHeld: true };
     if (summary && summary.deferred === true) { batchResults.push({ accountIds: ids, summary }); return { covered, rejected, transient, ambiguous, budgetDeferred, diagnostics, batchResults, deferred: true }; }
     batchResults.push({ accountIds: ids, summary });
-    const camp = (summary && summary.sources && summary.sources[CAMPAIGN_ADS_GRAIN]) || {};
+    const camp = (summary && summary.sources && summary.sources[grain]) || {};
     const failedSet = new Set([...(camp.failedAccounts || []), ...(camp.coverageFailedAccounts || [])].map(S));
     for (const id of ids) { if (failedSet.has(S(id))) transient.push(id); else covered.add(S(id)); }
   }

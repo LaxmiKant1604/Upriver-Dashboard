@@ -53,11 +53,12 @@ test("A1. one card per registered family with the exact reviewed field set; unkn
     controls: [{ source_key: "order-line-items", paused: false, schedule_enabled: false }],
     runStatuses: [runRow("order-line-items", "us")],
   });
-  // Post ASIN->Campaign cutover the retired ads grain's card is filtered SERVER-SIDE, so the DSC shows one card
-  // per registered NON-retired family. The registry entry is retained (rollback) but never rendered.
+  // A retired ads grain's card is filtered SERVER-SIDE; none is retired today -- ASIN Ads is an additional operable
+  // source (its own pause + status + admin manual sync), so every registered family renders.
   const visibleFamilies = registry.SOURCE_REGISTRY.filter((e) => !adsSrc.isAdsRegistryKeyRetired(e.sourceKey)).length;
   assert.equal(cards.length, visibleFamilies, "one card per registered NON-retired source family");
-  assert.equal(cards.find((c) => c.sourceKey === "ads-asin-date"), undefined, "the retired ASIN ads card is hidden from the active Data Sync Center");
+  assert.equal(visibleFamilies, registry.SOURCE_REGISTRY.length, "no family is retired");
+  assert.ok(cards.find((c) => c.sourceKey === "ads-asin-date"), "the ASIN ads card is visible (additional source)");
   assert.ok(cards.find((c) => c.sourceKey === "ads-campaign-date"), "the active Campaign ads card remains visible");
   const oli = cards.find((c) => c.sourceKey === "order-line-items");
   assert.equal(oli.label, "Order Line Items", "the human label comes from the canonical contract");
@@ -270,7 +271,7 @@ test("C-ADS3. a forged manual ASIN card action is refused BEFORE any preflight/c
   const record = { discovery: 0, creates: [] };
   const { runtime } = makeComposition({ calls: record });
   const res = await runtime.runSourceCardAction({ bucket: "us", sourceKey: "ads-asin-date" });
-  assert.equal(res.refused, true, "the retired ASIN card action is refused");
+  assert.equal(res.refused, true, "the bucket runtime never runs the ASIN card (only the shared ASIN runner does, via its own admin branch)");
   assert.equal(res.code, "SOURCE_ACTION_ADS_ARCHITECTURE", "typed refusal");
   assert.equal(record.creates.length, 0, "zero creates");
   assert.equal(record.adsCoverageReads.length, 0, "refused BEFORE any coverage / DataDoe / token I/O");
@@ -287,12 +288,12 @@ test("C-ADS4. active readiness identities use the ACTIVE Campaign grain (Brand V
   // The identities derive from the ONE cutover authority (not a second hardcoded switch).
   assert.equal(daily.degrading[0], adsSrc.ACTIVE_ADS_REGISTRY_KEY, "daily grain == ACTIVE_ADS_REGISTRY_KEY");
   assert.equal(bv.degrading[0], adsSrc.ACTIVE_ADS_REGISTRY_KEY, "brand-view ads grain == ACTIVE_ADS_REGISTRY_KEY");
-  assert.ok(adsSrc.isAdsRegistryKeyRetired("ads-asin-date"), "the ASIN registry grain is retired while Campaign is active");
+  assert.ok(!adsSrc.isAdsRegistryKeyRetired("ads-asin-date"), "the ASIN registry grain is an additional operable source, not retired");
   assert.ok(!adsSrc.isAdsRegistryKeyRetired("ads-campaign-date"), "the Campaign registry grain is never retired");
-  // Rollback remains structurally possible through the single authority: every retirement predicate is DERIVED
-  // from ADS_ACTIVE_SOURCE (no second hardcoded switch), so flipping it back to "asin" clears the retirement.
-  assert.equal(adsSrc.ADS_ACTIVE_SOURCE, "campaign", "Campaign is the single active source");
-  assert.deepEqual([...adsSrc.RETIRED_ADS_REGISTRY_KEYS], ["ads-asin-date"], "exactly the ASIN grain is retired; rollback re-includes it");
+  // The READ switch stays Campaign (readiness above); ASIN exports are RUNNER-ONLY, derived from the same single authority.
+  assert.equal(adsSrc.ADS_ACTIVE_SOURCE, "campaign", "Campaign is the single active READ source");
+  assert.deepEqual([...adsSrc.RETIRED_ADS_REGISTRY_KEYS], [], "nothing retired");
+  assert.deepEqual([...adsSrc.RUNNER_ONLY_ADS_EXPORT_SOURCE_KEYS], ["asin-performance-v1"], "ASIN exports are runner-only while Campaign is the read grain");
 });
 
 group("D. endpoint structural pins");

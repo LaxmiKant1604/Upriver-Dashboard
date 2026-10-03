@@ -578,6 +578,47 @@ jobs:
           if [ "${{ vars.ADS_RECONCILE_LIVE }}" = "true" ]; then LIVE="--live"; else LIVE=""; fi
           node scripts/release/ads-publication-reconcile.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.effective_asof }} --mode=periodic --deadline-seconds=300 $LIVE
 
+  # ASIN Ads ("Ad Performance by ASIN & Date", asin-performance-v1) -- an ADDITIONAL durable source whose saved
+  # ASIN-by-date rows feed future reports. It is NOT a new scheduler owner and NOT a second cron: a dependent job of the
+  # SAME per-region workflow run (it inherits the per-region `concurrency` group and the run's duplicate + token guards).
+  # It never touches Campaign Ads (the active Ads grain for every dashboard/report), a control window or a publication,
+  # and it is never a prerequisite of anything here. It runs after FBA so it never competes with the FBA Plan for the
+  # DataDoe rate limit. The DURABLE switch is source_controls['ads-asin-date'].schedule_enabled (false = deployed but not
+  # enabled -> a typed zero-create SKIP; the Data Sync Center pause also stops it). Each region has a hard create cap
+  # checked before every POST (planned ~2/7/3 daily exports + head-room for date-bisection of a full 50,000-row page),
+  # and the runner refuses any create the live balance could not cover with a 100-token reserve for OLI/Campaign left.
+  asin_ads:
+    needs: [run, fba]
+    if: always() && needs.run.outputs.region != '' && needs.run.outputs.execute_downstream == 'true' && needs.run.outputs.token_proceed == 'true' && needs.run.outputs.scope != 'bootstrap'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install dependencies
+        run: npm ci
+      - name: Refresh ASIN Ads (this region; additional durable source; runs only while schedule_enabled)
+        continue-on-error: true
+        run: |
+          case "${{ needs.run.outputs.region }}" in
+            india) CAP=4 ;;
+            europe-au) CAP=10 ;;
+            us-ca) CAP=5 ;;
+            *) echo "STOP unknown region ${{ needs.run.outputs.region }}" >&2; exit 2 ;;
+          esac
+          node scripts/release/scheduled-asin-ads-refresh.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.asof }} --scheduled --max-creates=$CAP
+
   # Listing Health v3 SHADOW ingestion -- runs ONLY after THIS region's FBA inventory job SUCCEEDED, so v3's reuse-only
   # inventory tranche adopts the fresh FBA Plan inventory cache (zero inventory creates). It is NOT a new scheduler
   # owner: it is a dependent job of the SAME per-region workflow run, so it inherits the workflow-level per-region

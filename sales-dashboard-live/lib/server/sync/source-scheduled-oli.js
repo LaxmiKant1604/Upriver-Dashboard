@@ -12,11 +12,15 @@ import { isRoutingScope } from "./scheduler-scope.js";
 
 export const OLI_TOKENS_PER_CREATE = 2; // one STANDARD DataDoe export
 
-// The ONLY source families the automatic scheduler runs: canonical OLI, the org-wide Catalog, and (post
-// ASIN->Campaign cutover) CAMPAIGN Ads (ads-campaign-date). These show schedule_enabled=true + paused=false in
-// source_controls; every other family -- INCLUDING the now-retired ASIN Ads (ads-asin-date) and FBA -- stays
-// schedule-disabled (ASIN exports are additionally hard-blocked in ads-sync.js; its durable history is retained).
+// The ONLY source families the automatic scheduler runs unconditionally: canonical OLI, the org-wide Catalog, and
+// (post ASIN->Campaign cutover) CAMPAIGN Ads (ads-campaign-date). These show schedule_enabled=true + paused=false in
+// source_controls; every other family stays schedule-disabled -- EXCEPT the operator-switched families below.
 export const SCHEDULED_ENABLED_SOURCE_KEYS = Object.freeze(["order-line-items", "product-catalog", "ads-campaign-date"]);
+
+// OPERATOR-SWITCHED families: their source_controls.schedule_enabled is the durable ON/OFF switch the scheduler-v2 job
+// itself READS (ASIN Ads: the asin_ads job runs only while it is true), so this config sweep never writes it and never
+// treats it as unexpected -- it is turned on/off deliberately by the owner-approved operator step, nowhere else.
+export const OPERATOR_SWITCHED_SOURCE_KEYS = Object.freeze(["ads-asin-date"]);
 
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
@@ -27,7 +31,7 @@ const nb = (v) => S(v).trim() !== "";
  * config operator's intent is offline-testable. Returns one { sourceKey, scheduleEnabled, paused? } per key.
  */
 export function scheduledSourceControlPlan(sourceKeys) {
-  const keys = [...new Set((sourceKeys || []).map(S).filter(nb))];
+  const keys = [...new Set((sourceKeys || []).map(S).filter(nb))].filter((k) => !OPERATOR_SWITCHED_SOURCE_KEYS.includes(k));
   return keys.map((sourceKey) => SCHEDULED_ENABLED_SOURCE_KEYS.includes(sourceKey)
     ? { sourceKey, scheduleEnabled: true, paused: false }
     : { sourceKey, scheduleEnabled: false });
