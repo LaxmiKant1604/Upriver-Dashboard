@@ -54,6 +54,21 @@ export const REPORT_MATERIALIZATION_REPORTS = Object.freeze([
 
 const utcDate = (d) => new Date(d).toISOString().slice(0, 10);
 
+const OWNED_REPORT_KEYS = Object.freeze(REPORT_MATERIALIZATION_REPORTS.map((r) => r.reportKey));
+
+// The optional report subset (`only`): null/undefined = every owned report (the default, byte-identical run); otherwise
+// a non-empty list of OWNED report keys (an unknown key or an empty list throws -- never a silent no-op run). Used by
+// the Returns event-source job to republish returns-leakage the same day without re-deriving the other reports.
+// sku-movement needs the account's brand list, so a subset naming it also runs (and materializes) brand-view-brands.
+export function normalizeReportSubset(only) {
+  if (only == null) return null;
+  const keys = (Array.isArray(only) ? only : [only]).map((k) => String(k == null ? "" : k).trim()).filter(Boolean);
+  if (!keys.length) throw new Error("runReportMaterialization: `only` must name at least one report");
+  const unknown = keys.filter((k) => !OWNED_REPORT_KEYS.includes(k));
+  if (unknown.length) throw new Error(`runReportMaterialization: unknown report(s) in \`only\`: ${unknown.join(", ")} (owned: ${OWNED_REPORT_KEYS.join(", ")})`);
+  return new Set(keys);
+}
+
 // Normalize a brand token to the canonical scope value the serve uses ("" -> "ALL", trimmed otherwise).
 function canonicalBrand(brand) {
   const s = String(brand == null ? "" : brand).trim();
@@ -68,6 +83,7 @@ function canonicalBrand(brand) {
  * @param {Array<{accountId:string,country?:string,currency?:string,name?:string}>} args.accounts  primary accounts.
  * @param {string} [args.ceiling]             UTC future-guard date (YYYY-MM-DD); defaults to now()'s UTC date.
  * @param {boolean} [args.dryRun=false]       when true, derive nothing is written -- every unit is reported "planned".
+ * @param {string[]|string|null} [args.only]  optional subset of the owned report keys (normalizeReportSubset); default all.
  * @param {() => (Date|number|string)} [args.now]
  * @param {object} collaborators              injected (all zero-export):
  *   deriveBrandViewBrands({ accountId }) -> { brands:string[], ... }
@@ -81,7 +97,7 @@ function canonicalBrand(brand) {
  * @returns {Promise<{ region, ceiling, dryRun, events: Array, summary: object }>}
  */
 export async function runReportMaterialization(
-  { region, accounts, ceiling, dryRun = false, now = () => new Date() },
+  { region, accounts, ceiling, dryRun = false, now = () => new Date(), only = null },
   collaborators = {},
 ) {
   const {
@@ -100,6 +116,8 @@ export async function runReportMaterialization(
   if (typeof deriveReturns !== "function") throw new Error("runReportMaterialization requires deriveReturns");
   if (!dryRun && typeof persistSnapshot !== "function") throw new Error("runReportMaterialization requires persistSnapshot for a live run");
 
+  const subset = normalizeReportSubset(only);
+  const wants = (reportKey) => !subset || subset.has(reportKey);
   const effectiveCeiling = ceiling || utcDate(now());
   const events = [];
   const push = (ev) => { events.push(ev); return ev; };
@@ -119,7 +137,7 @@ export async function runReportMaterialization(
 
     // 1) brand-view-brands (also yields the account's brand list for the per-brand SKU Movement materialization).
     let brands = [];
-    await runUnit(async () => {
+    if (wants(BRAND_VIEW_BRANDS_REPORT_KEY) || wants(SKU_MOVEMENT_REPORT_KEY)) await runUnit(async () => {
       const derived = await deriveBrandViewBrands({ accountId });
       brands = Array.isArray(derived && derived.brands) ? derived.brands.filter((b) => String(b || "").trim() !== "") : [];
       // brand-view-brands is a membership directory: it is ALWAYS materializable (an empty brand list is the honest,
@@ -141,7 +159,7 @@ export async function runReportMaterialization(
     }, { report: BRAND_VIEW_BRANDS_REPORT_KEY, account: accountId, scope: "directory" });
 
     // 2) sku-movement for ALL + each named brand (each an independent unit; the canonical { asOf, brand } identity).
-    const skuBrands = ["ALL", ...brands.map(canonicalBrand).filter((b) => b !== "ALL")];
+    const skuBrands = wants(SKU_MOVEMENT_REPORT_KEY) ? ["ALL", ...brands.map(canonicalBrand).filter((b) => b !== "ALL")] : [];
     const seenSkuBrand = new Set();
     for (const brand of skuBrands) {
       const cb = canonicalBrand(brand);
@@ -161,7 +179,7 @@ export async function runReportMaterialization(
     // 3) returns-leakage (single per account; identity { to: latest proven returns date }). deriveReturns REQUIRES a
     //    valid YYYY-MM-DD asOf (gatherReturnsEvidence rejects a blank one); the derive clamps its own window to the
     //    account's real returns/settlement horizon, so the future-guard ceiling is the correct as-of to pass.
-    await runUnit(async () => {
+    if (wants(RETURNS_REPORT_KEY)) await runUnit(async () => {
       const derived = await deriveReturns({ accountId, asOf: effectiveCeiling });
       const to = derived && (derived.latestDataDate || (derived.payload && derived.payload.latestDataDate)) ? (derived.latestDataDate || derived.payload.latestDataDate) : null;
       return materializeOne({

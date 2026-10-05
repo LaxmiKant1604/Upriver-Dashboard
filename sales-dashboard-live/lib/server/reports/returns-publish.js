@@ -5,7 +5,8 @@
 // math lives in returns-advanced.js; this module is the durable I/O + honest-window boundary. Mirrors
 // sku-movement-durable-rederive.js.
 
-import { buildReturnsAdvancedPayload, RETURNS_GRACE_DAYS } from "./returns-advanced.js";
+import { createHash } from "node:crypto";
+import { buildReturnsAdvancedPayload, RETURNS_GRACE_DAYS, RETURNS_ADVANCED_VERSION } from "./returns-advanced.js";
 import { returnsWindow, reshapeOrderedRows } from "../sync/returns-source-refresh.js";
 import { RETURNS, SETTLEMENTS, ORDER_LINE_ITEMS } from "./sources.js";
 import { mergeOrderedOliHistory, buildSkuAsinResolver, resolveUniqueMarketplaceByAccount, authoritativeMarketplace } from "../sync/oli-sales-estimate.js";
@@ -25,6 +26,29 @@ async function readOperationalUnits(readOliOperationalUnits, args) {
   catch (_e) { return []; }
 }
 
+// The OPTIONAL Returns event-source coverage read: readers.readReturnsCoverage({ organizationFingerprint, connectionId,
+// accountId }) -> the getSourceCoverageWindows shape for source_key 'returns' (the caller binds the key). It feeds
+// payload.returnsCoveredThrough / returnsCoverageWindows / returnsLegacyCoveredThrough and is NEVER a failure: an absent
+// reader, a throw, or anything but { read:'ok', windows:[...] } -> null (the payload is built exactly as without it). A
+// legacy-only account (no 'returns' coverage row) reads ok with zero windows.
+// READ ORDER: the coverage is read BEFORE the history rows. The event source writes rows + coverage in ONE transaction,
+// so a load landing between the two reads can only make the rows NEWER than the coverage read first -- the coverage
+// then UNDERSTATES the rows (a loaded day shows unavailable until the next derive), never the reverse (a day claimed
+// covered while its rows were read before the load: a fabricated zero).
+async function readReturnsCoverageSoft(readReturnsCoverage, { organizationFingerprint, connectionId, accountId }) {
+  if (typeof readReturnsCoverage !== "function") return null;
+  let cov;
+  try { cov = await readReturnsCoverage({ organizationFingerprint, connectionId, accountId: S(accountId) }); } catch (_e) { return null; }
+  return cov && typeof cov === "object" && cov.read === "ok" && Array.isArray(cov.windows) ? { read: "ok", windows: cov.windows } : null;
+}
+
+// The materializer's idempotency fingerprint (report-materialization-core.js depFingerprint): the report version + the
+// PURE payload (no wall-clock field), so ANY content change -- a coverage-only day with no new return date, returned
+// units, the ordered denominator, catalog names -- republishes, and an identical derive stays a zero-write replay.
+export function returnsPayloadFingerprint(payload) {
+  return createHash("sha256").update(JSON.stringify({ v: RETURNS_ADVANCED_VERSION, payload })).digest("hex").slice(0, 40);
+}
+
 async function buildAccountResolver({ readDirectory, readOliSkuAsinResolution }, { organizationFingerprint, connectionId, accountId }) {
   if (typeof readDirectory !== "function" || typeof readOliSkuAsinResolution !== "function") return null;
   try {
@@ -38,17 +62,20 @@ async function buildAccountResolver({ readDirectory, readOliSkuAsinResolution },
 }
 
 // Gather one account's durable Returns evidence + build the advanced payload. ZERO DataDoe. Returns
-// { payload, latestDataDate, sourceRefreshedAt } or { notReady }.
+// { payload, latestDataDate, sourceRefreshedAt, depFingerprint } or { notReady }. readers.readReturnsCoverage is
+// OPTIONAL (readReturnsCoverageSoft above).
 export async function gatherReturnsEvidence({ accountId, organizationFingerprint, connectionId = "primary", asOf, graceDays = RETURNS_GRACE_DAYS }, readers) {
   const {
     readReturnsHistory, readSettlementHistory, readOliHistory, readOliCoverage, readOliOperationalUnits,
-    readCatalogSnapshot, loadCatalogPayload, readOliSkuAsinResolution, readDirectory,
+    readCatalogSnapshot, loadCatalogPayload, readOliSkuAsinResolution, readDirectory, readReturnsCoverage,
   } = readers;
   if (!isDate(asOf)) return { notReady: "invalid-asof" };
   const win = returnsWindow(asOf);
   const from = win.from;
   const acctIds = [S(accountId)];
 
+  // The OPTIONAL 'returns' coverage FIRST (see READ ORDER above): it may only understate the rows read after it.
+  const returnsCoverage = await readReturnsCoverageSoft(readReturnsCoverage, { organizationFingerprint, connectionId, accountId });
   const durableReturnRows = await readReturnsHistory({ organizationFingerprint, connectionId, accountIds: acctIds, from, to: asOf });
   const durableSettlementRows = await readSettlementHistory({ organizationFingerprint, connectionId, accountIds: acctIds, from, to: asOf });
 
@@ -85,6 +112,7 @@ export async function gatherReturnsEvidence({ accountId, organizationFingerprint
     returnsRefreshedAt, settlementsRefreshedAt,
     returnsCoveredFrom: minDate(durableReturnRows, "return_date"), returnsCoveredTo: maxDate(durableReturnRows, "return_date"),
     settlementsCoveredFrom: minDate(durableSettlementRows, "settlement_date"), settlementsCoveredTo: maxDate(durableSettlementRows, "settlement_date"),
+    returnsCoverage,
   });
 
   // A provenance-faithful source_refreshed_at (never wall-clock): the freshest of the source refresh stamps + the
@@ -92,7 +120,7 @@ export async function gatherReturnsEvidence({ accountId, organizationFingerprint
   const cands = [returnsRefreshedAt, settlementsRefreshedAt, catalogSnapshot && catalogSnapshot.validated_at,
     isDate(payload.latestDataDate) ? payload.latestDataDate + "T00:00:00.000Z" : null].filter(Boolean).map(String).sort();
   const sourceRefreshedAt = cands.length ? cands[cands.length - 1] : null;
-  return { payload, latestDataDate: payload.latestDataDate, sourceRefreshedAt };
+  return { payload, latestDataDate: payload.latestDataDate, sourceRefreshedAt, depFingerprint: returnsPayloadFingerprint(payload) };
 }
 
 // Factory: build the operator's `publishAccount({ account, asOf })` from durable readers + an injected saveSnapshot.

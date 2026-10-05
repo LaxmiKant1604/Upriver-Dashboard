@@ -24,6 +24,7 @@ export const SCHEDULER_OWNERS = Object.freeze([
   "scheduler-v2:materialize",      // report-materialization.mjs (zero export)
   "scheduler-v2:materialize-inventory", // report-materialization-brandview (zero export)
   "scheduler-v2:asin-ads",         // scheduled-asin-ads-refresh.mjs (the additional ASIN Ads durable source; own job)
+  "scheduler-v2:returns-source",   // scheduled-returns-refresh.mjs + the returns-leakage-only republish step (Returns events; own job)
 ]);
 export const FROZEN_PLAN_PARTICIPATION = Object.freeze([
   "freeze-and-execute",                        // frozen + executed in ITS step (OLI)
@@ -46,6 +47,7 @@ export const COMPLETION_OUTPUTS = Object.freeze([
   "materialize-count",       // the count of materialized snapshots (zero-export jobs)
   "campaign-coverage-ok",    // the Campaign Ads coverage refresh step outcome (covered within ceiling; publication gates on it)
   "asin-result-and-run-status", // the ASIN operator's RESULT json classification + its (ads-asin-date, region) source_run_status row
+  "returns-result-and-run-status", // the Returns operator's RESULT json classification + its (returns, region) source_run_status row
 ]);
 export const PARTIAL_BEHAVIORS = Object.freeze([
   "d1-provisional-final-lkg", // publish real itemized D-1 as provisional, promote to final; never fabricate; LKG retained
@@ -99,6 +101,17 @@ export const SCHEDULED_FAMILY_REGISTRY = Object.freeze({
     partialBehavior: "stay-visibly-partial",
     watchdogIdempotency: "idempotent-replay",
     notes: "The ADDITIONAL ASIN/date durable source (asin-performance-v1) -- never the active Ads read grain, never a publication prerequisite. Its own asin_ads job after FBA in the same per-region run; runs only while source_controls['ads-asin-date'].schedule_enabled; coverage-derived windows (21-day rolling, one-time catch-up inside the 60-day horizon), <=5-seller batches, full-page date bisection, completed-export reuse, hard per-region cap (4/10/5); already-covered => zero creates.",
+  },
+  "returns": {
+    family: "returns",
+    schedulerOwner: "scheduler-v2:returns-source",
+    dependencies: ["order-line-items"],
+    frozenPlanParticipation: "none",
+    ceiling: "capped-per-region",
+    completionOutput: "returns-result-and-run-status",
+    partialBehavior: "stay-visibly-partial",
+    watchdogIdempotency: "idempotent-replay",
+    notes: "The ADDITIONAL Returns (FBA & FBM) ORDER-LEVEL durable source (one saved row per DataDoe return event, never collapsed; source_returns_history is re-derived from the events in the same transaction). Its own returns_source job in the same per-region run, after materialize (needs [run, fba, materialize] are ORDERING only; always()); runs only while source_controls['returns'].schedule_enabled (operator-switched by returns-schedule-switch.mjs; the pause stops it). Daily 14-day rolling replace, a 60-day initial load for a new account, NO catch-up and NO automatic backfill (an older gap is reported, never fetched); <=5-seller batches per identical window; a DB-enforced create cap per region per UTC claim day (4/11/6; the DB clock, never the run's as-of) claimed before every POST plus a fresh-balance reserve (108/120/110); completed-export reuse; a replay finds its accounts current (zero creates) and shares the same UTC-day cap under the per-region run lease. An identity-ambiguous account keeps every row, is reported and held (its initial load is never marked complete). Depends on order-line-items for the returns-v3 ordered units + the order-owner evidence; returns-leakage is republished by report-materialization.mjs --only=returns-leakage (zero-export) only when rows were written.",
   },
   "campaign-performance": {
     family: "campaign-performance",

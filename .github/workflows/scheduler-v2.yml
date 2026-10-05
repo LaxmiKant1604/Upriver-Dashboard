@@ -881,3 +881,56 @@ jobs:
           else
             node scripts/release/onboarding-dispatch-ack.mjs --region=${{ needs.run.outputs.region }} --dispatch-id=${{ inputs.dispatch_id }} --phase=failed --note=RUN_${{ needs.run.result }}_FBA_${{ needs.fba.result }}_VERIFY_${{ steps.verify_published.outcome }} --run-token=${{ github.run_id }}-${{ github.run_attempt }}
           fi
+
+  # Returns (FBA & FBM) -- an ADDITIONAL durable ORDER-LEVEL source (one saved row per DataDoe return event) from which the
+  # source_returns_history aggregates behind Returns & Refund Leakage are re-derived. It is NOT a new scheduler owner and
+  # NOT a second cron: a dependent job of the SAME per-region workflow run (it inherits the per-region `concurrency` group
+  # and the run's duplicate + token guards), and nothing here needs it. needs: [run, fba, materialize, materialize-inventory]
+  # is ORDERING only (always(): no upstream RESULT gates it) -- the paid refresh never competes with the FBA Plan for the
+  # DataDoe rate limit, and its returns-leakage republish always lands AFTER the base `materialize` job's (never
+  # overwritten by an older derive the same run). The DURABLE switch is source_controls['returns'].schedule_enabled (false
+  # = a typed zero-create SKIP; the pause stops it too), flipped only by scripts/release/returns-schedule-switch.mjs. Daily
+  # 14-day rolling replace (a 60-day initial load for a new account; NO catch-up, NO automatic backfill) under a
+  # DB-enforced per-region per-day create cap (planned ~2/7/3 + bisection head-room) and a fresh-balance reserve (100 + 2 x
+  # the ASIN cap) checked before every POST. returns-leakage is republished ONLY when the refresh wrote rows, by the base
+  # `materialize` job's own CLI + --as-of ceiling restricted to it (--only=returns-leakage; zero export); its payload
+  # fingerprint makes a coverage-only day a real update the same day.
+  returns_source:
+    needs: [run, fba, materialize, materialize-inventory]
+    if: always() && needs.run.outputs.region != '' && needs.run.outputs.execute_downstream == 'true' && needs.run.outputs.token_proceed == 'true' && needs.run.outputs.scope != 'bootstrap'
+    runs-on: ubuntu-latest
+    # refresh (<= 45 min) + republish (<= 30 min) + setup.
+    timeout-minutes: 85
+    defaults:
+      run:
+        working-directory: sales-dashboard-live
+    env:
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      DATADOE_API_KEY: ${{ secrets.DATADOE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install dependencies
+        run: npm ci
+      - name: Refresh Returns (FBA & FBM) events (this region; additional durable source; runs only while schedule_enabled)
+        id: refresh
+        continue-on-error: true
+        timeout-minutes: 45
+        run: |
+          case "${{ needs.run.outputs.region }}" in
+            india) CAP=4; RESERVE=108 ;;
+            europe-au) CAP=11; RESERVE=120 ;;
+            us-ca) CAP=6; RESERVE=110 ;;
+            *) echo "STOP unknown region ${{ needs.run.outputs.region }}" >&2; exit 2 ;;
+          esac
+          node scripts/release/scheduled-returns-refresh.mjs --bucket=${{ needs.run.outputs.region }} --as-of=${{ needs.run.outputs.asof }} --scheduled --max-creates=$CAP --reserve-tokens=$RESERVE
+      - name: Republish returns-leakage from the saved Returns events (zero export; only after the refresh wrote rows)
+        id: republish
+        if: always() && steps.refresh.outputs.rows_written == 'true'
+        timeout-minutes: 30
+        run: node scripts/release/report-materialization.mjs --region=${{ needs.run.outputs.region }} --mode=live --as-of=${{ needs.run.outputs.inventory_asof }} --only=returns-leakage

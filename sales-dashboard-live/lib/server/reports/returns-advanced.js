@@ -6,7 +6,8 @@
 //
 //   * the SAME base fields (accountId, asOf, window, source labels, returnRecordCount, pendingReturnRequests,
 //     fbmOnly, reasonTotals, currencies, rows[], catalogBrands) -- built through the SHARED assembleReturnsLeakageRows
-//     authority so the aggregate is byte-identical to buildReturnsLeakage() for the same underlying returns/money; and
+//     authority so the aggregate is byte-identical to buildReturnsLeakage() for the same underlying returns/money
+//     (except fbmOnly, which sums FBM rows only since schema 2 -- see SCHEMA 2 below); and
 //   * ADDITIVE advanced fields the redesigned page needs, all recomputable in the browser with ZERO refetch:
 //     a shared dayAxis, account-level returns/money/breakdown daily series, per-row compact daily sub-series, a
 //     confirmed-vs-provisional split driven by a documented settlement grace period, and freshness/coverage evidence.
@@ -15,6 +16,38 @@
 // from its RAW abs parts (commission + FBA per-unit fee - restocking) and clamped at ZERO once over the window (per
 // row it ships the raw parts so any sub-window re-clamps honestly); a returned item is one Returns row (COUNT, never
 // an invented quantity); recent returns inside the grace period stay PROVISIONAL, not leakage; nulls stay null.
+//
+// SCHEMA 2 (returnsSchema = 2; DESIGN-v2 5.2 -- the daily, region-wise Returns (FBA & FBM) event source). ADDITIVE:
+// every pre-existing field keeps its value and its key position (new keys are APPENDED to the payload, the row and
+// the daily cell), except the two INTENTIONAL changes marked (*):
+//   rows[i].returnQuantity  RETURNED UNITS = sum(returned_units) over the history rows behind the row's returns when
+//                           EVERY one of them carries units, else null (a legacy row -- returned_units null / absent --
+//                           or an event-source group whose events lacked a quantity voids the whole row: never a partial
+//                           sum). It rides the return-holder row like returnCount (0 on a row with no returns).
+//                           `returnedUnits` is NOT redefined: it stays the return-RATE numerator = return EVENTS.
+//   rows[i].daily[j]        rq  (units that day, only when > 0 and every history row that day carries units);
+//                           rqx (1 when some history row that day lacks units -- rq is then omitted);
+//                           frf / flc (FBM refunded amount / FBM seller-borne label cost that day, FBM rows ONLY).
+//   rollingDays = 14        the daily source re-reads only the last 14 days: older returns keep the status / FBM
+//                           refund / disposition they had when last fetched (the UI freshness label; OD1).
+//   moneyAvailableThrough   the max settlement_date of a nonblank-ASIN Settlement row the builder received (null when
+//                           none) -- Settlements are a separate MANUAL source the daily Returns source never refreshes.
+//   returnsCoveredThrough   the contiguous 'returns' event-source coverage end <= asOf (returnsCoverageEnd below), from
+//                           the OPTIONAL coverage input; null when it is absent / unreadable / holds no window. KEPT for
+//                           compatibility only: the client gates per day from the two fields below whenever they exist.
+//   returnsCoverageWindows  THE PER-DAY COVERAGE EVIDENCE (returnsCoverageEvidence below): the account's 'returns'
+//                           event-source windows, merged (overlapping / touching) and clipped to [window.from, asOf] --
+//                           [] when the read is ok but proves no day of the window, null when the read is absent /
+//                           unreadable / malformed (the client then keeps today's ungated counts). Only these days carry
+//                           event-source RETURNED UNITS and the 14-day freshness label.
+//   returnsLegacyCoveredThrough  the LEGACY MANUAL pipeline's horizon counted as covered from window.from (counts only,
+//                           never units): min(asOf, RETURNS_LEGACY_SAVED_THROUGH, the day before the first event-source
+//                           day) when the coverage read is ok AND the account has a history row dated inside that span;
+//                           else null. So an account the event source has not loaded shows its saved legacy counts through
+//                           2026-08-31 and NOTHING after (unavailable, never 0); with no saved row at all nothing is
+//                           covered (a zero-row legacy account cannot be told apart from a never-loaded one).
+//   (*) fbmOnly             sums ONLY fulfillment_channel 'FBM' rows (an FBA row's refund is never an FBM figure).
+//   (*) freshness.latestReconciliation = min(asOf - grace, moneyAvailableThrough); null when there is no money.
 //
 // Zero transport imports -- pure. The operator feeds it already-fetched durable rows.
 
@@ -35,6 +68,14 @@ export const RETURNS_WINDOW_DAY_OPTIONS = [7, 14, 30, 60];
 // or after (asOf - GRACE_DAYS + 1) is PROVISIONAL -- Amazon may not have settled its refund yet -- so it is shown as
 // pending, never immediately labelled leakage.
 export const RETURNS_GRACE_DAYS = 21;
+// The schema-2 marker + the daily event source's rolling re-read window. RETURNS_PAYLOAD_ROLLING_DAYS mirrors
+// RETURNS_ROLLING_DAYS of lib/server/sync/returns-event-source.js (owner decision OD1 = 14), inlined so this pure builder
+// never imports the event-source runner graph; scripts/report-returns-advanced.test.js pins the two equal.
+export const RETURNS_PAYLOAD_SCHEMA = 2;
+export const RETURNS_PAYLOAD_ROLLING_DAYS = 14;
+// The last day the LEGACY MANUAL Returns pipeline saved (source_returns_history 07-03..08-31; it wrote no 'returns'
+// coverage). A day after it is proven ONLY by the event source's coverage (returnsCoverageEvidence).
+export const RETURNS_LEGACY_SAVED_THROUGH = "2026-08-31";
 
 const norm = (v) => String(v ?? "").trim();
 const upper = (v) => norm(v).toUpperCase();
@@ -51,15 +92,97 @@ function dateAxis(from, to) {
   return out;
 }
 
+// One history row's RETURNED UNITS (schema 2): a positive integer (the event source stores sum(quantity) only when every
+// event of the group had a quantity >= 1), else null = units UNAVAILABLE -- a legacy row (returned_units null, or the
+// column absent on a pre-migration read) and any malformed / zero / negative value alike (fail closed, never a guess).
+const rowUnits = (raw) => {
+  const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\s*\d+\s*$/.test(raw) ? Number(raw) : NaN);
+  return Number.isInteger(n) && n >= 1 ? n : null;
+};
+
+// The OPTIONAL coverage input is evidence ONLY as a read:'ok' result carrying a windows array (the
+// getSourceCoverageWindows shape); absent / schema-missing / read-failed / malformed -> null.
+const coverageWindowsOf = (cov) => (cov && typeof cov === "object" && cov.read === "ok" && Array.isArray(cov.windows) ? cov.windows : null);
+
+/**
+ * The CONTIGUOUS Returns event-source coverage end (PURE) for a report window [from, asOf]: the last day X <= asOf such
+ * that EVERY day of [ref, X] lies inside a succeeded 'returns' coverage window (windows merged when they overlap or
+ * touch), where ref = max(from, the first covered day) -- days before the source's first covered day predate it (their
+ * rows, if any, are legacy evidence and stay as they are). When ref itself falls in a HOLE after an earlier run (a
+ * reported RETURNS_COVERAGE_GAP at the window start) X is that earlier run's end (< from): every window day then reads
+ * unavailable -- an uncovered day is never shown as "zero returns". Days after X are unavailable to the client.
+ * -> "YYYY-MM-DD" | null (null: no windows array, or no valid window starting on/before asOf).
+ */
+export function returnsCoverageEnd(windows, { from, asOf } = {}) {
+  if (!Array.isArray(windows) || !isDateStr(asOf)) return null;
+  const spans = windows
+    .map((w) => ({ from: norm(w && w.from), to: norm(w && w.to) }))
+    .filter((w) => isDateStr(w.from) && isDateStr(w.to) && w.from <= w.to && w.from <= asOf)
+    .map((w) => ({ from: w.from, to: w.to > asOf ? asOf : w.to }))
+    .sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0));
+  if (!spans.length) return null;
+  const runs = [];
+  for (const s of spans) {
+    const last = runs[runs.length - 1];
+    if (last && s.from <= addDaysStr(last.to, 1)) { if (s.to > last.to) last.to = s.to; } else runs.push({ ...s });
+  }
+  const ref = isDateStr(from) && from > runs[0].from ? from : runs[0].from;
+  const covering = runs.find((r) => r.from <= ref && ref <= r.to);
+  if (covering) return covering.to;
+  const before = runs.filter((r) => r.to < ref);
+  return before.length ? before[before.length - 1].to : null;
+}
+
+/**
+ * The PER-DAY coverage evidence of a report window [from, asOf] (PURE) -> { windows, legacyThrough }:
+ *   windows       the valid 'returns' event-source windows merged (overlapping / touching) and CLIPPED to [from, asOf],
+ *                 ascending; [] when the read is ok but proves no day of the window; null when `windows` is null (the
+ *                 coverage read is absent / unreadable / malformed -- the caller keeps today's ungated behaviour).
+ *   legacyThrough the LEGACY horizon counted as covered from `from` (counts only): the last day of
+ *                 [from, min(asOf, RETURNS_LEGACY_SAVED_THROUGH, firstEventDay - 1)] when that span is non-empty AND
+ *                 `rows` holds a history row dated inside it; else null (always null when windows is null). The days
+ *                 BEFORE the event source's first covered day were never replaced by it, so a saved row there is the
+ *                 legacy pipeline's own evidence -- trusted through its last saved day and never after it.
+ * A gap between event windows stays a gap: a later covered day is covered on its own (never cut at the first hole).
+ */
+export function returnsCoverageEvidence(windows, { from, asOf, rows = [] } = {}) {
+  if (!Array.isArray(windows) || !isDateStr(asOf)) return { windows: null, legacyThrough: null };
+  const lo = isDateStr(from) && from <= asOf ? from : asOf;
+  const spans = windows
+    .map((w) => ({ from: norm(w && w.from), to: norm(w && w.to) }))
+    .filter((w) => isDateStr(w.from) && isDateStr(w.to) && w.from <= w.to)
+    .sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0));
+  const merged = [];
+  for (const s of spans) {
+    const last = merged[merged.length - 1];
+    if (last && s.from <= addDaysStr(last.to, 1)) { if (s.to > last.to) last.to = s.to; } else merged.push({ ...s });
+  }
+  const clipped = merged
+    .map((w) => ({ from: w.from < lo ? lo : w.from, to: w.to > asOf ? asOf : w.to }))
+    .filter((w) => w.from <= w.to);
+  // The legacy span: from the window start up to the earliest of asOf, the legacy pipeline's last saved day and the day
+  // before the event source's first covered day (ANY window, also one outside this report window).
+  let legacyEnd = asOf < RETURNS_LEGACY_SAVED_THROUGH ? asOf : RETURNS_LEGACY_SAVED_THROUGH;
+  if (merged.length) { const pre = addDaysStr(merged[0].from, -1); if (pre < legacyEnd) legacyEnd = pre; }
+  let legacyThrough = null;
+  if (legacyEnd >= lo) {
+    const saved = (Array.isArray(rows) ? rows : []).some((r) => { const d = norm(r && r.return_date); return isDateStr(d) && d >= lo && d <= legacyEnd; });
+    if (saved) legacyThrough = legacyEnd;
+  }
+  return { windows: clipped, legacyThrough };
+}
+
 /**
  * Fold durable Returns aggregates into the SAME structures returnsLeakageReturnsFold produces (returnsByAsin +
  * account totals), weighting by return_count instead of counting rows one at a time. Also collects the account-level
  * daily returns series + dimension breakdown series (currency-less counts) and the per-asin daily return counts for
  * the per-row sub-series. Blank-ASIN rows are skipped from the fold (as in the raw path) but still counted in
- * returnRecordCount + freshness.
+ * returnRecordCount + freshness. Schema 2: per-asin returned units (unitsByAsin: { units, missing } -- `missing` counts
+ * the contributing rows WITHOUT units), per-asin-day units / missing-units flag, and the FBM-only money (FBM rows only).
  */
 function durableReturnsFold(rows, dateIndex) {
   const returnsByAsin = new Map();
+  const unitsByAsin = new Map();
   const reasonTotals = new Map();
   let pendingReturnRequests = 0;
   let fbmRefundedAmount = 0;
@@ -116,21 +239,33 @@ function durableReturnsFold(rows, dateIndex) {
     if (sku) entry.skus.add(sku);
     returnsByAsin.set(asin, entry);
     reasonTotals.set(reason, (reasonTotals.get(reason) || 0) + count);
-    fbmRefundedAmount += abs(row.fbm_refunded_amount);
-    fbmLabelCostBorneBySeller += abs(row.fbm_seller_label_cost);
+    // schema 2: returned units (ONE row without units voids the asin's sum) + FBM-only money (FBM rows only: an FBA
+    // row's refunded amount / label cost is never an FBM figure).
+    const units = rowUnits(row.returned_units);
+    const u = unitsByAsin.get(asin) || { units: 0, missing: 0 };
+    if (units == null) u.missing += 1; else u.units += units;
+    unitsByAsin.set(asin, u);
+    const fbm = channel === "FBM";
+    if (fbm) {
+      fbmRefundedAmount += abs(row.fbm_refunded_amount);
+      fbmLabelCostBorneBySeller += abs(row.fbm_seller_label_cost);
+    }
 
-    // per-asin daily return counts
+    // per-asin daily return counts (+ schema 2: units, the missing-units flag, FBM-only money)
     if (di >= 0) {
       let m = returnDailyByAsin.get(asin);
       if (!m) { m = new Map(); returnDailyByAsin.set(asin, m); }
-      const d = m.get(date) || { rc: 0, fba: 0, fbm: 0, pend: 0 };
+      const d = m.get(date) || { rc: 0, fba: 0, fbm: 0, pend: 0, rq: 0, rqx: false, frf: 0, flc: 0 };
       d.rc += count; if (channel === "FBA") d.fba += count; else if (channel === "FBM") d.fbm += count; if (pending) d.pend += count;
+      if (units == null) d.rqx = true; else d.rq += units;
+      if (fbm) { d.frf += abs(row.fbm_refunded_amount); d.flc += abs(row.fbm_seller_label_cost); }
       m.set(date, d);
     }
   }
   return {
     returnsByAsin, reasonTotals, pendingReturnRequests, fbmRefundedAmount, fbmLabelCostBorneBySeller,
     returnRecordCount, latestReturnDate, returnsDaily, channelSeries, statusSeries, labelPayerSeries, bucketSeries, returnDailyByAsin,
+    unitsByAsin,
   };
 }
 
@@ -224,7 +359,11 @@ function orderedDaily(orderedRows, dateIndex) {
 }
 
 /**
- * Build the full advanced payload. Pure.
+ * Build the full advanced payload. Pure. `returnsCoverage` (optional) = the account's 'returns' event-source coverage
+ * read in the getSourceCoverageWindows shape ({ read:'ok', windows:[{ from, to }] }); anything else -> the payload's
+ * returnsCoveredThrough, returnsCoverageWindows and returnsLegacyCoveredThrough are null (never a failure). A read:'ok'
+ * with no window in [from, asOf] is NOT "no information": returnsCoverageWindows is [] and only the legacy horizon (if
+ * any saved row proves it) is covered.
  */
 export function buildReturnsAdvancedPayload({
   accountId, asOf, from, windowDays, graceDays = RETURNS_GRACE_DAYS,
@@ -232,6 +371,7 @@ export function buildReturnsAdvancedPayload({
   durableReturnRows = [], durableSettlementRows = [], orderedRows = [], catalogRows = [],
   returnsRefreshedAt = null, settlementsRefreshedAt = null,
   returnsCoveredFrom = null, returnsCoveredTo = null, settlementsCoveredFrom = null, settlementsCoveredTo = null,
+  returnsCoverage = null,
 }) {
   const axis = dateAxis(from, asOf);
   const dateIndex = new Map(axis.map((d, i) => [d, i]));
@@ -280,6 +420,12 @@ export function buildReturnsAdvancedPayload({
       if (m.cog) cell.cog = m.cog; if (m.rus) cell.rus = m.rus; if (m.rev) cell.rev = m.rev;
       if (m.settledSales) cell.ssl = m.settledSales; if (m.settledUnits) cell.sun = m.settledUnits;
       if (o.ord) cell.ord = o.ord; if (o.sal) cell.sal = o.sal;
+      // schema 2 (APPENDED after every pre-existing key): the return-holder day's units / missing-units flag and its
+      // FBM-only money. rq only when every history row that day carries units; rqx replaces it otherwise.
+      if (rc.rc) {
+        if (rc.rqx) cell.rqx = 1; else if (rc.rq > 0) cell.rq = rc.rq;
+        if (rc.frf) cell.frf = rc.frf; if (rc.flc) cell.flc = rc.flc;
+      }
       return cell;
     });
     r.daily = daily;
@@ -289,6 +435,10 @@ export function buildReturnsAdvancedPayload({
     if (retDaily) for (const [d, v] of retDaily) { if (dateIndex.has(d) && dateIndex.get(d) >= provisionalIdx) recent += v.rc; }
     r.provisionalReturnCount = recent;
     r.confirmedReturnCount = Math.max(0, r.returnCount - recent);
+    // schema 2: RETURNED UNITS ride the return-holder row (like returnCount): the asin's sum when EVERY contributing
+    // history row carries units, else null; a row without returns has 0. Never feeds returnedUnits (the rate numerator).
+    const u = r.returnCount > 0 ? ret.unitsByAsin.get(r.asin) : null;
+    r.returnQuantity = r.returnCount > 0 ? (u && u.missing === 0 ? u.units : null) : 0;
   }
 
   // Account money-by-currency daily series (sum the per-key daily across asins).
@@ -326,8 +476,17 @@ export function buildReturnsAdvancedPayload({
 
   const currencies = [...new Set(rows.map((r) => r.currency).filter(Boolean))].sort();
   const latestDataDate = [ret.latestReturnDate, settle.latestSettlementDate].filter(Boolean).sort().slice(-1)[0] || null;
-  // A day is fully reconciled once it is older than the grace window (settlement corrections have landed).
-  const latestReconciliation = axis.length ? addDaysStr(asOf, -grace) : null;
+  // Schema 2: the Settlement money is a separate MANUAL source -> it is available only through the latest nonblank-ASIN
+  // settlement date the builder received (the settlement fold skips blank-ASIN rows), null when there is none.
+  const moneyAvailableThrough = settle.latestSettlementDate;
+  // A day is fully reconciled once it is older than the grace window (settlement corrections have landed) AND its money
+  // is saved: min(asOf - grace, moneyAvailableThrough); no money -> nothing is reconciled (null).
+  const graceCut = axis.length ? addDaysStr(asOf, -grace) : null;
+  const latestReconciliation = graceCut && moneyAvailableThrough ? (moneyAvailableThrough < graceCut ? moneyAvailableThrough : graceCut) : null;
+  const coverageWindows = coverageWindowsOf(returnsCoverage);
+  const returnsCoveredThrough = returnsCoverageEnd(coverageWindows, { from, asOf });
+  // The per-day coverage evidence (A1/A4): event-source windows in the window + the legacy horizon (counts only).
+  const coverage = returnsCoverageEvidence(coverageWindows, { from, asOf, rows: durableReturnRows });
 
   return {
     version: RETURNS_ADVANCED_VERSION,
@@ -374,5 +533,13 @@ export function buildReturnsAdvancedPayload({
       latestDataDate, latestReconciliation, provisionalFrom: provisionalCutoff, graceDays: grace,
     },
     latestDataDate,
+    // ---- schema 2 (APPENDED; DESIGN-v2 5.2) ----
+    returnsSchema: RETURNS_PAYLOAD_SCHEMA,
+    moneyAvailableThrough,
+    returnsCoveredThrough,
+    rollingDays: RETURNS_PAYLOAD_ROLLING_DAYS,
+    // the per-day coverage evidence (APPENDED after rollingDays): see the SCHEMA 2 header.
+    returnsCoverageWindows: coverage.windows,
+    returnsLegacyCoveredThrough: coverage.legacyThrough,
   };
 }

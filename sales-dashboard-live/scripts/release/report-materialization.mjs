@@ -12,7 +12,9 @@
 //     node scripts/release/report-materialization.mjs --region=india --mode=live
 //
 // Flags: --region=india|europe-au|us-ca (required), --mode=dry-run|live (default dry-run), --as-of=YYYY-MM-DD
-// (UTC future-guard ceiling; default UTC today -- the derive clamps down to each account's latest proven date).
+// (UTC future-guard ceiling; default UTC today -- the derive clamps down to each account's latest proven date),
+// --only=<report>[,<report>] (optional subset of the owned reports, e.g. --only=returns-leakage for the Returns event-source
+// job's same-day republish; an unknown or empty value refuses with exit 2; default every owned report).
 
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
 loadReleaseEnv();
@@ -22,7 +24,7 @@ loadReleaseEnv();
 // is already in process.env before node starts (so static would be fine), but for a LOCAL run env comes from
 // <repo>/.env.local via loadReleaseEnv() -- which must run FIRST. Dynamic import guarantees that ordering everywhere.
 const { buildReportMaterializationRelease } = await import("../../lib/server/sync/report-materialization-composition.js");
-const { runReportMaterialization } = await import("../../lib/server/sync/report-materialization-operation.js");
+const { runReportMaterialization, normalizeReportSubset } = await import("../../lib/server/sync/report-materialization-operation.js");
 const { REGION_SCOPES } = await import("../../lib/server/sync/scheduler-scope.js");
 
 const argv = process.argv.slice(2);
@@ -39,6 +41,7 @@ async function main() {
   const region = String(argOf("region", "") || "").trim();
   const mode = String(argOf("mode", "dry-run") || "dry-run").trim();
   const asOf = argOf("as-of", null);
+  const onlyArg = argOf("only", null);
 
   if (!REGION_SCOPES.includes(region)) {
     log(`report-materialization: --region must be one of ${REGION_SCOPES.join(", ")} (got "${region}"). Refusing.`);
@@ -52,6 +55,14 @@ async function main() {
     log(`report-materialization: --as-of must be YYYY-MM-DD (got "${asOf}"). Refusing.`);
     process.exit(2);
   }
+  let only = null;
+  if (onlyArg != null) {
+    only = onlyArg === true ? [] : String(onlyArg).split(",").map((k) => k.trim()).filter(Boolean);
+    try { normalizeReportSubset(only); } catch (e) {
+      log(`report-materialization: invalid --only (${e && e.message ? e.message.replace(/^runReportMaterialization: /, "") : "unreadable"}). Refusing.`);
+      process.exit(2);
+    }
+  }
   const dryRun = mode !== "live";
   const ceiling = asOf ? String(asOf) : new Date().toISOString().slice(0, 10);
 
@@ -62,13 +73,13 @@ async function main() {
   }
 
   const accounts = await release.discoverAccounts(region);
-  log(`report-materialization[${region}] ${dryRun ? "DRY-RUN" : "LIVE"} as-of ${ceiling}: ${accounts.length} primary account(s).`);
+  log(`report-materialization[${region}] ${dryRun ? "DRY-RUN" : "LIVE"} as-of ${ceiling}${only ? ` only ${only.join(",")}` : ""}: ${accounts.length} primary account(s).`);
   if (!accounts.length) {
     log("report-materialization: no primary accounts in this region. Nothing to materialize.");
     process.exit(0);
   }
 
-  const result = await runReportMaterialization({ region, accounts, ceiling, dryRun }, { ...release, log });
+  const result = await runReportMaterialization({ region, accounts, ceiling, dryRun, only }, { ...release, log });
   const s = result.summary;
 
   // Per-report tally (materialized / unchanged / unavailable / error), most useful for the natural-run readback.

@@ -35,8 +35,10 @@ export const PRIORITY_DASHBOARD_SOURCES = Object.freeze({
 const toRow = (rows, sourceKey, bucket) => (rows || []).find((r) => (r.source_key ?? r.sourceKey) === sourceKey && (r.bucket === bucket)) || null;
 
 // Sources whose operator status is written PER REGION (the scheduler-v2 asin_ads job writes (ads-asin-date, region)
-// rows). Their card in a legacy us / non-us bucket FOLDS that bucket's regions when the bucket has no row of its own.
-export const REGIONAL_STATUS_SOURCES = Object.freeze({ "ads-asin-date": Object.freeze({ us: Object.freeze(["us-ca"]), "non-us": Object.freeze(["india", "europe-au"]) }) });
+// rows; the returns_source job writes (returns, region) rows). Their card in a legacy us / non-us bucket FOLDS that
+// bucket's regions when the bucket has no row of its own.
+const LEGACY_BUCKET_REGIONS = Object.freeze({ us: Object.freeze(["us-ca"]), "non-us": Object.freeze(["india", "europe-au"]) });
+export const REGIONAL_STATUS_SOURCES = Object.freeze({ "ads-asin-date": LEGACY_BUCKET_REGIONS, returns: LEGACY_BUCKET_REGIONS });
 const STATUS_SEVERITY = ["never", "succeeded", "paused", "running", "partial", "failed"];
 // PURE: fold the region rows of one bucket into ONE card row -- the WORST status, the latest attempt, a success time and
 // covered window only when EVERY region has one (the bucket is covered through its earliest region), summed counts and

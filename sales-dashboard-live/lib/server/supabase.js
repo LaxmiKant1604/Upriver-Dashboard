@@ -2920,19 +2920,33 @@ export async function replaceOliSalesEstimatesWindow({ organizationFingerprint, 
 }
 
 /* ===================== Returns & Refund Leakage -- durable Returns + Settlement history ===================== */
+// The durable Returns history columns. returned_units (migration 20260942) is the group's unit count, NULL when units
+// are unavailable (every legacy row, and any group with an event lacking a positive quantity).
+const RETURNS_HISTORY_SELECT_V1 = "account_id,seller_or_vendor_id,marketplace_country_code,return_date,sku,child_asin,amazon_return_reason,fulfillment_channel,request_status,label_payer,detailed_disposition,return_count,fbm_refunded_amount,fbm_seller_label_cost,cogs_total_value,source_request_hash,refreshed_at";
+const RETURNS_HISTORY_SELECT = `${RETURNS_HISTORY_SELECT_V1},returned_units`;
+// True only for an undefined_column error about returned_units (the code running before migration 20260942 is applied):
+// Postgres 42703 through PostgREST, or its message carried in the request helper's error text.
+function isReturnedUnitsColumnMissing(error) {
+  const code = error && typeof error.code === "string" ? error.code : "";
+  const message = error && error.message ? String(error.message) : "";
+  return code === "42703" || /column .*returned_units.* does not exist/i.test(message);
+}
+
 // Read the durable per-account Returns history (source_returns_history) over a [from,to] return_date window. Paginated
 // + hard-capped; pre-migration (schema absent) returns [] so the dedicated returns publisher degrades to
-// last-known-good rather than throwing. ZERO DataDoe -- reads already-fetched durable evidence.
+// last-known-good rather than throwing. ZERO DataDoe -- reads already-fetched durable evidence. Each row carries
+// returned_units; before migration 20260942 adds that column (42703) the read restarts ONCE with the former column list
+// and every row gets returned_units: null (units unavailable -- never a fabricated 0).
 export async function getReturnsHistoryRows({ organizationFingerprint, connectionId = "primary", accountIds = null, from, to, maxRows = SOURCE_OLI_HISTORY_MAX_ROWS, pageRows = SOURCE_OLI_HISTORY_PAGE_ROWS, signal = null } = {}) {
   if (!organizationFingerprint || !from || !to) {
     throw new Error("getReturnsHistoryRows requires organizationFingerprint + from + to (fail closed).");
   }
   const PAGE = Math.max(1, Number(pageRows) || SOURCE_OLI_HISTORY_PAGE_ROWS);
-  const outRows = [];
-  try {
+  const readAll = async (select) => {
+    const outRows = [];
     for (let offset = 0; ; offset += PAGE) {
       const query = new URLSearchParams({
-        select: "account_id,seller_or_vendor_id,marketplace_country_code,return_date,sku,child_asin,amazon_return_reason,fulfillment_channel,request_status,label_payer,detailed_disposition,return_count,fbm_refunded_amount,fbm_seller_label_cost,cogs_total_value,source_request_hash,refreshed_at",
+        select,
         organization_fingerprint: `eq.${organizationFingerprint}`,
         connection_id: `eq.${connectionId}`,
         return_date: `gte.${from}`,
@@ -2954,12 +2968,20 @@ export async function getReturnsHistoryRows({ organizationFingerprint, connectio
       }
       if (list.length < PAGE) break;
     }
+    return outRows;
+  };
+  try {
+    try {
+      return await readAll(RETURNS_HISTORY_SELECT);
+    } catch (readError) {
+      if (!isReturnedUnitsColumnMissing(readError)) throw readError;
+      return (await readAll(RETURNS_HISTORY_SELECT_V1)).map((row) => ({ ...row, returned_units: null }));
+    }
   } catch (readError) {
     if (readError && readError.code === "RETURNS_HISTORY_ROW_LIMIT_EXCEEDED") throw readError;
     if (isSchemaMissingError(readError)) return []; // durable returns table not yet applied -> LKG
     throw readError;
   }
-  return outRows;
 }
 
 // STANDALONE atomic replace of ONLY the returns window for one account (delete + insert by exact account/return_date
@@ -3097,6 +3119,348 @@ export async function replaceSettlementHistoryWindow({ organizationFingerprint, 
     if (isSchemaMissingError(writeError)) return { write: "schema-missing", replaced: 0, inserted: 0, error: "SETTLEMENT_HISTORY_SCHEMA_MISSING" };
     return { write: "write-failed", replaced: 0, inserted: 0, error: "SETTLEMENT_HISTORY_REPLACE_FAILED" };
   }
+}
+
+/* ===================== Returns (FBA & FBM) EVENT SOURCE -- migration 20260942 ===================== */
+// One durable row per source return event (source_returns_events) + the per-account state, the region run lease and the
+// create ceiling per region per UTC claim day (the DB clock). Every WRITE is ONE SECURITY DEFINER RPC of supabase/migrations/
+// 20260942_returns_event_source.sql: it validates everything before any change and refuses with a FIXED
+// '<rpc>: <CODE>' string. The RPC wrappers THROW on any failure with a SAFE Error -- .status (HTTP status, null for a
+// transport failure), .code (the PostgREST / Postgres code, or null) and .returnsCode (that fixed CODE, parsed with
+// /^[a-z_]+: ([A-Z0-9_]+)/; null otherwise). The message names only the RPC, the status and a code: the server text is
+// never copied, so no parameter or row value can reach a log. Every argument is always sent (undefined -> null), so a
+// missing one comes back as the RPC's own typed refusal rather than a PostgREST signature miss. The three readers never
+// throw: typed { read } results, paged in primary-key order and row-capped (fail closed). ZERO DataDoe.
+const RETURNS_RPC_CODE = /^[a-z_]+: ([A-Z0-9_]+)/;
+const returnsArg = (v) => (v === undefined ? null : v);
+function returnsRpcFailure(rpcName, { status = null, code = null, returnsCode = null, label }) {
+  const failure = new Error(`${rpcName} failed${status === null ? "" : ` (${status})`}: ${label}`);
+  failure.name = "ReturnsRpcError";
+  failure.status = status;
+  failure.code = code;
+  failure.returnsCode = returnsCode;
+  return failure;
+}
+function returnsRpcError(rpcName, error) {
+  const status = error && Number.isInteger(error.status) ? error.status : null;
+  const code = error && typeof error.code === "string" && /^[A-Za-z0-9_]{1,32}$/.test(error.code) ? error.code : null;
+  // request() carries PostgREST's message as "Supabase request failed (<status>): <message>"; only the fixed code is kept.
+  const serverMessage = String((error && error.message) || "").replace(/^Supabase request failed \(\d+\): /, "");
+  const match = status === null ? null : RETURNS_RPC_CODE.exec(serverMessage);
+  const returnsCode = match ? match[1] : null;
+  return returnsRpcFailure(rpcName, { status, code, returnsCode, label: returnsCode || code || (status === null ? "TRANSPORT" : "UNTYPED") });
+}
+const returnsResponseInvalid = (rpcName) => returnsRpcFailure(rpcName, { code: "RETURNS_RPC_RESPONSE_INVALID", label: "RESPONSE_INVALID" });
+async function callReturnsRpc(path, body, signal) {
+  requireConfiguration();
+  const rpcName = path.slice(path.lastIndexOf("/") + 1);
+  let result;
+  try {
+    result = await request(path, { method: "POST", body, signal });
+  } catch (error) {
+    throw returnsRpcError(rpcName, error);
+  }
+  const value = Array.isArray(result) && result.length === 1 ? result[0] : result;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw returnsResponseInvalid(rpcName);
+  return value;
+}
+
+// 1.6 replace_returns_events_window -- the ONE atomic writer of an account window (events + derived history + compacted
+// coverage + state + log). `events` are the Event JSON objects (keys == source_returns_events columns; order_owner is
+// computed by the RPC). Returns { eventsDeleted, eventsInserted, unitsInserted, aggregatesDeleted, aggregatesInserted,
+// ownerSelf, ownerOther, ownerUnknown, oldCount, initialStatus }.
+export async function replaceReturnsEventsWindow({ organizationFingerprint, connectionId = "primary", accountId, sellerOrVendorId, marketplace, from, to,
+  mode, events, expectedCount, expectedUnits, requestHashes, exportIds, fragmentRows, sourceRefreshedAt, attribution,
+  allowShrink = false, identityStatus, identityDetail = {}, ownerToken, generation, runKey, region, signal = null } = {}) {
+  return callReturnsRpc("/rest/v1/rpc/replace_returns_events_window", {
+    p_organization_fingerprint: returnsArg(organizationFingerprint),
+    p_connection_id: returnsArg(connectionId),
+    p_account_id: returnsArg(accountId),
+    p_seller_or_vendor_id: returnsArg(sellerOrVendorId),
+    p_marketplace_country_code: returnsArg(marketplace),
+    p_covered_from: returnsArg(from),
+    p_covered_to: returnsArg(to),
+    p_mode: returnsArg(mode),
+    p_events: returnsArg(events),
+    p_expected_count: returnsArg(expectedCount),
+    p_expected_units: returnsArg(expectedUnits),
+    p_request_hashes: returnsArg(requestHashes),
+    p_export_ids: returnsArg(exportIds),
+    p_fragment_rows: returnsArg(fragmentRows),
+    p_source_refreshed_at: returnsArg(sourceRefreshedAt),
+    p_attribution: returnsArg(attribution),
+    p_allow_shrink: returnsArg(allowShrink),
+    p_identity_status: returnsArg(identityStatus),
+    p_identity_detail: returnsArg(identityDetail),
+    p_owner_token: returnsArg(ownerToken),
+    p_generation: returnsArg(generation),
+    p_run_key: returnsArg(runKey),
+    p_region: returnsArg(region),
+  }, signal);
+}
+
+// 1.7 confirm_returns_events_window -- the post-commit, zero-token server-side read-back. Returns { verified, reason:
+// 'verified' | 'held' | 'superseded' | 'mismatch', counts, initialStatus }; 'superseded' changed nothing.
+export async function confirmReturnsEventsWindow({ organizationFingerprint, connectionId = "primary", accountId, from, to, mode, expectedCount,
+  expectedUnits, requestHashes, runKey, region, signal = null } = {}) {
+  return callReturnsRpc("/rest/v1/rpc/confirm_returns_events_window", {
+    p_organization_fingerprint: returnsArg(organizationFingerprint),
+    p_connection_id: returnsArg(connectionId),
+    p_account_id: returnsArg(accountId),
+    p_covered_from: returnsArg(from),
+    p_covered_to: returnsArg(to),
+    p_mode: returnsArg(mode),
+    p_expected_count: returnsArg(expectedCount),
+    p_expected_units: returnsArg(expectedUnits),
+    p_request_hashes: returnsArg(requestHashes),
+    p_run_key: returnsArg(runKey),
+    p_region: returnsArg(region),
+  }, signal);
+}
+
+// 1.8 record_returns_window_failure -- state last_* + a 'failed' log row only (never events / history / coverage).
+// errorCode ^[A-Z0-9_]{1,64}$; detail a jsonb object <= 8192 bytes (counts, typed codes, dates only). -> { recorded, initialStatus }
+export async function recordReturnsWindowFailure({ organizationFingerprint, connectionId = "primary", accountId, marketplace, mode, from, to, errorCode,
+  detail = {}, runKey, region, signal = null } = {}) {
+  return callReturnsRpc("/rest/v1/rpc/record_returns_window_failure", {
+    p_organization_fingerprint: returnsArg(organizationFingerprint),
+    p_connection_id: returnsArg(connectionId),
+    p_account_id: returnsArg(accountId),
+    p_marketplace_country_code: returnsArg(marketplace),
+    p_mode: returnsArg(mode),
+    p_covered_from: returnsArg(from),
+    p_covered_to: returnsArg(to),
+    p_error_code: returnsArg(errorCode),
+    p_detail: returnsArg(detail),
+    p_run_key: returnsArg(runKey),
+    p_region: returnsArg(region),
+  }, signal);
+}
+
+// 1.9 rebuild_returns_history_from_events -- zero-export re-derive of a covered window from the stored events (e.g. after an
+// attribution change). -> { aggregatesDeleted, aggregatesInserted, events, attributedEvents, attribution }
+export async function rebuildReturnsHistoryFromEvents({ organizationFingerprint, connectionId = "primary", accountId, from, to, attribution, runKey, region, signal = null } = {}) {
+  return callReturnsRpc("/rest/v1/rpc/rebuild_returns_history_from_events", {
+    p_organization_fingerprint: returnsArg(organizationFingerprint),
+    p_connection_id: returnsArg(connectionId),
+    p_account_id: returnsArg(accountId),
+    p_covered_from: returnsArg(from),
+    p_covered_to: returnsArg(to),
+    p_attribution: returnsArg(attribution),
+    p_run_key: returnsArg(runKey),
+    p_region: returnsArg(region),
+  }, signal);
+}
+
+// 1.4 claim_returns_create_slot -- claim ONE create of the region's ceiling for the DB's UTC claim day (asOf is validated and
+// only recorded) under the live run lease BEFORE every create POST. -> { granted, claimed, max } (granted false at the ceiling; a lost lease throws returnsCode RETURNS_LEASE_LOST).
+export async function claimReturnsCreateSlot({ region, asOf, maxCreates, ownerToken, generation, runKey, requestHash, signal = null } = {}) {
+  const value = await callReturnsRpc("/rest/v1/rpc/claim_returns_create_slot", {
+    p_region: returnsArg(region),
+    p_as_of: returnsArg(asOf),
+    p_max_creates: returnsArg(maxCreates),
+    p_owner_token: returnsArg(ownerToken),
+    p_generation: returnsArg(generation),
+    p_run_key: returnsArg(runKey),
+    p_request_hash: returnsArg(requestHash),
+  }, signal);
+  if (typeof value.granted !== "boolean" || !Number.isSafeInteger(value.claimed) || !Number.isSafeInteger(value.max)) throw returnsResponseInvalid("claim_returns_create_slot");
+  return { granted: value.granted, claimed: value.claimed, max: value.max };
+}
+
+// 1.4b the region run lease (DB clock). acquire -> { granted, generation, expiresAt, holderRunKey } (granted only when the
+// region has no live lease; refused -> generation null + the holder's run key and expiry).
+export async function acquireReturnsRunLease({ region, ownerToken, ttlSeconds, runKey, signal = null } = {}) {
+  const value = await callReturnsRpc("/rest/v1/rpc/acquire_returns_run_lease", {
+    p_region: returnsArg(region),
+    p_owner_token: returnsArg(ownerToken),
+    p_ttl_seconds: returnsArg(ttlSeconds),
+    p_run_key: returnsArg(runKey),
+  }, signal);
+  const granted = value.granted;
+  if (typeof granted !== "boolean" || (granted && (!Number.isSafeInteger(value.generation) || value.generation < 1 || typeof value.expiresAt !== "string"))) {
+    throw returnsResponseInvalid("acquire_returns_run_lease");
+  }
+  return {
+    granted,
+    generation: granted ? value.generation : null,
+    expiresAt: typeof value.expiresAt === "string" ? value.expiresAt : null,
+    holderRunKey: typeof value.holderRunKey === "string" ? value.holderRunKey : null,
+  };
+}
+
+// renew -> { renewed, expiresAt }: only the live owner with its exact generation renews; an expired lease never does.
+export async function renewReturnsRunLease({ region, ownerToken, generation, ttlSeconds, signal = null } = {}) {
+  const value = await callReturnsRpc("/rest/v1/rpc/renew_returns_run_lease", {
+    p_region: returnsArg(region),
+    p_owner_token: returnsArg(ownerToken),
+    p_generation: returnsArg(generation),
+    p_ttl_seconds: returnsArg(ttlSeconds),
+  }, signal);
+  if (typeof value.renewed !== "boolean" || (value.renewed && typeof value.expiresAt !== "string")) throw returnsResponseInvalid("renew_returns_run_lease");
+  return { renewed: value.renewed, expiresAt: value.renewed ? value.expiresAt : null };
+}
+
+// release -> { released }: deletes ONLY the caller's (token, generation) row; anything else is a no-op.
+export async function releaseReturnsRunLease({ region, ownerToken, generation, signal = null } = {}) {
+  const value = await callReturnsRpc("/rest/v1/rpc/release_returns_run_lease", {
+    p_region: returnsArg(region),
+    p_owner_token: returnsArg(ownerToken),
+    p_generation: returnsArg(generation),
+  }, signal);
+  if (typeof value.released !== "boolean") throw returnsResponseInvalid("release_returns_run_lease");
+  return { released: value.released };
+}
+
+// 1.11 owner-approved handback of ONE account to the legacy writer. -> { released, reason?, coverageRowsDeleted?, initialStatus? }
+export async function releaseReturnsLegacyFence({ organizationFingerprint, connectionId = "primary", accountId, runKey, region, signal = null } = {}) {
+  return callReturnsRpc("/rest/v1/rpc/release_returns_legacy_fence", {
+    p_organization_fingerprint: returnsArg(organizationFingerprint),
+    p_connection_id: returnsArg(connectionId),
+    p_account_id: returnsArg(accountId),
+    p_run_key: returnsArg(runKey),
+    p_region: returnsArg(region),
+  }, signal);
+}
+
+// 1.11b owner-approved release of an identity hold (the next run re-does the 60-day initial load). -> { released, reason?, initialStatus? }
+export async function releaseReturnsIdentityHold({ organizationFingerprint, connectionId = "primary", accountId, runKey, region, signal = null } = {}) {
+  return callReturnsRpc("/rest/v1/rpc/release_returns_identity_hold", {
+    p_organization_fingerprint: returnsArg(organizationFingerprint),
+    p_connection_id: returnsArg(connectionId),
+    p_account_id: returnsArg(accountId),
+    p_run_key: returnsArg(runKey),
+    p_region: returnsArg(region),
+  }, signal);
+}
+
+const RETURNS_STATE_SELECT = "organization_fingerprint,connection_id,account_id,marketplace_country_code,initial_status,initial_window_from,initial_window_to,initial_loaded_at,initial_verified_at,last_mode,last_window_from,last_window_to,last_status,last_attempt_at,last_success_at,last_event_count,last_unit_sum,last_request_hashes,last_export_ids,last_error_code,last_run_key,last_region,legacy_fence,identity_status,hold_reason,identity_detail,created_at,updated_at";
+const isReturnsDay = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+
+// Per-account state rows (snake_case, every column) of one organization + connection, ordered by account_id (with org +
+// connection pinned that is the primary key: a total order for offset paging). accountIds null = every account; [] =
+// none. -> { read: 'ok', rows } | { read: 'missing' } (migration not applied) | { read: 'error' } (any other failure or
+// more than maxRows rows -- fail closed: the planner treats the accounts as 'pending').
+export async function getReturnsAccountStates({ organizationFingerprint, connectionId = "primary", accountIds = null, maxRows = 10000, pageRows = 1000, signal = null } = {}) {
+  if (!organizationFingerprint || !connectionId) return { read: "error" };
+  const ids = accountIds == null ? null
+    : [...new Set((Array.isArray(accountIds) ? accountIds : [accountIds]).map((a) => String(a ?? "").trim()).filter(Boolean))].sort();
+  if (ids && ids.length === 0) return { read: "ok", rows: [] };
+  const PAGE = Math.max(1, Math.min(1000, Number(pageRows) || 1000));
+  const groups = [];
+  if (ids) for (let i = 0; i < ids.length; i += 100) groups.push(ids.slice(i, i + 100));
+  else groups.push(null);
+  const rows = [];
+  try {
+    for (const group of groups) {
+      for (let offset = 0; ; offset += PAGE) {
+        const query = new URLSearchParams({
+          select: RETURNS_STATE_SELECT,
+          organization_fingerprint: `eq.${organizationFingerprint}`,
+          connection_id: `eq.${connectionId}`,
+          order: "account_id.asc",
+          limit: String(PAGE),
+          offset: String(offset),
+        });
+        if (group) query.append("account_id", `in.(${group.map((a) => `"${a.replaceAll('"', "")}"`).join(",")})`);
+        const list = await request(`/rest/v1/source_returns_account_state?${query}`, { signal });
+        if (!Array.isArray(list)) return { read: "error" };
+        rows.push(...list);
+        if (rows.length > maxRows) return { read: "error" };
+        if (list.length < PAGE) break;
+      }
+    }
+  } catch (readError) {
+    return isSchemaMissingError(readError) ? { read: "missing" } : { read: "error" };
+  }
+  return { read: "ok", rows };
+}
+
+// The EXACT number of one account's stored events over return_date [from, to] (one GET, select=return_date&limit=1 with
+// Prefer: count=exact -> the Content-Range total). -> { read: 'ok', count } | { read: 'error' } (a malformed argument, a
+// missing table, a transport / HTTP failure or an absent / malformed total; the runner records 'verify-unreadable').
+export async function countReturnsEventsWindow({ organizationFingerprint, connectionId = "primary", accountId, from, to, signal = null } = {}) {
+  if (!organizationFingerprint || !connectionId || String(accountId ?? "").trim() === "" || !isReturnsDay(from) || !isReturnsDay(to) || from > to) return { read: "error" };
+  try {
+    requireConfiguration();
+    const query = new URLSearchParams({
+      select: "return_date",
+      organization_fingerprint: `eq.${organizationFingerprint}`,
+      connection_id: `eq.${connectionId}`,
+      account_id: `eq.${accountId}`,
+      return_date: `gte.${from}`,
+      limit: "1",
+    });
+    query.append("return_date", `lte.${to}`);
+    const response = await fetchReadOnly(`${SUPABASE_URL}/rest/v1/source_returns_events?${query}`, {
+      method: "GET",
+      headers: { apikey: SUPABASE_SECRET_KEY, Authorization: `Bearer ${SUPABASE_SECRET_KEY}`, Prefer: "count=exact" },
+      ...(signal ? { signal } : {}),
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok || !Array.isArray(body)) return { read: "error" };
+    const total = /\/(\d+)\s*$/.exec(String((response.headers && typeof response.headers.get === "function" && response.headers.get("content-range")) || ""));
+    const count = total ? Number(total[1]) : NaN;
+    if (!Number.isSafeInteger(count) || count < 0 || (count === 0) !== (body.length === 0)) return { read: "error" };
+    return { read: "ok", count };
+  } catch (_readError) {
+    return { read: "error" };
+  }
+}
+
+// The returns-detail rows of ONE account + child ASIN over return_date [from, to]: ONLY the twelve display columns are
+// returned (never the seller id, LPN, FNSKU, COGS, keys or hashes), ordered return_date, event_key, occurrence (with org,
+// connection and account pinned: the primary key -> a total order). KEYSET paging: every page after the first asks for
+// the rows strictly AFTER the previous page's last (return_date, event_key, occurrence) -- the two key columns are read
+// ONLY as that cursor and never returned -- so a row inserted or deleted between two page requests cannot shift a page
+// boundary (no row twice, no row skipped; OFFSET paging would do both). A malformed cursor value or a repeated key fails
+// closed. At most maxRows rows: one more row than the cap is 'too-many' (fail closed, never a truncated list).
+// -> { read: 'ok', rows } | { read: 'missing' } | { read: 'error' } | { read: 'too-many' }
+const RETURNS_EVENT_DETAIL_COLUMNS = Object.freeze(["return_date", "amazon_order_id", "quantity", "fulfillment_channel", "amazon_return_reason",
+  "request_status", "detailed_disposition", "rma_id", "seller_rma_id", "label_paid_by", "refunded_amount", "order_owner"]);
+const RETURNS_EVENT_DETAIL_CURSOR = Object.freeze(["event_key", "occurrence"]);
+export async function getReturnsEventDetailRows({ organizationFingerprint, connectionId = "primary", accountId, childAsin, from, to, maxRows = 2000, pageRows = 1000, signal = null } = {}) {
+  if (!organizationFingerprint || !connectionId || String(accountId ?? "").trim() === "" || String(childAsin ?? "").trim() === ""
+    || !isReturnsDay(from) || !isReturnsDay(to) || from > to) return { read: "error" };
+  const cap = Number.isSafeInteger(maxRows) && maxRows >= 0 ? maxRows : 2000;
+  const PAGE = Math.max(1, Math.min(1000, Number(pageRows) || 1000));
+  const rows = [];
+  const seen = new Set();
+  let after = null; // the last row read: { d: return_date, k: event_key, o: occurrence } (validated before it is used)
+  try {
+    for (;;) {
+      const limit = Math.min(PAGE, cap + 1 - rows.length);
+      const query = new URLSearchParams({
+        select: [...RETURNS_EVENT_DETAIL_COLUMNS, ...RETURNS_EVENT_DETAIL_CURSOR].join(","),
+        organization_fingerprint: `eq.${organizationFingerprint}`,
+        connection_id: `eq.${connectionId}`,
+        account_id: `eq.${accountId}`,
+        child_asin: `eq.${childAsin}`,
+        return_date: `gte.${from}`,
+        order: "return_date.asc,event_key.asc,occurrence.asc",
+        limit: String(limit),
+      });
+      query.append("return_date", `lte.${to}`);
+      // (return_date, event_key, occurrence) > the cursor, as PostgREST logic (it has no row-value comparison).
+      if (after) query.append("or", `(return_date.gt.${after.d},and(return_date.eq.${after.d},event_key.gt.${after.k}),and(return_date.eq.${after.d},event_key.eq.${after.k},occurrence.gt.${after.o}))`);
+      const list = await request(`/rest/v1/source_returns_events?${query}`, { signal });
+      if (!Array.isArray(list)) return { read: "error" };
+      for (const r of list) {
+        const d = r ? r.return_date : null; const k = r ? r.event_key : null; const o = r ? r.occurrence : null;
+        if (!isReturnsDay(d) || typeof k !== "string" || !/^[0-9a-f]{64}$/.test(k) || !Number.isSafeInteger(o) || o < 1) return { read: "error" };
+        const id = d + "|" + k + "|" + o;
+        if (seen.has(id)) return { read: "error" };
+        seen.add(id);
+        rows.push(Object.fromEntries(RETURNS_EVENT_DETAIL_COLUMNS.map((c) => [c, r[c] === undefined ? null : r[c]])));
+        after = { d, k, o };
+      }
+      if (rows.length > cap) return { read: "too-many" };
+      if (list.length < limit) break;
+    }
+  } catch (readError) {
+    return isSchemaMissingError(readError) ? { read: "missing" } : { read: "error" };
+  }
+  return { read: "ok", rows };
 }
 
 // Durable read helper for future fulfillment / state / city contribution slices WITHOUT another historical

@@ -515,7 +515,7 @@ test("H3 the scheduled CLI is OFF unless source_controls.schedule_enabled; the p
   assert.match(cli, /if \(ctl && ctl\.paused === true\)/);
   assert.match(cli, /requires --confirm-paid/); assert.match(cli, /--max-creates=N \(a non-negative integer\) is REQUIRED/);
   assert.match(cli, /balance - worstTokens < reserveTokens/);
-  assert.deepEqual([...SSO.OPERATOR_SWITCHED_SOURCE_KEYS], ["ads-asin-date"]);
+  assert.deepEqual([...SSO.OPERATOR_SWITCHED_SOURCE_KEYS], ["ads-asin-date", "returns"]);
   assert.ok(!SSO.scheduledSourceControlPlan(["ads-asin-date", "order-line-items"]).some((p) => p.sourceKey === "ads-asin-date"), "the config sweep would overwrite the ASIN switch");
 });
 test("H4 the bucket slice refuses a plan above the approval with ZERO creates", async () => {

@@ -18,9 +18,10 @@ export const OLI_TOKENS_PER_CREATE = 2; // one STANDARD DataDoe export
 export const SCHEDULED_ENABLED_SOURCE_KEYS = Object.freeze(["order-line-items", "product-catalog", "ads-campaign-date"]);
 
 // OPERATOR-SWITCHED families: their source_controls.schedule_enabled is the durable ON/OFF switch the scheduler-v2 job
-// itself READS (ASIN Ads: the asin_ads job runs only while it is true), so this config sweep never writes it and never
-// treats it as unexpected -- it is turned on/off deliberately by the owner-approved operator step, nowhere else.
-export const OPERATOR_SWITCHED_SOURCE_KEYS = Object.freeze(["ads-asin-date"]);
+// itself READS (ASIN Ads: the asin_ads job runs only while it is true; Returns (FBA & FBM) events: the returns_source job
+// likewise), so this config sweep never writes it and never treats it as unexpected -- each is turned on/off deliberately
+// by its owner-approved operator step (asin-ads-schedule-switch.mjs / returns-schedule-switch.mjs), nowhere else.
+export const OPERATOR_SWITCHED_SOURCE_KEYS = Object.freeze(["ads-asin-date", "returns"]);
 
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";

@@ -38,6 +38,8 @@ export function buildReportMaterializationRelease(overrides = {}) {
     // Injectable durable readers / writers (default: the real Supabase functions). BUILD-TIME test seam only.
     readSkuOliHistory = getSourceOliHistoryRows,
     readOliCoverage = getSourceCoverageWindows,
+    // The Returns event source's 'returns' coverage windows (same read-only source_coverage reader, its own key).
+    readReturnsCoverage = (a) => getSourceCoverageWindows({ ...a, sourceKey: "returns" }),
     readCatalogSnapshot = getSourceSnapshot,
     loadCatalogPayload = getSourceSnapshotPayload,
     readOliOperationalUnits = getSourceOliOperationalUnitRows,
@@ -87,6 +89,9 @@ export function buildReportMaterializationRelease(overrides = {}) {
   const returnsReaders = {
     readReturnsHistory, readSettlementHistory, readOliHistory: readSkuOliHistory, readOliCoverage,
     readOliOperationalUnits, readCatalogSnapshot, loadCatalogPayload, readOliSkuAsinResolution, readDirectory,
+    // OPTIONAL (the Returns event source): the account's 'returns' coverage windows -> the payload's per-day returns
+    // coverage (returnsCoveredThrough / returnsCoverageWindows / returnsLegacyCoveredThrough).
+    readReturnsCoverage,
   };
 
   const deriveBrandViewBrands = ({ accountId }) => buildBrandViewBrands({ accountId, getSnapshot });
