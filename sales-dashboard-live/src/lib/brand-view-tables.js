@@ -307,7 +307,13 @@ export function buildMonthlyTable({ monthly, groups, displayCurrency, scope }) {
   groups.forEach((group, index) => {
     if (banded) rows.push(currencyBand(group, displayCurrency, index));
 
-    const groupTacos = tacos(group.totals.adSpend, group.totals.currentActual);
+    // All Markets month-to-date Ad Spend is COMPLETE only when every marketplace row has an available spend (the same
+    // withhold as the Daily table): currencyGroups sums with addMaybe, which silently omits an unavailable marketplace.
+    const monthSpendComplete = group.rows.every((row) => row.adSpend !== null && row.adSpend !== undefined);
+    const monthGroupSpend = monthSpendComplete ? group.totals.adSpend : null;
+    const groupTacos = tacos(monthGroupSpend, group.totals.currentActual);
+    const monthSpendHint = monthSpendComplete ? undefined
+      : "Withheld: at least one marketplace's month-to-date Ad Spend is unavailable (a day not reported yet, no saved Ads coverage, unmapped campaigns, or no exchange rate), so the All Markets Ad Spend and TACoS are not shown as a partial total.";
     if (showsTotalRow(group, groups.length)) rows.push({
       key: `total-${group.key}`,
       kind: "total",
@@ -320,9 +326,10 @@ export function buildMonthlyTable({ monthly, groups, displayCurrency, scope }) {
         }),
         cell(money(group.totals.currentActual, group.currency, SALES_DECIMALS), group.totals.currentActual),
         cell(money(group.totals.runRate, group.currency, SALES_DECIMALS), group.totals.runRate),
-        cell(money(group.totals.adSpend, group.currency, SPEND_DECIMALS), group.totals.adSpend),
+        cell(money(monthGroupSpend, group.currency, SPEND_DECIMALS), monthGroupSpend),
         cell(ratePct(groupTacos), groupTacos === null ? null : groupTacos * 100),
       ],
+      ...(monthSpendHint ? { hints: [...Array(completed.length + 3).fill(undefined), monthSpendHint, monthSpendHint] } : {}),
     });
 
     for (const row of group.rows) {
@@ -380,7 +387,8 @@ export function buildWeeklyTable({ weekly, groups, displayCurrency, rates, scope
 
     const totals = sevenDayColumnTotals(group, dates, displayCurrency, rates);
     const weekSales = group.totals.sales;
-    const weekSpend = group.totals.adSpend;
+    // Every marketplace row's 7D spend must be available (each is itself strict over its seven days).
+    const weekSpend = group.rows.every((row) => row.adSpend !== null && row.adSpend !== undefined) ? group.totals.adSpend : null;
     const weekTacos = tacos(weekSpend, weekSales);
 
     rows.push({

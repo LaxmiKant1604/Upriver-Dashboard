@@ -5,7 +5,7 @@
 // -- never Infinity, NaN, or a fabricated zero). Advertising that a period does not cover is `null` (an honest gap),
 // never 0. 7-bit ASCII.
 
-import { formatDailyRoi, formatDailyAcos, formatDailyTacos, oliCovMissing, oliRatioBlocked, EM_DASH } from "./daily-metrics.js";
+import { formatDailyRoi, formatDailyAcos, formatDailyTacos, oliCovMissing, oliRatioBlocked, adRatioBlocked, EM_DASH } from "./daily-metrics.js";
 
 // Index of the MTD column in a daily report; -1 when there is none. The column set is dynamic (built from the
 // account's latest proven date), so the MTD position is found by group, never hard-coded.
@@ -26,13 +26,17 @@ export function dailyMtdKpis(report) {
   const cell = ((report && report.cells) || [])[idx];
   if (!cell) return null;
   const covMissing = oliCovMissing(cell);      // unavailable / unknown -> the OLI total is NOT shown (em dash)
-  const ratioBlocked = oliRatioBlocked(cell);  // partial / unavailable / unknown -> a period ratio is not meaningful
+  // partial / unavailable / unknown OLI coverage, or ad totals missing an unknown (undelivered) day -> no period ratio
+  const ratioBlocked = oliRatioBlocked(cell) || adRatioBlocked(cell);
   return {
     label: report.columns[idx].label,
     totalSales: covMissing ? null : (Number(cell.sales) || 0),
     salesPartial: cell.status === "partial",
     adSales: cell.hasAd ? Number(cell.adSales) || 0 : null,
     adSpend: cell.hasAd ? Number(cell.adSpend) || 0 : null,
+    adsPartial: adRatioBlocked(cell),
+    adKnownDays: Number.isFinite(cell.adKnownDays) ? cell.adKnownDays : null,
+    adTotalDays: Number.isFinite(cell.adTotalDays) ? cell.adTotalDays : null,
     roi: ratioBlocked ? EM_DASH : formatDailyRoi(cell.sales, cell.adSpend, cell.hasAd),
     acos: formatDailyAcos(cell.adSpend, cell.adSales, cell.hasAd),
     tacos: ratioBlocked ? EM_DASH : formatDailyTacos(cell.adSpend, cell.sales, cell.hasAd),
@@ -55,7 +59,18 @@ export function dailyTrendSeries(report) {
     adSales: days.map((d) => (d.cell.hasAd ? Number(d.cell.adSales) || 0 : null)),
     roi: days.map((d) => (!oliRatioBlocked(d.cell) && d.cell.hasAd && Number(d.cell.adSpend) > 0 ? Number(d.cell.sales) / Number(d.cell.adSpend) : null)),
     acos: days.map((d) => (d.cell.hasAd && Number(d.cell.adSales) > 0 ? (Number(d.cell.adSpend) / Number(d.cell.adSales)) * 100 : null)),
+    // A day whose advertising was not received for the account (unknown -- delayed or no activity, the provider does
+    // not say which). Any such day makes the ad trends (Ad Sales, ROI, ACoS) partial. Older cells without the counts
+    // are treated as known (no claim either way).
+    adUnknown: days.map((d) => Number.isFinite(d.cell.adTotalDays) && Number.isFinite(d.cell.adKnownDays) && d.cell.adKnownDays < d.cell.adTotalDays),
   };
+}
+
+// The index of the last finite value of a trend series (-1 when none), so the card can say WHICH day its headline is.
+export function lastFiniteIndex(series) {
+  const arr = Array.isArray(series) ? series : [];
+  for (let i = arr.length - 1; i >= 0; i--) { if (Number.isFinite(arr[i])) return i; }
+  return -1;
 }
 
 // The last finite value of a trend series (the trend card's headline number), or null when the series has no finite

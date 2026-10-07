@@ -28,6 +28,7 @@ import { marketplaceProfile } from "../marketplaces.js";
 // still refused here at the one chokepoint they all flow through, before any lock / DataDoe / Supabase I/O.
 import { isAdsExportRunnerOnlyFor, ASIN_ADS_RUNNER_AUTHORIZATION } from "./active-ads-source.js";
 import { sanitizeExcerpt } from "./sync/source-failure-classifier.js";
+import { formatAdsWriteFailure } from "./ads-row-prune.js";
 
 // Bounded HTTP retry cap (429 on any method; 5xx on a free idempotent GET only -- a 5xx create POST is ambiguous and
 // is reconciled by the runner, never blind-retried). Kept small so a run never exceeds the workflow's safe runtime.
@@ -1118,14 +1119,14 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
             // is not re-recorded. End state on success is identical to delete-then-insert. Absent the prune dependency
             // (older deps), the delete-then-insert below is unchanged.
             if (Array.isArray(source.aggregations) && source.aggregations.length && !pruneRows) {
-              const deleteFailedIds = new Set();
+              const deleteFailedIds = new Map();
               for (const { account } of workingBatch) {
                 const ack = await deleteRows({ accountId: account.id, sourceKey: source.key, from: range.from, to: range.to });
-                if (!ack || ack.write !== "ok") deleteFailedIds.add(account.id);
+                if (!ack || ack.write !== "ok") deleteFailedIds.set(account.id, formatAdsWriteFailure(ack, "ADS_ROWS_DELETE_FAILED"));
               }
               if (deleteFailedIds.size) {
                 const failedEntries = workingBatch.filter(({ account }) => deleteFailedIds.has(account.id));
-                await upsertStates(failedEntries.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, new Error("ADS_ROWS_DELETE_FAILED"), now)));
+                await upsertStates(failedEntries.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, new Error(deleteFailedIds.get(account.id)), now)));
                 summary.sources[source.key].failedAccounts.push(...failedEntries.map((e) => e.account.id));
                 workingBatch = workingBatch.filter(({ account }) => !deleteFailedIds.has(account.id));
                 normalized = normalized.filter((r) => !deleteFailedIds.has(r.account_id));
@@ -1136,17 +1137,21 @@ export async function runAdsSyncWithDeps(deps, countries, sourceKeys = ADS_SOURC
             await upsertRows(normalized);
             if (Array.isArray(source.aggregations) && source.aggregations.length && pruneRows) {
               // PRUNE (acknowledged, like the delete it replaces): remove, within [from,to], only the rows NOT refreshed
-              // by this run (stale grain / no longer reported). A failed prune EXCLUDES that account (marked failed, no
-              // coverage, no success state) -- its fresh rows are in place but stale rows may remain, so the window is
-              // not claimed complete; it is retried next run.
-              const pruneFailedIds = new Set();
+              // by this run (stale grain / no longer reported). The prune is bounded per day and VERIFIED
+              // (ads-row-prune.js): it fails only when a stale row is proven to remain or a day cannot be read back after
+              // a failed DELETE -- a DELETE that timed out but committed (or a day that was already clean) is a success,
+              // so the window, its coverage and the state agree with the saved rows. A real failure EXCLUDES that
+              // account (failed state with the sanitized status / Postgres code, no coverage, no success state, the
+              // previous latest_metric_date / content_rev kept); it is retried next run (the stamp predicate makes any
+              // retry idempotent).
+              const pruneFailedIds = new Map();
               for (const { account } of workingBatch) {
                 const ack = await pruneRows({ accountId: account.id, sourceKey: source.key, from: range.from, to: range.to, keepRefreshedAt: now });
-                if (!ack || ack.write !== "ok") pruneFailedIds.add(account.id);
+                if (!ack || ack.write !== "ok") pruneFailedIds.set(account.id, formatAdsWriteFailure(ack, "ADS_ROWS_PRUNE_FAILED"));
               }
               if (pruneFailedIds.size) {
                 const failedEntries = workingBatch.filter(({ account }) => pruneFailedIds.has(account.id));
-                await upsertStates(failedEntries.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, new Error("ADS_ROWS_PRUNE_FAILED"), now)));
+                await upsertStates(failedEntries.map(({ account, previous }) => failedStateRecord(account.id, source.key, previous, new Error(pruneFailedIds.get(account.id)), now)));
                 summary.sources[source.key].failedAccounts.push(...failedEntries.map((e) => e.account.id));
                 workingBatch = workingBatch.filter(({ account }) => !pruneFailedIds.has(account.id));
                 normalized = normalized.filter((r) => !pruneFailedIds.has(r.account_id));

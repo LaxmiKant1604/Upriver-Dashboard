@@ -230,6 +230,7 @@ const SUITES = [
   "test:fba-regional-inventory",
   "test:plan-brand",
   "test:asin-ads-source",
+  "test:ads-freshness",
   "test:returns-event-source",
   "test:returns-event-runner",
   "test:returns-only-exports",

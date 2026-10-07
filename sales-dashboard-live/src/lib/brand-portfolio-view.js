@@ -53,10 +53,16 @@ export function portfolioKpis(tables) {
   const sales = single ? single.totals.sales : null;
   const ly = single ? single.totals.lySales : null;
   const adSpend = single ? single.totals.adSpend : null;
+  // RANGE-AWARE partial: a marketplace row whose Ad Spend is unavailable for THIS range (no Ads source, a range past its
+  // saved Ads window, a day not reported yet, unmapped spend) is silently omitted from the summed total. The value is
+  // then a lower bound (flagged Partial) and TACoS -- partial spend over full sales -- is withheld, never understated.
+  const adRows = single ? single.rows : [];
+  const adSpendPartial = adSpend !== null && adSpend !== undefined && adRows.some((row) => row && "adSpend" in row && (row.adSpend === null || row.adSpend === undefined));
   const lyDelta = sales != null && Number.isFinite(ly) && ly > 0 ? (sales - ly) / ly : null;
   return {
     single: Boolean(single), currency: single?.currency || null,
-    sales, ly, lyDelta, units: tables?.totalUnits ?? null, fba, cover, adSpend, tacos: tacos(adSpend, sales),
+    sales, ly, lyDelta, units: tables?.totalUnits ?? null, fba, cover, adSpend, adSpendPartial,
+    tacos: adSpendPartial ? null : tacos(adSpend, sales),
   };
 }
 

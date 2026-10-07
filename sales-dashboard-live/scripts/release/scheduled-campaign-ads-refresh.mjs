@@ -34,6 +34,38 @@ const { regionsForBucket, planCampaignAdsRegionRun, runCampaignAdsRegionSlice } 
 const { REGION_SCHEDULE } = await import("../../lib/server/sync/campaign-region-routing.js");
 const { resolveBootstrapScopeByDispatch, gateOnboardingBudget, recordOnboardingActualSpend, findApprovedStepEntry, bootstrapStepRef, assertBootstrapStepPlan } = await import("../../lib/server/sync/account-onboarding-bootstrap.js");
 const log = (m) => console.log("scheduled-campaign-ads[" + bucket + "@" + asOf + "/" + accountScope + "]: " + m);
+const { getAdsSyncStates } = await import("../../lib/server/supabase.js");
+const { campaignObservedThrough } = await import("../../lib/server/sync/ads-observed-through.js");
+const { appendFileSync } = await import("node:fs");
+const appendSummary = (md) => { const f = process.env.GITHUB_STEP_SUMMARY; if (f) { try { appendFileSync(f, md + "\n"); } catch { /* ignore */ } } };
+const ghEsc = (v) => String(v).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+// EXPORT COMPLETED vs DATA OBSERVED (India 2026-10-07): a completed Campaign export for [from..asOf] proves the window was
+// requested, not that a row arrived for every day -- a seller with no row for asOf has "No Campaign Ads row received for
+// this date" (delayed data or no ad activity; the provider does not say which). Reports show it as unknown, never zero;
+// the next daily rolling window requests it again. Read-only + fail-soft: never changes the exit
+// code, never creates an export, prints 8-character id prefixes only.
+async function reportObservedThrough(region, label, plan, requestedAsOf) {
+  try {
+    const ids = (plan && Array.isArray(plan.compatible) ? plan.compatible : []).map((a) => String(a && (a.accountId ?? a))).filter(Boolean);
+    if (!ids.length) return;
+    const states = await getAdsSyncStates(ids);
+    const r = campaignObservedThrough({ accountIds: ids, states, requestedAsOf });
+    const lag = r.noRowForDate.map((x) => x.id.slice(0, 8) + " (last row " + (x.observedThrough || "none") + ")");
+    log("region " + label + " Campaign observed-through " + requestedAsOf + ": " + r.reportedThrough.length + " of " + ids.length + " account(s) reported"
+      + (lag.length ? "; No Campaign Ads row received for " + requestedAsOf + ": " + lag.join(", ") : "") + (r.noRows.length ? "; no Campaign rows saved: " + r.noRows.map((x) => x.slice(0, 8)).join(", ") : "")
+      + (r.failed.length ? "; last sync failed: " + r.failed.map((x) => x.slice(0, 8)).join(", ") : ""));
+    appendSummary("### Campaign Ads (" + label + ") observed through " + requestedAsOf
+      + "\n- export completed for the requested window; a Campaign Ads row was received for " + requestedAsOf + " for " + r.reportedThrough.length + " of " + ids.length + " account(s)"
+      + (lag.length ? "\n- No Campaign Ads row received for " + requestedAsOf + " (delayed data or no ad activity -- the provider does not say which; shown as unknown in reports, never zero; requested again by the next rolling window): " + lag.join(", ") : "")
+      + (r.noRows.length ? "\n- no Campaign rows saved at all: " + r.noRows.map((x) => x.slice(0, 8)).join(", ") : "")
+      + (r.failed.length ? "\n- last Campaign sync failed (kept last-known-good): " + r.failed.map((x) => x.slice(0, 8)).join(", ") : ""));
+    if (lag.length && process.env.GITHUB_ACTIONS === "true") {
+      console.log("::notice title=No Campaign Ads row received (" + ghEsc(label).replace(/:/g, "%3A").replace(/,/g, "%2C") + ")::" + ghEsc("No Campaign Ads row received for " + requestedAsOf + " for " + lag.length + " of " + ids.length + " account(s): " + lag.join(", ") + ". The export completed; this can be delayed data or no ad activity (the provider does not say which). Reports show the day as unknown, never zero."));
+    }
+  } catch (e) {
+    log("observed-through report unavailable (non-fatal): " + String(e && e.message ? e.message : e).slice(0, 80));
+  }
+}
 
 // A region scope refreshes EXACTLY that region (the regional coordinator's one-region path); a legacy bucket fans out
 // to its member regions (compat). Either way Campaign Ads runs ONCE per region -- one automatic owner, no double-refresh.
@@ -68,12 +100,14 @@ for (const region of regions) {
     scopeDeps = { deps: { fetchAccounts: async () => frozenAccounts } };
   }
   let result = null;
+  let lastPlan = null; // the last pass's plan (its compatible accounts feed the observed-through report)
   let regionCreates = 0; let regionTokens = 0;
   let budgetRef = null;
   for (let pass = 1; pass <= MAX_PASSES; pass += 1) {
     // Daily rolling window (21-day) so only the still-missing recent dates are fetched; already-covered => zero
     // creates. A NEVER-covered (new) account plans the INITIAL 56-day window in its own batch (initialPending).
     const plan = await planCampaignAdsRegionRun({ region, asOf, runKind: "daily", ...scopeDeps });
+    lastPlan = plan;
     const initialPending = Array.isArray(plan.initialPending) ? plan.initialPending : [];
     const pendingAll = plan.pending.length + initialPending.length;
     if (pass === 1) {
@@ -144,6 +178,7 @@ for (const region of regions) {
   // the next scheduled pass retries transient/ambiguous, a definitively-rejected seller stays isolated until fixed upstream.
   if (rej || tr || amb) log("region " + label + " ISOLATED (retain last-known-good): rejected=" + rej + " transient=" + tr + " ambiguous=" + amb + "; diagnostics=" + JSON.stringify((result.diagnostics || []).map((d) => ({ classification: d.classification, status: d.status, batchSize: d.batchSize }))));
   log("region " + label + " covered=" + result.covered + " creates=" + result.creates + " tokens=" + result.tokens + " (disconnected excluded=" + result.incompatible + ")");
+  await reportObservedThrough(region, label, lastPlan, asOf);
 }
 log("bucket " + bucket + ": covered=" + totalCovered + " accounts across " + regions.length + " region(s); " + totalCreates + " creates / " + totalTokens + " tokens; isolated rejected=" + totalRejected + " transient=" + totalTransient + " ambiguous=" + totalAmbiguous + " (ASIN creates=0).");
 process.exit(0);

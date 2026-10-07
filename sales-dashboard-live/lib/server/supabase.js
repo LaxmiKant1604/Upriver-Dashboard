@@ -10,6 +10,7 @@ import { resolveActiveCycleHead } from "./sync/source-cycle-attempts.js";
 import { membershipBrandsForAccount } from "./reports/brand-membership.js";
 import { ACTIVE_ADS_SOURCE_KEY } from "./active-ads-source.js";
 import { isRoutingScope } from "./sync/scheduler-scope.js";
+import { pruneAdsWindowVerified, sanitizeAdsWriteError } from "./ads-row-prune.js";
 
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").replace(/\/$/, "");
 // Vercel Marketplace projects can expose either the legacy service-role JWT or
@@ -1170,7 +1171,7 @@ const ADS_ROW_CONFLICT_KEY = "source_key,account_id,marketplace_country_code,met
 export async function getAdsSyncStates(accountIds) {
   if (!accountIds.length) return [];
   const query = new URLSearchParams({
-    select: "account_id,source_key,initial_seeded_at,last_daily_sync_at,last_monthly_sync_at,latest_metric_date,last_status,last_error",
+    select: "account_id,source_key,initial_seeded_at,last_daily_sync_at,last_monthly_sync_at,latest_metric_date,last_status,last_error,updated_at",
     account_id: `in.(${accountIds.join(",")})`,
   });
   return request(`/rest/v1/ads_sync_state?${query}`);
@@ -1200,7 +1201,7 @@ export async function deleteAdsDailySourceRows({ accountId, sourceKey, from, to,
     return { write: "ok", error: null };
   } catch (writeError) {
     if (isSchemaMissingError(writeError)) return { write: "schema-missing", error: "ADS_ROWS_SCHEMA_MISSING" };
-    return { write: "write-failed", error: "ADS_ROWS_DELETE_FAILED" };
+    return { write: "write-failed", error: "ADS_ROWS_DELETE_FAILED", stage: "delete", ...sanitizeAdsWriteError(writeError) };
   }
 }
 
@@ -1237,19 +1238,32 @@ export async function getAdsDailySourceRowCount({ accountId, sourceKey, from, to
 // The LKG-preserving counterpart of deleteAdsDailySourceRows, run AFTER the fresh window has been upserted: delete ONE
 // account's rows for a source over [from,to] that THIS run did not refresh (source_refreshed_at absent or different from
 // the run's own stamp) -- stale grain or rows the provider no longer reports. Never touches a row the run just wrote,
-// another window, another account or another source. Returns the same typed ack as the delete.
+// another window, another account or another source. Bounded + verified (ads-row-prune.js): one small statement per
+// day, a DELETE only where a read does not PROVE the day already clean, one retry on a transient error, and a failed
+// DELETE re-checked before it is reported. The ack carries only a sanitized HTTP status / Postgres code on failure.
 export async function pruneAdsDailySourceRows({ accountId, sourceKey, from, to, keepRefreshedAt, signal = null }) {
   if (!keepRefreshedAt || Number.isNaN(Date.parse(String(keepRefreshedAt)))) return { write: "write-failed", error: "ADS_ROWS_PRUNE_NO_STAMP" };
-  const query = new URLSearchParams({ source_key: `eq.${sourceKey}`, account_id: `eq.${accountId}`, metric_date: `gte.${from}` });
-  query.append("metric_date", `lte.${to}`);
-  query.append("or", `(source_refreshed_at.is.null,source_refreshed_at.neq."${new Date(String(keepRefreshedAt)).toISOString()}")`);
-  try {
-    await request(`/rest/v1/ads_daily_source_rows?${query}`, { method: "DELETE", headers: { Prefer: "return=minimal" }, signal });
-    return { write: "ok", error: null };
-  } catch (writeError) {
-    if (isSchemaMissingError(writeError)) return { write: "schema-missing", error: "ADS_ROWS_SCHEMA_MISSING" };
-    return { write: "write-failed", error: "ADS_ROWS_PRUNE_FAILED" };
-  }
+  const stamp = new Date(String(keepRefreshedAt)).toISOString();
+  const dayQuery = (day) => {
+    const query = new URLSearchParams({ source_key: `eq.${sourceKey}`, account_id: `eq.${accountId}`, metric_date: `eq.${day}` });
+    query.append("or", `(source_refreshed_at.is.null,source_refreshed_at.neq."${stamp}")`);
+    return query;
+  };
+  return pruneAdsWindowVerified({
+    from, to, signal,
+    isSchemaMissing: isSchemaMissingError,
+    probeStale: async (day) => {
+      const query = dayQuery(day);
+      query.set("select", "metric_date");
+      query.set("limit", "1");
+      const rows = await request(`/rest/v1/ads_daily_source_rows?${query}`, signal ? { signal } : undefined);
+      if (!Array.isArray(rows)) throw new Error("ADS_ROWS_PRUNE_PROBE_UNREADABLE");
+      return rows.length > 0;
+    },
+    deleteStale: async (day) => {
+      await request(`/rest/v1/ads_daily_source_rows?${dayQuery(day)}`, { method: "DELETE", headers: { Prefer: "return=minimal" }, signal });
+    },
+  });
 }
 
 export async function upsertAdDailyMetrics(rows) {

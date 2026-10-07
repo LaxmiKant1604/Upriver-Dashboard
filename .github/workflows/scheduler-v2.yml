@@ -587,11 +587,17 @@ jobs:
   # enabled -> a typed zero-create SKIP; the Data Sync Center pause also stops it). Each region has a hard create cap
   # checked before every POST (planned ~2/7/3 daily exports + head-room for date-bisection of a full 50,000-row page),
   # and the runner refuses any create the live balance could not cover with a 100-token reserve for OLI/Campaign left.
+  # OUTCOME VISIBILITY (India 2026-10-07): the refresh exits 0 = COMPLETE / typed skip, 3 = PARTIAL (some accounts kept
+  # last-known-good; each one's typed reason is in the ::warning annotation + step summary), 1 = systemic failure. The
+  # JOB-level continue-on-error shows a PARTIAL / failed ASIN pass as THIS job's failure in the run graph while the
+  # region run itself still concludes success -- and nothing re-runs it: the watchdog / scheduler-recovery dispatch only
+  # when NO run was created, never after a started run, so a PARTIAL can never trigger an automatic paid retry.
   asin_ads:
     needs: [run, fba]
     if: always() && needs.run.outputs.region != '' && needs.run.outputs.execute_downstream == 'true' && needs.run.outputs.token_proceed == 'true' && needs.run.outputs.scope != 'bootstrap'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    continue-on-error: true
     defaults:
       run:
         working-directory: sales-dashboard-live
@@ -609,7 +615,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
       - name: Refresh ASIN Ads (this region; additional durable source; runs only while schedule_enabled)
-        continue-on-error: true
         run: |
           case "${{ needs.run.outputs.region }}" in
             india) CAP=4 ;;

@@ -15,6 +15,10 @@
 // kept for OLI / Campaign). A failed create is never blindly retried: one ADOPT-ONLY reconcile pass may reuse an
 // already-completed export (zero tokens). Logs print 8-character id prefixes only; full export ids go to
 // --evidence-file (operator canary evidence, a local file) when given.
+// Exit codes: 0 = COMPLETE or a typed SKIP; 3 = PARTIAL (some accounts kept last-known-good -- each with a typed reason
+// code in RESULT, the step summary and a ::warning annotation); 1 = systemic failure (::error); 2 = bad arguments. The
+// scheduler-v2 asin_ads job is continue-on-error, so a PARTIAL / failed ASIN pass marks only that job, never the region
+// run -- and the watchdog / recovery dispatch only when NO run was created, so nothing re-runs a paid pass automatically.
 
 import { writeFileSync, appendFileSync } from "node:fs";
 import { loadReleaseEnv } from "./env-bootstrap.mjs";
@@ -49,6 +53,10 @@ const log = (m) => console.log("asin-ads[" + region + "@" + asOf + (scheduled ? 
 const p8 = (x) => String(x == null ? "" : x).slice(0, 8);
 const summaryOut = (md) => { const f = process.env.GITHUB_STEP_SUMMARY; if (f) { try { appendFileSync(f, md + "\n"); } catch { /* ignore */ } } };
 const result = (o) => { console.log("RESULT " + JSON.stringify({ region, asOf, ...o })); };
+// GitHub workflow-command annotation (visible on the run page); message/property escaping per the runner contract.
+const esc = (v) => String(v).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+const escProp = (v) => esc(v).replace(/:/g, "%3A").replace(/,/g, "%2C");
+const annotate = (level, title, message) => { if (process.env.GITHUB_ACTIONS === "true") console.log("::" + level + " title=" + escProp(title) + "::" + esc(message)); };
 
 // ---- the durable control (pause / schedule switch) ----
 const controls = await getSourceControls();
@@ -92,11 +100,13 @@ if (exposure.normalCreates > 0) {
 const startedIso = new Date().toISOString();
 const MAX_PASSES = Number(process.env.SCHEDULED_ASIN_ADS_MAX_ITERS || 10);
 let spent = 0; let reused = 0; const all = { covered: new Set(), rejected: new Set(), transient: new Set(), ambiguous: new Set(), budgetDeferred: new Set() };
+const reasons = new Map(); // account id -> typed reason code (latest pass wins; cleared once the account is covered)
 const fragments = []; const created = []; const adopted = []; let last = null;
 const absorb = (r) => {
   spent += r.creates || 0; reused += r.reused || 0;
   for (const k of Object.keys(all)) for (const id of r[k] || []) all[k].add(id);
-  for (const id of r.covered || []) for (const k of ["rejected", "transient", "ambiguous", "budgetDeferred"]) all[k].delete(id);
+  for (const [id, code] of Object.entries(r.reasons || {})) reasons.set(id, R.safeAsinAdsReason(code));
+  for (const id of r.covered || []) { for (const k of ["rejected", "transient", "ambiguous", "budgetDeferred"]) all[k].delete(id); reasons.delete(id); }
   fragments.push(...(r.fragments || [])); created.push(...(r.createdExportIds || [])); adopted.push(...(r.adoptedExportIds || []));
 };
 let passPlan = plan;
@@ -116,12 +126,15 @@ if (all.transient.size || all.ambiguous.size) {
   if (rp.items.length) {
     const rr = await R.runAsinAdsRegionSlice({ region, asOf, plan: rp, maxTotalCreates: 0, adoptOnly: true, log });
     log("adopt-only reconcile: covered " + (rr.covered || []).length + " of " + retryIds.length + " (reused " + (rr.reused || 0) + ", creates 0)");
-    for (const id of rr.covered || []) { all.transient.delete(id); all.ambiguous.delete(id); all.covered.add(id); }
+    for (const id of rr.covered || []) { all.transient.delete(id); all.ambiguous.delete(id); all.covered.add(id); reasons.delete(id); }
+    for (const [id, code] of Object.entries(rr.reasons || {})) if (!all.covered.has(id) && !reasons.has(id)) reasons.set(id, R.safeAsinAdsReason(code));
     reused += rr.reused || 0; fragments.push(...(rr.fragments || [])); adopted.push(...(rr.adoptedExportIds || []));
   }
 }
 const tokens = spent * R.ASIN_ADS_TOKENS_PER_CREATE;
 const systemic = last && last.phase === "sync" && last.ok === false;
+const isolatedIds = [...all.rejected, ...all.transient, ...all.ambiguous, ...all.budgetDeferred];
+const reasonOf = (id) => reasons.get(id) || (all.budgetDeferred.has(id) ? "BUDGET_DEFERRED" : "UNCLASSIFIED");
 const out = {
   ok: !systemic, classification: systemic ? "ASIN_ADS_FAILED" : (all.transient.size + all.rejected.size + all.ambiguous.size + all.budgetDeferred.size ? "PARTIAL" : "COMPLETE"),
   creates: spent, reused, tokens, maxCreates,
@@ -129,19 +142,23 @@ const out = {
   incompatible: plan.incompatible.map((a) => p8(a.accountId)), unreadable: plan.unreadable.map((a) => p8(a.accountId)),
   failed: { rejected: [...all.rejected].map(p8), transient: [...all.transient].map(p8), ambiguous: [...all.ambiguous].map(p8), budgetDeferred: [...all.budgetDeferred].map(p8) },
   fragments: fragments.map((f) => ({ from: f.from, to: f.to, rowCount: f.rowCount, sellers: f.sellers, exportId: p8(f.exportId) })),
+  reasons: Object.fromEntries(isolatedIds.map((id) => [p8(id), reasonOf(id)])),
   createdExports: created, adoptedExports: adopted, problems: systemic ? last.problems : undefined,
 };
 result(out);
 // The operator status row for this region (the Data Sync Center card folds the bucket's regions). Best-effort: a status
 // write failure never changes the outcome, it is only logged.
 try {
-  await upsertSourceRunStatus(R.asinAdsRunStatusEntry({ region, plan, maxCreates, nowIso: startedIso, outcome: { systemic, creates: spent, covered: [...all.covered], rejected: [...all.rejected], transient: [...all.transient], ambiguous: [...all.ambiguous], budgetDeferred: [...all.budgetDeferred] } }));
+  await upsertSourceRunStatus(R.asinAdsRunStatusEntry({ region, plan, maxCreates, nowIso: startedIso, outcome: { systemic, creates: spent, covered: [...all.covered], rejected: [...all.rejected], transient: [...all.transient], ambiguous: [...all.ambiguous], budgetDeferred: [...all.budgetDeferred], reasons: Object.fromEntries(isolatedIds.map((id) => [id, reasonOf(id)])) } }));
 } catch (e) { log("run-status write failed (non-fatal): " + String(e && e.message).slice(0, 100)); }
 summaryOut("### ASIN Ads (" + label + ") " + out.classification + "\n- covered now " + out.covered.length + ", already covered " + out.alreadyCovered + ", incompatible " + out.incompatible.length + ", unreadable " + out.unreadable.length
   + "\n- failed: rejected " + out.failed.rejected.length + ", transient " + out.failed.transient.length + ", ambiguous " + out.failed.ambiguous.length + ", budget-deferred " + out.failed.budgetDeferred.length
-  + "\n- " + spent + " create(s) / " + tokens + " token(s) (cap " + maxCreates + "), reused " + reused + " completed export(s) at zero tokens");
+  + "\n- " + spent + " create(s) / " + tokens + " token(s) (cap " + maxCreates + "), reused " + reused + " completed export(s) at zero tokens"
+  + (isolatedIds.length ? "\n- kept last-known-good (no automatic paid retry; the next scheduled run retries):" + isolatedIds.map((id) => "\n  - " + p8(id) + ": " + reasonOf(id)).join("") : ""));
+if (systemic) annotate("error", "ASIN Ads FAILED (" + label + ")", "Systemic ASIN Ads failure; every account kept last-known-good. Problems: " + JSON.stringify((last.problems || []).slice(0, 4)) + ". No automatic paid retry.");
+else if (out.classification === "PARTIAL") annotate("warning", "ASIN Ads PARTIAL (" + label + ")", isolatedIds.length + " of " + (plan.pending.length || isolatedIds.length) + " pending account(s) kept last-known-good: " + isolatedIds.map((id) => p8(id) + " " + reasonOf(id)).join("; ") + ". No automatic paid retry; the next scheduled run retries.");
 if (evidenceFile) {
   try { writeFileSync(evidenceFile, JSON.stringify({ at: new Date().toISOString(), region, asOf, plan: { pending: plan.pending, items: plan.items, covered: plan.covered.map((a) => a.accountId), incompatible: plan.incompatible.map((a) => a.accountId) }, result: { ...out, covered: [...all.covered], fragmentsFull: fragments } }, null, 1)); }
   catch (e) { log("evidence file not written: " + String(e && e.message).slice(0, 80)); }
 }
-process.exit(systemic ? 1 : 0);
+process.exit(systemic ? 1 : (out.classification === "PARTIAL" ? 3 : 0));

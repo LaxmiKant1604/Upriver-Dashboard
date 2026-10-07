@@ -529,7 +529,8 @@ export function sevenDayRows(model, anchorDate) {
     const byDate = {};
     let anySales = 0;
     let anyUnits = 0;
-    let adSpendTotal = null;
+    let adSpendSum = null;
+    let adDaysMissing = 0;
     for (const date of dates) {
       const day = country.byDate.get(date);
       const sales = day ? day.sales : 0;
@@ -538,9 +539,14 @@ export function sevenDayRows(model, anchorDate) {
       byDate[date] = { sales, units, adSpend };
       anySales += sales;
       anyUnits += units;
-      adSpendTotal = addMaybe(adSpendTotal, adSpend);
+      if (adSpend === null) adDaysMissing += 1;
+      adSpendSum = addMaybe(adSpendSum, adSpend);
     }
-    if (!anySales && !anyUnits && adSpendTotal === null) continue;
+    if (!anySales && !anyUnits && adSpendSum === null) continue;
+    // The 7D Ad Spend total is shown only when EVERY one of the seven days has an available spend: skipping an
+    // unavailable day (e.g. a day the provider has not reported yet, past the saved Ads window) would understate the
+    // week and its TACoS (6 days of spend over 7 days of sales) while the total reads as complete.
+    const adSpendTotal = adDaysMissing ? null : adSpendSum;
     rows.push({
       key: country.country,
       country: country.country,
@@ -570,10 +576,12 @@ export function sevenDayColumnTotals(group, dates, displayCurrency, rates) {
     let sales = null;
     let units = 0;
     let adSpend = null;
+    let spendMissing = false; // a marketplace whose spend is unavailable that day makes the day's total unavailable
     let unconvertible = false;
     for (const row of group.rows) {
       const day = row.byDate?.[date];
       if (!day) continue;
+      if (day.adSpend === null || day.adSpend === undefined) spendMissing = true;
       units += Number(day.units) || 0;
       const daySales = converted ? convertMoney(day.sales, row.currency, displayCurrency, rates) : day.sales;
       if (converted && day.sales !== null && daySales === null) unconvertible = true;
@@ -582,6 +590,7 @@ export function sevenDayColumnTotals(group, dates, displayCurrency, rates) {
       if (converted && day.adSpend !== null && day.adSpend !== undefined && daySpend === null) unconvertible = true;
       else adSpend = addMaybe(adSpend, daySpend);
     }
+    if (spendMissing) adSpend = null;
     totals[date] = { sales, units, adSpend, tacos: tacos(adSpend, sales), unconvertible };
   }
   return totals;

@@ -246,6 +246,61 @@ function rawModel(series, countries) {
     coverage: { accountCount: 1, salesFrom: "2025-01-01", salesTo: ANCHOR, salesLatestDate: ANCHOR, adsFrom: "2025-01-01", adsTo: ANCHOR },
   });
 }
+// India 2026-10-07 shape: one marketplace's saved Ads stop a day before the sales (the provider has not reported the
+// latest day yet). Every total that would silently skip that day must be withheld, never shown as complete.
+function laggingModel() {
+  const dates = ["2026-08-22", "2026-08-23", "2026-08-24", "2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28"];
+  const series = [];
+  for (const d of dates) {
+    series.push({ c: "DE", cur: "EUR", d, s: 100, u: 1, a: 10 });
+    series.push({ c: "FR", cur: "EUR", d, s: 200, u: 1, ...(d < ANCHOR ? { a: 20 } : {}) });
+  }
+  return brandViewModel({
+    brand: "Bebi Born", scope: "portfolio", accountId: "portfolio", asOf: ANCHOR,
+    countries: [{ country: "DE", currency: "EUR", hasSales: true, adsAvailable: true }, { country: "FR", currency: "EUR", hasSales: true, adsAvailable: true }],
+    series,
+    coverage: {
+      accountCount: 2, salesFrom: "2025-01-01", salesTo: ANCHOR, salesLatestDate: ANCHOR, adsFrom: "2025-01-01", adsTo: ANCHOR,
+      adsCoverageByCountry: { DE: { from: "2025-01-01", to: ANCHOR }, FR: { from: "2025-01-01", to: "2026-08-27" } }, inventoryDate: null,
+    },
+    notes: [],
+  });
+}
+
+test("7-DAY: a marketplace whose latest day is not reported -> its 7D Ad Spend total, that day's column and the All Markets 7D total are withheld (never 6 days shown as a week)", () => {
+  const tables = buildBrandTables(laggingModel(), { rangeFrom: "2026-08-22", rangeTo: ANCHOR, displayCurrency: "ORIGINAL", rates: null });
+  const w = tables.weeklyTable;
+  const spend = w.rows.find((r) => r.key === "spend-EUR" || (r.label === "Ad Spend" && r.kind === "row"));
+  const tacosRow = w.rows.find((r) => r.label === "TACoS%");
+  ok("the 28 Aug column (FR not reported) is withheld, not DE-only 10", spend.cells[7].t === DASH);
+  ok("an earlier fully reported day still shows 30", spend.cells[1].n === 30);
+  ok("the 7D Total Ad Spend is withheld (not the 190 that skips FR's missing day)", spend.cells[8].t === DASH);
+  ok("the 7D TACoS is withheld too", tacosRow.cells[8].t === DASH);
+});
+
+test("MONTHLY All Markets: a marketplace with no month-to-date spend for the range is withheld with a tooltip (not a one-market total over all-market sales)", () => {
+  const tables = buildBrandTables(laggingModel(), { rangeFrom: "2026-08-22", rangeTo: ANCHOR, displayCurrency: "ORIGINAL", rates: null });
+  const m = tables.monthlyTable;
+  const total = m.rows.find((r) => r.kind === "total");
+  const spendIdx = m.headers.findIndex((h) => h.key === "spend");
+  const tacosIdx = m.headers.findIndex((h) => h.key === "tacos");
+  const fr = m.rows.find((r) => r.kind !== "total" && /FR|France/.test(String(r.label)));
+  ok("FR month-to-date spend is unavailable (its range runs past its saved Ads window)", fr && fr.cells[spendIdx].t === DASH);
+  ok("All Markets month-to-date Ad Spend is withheld", total.cells[spendIdx].t === DASH);
+  ok("All Markets TACoS is withheld", total.cells[tacosIdx].t === DASH);
+  ok("the withheld cell explains why", /not reported yet/i.test(String(total.hints?.[spendIdx] || "")));
+});
+
+test("PORTFOLIO KPI: range-aware Partial -- a marketplace unavailable for the selected range flags Ad Spend Partial and withholds TACoS", async () => {
+  const { portfolioKpis } = await import("../src/lib/brand-portfolio-view.js");
+  const tables = buildBrandTables(laggingModel(), { rangeFrom: "2026-08-22", rangeTo: ANCHOR, displayCurrency: "ORIGINAL", rates: null });
+  const k = portfolioKpis(tables);
+  ok("Ad Spend is flagged partial for this range", k.adSpendPartial === true);
+  ok("TACoS is withheld (partial spend over full sales would understate it)", k.tacos === null);
+  const full = portfolioKpis(buildBrandTables(laggingModel(), { rangeFrom: "2026-08-22", rangeTo: "2026-08-27", displayCurrency: "ORIGINAL", rates: null }));
+  ok("a range inside every marketplace's saved Ads window is complete: no Partial, TACoS shown", full.adSpendPartial === false && full.tacos !== null);
+});
+
 test("hasAdsCoverage: true when any marketplace has saved Ads coverage; false when none; false for a null model", () => {
   ok("covered model -> true", hasAdsCoverage(modelOf(BASE)) === true);
   const noAds = modelOf({ DE: { cur: "EUR", s: 100, ads: false }, FR: { cur: "EUR", s: 200, ads: false } });

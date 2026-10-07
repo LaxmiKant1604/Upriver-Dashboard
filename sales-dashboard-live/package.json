@@ -157,6 +157,7 @@
     "test:brand-membership-scope": "node scripts/brand-membership-scope.test.js",
     "test:brand-view-freshness": "node scripts/brand-view-freshness.test.js",
     "test:asin-ads-source": "node scripts/asin-ads-source.test.js",
+    "test:ads-freshness": "node scripts/ads-freshness.test.js",
     "test:returns-event-source": "node scripts/returns-event-source.test.js",
     "test:returns-event-runner": "node scripts/returns-event-runner.test.js",
     "test:returns-only-exports": "node scripts/returns-only-exports.test.js",

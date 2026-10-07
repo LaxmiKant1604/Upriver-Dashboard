@@ -474,7 +474,10 @@ export default function BrandPortfolio({
   const rangeLabel = range.rangeFrom && range.rangeTo ? fmtRangeLabel(range.rangeFrom, range.rangeTo) : "";
   const RANGE_BADGE = { "7D": "7D", "30D": "30D", MTD: "MTD", LASTMONTH: "Last month", LATEST: "Latest day", CUSTOM: "Custom" };
   const rangeBadge = RANGE_BADGE[range.preset] || null;
-  const adPartial = Boolean(model) && model.countries.some((entry) => entry.adsAvailable) && model.countries.some((entry) => !entry.adsAvailable);
+  // Partial = some marketplace has no Ads source at all, OR (range-aware) some marketplace's Ad Spend is unavailable for
+  // the selected range (e.g. it runs past the saved Ads window because a day is not reported yet).
+  const adPartial = (Boolean(model) && model.countries.some((entry) => entry.adsAvailable) && model.countries.some((entry) => !entry.adsAvailable))
+    || Boolean(kpis && kpis.adSpendPartial);
   // Accurate Ad Spend KPI copy: active attribution is Campaign Ads (campaign->brand mapping), and an em dash names the
   // real reason (no coverage / campaigns unmapped / per-marketplace) from existing model+coverage data -- never a
   // stale "same-ASIN" claim, and never "no saved Ads history" when saved Ads exist. A shown total that omits an
@@ -697,7 +700,7 @@ export default function BrandPortfolio({
             <BvKpi label="FBA Inventory" value={kpis.fba === null ? DASH : nInt(kpis.fba)} sub={`Available FBA units${coverage.inventoryDate ? ` · as of ${coverage.inventoryDate}` : ""}`} hint={kpis.fba === null ? "No overall FBA inventory total is available for this scope." : "Available FBA units for this brand's ASINs; unit counts are never currency converted."} />
             <BvKpi label="FBA Cover" value={kpis.cover === null ? DASH : coverLabel(kpis.cover)} sub="Based on selected-range unit velocity" hint="Available FBA units divided by this brand's average daily unit sales in the selected range." />
             <BvKpi label="Ad Spend" badge={adSpendCopy.badge} value={kpis.adSpend === null ? DASH : money(kpis.adSpend, kpis.currency, 2)} sub={adSpendCopy.sub} />
-            <BvKpi label="TACoS" badge="Overall" value={kpis.tacos === null ? DASH : ratePct(kpis.tacos)} sub="Brand ad spend ÷ brand sales" />
+            <BvKpi label="TACoS" badge="Overall" value={kpis.tacos === null ? DASH : ratePct(kpis.tacos)} sub={kpis.adSpendPartial ? "Withheld: Ad Spend is partial for this range" : "Brand ad spend ÷ brand sales"} />
           </div>
 
           <BvOverview tables={tables} currencyLabelNote={rangeLabel || "selected range"} />

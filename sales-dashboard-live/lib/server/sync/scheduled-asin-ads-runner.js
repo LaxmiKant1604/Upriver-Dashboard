@@ -245,15 +245,28 @@ export function exportRequestIdentity(x) {
  * PURE: the ONE listed export that may be adopted in place of creating `body`: COMPLETED, an EXACT request identity,
  * created within the reuse horizon (and not in the future), and downloadable for at least the minimum remaining time.
  * The newest such export wins. -> { disposition: "adopt", exportId } | { disposition: "none" }.
+ * `listedSourceName` (opt-in): DataDoe's export LISTING abbreviates sourceId to a short prefix (10 hex characters for
+ * every source, verified read-only 2026-10-07), so an exact identity can never match a listed export. When given, a
+ * listed sourceId that is a >= 10-character prefix of the body's sourceId AND whose sourceName equals this name
+ * (case-insensitive) is the same source; every other identity field must still match exactly.
  */
-export function matchReusableExport({ exports, body, nowMs, maxAgeMs = ASIN_ADS_REUSE_MAX_AGE_MS, minRemainingMs = ASIN_ADS_REUSE_MIN_REMAINING_MS, exclude = new Set() } = {}) {
+export function matchReusableExport({ exports, body, nowMs, maxAgeMs = ASIN_ADS_REUSE_MAX_AGE_MS, minRemainingMs = ASIN_ADS_REUSE_MIN_REMAINING_MS, exclude = new Set(), listedSourceName = null } = {}) {
   const want = exportRequestIdentity(body);
+  const fullSourceId = S(body && body.sourceId);
+  const sameSource = (e) => {
+    const listedId = S(e.sourceId);
+    if (listedId === fullSourceId) return e;
+    if (listedSourceName == null || listedId.length < 10 || !fullSourceId.startsWith(listedId)) return null;
+    if (S(e.sourceName).trim().toLowerCase() !== S(listedSourceName).trim().toLowerCase()) return null;
+    return { ...e, sourceId: fullSourceId };
+  };
   const ok = (Array.isArray(exports) ? exports : []).filter((e) => {
     if (!e || S(e.status) !== "COMPLETED" || !S(e.id) || exclude.has(S(e.id))) return false;
     const created = Date.parse(S(e.createdAt)); const expires = Date.parse(S(e.expiresAt));
     if (!Number.isFinite(created) || created > nowMs || nowMs - created > maxAgeMs) return false;
     if (Number.isFinite(expires) && expires - nowMs < minRemainingMs) return false;
-    return exportRequestIdentity(e) === want;
+    const comparable = sameSource(e);
+    return !!comparable && exportRequestIdentity(comparable) === want;
   }).sort((a, b) => Date.parse(S(b.createdAt)) - Date.parse(S(a.createdAt)));
   return ok.length ? { disposition: "adopt", exportId: S(ok[0].id) } : { disposition: "none" };
 }
@@ -287,6 +300,7 @@ export async function runAsinAdsRegionSlice({ region, asOf, plan = null, maxTota
   if (!p.items.length) return { phase: "complete", ...base, ...empty, note: p.compatible.length ? "already fully covered" : "no Amazon-Ads-compatible accounts in region" };
   const cap = maxTotalCreates != null ? Math.max(0, Math.trunc(Number(maxTotalCreates)) || 0) : asinAdsPlanExposure(p).worstCaseCreates;
   const nowMs = deps.nowMs || (() => Date.now());
+  const passStartedMs = nowMs(); // a failed state is this pass's reason only when written at/after this (see stateErrors)
   const baseCreate = deps.createExport || PRODUCTION_ADS_SYNC_DEPS.createExport;
   const listExports = deps.listRecentExports || ((o) => listRecentExports(o));
   let creates = 0; let reused = 0; let listing = null; let ceilingHit = false;
@@ -294,7 +308,7 @@ export async function runAsinAdsRegionSlice({ region, asOf, plan = null, maxTota
   const createErr = { value: null };
   const reusable = async (body) => {
     if (listing === null) { try { listing = await listExports({ apiKey: p.primaryConn.apiKey, nowMs: nowMs() }); } catch (e) { listing = []; log("export reuse unavailable this pass (" + S(e && e.code) + "); creates proceed under the cap"); } }
-    return matchReusableExport({ exports: listing, body, nowMs: nowMs(), exclude: adoptedIds });
+    return matchReusableExport({ exports: listing, body, nowMs: nowMs(), exclude: adoptedIds, listedSourceName: ASIN_ADS_SOURCE_NAME });
   };
   const ceilingError = () => typed("ASIN_ADS_CEILING", "approved total create cap " + cap + " reached");
   const guardedCreate = async (apiKey, source, ids, from, to, skip = 0) => {
@@ -350,7 +364,66 @@ export async function runAsinAdsRegionSlice({ region, asOf, plan = null, maxTota
   const unaccounted = p.pending.map((a) => S(a.accountId)).filter((id) => !accountedFor.has(id));
   if (unaccounted.length) return { phase: "sync", ok: false, ...base, ...counts, problems: ["accounts unaccounted for: " + unaccounted.length] };
   const isolated = rejected.length + transient.length + ambiguous.length + budgetDeferred.length;
-  return { phase: isolated ? "partial" : "complete", ...base, ...counts, covered, rejected, transient, ambiguous, budgetDeferred, fragments, diagnostics: rec.diagnostics.slice(0, 20), batches: rec.batchResults.length };
+  // WHY each isolated account kept last-known-good: the typed last_error its failed state was just given by this pass
+  // (read back, fail-soft -- a read problem only falls back to the engine's classification; never changes the outcome).
+  const stateErrors = {};
+  const failedNow = [...rejected, ...transient, ...ambiguous];
+  if (failedNow.length && typeof workerDeps.getAdsSyncStates === "function") {
+    try {
+      for (const st of (await workerDeps.getAdsSyncStates(failedNow)) || []) {
+        // Only a failed state written by THIS pass (5-minute clock-skew allowance); an older run's error is never reported
+        // as today's reason -- the engine's own classification of this pass is used instead.
+        const writtenMs = Date.parse(S(st && st.updated_at));
+        if (st && S(st.source_key) === ASIN_ADS_GRAIN && S(st.last_status) === "failed" && Number.isFinite(writtenMs) && writtenMs >= passStartedMs - 5 * 60 * 1000) stateErrors[S(st.account_id)] = st.last_error;
+      }
+    } catch { /* fail-soft */ }
+  }
+  const reasons = asinAdsIsolationReasons({ stateErrors, diagnostics: rec.diagnostics, isolatedIds: failedNow, budgetDeferred });
+  return { phase: isolated ? "partial" : "complete", ...base, ...counts, covered, rejected, transient, ambiguous, budgetDeferred, reasons, fragments, diagnostics: rec.diagnostics.slice(0, 20), batches: rec.batchResults.length };
+}
+
+const SAFE_REASON = /^[A-Z][A-Z0-9_]{2,63}(?: \([a-z]+=[A-Za-z0-9_.-]+(?: [a-z]+=[A-Za-z0-9_.-]+)*\))?$/;
+const LEADING_SLUG = /^([A-Z][A-Z0-9_]{2,63})(?![A-Za-z0-9_])/;
+/**
+ * PURE: a SAFE reason from untrusted text: the whole string when it is a typed slug with an optional sanitized
+ * "(key=value ...)" detail; else only its leading typed slug (e.g. "INVALID_EXPORT_EVIDENCE (cross-account)" ->
+ * "INVALID_EXPORT_EVIDENCE"); else UNCLASSIFIED. Free text (a provider or database message) never passes through.
+ */
+export function safeAsinAdsReason(text) {
+  const t = S(text).trim().slice(0, 160);
+  if (SAFE_REASON.test(t)) return t;
+  const m = LEADING_SLUG.exec(t);
+  return m ? m[1] : "UNCLASSIFIED";
+}
+
+/**
+ * PURE: WHY each isolated account kept last-known-good, as a typed code: its failed state's typed last_error (e.g.
+ * "ADS_ROWS_PRUNE_FAILED (stage=delete status=500 pg=57014 stale=present)"), else the engine's classification of a
+ * thrown batch error (e.g. "SOURCE_UPSTREAM_TRANSIENT (status=503)"), else BUDGET_DEFERRED. Ids are full account ids.
+ */
+export function asinAdsIsolationReasons({ stateErrors = {}, diagnostics = [], isolatedIds = [], budgetDeferred = [] } = {}) {
+  const want = new Set([...isolatedIds, ...budgetDeferred].map(S));
+  const out = {};
+  for (const [id, text] of Object.entries(stateErrors || {})) {
+    if (!want.has(S(id))) continue;
+    const code = safeAsinAdsReason(text);
+    if (code !== "UNCLASSIFIED") out[S(id)] = code;
+  }
+  for (const d of Array.isArray(diagnostics) ? diagnostics : []) {
+    const st = Number(d && d.status);
+    const code = safeAsinAdsReason(S(d && d.classification) + (Number.isInteger(st) ? " (status=" + st + ")" : ""));
+    for (const id of (d && d.sellers) || []) if (want.has(S(id)) && !out[S(id)]) out[S(id)] = code;
+  }
+  for (const id of budgetDeferred.map(S)) if (!out[id]) out[id] = "BUDGET_DEFERRED";
+  for (const id of want) if (!out[id]) out[id] = "UNCLASSIFIED";
+  return out;
+}
+
+/** PURE: "CODE xN; CODE xM" -- the leading typed codes of a reasons map, most frequent first (for the operator row). */
+export function summarizeAsinAdsReasons(reasons) {
+  const counts = new Map();
+  for (const r of Object.values(reasons || {})) { const code = S(r).split(" (")[0] || "UNCLASSIFIED"; counts.set(code, (counts.get(code) || 0) + 1); }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([c, n]) => c + " x" + n).join("; ");
 }
 
 /**
@@ -399,7 +472,7 @@ export function asinAdsRunStatusEntry({ region, plan, outcome, maxCreates = null
     lastStatus: systemic ? "failed" : (complete ? "succeeded" : "partial"),
     lastAttemptAt: nowIso, ...(complete ? { lastSuccessAt: nowIso } : {}),
     safeErrorCode: systemic ? "ASIN_ADS_FAILED" : (failedN ? "ASIN_ADS_ACCOUNTS_ISOLATED" : ((plan.unreadable || []).length ? "ASIN_ADS_ACCOUNTS_UNREADABLE" : null)),
-    safeErrorStage: systemic ? "run" : null,
+    safeErrorStage: systemic ? "run" : (failedN && o.reasons && Object.keys(o.reasons).length ? summarizeAsinAdsReasons(o.reasons).slice(0, 200) : null),
     coveredFrom: complete ? plan.windows.rolling.from : null, coveredTo: complete ? plan.windows.rolling.to : null,
     accountsCompleted: (o.covered || []).length + (plan.covered || []).length, accountsFailed: failedN + (plan.unreadable || []).length,
     accountsTotal: (plan.compatible || []).length, batchCount: (plan.items || []).length,

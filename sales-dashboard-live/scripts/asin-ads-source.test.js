@@ -34,6 +34,7 @@ let passed = 0; const tests = []; const test = (name, fn) => tests.push({ name, 
 const AS = await import("../lib/server/ads-sync.js");
 const AAS = await import("../lib/server/active-ads-source.js");
 const R = await import("../lib/server/sync/scheduled-asin-ads-runner.js");
+const PRUNE = await import("../lib/server/ads-row-prune.js");
 const C = await import("../lib/server/sync/scheduled-campaign-ads-runner.js");
 const ST = await import("../lib/server/sync/source-status.js");
 const REG = await import("../lib/server/sync/registry.js");
@@ -89,6 +90,26 @@ function world(opts = {}) {
     pruneAdsDailyRows: async (o) => {
       calls.order.push("prune"); calls.prunes.push(o);
       if (opts.pruneFails) return { write: "write-failed", error: "ADS_ROWS_PRUNE_FAILED" };
+      if (opts.verifiedPrune) {
+        // The production orchestration (ads-row-prune.js) over this store: probe = "any row of the day not stamped by
+        // this run"; delete = remove exactly those. deleteError(day, attempt) scripts a failure; commitDespiteError
+        // makes the failed DELETE still land (a client-side timeout after the server committed).
+        const vp = opts.verifiedPrune;
+        const stale = (day) => (r) => r.source_key === o.sourceKey && r.account_id === o.accountId && r.metric_date === day && r.source_refreshed_at !== o.keepRefreshedAt;
+        const attempts = new Map();
+        calls.pruneDeletes = calls.pruneDeletes || []; calls.pruneProbes = calls.pruneProbes || 0;
+        return PRUNE.pruneAdsWindowVerified({
+          from: o.from, to: o.to, sleep: async () => {}, retryDelayMs: 0,
+          probeStale: async (day) => { calls.pruneProbes += 1; if (vp.probeThrows) throw vp.probeThrows; return [...store.values()].some(stale(day)); },
+          deleteStale: async (day) => {
+            const n = (attempts.get(day) || 0) + 1; attempts.set(day, n); calls.pruneDeletes.push(day);
+            const err = vp.deleteError ? vp.deleteError(day, n) : null;
+            if (err && !vp.commitDespiteError) throw err;
+            for (const [k, r] of store) if (stale(day)(r)) store.delete(k);
+            if (err) throw err;
+          },
+        });
+      }
       for (const [k, r] of store) if (r.source_key === o.sourceKey && r.account_id === o.accountId && r.metric_date >= o.from && r.metric_date <= o.to && r.source_refreshed_at !== o.keepRefreshedAt) store.delete(k);
       return { write: "ok" };
     },
@@ -96,8 +117,8 @@ function world(opts = {}) {
     upsertAdsSyncStates: async (sts) => { calls.states.push(...sts); for (const s of sts) states.set(s.account_id + "|" + s.source_key, { ...(states.get(s.account_id + "|" + s.source_key) || {}), ...s }); },
     recordAdsCoverageWindows: async (rows) => { calls.coverage.push(...rows); for (const r of rows) coverage.set(r.accountId, (coverage.get(r.accountId) || []).concat([{ from: r.coveredFrom, to: r.coveredTo }])); return { write: "ok", recorded: rows.length }; },
     readDurableRows: async ({ accountId, sourceKeys, from, to }) => [...store.values()].filter((r) => r.account_id === accountId && sourceKeys.includes(r.source_key) && r.metric_date >= from && r.metric_date <= to),
-    now: () => NOW,
-    clock: () => Date.parse(NOW),
+    now: () => opts.now || NOW,
+    clock: () => Date.parse(opts.now || NOW),
   };
   const createExport = async (_k, source, ids, from, to, skip = 0) => {
     if (opts.createThrows) { const e = opts.createThrows({ ids, from, to }); if (e) throw e; }
@@ -376,6 +397,72 @@ test("F3 a failed PRUNE excludes the account (failed state, no coverage, no succ
   assert.equal(s.status, "failed"); assert.equal(w.calls.coverage.length, 0);
   assert.match(String(w.calls.states.at(-1).last_error), /ADS_ROWS_PRUNE_FAILED/);
 });
+const pgTimeout = () => Object.assign(new Error("Supabase request failed (500): canceling statement due to statement timeout B0SECRET42"), { status: 500, code: "57014" });
+const staleRow = (d, asin, at = "2026-09-30T00:00:00.000Z") => ({ source_key: "asin-performance-v1", account_id: id(1), marketplace_country_code: "IN", metric_date: d, dimension_key: JSON.stringify([asin]), metrics: { ad_spend: 7 }, source_refreshed_at: at });
+const prevState = { account_id: id(1), source_key: "asin-performance-v1", last_status: "succeeded", latest_metric_date: "2026-10-01", content_rev: "rev-prev" };
+
+test("F5 AAKRITI 2026-10-07: every row saved and NOTHING stale -> the probe proves each day clean, ZERO DELETE statements, the window is covered and the state succeeds (rows, coverage and state agree)", async () => {
+  const w = world({ states: [prevState], verifiedPrune: { deleteError: () => pgTimeout() }, rowsFor: () => [asinRow(id(1), "IN", "2026-10-01", "B1"), asinRow(id(1), "IN", ASOF, "B1")] });
+  const s = await runAsin(w, [id(1)], { from: "2026-10-01", to: ASOF });
+  assert.equal(s.status, "completed");
+  assert.deepEqual(w.calls.pruneDeletes, [], "no stale row -> no DELETE at all (the statement that timed out is never sent)");
+  assert.equal(w.calls.pruneProbes, 2, "one bounded probe per day");
+  assert.deepEqual(w.calls.coverage.map((c) => [c.coveredFrom, c.coveredTo]), [["2026-10-01", ASOF]]);
+  const st = w.states.get(id(1) + "|asin-performance-v1");
+  assert.equal(st.last_status, "succeeded"); assert.equal(st.latest_metric_date, ASOF, "the newest saved day is now the observed-through date");
+});
+test("F6 a stale row + a DELETE that times out but DID commit -> the re-probe proves the day clean: success, stale row gone, no false failure", async () => {
+  const w = world({ seedRows: [staleRow(ASOF, "GONE")], verifiedPrune: { deleteError: () => pgTimeout(), commitDespiteError: true }, rowsFor: () => [asinRow(id(1), "IN", ASOF, "B1")] });
+  const s = await runAsin(w, [id(1)], { from: ASOF, to: ASOF });
+  assert.equal(s.status, "completed");
+  assert.ok(![...w.store.values()].some((r) => r.dimension_key === JSON.stringify(["GONE"])));
+  assert.equal(w.calls.coverage.length, 1);
+});
+test("F7 a stale row the DELETE cannot remove (timeout twice) -> failed state with ONLY the sanitized status + Postgres code, no coverage, the previous observed-through date and content rev kept", async () => {
+  const w = world({ states: [prevState], seedRows: [staleRow(ASOF, "GONE")], verifiedPrune: { deleteError: () => pgTimeout() }, rowsFor: () => [asinRow(id(1), "IN", ASOF, "B1")] });
+  const s = await runAsin(w, [id(1)], { from: ASOF, to: ASOF });
+  assert.equal(s.status, "failed"); assert.equal(w.calls.coverage.length, 0);
+  assert.deepEqual(w.calls.pruneDeletes, [ASOF, ASOF], "exactly one retry of a transient (57014) failure");
+  const st = w.states.get(id(1) + "|asin-performance-v1");
+  assert.equal(st.last_status, "failed");
+  assert.equal(st.last_error, "ADS_ROWS_PRUNE_FAILED (stage=delete status=500 pg=57014 stale=present)");
+  assert.equal(st.latest_metric_date, "2026-10-01"); assert.equal(st.content_rev, "rev-prev");
+  assert.ok(!JSON.stringify([...w.states.values(), s]).includes("B0SECRET42"), "the raw database message never reaches state or the summary");
+});
+test("F8 CLEANUP RETRY is idempotent: the next run (new stamp) re-saves the same rows, removes the stale row and succeeds; a further run changes nothing", async () => {
+  const rows = () => [asinRow(id(1), "IN", ASOF, "B1")];
+  const w1 = world({ states: [prevState], seedRows: [staleRow(ASOF, "GONE")], verifiedPrune: { deleteError: () => pgTimeout() }, rowsFor: rows });
+  await runAsin(w1, [id(1)], { from: ASOF, to: ASOF });
+  const carried = [...w1.store.values()];
+  const w2 = world({ states: [...w1.states.values()], seedRows: carried, verifiedPrune: {}, rowsFor: rows, now: "2026-10-04T09:00:00.000Z" });
+  const s2 = await runAsin(w2, [id(1)], { from: ASOF, to: ASOF });
+  assert.equal(s2.status, "completed");
+  const after2 = [...w2.store.values()].map((r) => r.dimension_key).sort();
+  assert.deepEqual(after2, [JSON.stringify(["B1"])]);
+  const w3 = world({ states: [...w2.states.values()], seedRows: [...w2.store.values()], verifiedPrune: {}, rowsFor: rows, now: "2026-10-05T09:00:00.000Z" });
+  await runAsin(w3, [id(1)], { from: ASOF, to: ASOF });
+  assert.deepEqual([...w3.store.values()].map((r) => r.dimension_key).sort(), after2, "re-running is a no-op on content");
+  assert.deepEqual(w3.calls.pruneDeletes, [], "nothing stale -> no DELETE on the re-run");
+});
+test("F9 a single transient DELETE failure is retried once and succeeds; a non-transient (400) failure is not retried", async () => {
+  const w = world({ seedRows: [staleRow(ASOF, "GONE")], verifiedPrune: { deleteError: (_d, n) => (n === 1 ? pgTimeout() : null) }, rowsFor: () => [asinRow(id(1), "IN", ASOF, "B1")] });
+  assert.equal((await runAsin(w, [id(1)], { from: ASOF, to: ASOF })).status, "completed");
+  assert.deepEqual(w.calls.pruneDeletes, [ASOF, ASOF]);
+  const bad = Object.assign(new Error("Supabase request failed (400): bad filter"), { status: 400, code: "PGRST100" });
+  const w2 = world({ seedRows: [staleRow(ASOF, "GONE")], verifiedPrune: { deleteError: () => bad }, rowsFor: () => [asinRow(id(1), "IN", ASOF, "B1")] });
+  await runAsin(w2, [id(1)], { from: ASOF, to: ASOF });
+  assert.deepEqual(w2.calls.pruneDeletes, [ASOF], "a 400 is not retried");
+  assert.equal(w2.states.get(id(1) + "|asin-performance-v1").last_error, "ADS_ROWS_PRUNE_FAILED (stage=delete status=400 pg=PGRST100 stale=present)");
+});
+test("F10 an UNREADABLE probe never skips the DELETE (only a proven-clean day is skipped)", async () => {
+  const w = world({ seedRows: [staleRow(ASOF, "GONE")], verifiedPrune: { probeThrows: pgTimeout() }, rowsFor: () => [asinRow(id(1), "IN", ASOF, "B1")] });
+  const s = await runAsin(w, [id(1)], { from: ASOF, to: ASOF });
+  assert.deepEqual(w.calls.pruneDeletes, [ASOF], "the delete still ran");
+  assert.ok(![...w.store.values()].some((r) => r.dimension_key === JSON.stringify(["GONE"])));
+  // The day cannot be READ back as clean, so it is not claimed complete -- but the DELETE succeeded, which is proof.
+  assert.equal(s.status, "completed");
+});
+
 test("F4 stale rows of the OLDER wide grain inside the window are pruned (no mixed grain / double count); outside the window and other sources untouched", async () => {
   const wide = (d) => ({ source_key: "asin-performance-v1", account_id: id(1), marketplace_country_code: "IN", metric_date: d, dimension_key: JSON.stringify(["SKU", "C1", "G1", "AD1", "B1"]), metrics: { ad_spend: 5 }, source_refreshed_at: "2026-08-01T00:00:00.000Z" });
   const camp = { source_key: "campaign-performance-v1", account_id: id(1), marketplace_country_code: "IN", metric_date: ASOF, dimension_key: JSON.stringify(["c1", "SP"]), metrics: { ad_spend: 4 }, source_refreshed_at: "2026-08-01T00:00:00.000Z" };
@@ -446,6 +533,54 @@ test("G4 completed-export REUSE: an exact-identity COMPLETED export is adopted a
   }
   assert.equal(R.matchReusableExport({ exports: [listed({ sellerOrVendorIds: [...body.sellerOrVendorIds].reverse(), aggregations: [...body.aggregations].reverse() })], body, nowMs: Date.parse(NOW) }).disposition, "adopt");
 });
+test("G4b REUSE with DataDoe's ABBREVIATED listing sourceId (10 hex chars, verified 2026-10-07) + the matching source name is adopted; a wrong name, a shorter prefix or no opt-in never matches", async () => {
+  const w0 = world();
+  const it = (await planFor(w0)).items[0];
+  const body = AS.buildAdsExportRequestBody(ASIN, it.allowlist, it.window.from, it.window.to, 0);
+  const listed = (o = {}) => ({ id: "reuse-1", status: "COMPLETED", createdAt: "2026-10-03T08:00:00.000Z", expiresAt: "2026-10-04T08:00:00.000Z", ...body, sourceId: body.sourceId.slice(0, 10), sourceName: "Ad Performance by ASIN & Date", from: body.from + "T00:00:00.000Z", to: body.to + "T00:00:00.000Z", ...o });
+  const now = Date.parse(NOW);
+  assert.equal(R.matchReusableExport({ exports: [listed()], body, nowMs: now, listedSourceName: R.ASIN_ADS_SOURCE_NAME }).disposition, "adopt");
+  assert.equal(R.matchReusableExport({ exports: [listed()], body, nowMs: now }).disposition, "none", "no opt-in (the Returns runner) -> exact identity only, unchanged");
+  assert.equal(R.matchReusableExport({ exports: [listed({ sourceName: "Ad Performance by Campaign & Date" })], body, nowMs: now, listedSourceName: R.ASIN_ADS_SOURCE_NAME }).disposition, "none");
+  assert.equal(R.matchReusableExport({ exports: [listed({ sourceId: body.sourceId.slice(0, 6) })], body, nowMs: now, listedSourceName: R.ASIN_ADS_SOURCE_NAME }).disposition, "none");
+  assert.equal(R.matchReusableExport({ exports: [listed({ sourceId: "ffffffffff" })], body, nowMs: now, listedSourceName: R.ASIN_ADS_SOURCE_NAME }).disposition, "none");
+  assert.equal(R.matchReusableExport({ exports: [listed({ to: "2026-10-01T00:00:00.000Z" })], body, nowMs: now, listedSourceName: R.ASIN_ADS_SOURCE_NAME }).disposition, "none", "every other identity field still exact");
+  // End to end: the region pass adopts it with ZERO creates.
+  const w = world({ listed: [listed()], rowsFor: ({ to }) => [asinRow(id(1), "IN", to, "B1")] });
+  const r = await R.runAsinAdsRegionSlice({ region: "india", asOf: ASOF, plan: await planFor(w0), maxTotalCreates: 5, deps: w.deps });
+  assert.equal(r.creates, 0); assert.equal(r.reused, 1); assert.deepEqual(r.covered, [id(1)]);
+});
+test("G4c a prune failure is reported with its typed reason; the ADOPT-ONLY reconcile then re-persists from the SAME completed export at zero tokens and the account is covered", async () => {
+  const w = world({ seedRows: [staleRow(ASOF, "GONE")], verifiedPrune: { deleteError: () => pgTimeout() }, rowsFor: ({ to }) => [asinRow(id(1), "IN", to, "B1")] });
+  const r = await R.runAsinAdsRegionSlice({ region: "india", asOf: ASOF, plan: await planFor(w), maxTotalCreates: 5, deps: w.deps });
+  assert.equal(r.creates, 1); assert.deepEqual(r.transient, [id(1)]);
+  assert.deepEqual(r.reasons, { [id(1)]: "ADS_ROWS_PRUNE_FAILED (stage=delete status=500 pg=57014 stale=present)" });
+  const entry = R.asinAdsRunStatusEntry({ region: "india", plan: { windows: R.asinAdsWindows(ASOF), compatible: [1], covered: [], unreadable: [], items: [1] }, maxCreates: 4, nowIso: NOW, outcome: r });
+  assert.equal(entry.lastStatus, "partial"); assert.equal(entry.safeErrorCode, "ASIN_ADS_ACCOUNTS_ISOLATED"); assert.equal(entry.safeErrorStage, "ADS_ROWS_PRUNE_FAILED x1");
+  // The created export is now listed (abbreviated sourceId, as DataDoe lists it); the DB recovered -> the reconcile adopts it.
+  const made = w.calls.creates[0].body;
+  const listedMade = { id: "exp-1", status: "COMPLETED", createdAt: NOW, expiresAt: "2026-10-04T09:00:00.000Z", ...made, sourceId: made.sourceId.slice(0, 10), sourceName: "Ad Performance by ASIN & Date", from: made.from + "T00:00:00.000Z", to: made.to + "T00:00:00.000Z" };
+  const w2 = world({ states: [...w.states.values()], seedRows: [...w.store.values()], coverage: {}, listed: [listedMade], verifiedPrune: {}, rowsFor: ({ to }) => [asinRow(id(1), "IN", to, "B1")] });
+  const rr = await R.runAsinAdsRegionSlice({ region: "india", asOf: ASOF, plan: await planFor(w2), maxTotalCreates: 0, adoptOnly: true, deps: w2.deps });
+  assert.equal(rr.creates, 0); assert.equal(rr.reused, 1); assert.deepEqual(rr.covered, [id(1)]);
+  assert.ok(![...w2.store.values()].some((x) => x.dimension_key === JSON.stringify(["GONE"])));
+});
+test("G4e an OLDER run's failed state is never reported as this pass's reason (only a state written by this pass counts)", async () => {
+  const old = { account_id: id(1), source_key: "asin-performance-v1", last_status: "failed", last_error: "ADS_ROWS_PRUNE_FAILED (stage=delete status=500 pg=57014 stale=present)", updated_at: "2026-10-01T03:00:00.000Z" };
+  // Adopt-only with nothing to adopt: the pass fails BEFORE the worker writes any state, so the stored state is stale.
+  const w = world({ states: [old], rowsFor: ({ to }) => [asinRow(id(1), "IN", to, "B1")] });
+  const r = await R.runAsinAdsRegionSlice({ region: "india", asOf: ASOF, plan: await planFor(w), maxTotalCreates: 0, adoptOnly: true, deps: w.deps });
+  assert.deepEqual(r.transient, [id(1)]);
+  assert.ok(!String(r.reasons[id(1)]).startsWith("ADS_ROWS_PRUNE_FAILED"), "the stale prune error is not today's reason: " + r.reasons[id(1)]);
+  assert.match(String(r.reasons[id(1)]), /^SOURCE_[A-Z_]+/, "this pass's own classification is used");
+});
+test("G4d safe reasons: a typed slug (+ sanitized key=value detail) passes; free text never does", () => {
+  assert.equal(R.safeAsinAdsReason("ADS_ROWS_PRUNE_FAILED (stage=delete status=500 pg=57014 stale=present)"), "ADS_ROWS_PRUNE_FAILED (stage=delete status=500 pg=57014 stale=present)");
+  assert.equal(R.safeAsinAdsReason("INVALID_EXPORT_EVIDENCE (cross-account)"), "INVALID_EXPORT_EVIDENCE");
+  assert.equal(R.safeAsinAdsReason("Supabase request failed (500): canceling statement B0SECRET"), "UNCLASSIFIED");
+  assert.equal(R.safeAsinAdsReason("ADS_X (k=v; drop table)"), "ADS_X");
+  assert.equal(R.summarizeAsinAdsReasons({ a: "ADS_ROWS_PRUNE_FAILED (stage=delete)", b: "BUDGET_DEFERRED", c: "ADS_ROWS_PRUNE_FAILED" }), "ADS_ROWS_PRUNE_FAILED x2; BUDGET_DEFERRED x1");
+});
 test("G5 ADOPT-ONLY reconcile: never creates; adopts only an exact completed export", async () => {
   const w = world({ rowsFor: ({ to }) => [asinRow(id(1), "IN", to, "B1")] });
   const r = await R.runAsinAdsRegionSlice({ region: "india", asOf: ASOF, plan: await planFor(w), maxTotalCreates: 0, adoptOnly: true, deps: w.deps });
@@ -508,6 +643,16 @@ test("H2 ONE scheduler owner, NO new cron: the asin_ads job is a dependent job o
   const runJob = wf.slice(wf.indexOf("\n  run:"), wf.indexOf("\n  fba:"));
   assert.ok(!/scheduled-asin-ads-refresh/.test(runJob));
   assert.ok(!/needs\.asin_ads/.test(wf));
+});
+test("H2b PARTIAL is VISIBLE and never retried: exit 3 + a ::warning annotation naming each account's typed reason; systemic exit 1 + ::error; the step summary lists the reasons", () => {
+  const cli = readFileSync(path.join(ROOT, "scripts/release/scheduled-asin-ads-refresh.mjs"), "utf8");
+  assert.match(cli, /process\.exit\(systemic \? 1 : \(out\.classification === "PARTIAL" \? 3 : 0\)\);/);
+  assert.match(cli, /annotate\("warning", "ASIN Ads PARTIAL \(" \+ label \+ "\)"/);
+  assert.match(cli, /annotate\("error", "ASIN Ads FAILED \(" \+ label \+ "\)"/);
+  assert.match(cli, /kept last-known-good \(no automatic paid retry; the next scheduled run retries\)/);
+  assert.match(cli, /reasons: Object\.fromEntries\(isolatedIds\.map\(\(id\) => \[p8\(id\), reasonOf\(id\)\]\)\)/, "RESULT carries 8-char ids + typed reasons only");
+  // The adopt-only reconcile stays zero-create; nothing in the CLI re-creates after a failure.
+  assert.match(cli, /maxTotalCreates: 0, adoptOnly: true/);
 });
 test("H3 the scheduled CLI is OFF unless source_controls.schedule_enabled; the pause stops every paid path; an operator run needs --confirm-paid + --max-creates", () => {
   const cli = readFileSync(path.join(ROOT, "scripts/release/scheduled-asin-ads-refresh.mjs"), "utf8");
