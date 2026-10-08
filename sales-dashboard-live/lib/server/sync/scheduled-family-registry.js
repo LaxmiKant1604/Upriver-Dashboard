@@ -124,27 +124,30 @@ export const SCHEDULED_FAMILY_REGISTRY = Object.freeze({
     watchdogIdempotency: "idempotent-replay",
     notes: "The ONLY active Ads source (campaign-performance-v1). Refreshed ONCE per region in the run job (coverage mode, 21-day rolling window, <=5-seller batches with per-seller isolation + LKG retention). Independent of OLI/Catalog (an OLI failure never suppresses it); already-covered => zero creates (idempotent). Publication gates on steps.campaign.outcome == 'success'.",
   },
-  "fba-inventory-health": {
-    family: "fba-inventory-health",
+  // The FBA inventory family since the Listings inventory cutover (2026-10): the fba job creates the ONE canonical
+  // Listings export per <=5-seller batch (fba-plan:awd -- FBA inventory + AWD; listing-health-v3 adopts the same hash).
+  // FBA Inventory Health is RETIRED (RETIRED_FAMILIES below): never declared, never a dependency, never scheduled.
+  "listings": {
+    family: "listings",
     schedulerOwner: "scheduler-v2:fba",
     dependencies: ["order-line-items"],
     frozenPlanParticipation: "own-cycle",
-    ceiling: "computed-per-account",
+    ceiling: "computed-per-region",
     completionOutput: "fba_complete-job-output",
     partialBehavior: "stay-visibly-partial",
     watchdogIdempotency: "own-cycle-lkg",
-    notes: "P1: fba-plan-golive.mjs emits a machine-readable fba_complete to $GITHUB_OUTPUT; the fba job exports it. A partial region stays visibly partial (Canada LATEST_SNAPSHOT_INCOMPLETE never fabricates a zero).",
+    notes: "P1: fba-plan-golive.mjs emits a machine-readable fba_complete to $GITHUB_OUTPUT; the fba job exports it. The canonical Listings export is batched (<=5 sellers per export, one shared hash with listing-health-v3), so the create ceiling is computed from the region's batch count. Listings is a current snapshot with NO date: its freshness is the Listings fetch time, never a D-1 inventory day. FBA Inventory Health is retired: no Health export is planned or created by any job (createExport refuses its id); the last SAVED Health snapshot is read only as the dated read-only bridge. A partial region stays visibly partial (never a fabricated zero).",
   },
   "listing-health-v3": {
     family: "listing-health-v3",
     schedulerOwner: "scheduler-v2:listing-health-v3",
-    dependencies: ["fba-inventory-health"],
+    dependencies: ["listings"],
     frozenPlanParticipation: "own-cycle",
     ceiling: "computed-per-region",
     completionOutput: "terminal-succeeded-gate",
     partialBehavior: "stay-visibly-partial",
     watchdogIdempotency: "idempotent-replay",
-    notes: "OPTIONAL-INVENTORY: the v3 job runs whenever needs.run.result == 'success' && region != '' && scope != 'bootstrap' (always(); needs:[run,fba] keeps FBA as ordering only) -- NOT gated on the FBA publish outcome, because Listings + durable OLI are v3's OWN required evidence. Each account ADOPTS its FBA inventory where the reuse-only cache is fresh and publishes listings/OLI regardless; inventory-dependent fields stay unavailable for the FBA-failed accounts (inventory Pass-2 records complete-as-unavailable, so the cycle still finalizes 'succeeded'). Inventory remains reuse-only (ZERO v3 inventory creates). TOKEN PRICING: v3 creates are priced by the REAL source-registry token class (listings=premium=5, listings-raw=standard=2) -- the SAME sourceTokenCost(registryIsPremiumOf) definition the frozen tranche budget uses -- for the displayed estimate, the authorization decision, the frozen budget, and the observed post-run tokens; the authorization ceiling (maxAccounts -> derived maxTokens) is a reviewed standing limit and awaiting-budget is the honest result when the correctly-priced plan exceeds it.",
+    notes: "OPTIONAL-INVENTORY: the v3 job runs whenever needs.run.result == 'success' && region != '' && scope != 'bootstrap' (always(); needs:[run,fba] keeps FBA as ordering only) -- NOT gated on the FBA publish outcome, because Listings + durable OLI are v3's OWN required evidence. Since the Listings inventory cutover there is NO inventory source pass (FBA Inventory Health is retired): v3 reads FBA stock from its own canonical Listings rows (else the dated read-only Health bridge, else unavailable) -- ZERO inventory creates. TOKEN PRICING: v3 creates are priced by the REAL source-registry token class (listings=premium=5, listings-raw=standard=2) -- the SAME sourceTokenCost(registryIsPremiumOf) definition the frozen tranche budget uses -- for the displayed estimate, the authorization decision, the frozen budget, and the observed post-run tokens; the authorization ceiling (maxAccounts -> derived maxTokens) is a reviewed standing limit and awaiting-budget is the honest result when the correctly-priced plan exceeds it.",
   },
   "materialize": {
     family: "materialize",
@@ -160,7 +163,7 @@ export const SCHEDULED_FAMILY_REGISTRY = Object.freeze({
   "materialize-inventory": {
     family: "materialize-inventory",
     schedulerOwner: "scheduler-v2:materialize-inventory",
-    dependencies: ["order-line-items", "fba-inventory-health", "materialize"],
+    dependencies: ["order-line-items", "listings", "materialize"],
     frozenPlanParticipation: "none",
     ceiling: "zero-export",
     completionOutput: "materialize-count",
@@ -170,8 +173,12 @@ export const SCHEDULED_FAMILY_REGISTRY = Object.freeze({
   },
 });
 
-// The durable daily-cycle source families the guard REQUIRES to be declared (the paid pipeline core).
-export const REQUIRED_DAILY_FAMILIES = Object.freeze(["order-line-items", "product-catalog", "fba-inventory-health"]);
+// The durable daily-cycle source families the guard REQUIRES to be declared (the paid pipeline core). Listings is the
+// FBA inventory family (FBA Inventory Health is retired and must never be declared again).
+export const REQUIRED_DAILY_FAMILIES = Object.freeze(["order-line-items", "product-catalog", "listings"]);
+// Families that are RETIRED: declaring one, or depending on one, fails the guard (a retired paid source can never be
+// scheduled again).
+export const RETIRED_FAMILIES = Object.freeze(["fba-inventory-health"]);
 
 /**
  * PURE: validate ONE scheduled-family declaration against the required fields + controlled vocabularies. Returns
@@ -214,6 +221,13 @@ export function validateScheduledFamilyRegistry(registry = SCHEDULED_FAMILY_REGI
   }
   for (const req of REQUIRED_DAILY_FAMILIES) {
     if (!knownFamilies.has(req)) problems.push(`REQUIRED daily family "${req}" is not declared (a scheduled family cannot ship undeclared)`);
+  }
+  for (const key of keys) {
+    const decl = registry[key];
+    if (RETIRED_FAMILIES.includes(key) || RETIRED_FAMILIES.includes(S(decl && decl.family))) problems.push(`${key}: RETIRED family is declared (a retired source can never be scheduled)`);
+    for (const d of (decl && Array.isArray(decl.dependencies) ? decl.dependencies : [])) {
+      if (RETIRED_FAMILIES.includes(S(d))) problems.push(`${key}: depends on RETIRED family "${S(d)}"`);
+    }
   }
   return { ok: problems.length === 0, problems };
 }

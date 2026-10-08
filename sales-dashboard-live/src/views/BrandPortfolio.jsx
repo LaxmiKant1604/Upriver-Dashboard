@@ -25,7 +25,14 @@ import { DataQualityAlert, EmptyState, ErrorState, SkeletonMetricGrid, SkeletonT
 import { fmtRangeLabel, monthKeyLabel, nInt } from "../lib/format.js";
 import { partitionBrandSourceAccounts, refreshBrandSourceAccounts } from "../lib/brand-source-refresh.js";
 import { marketplaceToday } from "../../lib/marketplaces.js";
-import { CURRENCY_OPTIONS, brandViewModel, isConvertedMode, shareOf, hasAdsCoverage, hasUnmappedAds } from "../lib/brand-view.js";
+import { CURRENCY_OPTIONS, brandViewModel, isConvertedMode, shareOf, hasAdsCoverage, hasUnmappedAds, inventoryFreshnessSummary, inventoryFreshnessText } from "../lib/brand-view.js";
+
+// The FBA Inventory KPI sub-line freshness: the former " · as of <date>" for a legacy payload, else " · <source label>".
+function inventoryKpiSub(coverage) {
+  const summary = inventoryFreshnessSummary(coverage);
+  if (summary.legacy) return coverage && coverage.inventoryDate ? ` · as of ${coverage.inventoryDate}` : "";
+  return summary.label === "unavailable" ? "" : ` · ${summary.label}`;
+}
 import { DASH, buildBrandTables, countryTitle, coverLabel, money, ratePct } from "../lib/brand-view-tables.js";
 import { orderStatusItems, portfolioKpis, adSpendKpiCopy } from "../lib/brand-portfolio-view.js";
 import { regionLabel } from "../lib/region-view.js";
@@ -621,7 +628,7 @@ export default function BrandPortfolio({
           <span className="bv-fresh-item">{coverage.accountCount || accountCount} account{(coverage.accountCount || accountCount) === 1 ? "" : "s"} covered</span>
           {coverage.salesSavedAt ? <span className="bv-fresh-item">Oldest {new Date(coverage.salesSavedAt).toLocaleString()}</span> : null}
           {coverage.salesFrom && coverage.salesTo ? <span className="bv-fresh-item">Sales {coverage.salesFrom} → {coverage.salesTo}</span> : null}
-          <span className="bv-fresh-item">FBA {coverage.inventoryDate ? `as of ${coverage.inventoryDate}` : "unavailable"}</span>
+          <span className="bv-fresh-item" title={inventoryFreshnessSummary(coverage).title}>{inventoryFreshnessText(coverage, "FBA")}</span>
           {converted ? <span className="bv-fresh-item">{fxSummaryLine(fx, converted)}</span> : null}
           <span className="bv-fresh-item">{converted ? `Display ${displayCurrency}` : "Original currency"}</span>
         </div>
@@ -697,8 +704,8 @@ export default function BrandPortfolio({
           <div className="bv-kpi-strip">
             <BvKpi label="Total Sales" badge={rangeBadge} value={kpis.single ? money(kpis.sales, kpis.currency) : DASH} sub={totalSalesSub} />
             <BvKpi label="Units Sold" icon={<Boxes size={12} aria-hidden="true" />} badge={rangeBadge} value={nInt(kpis.units)} sub={`Across ${marketplaceCount} marketplace${marketplaceCount === 1 ? "" : "s"}`} hint="Ordered units summed across every marketplace. Unit counts are never currency converted." />
-            <BvKpi label="FBA Inventory" value={kpis.fba === null ? DASH : nInt(kpis.fba)} sub={`Available FBA units${coverage.inventoryDate ? ` · as of ${coverage.inventoryDate}` : ""}`} hint={kpis.fba === null ? "No overall FBA inventory total is available for this scope." : "Available FBA units for this brand's ASINs; unit counts are never currency converted."} />
-            <BvKpi label="FBA Cover" value={kpis.cover === null ? DASH : coverLabel(kpis.cover)} sub="Based on selected-range unit velocity" hint="Available FBA units divided by this brand's average daily unit sales in the selected range." />
+            <BvKpi label="FBA Inventory" value={kpis.fba === null ? DASH : nInt(kpis.fba)} sub={kpis.fbaWithheldReason ? "Withheld: pooled pan-EU stock" : `Available FBA units${inventoryKpiSub(coverage)}`} hint={kpis.fbaWithheldReason || (kpis.fba === null ? "No overall FBA inventory total is available for this scope." : "Available FBA units for this brand's ASINs; unit counts are never currency converted.")} />
+            <BvKpi label="FBA Cover" value={kpis.cover === null ? DASH : coverLabel(kpis.cover)} sub={kpis.fbaWithheldReason ? "Withheld with the FBA total" : "Based on selected-range unit velocity"} hint={kpis.fbaWithheldReason || "Available FBA units divided by this brand's average daily unit sales in the selected range."} />
             <BvKpi label="Ad Spend" badge={adSpendCopy.badge} value={kpis.adSpend === null ? DASH : money(kpis.adSpend, kpis.currency, 2)} sub={adSpendCopy.sub} />
             <BvKpi label="TACoS" badge="Overall" value={kpis.tacos === null ? DASH : ratePct(kpis.tacos)} sub={kpis.adSpendPartial ? "Withheld: Ad Spend is partial for this range" : "Brand ad spend ÷ brand sales"} />
           </div>
@@ -714,7 +721,7 @@ export default function BrandPortfolio({
                 subtitle={[
                   rangeLabel,
                   lastYear ? `LY compares ${fmtRangeLabel(lastYear.from, lastYear.to)}` : "LY unavailable for this window",
-                  coverage.inventoryDate ? `FBA Inv. as of ${coverage.inventoryDate}` : "FBA Inv. unavailable",
+                  inventoryFreshnessText(coverage, "FBA Inv."),
                   currencyLabel,
                 ].filter(Boolean).join(" · ")}
                 headers={tables.dailyTable.headers}

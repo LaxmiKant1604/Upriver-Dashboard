@@ -4,8 +4,8 @@
 // into BOTH the browser bundle and the serverless handler. A drift-guard test asserts these ids/locked/awd/order stay
 // identical to App.jsx's planColumns, so validation can never diverge from the rendered table.
 //
-// `locked` columns (Product / ASIN) can never be hidden. `awd` columns are valid hideable ids everywhere, but the
-// client only SHOWS them for AWD-eligible marketplaces (planVisibleColumns filters them out otherwise) -- a saved
+// `locked` columns (Product / ASIN) can never be hidden. `awd` columns are valid hideable ids everywhere; since the
+// Listings inventory cutover the client SHOWS them on every marketplace (a non-AWD marketplace renders "N/A") -- a saved
 // hidden set may legitimately contain them, so validation accepts them.
 
 export const FBA_PLAN_COLUMNS = Object.freeze([
@@ -19,20 +19,14 @@ export const FBA_PLAN_COLUMNS = Object.freeze([
   { id: "targetUnits", group: "Forecast" },
   { id: "fbaAvailable", group: "Inventory" },
   { id: "fbaDaysCover", group: "Inventory" },
-  { id: "custReserved", group: "Inventory" },
-  { id: "reserved", group: "Inventory" },
-  { id: "reservedFcTransfer", group: "Inventory" },
-  { id: "reservedFcProcessing", group: "Inventory" },
-  { id: "inboundPipeline", group: "Inventory" },
-  { id: "inboundWorking", group: "Inventory" },
-  { id: "inboundShipped", group: "Inventory" },
-  { id: "inboundReceived", group: "Inventory" },
+  { id: "fbaInbound", group: "Inventory" },
+  { id: "fbaReservedTotal", group: "Inventory" },
+  { id: "fbaFcTransfer", group: "Inventory" },
   { id: "awd", group: "Inventory", awd: true },
   { id: "awdInbound", group: "Inventory", awd: true },
-  { id: "totalFbaInv", group: "Inventory" },
+  { id: "fbaSupply", group: "Inventory" },
   { id: "amazonNetwork", group: "Inventory" },
   { id: "recommended", group: "Inventory" },
-  { id: "pipeline", group: "Planning" },
   { id: "horizon", group: "Planning" },
   { id: "horizonDemand", group: "Planning" },
   { id: "safety", group: "Planning" },
@@ -60,10 +54,20 @@ export const FBA_PLAN_COLUMNS = Object.freeze([
   { id: "suggestedReorder", group: "Reorder" },
 ]);
 
-// The columns HIDDEN by default for an account with no saved preference (the raw inventory-component columns).
-export const PLAN_DEFAULT_HIDDEN_COLS = Object.freeze([
-  "reservedFcTransfer", "reservedFcProcessing", "inboundWorking", "inboundShipped", "inboundReceived",
+// The columns HIDDEN by default for an account with no saved preference. None since the Listings inventory cutover:
+// the former raw FBA Inventory Health component columns no longer exist.
+export const PLAN_DEFAULT_HIDDEN_COLS = Object.freeze([]);
+
+// Column ids RETIRED by the Listings inventory cutover (2026-10). They described FBA Inventory Health buckets Listings does
+// not provide (customer reserved, FC processing, the inbound working/shipped/received split) or totals whose meaning
+// changed (Total FBA Inv. -> FBA Supply, Inbound Pipeline -> FBA Inbound, Pipeline). A saved hidden set may still carry
+// them: the client drops them on load (retiredFbaPlanColumnId) so a later save is never refused.
+export const RETIRED_FBA_PLAN_COLUMN_IDS = Object.freeze([
+  "custReserved", "reserved", "reservedFcTransfer", "reservedFcProcessing", "inboundPipeline",
+  "inboundWorking", "inboundShipped", "inboundReceived", "totalFbaInv", "pipeline",
 ]);
+const RETIRED_SET = new Set(RETIRED_FBA_PLAN_COLUMN_IDS);
+export function isRetiredFbaPlanColumnId(id) { return RETIRED_SET.has(String(id)); }
 
 export const FBA_PLAN_COLUMN_IDS = Object.freeze(FBA_PLAN_COLUMNS.map((c) => c.id));
 const ID_SET = new Set(FBA_PLAN_COLUMN_IDS);

@@ -3,6 +3,11 @@
 // exact seller-marketplace isolation, FBA inventory + Catalog reuse with ZERO duplicate exports, OLI arbitrary-window
 // reads with ZERO exports, partial/unavailable coverage, latest-inventory-only, Raw degraded, authorization,
 // LKG preservation, one account-scoped shadow snapshot saved via the real worker + idempotent replay, and no new API.
+// Listings inventory CUTOVER: the listing-health-v3:inventory fragment (a reuse of the cycle's FBA Inventory Health
+// export) is GONE -- no Health export exists. On Hand FBA follows ONE per-account source (validated Listings, else the
+// account's LAST SAVED durable Health snapshot injected READ-ONLY as context.listingHealthV3DurableInventory -- the dated
+// bridge, only while its date >= asOf - 2 -- else Unavailable); validatePayload requires the inventory-source-v1 model
+// and latestDataDate is the bridge date ONLY for a bridge-sourced payload.
 // Offline, zero DataDoe/network. 7-bit ASCII, LF.
 
 import assert from "node:assert/strict";
@@ -31,18 +36,21 @@ const distinctHashes = (plan, key) => { const s = new Set(); for (const r of pla
 /* ===================== A. registration / wiring ===================== */
 (() => {
   const keys = (REPORT_SOURCE_CONTRACTS["listing-health-v3"] || []).map((c) => c.requestKey);
-  ok("A: v3 owns listings + listings-raw + inventory (catalog is derived durable, not owned)",
-    keys.join(",") === "listing-health-v3:listings,listing-health-v3:listings-raw,listing-health-v3:inventory");
-  ok("A: v3 listings + listings-raw + inventory are seller-scoped (exact-pair attribution)",
-    ["listing-health-v3:listings", "listing-health-v3:listings-raw", "listing-health-v3:inventory"].every((k) => SELLER_SCOPED_REQUEST_KEYS.includes(k)));
+  ok("A: v3 owns listings + listings-raw ONLY (the retired inventory fragment is gone; catalog is derived durable, not owned)",
+    keys.join(",") === "listing-health-v3:listings,listing-health-v3:listings-raw");
+  ok("A: v3 listings + listings-raw are seller-scoped (exact-pair attribution)",
+    ["listing-health-v3:listings", "listing-health-v3:listings-raw"].every((k) => SELLER_SCOPED_REQUEST_KEYS.includes(k)));
+  ok("A: the v3 derive declares no inventory request key and receives the saved Health bridge as a derived context key",
+    !REPORT_DERIVATIONS["listing-health-v3"].optionalRequestKeys.includes("listing-health-v3:inventory")
+    && REPORT_DERIVATIONS["listing-health-v3"].derivedContextKeys.includes("listingHealthV3DurableInventory"));
   ok("A: v3 listings/listings-raw carry seller_or_vendor_id + marketplace_country_code",
     ["listing-health-v3:listings", "listing-health-v3:listings-raw"].every((k) => {
       const cols = REPORT_SOURCE_CONTRACTS["listing-health-v3"].find((c) => c.requestKey === k).columns;
       return cols.includes("seller_or_vendor_id") && cols.includes("marketplace_country_code");
     }));
   ok("A: v3 declares coverage", reportSourceCoverage("listing-health-v3") === "shadow");
-  ok("A: v3 requirements = order-line-items + listings + listings-raw + fba-inventory-health + product-catalog",
-    [...REPORT_SOURCE_REQUIREMENTS["listing-health-v3"]].sort().join(",") === "fba-inventory-health,listings,listings-raw,order-line-items,product-catalog");
+  ok("A: v3 requirements = order-line-items + listings + listings-raw + product-catalog (FBA Inventory Health is never fetched)",
+    [...REPORT_SOURCE_REQUIREMENTS["listing-health-v3"]].sort().join(",") === "listings,listings-raw,order-line-items,product-catalog");
   ok("A: v3 derivation registered at listing-health/v3-oli-window with a real derive",
     REPORT_DERIVATIONS["listing-health-v3"].snapshotVersion === "listing-health/v3-oli-window" && typeof REPORT_DERIVATIONS["listing-health-v3"].derive === "function");
   ok("A: v3 authorization is DENY_FOR_BRAND_RESTRICTED_USERS and NOT brand-accessible (same gate as listing-health)",
@@ -55,7 +63,8 @@ const distinctHashes = (plan, key) => { const s = new Set(); for (const r of pla
   const euPlan = planListingHealthV3BucketBatched({ accounts: mk(["UK", "DE", "FR", "IT", "ES", "UK", "DE", "IT", "UK", "NL", "BE", "PL", "AU", "NL", "FR", "ES"]), connections, asOfFor: () => asOf, inventoryAsOf: inv });
   ok("B: Europe-Australia 16 -> 4 listings batches", distinctHashes(euPlan, "listing-health-v3:listings").size === 4);
   ok("B: Europe-Australia 16 -> 4 listings-raw batches (counted separately)", distinctHashes(euPlan, "listing-health-v3:listings-raw").size === 4);
-  ok("B: Europe-Australia 16 -> 4 inventory batches", distinctHashes(euPlan, "listing-health-v3:inventory").size === 4);
+  ok("B: Europe-Australia 16 -> ZERO inventory sources (no Health export is ever planned)", distinctHashes(euPlan, "listing-health-v3:inventory").size === 0
+    && euPlan.every((r) => r.sources.every((x) => x.sourceKey !== "fba-inventory-health")));
   ok("B: India 8 -> 2 batches", distinctHashes(planListingHealthV3BucketBatched({ accounts: mk(Array(8).fill("IN")), connections, asOfFor: () => asOf, inventoryAsOf: inv }), "listing-health-v3:listings").size === 2);
   ok("B: US-Canada 10 -> 2 batches", distinctHashes(planListingHealthV3BucketBatched({ accounts: mk([...Array(8).fill("US"), "CA", "CA"]), connections, asOfFor: () => asOf, inventoryAsOf: inv }), "listing-health-v3:listings").size === 2);
   let le5 = true, pairs = true, mixed = false;
@@ -73,14 +82,13 @@ const distinctHashes = (plan, key) => { const s = new Set(); for (const r of pla
   const accts = mk(["UK", "DE", "FR", "IT", "ES", "UK", "DE", "IT", "UK", "NL", "BE", "PL", "AU", "NL", "FR", "ES"]);
   const v3 = planListingHealthV3BucketBatched({ accounts: accts, connections, asOfFor: () => asOf, inventoryAsOf: inv });
   const fba = planFbaPlanBucketBatched({ accounts: accts, connections, asOfFor: () => asOf, inventoryAsOf: inv });
-  const v3inv = distinctHashes(v3, "listing-health-v3:inventory");
-  const fbainv = distinctHashes(fba, "fba-plan:inventory-health");
-  ok("C: v3 inventory request_hash SET is IDENTICAL to fba-plan:inventory-health (one shared export, FBA hash untouched)",
-    v3inv.size > 0 && v3inv.size === fbainv.size && [...v3inv].every((h) => fbainv.has(h)));
+  ok("C: NEITHER v3 nor fba-plan plans an FBA Inventory Health export (the retired source is never fetched)",
+    distinctHashes(v3, "listing-health-v3:inventory").size === 0 && distinctHashes(fba, "fba-plan:inventory-health").size === 0
+    && [...v3, ...fba].every((r) => r.sources.every((x) => x.sourceKey !== "fba-inventory-health")));
   ok("C: v3 defines NO owned inventory/catalog export beyond the reused identity (catalog is derived durable)",
     !(REPORT_SOURCE_CONTRACTS["listing-health-v3"] || []).some((c) => c.requestKey === "listing-health-v3:catalog"));
-  // v3:listings now REUSES the fba-plan:awd CANONICAL Listings export (identical hash SET over the same batches),
-  // exactly like v3:inventory reuses fba-plan:inventory-health -- ONE shared paid Listings export instead of two. This
+  // v3:listings REUSES the fba-plan:awd CANONICAL Listings export (identical hash SET over the same batches) -- ONE
+  // shared paid Listings export instead of two. This
   // also proves the two planners produce IDENTICAL listings batches (same batch family => same membership => same ids).
   const v3listings = distinctHashes(v3, "listing-health-v3:listings");
   const fbaAwd = distinctHashes(fba, "fba-plan:awd");
@@ -98,12 +106,14 @@ const invRow = (date, seller, mkt, sku, available) => ({ date, seller_or_vendor_
 const listingRow = (seller, mkt, sku, o = {}) => ({ seller_or_vendor_id: seller, marketplace_country_code: mkt, sku, child_asin: `ASIN-${sku}`, listing_name: o.name ?? `L ${sku}`, listing_status: o.status ?? "Active", listing_price_value: o.price === undefined ? 9 : o.price, listing_price_currency: o.currency ?? "USD", listing_current_quantity: o.qty ?? 0, fba_quantity_available: o.fba ?? 0, listing_fulfillment_channel: o.channel ?? "AMAZON_NA", listing_open_date: o.open ?? "2024-01-01" });
 const oliRow = (date, sku, sales, units) => ({ account_id: SELLER, seller_or_vendor_id: SELLER, sale_date: date, sku, child_asin: `ASIN-${sku}`, currency: "USD", sales_amount: sales, ordered_units: units, unpriced_units: 0 });
 const catRow = (sku, brand) => ({ child_asin: `ASIN-${sku}`, product_name: `P ${sku}`, product_brand: brand });
+// Expanded (post-cutover, 18-column) canonical Listings rows: the three inventory fields as own keys.
+const xRow = (seller, mkt, sku, o = {}) => ({ ...listingRow(seller, mkt, sku, o), fba_quantity_inbound: 0, fba_quantity_reserved: 0, fba_quantity_fc_transfer: 0 });
 
 // Build isolated sources for a single-account v3 derive from raw batch rows.
-function v3Sources({ listings, raw, inventory, owner, rawState = "success" }) {
+function v3Sources({ listings, raw, owner, rawState = "success" }) {
   const planned = planListingHealthV3BucketBatched({ accounts: [{ accountId: SELLER, country: "US", currency: "USD", name: "A0" }], connections, asOfFor: () => asOf, inventoryAsOf: inv })[0];
   const statusByHash = {}; const errorByHash = {}; const loaded = new Map();
-  const rowsByKey = { "listing-health-v3:listings": listings, "listing-health-v3:listings-raw": raw, "listing-health-v3:inventory": inventory };
+  const rowsByKey = { "listing-health-v3:listings": listings, "listing-health-v3:listings-raw": raw };
   for (const s of planned.sources) {
     if (s.requestKey === "listing-health-v3:listings-raw" && rawState !== "success") {
       statusByHash[s.requestHash] = "failed";
@@ -118,6 +128,8 @@ function v3Sources({ listings, raw, inventory, owner, rawState = "success" }) {
 }
 const durableOli = ({ rows, coverageWindows, completenessRows = [] }) => ({ available: true, rows, coverageWindows, completenessRows });
 const durableCat = (rows) => ({ available: true, rows });
+// The account's LAST SAVED durable FBA Inventory Health snapshot (the read-only bridge), as the loader injects it.
+const bridge = (rows, savedAt = "2026-09-04T09:00:00.000Z") => ({ available: true, rows, snapshotDate: rows.reduce((d, r) => (String(r.date) > d ? String(r.date) : d), ""), savedAt });
 const fullCoverage = [{ from: "2024-01-01", to: asOf }];
 
 /* ===================== D. exact seller-marketplace isolation ===================== */
@@ -134,30 +146,44 @@ const fullCoverage = [{ from: "2024-01-01", to: asOf }];
 
 /* ===================== E. derive: parity, window/zero-export, coverage, inventory, raw, LKG ===================== */
 const baseListings = [listingRow(SELLER, "US", "A", { status: "Active", price: 25, fba: 30, channel: "AMAZON_NA" }), listingRow(SELLER, "US", "B", { status: "Inactive", price: 0, qty: 7, channel: "DEFAULT" })];
-// Inventory is EXACTLY the single requested snapshot day (inv = 2026-09-04); any other date is rejected.
+// The saved Health bridge rows (dated inv = 2026-09-04; within asOf - 2 of asOf 2026-09-02).
 const baseInv = [invRow(inv, SELLER, "US", "A", 30)];
 const baseCat = [catRow("A", "BrandX"), catRow("B", "BrandY")];
 const baseOli = [oliRow("2026-09-01", "A", 100, 10), oliRow("2026-08-20", "A", 50, 5), oliRow("2026-09-02", "B", 200, 20), oliRow("2026-06-01", "A", 999, 99)];
 // marketCountry is the TRUSTED account-directory marketplace the real planner ALWAYS supplies (report-planner.js) and
 // the live-promote bundle now threads (dependency-bundle context). The derive requires it to validate row ownership and
 // stamps it (canonical) onto the payload; a context that lacks it fails closed (proved in section J).
-const ctx = (over = {}) => ({ to: asOf, inventoryAsOf: inv, rawSellerId: SELLER, accountId: SELLER, marketCountry: "US", listingHealthV3DurableOli: durableOli({ rows: baseOli, coverageWindows: fullCoverage }), listingHealthV3DurableCatalog: durableCat(baseCat), ...over });
+const ctx = (over = {}) => ({ to: asOf, inventoryAsOf: inv, rawSellerId: SELLER, accountId: SELLER, marketCountry: "US", listingHealthV3DurableOli: durableOli({ rows: baseOli, coverageWindows: fullCoverage }), listingHealthV3DurableCatalog: durableCat(baseCat), listingHealthV3DurableInventory: bridge(baseInv), ...over });
 const deriveV3 = (sources, context) => deriveReportSnapshot({ reportKey: "listing-health-v3", sources, context });
 
 (() => {
-  const { sources } = v3Sources({ listings: baseListings, raw: [{ seller_or_vendor_id: SELLER, marketplace_country_code: "US", sku: "A", child_asin: "ASIN-A", summaries: JSON.stringify({ status: ["BUYABLE", "DISCOVERABLE"] }), issues: JSON.stringify([]), offers: JSON.stringify([{ price: { amount: 25 } }]) }], inventory: baseInv });
+  const { sources } = v3Sources({ listings: baseListings, raw: [{ seller_or_vendor_id: SELLER, marketplace_country_code: "US", sku: "A", child_asin: "ASIN-A", summaries: JSON.stringify({ status: ["BUYABLE", "DISCOVERABLE"] }), issues: JSON.stringify([]), offers: JSON.stringify([{ price: { amount: 25 } }]) }] });
 
   // 30D window (default): SKU-A = 09-01(100) only in 7D but 09-01+08-20 in 30D.
   const r30 = deriveV3(sources, ctx({ windowPreset: "30D" }));
   ok("E: derive status derived; sales source is order-line-items (no Profit-by-SKU)", r30.status === "derived" && r30.payload.salesSource === "order-line-items");
   const a30 = r30.payload.rows.find((x) => x.sku === "A");
   ok("E: 30D OLI window sales/units for SKU-A = 150/15 (08-20 + 09-01, June excluded)", a30.sales === 150 && a30.units === 15);
-  ok("E: exact single-day (D-1) inventory (SKU-A on-hand 30 from the 09-04 snapshot)", a30.onHandFba === 30 && a30.onHandFbaSource === "fba-snapshot");
+  // 15-column Listings are not validated inventory evidence -> the saved Health BRIDGE (its latest date, read-only).
+  ok("E: the dated saved Health bridge (SKU-A on-hand 30 from the 09-04 snapshot)", a30.onHandFba === 30 && a30.onHandFbaSource === "fba-health-fallback");
+  ok("E: payload.inventory = inventory-source-v1 health-fallback (the bridge) carrying its date + reason; latestDataDate = that date; provenance = the bridge's saved time",
+    r30.payload.inventory.model === "inventory-source-v1" && r30.payload.inventory.source === "health-fallback" && r30.payload.inventory.snapshotDate === inv
+    && r30.payload.inventory.refreshedAt === null && r30.payload.inventory.fallbackReasons.join(",") === "listings-not-expanded"
+    && r30.payload.inventory.label === `FBA Inventory Health snapshot ${inv} (saved, no longer refreshed -- temporary bridge: listings-not-expanded)` && r30.latestDataDate === inv
+    && r30.payload.inventory.bridgeMaxAgeDays === 2 && r30.payload.provenance.inventoryFetchedAt === "2026-09-04T09:00:00.000Z");
 
-  // Cross-date guard: an inventory row on ANY other day than the exact requested one invalidates the derive.
-  const crossed = v3Sources({ listings: baseListings, raw: [], inventory: [...baseInv, invRow("2026-09-01", SELLER, "US", "A", 999)] });
-  ok("E: an inventory row dated off the exact D-1 day => invalid (never folded or summed)",
-    deriveV3(crossed.sources, ctx({ windowPreset: "30D" })).status === "invalid");
+  // The bridge reads its LATEST date only: an older-dated row is never folded or summed.
+  const olderRow = deriveV3(sources, ctx({ windowPreset: "30D", listingHealthV3DurableInventory: bridge([...baseInv, invRow("2026-09-01", SELLER, "US", "A", 999)]) }));
+  ok("E: an older-dated bridge row is ignored (latest date only; never 999, never 1029)", olderRow.status === "derived" && olderRow.payload.rows.find((x) => x.sku === "A").onHandFba === 30);
+  // A STALE bridge (older than asOf - 2) never drives On Hand FBA: Unavailable with the typed reason, never the stale 30.
+  const staleR = deriveV3(sources, ctx({ windowPreset: "30D", listingHealthV3DurableInventory: bridge([invRow("2026-08-30", SELLER, "US", "A", 30)]) }));
+  ok("E: a stale bridge (2026-08-30 < 2026-09-02 - 2) -> On Hand FBA Unavailable (health-bridge-stale), never the stale figure",
+    staleR.status === "derived" && staleR.payload.inventory.source === "unavailable" && staleR.payload.rows.find((x) => x.sku === "A").onHandFba === null
+    && JSON.stringify(staleR.payload.inventory.unavailableReasons) === JSON.stringify(["listings-not-expanded", "health-bridge-stale:2026-08-30"]) && staleR.latestDataDate === null);
+  // A bridge carrying another seller's / marketplace's row is refused SOFTLY (Unavailable with the reason) -- never invalid.
+  const foreignR = deriveV3(sources, ctx({ windowPreset: "30D", listingHealthV3DurableInventory: bridge([...baseInv, invRow(inv, SELLER, "DE", "A", 7)]) }));
+  ok("E: a bridge with another marketplace's row -> Unavailable (soft refusal; listings/OLI still publish)",
+    foreignR.status === "derived" && foreignR.payload.inventory.source === "unavailable" && foreignR.payload.inventory.unavailableReasons.includes("health-foreign-seller-or-marketplace-rows"));
 
   // WINDOW CHANGE with ZERO exports: 7D re-aggregates the SAME durable OLI (no fetch), different total.
   const realFetch = globalThis.fetch; let hits = 0; globalThis.fetch = () => { hits += 1; throw new Error("no network in derive"); };
@@ -174,23 +200,57 @@ const deriveV3 = (sources, context) => deriveReportSnapshot({ reportKey: "listin
   ok("E: full coverage -> salesWindowStatus 'covered'", r30.payload.salesWindowStatus === "covered");
 
   // Raw degraded (SOURCE_DISABLED) => issuesAvailable false, snapshot still saved (never blocked); nothing inferred.
-  const dg = v3Sources({ listings: baseListings, raw: [], inventory: baseInv, rawState: "disabled" });
+  const dg = v3Sources({ listings: baseListings, raw: [], rawState: "disabled" });
   const rDg = deriveV3(dg.sources, ctx({ windowPreset: "30D" }));
   ok("E: Listings Raw disabled => derived with issuesAvailable false; buyable/discoverable/liveOffer null (nothing inferred)",
     rDg.status === "derived" && rDg.payload.issuesAvailable === false && rDg.payload.rows.every((x) => x.buyable === null && x.discoverable === null && x.liveOffer === null));
 
-  // OPTIONAL INVENTORY (Section 3 partial-data contract): a MISSING inventory source no longer blocks -- listings +
-  // durable OLI still publish, with inventory.available:false and FBA on-hand falling back to the Listings quantity
-  // (never a fabricated zero). This lets an account whose FBA failed publish while other accounts' FBA succeeded.
-  const miss = v3Sources({ listings: baseListings, raw: [], inventory: baseInv });
-  delete miss.sources["listing-health-v3:inventory"];
-  const rMiss = deriveV3(miss.sources, ctx({ windowPreset: "30D" }));
-  ok("E: missing OPTIONAL inventory => still DERIVED (listings/OLI publish), inventory.available:false",
+  // OPTIONAL INVENTORY (Section 3 partial-data contract): no saved Health snapshot does not block -- listings + durable
+  // OLI still publish, with inventory.available:false (never a fabricated zero).
+  const miss = v3Sources({ listings: baseListings, raw: [] });
+  const rMiss = deriveV3(miss.sources, ctx({ windowPreset: "30D", listingHealthV3DurableInventory: { available: false, reason: "health-snapshot-missing" } }));
+  ok("E: no saved Health snapshot => still DERIVED (listings/OLI publish), inventory.available:false",
     rMiss.status === "derived" && rMiss.payload.inventory && rMiss.payload.inventory.available === false);
-  ok("E: with inventory unavailable, FBA on-hand falls back to the Listings quantity (never a fabricated zero)",
-    (() => { const a = rMiss.payload.rows.find((x) => x.sku === "A"); return !!a && a.onHandFba === 30 && a.onHandFbaSource === "listings-fallback"; })());
+  ok("E: with no Health and non-validated (15-column) Listings, FBA on-hand is Unavailable -- never the Listings 30, never 0",
+    (() => { const a = rMiss.payload.rows.find((x) => x.sku === "A"); return !!a && a.onHandFba === null && a.onHandFbaSource === null; })()
+    && rMiss.payload.inventory.source === "unavailable" && rMiss.latestDataDate === null
+    && JSON.stringify(rMiss.payload.inventory.unavailableReasons) === JSON.stringify(["listings-not-expanded", "health-snapshot-missing"]));
+  const rNotLoaded = deriveV3(miss.sources, ctx({ windowPreset: "30D", listingHealthV3DurableInventory: undefined }));
+  ok("E: a derive context without the bridge => health-bridge-not-loaded (Unavailable)", rNotLoaded.status === "derived"
+    && JSON.stringify(rNotLoaded.payload.inventory.unavailableReasons) === JSON.stringify(["listings-not-expanded", "health-bridge-not-loaded"]));
+
+  // VALIDATED (expanded) Listings is the source -- the saved Health bridge is never used next to it.
+  const xListings = [xRow(SELLER, "US", "A", { status: "Active", price: 25, fba: 30, channel: "AMAZON_NA" }), xRow(SELLER, "US", "B", { status: "Inactive", price: 0, qty: 7, channel: "DEFAULT" })];
+  const vx = v3Sources({ listings: xListings, raw: [] });
+  const rX = deriveV3(vx.sources, ctx({ windowPreset: "30D", listingsFetchedAt: "2026-09-04T06:00:00.000Z", listingHealthV3DurableInventory: bridge([invRow(inv, SELLER, "US", "A", 999)]) }));
+  const aX = rX.status === "derived" ? rX.payload.rows.find((x) => x.sku === "A") : null;
+  ok("E: validated Listings -> on-hand from Listings (SKU-A 30, source listings), never the Health 999", !!aX && aX.onHandFba === 30 && aX.onHandFbaSource === "listings");
+  ok("E: ... payload.inventory listings: NO inventory date, freshness = the Listings refresh time; latestDataDate null",
+    rX.payload.inventory.source === "listings" && rX.payload.inventory.snapshotDate === null && rX.payload.inventory.refreshedAt === "2026-09-04T06:00:00.000Z"
+    && rX.payload.inventory.label === "Listings refreshed 2026-09-04T06:00:00.000Z" && rX.payload.provenance.inventorySnapshotDate === null && rX.latestDataDate === null);
+  ok("E: ... a merchant-fulfilled all-zero SKU (B) is FBA not applicable", rX.payload.rows.find((x) => x.sku === "B").onHandFbaApplicable === false);
+  // Validated Listings never need the bridge -- even a STALE one is irrelevant to them.
+  ok("E: validated Listings with a stale bridge -> still Listings", deriveV3(vx.sources, ctx({ windowPreset: "30D", listingHealthV3DurableInventory: bridge([invRow("2026-08-01", SELLER, "US", "A", 999)]) })).payload.inventory.source === "listings");
+  // Conflicting duplicate Listings rows (AAKRITI-style) -> the dated saved Health bridge, conflict reported.
+  const vc = v3Sources({ listings: [...xListings, xRow(SELLER, "US", "A", { status: "Active", price: 25, fba: 12, channel: "AMAZON_NA" })], raw: [] });
+  const rC = deriveV3(vc.sources, ctx({ windowPreset: "30D", listingHealthV3DurableInventory: bridge([invRow(inv, SELLER, "US", "A", 31)]) }));
+  ok("E: conflicting duplicate Listings rows -> health-fallback (SKU-A 31 from Health on every row), conflict reported",
+    rC.status === "derived" && rC.payload.inventory.source === "health-fallback" && rC.payload.inventory.fallbackReasons.includes("listings-unresolved-conflicts:1")
+    && rC.payload.inventory.conflicts.some((c) => c.sku === "A") && rC.payload.rows.filter((x) => x.sku === "A").every((x) => x.onHandFba === 31 && x.onHandFbaSource === "fba-health-fallback"));
+
+  // validatePayload: the phase-2 inventory model is REQUIRED (a pre-phase-2 payload is never valid / served / promoted).
+  const V = REPORT_DERIVATIONS["listing-health-v3"];
+  ok("E: validatePayload accepts the phase-2 payloads (listings / health-fallback / unavailable)", V.validatePayload(rX.payload) && V.validatePayload(r30.payload) && V.validatePayload(rMiss.payload));
+  ok("E: validatePayload rejects a pre-phase-2 payload (no inventory.model) and a phase-3-only model",
+    V.validatePayload({ ...r30.payload, inventory: { available: true, snapshotDate: inv } }) === false
+    && V.validatePayload({ ...rX.payload, inventory: { ...rX.payload.inventory, model: "listings-v1" } }) === false
+    && V.validatePayload({ ...rX.payload, inventory: null }) === false);
+  ok("E: latestDataDate = the Health date ONLY for a health-fallback payload (Listings / Unavailable claim none)",
+    V.latestDataDate(r30.payload) === inv && V.latestDataDate(rX.payload) === null && V.latestDataDate(rMiss.payload) === null
+    && V.latestDataDate({ inventory: { source: "listings", snapshotDate: inv } }) === null
+    && V.latestDataDate({ inventory: { source: "health-fallback", snapshotDate: "2026-02-30" } }) === null);
   // The truly-required LISTINGS source still blocks when missing (LKG preserved, no snapshot).
-  const missListings = v3Sources({ listings: baseListings, raw: [], inventory: baseInv });
+  const missListings = v3Sources({ listings: baseListings, raw: [] });
   delete missListings.sources["listing-health-v3:listings"];
   ok("E: a missing REQUIRED source (listings) => unavailable (LKG preserved, no snapshot)", deriveV3(missListings.sources, ctx()).status === "unavailable");
   // Missing durable OLI => unavailable.
@@ -206,7 +266,7 @@ const deriveV3 = (sources, context) => deriveReportSnapshot({ reportKey: "listin
 // UK->GB/fail-open matrix is proved directly in report-listing-health-advanced.test.js; here we prove the DERIVE wires
 // the trusted marketplace through and gates on it.
 (() => {
-  const { sources } = v3Sources({ listings: baseListings, raw: [{ seller_or_vendor_id: SELLER, marketplace_country_code: "US", sku: "A", child_asin: "ASIN-A", summaries: JSON.stringify({ status: ["BUYABLE"] }), issues: JSON.stringify([]), offers: JSON.stringify([{ price: { amount: 25 } }]) }], inventory: baseInv });
+  const { sources } = v3Sources({ listings: baseListings, raw: [{ seller_or_vendor_id: SELLER, marketplace_country_code: "US", sku: "A", child_asin: "ASIN-A", summaries: JSON.stringify({ status: ["BUYABLE"] }), issues: JSON.stringify([]), offers: JSON.stringify([{ price: { amount: 25 } }]) }] });
   // A present, trusted marketplace derives AND stamps the canonical owner marketplace on the payload (this is the SAME
   // owner.marketplace the direct read-only serve resolves from the account directory -> scheduler/serve are equivalent).
   const rOk = deriveV3(sources, ctx({ windowPreset: "30D" }));
@@ -229,7 +289,6 @@ await (async () => {
   const rowsByKey = {
     "listing-health-v3:listings": baseListings,
     "listing-health-v3:listings-raw": [{ seller_or_vendor_id: SELLER, marketplace_country_code: "US", sku: "A", child_asin: "ASIN-A", summaries: JSON.stringify({ status: ["BUYABLE", "DISCOVERABLE"] }), issues: JSON.stringify([]), offers: JSON.stringify([{ price: { amount: 25 } }]) }],
-    "listing-health-v3:inventory": baseInv,
   };
   for (const s of planned.sources) {
     store.upsertSourceJob({ cycleId: cid, requestHash: s.requestHash, requestKey: s.requestKey, sourceId: s.sourceId, sourceKey: s.sourceKey, connectionId: s.connectionId, organizationFingerprint: s.organizationFingerprint, accountScopeHash: s.accountScopeHash });
@@ -245,6 +304,8 @@ await (async () => {
     getCompleteness: async () => [{ sale_date: asOf, completeness_status: "final", itemization_percent: 100 }],
     getCatalogSnapshot: async () => ({ read: "ok", snapshot: { object_path: "cat/p" } }),
     loadCatalogPayload: async () => ({ rows: baseCat }),
+    // The saved Health bridge (read-only; the retired inventory fragment no longer exists).
+    getHealthBridge: async () => ({ rows: baseInv, unavailableReason: null, snapshotDate: inv, savedAt: "2026-09-04T09:00:00.000Z" }),
   });
   const saved = [];
   const saveSnapshot = async ({ reportKey, accountId, params, payload }) => { store.saveCalls += 1; store.seedSnapshot(reportKey, accountId, payload); saved.push({ reportKey, accountId, params, payload }); return { paramsHash: "ph" }; };
@@ -255,6 +316,8 @@ await (async () => {
   ok("F: saved under the shadow key scheduler-v2/listing-health-v3, version listing-health/v3-oli-window",
     saved[0].reportKey === "scheduler-v2/listing-health-v3" && saved[0].params.reportVersion === "listing-health/v3-oli-window");
   ok("F: the shadow payload is account-scoped + OLI-sourced", saved[0].accountId === SELLER && saved[0].payload.salesSource === "order-line-items" && saved[0].payload.accountId === SELLER);
+  ok("F: the shadow payload carries the inventory model (15-column Listings -> the saved Health bridge from the loader)",
+    saved[0].payload.inventory.model === "inventory-source-v1" && saved[0].payload.inventory.source === "health-fallback" && saved[0].payload.rows.find((x) => x.sku === "A").onHandFba === 30);
   ok("F: the loader read enriched OLI via the established wrapper for the resolved 30D window", enrichedCalledWith && enrichedCalledWith.from === "2026-08-04" && enrichedCalledWith.to === asOf && enrichedCalledWith.accountIds[0] === SELLER);
   ok("F: zero network/DataDoe during the worker derive", hits === 0);
   const before = store.saveCalls;
@@ -288,6 +351,23 @@ await (async () => {
   ok("H: a durable READ FAILURE fails closed ({}), never a fabricated zero", Object.keys(cf).length === 0);
   const other = await okLoader({ reportKey: "fba-plan", accountId: SELLER, planned });
   ok("H: loader returns {} for any non-v3 report key", Object.keys(other).length === 0);
+  // The saved Health bridge: read READ-ONLY with the account's identity; soft when missing / unreadable; never in STRICT.
+  const calls = [];
+  const bLoader = makeListingHealthV3DurableContextLoader({ ...base, getEnrichedOli: async () => [], getHealthBridge: async (a) => { calls.push(a); return { rows: baseInv, unavailableReason: null, snapshotDate: inv, savedAt: "t" }; } });
+  const cb = await bLoader({ reportKey: "listing-health-v3", accountId: SELLER, planned });
+  ok("H: the loader injects the saved Health bridge (rows + date + saved time) with the account's org / connection / scope / raw seller",
+    cb.listingHealthV3DurableInventory.available === true && cb.listingHealthV3DurableInventory.snapshotDate === inv && cb.listingHealthV3DurableInventory.rows.length === 1
+    && calls[0].accountId === SELLER && calls[0].rawSellerId === SELLER && calls[0].connectionId === "primary" && !!calls[0].organizationFingerprint);
+  const mLoader = makeListingHealthV3DurableContextLoader({ ...base, getEnrichedOli: async () => [], getHealthBridge: async () => ({ rows: null, unavailableReason: "health-snapshot-missing" }) });
+  ok("H: no saved Health snapshot -> { available:false, reason } (soft; OLI + catalog still load)",
+    (await mLoader({ reportKey: "listing-health-v3", accountId: SELLER, planned })).listingHealthV3DurableInventory.reason === "health-snapshot-missing");
+  const tLoader = makeListingHealthV3DurableContextLoader({ ...base, getEnrichedOli: async () => [], getHealthBridge: async () => { throw new Error("db down"); } });
+  const ct = await tLoader({ reportKey: "listing-health-v3", accountId: SELLER, planned });
+  ok("H: a bridge read THROW is soft (health-snapshot-read-failed) -- OLI + catalog still load", ct.listingHealthV3DurableOli.available === true && ct.listingHealthV3DurableInventory.reason === "health-snapshot-read-failed");
+  let strictCalls = 0;
+  const sLoader = makeListingHealthV3DurableContextLoader({ ...base, strict: true, buildObjectPath: () => "x", getEnrichedOli: async () => [], getHealthBridge: async () => { strictCalls += 1; return { rows: baseInv }; } });
+  await sLoader({ reportKey: "listing-health-v3", accountId: SELLER, planned });
+  ok("H: STRICT (reconciler) mode never reads the bridge here (the dependency bundle proves + injects it)", strictCalls === 0);
 })();
 
 /* ===================== I. no new API function (12-function ceiling preserved) ===================== */

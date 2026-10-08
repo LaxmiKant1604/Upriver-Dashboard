@@ -1,6 +1,9 @@
 // Listing Health v3 -- READ-ONLY preview (Phase 3, default-OFF LISTING_HEALTH_V3 flag). Additive; the v1 page is the
 // production default and is untouched. Sales/Units come only from durable enriched OLI (server), change with the
-// selected inclusive window, and NEVER call DataDoe. Status/issues/inventory always use the latest saved snapshot.
+// selected inclusive window, and NEVER call DataDoe. Status/issues/On Hand stock always use the latest saved snapshot.
+// On Hand FBA follows the account's ONE inventory source (validated Listings, else the account's last saved FBA
+// Inventory Health snapshot as a dated read-only temporary bridge, else Unavailable -- never 0); the freshness bar names
+// that source.
 // All React hooks are unconditional and above every early return (hook-order stable); no full-page/blank transition --
 // the report surface renders its own loading/empty/partial/unavailable states while data refreshes.
 
@@ -8,7 +11,7 @@ import React, { useMemo, useState } from "react";
 import { ShieldAlert } from "lucide-react";
 
 import {
-  buildV3Rows, buildV3PriorityActions, v3ExportRows, v3WindowStatusLabel,
+  buildV3Rows, buildV3PriorityActions, v3ExportRows, v3WindowStatusLabel, v3InventoryFreshness,
   fmtOnHand, fmtBool, fmtIssue, GATE_RANK, V3_GATES,
 } from "../lib/listing-health-v3-view.js";
 import { reportFilename } from "../lib/csv.js";
@@ -58,6 +61,7 @@ export default function ListingHealthV3({ data, loading, error, accountName, sel
   const rows = useMemo(() => buildV3Rows(data, selectedBrand), [data, selectedBrand]);
   const priority = useMemo(() => buildV3PriorityActions(rows), [rows]);
   const windowStatus = useMemo(() => v3WindowStatusLabel(data), [data]);
+  const inventoryFreshness = useMemo(() => v3InventoryFreshness(data), [data]);
   const counts = useMemo(() => {
     const c = {};
     for (const r of rows) c[r.gate] = (c[r.gate] || 0) + 1;
@@ -120,7 +124,7 @@ export default function ListingHealthV3({ data, loading, error, accountName, sel
     <div className="container skupl-page">
       <ReportHeader
         title="Listing Health — v3 preview (read-only)"
-        subtitle="OLI-based sales/units over a selected window · latest snapshot for status, issues & inventory · creates no exports"
+        subtitle="OLI-based sales/units over a selected window · latest snapshot for status, issues & on-hand stock · creates no exports"
       />
       <StaleScopeNotice data={data} />
 
@@ -152,12 +156,13 @@ export default function ListingHealthV3({ data, loading, error, accountName, sel
         <>
           <FreshnessBar items={[
             data.window ? `Window ${data.window.from} → ${data.window.to} (${data.window.days}d)` : null,
-            data.inventory ? `Inventory snapshot ${data.inventory.snapshotDate || "unavailable"}` : null,
+            inventoryFreshness.label,
             data.completeness && data.completeness.provisional ? "Provisional (some days still finalising)" : null,
             "Read-only preview · zero DataDoe exports",
           ]} />
 
           {windowStatus.label !== "Covered" && <Notice tone="warn">{windowStatus.note}</Notice>}
+          {inventoryFreshness.note && <Notice tone="warn">{inventoryFreshness.note}</Notice>}
           {data.evidence && data.evidence.listingsEvidenceAvailable === false && (
             <Notice tone="warn">{data.evidence.listingsUnavailableReason || "Listings snapshot not yet available in this preview."}</Notice>
           )}
@@ -205,7 +210,7 @@ export default function ListingHealthV3({ data, loading, error, accountName, sel
                     <th className="pt-left">Confidence</th>
                     <SortTh label="Fulfilment" col="channel" sort={sort} onSort={onSort} align="left" />
                     <SortTh label="Price" col="price" sort={sort} onSort={onSort} />
-                    <SortTh label="On Hand FBA" col="onHandFba" sort={sort} onSort={onSort} />
+                    <SortTh label="On Hand FBA" col="onHandFba" sort={sort} onSort={onSort} hint={inventoryFreshness.hint} />
                     <SortTh label="On Hand FBM" col="onHandFbm" sort={sort} onSort={onSort} />
                     <SortTh label="Sales" col="sales" sort={sort} onSort={onSort} hint="Selected window (durable OLI)" />
                     <SortTh label="Units" col="units" sort={sort} onSort={onSort} hint="Selected window (durable OLI)" />
@@ -252,7 +257,7 @@ export default function ListingHealthV3({ data, loading, error, accountName, sel
           </div>
 
           <div className="footer-note">
-            Read-only preview. Sales &amp; Units come only from durable Order Line Items for the selected window; status, issues and inventory use the latest saved snapshot. Selecting a date creates no DataDoe export.
+            Read-only preview. Sales &amp; Units come only from durable Order Line Items for the selected window; status and issues use the latest saved snapshot. On Hand FBA comes from this account's validated Listings (as of the Listings refresh time) or, when Listings cannot be validated, from the last saved FBA Inventory Health snapshot shown above — a dated, read-only, temporary bridge used only while it is at most two days older than this report (FBA Inventory Health is no longer refreshed); otherwise it is Unavailable (never 0). Selecting a date creates no DataDoe export.
           </div>
         </>
       )}

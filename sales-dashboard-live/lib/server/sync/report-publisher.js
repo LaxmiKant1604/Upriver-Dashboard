@@ -117,11 +117,13 @@ export const SCHEDULER_LIVE_SNAPSHOT_CONTRACTS = Object.freeze({
   // Round-6 fix 3: the compact Brand View inventory, PRODUCED by the source-first durable runtime and
   // PROMOTED (never dispatched) -- transcribed from the EXECUTABLE live route (api/datadoe.js
   // sharedSnapshotSpec case "brand-inventory": reportKey brand-inventory, reportVersion
-  // brand-inventory-shared-v1, params { to }). The live shared version EQUALS the shadow snapshotVersion:
+  // brand-inventory-shared-v2, params { to }). The live shared version EQUALS the shadow snapshotVersion:
   // the compact contract IS the live contract (lib/server/reports/brand-view.js
   // BRAND_INVENTORY_REPORT_VERSION), so isCompactInventorySnapshot accepts the promoted row unchanged.
+  // v2 = Listings inventory cutover phase 2 (the compact records its per-account source: validated Listings, else a
+  // labelled FBA Inventory Health fallback, else unavailable).
   "brand-inventory": Object.freeze({
-    liveReportKey: "brand-inventory", liveReportVersion: "brand-inventory-shared-v1",
+    liveReportKey: "brand-inventory", liveReportVersion: "brand-inventory-shared-v2",
     liveParams: (p) => (isDate(p.to) ? { to: p.to } : null),
   }),
   // WORK D: advanced Listing Health (v3), PRODUCED by the source-first durable runtime and PROMOTED (never

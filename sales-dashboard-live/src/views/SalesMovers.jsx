@@ -8,6 +8,7 @@ import {
   buildSalesMoversInsights,
   buildSalesMoversRows,
   insightExportRows,
+  insightInventoryState,
   salesMoversCompletenessWarning,
 } from "../lib/insights.js";
 import { downloadCsv, reportFilename } from "../lib/csv.js";
@@ -66,7 +67,7 @@ const ACCESSORS = {
   aspDeltaPct: (row) => row.aspDeltaPct,
   units: (row) => Number(row.recent?.units) || 0,
   adSpendDelta: (row) => row.adSpendDelta,
-  available: (row) => (row.inventory ? row.inventory.available : null),
+  available: (row) => row.fbaAvailable,
   driver: (row) => row.dominantDriver || "zzz",
 };
 
@@ -79,6 +80,8 @@ export default function SalesMovers({ data, loading, error, accountName, selecte
   const rows = useMemo(() => buildSalesMoversRows(data, selectedBrand), [data, selectedBrand]);
   const insights = useMemo(() => buildSalesMoversInsights(data, rows, currency), [data, rows, currency]);
   const completeness = useMemo(() => salesMoversCompletenessWarning(rows), [rows]);
+  // The account's FBA stock source (validated Listings / the dated saved Health bridge / unavailable) -- one label everywhere.
+  const stockState = useMemo(() => insightInventoryState(data), [data]);
 
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -134,8 +137,10 @@ export default function SalesMovers({ data, loading, error, accountName, selecte
     "Dominant Driver": row.dominantDriver ? DRIVER_LABEL[row.dominantDriver] : "Not attributable",
     "Ad Spend Change": Number(row.adSpendDelta || 0).toFixed(2),
     "Ad Sales Change": Number(row.adSalesDelta || 0).toFixed(2),
-    "FBA Available": row.inventory ? Math.round(row.inventory.available) : "",
-    "Days of Supply": row.inventory && row.inventory.daysOfSupply !== null ? Math.round(row.inventory.daysOfSupply) : "",
+    // FBA stock from the account's selected source (validated Listings, else the dated saved FBA Inventory Health bridge);
+    // unknown is blank, never 0. No days-of-supply column: it was an FBA Inventory Health metric (no longer requested).
+    "FBA Available": row.fbaAvailable === null || row.fbaAvailable === undefined ? "" : Math.round(row.fbaAvailable),
+    "FBA Stock Source": stockState.label,
   })), reportFilename("sales-movers", accountName, data?.salesLatestDate));
 
   const exportInsights = () => downloadCsv(insightExportRows(insights), reportFilename("sales-movers-insights", accountName, data?.salesLatestDate));
@@ -160,17 +165,18 @@ export default function SalesMovers({ data, loading, error, accountName, selecte
           `${data.sourceLabel} through ${fmtDateHuman(data.salesLatestDate)}`,
           `this week ${fmtDateHuman(data.windows.recent.from)} – ${fmtDateHuman(data.windows.recent.to)} vs prior week ${fmtDateHuman(data.windows.prior.from)} – ${fmtDateHuman(data.windows.prior.to)}`,
           `source can lag up to about ${data.lagDays} days, so both windows end on the latest completed date`,
-          data.inventoryAvailable ? `FBA snapshot ${fmtDateHuman(data.inventorySnapshotDate)}` : "FBA snapshot unavailable",
+          `FBA stock: ${stockState.label}`,
           snapshotFreshnessLabel(data),
         ]} />
 
         {completeness && <Notice tone="warn">{completeness}</Notice>}
 
-        {!data.inventoryAvailable && (
+        {!stockState.available && (
           <Notice tone="warn">
-            Live FBA inventory is unavailable for this account, so stockout signals are not evaluated. Sales, traffic and conversion movements are unaffected.
+            {stockState.note} Stockout signals are not evaluated; sales, traffic and conversion movements are unaffected.
           </Notice>
         )}
+        {stockState.available && stockState.note && <Notice tone="warn">{stockState.note}</Notice>}
 
         {(data.currencies?.length || 0) > 1 && (
           <Notice>
@@ -218,7 +224,7 @@ export default function SalesMovers({ data, loading, error, accountName, selecte
                   <SortTh label="Avg Price" col="aspRecent" sort={sort} onSort={onSort} hint="Sales divided by units" />
                   <SortTh label="Price Δ%" col="aspDeltaPct" sort={sort} onSort={onSort} />
                   <SortTh label="Ad Spend Δ" col="adSpendDelta" sort={sort} onSort={onSort} />
-                  <SortTh label="FBA Avail" col="available" sort={sort} onSort={onSort} />
+                  <SortTh label="FBA Avail" col="available" sort={sort} onSort={onSort} hint={stockState.available ? `FBA available units: ${stockState.label}. Unknown is shown as —, never 0.` : "FBA stock unavailable"} />
                   <SortTh label="Dominant Driver" col="driver" sort={sort} onSort={onSort} align="left" />
                 </tr>
               </thead>
@@ -237,7 +243,7 @@ export default function SalesMovers({ data, loading, error, accountName, selecte
                     <td className="mono">{row.aspRecent === null ? "—" : fmtMoney(row.aspRecent, currency, 2)}</td>
                     <td className="mono">{fmtPct(row.aspDeltaPct)}</td>
                     <td className="mono">{fmtMoney(row.adSpendDelta, currency)}</td>
-                    <td className="mono">{row.inventory ? nInt(row.inventory.available) : "—"}</td>
+                    <td className="mono" title={row.fbaContext === "mfn-only" ? "Merchant-fulfilled only: no FBA stock (not a stockout)" : undefined}>{row.fbaContext === "mfn-only" ? "MFN" : (row.fbaAvailable === null || row.fbaAvailable === undefined ? "—" : nInt(row.fbaAvailable))}</td>
                     <td className="movers-driver">
                       {row.dominantDriver
                         ? <span className={"pt-badge driver-" + row.dominantDriver}>{DRIVER_LABEL[row.dominantDriver]}</span>
@@ -252,7 +258,7 @@ export default function SalesMovers({ data, loading, error, accountName, selecte
         </div>
 
         <div className="footer-note">
-          Sales, units, sessions and page views come from DataDoe <code>Sales &amp; Traffic by ASIN &amp; Date</code>, summed per ASIN over two equal seven-day windows. That source's documented recurring window is {data.lagDays} days, so both windows end at the latest date the source actually reported units ({fmtDateHuman(data.salesLatestDate)}) rather than at today — this is why the report is not a calendar week. Advertising change comes from <code>Profit by SKU &amp; Date</code> (<code>ad_spend</code>, <code>ad_sales</code>) grouped to ASIN; stock comes from the latest <code>FBA Inventory Health</code> snapshot.
+          Sales, units, sessions and page views come from DataDoe <code>Sales &amp; Traffic by ASIN &amp; Date</code>, summed per ASIN over two equal seven-day windows. That source's documented recurring window is {data.lagDays} days, so both windows end at the latest date the source actually reported units ({fmtDateHuman(data.salesLatestDate)}) rather than at today — this is why the report is not a calendar week. Advertising change comes from <code>Profit by SKU &amp; Date</code> (<code>ad_spend</code>, <code>ad_sales</code>) grouped to ASIN. FBA stock comes, for this account, from its saved <code>Listings</code> snapshot when that can be validated (shown as the time it was refreshed; Listings has no inventory date), otherwise from its last saved <code>FBA Inventory Health</code> snapshot as a clearly labelled, temporary read-only bridge (dated by that snapshot and used only while it is at most two days older than this report — FBA Inventory Health is no longer refreshed, and its days of supply are not shown), otherwise it is unavailable. Every stock claim says when the stock was observed; a figure older than this report, and every bridge figure, is marked as possibly changed since. Unknown stock shows — (never 0), and a merchant-fulfilled-only product shows MFN, never a stockout.
           {" "}Because sales = sessions × (units ÷ sessions) × (sales ÷ units), the change is split exactly into a traffic effect, a conversion effect and a price effect that sum to the total change; the dominant driver is simply the largest of the three. An ASIN with no sessions or no units in one of the weeks shows <strong>Not attributable</strong> instead of a guessed driver. Units per session and average price are recomputed from the summed totals — no percentage is ever averaged. Buy Box share is <strong>not</strong> evaluated here because aggregating it correctly needs a page-view-weighted average of daily rows; the Buy Box Loss report does that on its own scope. Changing account, brand, filters, search or sorting re-derives everything locally; only Refresh calls DataDoe, and it saves one shared snapshot for every user with access to this account.
         </div>
       </>}

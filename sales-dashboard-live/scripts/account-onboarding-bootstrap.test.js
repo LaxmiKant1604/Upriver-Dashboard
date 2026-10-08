@@ -454,8 +454,8 @@ await (async () => {
     onboardingStepPlanHash({ ...base, plannedCreates: 3, plannedTokens: 6 }) === onboardingStepPlanHash({ ...base, plannedCreates: 1, plannedTokens: 2 }));
 
   // --- fbaSellerBatches: stable seller grouping from an FBA plan (shared by planner + operator). ---
-  const fbaPlan = { reportRequests: [{ sources: [{ requestKey: "fba-inventory-health", sellerOrVendorIds: ["s2", "s1"] }, { requestKey: "product-catalog", sellerOrVendorIds: ["s9"] }] }] };
-  ok("F: fbaSellerBatches extracts ONLY sorted fba-inventory seller groups (catalog/other excluded)",
+  const fbaPlan = { reportRequests: [{ sources: [{ requestKey: "fba-plan:awd", sellerOrVendorIds: ["s2", "s1"] }, { requestKey: "product-catalog", sellerOrVendorIds: ["s9"] }, { requestKey: "fba-plan:inventory-health", sellerOrVendorIds: ["s7"] }] }] };
+  ok("F: fbaSellerBatches extracts ONLY the sorted canonical Listings (fba-plan:awd) seller groups (catalog / the retired Health key excluded)",
     JSON.stringify(fbaSellerBatchesFn(fbaPlan)) === JSON.stringify([["s1", "s2"]]));
 })();
 
@@ -709,12 +709,12 @@ await (async () => {
     incapRes.phase === "partial" && incapRes.ok === false && incapRes.failedAccounts.includes("nofba-1") && incapRes.perAccount.sourceIncapable === undefined);
 
   // --- Blocker 6: exact FBA plan-structure binding (real fbaPlanStructure) -- never empty membership/hashes/limits. ---
-  const plan = { reportRequests: [{ sources: [{ requestKey: "fba-plan:inventory-health", requestHash: "rh1", limit: 50000, sellerOrVendorIds: ["s2", "s1"], marketplacePairs: [{ sellerId: "s1", marketplace: "IN" }] }] }] };
+  const plan = { reportRequests: [{ sources: [{ requestKey: "fba-plan:awd", requestHash: "rh1", limit: 50000, sellerOrVendorIds: ["s2", "s1"], marketplacePairs: [{ sellerId: "s1", marketplace: "IN" }] }] }] };
   const st = fbaPlanStructure(plan, D_1());
   ok("I(blocker 6): fbaPlanStructure binds sellers + marketplacePairs + defaultBatches + requestHashes + sourceKeys + rowLimits + inventoryAsOf + adaptiveSplitAllowed (never empty)",
     JSON.stringify(st.sellers) === JSON.stringify(["s1", "s2"]) && st.marketplacePairs.length === 1 && st.defaultBatches.length === 1
-    && st.requestHashes.join() === "rh1" && st.sourceKeys.join() === "fba-plan:inventory-health" && st.rowLimits.join() === "50000"
-    && st.inventoryAsOf === D_1() && st.adaptiveSplitAllowed === true);
+    && st.requestHashes.join() === "rh1" && st.sourceKeys.join() === "fba-plan:awd" && st.rowLimits.join() === "50000"
+    && st.inventoryAsOf === D_1() && st.adaptiveSplitAllowed === false);
 
   // --- Blocker 1 CONTROL-PLANE LEASE: a DETERMINISTIC INTERLEAVING against the REAL runControlPackageTransaction
   //     with a lease-capable shared store (models the DB CAS). A apply -> B apply -> A check -> A close -> B.
@@ -784,13 +784,13 @@ await (async () => {
 
   // --- Blocker 3 FBA UNAVAILABLE CONTRACT via the REAL fbaPlanPayload derivation + the REAL derivation validator. ---
   {
-    const inputs = (over) => ({ asOf: D_1(), accountName: "Acme", marketCountry: "IN", isUS: false, awdEligible: false, completed: [{ key: "2026-08", from: "2026-08-01", to: "2026-08-31" }], current: { key: "2026-09", from: "2026-09-01", to: D_1() }, completedUnitRows: [[]], mtdUnitRows: [], dailyDateRows: [], catalogRows: [], invRows: [], awdRows: [], ...over });
+    const inputs = (over) => ({ asOf: D_1(), accountName: "Acme", marketCountry: "IN", isUS: false, awdEligible: false, completed: [{ key: "2026-08", from: "2026-08-01", to: "2026-08-31" }], current: { key: "2026-09", from: "2026-09-01", to: D_1() }, completedUnitRows: [[]], mtdUnitRows: [], dailyDateRows: [], catalogRows: [], listingsRows: [], ...over });
     const der = REPORT_DERIVATIONS["fba-plan"];
     const empty = fbaPlanPayload(inputs());
-    ok("I(blocker 3): an EMPTY validated D-1 inventory is an HONEST VALID fba-plan snapshot (inventoryAvailable:false, no dataUnavailable) that PASSES the real validator (so it PUBLISHES + earns a manifest identity)",
+    ok("I(blocker 3): an EMPTY validated Listings inventory is an HONEST VALID fba-plan snapshot (inventoryAvailable:false, no dataUnavailable) that PASSES the real validator (so it PUBLISHES + earns a manifest identity)",
       der.validatePayload(empty) === true && empty.inventoryAvailable === false && !("dataUnavailable" in empty));
-    const withInv = fbaPlanPayload(inputs({ invRows: [{ date: D_1(), child_asin: "B01", sku: "SKU1", available: 12, marketplace_country_code: "IN", product_name: "X" }] }));
-    ok("I(blocker 3): a NON-empty D-1 inventory is inventoryAvailable:true and valid (the same contract; empty vs present differ only in the flag)",
+    const withInv = fbaPlanPayload(inputs({ listingsRows: [{ seller_or_vendor_id: "S1", marketplace_country_code: "IN", child_asin: "B01", sku: "SKU1", listing_name: "X", listing_fulfillment_channel: "AMAZON_IN", fba_quantity_available: 12, fba_quantity_inbound: 0, fba_quantity_reserved: 0, fba_quantity_fc_transfer: 0 }] }));
+    ok("I(blocker 3): a NON-empty expanded Listings inventory is inventoryAvailable:true and valid (the same contract; empty vs present differ only in the flag)",
       der.validatePayload(withInv) === true && withInv.inventoryAvailable === true);
     // A publisher's data-unavailable disposition requires payload.dataUnavailable===true, which fba-plan NEVER sets:
     ok("I(blocker 3): fba-plan payloads NEVER carry dataUnavailable, so the publisher's data-unavailable disposition is unreachable for fba-plan (dead path correctly removed)",

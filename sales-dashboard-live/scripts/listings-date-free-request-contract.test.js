@@ -14,9 +14,10 @@
 //   (2) listing-health-v3:listings-raw  request has no date filter/window/order        [mandatory test 2 + 4]
 //   (3) fba-plan:awd                    request has no date filter/window/order        [mandatory test 3]
 //   (5) a DIFFERENT scheduler cycle date does NOT change any of those request hashes,  [mandatory test 5]
-//       while the DATED sibling (single-day D-1 FBA inventory) request hash DOES change -- proving the stability
-//       is a real property, not a vacuous one where the date never mattered anywhere.
-//   (9) D-1 stays REQUIRED for the dated FBA Inventory Health request (single-day from===to===asOf).  [mandatory test 9]
+//       while the cycle date DOES change the planner's NON-hash freshness boundary (freshnessNotBefore) on the same
+//       sources -- proving the stability is a real property, not a vacuous one where the date never reached the plan.
+//   (9) Listings inventory cutover: FBA Inventory Health is RETIRED -- there is NO dated inventory request left for
+//       either Listings consumer (listing-health-v3:inventory / fba-plan:inventory-health are refused as unknown).
 //
 // NOTE on columns: LH_V3_LISTING_COLUMNS legitimately contains `listing_open_date` -- that is a per-listing DATA
 // ATTRIBUTE returned by the current-state snapshot, NOT a date FILTER on the request. The contract forbids a date
@@ -30,6 +31,7 @@ process.env.POSTGRES_URL = "postgres://user:pass@localhost:5432/db";
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
 import { reportSourceRequestHashes, REPORT_SOURCE_CONTRACTS } from "../lib/server/sync/report-source-contracts.js";
+import { planListingHealthV3BucketBatched } from "../lib/server/sync/report-planner.js";
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -49,15 +51,14 @@ function resolveOne({ reportKey, requestKey, windowsByRequestKey }) {
   return row;
 }
 
-// The planner's LHv3 window map (report-planner.js:533-537): listings + listings-raw date-free, inventory single-day D-1.
-const lhv3Windows = (cycleDate) => ({
+// The planner's LHv3 window map: listings + listings-raw date-free (there is no inventory request any more). The
+// cycleDate parameter is deliberately UNUSED -- it is what proves the request carries no date.
+const lhv3Windows = (_cycleDate) => ({
   "listing-health-v3:listings": [{ from: null, to: null }],
   "listing-health-v3:listings-raw": [{ from: null, to: null }],
-  "listing-health-v3:inventory": [{ from: cycleDate, to: cycleDate }],
 });
-// The planner's fba-plan window map (report-planner.js:446-447): inventory single-day D-1, AWD date-free.
-const fbaWindows = (cycleDate) => ({
-  "fba-plan:inventory-health": [{ from: cycleDate, to: cycleDate }],
+// The planner's fba-plan window map: the canonical Listings (AWD + FBA inventory fields) date-free, nothing else.
+const fbaWindows = (_cycleDate) => ({
   "fba-plan:awd": [{ from: null, to: null }],
 });
 
@@ -110,23 +111,28 @@ function assertDateFree(label, row, cycleDate) {
 
   ok("[5] LHv3 listings request_hash is IDENTICAL across cycle dates", hashOf(lhA, "listing-health-v3:listings") === hashOf(lhB, "listing-health-v3:listings"));
   ok("[5] LHv3 listings-raw request_hash is IDENTICAL across cycle dates", hashOf(lhA, "listing-health-v3:listings-raw") === hashOf(lhB, "listing-health-v3:listings-raw"));
-  // Meaningful contrast: the DATED sibling (single-day D-1 inventory) request_hash MUST differ across cycle dates,
-  // proving the cycle date genuinely flows into dated requests -- so listings' stability is a real property.
-  ok("[5] LHv3 inventory (dated D-1) request_hash DIFFERS across cycle dates (meaningful control)", hashOf(lhA, "listing-health-v3:inventory") !== hashOf(lhB, "listing-health-v3:inventory"));
+  // Meaningful contrast: the REAL planner, for two cycle dates, keeps the SAME Listings request_hash while the cycle
+  // date DOES reach the plan as the NON-hash freshness boundary -- so the stability is a real property.
+  const connections = [{ id: "primary", apiKey: API_KEY, accountPrefix: "" }];
+  const planFor = (d) => planListingHealthV3BucketBatched({ accounts: [{ accountId: SELLER, country: MKT, currency: "USD", name: "A" }], connections, asOfFor: () => d, inventoryAsOf: d });
+  const lsrc = (plan) => plan[0].sources.find((x) => x.requestKey === "listing-health-v3:listings");
+  const pA = lsrc(planFor(CYCLE_A)); const pB = lsrc(planFor(CYCLE_B));
+  ok("[5] planner: LHv3 listings request_hash IDENTICAL across cycle dates", pA.requestHash === pB.requestHash);
+  ok("[5] planner: the cycle date reaches the plan ONLY as the non-hash freshnessNotBefore (meaningful control)",
+    pA.freshnessNotBefore !== pB.freshnessNotBefore && String(pB.freshnessNotBefore).startsWith(CYCLE_B));
 
   const fbaA = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: API_KEY, ids: [SELLER], windowsByRequestKey: fbaWindows(CYCLE_A), marketplaceCountry: MKT });
   const fbaB = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: API_KEY, ids: [SELLER], windowsByRequestKey: fbaWindows(CYCLE_B), marketplaceCountry: MKT });
   ok("[5] fba-plan AWD request_hash is IDENTICAL across cycle dates", hashOf(fbaA, "fba-plan:awd") === hashOf(fbaB, "fba-plan:awd"));
-  ok("[5] fba-plan inventory-health (dated D-1) request_hash DIFFERS across cycle dates (meaningful control)", hashOf(fbaA, "fba-plan:inventory-health") !== hashOf(fbaB, "fba-plan:inventory-health"));
 }
 
-// ---- (9) D-1 stays REQUIRED for the dated FBA Inventory Health request (single-day from===to===asOf) ----
+// ---- (9) FBA Inventory Health is RETIRED: no dated inventory request remains for either Listings consumer ----
 {
-  const v3inv = resolveOne({ reportKey: "listing-health-v3", requestKey: "listing-health-v3:inventory", windowsByRequestKey: lhv3Windows(CYCLE_B) });
-  ok("[9] LHv3 inventory is dated single-day D-1 (from === to === cycle D-1)", v3inv.from === CYCLE_B && v3inv.to === CYCLE_B);
-  ok("[9] LHv3 inventory folds the D-1 date INTO its request identity", v3inv.requestMeta.from === CYCLE_B && v3inv.requestMeta.to === CYCLE_B);
-  const fbaInv = resolveOne({ reportKey: "fba-plan", requestKey: "fba-plan:inventory-health", windowsByRequestKey: fbaWindows(CYCLE_B) });
-  ok("[9] fba-plan inventory-health is dated single-day D-1 (from === to === cycle D-1)", fbaInv.from === CYCLE_B && fbaInv.to === CYCLE_B);
+  const refused = (reportKey, windowsByRequestKey) => { try { reportSourceRequestHashes({ reportKey, apiKey: API_KEY, ids: [SELLER], windowsByRequestKey, marketplaceCountry: MKT }); return false; } catch (_e) { return true; } };
+  ok("[9] listing-health-v3:inventory is REFUSED (no such request key)", refused("listing-health-v3", { ...lhv3Windows(CYCLE_B), "listing-health-v3:inventory": [{ from: CYCLE_B, to: CYCLE_B }] }));
+  ok("[9] fba-plan:inventory-health is REFUSED (no such request key)", refused("fba-plan", { ...fbaWindows(CYCLE_B), "fba-plan:inventory-health": [{ from: CYCLE_B, to: CYCLE_B }] }));
+  const datedV3 = reportSourceRequestHashes({ reportKey: "listing-health-v3", apiKey: API_KEY, ids: [SELLER], windowsByRequestKey: lhv3Windows(CYCLE_B), marketplaceCountry: MKT });
+  ok("[9] every LHv3 request is date-free (no dated sibling at all)", datedV3.length === 2 && datedV3.every((r) => r.from === null && r.to === null));
 }
 
 writeSync(1, `\nlistings-date-free-request-contract: ${passed} assertions passed\n`);

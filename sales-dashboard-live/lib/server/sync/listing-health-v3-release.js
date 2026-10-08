@@ -33,7 +33,6 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const LIVE_REPORT_KEY = "listing-health-v3";
 const LISTINGS_REQUEST_KEY = "listing-health-v3:listings";
 const LISTINGS_RAW_REQUEST_KEY = "listing-health-v3:listings-raw";
-const INVENTORY_REQUEST_KEY = "listing-health-v3:inventory";
 const SHADOW_KEY = "scheduler-v2/" + LIVE_REPORT_KEY; // "scheduler-v2/listing-health-v3"
 
 const ok = () => ({ code: 0, ok: true, stage: "complete", status: null, leaseLost: false, reason: null, blockerCodes: [], problems: [] });
@@ -59,7 +58,7 @@ function noDateSource(requestKey, rows, rawSellerId) {
 /**
  * Build the dedicated listing-health-v3 release. Injected collaborators (production wired by the entrypoint):
  *   resolveBundle({ accountId, requestedAsOf, signal }) -> { eligible, reason?, revisionId, deps, contentDeps, status,
- *       bundle:{ listingsRows, rawRows, inventorySource, context, listingsSnapshot, rawSnapshot, inventorySnapshot } }
+ *       bundle:{ listingsRows, rawRows, inventoryBridge, context, listingsSnapshot, rawSnapshot, inventorySnapshot } }
  *       -- the SHARED resolveListingHealthV3DependencyBundle closure (full integrity + the complete-manifest fingerprint)
  *   openCycle({ bucket, cycleDate, trigger }, { signal }) ; getCycleByBucketDate(bucket, cycleDate, { signal }) -> cycleRow
  *   deriveSnapshot({ reportKey, sources, context }) -> { status, validated, payload, latestDataDate } (deriveReportSnapshot)
@@ -118,7 +117,8 @@ export function buildListingHealthV3Release({
     const sources = {
       [LISTINGS_REQUEST_KEY]: noDateSource(LISTINGS_REQUEST_KEY, bundle.listingsRows, rawSellerId),
       [LISTINGS_RAW_REQUEST_KEY]: noDateSource(LISTINGS_RAW_REQUEST_KEY, bundle.rawRows, rawSellerId),
-      [INVENTORY_REQUEST_KEY]: bundle.inventorySource || { available: false },
+      // (No inventory source: the retired listing-health-v3:inventory fragment is gone. The saved FBA Inventory Health
+      // BRIDGE rides in the bundle context as listingHealthV3DurableInventory -- read-only, Listings inventory cutover.)
     };
     let derived;
     try { derived = await deriveSnapshot({ reportKey: LIVE_REPORT_KEY, sources, context }); }

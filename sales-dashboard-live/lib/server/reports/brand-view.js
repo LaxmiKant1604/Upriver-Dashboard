@@ -20,7 +20,13 @@
 //                             Ads worker. Joined to this account's ASIN->brand
 //                             map so brand TACoS never carries whole-account
 //                             spend.
-//   inventory  `fba-plan`     snapshot: latest FBA Inventory Health values.
+//   inventory  `brand-inventory` compact snapshot (else the saved fba-plan payload): per account, the validated
+//                             saved Listings inventory, else the account's LAST SAVED durable FBA Inventory Health
+//                             snapshot as a dated, read-only, temporary BRIDGE (Listings inventory CUTOVER: no Health
+//                             export exists any more; the bridge drives figures only while its snapshot date is within
+//                             HEALTH_BRIDGE_MAX_AGE_DAYS of the report as-of), else Unavailable
+//                             (lib/server/inventory-source.js selectAccountInventory). Listings has no date -- its
+//                             freshness is the Listings fetch time; the bridge carries its snapshot date.
 //
 // WHAT IS SAVED
 //   One compact snapshot per (account, brand, as-of). The SKU/ASIN dimension is
@@ -34,6 +40,16 @@ import { asinOf, asinAdsMetricsFromRow } from "./asin-ads-aggregation.js";
 import { campaignIdentityOfRow, campaignAdsMetricsFromRow, campaignBrandMap } from "./campaign-ads-aggregation.js";
 import { brandKey } from "./brand-membership.js";
 import { ACTIVE_ADS_SOURCE_KEY, ASIN_ADS_SOURCE_KEY } from "../active-ads-source.js";
+import { brandCountryInventory, canonicalMarketplace, LISTINGS_INVENTORY_MODEL } from "../listings-inventory.js";
+import {
+  selectAccountInventory, selectionFoldView, HEALTH_BRIDGE_MAX_AGE_DAYS,
+  INVENTORY_SOURCE_LISTINGS, INVENTORY_SOURCE_HEALTH_FALLBACK, INVENTORY_SOURCE_UNAVAILABLE,
+} from "../inventory-source.js";
+// The pan-European FBA pool marketplaces for the EU all-market rule (euPoolAllMarketRule). The web line reads this list
+// from Product Reporting (brand-reporting.js PAN_EU_POOL_MARKETPLACES), which this line does not carry, so the SAME
+// list is defined here: DataDoe reports one seller's pooled Pan-EU units in every pool marketplace; the UK left the
+// pool in 2021 and keeps separate stock.
+const PAN_EU_POOL_MARKETPLACES = Object.freeze(["BE", "DE", "ES", "FR", "IE", "IT", "NL", "PL", "SE"]);
 
 // ---------------------------------------------------------------- identifiers
 
@@ -55,11 +71,22 @@ export const BRAND_VIEW_PORTFOLIO_VERSION = "brand-view-portfolio-v1";
 // in memory at a time, large enough to cut a dozen-account rebuild from ~37s to well under the route deadline.
 export const PORTFOLIO_SLICE_CONCURRENCY = 4;
 
-// The compact per-account FBA inventory snapshot Brand View prefers. It is a
-// minimal roll-up of the latest validated FBA Inventory Health export folded to
-// (country, brand), created by the temporary admin Brand View inventory refresh.
+// The compact per-account FBA inventory snapshot Brand View prefers: a minimal roll-up of the account's selected
+// inventory source folded to (country, brand). v2 (Listings inventory cutover): built from selectAccountInventory --
+// validated saved Listings, else the last SAVED FBA Inventory Health snapshot (the dated read-only bridge, within its
+// threshold of the as-of), else Unavailable -- and it records WHICH source it used (inventorySource), so a Health value
+// is never presented as a Listings one.
 export const BRAND_INVENTORY_SNAPSHOT_KEY = "brand-inventory";
-export const BRAND_INVENTORY_REPORT_VERSION = "brand-inventory-shared-v1";
+export const BRAND_INVENTORY_REPORT_VERSION = "brand-inventory-shared-v2";
+// The production v1 compact (folded from FBA Inventory Health, before phase 2). It is never produced again, but it is
+// still SERVED during the transition (web deployed before the scheduler) as a legacy Health-sourced snapshot labelled
+// with its Health date -- production stock is never hidden in that window.
+export const BRAND_INVENTORY_LEGACY_REPORT_VERSION = "brand-inventory-shared-v1";
+// The versions a brand-inventory candidate read SERVES (phase-2 transition): the newest AVAILABLE compact among both, so
+// the web (deployed before the scheduler) still finds the production v1 Health compact. Selection prefers v2.
+export const BRAND_INVENTORY_SERVE_VERSIONS = Object.freeze([BRAND_INVENTORY_REPORT_VERSION, BRAND_INVENTORY_LEGACY_REPORT_VERSION]);
+// The inventory source of a legacy (pre-phase-2) Health payload: the v1 compact or an old Health-shaped fba-plan.
+export const INVENTORY_SOURCE_HEALTH_LEGACY = "health-legacy";
 
 // The ACTIVE durable Ads grain maintained by the scheduled worker. After the ASIN->Campaign cutover this is the
 // campaign grain (campaign-performance-v1), attributed to brands via the manual campaign->brand mapping; rollback
@@ -84,11 +111,9 @@ export const ASIN_BRAND_SNAPSHOT_KEYS = [
   "returns-leakage", "buy-box-loss", "listing-optimizer",
 ];
 
-// Listing Health enumerates the whole listing catalogue with the same FBA
-// Inventory Health `fbaAvailable` field the shipment plan uses, so it is a
-// sound fallback when no FBA Shipment Plan has been saved. It carries no
-// marketplace dimension, so it can only ever produce an account-level total.
-const INVENTORY_FALLBACK_SNAPSHOT_KEY = "listing-health";
+// (The former Listing Health v1 / rows-only fba-plan account-level inventory fallbacks are removed by the Listings
+// inventory cutover: an undated, unlabelled value is never presented as current inventory. The saved fba-plan is used
+// only in its phase-2 shape or its old Health shape, labelled with its Health date.)
 
 // `orderSalesByBrand` labels ASINs with no catalog brand as "Unassigned". That
 // is real sales but not a brand, so it must not appear in a brand selector.
@@ -383,64 +408,150 @@ export function aggregateBrandCampaignAdsSpend(adRows, campaignIdentityBrandKey,
   return { spendByKey, adCountries: [...adCountries], coverageByCountry, matchedRows, unattributedByKey };
 }
 
+/* ------------------------------------------- EU all-market rule (Brand View) */
+
+// The plain reason shown wherever the rule withholds an all-market figure (server notes, client cells / KPI hints).
+export const EU_POOL_ALL_MARKET_WITHHELD_REASON = "Withheld: two or more pan-EU marketplaces report positive FBA stock for this brand; pooled EU stock cannot be counted once from brand totals.";
+
 /**
- * Per-country FBA available units for ONE brand, from the saved fba-plan payload.
+ * The EU ALL-MARKET rule (owner requirement 2026-10-08) -- ONE definition shared by the server merge and the client
+ * (src/lib/brand-view.js re-exports it; the tables, the portfolio KPI and FBA Cover apply it).
  *
- * `inventoryByBrandCountry` is the additive field the FBA Shipment Plan builder
- * now saves. Older snapshots do not have it; in that case the account-level
- * total is still returned so the All Markets row stays truthful and the
- * per-country cells are honestly unavailable rather than guessed.
+ * Per-marketplace FBA figures keep per-market semantics ("available in this marketplace"). The ALL-MARKET physical
+ * total for a brand is WITHHELD when TWO OR MORE pan-EU pool marketplaces (PAN_EU_POOL_MARKETPLACES above)
+ * report POSITIVE FBA stock for that brand: a Pan-European FBA seller's pooled units are reported in EVERY pool
+ * marketplace, so adding the marketplaces could count the same physical units several times. Why no count-once fix:
+ * brand x country totals carry no FNSKU, so a per-FNSKU count-once rule cannot be applied
+ * here; and Listings rows carry no selling-partner identity, so pooled stock cannot be told apart from separate stock.
+ * No max / heuristic is substituted. Non-pool marketplaces (GB/UK, US, IN, AU, CA, ...) add normally; ONE positive pool
+ * marketplace (plus any non-pool ones) is summed; a pool marketplace with 0 (or unknown) stock does not trigger it.
+ *
+ * `entries` -- an iterable of [country, fbaAvailable] pairs (a Map works) or { country, fbaAvailable } objects.
+ * Returns { withheld, poolMarkets:[the positive pool marketplaces, sorted], reason|null }.
  */
-export function brandInventory(planPayload, brand, accountCountry, fallbackPayload) {
+export function euPoolAllMarketRule(entries) {
+  const pool = new Set(PAN_EU_POOL_MARKETPLACES);
+  const positive = new Set();
+  for (const entry of entries || []) {
+    const country = Array.isArray(entry) ? entry[0] : entry && entry.country;
+    const raw = Array.isArray(entry) ? entry[1] : entry && entry.fbaAvailable;
+    const code = canonicalMarketplace(country);
+    const value = raw === null || raw === undefined || raw === "" ? NaN : Number(raw);
+    if (pool.has(code) && Number.isFinite(value) && value > 0) positive.add(code);
+  }
+  const poolMarkets = [...positive].sort();
+  const withheld = poolMarkets.length >= 2;
+  return { withheld, poolMarkets, reason: withheld ? EU_POOL_ALL_MARKET_WITHHELD_REASON : null };
+}
+
+/* ------------------------------------------------- inventory payload reading */
+
+// SERVE-time bridge freshness (Listings inventory cutover). A Brand View request's `asOf` is the marketplace's TODAY,
+// whose report day (the scheduler cycle's as-of the compact was built for) is the day before it; a saved FBA Inventory
+// Health figure (the bridge, a legacy v1 compact, or an old Health-shaped fba-plan) is shown only while its snapshot
+// date >= that report day - HEALTH_BRIDGE_MAX_AGE_DAYS -- the SAME threshold the build applied (FBA Inventory Health is
+// no longer refreshed, so an older saved figure would otherwise resurface forever). null when asOf is not a date (no
+// serve-time check: the build-time threshold still applied).
+export function brandViewHealthBridgeFloor(asOf) {
+  const d = trimmed(asOf).slice(0, 10);
+  return isStrictCalendarDate(d) ? addDays(d, -(HEALTH_BRIDGE_MAX_AGE_DAYS + 1)) : null;
+}
+
+const V2_INVENTORY_SOURCES = new Set([INVENTORY_SOURCE_LISTINGS, INVENTORY_SOURCE_HEALTH_FALLBACK, INVENTORY_SOURCE_UNAVAILABLE]);
+const instantOf = (value) => { const s = trimmed(value); return s && Number.isFinite(Date.parse(s)) ? s : null; };
+const dateOf = (value) => { const s = trimmed(value).slice(0, 10); return isStrictCalendarDate(s) ? s : null; };
+
+/**
+ * Classify a saved inventory payload (a compact brand-inventory payload or a saved fba-plan payload) into the ONE
+ * evidence shape Brand View consumes. PURE.
+ *   - PHASE-2 shape (inventorySource is "listings" | "health-fallback" | "unavailable"; inventoryModel, when present,
+ *     must be "listings-v1"): the source it records; available only when inventoryAvailable === true and the source is
+ *     not "unavailable". Listings -> listingsRefreshedAt (the fetch time); Health fallback -> its snapshot date.
+ *   - LEGACY Health shape (no inventorySource, no inventoryModel -- the production v1 compact or a pre-phase-2 fba-plan):
+ *     "health-legacy", available only with inventoryAvailable === true AND a strict Health snapshot date (inventoryDate,
+ *     else inventorySnapshotDate) -- labelled with that date, never presented as Listings.
+ *   - anything else (an unknown model, no buckets): unavailable.
+ * `asOf` (optional, the Brand View as-of): a Health-sourced figure (bridge / legacy) older than
+ * brandViewHealthBridgeFloor(asOf) is unavailable (health-bridge-stale:<date>) -- never a stale saved Health figure.
+ * Returns { available, inventorySource, buckets, listingsRefreshedAt, healthDate, listingsReasons, unavailableReason }.
+ */
+export function inventoryEvidenceOf(payload, { asOf = null } = {}) {
+  const floor = brandViewHealthBridgeFloor(asOf);
+  const none = (unavailableReason, extra = {}) => ({ available: false, inventorySource: INVENTORY_SOURCE_UNAVAILABLE, buckets: [], listingsRefreshedAt: null, healthDate: null, listingsReasons: [], unavailableReason, ...extra });
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return none("no-inventory-snapshot");
+  const buckets = Array.isArray(payload.inventoryByBrandCountry) ? payload.inventoryByBrandCountry : null;
+  const listingsReasons = Array.isArray(payload.inventoryListingsReasons) ? payload.inventoryListingsReasons.map(String) : [];
+  if (payload.inventorySource !== undefined && payload.inventorySource !== null) {
+    const source = String(payload.inventorySource);
+    if (!V2_INVENTORY_SOURCES.has(source) || (payload.inventoryModel != null && payload.inventoryModel !== LISTINGS_INVENTORY_MODEL)) return none("inventory-source-unrecognized");
+    if (source === INVENTORY_SOURCE_UNAVAILABLE || payload.inventoryAvailable !== true || !buckets) {
+      return none(trimmed(payload.inventoryUnavailableReason) || "inventory-unavailable", { listingsReasons });
+    }
+    if (source === INVENTORY_SOURCE_LISTINGS) {
+      return { available: true, inventorySource: source, buckets, listingsRefreshedAt: instantOf(payload.listingsRefreshedAt), healthDate: null, listingsReasons: [], unavailableReason: null };
+    }
+    const healthDate = dateOf(payload.inventoryHealthDate) || dateOf(payload.inventoryDate);
+    if (!healthDate) return none("health-fallback-date-missing", { listingsReasons });
+    if (floor && healthDate < floor) return none(`health-bridge-stale:${healthDate}`, { listingsReasons });
+    return { available: true, inventorySource: source, buckets, listingsRefreshedAt: null, healthDate, listingsReasons, unavailableReason: null };
+  }
+  if (payload.inventoryModel !== undefined && payload.inventoryModel !== null) return none("inventory-source-unrecognized");
+  // LEGACY Health shape.
+  const healthDate = dateOf(payload.inventoryDate) || dateOf(payload.inventorySnapshotDate);
+  if (payload.inventoryAvailable !== true || !buckets) return none("inventory-unavailable");
+  if (!healthDate) return none("health-snapshot-date-missing");
+  if (floor && healthDate < floor) return none(`health-bridge-stale:${healthDate}`);
+  return { available: true, inventorySource: INVENTORY_SOURCE_HEALTH_LEGACY, buckets, listingsRefreshedAt: null, healthDate, listingsReasons: [], unavailableReason: null };
+}
+
+/**
+ * Per-country FBA available units for ONE brand, from a saved inventory payload (the compact brand-inventory snapshot,
+ * else the saved fba-plan payload -- see inventoryEvidenceOf). `origin` names which saved report it came from.
+ *
+ * A payload that is unavailable (or an unrecognized shape) is "unavailable" -- never a stale value. A bucket whose
+ * fbaAvailable is unknown (null / malformed: a conflicting or unknown SKU) makes that country null and the account total
+ * null (`unknown`), never a partial sum. An `unattributed` marker (Listings stock on SKUs with no ASIN) makes its
+ * marketplace unknown for EVERY brand. A brand absent from the buckets has no FBA figure (an empty map; scope stays
+ * "country"). The account total also obeys the EU all-market rule (allMarketWithheld). `asOf` applies the serve-time
+ * bridge freshness (inventoryEvidenceOf).
+ */
+export function brandInventory(payload, brand, accountCountry, origin = BRAND_INVENTORY_SNAPSHOT_KEY, { asOf = null } = {}) {
   const byCountry = new Map();
+  const evidence = inventoryEvidenceOf(payload, { asOf });
+  const base = {
+    inventorySource: evidence.inventorySource, listingsRefreshedAt: evidence.listingsRefreshedAt, healthDate: evidence.healthDate,
+    listingsReasons: evidence.listingsReasons, unavailableReason: evidence.unavailableReason,
+  };
+  if (!evidence.available) {
+    return { byCountry, accountTotal: null, scope: "unavailable", source: null, unknown: false, allMarketWithheld: false, ...base };
+  }
+  const fallbackCountry = trimmed(accountCountry).toUpperCase();
+  let unknown = false;
+  for (const entry of evidence.buckets) {
+    const country = trimmed(entry && entry.country).toUpperCase() || fallbackCountry;
+    // An `unattributed` marker (Listings stock on SKUs with no ASIN, e.g. DataDoe's "__EMPTY__") makes the marketplace
+    // Unavailable for EVERY brand: that stock may be this brand's, so no figure there is complete.
+    if (entry && entry.unattributed === true) { byCountry.set(country, null); unknown = true; continue; }
+    if (trimmed(entry && entry.brand) !== brand) continue;
+    const raw = entry ? entry.fbaAvailable : null;
+    const available = raw === null || raw === undefined || raw === "" ? NaN : Number(raw);
+    if (!Number.isFinite(available) || available < 0) { byCountry.set(country, null); unknown = true; continue; }
+    if (byCountry.has(country) && byCountry.get(country) === null) continue;
+    byCountry.set(country, (byCountry.get(country) || 0) + available);
+  }
+  const eu = euPoolAllMarketRule(byCountry);
   let accountTotal = null;
-  let scope = "unavailable";
-  let source = null;
-
-  const detailed = planPayload?.inventoryByBrandCountry;
-  if (Array.isArray(detailed) && detailed.length) {
-    scope = "country";
-    source = "fba-plan";
-    for (const entry of detailed) {
-      if (trimmed(entry?.brand) !== brand) continue;
-      const country = trimmed(entry?.country).toUpperCase() || trimmed(accountCountry).toUpperCase();
-      const available = Number(entry?.fbaAvailable);
-      if (!Number.isFinite(available)) continue;
-      byCountry.set(country, (byCountry.get(country) || 0) + available);
-      accountTotal = (accountTotal || 0) + available;
-    }
-    return { byCountry, accountTotal, scope, source };
-  }
-
-  // Per-ASIN rows with no marketplace dimension: an older FBA Shipment Plan
-  // payload first, then Listing Health, which carries the same FBA Inventory
-  // Health field across the whole listing catalogue. Either can only produce an
-  // account-level total, which the caller labels rather than spreading across
-  // countries it cannot actually attribute.
-  for (const [candidate, candidateSource] of [[planPayload, "fba-plan"], [fallbackPayload, INVENTORY_FALLBACK_SNAPSHOT_KEY]]) {
-    let known = false;
-    let total = 0;
-    for (const row of candidate?.rows || []) {
-      if (trimmed(row?.brand) !== brand) continue;
-      const available = Number(row?.fbaAvailable);
-      if (!Number.isFinite(available)) continue;
-      known = true;
-      total += available;
-    }
-    if (known) return { byCountry, accountTotal: total, scope: "account", source: candidateSource };
-  }
-
-  return { byCountry, accountTotal, scope, source };
+  if (!unknown && !eu.withheld && byCountry.size) accountTotal = [...byCountry.values()].reduce((t, v) => t + v, 0);
+  return { byCountry, accountTotal, scope: "country", source: origin, unknown, allMarketWithheld: eu.withheld, ...base };
 }
 
 /* ---------------------------------------------- compact Brand View inventory */
 
-// The compact Brand View inventory snapshot (reportKey "brand-inventory"). It is a
-// minimal, per-account roll-up of the LATEST validated FBA Inventory Health snapshot
-// folded to (marketplace country, brand), so a Brand View portfolio can show FBA
-// Available and FBA Cover without the full multi-export FBA Shipment Plan build.
-// These functions are PURE (no I/O), so the whole fold — including the strict cap
-// and the "validated empty is zero, missing is unavailable" rule — is unit-testable.
+// The compact Brand View inventory snapshot (reportKey "brand-inventory"). It is a minimal, per-account roll-up of the
+// account's SELECTED inventory source (validated saved Listings, else the last valid FBA Inventory Health snapshot,
+// else Unavailable) folded to (marketplace country, brand), so a Brand View portfolio can show FBA Available and FBA
+// Cover without the full FBA Shipment Plan build. These functions are PURE (no I/O), so the whole fold -- including the
+// cap and the "unknown is unavailable, never zero" rule -- is unit-testable.
 
 // The saved brand-sales snapshot carries an additive `asinBrand` map ({asin: brand}).
 // It is the ONLY brand map a Brand View inventory refresh uses, so the refresh never
@@ -468,208 +579,255 @@ function safeInventoryError(message) {
   return error;
 }
 
-// A saved brand-inventory snapshot is AUTHORITATIVE only when it is genuinely the
-// compact report — its params record the current compact report version AND its payload
-// carries the compact shape. A wrong-version or malformed snapshot is treated as "no
-// valid compact snapshot" so a version bump never strands Brand View on an unreadable
-// payload, and (once valid) it is used exclusively so stale FBA Plan values cannot
-// resurface.
+// A saved brand-inventory snapshot is a COMPACT (authoritative) snapshot only when it is genuinely the compact report:
+//   - v2 (BRAND_INVENTORY_REPORT_VERSION): the phase-2 shape -- inventoryModel "listings-v1" + a recognized
+//     inventorySource + the compact buckets;
+//   - v1 (BRAND_INVENTORY_LEGACY_REPORT_VERSION): the production FBA Inventory Health compact (no inventorySource /
+//     inventoryModel) -- served during the transition as a LEGACY Health-sourced snapshot, labelled with its date.
+// A wrong-version or malformed snapshot is "no valid compact snapshot", so a version bump never strands Brand View on an
+// unreadable payload, and (once valid) a compact is used exclusively so stale FBA Plan values cannot resurface.
 export function isCompactInventorySnapshot(snapshot) {
-  return !!snapshot
-    && snapshot.params?.reportVersion === BRAND_INVENTORY_REPORT_VERSION
-    && Array.isArray(snapshot.payload?.inventoryByBrandCountry);
+  if (!snapshot || !snapshot.payload || !Array.isArray(snapshot.payload.inventoryByBrandCountry)) return false;
+  const version = snapshot.params?.reportVersion;
+  const p = snapshot.payload;
+  if (version === BRAND_INVENTORY_REPORT_VERSION) return p.inventoryModel === LISTINGS_INVENTORY_MODEL && V2_INVENTORY_SOURCES.has(String(p.inventorySource));
+  if (version === BRAND_INVENTORY_LEGACY_REPORT_VERSION) return p.inventorySource == null && p.inventoryModel == null;
+  return false;
 }
 
-// SERVE SELECTION (Round-4 Defect 2): pick the AUTHORITATIVE compact brand-inventory snapshot for an account from a
-// set of recent brand-inventory rows, instead of blindly trusting the latest-by-updated_at row. The priority run
-// republishes an inventoryAvailable:false PLACEHOLDER at params {to: cycle D-1} every cycle (newest updated_at), while
-// the zero-export rebuild publishes a REAL available compact at params {to: its real inventory date} -- which, when
-// the fba inventory LAGS the cycle (LKG / LATEST_SNAPSHOT_INCOMPLETE), is a DIFFERENT row than the placeholder. A
-// latest-by-updated_at read lets the fresh placeholder SHADOW that available compact, regressing Brand View to
-// unavailable. So selection PREFERS a genuinely-available compact (the newest real inventory date; updated_at breaks a
-// tie) and only falls back to the newest UNAVAILABLE compact when no available one exists (honest unavailable). This
-// is pure LKG preference -- it never fabricates freshness and never rewrites; the available compact keeps its REAL
-// (possibly older) inventory date, and the fingerprint/serve staleness signal freshness independently. Returns the
-// selected row (a valid compact) or null when the set holds no valid compact (the caller then uses the legacy fallback).
+// The freshness a compact claims, comparable across sources: the Listings fetch time (ISO instant) for Listings, the
+// Health snapshot date (YYYY-MM-DD) for a Health fallback / a legacy v1 compact ("" when none). A Listings fetch on day
+// X+1 sorts after a Health snapshot dated X (a longer string with the same prefix sorts later).
+function compactFreshness(s) {
+  const p = (s && s.payload) || {};
+  return String(p.listingsRefreshedAt || p.inventoryHealthDate || p.inventoryDate || p.inventorySnapshotDate || "");
+}
+
+// SERVE SELECTION (Round-4 Defect 2, phase 2): pick the AUTHORITATIVE compact brand-inventory snapshot for an account
+// from a set of recent brand-inventory rows, instead of blindly trusting the latest-by-updated_at row. The priority run
+// can republish an inventoryAvailable:false PLACEHOLDER (newest updated_at) while the zero-export rebuild publishes a
+// REAL available compact at another identity; a latest-by-updated_at read would let the placeholder SHADOW it. So:
+//   1. an AVAILABLE v2 compact (newest freshness -- Listings fetch time / Health snapshot date; updated_at breaks a tie);
+//   2. else an AVAILABLE legacy v1 (FBA Inventory Health) compact -- the transition window before the phase-2 scheduler
+//      publishes v2 (production stock is never hidden; it is labelled with its Health date);
+//   3. else the newest compact (an honest unavailable placeholder).
+// Pure LKG preference -- it never fabricates freshness and never rewrites. Returns the selected row or null when the set
+// holds no valid compact (the caller then uses the saved fba-plan fallback). (Listings inventory cutover: a selected
+// compact whose saved Health figure is past the bridge threshold is still made Unavailable at READ time --
+// brandInventory(..., { asOf }) -- so the selection stays the one shared function the dependency fingerprint uses.)
 export function selectAuthoritativeInventorySnapshot(rows) {
   const compacts = (Array.isArray(rows) ? rows : []).filter(isCompactInventorySnapshot);
   if (!compacts.length) return null;
-  const available = compacts.filter((s) => s.payload && s.payload.inventoryAvailable === true);
-  const pool = available.length ? available : compacts;
-  const dateOf = (s) => String((s.payload && (s.payload.inventoryDate || s.payload.inventorySnapshotDate)) || "");
+  const available = compacts.filter((s) => s.payload.inventoryAvailable === true);
+  const availableV2 = available.filter((s) => s.params.reportVersion === BRAND_INVENTORY_REPORT_VERSION);
+  const pool = availableV2.length ? availableV2 : available.length ? available : compacts;
   const timeOf = (s) => String(s.source_refreshed_at || s.updated_at || "");
-  // Newest REAL inventory date wins; a tie breaks to the newest provenance/updated_at. Among available compacts this
-  // is the freshest genuine stock; when none are available it is simply the newest placeholder (unavailable).
   return pool.slice().sort((a, b) => {
-    const da = dateOf(a); const db = dateOf(b);
+    const da = compactFreshness(a); const db = compactFreshness(b);
     if (da !== db) return da < db ? 1 : -1;
     const ta = timeOf(a); const tb = timeOf(b);
     return ta < tb ? 1 : (ta > tb ? -1 : 0);
   })[0];
 }
 
-/**
- * PURE, STRICT validation + fold of FBA Inventory Health rows into the compact
- * brand-inventory payload. `invRows` are the raw source rows; `brandByAsin` is a Map
- * (or {asin:brand} object); `[from, to]` is the EXACT expected window (the single D-1
- * snapshot day: from === to).
- *
- * The whole payload is REFUSED (throws an admin-safe error) if ANY row is invalid, so a
- * malformed/truncated export is never saved and the previous snapshot is preserved:
- *   - `invRows` must be an array; every row a plain object;
- *   - `row.date` a strict UTC calendar date INSIDE [from, to] (impossible / malformed /
- *     future / out-of-window dates are rejected, never coerced);
- *   - `row.child_asin` non-empty;
- *   - `row.available` a NO-STOCK null/undefined (folds to an honest 0, exactly like the canonical fba-plan derive's
- *     num()) OR an already-finite non-negative number; a PRESENT malformed value (negative / NaN / Infinity /
- *     non-numeric string) is rejected, never coerced;
- *   - a country (row marketplace, else the authoritative account-country fallback).
- * Only the LATEST validated date folds. `inventoryAvailable` is true only when rows were
- * returned, so a brand present with 0 available is a genuine zero while an empty snapshot
- * stays unavailable — never invented zero.
- */
-export function buildBrandInventoryPayload({ accountId, invRows, brandByAsin, accountCountry, from, to, rowLimit }) {
-  const windowFrom = trimmed(from);
-  const windowTo = trimmed(to);
-  if (!isStrictCalendarDate(windowFrom) || !isStrictCalendarDate(windowTo) || windowFrom > windowTo) {
-    throw safeInventoryError("Brand View inventory was requested with an invalid date window and was not saved; the previous snapshot is preserved.");
-  }
-  if (!Array.isArray(invRows)) {
-    throw safeInventoryError("Brand View inventory returned an unexpected shape and was not saved; the previous snapshot is preserved.");
-  }
-  if (rowLimit && invRows.length >= rowLimit) {
-    throw safeInventoryError(`The FBA inventory export reached its ${rowLimit.toLocaleString("en-US")}-row cap, so it may be truncated. The compact Brand View inventory was not saved; the previous snapshot is preserved.`);
-  }
-  const brandOf = brandByAsin instanceof Map ? brandByAsin : new Map(Object.entries(brandByAsin || {}));
-  const accountFallbackCountry = trimmed(accountCountry).toUpperCase();
-  // `available` folded exactly like the CANONICAL fba-plan derive (derivation-core.js `num`): a null/undefined value
-  // is a legitimate NO-STOCK ASIN (DataDoe's fba-inventory-health returns null available -- and null reserved/inbound --
-  // for a SKU that is LISTED but holds no FBA inventory record) and folds to an HONEST 0, never a fabricated
-  // availability. A PRESENT value is used as-is and must be a finite non-negative number (a negative / NaN / Infinity /
-  // non-numeric string is corruption -> rejected below, LKG preserved). This makes the ZERO-EXPORT reconciler backstop
-  // reproduce the go-live's brand-inventory byte-for-byte instead of deferring an account whose valid D-1 snapshot
-  // merely carries some no-stock ASINs (the exact gate that deferred 9 europe-au accounts).
-  const availableUnitsOf = (row) => (row.available == null ? 0 : row.available);
-
-  // Pass 1: STRICTLY validate EVERY row (any invalid row rejects the whole payload) and
-  // find the latest in-window date. A row is validated even if it is not the latest date.
-  let inventoryDate = null;
-  for (const row of invRows) {
-    if (!row || typeof row !== "object" || Array.isArray(row)) {
-      throw safeInventoryError("Brand View inventory contained a malformed row and was not saved; the previous snapshot is preserved.");
-    }
+// Health rows as production persists them (the account's LAST SAVED durable FBA Inventory Health snapshot, isolated to
+// its seller + marketplace -- read-only; no Health export exists any more). They feed ONLY the dated bridge, so a
+// malformed Health row never refuses a validated
+// Listings compact (the Health evidence is simply not used); when the account DEPENDS on Health (Listings not
+// validated) the payload is refused exactly like production (previous compact preserved). Returns null or a typed reason.
+function healthRowsProblem(rows, { country, to }) {
+  const limitDate = dateOf(to);
+  for (const row of rows) {
     const date = trimmed(row.date);
-    if (!isStrictCalendarDate(date) || date < windowFrom || date > windowTo) {
-      throw safeInventoryError("Brand View inventory contained an impossible, future or out-of-window date and was not saved; the previous snapshot is preserved.");
-    }
-    if (!trimmed(row.child_asin)) {
-      throw safeInventoryError("Brand View inventory contained a row without an ASIN and was not saved; the previous snapshot is preserved.");
-    }
-    // A NO-STOCK null/undefined folds to 0 (availableUnitsOf); a PRESENT value must ALREADY be a finite non-negative
-    // number -- no coercion, so "" / "5" / NaN / Infinity / a negative are all rejected rather than converted to zero.
-    const availableUnits = availableUnitsOf(row);
-    if (!Number.isFinite(availableUnits) || availableUnits < 0) {
-      throw safeInventoryError("Brand View inventory contained a malformed or negative available quantity and was not saved; the previous snapshot is preserved.");
-    }
-    if (!(trimmed(row.marketplace_country_code).toUpperCase() || accountFallbackCountry)) {
-      throw safeInventoryError("Brand View inventory contained a row with no marketplace and no account-country fallback; it was not saved and the previous snapshot is preserved.");
-    }
-    if (!inventoryDate || date > inventoryDate) inventoryDate = date;
+    if (!isStrictCalendarDate(date)) return "health-row-date-invalid";
+    if (limitDate && date > limitDate) return "health-row-date-after-requested-day";
+    if (!trimmed(row.child_asin)) return "health-row-asin-missing";
+    const mkt = canonicalMarketplace(row.marketplace_country_code);
+    if (mkt && country && mkt !== country) return "health-foreign-marketplace-rows";
+    const available = row.available;
+    // A blank available stays UNKNOWN in the shared fold (inventory-source.js, never 0); a PRESENT value must already
+    // be a finite non-negative number (no coercion of "5", NaN, Infinity or a negative).
+    if (available !== null && available !== undefined && !(typeof available === "number" && Number.isFinite(available) && available >= 0)) return "health-row-available-invalid";
   }
+  return null;
+}
 
-  // Pass 2: fold ONLY the latest validated date, by (country, brand).
-  const byCountryBrand = new Map();
-  for (const row of invRows) {
-    if (trimmed(row.date) !== inventoryDate) continue;
-    const asin = trimmed(row.child_asin);
-    const country = trimmed(row.marketplace_country_code).toUpperCase() || accountFallbackCountry;
-    const brand = brandOf.get(asin) || null;
-    const key = `${country}|${brand || ""}`;
-    const bucket = byCountryBrand.get(key) || { country, brand, fbaAvailable: 0, skus: new Set() };
-    bucket.fbaAvailable += availableUnitsOf(row); // no-stock null/undefined -> 0; else the finite non-negative validated in pass 1
-    const sku = trimmed(row.sku);
-    if (sku) bucket.skus.add(sku);
-    byCountryBrand.set(key, bucket);
+/**
+ * PURE fold of ONE account's saved inventory evidence into the compact brand-inventory payload (v2, phase 2).
+ *   listingsRows  -- the account's isolated rows of the saved canonical Listings snapshot (may be empty / absent);
+ *   healthRows    -- the account's LAST SAVED durable FBA Inventory Health rows, exactly as production persists them (may
+ *                    be empty) -- the read-only bridge; `invRows` is accepted as the former name of the same input;
+ *   brandByAsin   -- Map (or {asin: brand}); accountCountry -- the account's marketplace (required);
+ *   listingsRefreshedAt -- the Listings fetch time (the saved pointer's validated_at); `refreshedAt` is an alias;
+ *   to            -- the requested report day: a Health row dated after it rejects the Health evidence, AND the bridge's
+ *                    as-of (the bridge drives figures only while its snapshot date >= to - HEALTH_BRIDGE_MAX_AGE_DAYS;
+ *                    without `to` / `asOf` it is refused -- health-bridge-as-of-missing);
+ *   asOf          -- optional explicit bridge as-of (defaults to `to`);
+ *   listingsUnavailableReason -- optional: why the caller could not use the account's saved Listings at all (e.g. a
+ *                    stale pointer); it replaces the generic Listings reason when Listings is not the source;
+ *   rowLimit      -- the Health cap (a list at/over it may be truncated -> refused); listingsRowLimit -- the Listings
+ *                    cap (default rowLimit; the per-account Listings rows include merchant-fulfilled / inactive ones).
+ * The source is decided by lib/server/inventory-source.js selectAccountInventory (validated Listings, else the saved
+ * Health bridge within its threshold, else unavailable) and rolled up with the shared brandCountryInventory over
+ * selectionFoldView (an unknown SKU -> a null bucket; an mfn-only ASIN -> no bucket; an `unattributed` marker when
+ * Listings stock has no ASIN). asinForSku is null: no in-account SKU->ASIN map is cheaply available here.
+ *
+ * Structural problems REFUSE the whole payload (throws an admin-safe error; the previous snapshot is preserved): a
+ * non-array input, a non-object row, a list at the row cap, no account marketplace -- or a malformed Health snapshot
+ * (impossible / future date, blank ASIN, another marketplace's row, a present non-numeric / negative available) when the
+ * account has no validated Listings (it would depend on that Health snapshot).
+ *
+ * Payload (version brand-inventory-shared-v2): { accountId, inventoryModel:"listings-v1", inventorySource,
+ * inventoryListingsReasons, inventoryHealthDate, listingsRefreshedAt (Listings source only), inventoryDate (the Health
+ * date for the fallback, null for Listings), inventoryAvailable, inventoryUnavailableReason, inventoryConflicts (count),
+ * inventoryByBrandCountry }.
+ */
+export function buildBrandInventoryPayload({
+  accountId, listingsRows = null, healthRows = undefined, invRows = undefined, brandByAsin, accountCountry,
+  listingsRefreshedAt = undefined, refreshedAt = null, to = null, asOf = undefined, rowLimit = null, listingsRowLimit = undefined,
+  listingsUnavailableReason = null,
+}) {
+  const health = healthRows !== undefined ? healthRows : (invRows !== undefined ? invRows : null);
+  const lists = [
+    ["Listings", listingsRows == null ? [] : listingsRows, listingsRowLimit !== undefined ? listingsRowLimit : rowLimit],
+    ["FBA Inventory Health", health == null ? [] : health, rowLimit],
+  ];
+  for (const [label, rows, cap] of lists) {
+    if (!Array.isArray(rows)) {
+      throw safeInventoryError(`Brand View inventory (${label}) returned an unexpected shape and was not saved; the previous snapshot is preserved.`);
+    }
+    if (cap && rows.length >= cap) {
+      throw safeInventoryError(`The ${label} inventory reached its ${cap.toLocaleString("en-US")}-row cap, so it may be truncated. The compact Brand View inventory was not saved; the previous snapshot is preserved.`);
+    }
+    if (rows.some((row) => !row || typeof row !== "object" || Array.isArray(row))) {
+      throw safeInventoryError(`Brand View inventory (${label}) contained a malformed row and was not saved; the previous snapshot is preserved.`);
+    }
   }
-
+  const country = canonicalMarketplace(accountCountry);
+  if (!country) {
+    throw safeInventoryError("Brand View inventory has no account marketplace; it was not saved and the previous snapshot is preserved.");
+  }
+  const lRows = lists[0][1];
+  let hRows = lists[1][1];
+  const healthProblem = hRows.length ? healthRowsProblem(hRows, { country, to }) : null;
+  if (healthProblem) hRows = [];
+  const brandOf = brandByAsin instanceof Map ? brandByAsin : new Map(Object.entries(brandByAsin || {}));
+  // The bridge threshold is measured against the report day (`asOf`, default `to`); no as-of => the bridge is refused.
+  const bridgeAsOf = dateOf(asOf !== undefined ? asOf : to);
+  const sel = selectAccountInventory({ listingsRows: lRows, healthRows: hRows, marketplace: country, awdEligible: false, asinForSku: null, asOf: bridgeAsOf });
+  // A malformed Health snapshot is corruption: when the account would DEPEND on it (no validated Listings), refuse the
+  // whole payload exactly like production did (typed, admin-safe; the previous compact / LKG is preserved and the
+  // reconciler defers) -- never an "unavailable" compact that hides the integrity failure as an ordinary gap.
+  if (healthProblem && sel.source !== INVENTORY_SOURCE_LISTINGS) {
+    throw safeInventoryError(`Brand View inventory: the saved FBA Inventory Health snapshot failed validation (${healthProblem}) and this account's Listings inventory is not validated, so nothing was saved; the previous snapshot is preserved.`);
+  }
+  const fetchedAt = instantOf(listingsRefreshedAt !== undefined ? listingsRefreshedAt : refreshedAt);
+  const isListings = sel.source === INVENTORY_SOURCE_LISTINGS;
+  const isFallback = sel.source === INVENTORY_SOURCE_HEALTH_FALLBACK;
+  const available = isListings || isFallback;
+  // Why neither source drives figures: no validated Listings + the bridge's typed refusal (stale / no as-of / foreign
+  // rows) when a saved Health snapshot existed, else no saved Health snapshot at all.
+  const bridgeWhy = hRows.length && Array.isArray(sel.healthReasons) && sel.healthReasons.length ? sel.healthReasons.join(",") : "no-fba-inventory-health-snapshot";
+  const unavailableReason = available ? null : `no-validated-listings;${bridgeWhy}`;
   return {
     accountId: String(accountId),
-    inventoryDate,
-    inventoryAvailable: invRows.length > 0,
-    inventoryByBrandCountry: [...byCountryBrand.values()].map(({ skus, ...entry }) => ({ ...entry, skuCount: skus.size })),
+    inventoryModel: LISTINGS_INVENTORY_MODEL,
+    inventorySource: sel.source,
+    inventoryListingsReasons: !isListings && trimmed(listingsUnavailableReason) ? [trimmed(listingsUnavailableReason)] : [...(sel.listingsReasons || [])],
+    inventoryHealthDate: isFallback ? sel.healthDate : null,
+    listingsRefreshedAt: isListings ? fetchedAt : null,
+    inventoryDate: isFallback ? sel.healthDate : null,
+    inventoryAvailable: available,
+    inventoryUnavailableReason: unavailableReason,
+    inventoryConflicts: Array.isArray(sel.conflicts) ? sel.conflicts.length : 0,
+    inventoryByBrandCountry: available
+      ? brandCountryInventory(selectionFoldView(sel), { country, brandOf: (asin) => brandOf.get(asin) || null })
+      : [],
   };
 }
 
 /**
- * Orchestrate one account's compact brand-inventory refresh with INJECTED readers so
- * the whole flow (brand-map decision + the single inventory export + strict fold) is
- * offline-testable and makes no direct network call itself.
+ * Orchestrate one account's compact brand-inventory build with INJECTED readers (offline-testable; no network call).
  *
- *  - ASIN->brand comes ONLY from the saved brand-sales snapshot's `asinBrand` map.
- *    There is NO live Product Catalog fallback: if the map is missing this FAILS
- *    BEFORE the FBA Inventory export, so a just-failed Brand Sales catalog can never
- *    trigger an immediate second Product Catalog export in the same click.
- *  - `fetchInventoryRows` is the ONE FBA Inventory Health export, validated by
- *    `buildBrandInventoryPayload` against the exact `[from, to]` window.
+ *  - ASIN->brand comes ONLY from the saved brand-sales snapshot's `asinBrand` map. If the map is missing this FAILS
+ *    BEFORE reading inventory (no live catalog fallback; zero Catalog exports by construction).
+ *  - `fetchInventoryRows` returns the account's LAST SAVED durable FBA Inventory Health rows (the read-only bridge, as
+ *    production persists them; zero export -- no Health export exists any more); `fetchListingsRows` (optional) returns
+ *    the account's SAVED Listings rows; `listingsRefreshedAt` is that Listings snapshot's fetch time. `from` is
+ *    accepted for call-site compatibility; `to` bounds the Health dates AND is the bridge's as-of (threshold).
  *  - Returns { payload, asinBrandCount }.
  */
 export async function buildBrandInventorySnapshot({
-  accountId, accountCountry, from, to, rowLimit,
-  getSnapshot, fetchInventoryRows,
+  accountId, accountCountry, from = null, to = null, rowLimit = null, listingsRowLimit = undefined,
+  getSnapshot, fetchInventoryRows, fetchListingsRows = null, listingsRefreshedAt = null, listingsUnavailableReason = null,
 }) {
+  void from;
   if (typeof getSnapshot !== "function") throw new Error("A snapshot reader is required.");
   if (typeof fetchInventoryRows !== "function") throw new Error("An inventory reader is required.");
 
   const salesSnapshot = await getSnapshot({ reportKey: "brand-sales", accountId });
   const brandByAsin = asinBrandFromSalesPayload(salesSnapshot?.payload);
   if (!brandByAsin.size) {
-    // FAIL CLOSED before any export: no live catalog fetch, so zero Catalog and zero
-    // FBA exports are spent when the brand map is unavailable.
-    throw safeInventoryError("Brand View inventory needs this account's saved Brand Sales brand map, which is not available. Refresh Brand Sales successfully for this account first, then fetch FBA inventory.");
+    // FAIL CLOSED before any inventory read: no live catalog fetch.
+    throw safeInventoryError("Brand View inventory needs this account's saved Brand Sales brand map, which is not available. Refresh Brand Sales successfully for this account first.");
   }
 
-  const invRows = await fetchInventoryRows();
-  const payload = buildBrandInventoryPayload({ accountId, invRows, brandByAsin, accountCountry, from, to, rowLimit });
+  const healthRows = await fetchInventoryRows();
+  const listingsRows = typeof fetchListingsRows === "function" ? await fetchListingsRows() : [];
+  const payload = buildBrandInventoryPayload({ accountId, listingsRows, healthRows, brandByAsin, accountCountry, listingsRefreshedAt, to, rowLimit, listingsRowLimit, listingsUnavailableReason });
   return { payload, asinBrandCount: brandByAsin.size };
 }
 
 /**
- * PURE zero-export adapter: build the compact brand-inventory payload from an ALREADY-VALIDATED fba-plan report
- * snapshot payload (Defect A). The fba-plan derive (derivation-core.js) already folds the validated FBA Inventory
- * Health to the EXACT compact shape (inventoryByBrandCountry [{country, brand, fbaAvailable, skuCount}] +
- * inventorySnapshotDate + inventoryAvailable), so there is ONE inventory definition and NO second paid export.
+ * PURE zero-export adapter: the compact brand-inventory payload from an ALREADY-VALIDATED saved fba-plan payload in the
+ * PHASE-2 shape (inventorySource recorded; the fba-plan derive folds the SAME per-account selection to the SAME compact
+ * buckets via the shared brandCountryInventory, so there is ONE inventory definition and no second export).
  *
  * The priority run publishes the compact BEFORE the FBA job runs, so it is inventoryAvailable:false; the FBA-aware
  * materialize-inventory job (which runs AFTER fba) uses this adapter to REBUILD the compact from the fresh fba-plan,
  * making Brand View's exclusive-compact consumer serve real inventory the SAME day.
  *
- * Returns null (never a fabricated zero) when the fba-plan carries no available inventory or no strict snapshot
- * date -- the caller then leaves the existing (unavailable) compact untouched, preserving per-account
- * zero-vs-missing semantics. An fba-plan on LKG (an older validated date) rebuilds with its REAL inventoryDate
- * (labeled by that date downstream, never claimed D-1).
+ * Returns null (never a fabricated zero) when the plan is not the phase-2 shape (a pre-phase-2 Health plan never becomes
+ * a v2 compact -- the source decision was never made for it), carries no available inventory, lacks its freshness (a
+ * Listings plan without a parseable fetch time / a fallback without a Health date) or has a malformed bucket -- the
+ * caller then leaves the existing compact untouched. A bucket whose fbaAvailable is null (unknown) stays null, never 0.
+ * `reportAsOf` (optional, the cycle's report day): a plan whose Health BRIDGE date is older than reportAsOf -
+ * HEALTH_BRIDGE_MAX_AGE_DAYS never becomes an available compact (the saved Health snapshot is no longer refreshed).
  */
-export function compactInventoryFromFbaPlanPayload(planPayload, accountId) {
-  if (!planPayload || planPayload.inventoryAvailable !== true) return null;
-  const rows = Array.isArray(planPayload.inventoryByBrandCountry) ? planPayload.inventoryByBrandCountry : null;
-  if (!rows) return null;
-  const inventoryDate = trimmed(planPayload.inventorySnapshotDate || planPayload.inventoryDate);
-  // Never publish a compact with a fabricated/absent date -- the whole value of the D-1 contract is an honest date.
-  if (!isStrictCalendarDate(inventoryDate)) return null;
+export function compactInventoryFromFbaPlanPayload(planPayload, accountId, { reportAsOf = null } = {}) {
+  if (!planPayload || planPayload.inventorySource == null) return null;
+  const evidence = inventoryEvidenceOf(planPayload);
+  if (!evidence.available || evidence.inventorySource === INVENTORY_SOURCE_HEALTH_LEGACY) return null;
+  const day = dateOf(reportAsOf);
+  if (day && evidence.inventorySource === INVENTORY_SOURCE_HEALTH_FALLBACK && evidence.healthDate < addDays(day, -HEALTH_BRIDGE_MAX_AGE_DAYS)) return null;
+  if (evidence.inventorySource === INVENTORY_SOURCE_LISTINGS && !evidence.listingsRefreshedAt) return null;
   const inventoryByBrandCountry = [];
-  for (const entry of rows) {
-    const available = Number(entry && entry.fbaAvailable);
-    if (!Number.isFinite(available) || available < 0) return null; // malformed fold -> preserve previous compact
-    inventoryByBrandCountry.push({
-      country: trimmed(entry && entry.country).toUpperCase() || null,
+  for (const entry of evidence.buckets) {
+    const raw = entry ? entry.fbaAvailable : undefined;
+    const available = raw === null ? null : Number(raw);
+    if (available !== null && (!Number.isFinite(available) || available < 0)) return null; // malformed fold -> preserve previous compact
+    const bucket = {
+      country: canonicalMarketplace(entry && entry.country) || null,
       brand: (entry && entry.brand != null) ? entry.brand : null,
       fbaAvailable: available,
       skuCount: Number.isFinite(Number(entry && entry.skuCount)) ? Number(entry.skuCount) : 0,
-    });
+    };
+    if (entry && entry.unattributed === true) bucket.unattributed = true;
+    inventoryByBrandCountry.push(bucket);
   }
+  const isFallback = evidence.inventorySource === INVENTORY_SOURCE_HEALTH_FALLBACK;
+  const conflicts = planPayload.inventoryConflicts;
   return {
     accountId: String(accountId),
-    inventoryDate,
+    inventoryModel: LISTINGS_INVENTORY_MODEL,
+    inventorySource: evidence.inventorySource,
+    inventoryListingsReasons: [...evidence.listingsReasons],
+    inventoryHealthDate: isFallback ? evidence.healthDate : null,
+    listingsRefreshedAt: isFallback ? null : evidence.listingsRefreshedAt,
+    inventoryDate: isFallback ? evidence.healthDate : null,
     inventoryAvailable: true,
+    inventoryUnavailableReason: null,
+    inventoryConflicts: Array.isArray(conflicts) ? conflicts.length : (Number.isFinite(Number(conflicts)) ? Number(conflicts) : 0),
     inventoryByBrandCountry,
   };
 }
@@ -793,14 +951,13 @@ export async function buildAccountBrandSlice({ accountId, brand, asOf, account, 
     ads = aggregateBrandCampaignAdsSpend(adRows, campaignMap, brandKey(brand));
   }
 
-  // Inventory source: a VALID compact brand-inventory snapshot is AUTHORITATIVE. Once
-  // it exists (correct report version + compact shape), it is used EXCLUSIVELY, even
-  // when its rows are empty or the selected brand is absent — an empty/unavailable
-  // compact snapshot shows unavailable, never resurrecting a stale FBA Plan value. The
-  // legacy fba-plan/listing-health fallback is allowed ONLY while no valid compact
-  // snapshot exists yet.
+  // Inventory source: a VALID compact brand-inventory snapshot (v2, or the legacy v1 Health compact during the
+  // transition) is AUTHORITATIVE. Once it exists, it is used EXCLUSIVELY, even when its rows are empty or the selected
+  // brand is absent -- an empty/unavailable compact snapshot shows unavailable, never resurrecting a stale FBA Plan
+  // value. The saved fba-plan is used ONLY while no valid compact snapshot exists yet, and only in its phase-2 shape or
+  // its old Health shape (labelled with its Health date); the Listing Health v1 fallback is removed.
   // SERVE SELECTION (Round-4 Defect 2): when a multi-row inventory reader is wired, SELECT the authoritative compact
-  // (prefer a genuinely-available compact by newest real inventory date) across the account's recent brand-inventory
+  // (prefer a genuinely-available compact by newest freshness) across the account's recent brand-inventory
   // rows, so a fresh unavailable placeholder republished this cycle cannot shadow a lagging AVAILABLE compact. Without
   // the reader (legacy/tests) this is byte-identical to the single latest read. Cached under the same key as readOnce.
   const readBrandInventory = async () => {
@@ -817,16 +974,24 @@ export async function buildAccountBrandSlice({ accountId, brand, asOf, account, 
   };
   const brandInventorySnapshot = await readBrandInventory();
   const planSnapshot = await readOnce("fba-plan");
-  const inventoryFallbackSnapshot = await readOnce(INVENTORY_FALLBACK_SNAPSHOT_KEY);
   const useCompact = isCompactInventorySnapshot(brandInventorySnapshot);
+  // Authoritative compact first (an empty compact or an absent brand resolves to unavailable, never an older value);
+  // else the saved fba-plan, read through the SAME evidence classifier (inventoryEvidenceOf).
+  // Serve-time bridge freshness (asOf): a saved FBA Inventory Health figure older than its threshold is Unavailable.
   const inventory = useCompact
-    // Authoritative: no legacy fallback payload, so an empty compact snapshot or an
-    // absent brand resolves to unavailable rather than an older legacy value.
-    ? brandInventory(brandInventorySnapshot.payload, brand, account?.country, null)
-    : brandInventory(planSnapshot?.payload, brand, account?.country, inventoryFallbackSnapshot?.payload);
-  const inventorySnapshot = useCompact
-    ? brandInventorySnapshot
-    : (inventory.source === INVENTORY_FALLBACK_SNAPSHOT_KEY ? inventoryFallbackSnapshot : planSnapshot);
+    ? brandInventory(brandInventorySnapshot.payload, brand, account?.country, BRAND_INVENTORY_SNAPSHOT_KEY, { asOf })
+    : brandInventory(planSnapshot?.payload, brand, account?.country, "fba-plan", { asOf });
+  const inventorySnapshot = useCompact ? brandInventorySnapshot : planSnapshot;
+  const inventoryKnown = inventory.scope !== "unavailable";
+  // A Listings compact keys the United Kingdom by its canonical Amazon code (GB) while this account's saved sales may
+  // spell it UK: re-key an inventory marketplace onto the sales spelling of the SAME marketplace, so one marketplace
+  // is never split into a sales row with no stock plus a phantom "FC only" row.
+  for (const [key, value] of [...inventory.byCountry]) {
+    const salesKey = [...sales.countries.keys()].find((code) => code !== key && canonicalMarketplace(code) === canonicalMarketplace(key));
+    if (!salesKey || inventory.byCountry.has(salesKey)) continue;
+    inventory.byCountry.delete(key);
+    inventory.byCountry.set(salesKey, value);
+  }
 
   return {
     accountId: String(accountId),
@@ -846,9 +1011,10 @@ export async function buildAccountBrandSlice({ accountId, brand, asOf, account, 
     asinBrandSources,
     asinBrandCount: asinBrand.size,
     inventory,
-    inventoryDate: inventorySnapshot?.payload?.inventoryDate
-      || inventorySnapshot?.payload?.inventorySnapshotDate
-      || null,
+    // The freshness this account's inventory claims: a Health snapshot DATE (fallback / legacy) or a Listings FETCH
+    // TIME (Listings has no date) -- never both, and none when the inventory is unavailable.
+    inventoryDate: inventoryKnown ? inventory.healthDate : null,
+    inventoryRefreshedAt: inventoryKnown ? inventory.listingsRefreshedAt : null,
     inventorySavedAt: inventorySnapshot?.source_refreshed_at || inventorySnapshot?.updated_at || null,
   };
 }
@@ -971,27 +1137,64 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
   }), { from: null, to: null });
 
   /* ---------- inventory ---------- */
+  // Each account carries its OWN inventory source (validated Listings, the dated saved FBA Inventory Health bridge, a
+  // legacy v1 Health compact within the same threshold, or unavailable). A marketplace / total is a COMPLETE sum or null
+  // (Unavailable): an unknown contributor never yields a partial sum. Freshness is reported per account
+  // (inventoryAccountSources) and, merged, as the OLDEST Health snapshot date (inventoryDate) and the OLDEST Listings
+  // fetch time (inventoryRefreshedAt) among the contributing accounts -- never a newer claim than the data supports.
   const inventoryByCountry = new Map();
-  let inventoryAccountTotal = null;
+  let inventoryTotalUnknown = false;
   let inventoryDate = null;
+  let inventoryRefreshedAt = null;
   const inventoryScopes = new Set();
   const inventorySources = new Set();
+  const inventoryUnknownSlices = [];
+  const inventoryMissingSlices = [];
+  const inventoryAccountSources = [];
   for (const slice of usable) {
-    if (slice.inventory.scope === "unavailable") continue;
-    inventoryScopes.add(slice.inventory.scope);
-    if (slice.inventory.source) inventorySources.add(slice.inventory.source);
-    for (const [country, available] of slice.inventory.byCountry) {
-      inventoryByCountry.set(country, (inventoryByCountry.get(country) || 0) + available);
+    const inv = slice.inventory;
+    inventoryAccountSources.push({
+      accountId: slice.accountId,
+      accountName: slice.accountName || null,
+      source: inv.scope === "unavailable" ? INVENTORY_SOURCE_UNAVAILABLE : (inv.inventorySource || INVENTORY_SOURCE_UNAVAILABLE),
+      listingsRefreshedAt: slice.inventoryRefreshedAt || null,
+      healthDate: slice.inventoryDate || null,
+      listingsReasons: Array.isArray(inv.listingsReasons) ? [...inv.listingsReasons] : [],
+      unavailableReason: inv.scope === "unavailable" ? (inv.unavailableReason || "no-inventory-snapshot") : null,
+    });
+    if (inv.scope === "unavailable") { inventoryMissingSlices.push(slice); continue; }
+    inventoryScopes.add(inv.scope);
+    if (inv.source) inventorySources.add(inv.source);
+    for (const [country, available] of inv.byCountry) {
+      const prev = inventoryByCountry.has(country) ? inventoryByCountry.get(country) : 0;
+      inventoryByCountry.set(country, prev === null || available === null ? null : prev + available);
     }
-    if (slice.inventory.accountTotal !== null) {
-      inventoryAccountTotal = (inventoryAccountTotal || 0) + slice.inventory.accountTotal;
+    if (inv.unknown) { inventoryTotalUnknown = true; inventoryUnknownSlices.push(slice); }
+    if (slice.inventoryDate && (!inventoryDate || slice.inventoryDate < inventoryDate)) inventoryDate = slice.inventoryDate;
+    if (slice.inventoryRefreshedAt && (!inventoryRefreshedAt || slice.inventoryRefreshedAt < inventoryRefreshedAt)) inventoryRefreshedAt = slice.inventoryRefreshedAt;
+  }
+  // An account with NO usable inventory (no compact / fba-plan yet, an unavailable source, a failed read) is UNKNOWN,
+  // not zero: when other accounts' inventory is known, every marketplace that account sells in -- and the total -- is
+  // Unavailable instead of a partial sum that looks complete. (When NO account has inventory the scope is simply
+  // "unavailable" below.)
+  if (inventoryScopes.size && inventoryMissingSlices.length) {
+    for (const slice of inventoryMissingSlices) {
+      for (const [country] of slice.sales.countries) inventoryByCountry.set(country, null);
+      inventoryUnknownSlices.push(slice);
     }
-    if (slice.inventoryDate && (!inventoryDate || slice.inventoryDate > inventoryDate)) inventoryDate = slice.inventoryDate;
+    inventoryTotalUnknown = true;
   }
   const inventoryScope = !inventoryScopes.size
     ? "unavailable"
     : inventoryScopes.has("account") && inventoryScopes.has("country") ? "mixed"
       : [...inventoryScopes][0];
+  // The ALL-MARKET total: a complete sum of every marketplace, withheld (null) when any marketplace is unknown OR when
+  // the EU all-market rule fires (two or more pan-EU pool marketplaces with positive stock -- euPoolAllMarketRule).
+  const inventoryEu = euPoolAllMarketRule(inventoryByCountry);
+  let inventoryAccountTotal = null;
+  if (inventoryScope !== "unavailable" && !inventoryTotalUnknown && !inventoryEu.withheld && inventoryByCountry.size) {
+    inventoryAccountTotal = [...inventoryByCountry.values()].reduce((total, value) => total + value, 0);
+  }
 
   /* ---------- countries ---------- */
   const adsCountrySet = new Set(adsCountries);
@@ -1003,6 +1206,9 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
       hasSales: true,
       adsAvailable: adsCountrySet.has(country),
       fbaAvailable: inventoryByCountry.has(country) ? inventoryByCountry.get(country) : null,
+      // true = a contributing account's inventory for this marketplace is UNKNOWN (not merely absent): any total over
+      // it is withheld, never a partial sum.
+      fbaUnknown: inventoryByCountry.has(country) && inventoryByCountry.get(country) === null,
       currencyConflict: currencyConflicts.has(country),
       accounts: [...(accountsByCountry.get(country) || [])].sort(),
     });
@@ -1018,6 +1224,7 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
       hasSales: false,
       adsAvailable: adsCountrySet.has(country),
       fbaAvailable: available,
+      fbaUnknown: available === null,
       currencyConflict: false,
       accounts: [],
     });
@@ -1079,8 +1286,23 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
     notes.push(`No saved advertising covers every account selling in ${salesOnlyCountries.join(", ")}, so ad spend and TACoS there are shown as unavailable rather than as a partial sum.`);
   }
   if (inventoryScope === "unavailable") {
-    notes.push("FBA inventory and inventory cover are unavailable because no contributing account has a saved FBA Shipment Plan or Listing Health snapshot yet.");
-  } else if (inventoryScope !== "country") {
+    notes.push("FBA inventory and inventory cover are unavailable because no contributing account has validated Listings inventory or a recent enough saved FBA Inventory Health snapshot (FBA Inventory Health is no longer refreshed).");
+  } else if (inventoryUnknownSlices.length) {
+    notes.push(`FBA inventory for ${[...new Set(inventoryUnknownSlices.map(label))].join(", ")} is not fully known (no usable inventory snapshot, or inventory rows that are unknown or conflicting), so the affected marketplaces and totals are shown as unavailable rather than as a partial sum.`);
+  }
+  // Per-account source labels for anything that is NOT validated Listings (the fallback is always named).
+  const fallbackAccounts = inventoryAccountSources.filter((entry) => entry.source === INVENTORY_SOURCE_HEALTH_FALLBACK);
+  if (fallbackAccounts.length) {
+    notes.push(`FBA inventory for ${fallbackAccounts.map((entry) => `${entry.accountName || entry.accountId} (FBA Inventory Health snapshot ${entry.healthDate})`).join(", ")} comes from the last saved FBA Inventory Health snapshot -- a temporary read-only bridge (no longer refreshed; it may have changed since) -- because that account's Listings inventory is not validated yet.`);
+  }
+  const legacyAccounts = inventoryAccountSources.filter((entry) => entry.source === INVENTORY_SOURCE_HEALTH_LEGACY);
+  if (legacyAccounts.length) {
+    notes.push(`FBA inventory for ${legacyAccounts.map((entry) => `${entry.accountName || entry.accountId} (FBA Inventory Health snapshot ${entry.healthDate})`).join(", ")} comes from an FBA Inventory Health snapshot saved before the Listings inventory switch.`);
+  }
+  if (inventoryEu.withheld) {
+    notes.push(`The All Markets FBA inventory total is withheld: ${inventoryEu.poolMarkets.join(", ")} each report positive FBA stock for this brand, and pan-European pooled stock cannot be counted once from brand totals. Each marketplace's own figure is still shown.`);
+  }
+  if (inventoryScope !== "unavailable" && inventoryScope !== "country") {
     const accountLevel = usable.filter((slice) => slice.inventory.scope === "account");
     notes.push(`FBA inventory for ${accountLevel.map(label).join(", ")} is account-level only, because the saved snapshot carries no marketplace dimension. Those units are excluded from the country rows rather than assigned to a marketplace. Refresh the FBA Shipment Plan once for those accounts to split inventory by country.`);
   }
@@ -1137,7 +1359,17 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
       inventoryScope,
       inventorySource: [...inventorySources].sort().join(", ") || null,
       inventoryAccountTotal,
+      // EU all-market rule: true when two or more pan-EU pool marketplaces report positive stock (the total is withheld).
+      inventoryAllMarketWithheld: inventoryEu.withheld,
+      inventoryAllMarketWithheldReason: inventoryEu.reason,
+      inventoryPoolMarketsPositive: inventoryEu.poolMarkets,
+      // The OLDEST Health snapshot date among Health-sourced accounts (null when none) and the OLDEST Listings fetch
+      // time among Listings-sourced accounts (null when none).
       inventoryDate,
+      inventoryRefreshedAt,
+      // One entry per contributing account: { accountId, accountName, source, listingsRefreshedAt, healthDate,
+      // listingsReasons, unavailableReason } -- source is listings | health-fallback | health-legacy | unavailable.
+      inventoryAccountSources,
       inventorySavedAt: usable
         .map((slice) => slice.inventorySavedAt)
         .filter(Boolean)
@@ -1151,7 +1383,7 @@ export function assembleBrandViewPayload({ slices, brand, asOf, scope }) {
       ads: ACTIVE_ADS_SOURCE_KEY === ASIN_ADS_SOURCE_KEY
         ? "Saved Ad Performance by ASIN & Date rows joined to each account's ASIN-to-brand map"
         : "Saved Ad Performance by Campaign & Date rows attributed via each account's campaign-to-brand map",
-      inventory: "Saved FBA Shipment Plan snapshots (FBA Inventory Health)",
+      inventory: "Saved per-account inventory: validated Listings, else the last saved FBA Inventory Health snapshot (a dated, read-only, temporary bridge; no longer refreshed), else unavailable",
     },
     notes,
   };

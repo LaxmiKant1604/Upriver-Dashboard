@@ -12,6 +12,13 @@
 // covered/partial/unavailable -- it never fabricates a proven zero. It fails closed (returns {}) only when a durable
 // READ itself fails (a DB error must never masquerade as "no sales"), preserving last-known-good.
 //
+// Listings inventory CUTOVER: the loader ALSO reads the account's LAST SAVED durable FBA Inventory Health snapshot
+// (source_snapshots 'fba-inventory-health', READ-ONLY -- lib/server/reports/health-bridge.js) as
+// listingHealthV3DurableInventory, the dated bridge the derive uses only when the account's Listings are not validated
+// and the bridge is within HEALTH_BRIDGE_MAX_AGE_DAYS of the as-of. It replaces the retired listing-health-v3:inventory
+// fragment (no Health export exists). An absent / refused bridge is { available:false, reason } (On Hand FBA then
+// Unavailable, never 0). In STRICT (reconciler) mode it is NOT read here: the dependency bundle proves + injects it.
+//
 // All I/O is injected (offline-testable, ZERO DataDoe). This loader is NOT wired into any active dispatch: v3 is
 // dormant. It is exercised by the shadow build/verify path and its unit test.
 
@@ -20,6 +27,7 @@ import { organizationFingerprint as organizationFingerprintOf } from "../source-
 import { resolveListingHealthWindow } from "../reports/listing-health-advanced.js";
 import { getEnrichedOliHistoryRows } from "./oli-enriched-history.js";
 import { getSourceCoverageWindows, getOliCompleteness } from "../supabase.js";
+import { readSavedHealthBridge } from "../reports/health-bridge.js";
 import { isValidRfc3339Timestamp } from "../rfc3339-timestamp.js";
 
 const S = (v) => (v == null ? "" : String(v));
@@ -47,8 +55,12 @@ export function normalizeCoverageWindows(windows) {
  *   - the account's OLI coverage windows (getOliCoverage) -- carried through (NOT a fail-closed gate);
  *   - the account's OLI completeness rows for the window (getCompleteness);
  *   - the org Product Catalog snapshot (getCatalogSnapshot + loadCatalogPayload, injected like fba-plan's loader).
- * Returns { listingHealthV3DurableOli, listingHealthV3DurableCatalog }. A durable READ FAILURE fails closed (returns
- * {} for OLI, or omits catalog) so the derive preserves last-known-good rather than fabricating a zero.
+ *   - the account's LAST SAVED durable FBA Inventory Health snapshot (getHealthBridge, default readSavedHealthBridge) --
+ *     the dated read-only bridge.
+ * Returns { listingHealthV3DurableOli, listingHealthV3DurableCatalog, listingHealthV3DurableInventory }. A durable READ
+ * FAILURE fails closed (returns {} for OLI, or omits catalog) so the derive preserves last-known-good rather than
+ * fabricating a zero. listingHealthV3DurableInventory = { available:true, rows, snapshotDate, savedAt } |
+ * { available:false, reason } (soft). STRICT mode leaves it to the dependency bundle (not read here).
  */
 export function makeListingHealthV3DurableContextLoader({
   connections,
@@ -65,6 +77,7 @@ export function makeListingHealthV3DurableContextLoader({
   // is required for the strict catalog namespace recompute.
   strict = false,
   buildObjectPath = null,
+  getHealthBridge = readSavedHealthBridge,
 } = {}) {
   return async ({ reportKey, accountId, planned, signal = null }) => {
     if (reportKey !== "listing-health-v3") return {};
@@ -121,21 +134,39 @@ export function makeListingHealthV3DurableContextLoader({
 
     const listingHealthV3DurableOli = { available: true, rows, coverageWindows, completenessRows };
 
+    // 3b) The saved FBA Inventory Health BRIDGE (read-only; never an export). Soft: missing / refused / unreadable =>
+    //     available:false with the typed reason (On Hand FBA then Unavailable, never 0). STRICT (the reconciler): NOT read
+    //     here -- the dependency bundle proves the saved Health pointer with FULL integrity itself and injects the bridge
+    //     (listing-health-v3-dependency-bundle.js), so a strict caller never depends on this soft read.
+    let listingHealthV3DurableInventory;
+    if (!strict) {
+      try {
+        const b = typeof getHealthBridge === "function"
+          ? await getHealthBridge({ organizationFingerprint: orgFingerprint, connectionId, accountId: S(accountId), rawSellerId, signal })
+          : null;
+        listingHealthV3DurableInventory = b && Array.isArray(b.rows)
+          ? { available: true, rows: b.rows, snapshotDate: b.snapshotDate || null, savedAt: b.savedAt || null }
+          : { available: false, reason: S(b && b.unavailableReason) || "health-snapshot-missing" };
+      } catch (_e) {
+        listingHealthV3DurableInventory = { available: false, reason: "health-snapshot-read-failed" };
+      }
+    }
+
     // 4) Org Product Catalog snapshot (reused canonical evidence, never a new export). Unreadable/missing catalog ->
     //    omit it so the derive blocks on the missing catalog (fail closed, LKG preserved).
     if (typeof getCatalogSnapshot !== "function" || typeof loadCatalogPayload !== "function") {
-      return { listingHealthV3DurableOli };
+      return { listingHealthV3DurableOli, listingHealthV3DurableInventory };
     }
     let catRead;
     try {
       catRead = await getCatalogSnapshot({ organizationFingerprint: orgFingerprint, connectionId, sourceKey: CATALOG_SOURCE_KEY, scopeKey: ORGANIZATION_SCOPE_KEY, signal });
-    } catch (_e) { return { listingHealthV3DurableOli }; }
+    } catch (_e) { return { listingHealthV3DurableOli, listingHealthV3DurableInventory }; }
     const catalogSnapshot = catRead && typeof catRead === "object" && "snapshot" in catRead ? catRead.snapshot : catRead;
     const catalogReadOk = !catRead || typeof catRead !== "object" || !("read" in catRead) || catRead.read === "ok";
     // STRICT (reconciler): a typed catalog read failure DEFERS (mandatory catalog; return {} not "omit catalog then
     // degrade"). PREVIEW: unreadable/missing catalog -> omit (the derive blocks on the missing catalog).
     if (strict && catRead && typeof catRead === "object" && "read" in catRead && catRead.read !== "ok") return {};
-    if (!catalogReadOk || !catalogSnapshot || !catalogSnapshot.object_path) return { listingHealthV3DurableOli };
+    if (!catalogReadOk || !catalogSnapshot || !catalogSnapshot.object_path) return { listingHealthV3DurableOli, listingHealthV3DurableInventory };
     // STRICT: FULL Catalog pointer integrity (blockers 2 + 4) -- FAIL CLOSED (return {} -> the dependency bundle DEFERS
     // before cycle open or any shadow/live write; LKG preserved). The snapshot must echo the EXACT expected identity
     // (organization_fingerprint + connection_id + source_key=product-catalog + scope_key=__organization), carry a
@@ -173,7 +204,7 @@ export function makeListingHealthV3DurableContextLoader({
       let hydrated;
       try {
         hydrated = await loadCatalogPayload(catalogSnapshot.object_path, { signal });
-      } catch (_e) { if (strict) return {}; return { listingHealthV3DurableOli }; }
+      } catch (_e) { if (strict) return {}; return { listingHealthV3DurableOli, listingHealthV3DurableInventory }; }
       if (strict) {
         // STRICT: the hydrated payload MUST contain an ACTUAL rows array (an array payload, or { rows: [...] }). A
         // missing / non-array rows property DEFERS -- INCLUDING when row_count is 0 -- so a malformed payload ({},
@@ -190,6 +221,6 @@ export function makeListingHealthV3DurableContextLoader({
 
     // Surface the catalog's content-addressed payload_sha + validated_at so the dependency-bundle fingerprint can fold
     // the exact catalog content identity (WORK C/D blocker 1); additive -- the derive ignores these extra fields.
-    return { listingHealthV3DurableOli, listingHealthV3DurableCatalog: { available: true, rows: catalogRows, payloadSha: S(catalogSnapshot.payload_sha), validatedAt: catalogSnapshot.validated_at || null } };
+    return { listingHealthV3DurableOli, listingHealthV3DurableInventory, listingHealthV3DurableCatalog: { available: true, rows: catalogRows, payloadSha: S(catalogSnapshot.payload_sha), validatedAt: catalogSnapshot.validated_at || null } };
   };
 }

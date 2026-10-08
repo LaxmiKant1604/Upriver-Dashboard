@@ -4,10 +4,16 @@
 //   - sales/units: DURABLE enriched Order Line Items (getEnrichedOli) for the requested inclusive window, plus the
 //     account's OLI coverage windows + completeness rows (honest Covered/Partial/Unavailable);
 //   - identity: the DURABLE org Product Catalog snapshot;
-//   - status/price/fulfilment/FBM + On-Hand FBA + issues: the LATEST SAVED source rows in source_export_cache
-//     (cache-only reads keyed by the v3 request_hash -- inventory reuses the fba-plan:inventory-health identity;
-//     a cache MISS never triggers an export -- the dimension is honestly Unavailable).
-// The window changes ONLY the OLI sales/units; status/issues/inventory always use the latest saved snapshot.
+//   - status/price/fulfilment/FBM + issues: the LATEST SAVED Listings / Listings-Raw rows in source_export_cache
+//     (cache-only reads keyed by the v3 request_hash; a cache MISS never triggers an export -- the dimension is honestly
+//     Unavailable).
+//   - On-Hand FBA source (Listings inventory CUTOVER): buildAdvancedListingHealth picks ONE source per account -- the
+//     saved Listings rows when they are VALIDATED inventory evidence, else the account's LAST SAVED durable FBA Inventory
+//     Health snapshot (source_snapshots 'fba-inventory-health', read-only here -- the dated temporary bridge, used only
+//     while it is within HEALTH_BRIDGE_MAX_AGE_DAYS of the as-of), else Unavailable (never 0). The former
+//     listing-health-v3:inventory cache fragment (a reuse of the cycle's Health export) no longer exists: no Health
+//     export is created. payload.inventory says which source was used and why.
+// The window changes ONLY the OLI sales/units; status/issues/on-hand stock always use the latest saved snapshot.
 // Account + marketplace identity are PINNED by the caller (owner from server-resolved accountScope); buildAdvanced-
 // ListingHealth re-asserts the trusted-owner projection boundary so no cross-account row can appear. No snapshot is
 // written -- this is a live derivation from durable/saved evidence, returned directly.
@@ -17,6 +23,7 @@ import { listingHealthV3PerAccountReadHashes } from "../sync/listing-health-v3-m
 import { organizationFingerprint as orgFingerprintOf } from "../source-identity.js";
 import { getEnrichedOliHistoryRows } from "../sync/oli-enriched-history.js";
 import { getSourceCoverageWindows, getOliCompleteness, getSourceSnapshot, getSourceSnapshotPayload, getSourceExportCache } from "../supabase.js";
+import { readSavedHealthBridge } from "./health-bridge.js";
 
 const S = (v) => (v == null ? "" : String(v));
 
@@ -51,7 +58,9 @@ const defaultSavedSourceReader = async (requestHash) => {
  * identity         : { apiKey, organizationFingerprint, connectionId }
  * windowControls   : { preset, from, to, month } (from the request; validated here)
  * asOf             : the report as-of (account/marketplace date; server-supplied, never the browser clock beyond `to`)
- * readers          : { getEnrichedOli, getOliCoverage, getCompleteness, getCatalog, getSavedSourceRows }
+ * readers          : { getEnrichedOli, getOliCoverage, getCompleteness, getCatalog, getSavedSourceRows, getHealthBridge }
+ *                    getHealthBridge({ organizationFingerprint, connectionId, accountId, rawSellerId }) -> the saved
+ *                    Health bridge { rows, unavailableReason, snapshotDate, savedAt } (default readSavedHealthBridge).
  */
 export async function serveListingHealthV3Preview({ owner, identity, windowControls = {}, asOf, readers = {} }) {
   if (!owner || S(owner.rawSellerId).trim() === "" || S(owner.accountId).trim() === "") {
@@ -62,6 +71,7 @@ export async function serveListingHealthV3Preview({ owner, identity, windowContr
   const getCompleteness = readers.getCompleteness || getOliCompleteness;
   const getCatalog = readers.getCatalog || defaultCatalogReader;
   const getSavedSourceRows = readers.getSavedSourceRows || defaultSavedSourceReader;
+  const getHealthBridge = readers.getHealthBridge || readSavedHealthBridge;
   // Window (throws typed on an invalid/reversed/future control -> the caller maps it to 400).
   const window = resolveListingHealthWindow({ preset: windowControls.preset, from: windowControls.from, to: windowControls.to, month: windowControls.month, asOf });
   const accountId = S(owner.accountId);
@@ -86,7 +96,7 @@ export async function serveListingHealthV3Preview({ owner, identity, windowContr
   let catalogRows = [];
   try { const cat = await getCatalog({ organizationFingerprint: org, connectionId }); catalogRows = Array.isArray(cat) ? cat : []; } catch (_e) { catalogRows = []; }
 
-  // 3) LATEST SAVED listings / inventory / listings-raw via the PER-ACCOUNT read identities (cache-only; NO create).
+  // 3) LATEST SAVED listings / listings-raw via the PER-ACCOUNT read identities (cache-only; NO create).
   //    These date-free single-seller identities are byte-identical to what the scheduler ingestion writes when it
   //    splits each <=5-seller batch export back per account (see listing-health-v3-materialize.js). A cache MISS
   //    means that per-account fragment has not been materialized yet -> the dimension is honestly Unavailable.
@@ -113,16 +123,24 @@ export async function serveListingHealthV3Preview({ owner, identity, windowContr
     } catch (_e) { return null; }
   };
   const listingRows = await readSaved("listing-health-v3:listings");
-  const inventoryRows = await readSaved("listing-health-v3:inventory");
   const rawRows = await readSaved("listing-health-v3:listings-raw");
   const metaOf = (rk) => savedMeta[rk] || {};
+  // 3b) The account's LAST SAVED durable FBA Inventory Health snapshot -- the dated READ-ONLY bridge (never an export,
+  //     never a cache adoption). Whether it may drive On-Hand FBA is decided by buildAdvancedListingHealth (validated
+  //     Listings first; the bridge only within its threshold of asOf). A read failure is an honest unavailable reason.
+  let bridge;
+  try {
+    bridge = await getHealthBridge({ organizationFingerprint: org, connectionId, accountId, rawSellerId });
+  } catch (_e) { bridge = null; }
+  if (!bridge || typeof bridge !== "object") bridge = { rows: null, unavailableReason: "health-snapshot-read-failed", snapshotDate: null, savedAt: null };
+  const inventoryRows = Array.isArray(bridge.rows) ? bridge.rows : null;
 
   // OPERATIONAL LOGGING (observable in server logs; NEVER a write/export). Records which dimensions are Unavailable for
   // this owner so missing-source evidence is inspectable. Best-effort: a logging failure never affects the response.
   try {
     // Availability is the actual hydrated rows (Array.isArray), NOT savedMeta presence -- an injected plain-array
     // reader (tests) has no savedMeta yet still has rows, so keying off savedMeta would falsely log everything missing.
-    const missing = [["listing-health-v3:listings", listingRows], ["listing-health-v3:listings-raw", rawRows], ["listing-health-v3:inventory", inventoryRows]]
+    const missing = [["listing-health-v3:listings", listingRows], ["listing-health-v3:listings-raw", rawRows], ["fba-inventory-health (saved bridge)", inventoryRows]]
       .filter(([, v]) => !Array.isArray(v)).map(([rk]) => rk);
     if (missing.length && typeof console !== "undefined" && console.warn) {
       console.warn(JSON.stringify({ evt: "lhv3.serve.unavailable_fragments", accountId, marketplace: owner.marketplace || null, missing }));
@@ -142,19 +160,21 @@ export async function serveListingHealthV3Preview({ owner, identity, windowContr
     rawRows: Array.isArray(rawRows) ? rawRows : [],
     issuesAvailable,
     issuesUnavailableReason: issuesAvailable ? null : "Listings (Raw JSON) evidence is not yet saved for this account (populated when v3 ingestion is scheduled).",
+    inventoryUnavailableReason: Array.isArray(inventoryRows) ? null : (bridge.unavailableReason || "health-snapshot-missing"),
     // Honest per-fragment provenance so the read-only UI shows each row's evidence source + as-of and labels stale
     // evidence. `*FetchedAt` is the truer EFFECTIVE date (the batch's real download time, batchFetchedAt) falling back
     // to the materialization time; `*SavedAt` is the materialization time; `*SourceType` is the source id. Null when
     // the dimension is Unavailable -- never a fabricated date.
     provenance: {
       listingsFetchedAt: metaOf("listing-health-v3:listings").effectiveAt || null,
-      inventoryFetchedAt: metaOf("listing-health-v3:inventory").effectiveAt || null,
+      // The saved Health bridge's validation time (its pointer validated_at) -- never a fetch of a new Health export.
+      inventoryFetchedAt: bridge.savedAt || null,
       rawFetchedAt: metaOf("listing-health-v3:listings-raw").effectiveAt || null,
       listingsSavedAt: metaOf("listing-health-v3:listings").fetchedAt || null,
-      inventorySavedAt: metaOf("listing-health-v3:inventory").fetchedAt || null,
+      inventorySavedAt: bridge.savedAt || null,
       rawSavedAt: metaOf("listing-health-v3:listings-raw").fetchedAt || null,
       listingsSourceType: metaOf("listing-health-v3:listings").sourceType || null,
-      inventorySourceType: metaOf("listing-health-v3:inventory").sourceType || null,
+      inventorySourceType: Array.isArray(inventoryRows) ? "fba-inventory-health (saved bridge)" : null,
       rawSourceType: metaOf("listing-health-v3:listings-raw").sourceType || null,
     },
   });
@@ -166,7 +186,9 @@ export async function serveListingHealthV3Preview({ owner, identity, windowContr
     evidence: {
       salesSource: "order-line-items (durable)",
       listingsEvidenceAvailable: Array.isArray(listingRows),
-      inventoryEvidenceAvailable: Array.isArray(inventoryRows),
+      // On Hand FBA evidence = the account's selected inventory source (validated Listings or the dated saved FBA
+      // Inventory Health bridge); false only when neither is usable. See payload.inventory for source + reasons.
+      inventoryEvidenceAvailable: !!(payload.inventory && payload.inventory.available === true),
       issuesEvidenceAvailable: issuesAvailable,
       listingsUnavailableReason: Array.isArray(listingRows) ? null : "No saved Listings snapshot for this account yet (read-only preview creates no export; populated when v3 ingestion is scheduled).",
     },

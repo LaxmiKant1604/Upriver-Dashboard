@@ -22,7 +22,7 @@ import { marketplaceProfile } from "../../lib/marketplaces.js";
 import {
   currencyGroups, dailySnapshotRows, inventoryCoverDays, isConvertedMode,
   monthlySnapshotRows, sevenDayColumnTotals, sevenDayRows, shareOf, tacos,
-  unconvertibleCurrencies,
+  unconvertibleCurrencies, EU_POOL_ALL_MARKET_WITHHELD_REASON,
 } from "./brand-view.js";
 
 export const DASH = "—";
@@ -208,7 +208,7 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
     { key: "ly", label: `LY Sales${suffix}`, hint: "The equivalent period one year earlier. Shown only when the saved snapshot fully covers that window." },
     { key: "spend", label: `Ad Spend${suffix}`, hint: "Ad Spend from Campaign Ads campaigns mapped to this brand, for this marketplace and window. A dash means Ads are unavailable, or the marketplace has campaign spend not yet mapped to any brand — so this brand's total could be partial and is withheld (never shown as zero)." },
     { key: "tacos", label: "TACoS%", hint: "This brand's Ad Spend divided by its Total Sales for the same marketplace and window; All Markets divides aggregated spend by aggregated sales. Withheld whenever Ad Spend is unavailable or only partially attributed." },
-    { key: "fba", label: "FBA Inv.", tone: "positive", hint: "Available FBA units for this brand's ASINs from the latest saved FBA snapshot. Never currency converted." },
+    { key: "fba", label: "FBA Inv.", tone: "positive", hint: "Available FBA units for this brand's ASINs in each marketplace: from the account's validated Listings snapshot, else its last saved FBA Inventory Health snapshot (a dated temporary bridge, no longer refreshed; dropped once it is more than two days old). Never currency converted. An All Markets total over an unknown marketplace -- or over two or more pan-EU marketplaces with positive stock (pooled stock cannot be counted once) -- is withheld." },
     { key: "cover", label: "Inv Cover", tone: "positive", hint: "Months of cover: available FBA units divided by this brand's month-to-date daily unit run rate." },
     { key: "units", label: "Units" },
   ];
@@ -235,7 +235,12 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
     const groupTacos = tacos(groupAdSpend, group.totals.sales);
     const partialSpendHint = adSpendComplete ? undefined
       : "Withheld: at least one marketplace's Ad Spend is unavailable or only partially attributed (unmapped campaigns, no saved Ads coverage, or no exchange rate to the display currency), so the All Markets Ad Spend and TACoS are not shown as a partial total.";
-    const groupFba = group.fbaAvailable === null ? unattributedFba : group.fbaAvailable;
+    // FBA All Markets total: withheld (never a partial or double-counted sum) when a marketplace's inventory is UNKNOWN,
+    // or when the EU all-market rule fires (two or more pan-EU pool marketplaces with positive stock: pooled units are
+    // reported in each, and brand x country totals carry no FNSKU / seller identity to count them once).
+    const groupFbaWithheld = group.fbaWithheld === true && !group.fbaUnknown;
+    const groupFba = group.fbaUnknown || groupFbaWithheld ? null : (group.fbaAvailable === null ? unattributedFba : group.fbaAvailable);
+    const fbaWithheldHint = groupFbaWithheld ? (group.fbaWithheldReason || EU_POOL_ALL_MARKET_WITHHELD_REASON) : undefined;
     const groupRangeUnits = group.rows.reduce((sum, row) => sum + (Number(row.coverUnits) || 0), 0);
     const groupCover = daily.selectedRangeDays
       ? inventoryCoverDays(groupFba, groupRangeUnits, daily.selectedRangeDays)
@@ -244,15 +249,15 @@ export function buildDailyTable({ daily, groups, displayCurrency, scope }) {
       key: `total-${group.key}`,
       kind: "total",
       label: "All Markets",
-      hints: [undefined, undefined, undefined, partialSpendHint, partialSpendHint, undefined, coverHint(groupCover), undefined],
+      hints: [undefined, undefined, undefined, partialSpendHint, partialSpendHint, fbaWithheldHint, groupFbaWithheld ? fbaWithheldHint : coverHint(groupCover), undefined],
       cells: [
         cell("All Markets"),
         cell(money(group.totals.sales, group.currency, SALES_DECIMALS), group.totals.sales),
         cell(money(group.totals.lySales, group.currency, SALES_DECIMALS), group.totals.lySales),
         cell(money(groupAdSpend, group.currency, SPEND_DECIMALS), groupAdSpend),
         cell(ratePct(groupTacos), groupTacos === null ? null : groupTacos * 100),
-        cell(groupFba === null ? NA : nInt(groupFba), groupFba),
-        cell(coverLabel(groupCover, NA), groupCover),
+        cell(groupFbaWithheld ? DASH : (groupFba === null ? NA : nInt(groupFba)), groupFba),
+        cell(groupFbaWithheld ? DASH : coverLabel(groupCover, NA), groupCover),
         cell(nInt(group.units), group.units),
       ],
     });

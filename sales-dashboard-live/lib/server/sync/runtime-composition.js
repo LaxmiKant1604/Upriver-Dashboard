@@ -20,6 +20,7 @@ import { makeSupabaseReportStore, makeSourceRowLoader, makeShadowSnapshotSaver }
 import { makeDailyAdsContextLoader } from "./daily-ads-loader.js";
 import { makeFbaPlanDurableContextLoader } from "./fba-plan-durable-loader.js";
 import { makeListingHealthV3DurableContextLoader } from "./listing-health-v3-durable-loader.js";
+import { makeInsightInventoryContextLoader } from "./insight-inventory-loader.js";
 import { schedulerV2ReportControlCatalog, CONTROLLED_REPORT_KEYS, SCHEDULER_V2_READY_REPORT_KEYS } from "./report-controls.js";
 import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "./report-publisher.js";
 import { runSchedulerV2Shadow } from "./sync-dispatch.js";
@@ -225,7 +226,11 @@ export function buildSchedulerV2Runtime(overrides = {}) {
   // reports and only produces durable OLI + Catalog context if a v3 report is ever derived (never on the default/
   // scheduled path). Uses the SAME production wrappers by default (enriched OLI / coverage / completeness).
   const listingHealthV3DurableLoader = makeListingHealthV3DurableContextLoader({ connections, getCatalogSnapshot: readCatalogSnapshot, loadCatalogPayload });
-  const loadDerivedContext = async (args) => ({ ...(await dailyAdsLoader(args)), ...(await fbaPlanDurableLoader(args)), ...(await listingHealthV3DurableLoader(args)) });
+  // Sales Movers / Buy Box Loss / Listing Health v1 (Listings inventory cutover): their SAVED inventory evidence (saved
+  // Listings + the last saved FBA Inventory Health snapshot as the dated read-only bridge) -- read-only, fail-soft, {}
+  // for every other report. Replaces the retired insight Health fragments (no Health export is created).
+  const insightInventoryLoader = makeInsightInventoryContextLoader({ connections });
+  const loadDerivedContext = async (args) => ({ ...(await dailyAdsLoader(args)), ...(await fbaPlanDurableLoader(args)), ...(await listingHealthV3DurableLoader(args)), ...(await insightInventoryLoader(args)) });
   const discoverAccounts = makeProductionDiscoverAccounts({ connections, fetchAccounts });
   // Gate-7 durable ACCOUNT gate loader (the dispatcher enforces it on EVERY dispatch, scheduled AND manual --
   // manualReportKeys selects reports only, never accounts). Trusted + fixed: RUN_OPERATIONAL_ARGS does not

@@ -200,13 +200,13 @@ function makeReadinessDataDoe({ unready = new Set() } = {}) {
     },
   };
 }
-const PAUSE = new Set(["product-catalog", "fba-inventory-health"]); // isolate the OLI family for these reproductions
+const PAUSE = new Set(["product-catalog"]); // isolate the OLI family for these reproductions (no FBA family exists)
 function runOli({ store, dd, accounts = FIVE, cycleDate, readinessIsolateSellers = new Set(), deadlineMs = Infinity, clock = makeClock() }) {
   const sinks = makeSinks();
   return bucketSync.runBucketSourceSync({
     apiKey: API_KEY, bucket: BUCKET, accounts, existingMembership: new Map(),
     coverageByAccountId: steadyCoverage(accounts, dates.addDaysStr(ASOF, -7)),
-    catalogSnapshot: null, fbaSnapshotsByAccount: {}, pausedSources: PAUSE,
+    catalogSnapshot: null, pausedSources: PAUSE,
     asOf: ASOF, today: TODAY, store, dataDoe: dd, ...sinks,
     cycleDate, clock: clock.fn, wait: null, cooldownMs: 0, catalogCarrierSeller: CATALOG_CARRIER,
     readinessIsolateSellers, deadlineMs, reserveMs: 0,
@@ -371,32 +371,25 @@ await (async () => {
   ok("F: peel-off -> the isolate seller is a single-seller unit; the 4 healthy stay in one batched unit", unitSizes.join(",") === "1,4");
 })();
 
-/* =================================== G. FBA / v3 / AWD coverage (overflow channel) + overflow unchanged === */
+/* =================================== G. Listings inventory cutover: no Health identity, Listings never split === */
 (() => {
   const conns = [{ id: "primary", apiKey: "fixture-key", accountPrefix: "" }];
   const asOf = "2026-08-15";
   const IN8 = Array.from({ length: 8 }, (_, i) => ({ accountId: `in-${i}`, country: "IN", currency: "INR" }));
-  const invOf = (plan) => [...new Map(plan.flatMap((r) => r.sources.filter((s) => s.requestKey === "fba-plan:inventory-health").map((s) => [s.requestHash, s]))).values()];
-  // Overflow UNCHANGED: default [5,3]; overflow whale -> [5,1,1,1] (the FBA/v3 planners are reverted to overflow-only).
+  const keysOf = (plan) => [...new Set(plan.flatMap((r) => r.sources.map((s) => s.requestKey)))].sort();
+  const listingsOf = (plan, rk) => [...new Map(plan.flatMap((r) => r.sources.filter((s) => s.requestKey === rk).map((s) => [s.requestHash, s]))).values()];
   const base = planner.planFbaPlanBucketBatched({ accounts: IN8, connections: conns, asOfFor: () => asOf, inventoryAsOf: asOf });
-  const baseInv = invOf(base);
-  const whale = baseInv.find((s) => s.sellerOrVendorIds.length === 3).sellerOrVendorIds.map(String);
-  const overflowSplit = invOf(planner.planFbaPlanBucketBatched({ accounts: IN8, connections: conns, asOfFor: () => asOf, inventoryAsOf: asOf, overflowSellers: new Set(whale) }));
-  ok("G: existing FBA overflow is UNCHANGED -- default [5,3], overflow -> [5,1,1,1]", baseInv.map((s) => s.sellerOrVendorIds.length).sort((a, b) => a - b).join(",") === "3,5" && overflowSplit.map((s) => s.sellerOrVendorIds.length).sort((a, b) => a - b).join(",") === "1,1,1,5");
-  // FBA/v3/AWD readiness rides the SAME overflow channel: readiness-isolate sellers (from the core, keyed by the
-  // FBA inventory request key) folded into overflowSellers split the poisoned inventory batch to single-seller.
-  const invBatches = [{ sellerOrVendorIds: baseInv.flatMap((s) => s.sellerOrVendorIds.map(String)) }];
-  const readinessSellers = readinessIsolationFrom({ defaultBatches: invBatches, isolateScopeHashes: whale.map(scope) }).isolateSellers;
-  ok("G: readiness isolate maps the FBA whale scopes to their current sellers", [...readinessSellers].sort().join(",") === whale.slice().sort().join(","));
-  const folded = invOf(planner.planFbaPlanBucketBatched({ accounts: IN8, connections: conns, asOfFor: () => asOf, inventoryAsOf: asOf, overflowSellers: new Set([...readinessSellers]) }));
-  ok("G: FBA Inventory readiness (folded into overflowSellers) splits the whale batch to single-seller", folded.map((s) => s.sellerOrVendorIds.length).sort((a, b) => a - b).join(",") === "1,1,1,5");
-  // v3 rides the same channel.
-  const v3InvOf = (plan) => [...new Map(plan.flatMap((r) => r.sources.filter((s) => s.requestKey === "listing-health-v3:inventory").map((s) => [s.requestHash, s]))).values()];
-  const v3Base = planner.planListingHealthV3BucketBatched({ accounts: IN8, connections: conns, asOfFor: () => asOf, inventoryAsOf: asOf });
-  const v3Whale = v3InvOf(v3Base).find((s) => s.sellerOrVendorIds.length === 3).sellerOrVendorIds.map(String);
-  const v3Folded = v3InvOf(planner.planListingHealthV3BucketBatched({ accounts: IN8, connections: conns, asOfFor: () => asOf, inventoryAsOf: asOf, overflowSellers: new Set(v3Whale) }));
-  ok("G: v3 inventory readiness (folded into overflowSellers) splits to single-seller (listings/raw stay batched)", v3Folded.map((s) => s.sellerOrVendorIds.length).sort((a, b) => a - b).join(",") === "1,1,1,5");
-  ok("G: READINESS_PROTECTED_REQUEST_KEYS is the WIRED set -- OLI + the shared inventory identity (v3 reuses it)", iso.READINESS_PROTECTED_REQUEST_KEYS.includes("source-oli:slice-v1") && iso.READINESS_PROTECTED_REQUEST_KEYS.includes("fba-plan:inventory-health") && !iso.READINESS_PROTECTED_REQUEST_KEYS.includes("fba-plan:awd"));
+  ok("G: the fba plan carries ONLY the canonical Listings request (fba-plan:awd) -- no fba-plan:inventory-health", keysOf(base).join(",") === "fba-plan:awd");
+  const baseL = listingsOf(base, "fba-plan:awd");
+  const whale = baseL.find((s) => s.sellerOrVendorIds.length === 3).sellerOrVendorIds.map(String);
+  const withOverflow = listingsOf(planner.planFbaPlanBucketBatched({ accounts: IN8, connections: conns, asOfFor: () => asOf, inventoryAsOf: asOf, overflowSellers: new Set(whale) }), "fba-plan:awd");
+  ok("G: the canonical Listings batches are NEVER split by overflow/readiness sellers (one shared hash with v3): [5,3] both ways",
+    baseL.map((s) => s.sellerOrVendorIds.length).sort((a, b) => a - b).join(",") === "3,5"
+    && JSON.stringify(withOverflow.map((s) => s.requestHash).sort()) === JSON.stringify(baseL.map((s) => s.requestHash).sort()));
+  const v3 = planner.planListingHealthV3BucketBatched({ accounts: IN8, connections: conns, asOfFor: () => asOf, inventoryAsOf: asOf });
+  ok("G: the v3 plan carries no inventory (Health) request -- listings + listings-raw only", keysOf(v3).join(",") === "listing-health-v3:listings,listing-health-v3:listings-raw");
+  ok("G: READINESS_PROTECTED_REQUEST_KEYS is the WIRED set -- OLI only (the retired Health identity is not protected; Listings is never split)",
+    JSON.stringify([...iso.READINESS_PROTECTED_REQUEST_KEYS]) === JSON.stringify(["source-oli:slice-v1"]));
 })();
 
 writeSync(1, `\nsource-readiness-isolation: ${passed} assertions passed\n`);

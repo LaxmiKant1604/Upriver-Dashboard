@@ -12,8 +12,10 @@
 //     <=cap chunks, a new account backfills SOLO, and completed accounts are never re-exported;
 //   - the organization-wide durable catalog refreshes ONCE per organization per day (its request identity is
 //     bucket-free, so the second bucket adopts the first bucket's durable cache with zero DataDoe);
-//   - the FBA inventory snapshot refreshes once daily per account (latest-VALIDATED preserved on failure);
-//   - families run ONE AT A TIME in canonical order (OLI -> catalog -> FBA) over the shared
+//   - FBA inventory is NOT a bucket family: since the Listings inventory cutover (2026-10) it comes from the canonical
+//     Listings export the fba-plan operation fetches (fba-plan:awd). The retired FBA Inventory Health family is never
+//     planned, priced, executed or persisted here (resolvedFbaSnapshot is a READ-ONLY identity of a saved snapshot);
+//   - families run ONE AT A TIME in canonical order (OLI -> catalog) over the shared
 //     (bucket, cycle_date) cycle with the full plan upserted before narrowing, frozen create/token ceilings
 //     per (cycle, family), a completion-anchored cooldown (injected clock/waiter -- never sleeps here), and
 //     a REQUIRED-source failure stopping this bucket (the other bucket runs independently);
@@ -28,7 +30,7 @@
 import { sourceRequestIdentity } from "../source-identity.js";
 import { sourceContractForKey } from "../source-contracts.js";
 import { addDaysStr } from "../date-windows.js";
-import { REPORT_SOURCE_CONTRACTS, sourceScopeForContract } from "./report-source-contracts.js";
+import { REPORT_SOURCE_CONTRACTS, RETIRED_FBA_HEALTH_REQUEST, sourceScopeForContract } from "./report-source-contracts.js";
 import { assignAccountBatches, MAX_ACCOUNTS_PER_BATCH } from "./source-batching.js";
 import { isRoutingScope } from "./scheduler-scope.js";
 import { plannedSourceJob, plannedBatchSourceJobs } from "./source-sync-driver.js";
@@ -51,6 +53,8 @@ import { buildBrandMaps } from "./brand-resolution.js";
 export const SOURCE_SYNC_OWNER_REPORT_KEY = "source-sync";
 export const DURABLE_CATALOG_REQUEST_KEY = "source-catalog:durable-v1";
 export const OLI_SLICE_REQUEST_KEY = "source-oli:slice-v1";
+// The retired per-account FBA Inventory Health snapshot request key (kept ONLY so retained durable owner rows from
+// before the Listings inventory cutover stay recognizable; nothing plans it).
 export const FBA_SNAPSHOT_REQUEST_KEY = "source-fba:snapshot-v1";
 
 // The durable organization-wide catalog request. Product Catalog 68d2de238e is organization-wide and does NOT
@@ -79,8 +83,6 @@ export function selectCatalogCarrierSeller(activeAccounts) {
   const canonical = [...new Set(ids)].sort();
   return canonical.length ? canonical[0] : null;
 }
-
-// FBA inventory is EXACTLY the single snapshot day [asOf .. asOf] (D-1) -- mirrors fba-plan:inventory-health.
 
 const isDateStr = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
 
@@ -150,17 +152,22 @@ export function resolvedDurableCatalog({ apiKey, carrierSellerId, bucket }) {
   };
 }
 
-// The per-account FBA inventory snapshot request (same canonical spec as fba-plan:inventory-health, so the
-// hash is SHARED with the fba-plan report when both cover the same account/asOf). Finding 10: the data IS
-// seller-scoped (the rows belong to this one seller) and the contract fetches marketplace_country_code, so
-// the resolved job carries the honest scope + the account's marketplace constraint; every downloaded row is
-// additionally validated against that marketplace before any snapshot is recorded (validateFbaSnapshotRows).
+// RETIRED (Listings inventory cutover, 2026-10): FBA Inventory Health is no longer fetched by ANY path. The bucket sync
+// plans no FBA family, and lib/server/datadoe.js createExport refuses the Health source id (RETIRED_SOURCE_ERROR_CODE).
+export const HEALTH_SOURCE_RETIRED_CODE = "HEALTH_SOURCE_RETIRED";
+
+// READ-ONLY identity of a SAVED per-account FBA Inventory Health snapshot (source_snapshots 'fba-inventory-health'):
+// the request identity the snapshot was bound to when it was persisted, recomputed from the retired recipe
+// (RETIRED_FBA_HEALTH_REQUEST -- byte-identical to the former fba-plan:inventory-health contract), so the read-only
+// bridge readers (the FBA / Listing Health v3 reconciler entrypoints) can verify a saved pointer before reading it.
+// It is NEVER planned or executed: no planner calls it, and the returned object is flagged retired/readOnly -- a stale
+// caller that handed it to a source worker would be refused at createExport (typed HEALTH_SOURCE_RETIRED).
 export function resolvedFbaSnapshot({ apiKey, account, asOf, bucket }) {
   if (!isDateStr(asOf)) throw new Error("resolvedFbaSnapshot requires a YYYY-MM-DD asOf (fail closed).");
   if (!String(account.country || "").trim()) {
     throw new Error("resolvedFbaSnapshot requires the account's marketplace country for row validation (fail closed).");
   }
-  const c = contractOf("fba-plan", "fba-plan:inventory-health");
+  const c = RETIRED_FBA_HEALTH_REQUEST;
   const sourceId = sourceContractForKey(FBA_INVENTORY_SOURCE_KEY).ids[0];
   const options = optionsOf(c);
   const identity = sourceRequestIdentity({
@@ -171,21 +178,21 @@ export function resolvedFbaSnapshot({ apiKey, account, asOf, bucket }) {
     ...identity,
     requestKey: FBA_SNAPSHOT_REQUEST_KEY,
     sourceId, sourceKey: FBA_INVENTORY_SOURCE_KEY,
+    retired: true, readOnly: true,
     bucket, strict: true, limit: c.limit,
     sourceScope: "seller",
     marketplaceScoped: true,
     marketplaceCountry: String(account.country),
     sellerOrVendorIds: [String(account.rawSellerId)],
-    columns: c.columns,
+    columns: [...c.columns],
     from: asOf, to: asOf, options,
   };
 }
 
-// Finding 10: validate EVERY returned FBA row against the account's marketplace BEFORE any snapshot is
-// recorded. The single-account fetch bypasses the worker's >1-id batch validation, so this is the
-// persistence-side gate: every non-empty row must be a plain object carrying the account's exact
-// marketplace_country_code (blank/mismatched/malformed rows reject the WHOLE payload -- latest-good
-// preserved). A zero-row payload is valid empty evidence.
+// Validate EVERY saved FBA Inventory Health row against the account's marketplace (the persistence-side gate the
+// retained-snapshot writers + the read-only bridge readers share): every non-empty row must be a plain object carrying
+// the account's exact marketplace_country_code (blank/mismatched/malformed rows reject the WHOLE payload). A zero-row
+// payload is valid empty evidence.
 export function validateFbaSnapshotRows(rows, marketplaceCountry) {
   if (!Array.isArray(rows)) return { valid: false, code: "MALFORMED_PAYLOAD" };
   const want = String(marketplaceCountry || "").trim();
@@ -218,8 +225,8 @@ export function clipCoverageForRefresh(windows, refreshFrom) {
  *   existingMembership  : Map(accountId -> batchIndex) -- the durable stable membership (never reshuffled);
  *   coverageByAccountId : accountId -> proven OLI windows;
  *   catalogSnapshot     : { validated_at } | null -- the org's durable catalog snapshot;
- *   fbaSnapshotsByAccount: accountId -> { validated_at } | undefined;
  *   pausedSources       : Set(sourceKey) -- paused families plan ZERO new exports;
+ * (The retired FBA Inventory Health family is never planned; a legacy fbaSnapshotsByAccount argument is ignored.)
  *   asOf / today        : YYYY-MM-DD (marketplace-local latest completed day / decision day).
  * Returns { batches, membership, families:[{sourceKey, plannedJobs, units?}], skippedPaused, summary }.
  */
@@ -246,7 +253,7 @@ function readinessAdjustedBatches(batches, isolateSet) {
 
 export function planBucketSourceSync({
   apiKey, bucket, accounts, existingMembership = new Map(),
-  coverageByAccountId = {}, catalogSnapshot = null, fbaSnapshotsByAccount = {},
+  coverageByAccountId = {}, catalogSnapshot = null,
   pausedSources = new Set(), asOf, today,
   // The deterministic organization Catalog carrier seller (selectCatalogCarrierSeller over the FULL fresh
   // primary directory; identical for both buckets). REQUIRED whenever a Catalog job is planned -- the org-wide
@@ -344,22 +351,8 @@ export function planBucketSourceSync({
     families.push({ sourceKey: CATALOG_SOURCE_KEY, plannedJobs: catalogJobs, decision, forcedRefresh: !decision.refresh && forceCatalogRefresh });
   }
 
-  // 4) FBA INVENTORY: once daily per account; historical inventory is never repeatedly backfilled. The
-  //    planned job carries the account's marketplace constraint (finding 10) so persistence can validate
-  //    every returned row against it.
-  if (pausedSources.has(FBA_INVENTORY_SOURCE_KEY)) {
-    skippedPaused.push(FBA_INVENTORY_SOURCE_KEY);
-  } else {
-    const fbaJobs = [];
-    for (const account of accounts) {
-      const snap = fbaSnapshotsByAccount[account.accountId];
-      const decision = snapshotRefreshDecision({ sourceKey: FBA_INVENTORY_SOURCE_KEY, lastValidatedAt: snap && snap.validated_at, today });
-      if (!decision.refresh) continue;
-      const resolved = resolvedFbaSnapshot({ apiKey, account, asOf, bucket });
-      fbaJobs.push(plannedSourceJob(SOURCE_SYNC_OWNER_REPORT_KEY, resolved, bucket, "primary", account.accountId, account.rawSellerId, resolved.marketplaceCountry));
-    }
-    families.push({ sourceKey: FBA_INVENTORY_SOURCE_KEY, plannedJobs: fbaJobs });
-  }
+  // (No FBA family: FBA inventory comes from the canonical Listings export the fba-plan operation fetches -- FBA
+  //  Inventory Health is retired, so a bucket sync can never plan it.)
 
   const summary = {
     accounts: accounts.length,
@@ -373,8 +366,8 @@ export function planBucketSourceSync({
 }
 
 // Round-4 finding 5: EVERY persistence-time payload problem -- an UNREADABLE loader (throws), a MISSING
-// entry, a MALFORMED (non-array) payload, or a DOMAIN-INVALID one (catalog with no usable brands; FBA rows
-// failing marketplace validation) -- is the SAME typed fail-closed stop: the bucket stops non-drained,
+// entry, a MALFORMED (non-array) payload, or a DOMAIN-INVALID one (catalog with no usable brands) -- is the
+// SAME typed fail-closed stop: the bucket stops non-drained,
 // durable persistence is never silently skipped, and LKG stays intact.
 async function loadPayloadOrNull(store, requestHash) {
   if (!store.loadSourceRows) return null;
@@ -427,8 +420,10 @@ function deferredFrozenScope(bucket, cycleId, reason, { deferredReason = "deferr
 }
 
 const safeMessage = (e) => String(e && e.message ? e.message : e || "").slice(0, 200);
-// The three source-sync families whose frozen tranche budgets a continuation may resume (planBucketSourceSync order).
-const CONTINUATION_FAMILIES = Object.freeze([OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY]);
+// The source-sync families whose frozen tranche budgets a continuation may resume (planBucketSourceSync order). The
+// retired FBA Inventory Health family is NOT resumable: a pre-cutover cycle's frozen Health jobs are never planned or
+// executed again (no Health create), so such a cycle simply stays non-drained until the next fresh cycle.
+const CONTINUATION_FAMILIES = Object.freeze([OLI_SOURCE_KEY, CATALOG_SOURCE_KEY]);
 const rowHash = (r) => String((r && (r.request_hash ?? r.requestHash)) ?? "").trim();
 
 /**
@@ -436,14 +431,15 @@ const rowHash = (r) => String((r && (r.request_hash ?? r.requestHash)) ?? "").tr
  * store + dataDoe (the proven worker backends), durable-model sinks (persistHistory / recordCoverage /
  * persistSnapshot / updateRunStatus -- production: the supabase.js wrappers), clock + wait (cooldown;
  * NEVER sleeps here), reuseOnly (rehearsal: zero creates + tripwire upstream). Families run one at a time
- * (OLI -> catalog -> FBA) over ONE shared (bucket, cycleDate) cycle: the FULL bucket plan is upserted every
+ * (OLI -> catalog) over ONE shared (bucket, cycleDate) cycle: the FULL bucket plan is upserted every
  * pass while execution narrows to the family (the engine's proven tranche mechanics); ceilings are frozen
  * per (cycle, "source-sync:<family>") BEFORE the family's first create; a REQUIRED-source failure stops
- * this bucket (later families never launch; durable data + LKG preserved).
+ * this bucket (later families never launch; durable data + LKG preserved). (No FBA family: FBA Inventory Health
+ * is retired; a legacy fbaSnapshotsByAccount argument is ignored.)
  */
 export async function runBucketSourceSync({
   apiKey, bucket, accounts, existingMembership = new Map(),
-  coverageByAccountId = {}, catalogSnapshot = null, fbaSnapshotsByAccount = {},
+  coverageByAccountId = {}, catalogSnapshot = null,
   pausedSources = new Set(), asOf, today,
   store, dataDoe,
   replaceHistoryWindow = null, persistSnapshot = null, updateRunStatus = null, recordCompleteness = null,
@@ -681,7 +677,7 @@ export async function runBucketSourceSync({
   }
   const plan = planBucketSourceSync({
     apiKey, bucket, accounts: planningAccounts, existingMembership, coverageByAccountId,
-    catalogSnapshot, fbaSnapshotsByAccount, pausedSources, asOf, today,
+    catalogSnapshot, pausedSources, asOf, today,
     catalogCarrierSeller,
     forceCatalogRefresh,
     // Readiness isolation: a FRESH cycle uses the evidence-resolved set (shapes + freezes the plan); a CONTINUATION
@@ -808,7 +804,7 @@ export async function runBucketSourceSync({
     }
 
     // Frozen family ceiling (Blocker 4d): computed from THIS bucket plan's family jobs, persisted before the
-    // first create. FBA is premium (5 tokens/create); OLI + catalog standard (2). Registry-priced.
+    // first create. OLI + catalog are standard (2 tokens/create). Registry-priced.
     const tranche = makeSourceTranche({ name: family.sourceKey, sourceKeys: [family.sourceKey] });
     const trancheKey = `source-sync:${family.sourceKey}`;
     let budget = null;
@@ -1124,41 +1120,6 @@ export async function runBucketSourceSync({
       }
     }
 
-    if (family.sourceKey === FBA_INVENTORY_SOURCE_KEY && family.plannedJobs.length) {
-      const rows = await store.listSourceJobs(rollup.cycleId);
-      const byHash = new Map(rows.map((r) => [r.request_hash ?? r.requestHash, r]));
-      for (const job of family.plannedJobs) {
-        const row = byHash.get(job.requestHash);
-        if (!row || stat(row) !== "succeeded") continue;
-        if (outOfTime()) { rollup.deadlineReached = true; rollup.continuationRequired = true; break; }
-        const payload = await loadPayloadOrNull(store, job.requestHash);
-        // Finding 4: a succeeded FBA job with a lost/unreadable cached payload fails closed typed.
-        if (!payload || !Array.isArray(payload.rows)) {
-          rollup.stopped = true;
-          rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: FBA_INVENTORY_SOURCE_KEY, requestHash: job.requestHash, detail: "missing-or-malformed" });
-          break;
-        }
-        // Finding 10 + round-4 finding 5: a DOMAIN-INVALID payload (blank/mismatched marketplace rows) is
-        // the SAME typed fail-closed stop -- recorded for the account, bucket non-drained, latest-good kept.
-        const fv = validateFbaSnapshotRows(payload.rows, job.marketplaceConstraint);
-        if (!fv.valid) {
-          rollup.snapshots.rejected.push({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: job.owner.accountId, code: fv.code });
-          rollup.stopped = true;
-          rollup.stopReason = Object.freeze({ code: "SOURCE_PAYLOAD_UNAVAILABLE", family: FBA_INVENTORY_SOURCE_KEY, requestHash: job.requestHash, detail: fv.code });
-          break;
-        }
-        if (persistSnapshot) {
-          await persistSnapshot({
-            sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: job.owner.accountId,
-            rows: payload.rows, rowCount: payload.rows.length,
-            sourceRequestHash: job.requestHash, validatedAt: nowIso(),
-          });
-          rollup.snapshots.recorded.push(`${FBA_INVENTORY_SOURCE_KEY}:${job.owner.accountId}`);
-        }
-      }
-      if (rollup.stopped) break; // finding 4: a lost payload stops the bucket typed
-    }
-
     if (updateRunStatus) {
       const failedAny = state && state.failed > 0;
       await updateRunStatus({
@@ -1176,8 +1137,7 @@ export async function runBucketSourceSync({
     // block -- the healthy sellers that succeeded still derive/publish, and the unready seller stays "waiting"
     // (self-healing via next fresh cycle's isolation/exclusion). Any NON-readiness failure still stops the bucket.
     const realFailed = (state ? state.failed : 0) - (state ? (state.readinessWaiting || 0) : 0) - (state ? (state.deferredPending || 0) : 0);
-    if (state && realFailed > 0 && sourceRegistryEntry(family.sourceKey).usedByReports.length > 0
-      && family.sourceKey !== FBA_INVENTORY_SOURCE_KEY) {
+    if (state && realFailed > 0 && sourceRegistryEntry(family.sourceKey).usedByReports.length > 0) {
       rollup.stopped = true;
       rollup.stopReason = Object.freeze({ code: "REQUIRED_SOURCE_FAILED", family: family.sourceKey, state });
       break;
@@ -1188,8 +1148,7 @@ export async function runBucketSourceSync({
     // preserved; the source materializes on the next natural cycle), never a hard REQUIRED_SOURCE_FAILED. deferredPending
     // is 0 on the scheduled full-region path (its real adapter never emits SOURCE_READINESS_PENDING), so that path is
     // byte-identical; a real terminal failure mixed in keeps realFailed>0 and hard-stops above (a defect is never masked).
-    if (state && realFailed <= 0 && (state.deferredPending || 0) > 0 && sourceRegistryEntry(family.sourceKey).usedByReports.length > 0
-      && family.sourceKey !== FBA_INVENTORY_SOURCE_KEY) {
+    if (state && realFailed <= 0 && (state.deferredPending || 0) > 0 && sourceRegistryEntry(family.sourceKey).usedByReports.length > 0) {
       rollup.stopped = true;
       rollup.stopReason = Object.freeze({ code: "SOURCE_READINESS_PENDING", family: family.sourceKey, state });
       break;

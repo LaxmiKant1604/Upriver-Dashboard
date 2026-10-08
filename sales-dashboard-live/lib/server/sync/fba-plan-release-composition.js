@@ -10,13 +10,8 @@
 
 import { buildSchedulerV2Runtime, makeProductionDiscoverAccounts } from "./runtime-composition.js";
 import { buildSchedulerV2Publisher } from "./publisher-composition.js";
-import { planFbaPlanBucketBatched } from "./report-planner.js";
 import { fbaCycleBucket } from "./fba-plan-operation.js";
-import { persistDurableFbaSnapshotsFromPlan } from "./fba-durable-source-persist.js";
-import { defaultInventoryBatchesOf, overflowSellersFromTruncated, readRecentTruncatedInventoryOwnership, DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS } from "./fba-inventory-overflow.js";
-import { readRecentReadinessRejectionOwnership, readinessIsolationFrom } from "./source-readiness-isolation.js";
-import { getRecentSyncCycleIds, getSyncSourceJobsWithMeta, getSyncSourceJobOwnersForCycle } from "../supabase.js";
-import { organizationFingerprint as orgFingerprintOf } from "../source-identity.js";
+import { persistDurableListingsSnapshotsFromPlan } from "./fba-durable-source-persist.js";
 import { runControlPackageCli, buildFbaPlanControlPackage } from "./source-priority-control-package.js";
 import { CONTROLLED_REPORT_KEYS } from "./report-controls.js";
 import { buildLiveReadback } from "./source-priority-release-runner.js";
@@ -26,7 +21,7 @@ import { paramsHashFor } from "../report-store.js";
 import {
   getReportSnapshot, getReportSnapshotStoragePayload,
   getSourceCoverageWindows, getSourceExportCache,
-  saveSourceSnapshotPayload, recordSourceSnapshot,
+  saveSourceSnapshotPayload, recordSourceListingsSnapshot,
 } from "../supabase.js";
 import { getDataDoeConnections, resolveDataDoeAccountIds } from "../datadoe-connections.js";
 import { discoverPrimaryAccountIds, connectPriorityControlStore } from "./priority-control-pg-store.js";
@@ -167,64 +162,25 @@ export function buildFbaPlanRelease(overrides = {}) {
     return primaryIds.map((id) => metaById.get(id)).filter(Boolean);
   };
 
-  // Adaptive FBA-inventory self-heal: derive the proven-overflow raw seller ids for a bucket from recent terminal
-  // TRUNCATED inventory evidence (scoped to the region-fba cycle bucket + a recency window). Ownership of each TRUNCATED
-  // export is resolved from the DURABLE owner memberships (date-independent account_scope_hash), NOT the date-dependent
-  // request hash, so the overflow set survives the daily date rollover. Fail-soft: any read error yields an empty set
-  // (byte-identical default batching). Also returns single-seller HARD STOPS (a lone seller still at the 50000 cap
-  // that cannot split further -- the caller escalates, never auto-raises the limit).
-  const resolveOverflowSellers = async ({ bucket, bucketAccounts, asOf, inventoryAsOf, maxAgeDays = DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS, now = () => Date.now() }) => {
-    if (!bucketAccounts || !bucketAccounts.length) return { overflowSellers: new Set(), singleSellerHardStops: [] };
-    const conns = getConnections();
-    let defaultInventoryBatches = [];
-    try {
-      const plan = planFbaPlanBucketBatched({ accounts: bucketAccounts, connections: conns, asOfFor: () => asOf, inventoryAsOf });
-      defaultInventoryBatches = defaultInventoryBatchesOf(plan);
-    } catch (_e) { return { overflowSellers: new Set(), singleSellerHardStops: [] }; }
-    const primary = (conns || []).find((c) => c && c.id === "primary");
-    const org = primary ? (primary.organizationFingerprint || orgFingerprintOf(primary.apiKey)) : null;
-    const truncatedOwnership = await readRecentTruncatedInventoryOwnership({
-      cycleBucket: fbaCycleBucket(bucket), now, maxAgeDays, connectionId: "primary", organizationFingerprint: org,
-      readRecentCycleIds: (cb, since) => getRecentSyncCycleIds(cb, since),
-      readSourceJobs: (cid) => getSyncSourceJobsWithMeta(cid),
-      readOwners: (cid) => getSyncSourceJobOwnersForCycle(cid),
-    });
-    const base = overflowSellersFromTruncated({ defaultInventoryBatches, truncatedOwnership });
-    // BATCH-POISONING SELF-HEAL: fold readiness-isolation (DATADOE_INITIAL_LOAD_INCOMPLETE) for the FBA INVENTORY
-    // source into the SAME single-seller inventory split channel. A seller whose newest readiness event is a rejection
-    // is isolated off its shared inventory batch so the healthy batch-mates are never poisoned; it self-clears the
-    // moment its single-seller inventory export next succeeds. Fail-soft: any read error adds nothing. ONLY the
-    // inventory key is folded -- planFbaPlanBucketBatched splits inventory batches only (never AWD), so folding the
-    // AWD key would force needless single-seller INVENTORY without ever protecting AWD or self-clearing (AWD is a
-    // stable no-date hash that never runs single-seller). AWD readiness evidence is still recorded by the classifier;
-    // AWD batch-isolation is deferred to a dedicated AWD-split pass (out of scope here).
-    let readinessIsolate = new Set();
-    try {
-      const { isolateScopeHashes } = await readRecentReadinessRejectionOwnership({
-        requestKey: "fba-plan:inventory-health", cycleBucket: fbaCycleBucket(bucket), now, maxAgeDays, connectionId: "primary", organizationFingerprint: org,
-        readRecentCycleIds: (cb, since) => getRecentSyncCycleIds(cb, since),
-        readSourceJobs: (cid) => getSyncSourceJobsWithMeta(cid),
-        readOwners: (cid) => getSyncSourceJobOwnersForCycle(cid),
-      });
-      readinessIsolate = readinessIsolationFrom({ defaultBatches: defaultInventoryBatches, isolateScopeHashes }).isolateSellers;
-    } catch (_e) { readinessIsolate = new Set(); /* fail-soft: no readiness isolation */ }
-    return { overflowSellers: new Set([...base.overflowSellers, ...readinessIsolate]), singleSellerHardStops: base.singleSellerHardStops };
-  };
+  // Listings inventory cutover: the former FBA Inventory Health self-heal (proven-overflow TRUNCATED evidence +
+  // readiness-isolation sellers split into single-seller INVENTORY batches) no longer applies -- FBA Inventory Health is
+  // retired and the only owned fba-plan export is the canonical Listings, which is never split (one shared hash with
+  // listing-health-v3). Kept as a typed no-op so every caller (fba-plan-golive.mjs, the replay operator) stays unchanged.
+  const resolveOverflowSellers = async () => ({ overflowSellers: new Set(), singleSellerHardStops: [] });
 
-  // ZERO-EXPORT durable FBA source-snapshot persist collaborator (backstop enabler). Reuses the source-job cache
-  // (never a create) to land public.source_snapshots(fba-inventory-health) per account under the per-seller identity
-  // the reconciler recomputes -- so the zero-export FBA reconciler can converge. The primary connection's api key is
-  // resolved lazily (no build-time I/O) and folds into the request hash EXACTLY as the reconciler's resolver does.
-  const persistDurableFbaSnapshots = async ({ reportRequests = [], includedIds = [], inventoryAsOf, bucket, accountsById = new Map(), outOfTime = () => false, log = () => {} } = {}) => {
+  // ZERO-EXPORT durable inventory persist (backstop enabler): reuses the source-job cache (never a create) to land the
+  // account's SAVED LISTINGS snapshot (public.source_listings_snapshot) from the fba job's canonical Listings fragment
+  // (fba-plan:awd). Since the Listings inventory cutover FBA Inventory Health is never fetched, so the retired Health
+  // snapshot is never written here (its last saved row stays as the read-only bridge).
+  const persistDurableFbaSnapshots = async ({ reportRequests = [], includedIds = [], inventoryAsOf, outOfTime = () => false, log = () => {} } = {}) => {
     const conns = getConnections();
     const primary = (conns || []).find((c) => c && c.id === "primary");
     if (!primary || !primary.apiKey) return { persisted: [], skipped: [], failed: [], error: "no-primary-connection" };
-    return persistDurableFbaSnapshotsFromPlan({
-      reportRequests, includedIds, inventoryAsOf, bucket, accountsById,
-      apiKey: primary.apiKey, connectionId: "primary",
+    return persistDurableListingsSnapshotsFromPlan({
+      reportRequests, includedIds, inventoryAsOf, connectionId: "primary",
       loadSourceExportCache: (h) => readExportCache(h),
       saveSnapshotPayload: saveSourceSnapshotPayload,
-      recordSnapshot: recordSourceSnapshot,
+      recordListingsSnapshot: recordSourceListingsSnapshot,
       outOfTime, log,
     });
   };

@@ -1,4 +1,7 @@
-// Regression guard for the India FBA Inventory [5,3] TRUNCATED incident (2026-09-05).
+// Regression guard for the India FBA Inventory [5,3] TRUNCATED incident (2026-09-05), carried onto the canonical
+// Listings export by the Listings inventory cutover (2026-10): FBA Inventory Health is retired, so FBA inventory now
+// rides the ONE canonical Listings batch request (fba-plan:awd, shared with listing-health-v3) -- the same strict
+// 50000-row cap and the same fail-closed TRUNCATED honesty apply to it.
 //
 // ROOT CAUSE (proven against production): the 3-seller India inventory batch's data exceeds the 50000-row export cap
 // (PLAN_INVENTORY_ROW_LIMIT). The export was created + returned exactly 50000 rows (capped at source by the create
@@ -36,7 +39,7 @@ const ROW_CAP = 50000;
 /* ===================== A. planner: 8 IN accounts -> [5,3] strict inventory batches ===================== */
 const reportRequests = planFbaPlanBucketBatched({ accounts: IN8, connections, asOfFor: () => cycleDate, inventoryAsOf: cycleDate }); // returns the report-requests array
 const plan = { reportRequests };
-const invSrcs = [...new Map(reportRequests.flatMap((r) => r.sources.filter((s) => s.requestKey === "fba-plan:inventory-health").map((s) => [s.requestHash, s]))).values()];
+const invSrcs = [...new Map(reportRequests.flatMap((r) => r.sources.filter((s) => s.requestKey === "fba-plan:awd").map((s) => [s.requestHash, s]))).values()];
 const sizeByHash = new Map(invSrcs.map((s) => [s.requestHash, s.sellerOrVendorIds.length]));
 (() => {
   ok("A: India (8 accounts) -> exactly 2 inventory batches", invSrcs.length === 2);
@@ -45,16 +48,17 @@ const sizeByHash = new Map(invSrcs.map((s) => [s.requestHash, s.sellerOrVendorId
   // fba-plan:awd is now the SHARED CANONICAL Listings export, planned for EVERY marketplace (India included) so it
   // shares ONE export with listing-health-v3:listings. AWD ELIGIBILITY is decided in the derive (India = not AWD-capable
   // => AWD unavailable, never a fabricated zero), NOT by omitting the fetch.
-  ok("A: FBA India plans inventory-health + the shared canonical Listings (fba-plan:awd), and nothing else",
-    plan.reportRequests.every((r) => r.sources.every((s) => s.requestKey === "fba-plan:inventory-health" || s.requestKey === "fba-plan:awd"))
-    && plan.reportRequests.some((r) => r.sources.some((s) => s.requestKey === "fba-plan:awd")));
+  ok("A: FBA India plans ONLY the shared canonical Listings (fba-plan:awd) -- no retired fba-plan:inventory-health request",
+    plan.reportRequests.every((r) => r.sources.every((s) => s.requestKey === "fba-plan:awd"))
+    && plan.reportRequests.some((r) => r.sources.some((s) => s.requestKey === "fba-plan:awd"))
+    && !JSON.stringify(plan.reportRequests).includes("inventory-health"));
 })();
 
 // A fake DataDoe: create -> exportId; poll -> ok; download -> the 3-seller batch returns a CAP-SIZED page (TRUNCATED),
 // the 5-seller batch returns a valid under-cap page. Keyed by the job's canonical request_hash.
 function makeDataDoe() {
   const creates = { count: 0, byHash: new Map() };
-  const invRow = (seller) => ({ seller_or_vendor_id: seller, marketplace_country_code: "IN", child_asin: "ASIN-x", sku: "SKU-x", available: 1 });
+  const invRow = (seller) => ({ seller_or_vendor_id: seller, marketplace_country_code: "IN", child_asin: "ASIN-x", sku: "SKU-x", fba_quantity_available: 1, fba_quantity_inbound: 0, fba_quantity_reserved: 0, fba_quantity_fc_transfer: 0 });
   return {
     creates,
     create: async (job) => { creates.count += 1; creates.byHash.set(job.requestHash, (creates.byHash.get(job.requestHash) || 0) + 1); return { exportId: `exp-${String(job.requestHash).slice(0, 6)}` }; },
@@ -131,7 +135,7 @@ await (async () => {
   const statusByHash = {}; for (const j of store.listSourceJobs(store.getCycleByBucketDate("india-fba", cycleDate).id)) statusByHash[j.request_hash] = j.fetch_status;
   // Map each account to its inventory batch hash (its required source).
   const hashForAccount = new Map();
-  for (const req of plan.reportRequests) { const inv = req.sources.find((s) => s.requestKey === "fba-plan:inventory-health"); if (inv) hashForAccount.set(req.accountId, inv.requestHash); }
+  for (const req of plan.reportRequests) { const inv = req.sources.find((s) => s.requestKey === "fba-plan:awd"); if (inv) hashForAccount.set(req.accountId, inv.requestHash); }
   let ready = 0, blocked = 0;
   for (const a of IN8) { const gate = reportFetchGate({ dependsOn: [hashForAccount.get(a.accountId)] }, statusByHash); if (gate === "ready") ready += 1; else if (gate === "blocked") blocked += 1; }
   ok("D: exactly 5 accounts are report-ready (their inventory batch succeeded)", ready === 5);

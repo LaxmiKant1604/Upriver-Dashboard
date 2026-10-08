@@ -5,6 +5,9 @@
 // estimated units, currency/account isolation, unknown-vs-zero stock, latest-snapshot selection, FBA/FBM split,
 // flagged/sales-at-risk semantics (confirmed vs possible), mixed-marketplace <=5 batches (8->2/16->4/10->2),
 // malformed rows, and zero-export purity (no transport import).
+// Listings inventory cutover PHASE 2: On Hand FBA follows ONE per-account source -- validated (expanded) Listings, else
+// the latest FBA Inventory Health snapshot as a labelled fallback (15-column rows / unresolved conflict / unattributed
+// "__EMPTY__" stock / blank FBA field), else Unavailable -- never mixed per SKU, duplicates never summed.
 //
 // 7-bit ASCII, LF.
 
@@ -14,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
   buildAdvancedListingHealth, resolveListingHealthWindow, foldOliWindowSales, assessOliCoverage,
-  LISTING_HEALTH_ADVANCED_SALES_SOURCE,
+  LISTING_HEALTH_ADVANCED_SALES_SOURCE, listingHealthInventorySelection,
 } from "../lib/server/reports/listing-health-advanced.js";
 import { planListingHealthSourceBatches } from "../lib/server/reports/listing-health-batching.js";
 
@@ -76,7 +79,9 @@ const enriched = [
   ok("no coverage over the window -> complete false, whole window is the gap", none.complete === false && none.coveredFrom === null && none.gapFrom === w30.from);
 })();
 
-/* ===================== full payload: inventory authority, unknown-vs-zero, FBA/FBM split, flags ===================== */
+/* ===================== full payload: Health fallback (15-column Listings), unknown-vs-zero, FBA/FBM split, flags ===================== */
+// 15-column Listings rows (no fba_quantity_inbound / _reserved / _fc_transfer, plus one SKU-less row): NOT validated
+// inventory evidence, so this account's On Hand FBA is the labelled FBA Inventory Health fallback.
 const listingRows = [
   { sku: "SKU-A", child_asin: "ASIN-A", listing_name: "A", listing_status: "Active", listing_price_value: 25, listing_price_currency: "USD", listing_current_quantity: 0, fba_quantity_available: 30, listing_fulfillment_channel: "AMAZON_NA", listing_open_date: "2024-01-01" },
   { sku: "SKU-B", child_asin: "ASIN-B", listing_name: "B", listing_status: "Inactive", listing_price_value: 0, listing_price_currency: "USD", listing_current_quantity: 7, fba_quantity_available: null, listing_fulfillment_channel: "DEFAULT", listing_open_date: "2024-02-01" },
@@ -114,10 +119,18 @@ const byId = new Map(payload.rows.map((r) => [r.sku, r]));
 (() => {
   ok("payload sales source is order-line-items (no Profit-by-SKU)", payload.salesSource === LISTING_HEALTH_ADVANCED_SALES_SOURCE);
   ok("listingCount counts all listing rows (blank included), rows exclude the blank-sku listing", payload.listingCount === 5 && payload.rows.length === 4);
-  // Inventory authority + latest-snapshot + unknown vs zero.
-  ok("SKU-A FBA on-hand comes from the LATEST snapshot (30, not 999) and is marked fba-snapshot", byId.get("SKU-A").onHandFba === 30 && byId.get("SKU-A").onHandFbaSource === "fba-snapshot");
-  ok("SKU-C FBA on-hand is UNAVAILABLE (null) when no snapshot and no listing fallback", byId.get("SKU-C").onHandFba === null && byId.get("SKU-C").onHandFbaSource === null);
-  ok("SKU-E FBA on-hand is a genuine ZERO via the explicit Listings fallback (0, listings-fallback)", byId.get("SKU-E").onHandFba === 0 && byId.get("SKU-E").onHandFbaSource === "listings-fallback");
+  // Health fallback: latest snapshot only + unknown vs zero; the non-validated Listings quantities are NEVER mixed in.
+  ok("FALLBACK: SKU-A FBA on-hand comes from the LATEST Health snapshot (30, not 999), marked fba-health-fallback", byId.get("SKU-A").onHandFba === 30 && byId.get("SKU-A").onHandFbaSource === "fba-health-fallback");
+  ok("FALLBACK: SKU-C (absent from the Health snapshot) is UNAVAILABLE (null), never 0", byId.get("SKU-C").onHandFba === null && byId.get("SKU-C").onHandFbaSource === null);
+  ok("FALLBACK: SKU-E (absent from Health) is UNAVAILABLE -- its Listings 0 is never mixed into a Health-sourced account", byId.get("SKU-E").onHandFba === null && byId.get("SKU-E").onHandFbaSource === null);
+  ok("FALLBACK: payload.inventory = inventory-source-v1 / health-fallback with the Health date, the Listings reasons and the label",
+    payload.inventory.model === "inventory-source-v1" && payload.inventory.source === "health-fallback" && payload.inventory.available === true
+    && payload.inventory.snapshotDate === "2026-09-03" && payload.inventory.refreshedAt === null
+    && JSON.stringify(payload.inventory.fallbackReasons) === JSON.stringify(["listings-not-expanded", "listings-invalid-rows:1"])
+    && payload.inventory.unavailableReasons.length === 0
+    && payload.inventory.label === "FBA Inventory Health snapshot 2026-09-03 (saved, no longer refreshed -- temporary bridge: listings-not-expanded, listings-invalid-rows:1)"
+    && payload.inventory.bridgeMaxAgeDays === 2);
+  ok("FALLBACK: no row is a Listings conflict (the Health value is the displayed one)", payload.rows.every((r) => r.inventoryConflict === false));
   // FBA/FBM split + not applicable.
   ok("SKU-A (FBA) FBM on-hand is NOT APPLICABLE", byId.get("SKU-A").onHandFbmApplicable === false && byId.get("SKU-A").onHandFbm === null && byId.get("SKU-A").onHandFbaApplicable === true);
   ok("SKU-B (FBM) FBA on-hand is NOT APPLICABLE; FBM on-hand is 7", byId.get("SKU-B").onHandFbaApplicable === false && byId.get("SKU-B").onHandFbm === 7 && byId.get("SKU-B").onHandFbmApplicable === true);
@@ -140,8 +153,168 @@ const byId = new Map(payload.rows.map((r) => [r.sku, r]));
   // Provenance + coverage + completeness.
   ok("coverage reported honestly (incomplete, gap 09-03..09-04)", payload.coverage.complete === false && payload.coverage.gapFrom === "2026-09-03");
   ok("completeness surfaces provisional", payload.completeness && payload.completeness.provisional === true);
-  ok("provenance carries source dates + snapshot date + oli covered-to", payload.provenance.listingsFetchedAt === "2026-09-04T08:00:00Z" && payload.provenance.inventorySnapshotDate === "2026-09-03" && payload.provenance.oliCoveredTo === "2026-09-02");
-  ok("inventory snapshot date is the latest (2026-09-03)", payload.inventory.snapshotDate === "2026-09-03" && payload.inventory.available === true);
+  ok("provenance carries source dates + the Health snapshot date (fallback source) + oli covered-to", payload.provenance.listingsFetchedAt === "2026-09-04T08:00:00Z" && payload.provenance.inventorySnapshotDate === "2026-09-03" && payload.provenance.oliCoveredTo === "2026-09-02"
+    && payload.provenance.inventoryFetchedAt === "2026-09-04T08:05:00Z");
+  ok("inventory snapshot date is the latest Health date (2026-09-03)", payload.inventory.snapshotDate === "2026-09-03" && payload.inventory.available === true);
+})();
+
+/* ===================== PHASE 2: validated Listings is the source (Health present but never read) ===================== */
+// The EXPANDED canonical Listings fields (post-cutover 18-column export): every row carries them as own keys.
+const X = { fba_quantity_inbound: 0, fba_quantity_reserved: 0, fba_quantity_fc_transfer: 0 };
+const xBase = { owner: { accountId: "acct-1", rawSellerId: "SELLER-1", marketplace: "US" }, asOf, window: resolveListingHealthWindow({ preset: "30D", asOf }), enrichedOliRows: [], oliCoverageWindows: [], completenessRows: [], catalogRows: [], rawRows: [], issuesAvailable: false, provenance };
+const xRow = (sku, asin, fba, o = {}) => ({ sku, child_asin: asin, listing_status: "Active", listing_fulfillment_channel: "AMAZON_NA", marketplace_country_code: "US", fba_quantity_available: fba, ...X, ...o });
+const hRow = (sku, asin, available, date = "2026-09-03") => ({ date, sku, child_asin: asin, marketplace_country_code: "US", available, inbound_working: 0, inbound_shipped: 0, inbound_received: 0 });
+(() => {
+  const p = buildAdvancedListingHealth({ ...xBase,
+    listingRows: [
+      xRow("SKU-A", "ASIN-A", 30),
+      xRow("SKU-E", "ASIN-E", 0),                                                    // genuine zero
+      xRow("SKU-D", "ASIN-D", "8"),                                                  // numeric string -> 8
+      xRow("SKU-B", "ASIN-B", 0, { listing_fulfillment_channel: "DEFAULT", listing_status: "Inactive", listing_current_quantity: 7 }), // merchant-fulfilled, FBA all 0
+    ],
+    inventoryRows: [hRow("SKU-A", "ASIN-A", 999), hRow("SKU-E", "ASIN-E", 55), hRow("SKU-D", "ASIN-D", 77)],
+  });
+  const b = new Map(p.rows.map((r) => [r.sku, r]));
+  ok("LISTINGS: SKU-A on-hand is the Listings 30 (source listings) -- the Health 999 is never read", b.get("SKU-A").onHandFba === 30 && b.get("SKU-A").onHandFbaSource === "listings");
+  ok("LISTINGS: a genuine Listings 0 is kept (never the Health 55, never unknown)", b.get("SKU-E").onHandFba === 0 && b.get("SKU-E").onHandFbaSource === "listings");
+  ok("LISTINGS: a numeric-string quantity is read as its number", b.get("SKU-D").onHandFba === 8);
+  ok("LISTINGS: a merchant-fulfilled all-zero SKU is FBA NOT applicable (never an FBA stockout); FBM on-hand 7",
+    b.get("SKU-B").onHandFbaApplicable === false && b.get("SKU-B").onHandFba === null && b.get("SKU-B").onHandFbm === 7);
+  ok("LISTINGS: payload.inventory = inventory-source-v1 / listings: NO inventory date, freshness = the Listings refresh time",
+    p.inventory.model === "inventory-source-v1" && p.inventory.source === "listings" && p.inventory.available === true
+    && p.inventory.snapshotDate === null && p.inventory.refreshedAt === "2026-09-04T08:00:00Z"
+    && p.inventory.label === "Listings refreshed 2026-09-04T08:00:00Z"
+    && p.inventory.fallbackReasons.length === 0 && p.inventory.unavailableReasons.length === 0 && p.inventory.conflicts.length === 0);
+  ok("LISTINGS: provenance keeps the Health fetch fields but claims NO inventory snapshot date", p.provenance.inventorySnapshotDate === null && p.provenance.inventoryFetchedAt === "2026-09-04T08:05:00Z");
+  ok("LISTINGS: no row is flagged as an inventory conflict", p.rows.every((r) => r.inventoryConflict === false));
+})();
+
+/* ===================== PHASE 2: Unavailable (no validated Listings and no Health) ===================== */
+(() => {
+  const p = buildAdvancedListingHealth({ ...xBase,
+    listingRows: [{ sku: "U1", child_asin: "B1", listing_status: "Inactive", listing_fulfillment_channel: "AMAZON_NA", fba_quantity_available: 40 }], // 15-column
+    inventoryRows: [],
+  });
+  ok("UNAVAILABLE: 15-column Listings + no Health -> on-hand null (never the Listings 40, never 0)", p.rows[0].onHandFba === null && p.rows[0].onHandFbaSource === null);
+  ok("UNAVAILABLE: payload.inventory carries both reasons, no date, no refresh time, label 'FBA inventory unavailable'",
+    p.inventory.model === "inventory-source-v1" && p.inventory.source === "unavailable" && p.inventory.available === false
+    && p.inventory.snapshotDate === null && p.inventory.refreshedAt === null && p.provenance.inventorySnapshotDate === null
+    && JSON.stringify(p.inventory.unavailableReasons) === JSON.stringify(["listings-not-expanded", "health-snapshot-missing"])
+    && JSON.stringify(p.inventory.fallbackReasons) === JSON.stringify(["listings-not-expanded"])
+    && p.inventory.label === "FBA inventory unavailable");
+  ok("UNAVAILABLE: an unknown on-hand never raises stranded stock", !p.rows[0].flagReasons.some((r) => r.code === "stranded_stock"));
+  const empty = buildAdvancedListingHealth({ ...xBase, listingRows: [], inventoryRows: [] });
+  ok("UNAVAILABLE: no Listings rows and no Health -> reasons listings-empty + health-snapshot-missing", empty.inventory.available === false
+    && JSON.stringify(empty.inventory.unavailableReasons) === JSON.stringify(["listings-empty", "health-snapshot-missing"]));
+})();
+
+/* ===================== PHASE 2: duplicate listing rows (identical once; conflicting -> fallback / unavailable) ===================== */
+(() => {
+  // Identical duplicate rows of one SKU count ONCE (Listings stays validated).
+  const same = buildAdvancedListingHealth({ ...xBase, listingRows: [xRow("DUP", "A1", 30), xRow("DUP", "A1", 30), xRow("OTH", "A2", 9)], inventoryRows: [] });
+  ok("DUP: identical duplicate rows -> Listings validated, on-hand 30 on each row (never 60)",
+    same.inventory.source === "listings" && same.rows.filter((r) => r.sku === "DUP").length === 2 && same.rows.filter((r) => r.sku === "DUP").every((r) => r.onHandFba === 30 && r.inventoryConflict === false));
+  // Conflicting duplicates (quantities differ) -> Listings NOT validated; with Health -> the labelled fallback.
+  const conflictRows = [xRow("DUP", "A1", 30), xRow("DUP", "A1", 12), xRow("OTH", "A2", 9)];
+  const fb = buildAdvancedListingHealth({ ...xBase, listingRows: conflictRows, inventoryRows: [hRow("DUP", "A1", 31), hRow("OTH", "A2", 4)] });
+  ok("DUP: conflicting duplicates + Health -> health-fallback (reason listings-unresolved-conflicts:1), conflict reported",
+    fb.inventory.source === "health-fallback" && fb.inventory.fallbackReasons.includes("listings-unresolved-conflicts:1")
+    && fb.inventory.conflicts.length === 1 && fb.inventory.conflicts[0].sku === "DUP" && fb.inventory.conflicts[0].reasons.includes("duplicate-different-quantities"));
+  ok("DUP: in the fallback every SKU reads the Health value (DUP 31, OTH 4 -- never the Listings 9)",
+    fb.rows.filter((r) => r.sku === "DUP").every((r) => r.onHandFba === 31 && r.onHandFbaSource === "fba-health-fallback") && fb.rows.find((r) => r.sku === "OTH").onHandFba === 4);
+  // Without Health -> the whole account is Unavailable (no partial Listings figure presented as complete).
+  const un = buildAdvancedListingHealth({ ...xBase, listingRows: conflictRows, inventoryRows: [] });
+  ok("DUP: conflicting duplicates + no Health -> Unavailable for EVERY SKU (null), conflict still reported",
+    un.inventory.source === "unavailable" && un.rows.every((r) => r.onHandFba === null) && un.inventory.conflicts.length === 1
+    && un.inventory.unavailableReasons[0] === "listings-unresolved-conflicts:1" && un.inventory.unavailableReasons[un.inventory.unavailableReasons.length - 1] === "health-snapshot-missing");
+  // IDENTITY conflict (only the ASIN differs; FNSKU + quantities agree) resolved by the account's OWN sales (R2) -> validated.
+  const idRows = [xRow("R2", "ASIN-R1", 6, { fnsku: "X00R2" }), xRow("R2", "ASIN-R2", 6, { fnsku: "X00R2" })];
+  const oli = [{ sale_date: "2026-09-01", sku: "R2", child_asin: "ASIN-R2", currency: "USD", sales_amount: 10, ordered_units: 1 }];
+  const r2 = buildAdvancedListingHealth({ ...xBase, enrichedOliRows: oli, listingRows: idRows, inventoryRows: [] });
+  ok("DUP: an ASIN identity conflict resolved by the account's own sales (R2) keeps Listings validated and is REPORTED",
+    r2.inventory.source === "listings" && r2.rows.every((r) => r.onHandFba === 6) && r2.inventory.resolvedConflicts.length === 1
+    && r2.inventory.resolvedConflicts[0].rules.includes("R2-sales-asin"));
+  const noSales = buildAdvancedListingHealth({ ...xBase, listingRows: idRows, inventoryRows: [] });
+  ok("DUP: the same identity conflict WITHOUT sales evidence stays unresolved -> Unavailable (never a guessed ASIN)",
+    noSales.inventory.source === "unavailable" && noSales.rows.every((r) => r.onHandFba === null) && noSales.inventory.conflicts[0].reasons.includes("duplicate-different-asin"));
+})();
+
+/* ===================== PHASE 2: "__EMPTY__" ASIN, blank FBA field, never mixing sources ===================== */
+(() => {
+  // DataDoe's "__EMPTY__" placeholder is a MISSING ASIN: shown blank; its stock is unattributed unless the account's own
+  // sales map the SKU to exactly one ASIN.
+  const emp = [xRow("EMP", "__EMPTY__", 5), xRow("SKU-A", "ASIN-A", 30)];
+  const fb = buildAdvancedListingHealth({ ...xBase, listingRows: emp, inventoryRows: [hRow("EMP", "ASIN-EMP", 4), hRow("SKU-A", "ASIN-A", 31)] });
+  const e = fb.rows.find((r) => r.sku === "EMP");
+  ok("EMPTY: '__EMPTY__' is shown as a missing ASIN (null), never a product key", e.asin === null);
+  ok("EMPTY: unattributed stock -> health-fallback (reason listings-unattributed-stock:1); EMP 4 + SKU-A 31 from Health",
+    fb.inventory.source === "health-fallback" && fb.inventory.fallbackReasons.join(",") === "listings-unattributed-stock:1"
+    && e.onHandFba === 4 && fb.rows.find((r) => r.sku === "SKU-A").onHandFba === 31);
+  const oli = [{ sale_date: "2026-09-01", sku: "EMP", child_asin: "ASIN-EMP", currency: "USD", sales_amount: 10, ordered_units: 1 }];
+  const res = buildAdvancedListingHealth({ ...xBase, enrichedOliRows: oli, listingRows: emp, inventoryRows: [hRow("EMP", "ASIN-EMP", 4)] });
+  ok("EMPTY: the account's own sales resolve the missing ASIN -> Listings validated (EMP 5, SKU-A 30), ASIN still shown blank",
+    res.inventory.source === "listings" && res.rows.find((r) => r.sku === "EMP").onHandFba === 5 && res.rows.find((r) => r.sku === "EMP").asin === null
+    && res.rows.find((r) => r.sku === "SKU-A").onHandFba === 30);
+  // A blank FBA field on an FBA-channel SKU -> Listings NOT validated.
+  const blank = buildAdvancedListingHealth({ ...xBase, listingRows: [xRow("BL", "ASIN-BL", ""), xRow("SKU-A", "ASIN-A", 30)], inventoryRows: [hRow("BL", "ASIN-BL", 2), hRow("SKU-A", "ASIN-A", 29)] });
+  ok("BLANK: a blank FBA quantity -> health-fallback (listings-blank-fba-fields:1); BL 2 + SKU-A 29 from Health",
+    blank.inventory.source === "health-fallback" && blank.inventory.fallbackReasons.join(",") === "listings-blank-fba-fields:1"
+    && blank.rows.find((r) => r.sku === "BL").onHandFba === 2 && blank.rows.find((r) => r.sku === "SKU-A").onHandFba === 29);
+  const blankInbound = buildAdvancedListingHealth({ ...xBase, listingRows: [xRow("BI", "ASIN-BI", 3, { fba_quantity_inbound: null })], inventoryRows: [] });
+  ok("BLANK: a blank FBA inbound (available known) also blocks validation -> Unavailable without Health", blankInbound.inventory.source === "unavailable" && blankInbound.rows[0].onHandFba === null);
+  // The Health fallback never fills a SKU from Listings: a SKU absent from Health stays null.
+  const mix = buildAdvancedListingHealth({ ...xBase, listingRows: [xRow("BL", "ASIN-BL", ""), xRow("ONLY-L", "ASIN-OL", 12)], inventoryRows: [hRow("BL", "ASIN-BL", 2)] });
+  ok("MIX: in a Health-sourced account a SKU absent from Health is null -- its Listings 12 is NEVER used",
+    mix.inventory.source === "health-fallback" && mix.rows.find((r) => r.sku === "ONLY-L").onHandFba === null && mix.rows.find((r) => r.sku === "ONLY-L").onHandFbaSource === null);
+  // A merchant-fulfilled (DEFAULT) listing whose FBA stock the Health fallback PROVES positive keeps it visible.
+  const mfn = buildAdvancedListingHealth({ ...xBase, listingRows: [xRow("M1", "ASIN-M1", "", { listing_fulfillment_channel: "DEFAULT", listing_current_quantity: 2 }), xRow("BL", "ASIN-BL", "")], inventoryRows: [hRow("M1", "ASIN-M1", 3), hRow("BL", "ASIN-BL", 1)] });
+  ok("MIX: a DEFAULT listing with Health-proven positive FBA stock keeps it visible (3, applicable, source fba-health-fallback)",
+    mfn.rows.find((r) => r.sku === "M1").onHandFbaApplicable === true && mfn.rows.find((r) => r.sku === "M1").onHandFba === 3 && mfn.rows.find((r) => r.sku === "M1").onHandFbaSource === "fba-health-fallback");
+  // The pure selection helper agrees with the payload (one shared decision).
+  const s = listingHealthInventorySelection({ listingRows: [xRow("SKU-A", "ASIN-A", 30)], inventoryRows: [], marketplace: "us", listingsRefreshedAt: "2026-09-04T08:00:00Z" });
+  ok("HELPER: listingHealthInventorySelection -> listings source, SKU-A 30, label with the refresh time", s.source === "listings" && s.skus.get("SKU-A").fbaAvailable === 30 && s.label === "Listings refreshed 2026-09-04T08:00:00Z");
+})();
+
+/* ===================== CUTOVER: the saved Health snapshot is a READ-ONLY BRIDGE with a 2-day threshold ===================== */
+(() => {
+  // asOf = 2026-09-04: a bridge dated 2026-09-02 (asOf - 2) still serves; 2026-09-01 is stale -> Unavailable (typed).
+  const conflictRows = [xRow("DUP", "A1", 30), xRow("DUP", "A1", 12)]; // AAKRITI-style unresolved duplicate
+  const edge = buildAdvancedListingHealth({ ...xBase, listingRows: conflictRows, inventoryRows: [hRow("DUP", "A1", 31, "2026-09-02")] });
+  ok("BRIDGE: dated asOf-2 -> still the source (31), labelled as the saved temporary bridge",
+    edge.inventory.source === "health-fallback" && edge.rows.every((r) => r.onHandFba === 31) && /saved, no longer refreshed -- temporary bridge/.test(edge.inventory.label));
+  const stale = buildAdvancedListingHealth({ ...xBase, listingRows: conflictRows, inventoryRows: [hRow("DUP", "A1", 31, "2026-09-01")] });
+  ok("BRIDGE: older than asOf-2 -> Unavailable for EVERY SKU (never the stale 31, never 0) with the typed reason",
+    stale.inventory.source === "unavailable" && stale.rows.every((r) => r.onHandFba === null) && stale.inventory.snapshotDate === null
+    && JSON.stringify(stale.inventory.unavailableReasons) === JSON.stringify(["listings-unresolved-conflicts:1", "health-bridge-stale:2026-09-01"]));
+  // FR-style "__EMPTY__" unattributed stock: the bridge while fresh; Unavailable once stale.
+  const emp = [xRow("EMP", "__EMPTY__", 5), xRow("SKU-A", "ASIN-A", 30)];
+  ok("BRIDGE: FR __EMPTY__ unattributed -> the fresh bridge", buildAdvancedListingHealth({ ...xBase, listingRows: emp, inventoryRows: [hRow("SKU-A", "ASIN-A", 31)] }).inventory.source === "health-fallback");
+  ok("BRIDGE: FR __EMPTY__ unattributed + a stale bridge -> Unavailable", buildAdvancedListingHealth({ ...xBase, listingRows: emp, inventoryRows: [hRow("SKU-A", "ASIN-A", 31, "2026-08-20")] }).inventory.source === "unavailable");
+  // Without the report as-of the bridge is refused (never an undated Health figure).
+  const noAsOf = listingHealthInventorySelection({ listingRows: conflictRows, inventoryRows: [hRow("DUP", "A1", 31)], marketplace: "US" });
+  ok("BRIDGE: no as-of -> refused (health-bridge-as-of-missing)", noAsOf.source === "unavailable" && noAsOf.unavailableReasons.includes("health-bridge-as-of-missing"));
+  // The caller's typed reason for having no saved Health snapshot is carried (e.g. a read failure).
+  const missing = buildAdvancedListingHealth({ ...xBase, listingRows: conflictRows, inventoryRows: [], inventoryUnavailableReason: "health-snapshot-read-failed" });
+  ok("BRIDGE: no saved Health rows -> the caller's reason (health-snapshot-read-failed) is carried",
+    missing.inventory.unavailableReasons[missing.inventory.unavailableReasons.length - 1] === "health-snapshot-read-failed");
+  // Validated Listings never need the bridge (a stale one is irrelevant to them).
+  ok("BRIDGE: validated Listings ignore even a stale bridge", buildAdvancedListingHealth({ ...xBase, listingRows: [xRow("SKU-A", "ASIN-A", 30)], inventoryRows: [hRow("SKU-A", "ASIN-A", 999, "2026-08-01")] }).inventory.source === "listings");
+})();
+
+/* ===================== PHASE 2: DEFAULT (merchant-fulfilled) + stranded stock from validated Listings ===================== */
+(() => {
+  const p = buildAdvancedListingHealth({ ...xBase, owner: { accountId: "acct-1", rawSellerId: "SELLER-1" }, listingRows: [
+    { sku: "M-POS", child_asin: "C1", listing_status: "Active", listing_fulfillment_channel: "DEFAULT", listing_current_quantity: 3, fba_quantity_available: 5, ...X },
+    { sku: "M-ZERO", child_asin: "C2", listing_status: "Active", listing_fulfillment_channel: "DEFAULT", listing_current_quantity: 3, fba_quantity_available: 0, ...X },
+    { sku: "F-STR", child_asin: "C3", listing_status: "Inactive", listing_fulfillment_channel: "AMAZON_NA", listing_current_quantity: null, fba_quantity_available: 10, ...X },
+    { sku: "F-ZERO", child_asin: "C4", listing_status: "Inactive", listing_fulfillment_channel: "AMAZON_NA", listing_current_quantity: null, fba_quantity_available: 0, ...X },
+  ], inventoryRows: [] });
+  const b = new Map(p.rows.map((r) => [r.sku, r]));
+  ok("DEFAULT: a merchant-fulfilled listing with PROVEN positive Listings FBA stock keeps it visible (5, applicable)", p.inventory.source === "listings" && b.get("M-POS").onHandFbaApplicable === true && b.get("M-POS").onHandFba === 5 && b.get("M-POS").onHandFbm === 3);
+  ok("DEFAULT: a merchant-fulfilled zero is NOT applicable (never an FBA stockout)", b.get("M-ZERO").onHandFbaApplicable === false && b.get("M-ZERO").onHandFba === null);
+  ok("DEFAULT: the stranded gate keeps the OWN channel's on-hand (an Active DEFAULT row with FBA 5 is not stranded)", !b.get("M-POS").flagReasons.some((r) => r.code === "stranded_stock"));
+  ok("STRANDED: an Inactive FBA listing with Listings on-hand 10 is 'possible' stranded stock", b.get("F-STR").flagReasons.some((r) => r.code === "stranded_stock" && r.confidence === "possible"));
+  ok("STRANDED: an Inactive FBA listing with a genuine Listings 0 is not stranded", !b.get("F-ZERO").flagReasons.some((r) => r.code === "stranded_stock"));
 })();
 
 /* ===================== degraded issues (Raw JSON unavailable) ===================== */

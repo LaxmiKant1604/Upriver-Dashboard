@@ -231,7 +231,8 @@ await testAsync("params_hash provenance is enforced (a forged hash is refused)",
 
 await testAsync("unrelated reports are byte-identical; sku-movement is an ADDITIVE registry entry", async () => {
   assert.equal(REPORT_DERIVATIONS["daily-reporting"].snapshotVersion, "daily-reporting/v2f-campaign");
-  assert.equal(REPORT_DERIVATIONS["brand-inventory"].snapshotVersion, "brand-inventory-shared-v1");
+  // brand-inventory moved to v2 with phase 2 of the Listings inventory cutover (Listings or a labelled Health fallback).
+  assert.equal(REPORT_DERIVATIONS["brand-inventory"].snapshotVersion, "brand-inventory-shared-v2");
   assert.ok(REPORT_DERIVATIONS["brand-sales"], "brand-sales still present");
   assert.ok(REPORT_DERIVATIONS["sales-movers"], "sales-movers still present");
   assert.equal(REPORT_DERIVATIONS[SKU_MOVEMENT_REPORT_KEY].snapshotVersion, SKU_MOVEMENT_VERSION);

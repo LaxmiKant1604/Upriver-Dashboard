@@ -13,7 +13,7 @@ import path from "node:path";
 import {
   V3_GATES, GATE_RANK, v3GateForRow, v3WhyFlagged, v3RecommendedAction, v3Confidence, v3EvidenceSource,
   buildV3Rows, buildV3PriorityActions, v3ExportRows, v3WindowStatusLabel,
-  fmtOnHand, fmtBool, fmtIssue,
+  fmtOnHand, fmtBool, fmtIssue, v3InventoryFreshness, v3InventoryReasonText, isInventorySourcePayload,
 } from "../src/lib/listing-health-v3-view.js";
 import { LISTING_HEALTH_V3 } from "../src/lib/feature-flags.js";
 
@@ -219,6 +219,70 @@ const row = (o = {}) => ({ sku: o.sku ?? "S", asin: o.asin ?? "ASIN-S", brand: o
   // Stale evidence is flagged when the snapshot is >2 days older than the report as-of.
   const stale = buildV3Rows({ asOf: "2026-09-18", provenance: { listingsFetchedAt: "2026-09-10T04:00:00Z" }, rows: [nev()] });
   ok("L: evidence older than 2 days before as-of is marked stale", stale[0].evidenceStale === true && built[0].evidenceStale === false);
+})();
+
+/* ===================== M. Listings inventory cutover PHASE 2: per-account On Hand FBA source + freshness label ===================== */
+(() => {
+  const inv = (o = {}) => ({ model: "inventory-source-v1", source: "listings", label: "x", available: true, snapshotDate: null, refreshedAt: "2026-09-17T02:00:00.000Z", fallbackReasons: [], unavailableReasons: [], conflicts: [], resolvedConflicts: [], ...o });
+  // listings -> "Listings refreshed <UTC minute>" (no inventory date claimed).
+  const fl = v3InventoryFreshness({ inventory: inv() });
+  ok("M: listings -> 'Listings refreshed 2026-09-17 02:00 UTC', ok tone, no note, source listings",
+    fl.label === "Listings refreshed 2026-09-17 02:00 UTC" && fl.tone === "ok" && fl.note === null && fl.source === "listings" && !/snapshot/i.test(fl.label) && /validated Listings/.test(fl.hint));
+  ok("M: listings without a refresh time is labelled honestly (never a fabricated time)", v3InventoryFreshness({ inventory: inv({ refreshedAt: null }) }).label === "Listings refresh time unavailable");
+  // health-fallback -> dated Health label with plain-language reasons + a warn note.
+  const ff = v3InventoryFreshness({ inventory: inv({ source: "health-fallback", snapshotDate: "2026-09-16", refreshedAt: null, fallbackReasons: ["listings-not-expanded", "listings-unresolved-conflicts:2"], conflicts: [{ sku: "A" }, { sku: "B" }] }) });
+  ok("M: health-fallback (the saved bridge) -> 'FBA Inventory Health snapshot <date> (saved, no longer refreshed -- temporary bridge: <plain reasons>)', warn",
+    ff.label === "FBA Inventory Health snapshot 2026-09-16 (saved, no longer refreshed — temporary bridge: the saved Listings export has no inventory fields; SKUs with conflicting duplicate Listings rows (2))"
+    && ff.tone === "warn" && ff.source === "health-fallback" && ff.conflicts === 2);
+  ok("M: the bridge note says the values come from the last SAVED Health snapshot (no longer refreshed) because Listings could not be validated, and may have changed",
+    /last saved FBA Inventory Health snapshot \(2026-09-16\)/.test(ff.note) && /could not be validated/.test(ff.note) && /no longer refreshed/.test(ff.note) && /changed since/.test(ff.note) && /2026-09-16/.test(ff.hint));
+  ok("M: a stale bridge reason is plain language (the server already made On Hand FBA Unavailable)",
+    v3InventoryReasonText("health-bridge-stale:2026-09-10") === "the last saved FBA Inventory Health snapshot (2026-09-10) is too old to use (no longer refreshed)"
+    && v3InventoryReasonText("health-bridge-not-loaded") === "the saved FBA Inventory Health snapshot was not loaded");
+  // unavailable -> never 0, with reasons.
+  const fu = v3InventoryFreshness({ inventory: inv({ source: "unavailable", available: false, refreshedAt: null, fallbackReasons: ["listings-empty"], unavailableReasons: ["listings-empty", "health-snapshot-missing"] }) });
+  ok("M: unavailable -> 'On Hand FBA unavailable' + reasons, never shown as 0",
+    fu.label === "On Hand FBA unavailable" && fu.tone === "warn" && fu.source === "unavailable" && /never shown as 0/.test(fu.note)
+    && /no saved Listings rows; no saved FBA Inventory Health snapshot/.test(fu.note));
+  ok("M: reason text maps codes (with counts) to plain language; an unknown code is shown as-is",
+    v3InventoryReasonText("listings-blank-fba-fields:3") === "FBA SKUs with blank Listings stock fields (3)" && v3InventoryReasonText("listings-unattributed-stock:1") === "SKUs with stock but no ASIN in Listings (1)"
+    && v3InventoryReasonText("listings-foreign-marketplace-rows") === "Listings rows from another marketplace" && v3InventoryReasonText("weird-code") === "weird-code");
+  // A pre-phase-2 payload (no inventory-source-v1 model, e.g. browser-cached) is detected and never shown.
+  const legacy = { asOf: "2026-09-18", inventory: { available: true, snapshotDate: "2026-09-03" }, provenance: { inventorySnapshotDate: "2026-09-03" }, rows: [] };
+  ok("M: a pre-phase-2 payload is NOT an inventory-source payload (nor is a phase-3-only listings-v1 model)",
+    isInventorySourcePayload(legacy) === false && isInventorySourcePayload({ inventory: inv() }) === true && isInventorySourcePayload({ inventory: inv({ model: "listings-v1" }) }) === false);
+  const fLegacy = v3InventoryFreshness(legacy);
+  ok("M: a pre-phase-2 payload -> 'On Hand FBA unavailable' (its old date never shown) + a refresh note", fLegacy.label === "On Hand FBA unavailable" && fLegacy.source === "legacy" && !/2026-09-03/.test(fLegacy.label + fLegacy.note) && /predates/.test(fLegacy.note));
+  // buildV3Rows on a pre-phase-2 payload: on-hand FBA -> Unavailable; an FBA-channel stranded flag that rested on it is
+  // withdrawn (flagged / sales-at-risk follow); an FBM stranded flag and Amazon findings are kept.
+  const legacyRows = buildV3Rows({ ...legacy, rows: [
+    row({ sku: "H1", channel: "FBA", listingStatus: "", onHandFba: 40, flagged: true, salesAtRisk: 90, flagReasons: [reason("stranded_stock", "possible")] }),
+    row({ sku: "H2", channel: "FBA", listingStatus: "Inactive", onHandFba: 40, flagged: true, salesAtRisk: 70, flagReasons: [reason("status_not_active", "possible"), reason("stranded_stock", "possible")] }),
+    row({ sku: "M1", channel: "FBM", listingStatus: "", onHandFba: null, onHandFbaApplicable: false, onHandFbm: 6, onHandFbmApplicable: true, flagged: true, salesAtRisk: 30, flagReasons: [reason("stranded_stock", "possible")] }),
+  ] });
+  const lb = new Map(legacyRows.map((r) => [r.sku, r]));
+  ok("M: legacy FBA on-hand is shown as Unavailable", lb.get("H1").onHandFba === null && lb.get("H2").onHandFba === null && fmtOnHand(lb.get("H1").onHandFba, lb.get("H1").onHandFbaApplicable) === "Unavailable");
+  ok("M: a legacy FBA stranded-only flag is withdrawn (not flagged, gate not 'stranded', sales-at-risk 0)", lb.get("H1").flagged === false && lb.get("H1").gate !== "stranded" && lb.get("H1").salesAtRisk === 0);
+  ok("M: a legacy row with another finding keeps it (flagged, sales-at-risk kept) but loses the stranded reason", lb.get("H2").flagged === true && lb.get("H2").salesAtRisk === 70 && !lb.get("H2").flagReasons.some((x) => x.code === "stranded_stock"));
+  ok("M: a legacy FBM stranded flag (FBM on-hand, not FBA) is kept", lb.get("M1").flagged === true && lb.get("M1").gate === "stranded" && lb.get("M1").onHandFbm === 6);
+  // A phase-2 payload keeps the server values untouched -- for BOTH sources (incl. a Health-fallback stranded flag).
+  const cur = buildV3Rows({ asOf: "2026-09-18", inventory: inv(), rows: [row({ sku: "C1", onHandFba: 12, flagged: true, salesAtRisk: 5, listingStatus: "", flagReasons: [reason("stranded_stock", "possible")] })] });
+  ok("M: a Listings-sourced payload keeps on-hand + stranded as derived by the server", cur[0].onHandFba === 12 && cur[0].flagged === true && cur[0].gate === "stranded");
+  const hf = buildV3Rows({ asOf: "2026-09-18", inventory: inv({ source: "health-fallback", snapshotDate: "2026-09-16" }), rows: [{ ...row({ sku: "C2", onHandFba: 7, flagged: true, salesAtRisk: 5, listingStatus: "", flagReasons: [reason("stranded_stock", "possible")] }), onHandFbaSource: "fba-health-fallback" }] });
+  ok("M: a Health-fallback payload keeps on-hand + its source tag + stranded as derived by the server", hf[0].onHandFba === 7 && hf[0].onHandFbaSource === "fba-health-fallback" && hf[0].gate === "stranded");
+  // evidenceAsOf never falls back to the inventory snapshot date (Listings/Raw fetch time, else the report as-of).
+  const ev = buildV3Rows({ asOf: "2026-09-18", inventory: inv({ source: "health-fallback", snapshotDate: "2026-09-03" }), provenance: { inventorySnapshotDate: "2026-09-03" }, rows: [row({ sku: "E1" })] });
+  ok("M: evidenceAsOf never uses the inventory snapshot date (falls back to the report as-of)", ev[0].evidenceAsOf === "2026-09-18");
+  // Source scan: the page shows the source-aware freshness and the column hint; the presenter no longer reads the
+  // provenance inventory date for evidence.
+  const viewSrc = readFileSync(path.join(root, "src/lib/listing-health-v3-view.js"), "utf8");
+  const pageSrc = readFileSync(path.join(root, "src/views/ListingHealthV3.jsx"), "utf8");
+  ok("M: the presenter no longer reads provenance.inventorySnapshotDate", !/inventorySnapshotDate/.test(viewSrc));
+  ok("M: the page shows v3InventoryFreshness (bar label + note + On Hand FBA hint) and never 'Inventory snapshot <date>'",
+    /v3InventoryFreshness\(data\)/.test(pageSrc) && /inventoryFreshness\.label/.test(pageSrc) && /inventoryFreshness\.note/.test(pageSrc)
+    && /label="On Hand FBA"[^\n]*hint=\{inventoryFreshness\.hint\}/.test(pageSrc) && !/Inventory snapshot/.test(pageSrc) && !/inventory\.snapshotDate/.test(pageSrc));
+  ok("M: the inventory-freshness hook sits with the other hooks (before the first early-return-style state render)",
+    pageSrc.indexOf("useMemo(() => v3InventoryFreshness(data)") > 0 && pageSrc.indexOf("useMemo(() => v3InventoryFreshness(data)") < pageSrc.indexOf("const state = <SnapshotState"));
 })();
 
 writeSync(1, `\nlisting-health-v3-view: ${passed} assertions passed\n`);

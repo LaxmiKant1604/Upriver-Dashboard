@@ -36,7 +36,7 @@ writeSync(1, "delivery-status\n");
 {
   const oli = dependentLiveReportsForSource("order-line-items");
   const ads = dependentLiveReportsForSource("ads-campaign-date");
-  const fba = dependentLiveReportsForSource("fba-inventory-health");
+  const retiredHealth = dependentLiveReportsForSource("fba-inventory-health");
   const listings = dependentLiveReportsForSource("listings");
   const raw = dependentLiveReportsForSource("listings-raw");
   const cat = dependentLiveReportsForSource("product-catalog");
@@ -47,14 +47,15 @@ writeSync(1, "delivery-status\n");
   ok("OLI dependents EXCLUDE listing-health-v3 (OLI is derived, not owned, there)", !oli.includes("listing-health-v3"));
   ok("Catalog dependents === [brand-inventory, brand-sales, daily-reporting] (rides OLI lineage)", cat.join(",") === "brand-inventory,brand-sales,daily-reporting");
   ok("Ads dependents === [daily-reporting, ppc-performance]", ads.join(",") === "daily-reporting,ppc-performance");
-  ok("FBA Inventory dependents === [brand-inventory, fba-plan] (Brand Inventory + FBA Plan)", fba.join(",") === "brand-inventory,fba-plan");
-  ok("Listings dependents === [fba-plan, listing-health-v3] (FBA Plan AWD + LHv3)", listings.join(",") === "fba-plan,listing-health-v3");
+  ok("Listings inventory cutover: the retired fba-inventory-health is NOT a matrix column; its only remaining lineage dependent (brand-inventory, via the read-only bridge) is shown under the Listings column",
+    !DELIVERY_SOURCES.some((s) => s.sourceKey === "fba-inventory-health") && retiredHealth.every((k) => listings.includes(k)));
+  ok("Listings dependents === [brand-inventory, fba-plan, listing-health-v3] (FBA inventory: Brand Inventory + FBA Plan; LHv3)", listings.join(",") === "brand-inventory,fba-plan,listing-health-v3");
   ok("Listings Raw dependents === [listing-health-v3]", raw.join(",") === "listing-health-v3");
   ok("every dependent is a live-publishable report key (no drift outside the contract set)",
-    [...oli, ...ads, ...fba, ...listings, ...raw, ...cat].every((k) => LIVE_PUBLISHABLE_REPORT_KEYS.includes(k)));
+    [...oli, ...ads, ...listings, ...raw, ...cat].every((k) => LIVE_PUBLISHABLE_REPORT_KEYS.includes(k)));
   ok("dependents are sorted + de-duplicated", JSON.stringify(oli) === JSON.stringify([...new Set(oli)].sort()));
   ok("there are exactly 15 live-publishable report keys", LIVE_PUBLISHABLE_REPORT_KEYS.length === 15);
-  ok("the six matrix source columns are OLI/Catalog/Ads/FBA/Listings/Listings-Raw", DELIVERY_SOURCES.map((s) => s.sourceKey).join(",") === "order-line-items,product-catalog,ads-campaign-date,fba-inventory-health,listings,listings-raw");
+  ok("the five matrix source columns are OLI/Catalog/Ads/Listings (FBA inventory)/Listings-Raw -- no retired FBA Inventory Health column", DELIVERY_SOURCES.map((s) => s.sourceKey).join(",") === "order-line-items,product-catalog,ads-campaign-date,listings,listings-raw" && !JSON.stringify(DELIVERY_SOURCES).includes("inventory-health"));
 }
 
 // ============================ (B) classifyExport: fail-closed + dated vs date-free ============================
@@ -152,7 +153,6 @@ function baseDeps(over = {}) {
     getSourceListingsSnapshot: async () => ({ snapshot: { validated_at: "2026-09-15T17:25:00Z", row_count: 3, as_of: "2026-09-14" }, read: "ok", error: null }),
     getSourceListingsRawSnapshot: async () => ({ snapshot: { validated_at: "2026-09-15T17:25:00Z", row_count: 3, as_of: "2026-09-14" }, read: "ok", error: null }),
     getAdsSyncStates: async () => ["US1", "CA1"].map((acct) => ({ account_id: acct, source_key: "campaign-performance-v1", last_status: "succeeded", latest_metric_date: "2026-09-14", last_daily_sync_at: "2026-09-15T17:00:00Z" })),
-    getLatestReportJobLineage: async (reportKey, accountId) => ({ reportKey, accountId, validated: true, latestDataDate: "2026-09-14", cycleStatus: "succeeded" }),
     // Called PER KEY (reportKeys:[oneKey]). Return an EXACT-version live row for the requested key(s) x the queried
     // accounts, at the cycle's as-of -> a healthy publish baseline the failure tests then perturb.
     getReportSnapshotsMeta: async ({ reportKeys, accountIds }) => { calls.metaKeys = (calls.metaKeys || []).concat(reportKeys); return reportKeys.flatMap((rk) => (accountIds || ["US1", "CA1"]).map((acct) => ({ report_key: rk, account_id: acct, params: { reportVersion: SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[rk].liveReportVersion, to: "2026-09-14" }, source_refreshed_at: "2026-09-15T17:00:00Z", updated_at: "2026-09-15T17:05:00Z" }))); },
@@ -208,7 +208,7 @@ function baseDeps(over = {}) {
   }).deps;
   const p = await loadDeliveryStatus({ region: "us-ca" }, dupDeps);
   const us1 = p.accounts.find((a) => a.accountId === "US1");
-  ok("[#6] version-preferred dedup keeps the correct-live-version row over a newer wrong-version row (Publish detected)", us1.reports.find((r) => r.sourceKey === "fba-inventory-health").publicationCount >= 1);
+  ok("[#6] version-preferred dedup keeps the correct-live-version row over a newer wrong-version row (Publish detected)", us1.reports.find((r) => r.sourceKey === "listings").publicationCount >= 1);
 }
 
 // [#5] while the listing-health-v3 live gate is OFF, it is excluded from the Publish universe (its Listings-Raw
@@ -256,12 +256,12 @@ function baseDeps(over = {}) {
 // [#21] one account's bad evidence does not crash the page; it degrades to Unavailable while others stay classified.
 {
   const partialDeps = baseDeps({
-    getLatestReportJobLineage: async (rk, accountId) => { if (accountId === "US1") throw new Error("boom"); return { reportKey: rk, accountId, validated: true, latestDataDate: "2026-09-14" }; },
+    getSourceListingsSnapshot: async ({ accountId }) => { if (accountId === "US1") throw new Error("boom"); return { snapshot: { validated_at: "2026-09-15T17:25:00Z", row_count: 3, as_of: "2026-09-14" }, read: "ok", error: null }; },
   }).deps;
   const p = await loadDeliveryStatus({ region: "us-ca" }, partialDeps);
   const us1 = p.accounts.find((a) => a.accountId === "US1");
   const ca1 = p.accounts.find((a) => a.accountId === "CA1");
-  ok("[#21] a thrown per-account FBA job read degrades that cell to Unavailable, page still renders", us1.reports.find((r) => r.sourceKey === "fba-inventory-health").exportStatus === "Unavailable" && ca1.reports.find((r) => r.sourceKey === "fba-inventory-health").exportStatus === "Yes");
+  ok("[#21] a thrown per-account Listings (FBA inventory) read degrades that cell to Unavailable, page still renders", us1.reports.find((r) => r.sourceKey === "listings").exportStatus === "Unavailable" && ca1.reports.find((r) => r.sourceKey === "listings").exportStatus === "Yes");
 }
 
 // [#13] org fingerprint unconfigured -> every per-account source Unavailable (never a fabricated Yes/zero).
@@ -339,27 +339,27 @@ function secondaryDeps() {
   ok("[#7-fail] OLI D-1 miss -> Export No with a specific safe code (D1_COVERAGE_MISSING)", oli.exportStatus === "No" && oli.safeCode === "D1_COVERAGE_MISSING");
   ok("[#7-fail] remark names the SPECIFIC source + code, never the generic 'Source export failed'", us1.remark === "Order Line Items export failed (D1_COVERAGE_MISSING)" && us1.remark !== "Source export failed");
 
-  // [#20] FBA contradictory Export No / Publish Yes: this cycle's fba-plan job did not validate (Export No), yet the
-  // brand-inventory/fba-plan live snapshots are current (Publish Yes -- retained/current from an earlier attempt). Both
-  // are classified honestly and independently, and the account remark surfaces the actionable FBA export failure.
+  // [#20] FBA inventory contradictory Export No / Publish Yes: US1 has NO saved Listings pointer (Export No on a terminal
+  // cycle), yet the brand-inventory/fba-plan live snapshots are current (Publish Yes -- retained/current from an earlier
+  // attempt). Both are classified honestly and independently, and the account remark surfaces the actionable export failure.
   const fbaContradictionDeps = baseDeps({
-    getLatestReportJobLineage: async (rk, accountId) => (accountId === "US1"
-      ? { reportKey: rk, accountId, validated: false, latestDataDate: null }   // FBA export did NOT validate this cycle
-      : { reportKey: rk, accountId, validated: true, latestDataDate: "2026-09-14" }),
+    getSourceListingsSnapshot: async ({ accountId }) => (accountId === "US1"
+      ? { snapshot: null, read: "ok", error: null }   // no saved Listings (FBA inventory) pointer for US1
+      : { snapshot: { validated_at: "2026-09-15T17:25:00Z", row_count: 3, as_of: "2026-09-14" }, read: "ok", error: null }),
     // brand-inventory + fba-plan live snapshots are still CURRENT (as_of == cycle as-of) for US1 -> Publish Yes.
   }).deps;
   const q = await loadDeliveryStatus({ region: "us-ca" }, fbaContradictionDeps);
   const us1b = q.accounts.find((a) => a.accountId === "US1");
-  const fba = us1b.reports.find((r) => r.sourceKey === "fba-inventory-health");
-  ok("[#20] FBA Export No is classified (job not validated) with a safe code, never a fabricated Yes", fba.exportStatus === "No" && fba.safeCode === "SOURCE_EVIDENCE_MISSING");
-  ok("[#20] FBA Publish stays Yes independently (retained/current live snapshot) -- the contradiction is shown, not hidden", fba.publishStatus === "Yes" && fba.publicationExpected === 2);
-  ok("[#20] the account remark honestly surfaces the FBA export failure (specific, not generic)", us1b.remark === "FBA Inventory export failed (SOURCE_EVIDENCE_MISSING)");
+  const fba = us1b.reports.find((r) => r.sourceKey === "listings");
+  ok("[#20] Listings (FBA inventory) Export No is classified (no saved pointer) with a safe code, never a fabricated Yes", fba.exportStatus === "No" && fba.safeCode === "SOURCE_EVIDENCE_MISSING");
+  ok("[#20] its Publish stays Yes independently (retained/current brand-inventory + fba-plan + LHv3, gate on in this suite) -- the contradiction is shown, not hidden", fba.publishStatus === "Yes" && fba.publicationExpected === 3);
+  ok("[#20] the account remark honestly surfaces the Listings (FBA inventory) export failure (specific, not generic)", us1b.remark === "Listings (FBA inventory) export failed (SOURCE_EVIDENCE_MISSING)");
 }
 
 // ============================ (E3b) terminal-cycle LKG: a lagging live report is a truthful terminal LKG, never Waiting ============================
 {
   // Lead-1 end-to-end: the cycle is TERMINAL (succeeded). US1's fba-plan live row lags (as_of 2026-08-29 << cycle
-  // as-of 2026-09-14); everything else is current. The fba-plan-dependent source cells (FBA Inventory + Listings) must
+  // as-of 2026-09-14); everything else is current. The fba-plan-dependent source cell (Listings = FBA inventory) must
   // classify as LKG (NOT an indefinitely-running Waiting), surface the last-published as-of, and the account remark +
   // summary must make the stuck fba-plan publication visible -- never masked, never a fabricated Yes.
   const lagDeps = baseDeps({
@@ -372,15 +372,13 @@ function secondaryDeps() {
   const p = await loadDeliveryStatus({ region: "us-ca" }, lagDeps);
   const us1 = p.accounts.find((a) => a.accountId === "US1");
   const ca1 = p.accounts.find((a) => a.accountId === "CA1");
-  const fbaInv = us1.reports.find((r) => r.sourceKey === "fba-inventory-health");
   const listings = us1.reports.find((r) => r.sourceKey === "listings");
-  ok("[LKG-e2e] terminal cycle + lagging fba-plan -> FBA Inventory Publish is LKG (never Waiting), carrying last-published as-of",
-    fbaInv.publishStatus === "LKG" && fbaInv.publishLkg === true && fbaInv.publishLkgAsOf === "2026-08-29" && fbaInv.publicationCount === 1 && fbaInv.publicationExpected === 2);
-  ok("[LKG-e2e] Listings Publish is also LKG (fba-plan AWD dependent), never Waiting", listings.publishStatus === "LKG" && listings.publishLkgAsOf === "2026-08-29");
+  ok("[LKG-e2e] terminal cycle + lagging fba-plan -> Listings (FBA inventory) Publish is LKG (never Waiting), carrying last-published as-of",
+    listings.publishStatus === "LKG" && listings.publishLkg === true && listings.publishLkgAsOf === "2026-08-29" && listings.publicationCount === 2 && listings.publicationExpected === 3);
   ok("[LKG-e2e] no cell on a terminal cycle is left 'Waiting' (no indefinite Waiting)", us1.reports.every((r) => r.publishStatus !== "Waiting"));
   ok("[LKG-e2e] the account remark names the SPECIFIC source + last-published as-of (surfaced, not hidden)",
     /last-known-good as-of 2026-08-29 retained; current cycle not published/.test(us1.remark));
-  ok("[LKG-e2e] CA1 (all current) stays healthy Publish Yes", ca1.reports.find((r) => r.sourceKey === "fba-inventory-health").publishStatus === "Yes");
+  ok("[LKG-e2e] CA1 (all current) stays healthy Publish Yes", ca1.reports.find((r) => r.sourceKey === "listings").publishStatus === "Yes");
   ok("[LKG-e2e] summary counts the retained-LKG account in lkgCount (not waitingCount, not a false success)",
     p.summary.lkgCount === 1 && p.summary.waitingCount === 0 && p.summary.publishYes < p.summary.publishTotal);
 }

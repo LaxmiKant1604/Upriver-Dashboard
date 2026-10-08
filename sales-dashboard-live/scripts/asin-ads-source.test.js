@@ -715,7 +715,7 @@ test("J2 the shared recovery engine's defaults are byte-identical for Campaign (
 });
 test("J3 every dashboard/report keeps reading Campaign: readiness degrades on ads-campaign-date only; ASIN is in no report's requirements", async () => {
   assert.deepEqual([...ST.PRIORITY_DASHBOARD_SOURCES["daily-reporting"].degrading], ["ads-campaign-date"]);
-  assert.deepEqual([...ST.PRIORITY_DASHBOARD_SOURCES["brand-view"].degrading], ["ads-campaign-date", "fba-inventory-health"]);
+  assert.deepEqual([...ST.PRIORITY_DASHBOARD_SOURCES["brand-view"].degrading], ["ads-campaign-date", "listings"]); // Listings = FBA inventory (Health retired)
   const { sourceRegistryEntry } = await import("../lib/server/sync/source-registry.js");
   const e = sourceRegistryEntry("ads-asin-date");
   assert.deepEqual([...e.usedByReports], []); assert.deepEqual([...e.usedByDashboards], []);

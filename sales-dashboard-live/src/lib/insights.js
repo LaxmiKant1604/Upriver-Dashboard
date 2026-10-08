@@ -169,6 +169,135 @@ export function freshnessNote({ sourceLabel, asOf, lagDays, extra }) {
 }
 
 /* ==================================================================== */
+/* FBA stock source (Sales Movers / Buy Box Loss / Listing Health v1)    */
+/* ==================================================================== */
+
+// Listings inventory CUTOVER: each insight payload carries ONE per-account stock source
+// (lib/server/reports/derivation-core.js insightInventoryFields): the account's validated saved Listings ("Listings
+// refreshed <time>"; Listings has no date), else its last SAVED FBA Inventory Health snapshot as a temporary read-only
+// BRIDGE (dated by the snapshot, no longer refreshed, never presented as current; the server uses it only while it is
+// within 2 days of the report's as-of), else Unavailable. FBA Inventory Health is no longer requested, so its Health-only
+// metrics (days of supply, run rate, competitive prices, inbound shipped + received) are never shown. Every stock claim
+// is DATED and QUALIFIED:
+//   * it names when the stock was observed ("as of <time>" / "as of the saved FBA Inventory Health snapshot of <date>");
+//   * a Listings snapshot older than the report's as-of date, and EVERY bridge figure, is qualified "may have changed
+//     since" with medium confidence;
+//   * no stock claim is made without an observation time.
+// The payload model the server stamps (lib/server/reports/inventory-consumer.js INVENTORY_SOURCE_MODEL). A payload
+// without it predates phase 2: its stock values are never shown (and never read as 0).
+export const INSIGHT_INVENTORY_SOURCE_MODEL = "inventory-source-v1";
+
+// Plain-language reasons (server codes; a "<code>:<count>" suffix is a SKU count).
+const INVENTORY_REASON_TEXT = {
+  "listings-not-loaded": "this saved snapshot was built without the account's saved Listings",
+  "listings-snapshot-missing": "no saved Listings snapshot exists for this account yet",
+  "listings-snapshot-read-failed": "the saved Listings snapshot could not be read",
+  "listings-snapshot-stale": "the saved Listings snapshot is from an older scheduled run",
+  "listings-payload-unreadable": "the saved Listings snapshot could not be read",
+  "listings-payload-row-count-mismatch": "the saved Listings snapshot failed its integrity check",
+  "listings-identity-unavailable": "this account's saved Listings snapshot could not be identified",
+  "listings-empty": "the saved Listings snapshot has no rows for this account",
+  "listings-foreign-marketplace-rows": "the saved Listings snapshot contains another marketplace's rows",
+  "listings-foreign-seller-rows": "the saved Listings snapshot contains another seller's rows",
+  "listings-not-expanded": "the saved Listings snapshot predates the inventory fields",
+  "listings-invalid-rows": "the saved Listings snapshot contains rows without a SKU or with an invalid quantity",
+  "listings-unresolved-conflicts": "duplicate Listings rows disagree",
+  "listings-unattributed-stock": "Listings holds stock on SKUs without an ASIN",
+  "listings-blank-fba-fields": "Listings left FBA quantities blank",
+  "health-snapshot-empty": "no saved FBA Inventory Health snapshot is available either",
+  "health-snapshot-missing": "no saved FBA Inventory Health snapshot is available either",
+  "health-snapshot-read-failed": "the saved FBA Inventory Health snapshot could not be read",
+  "health-payload-unreadable": "the saved FBA Inventory Health snapshot could not be read",
+  "health-payload-row-count-mismatch": "the saved FBA Inventory Health snapshot failed its integrity check",
+  "health-payload-malformed": "the saved FBA Inventory Health snapshot failed its integrity check",
+  "health-snapshot-identity-mismatch": "the saved FBA Inventory Health snapshot does not belong to this account",
+  "health-identity-unavailable": "this account's saved FBA Inventory Health snapshot could not be identified",
+  "health-foreign-seller-rows": "the saved FBA Inventory Health snapshot contains another seller's rows",
+  "health-foreign-marketplace-rows": "the saved FBA Inventory Health snapshot contains another marketplace's rows",
+  "health-bridge-not-loaded": "this saved snapshot was built without the saved FBA Inventory Health snapshot",
+  "health-bridge-as-of-missing": "the saved FBA Inventory Health snapshot cannot be checked against a report date",
+};
+export function inventoryReasonText(code) {
+  const raw = String(code || "");
+  const [key, count] = raw.split(":");
+  // health-bridge-stale:<date> -- the last saved Health snapshot is older than its bridge limit (Health is no longer
+  // refreshed), so it drives no figure.
+  if (key === "health-bridge-stale") {
+    const date = raw.slice(key.length + 1);
+    return `the last saved FBA Inventory Health snapshot${/^\d{4}-\d{2}-\d{2}$/.test(date) ? ` (${date})` : ""} is too old to use (FBA Inventory Health is no longer refreshed)`;
+  }
+  const text = INVENTORY_REASON_TEXT[key] || raw || "the stock source is not available";
+  return count && /^\d+$/.test(count) ? `${text} (${count} SKU${count === "1" ? "" : "s"})` : text;
+}
+const reasonsText = (codes) => (Array.isArray(codes) ? codes : []).map(inventoryReasonText).join("; ");
+
+// An ISO instant -> "YYYY-MM-DD HH:MM UTC" (deterministic, no locale); null when absent or unparseable.
+export function fmtListingsRefreshed(value) {
+  const t = Date.parse(String(value || ""));
+  if (!Number.isFinite(t)) return null;
+  return `${new Date(t).toISOString().slice(0, 16).replace("T", " ")} UTC`;
+}
+
+// Whole days between an observation day (YYYY-MM-DD) and the report's as-of date; null when either is unknown.
+function daysBefore(day, asOf) {
+  const a = String(asOf || "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day || "") || !/^\d{4}-\d{2}-\d{2}$/.test(a)) return null;
+  return Math.max(0, Math.round((Date.parse(a + "T00:00:00Z") - Date.parse(day + "T00:00:00Z")) / 86400000));
+}
+// Whole days between the Listings refresh (its UTC date) and the report's as-of date; null when either is unknown.
+export function listingsAgeDays(data) {
+  const t = Date.parse(String((data && data.listingsRefreshedAt) || ""));
+  return Number.isFinite(t) ? daysBefore(new Date(t).toISOString().slice(0, 10), data && data.asOf) : null;
+}
+
+/**
+ * The FBA stock state of a Sales Movers / Buy Box Loss / Listing Health payload:
+ *   { available, legacy, source, sourceShort, label, note, when, ageDays, stale, asOfPhrase }
+ * source "listings": when = the Listings refresh time; stale when it is one or more days older than the report's as-of
+ *   date (or its age is unknown). source "health-fallback" (the saved FBA Inventory Health BRIDGE): when = the saved
+ *   snapshot date; ALWAYS stale (a bridge figure is never presented as current). asOfPhrase qualifies every stock claim;
+ *   null when no observation time exists (then no stock claim is made).
+ */
+export function insightInventoryState(data) {
+  if (!data || data.inventoryModel !== INSIGHT_INVENTORY_SOURCE_MODEL) {
+    return {
+      available: false, legacy: true, source: null, sourceShort: null, label: "FBA stock unavailable",
+      note: "This saved snapshot predates the per-account FBA stock source, so its stock values are not shown (never read as 0). A refreshed snapshot shows them with their source.",
+      when: null, ageDays: null, stale: true, asOfPhrase: null,
+    };
+  }
+  const source = data.inventorySource;
+  if (data.inventoryAvailable !== true || (source !== "listings" && source !== "health-fallback")) {
+    const why = reasonsText(data.inventoryUnavailableReasons) || "neither validated Listings nor a usable saved FBA Inventory Health snapshot is available";
+    return { available: false, legacy: false, source: "unavailable", sourceShort: null, label: "FBA stock unavailable",
+      note: `FBA stock is Unavailable because ${why}. It is never shown as 0.`, when: null, ageDays: null, stale: true, asOfPhrase: null };
+  }
+  if (source === "listings") {
+    const when = fmtListingsRefreshed(data.listingsRefreshedAt);
+    const ageDays = when ? listingsAgeDays(data) : null;
+    const stale = ageDays === null || ageDays >= 1;
+    const age = ageDays === null ? "" : ageDays === 0 ? " (same day as this report)" : ` (${ageDays} day${ageDays === 1 ? "" : "s"} before this report's as-of date)`;
+    return {
+      available: true, legacy: false, source, sourceShort: "Listings",
+      label: when ? `Listings refreshed ${when}${age}` : "Listings refresh time unavailable",
+      note: null, when, ageDays, stale,
+      asOfPhrase: when ? `as of ${when}${stale ? ", may have changed since" : ""}` : null,
+    };
+  }
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(String(data.inventoryHealthDate || "")) ? String(data.inventoryHealthDate) : null;
+  const why = reasonsText(data.inventoryFallbackReasons) || "the account's Listings could not be validated";
+  return {
+    available: true, legacy: false, source, sourceShort: "FBA Inventory Health saved bridge",
+    label: `FBA Inventory Health snapshot ${date || "(date unavailable)"} (saved, no longer refreshed — temporary bridge: ${why})`,
+    note: `This account's saved Listings could not be used (${why}), so FBA stock comes from its last saved FBA Inventory Health snapshot${date ? ` of ${date}` : ""} — a temporary read-only bridge. FBA Inventory Health is no longer refreshed: those figures are as of that snapshot and may have changed since, and its other metrics (days of supply, run rate, competitive prices) are not shown.`,
+    when: date, ageDays: date ? daysBefore(date, data.asOf) : null, stale: true,
+    asOfPhrase: date ? `as of the saved FBA Inventory Health snapshot of ${date}, may have changed since` : null,
+  };
+}
+
+const knownQuantity = (v) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null);
+
+/* ==================================================================== */
 /* Sales Movers                                                          */
 /* ==================================================================== */
 
@@ -202,9 +331,13 @@ export function decomposeSalesChange(recent, prior) {
 
 export function buildSalesMoversRows(data, selectedBrand) {
   if (!data || !Array.isArray(data.rows)) return [];
+  const stockState = insightInventoryState(data);
   return data.rows
     .filter((row) => selectedBrand === "ALL" || row.brand === selectedBrand)
-    .map((row) => {
+    .map((sourceRow) => {
+      // A pre-phase-2 row's `inventory` (FBA Inventory Health, read as 0 when absent) is dropped here so no consumer --
+      // table, CSV, insight, Priority Feed -- can read it.
+      const { inventory: _legacyInventory, ...row } = sourceRow;
       const recent = row.recent || {};
       const prior = row.prior || {};
       const salesDelta = (Number(recent.sales) || 0) - (Number(prior.sales) || 0);
@@ -232,10 +365,26 @@ export function buildSalesMoversRows(data, selectedBrand) {
       const adsMixed = Boolean(row.ads?.mixedCurrency);
       const adSpendDelta = adsMixed ? null : (Number(row.ads?.recentSpend) || 0) - (Number(row.ads?.priorSpend) || 0);
       const adSalesDelta = adsMixed ? null : (Number(row.ads?.recentSales) || 0) - (Number(row.ads?.priorSales) || 0);
-      const stockedOut = row.inventory ? Number(row.inventory.available) === 0 : null;
+      // The account's selected FBA stock source. null = Unavailable (never 0). A merchant-fulfilled ("mfn-only") ASIN, an
+      // ASIN absent from the source and a conflicting ASIN are never a stockout: stockedOut is true ONLY for a listed FBA
+      // ASIN whose FBA available is a KNOWN 0. No Health-only metric (days of supply, inbound shipped + received) exists:
+      // FBA Inventory Health is no longer requested, and a saved-bridge snapshot carries only available + inbound.
+      // A pre-cutover snapshot's `stock.health` extras are dropped here so no consumer (table, CSV, insight, feed) reads them.
+      const rawStock = stockState.available && row.stock && typeof row.stock === "object" ? row.stock : null;
+      const stock = rawStock ? (({ health: _retiredHealthMetrics, ...rest }) => rest)(rawStock) : null;
+      const usable = !!stock && stock.listed === true && !stock.conflict;
+      const fbaContext = usable ? (stock.fbaContext || null) : null;
+      const fbaAvailable = usable && fbaContext === "fba" ? knownQuantity(stock.fbaAvailable) : null;
+      const fbaInbound = usable && fbaContext === "fba" ? knownQuantity(stock.fbaInbound) : null;
+      const stockedOut = stock ? (usable && fbaContext === "fba" && fbaAvailable === 0) : null;
 
       return {
         ...row,
+        stock,
+        stockSource: stockState.available ? stockState.source : null,
+        fbaContext,
+        fbaAvailable,
+        fbaInbound,
         salesDelta,
         salesDeltaPct: prior.sales > 0 ? (salesDelta / prior.sales) * 100 : null,
         unitsDelta,
@@ -284,6 +433,8 @@ export function buildSalesMoversInsights(data, rows, currency) {
     lagDays: data.lagDays,
   });
   const priorTotal = rows.reduce((sum, row) => sum + (Number(row.prior?.sales) || 0), 0);
+  const stockState = insightInventoryState(data);
+  const fallback = stockState.source === "health-fallback";
   const insights = [];
 
   for (const row of rows) {
@@ -291,32 +442,45 @@ export function buildSalesMoversInsights(data, rows, currency) {
     const exposure = Math.abs(row.salesDelta);
     const share = priorTotal > 0 ? exposure / priorTotal : 0;
 
-    // A stockout is the one cause this report can state on its own evidence:
-    // the live snapshot says zero available while the week sold units.
-    if (row.stockedOut && (Number(row.recent.units) || 0) > 0) {
+    // A stockout is the one cause this report can state on its own evidence: the account's stock source reports a
+    // KNOWN zero FBA available for a listed FBA ASIN that sold units this week. The claim is DATED (asOfPhrase) and
+    // QUALIFIED: a Listings snapshot older than this report, and every saved-bridge figure, "may have changed since"
+    // (medium confidence). Unknown / absent / merchant-fulfilled stock never raises it, nor stock with no observation time.
+    if (row.stockedOut === true && stockState.available && stockState.asOfPhrase && (Number(row.recent.units) || 0) > 0) {
+      const inbound = row.fbaInbound;
       insights.push(makeInsight({
         id: `movers-stockout-${row.asin}`,
         reportKey: "sales-movers",
         reportLabel: SALES_MOVERS_LABEL,
         category: "stockout",
         severity: severityFromExposure({ share: priorTotal > 0 ? (Number(row.recent.sales) || 0) / priorTotal : 0, moneyAtRisk: Number(row.recent.sales) || 0 }),
-        title: `${label} sold ${Math.round(Number(row.recent.units) || 0)} units this week but FBA stock is now zero`,
+        title: `${label} sold ${Math.round(Number(row.recent.units) || 0)} units this week; ${stockState.sourceShort} (${stockState.asOfPhrase}) showed zero FBA available`,
         asin: row.asin, brand: row.brand, entityLabel: label,
         evidence: [
           { label: "Units, last 7 days", value: Math.round(Number(row.recent.units) || 0) },
           { label: "Sales, last 7 days", value: Number(row.recent.sales || 0).toFixed(2) },
-          { label: "FBA available", value: 0 },
-          { label: "Inbound units", value: Math.round(Number(row.inventory?.inbound) || 0) },
+          { label: `FBA available (${stockState.sourceShort})`, value: 0 },
+          fallback
+            ? { label: `FBA inbound, working + shipped + received (saved FBA Inventory Health snapshot ${stockState.when})`, value: inbound === null ? null : Math.round(inbound) }
+            : { label: "FBA inbound, all inbound states (Listings)", value: inbound === null ? null : Math.round(inbound) },
         ],
         moneyAtRisk: Number(row.recent.sales) || 0,
         moneyBasis: "last completed week's sales for this ASIN, which stops if the stockout continues",
         currency,
-        confidence: "high",
-        freshness: `FBA snapshot ${data.inventorySnapshotDate || "unavailable"} · ${freshness}`,
-        why: "The latest FBA Inventory Health snapshot reports zero available units for an ASIN that sold in the most recent completed week.",
-        action: (Number(row.inventory?.inbound) || 0) > 0
-          ? "Inbound units already exist — confirm the shipment's arrival date and consider expediting."
-          : "Create a shipment now; see FBA Shipment Plan for the recommended quantity.",
+        confidence: stockState.stale ? "medium" : "high",
+        freshness: `${stockState.label} · ${freshness}`,
+        why: fallback
+          ? `This account's saved Listings could not be used, so its last saved FBA Inventory Health snapshot (a temporary bridge, no longer refreshed) is the stock source: it reports zero available units (${stockState.asOfPhrase}) for an ASIN that sold in the most recent completed week.`
+          : `The account's saved Listings snapshot (${stockState.asOfPhrase}) reports zero FBA available units (fba_quantity_available) for an ASIN that sold in the most recent completed week.`,
+        action: fallback
+          ? (inbound !== null && inbound > 0
+            ? "The saved FBA Inventory Health snapshot showed inbound units — check whether they have arrived since that snapshot (it is no longer refreshed), and expedite if not."
+            : "First check whether stock has arrived since the saved FBA Inventory Health snapshot (it is no longer refreshed) and any open inbound shipments in Seller Central, then see FBA Shipment Plan for the recommended quantity.")
+          : (inbound !== null && inbound > 0
+            ? "Listings shows FBA inbound units (its inbound total covers every inbound state, including shipments not yet shipped) — confirm the shipment's status and arrival date and consider expediting."
+            : inbound === 0
+              ? "Create a shipment now; see FBA Shipment Plan for the recommended quantity."
+              : "Check open inbound shipments in Seller Central, then see FBA Shipment Plan for the recommended quantity."),
       }));
     }
 
@@ -372,13 +536,14 @@ export function buildSalesMoversInsights(data, rows, currency) {
           { label: "Sales, last 7 days", value: Number(row.recent.sales || 0).toFixed(2) },
           { label: "Sales, prior 7 days", value: Number(row.prior.sales || 0).toFixed(2) },
           { label: "Sessions", value: `${Math.round(Number(row.prior.sessions) || 0)} → ${Math.round(Number(row.recent.sessions) || 0)}` },
-          { label: "Days of supply", value: row.inventory?.daysOfSupply ?? null },
+          { label: `FBA available (${stockState.sourceShort || "unavailable"})`, value: row.fbaAvailable === null || row.fbaAvailable === undefined ? null : Math.round(row.fbaAvailable) },
+          // No days-of-supply figure: it was an FBA Inventory Health metric, which is no longer requested.
         ],
         moneyAtRisk: row.salesDelta,
         moneyBasis: "week-over-week gain in ordered sales, which is what a stockout would forfeit",
         currency,
         confidence: "high",
-        freshness,
+        freshness: row.fbaAvailable === null || row.fbaAvailable === undefined ? freshness : `${freshness} · ${stockState.label}`,
         why: "This ASIN is one of the largest week-over-week gainers in the selected scope.",
         action: "Protect the win: confirm stock cover in FBA Shipment Plan before scaling ads on it.",
       }));
@@ -428,25 +593,31 @@ export const LISTING_GATES = {
  * Units genuinely on hand for this listing.
  *
  * These fields are different views of the same stock, so they are NEVER added.
- * FBA listings use the inventory snapshot (or the listing's own FBA figure when
- * the snapshot is missing); FBM listings use the merchant quantity.
+ * FBA listings use the account's selected stock source (`onHandFba`: validated
+ * saved Listings, else the dated read-only saved FBA Inventory Health bridge); a
+ * pre-phase-2 snapshot's Health `snapshotAvailable` and the listing record's own
+ * FBA field are never read for it. FBM listings use the merchant quantity. An
+ * unknown FBA quantity is null (Unavailable), never 0.
  */
-function unitsOnHand(row) {
+function unitsOnHand(row, stockState) {
   if (row.fulfillmentChannel === "FBM") return Number(row.listingQuantity) || 0;
-  if (row.snapshotAvailable !== null && row.snapshotAvailable !== undefined) return Number(row.snapshotAvailable) || 0;
-  return Number(row.fbaAvailable) || 0;
+  if (!stockState || !stockState.available) return null;
+  return knownQuantity(row.onHandFba);
 }
 
 export function buildListingHealthRows(data, selectedBrand) {
   if (!data || !Array.isArray(data.rows)) return [];
+  const stockState = insightInventoryState(data);
   return data.rows
     .filter((row) => selectedBrand === "ALL" || row.brand === selectedBrand)
-    .map((row) => {
+    .map((sourceRow) => {
+      // A pre-phase-2 row's `snapshotAvailable` (FBA Inventory Health, read without a source decision) is dropped.
+      const { snapshotAvailable: _legacySnapshotAvailable, ...row } = sourceRow;
       const issues = Array.isArray(row.issues) ? row.issues : [];
       const errors = issues.filter((issue) => issue.severity === "ERROR");
       const warnings = issues.filter((issue) => issue.severity === "WARNING" || issue.severity === "INFO");
       const status = String(row.listingStatus || "");
-      const onHand = unitsOnHand(row);
+      const onHand = unitsOnHand(row, stockState);
       const isActive = status.toLowerCase() === "active";
       const summary = row.summary || null;
       // Only treat a flag as absent when the source actually reported flags.
@@ -458,7 +629,7 @@ export function buildListingHealthRows(data, selectedBrand) {
       else if (suppressed) gate = "suppressed";
       else if (status === "Inactive") gate = "inactive";
       else if (status === "Incomplete") gate = "incomplete";
-      else if (onHand > 0 && (!isActive || noBuyableOffer)) gate = "stranded";
+      else if (onHand !== null && onHand > 0 && (!isActive || noBuyableOffer)) gate = "stranded";
       else if (isActive && (row.price === null || Number(row.price) <= 0)) gate = "no_price";
       else if (warnings.length) gate = "warning";
 
@@ -471,6 +642,8 @@ export function buildListingHealthRows(data, selectedBrand) {
         suppressed: Boolean(suppressed),
         noBuyableOffer,
         unitsOnHand: onHand,
+        // FBA on-hand comes from the account's stock source (dated); FBM from the listing's own merchant quantity.
+        unitsOnHandSource: row.fulfillmentChannel === "FBM" ? "merchant" : (onHand === null ? null : stockState.source),
         salesAtRisk: gate === "ok" ? 0 : Number(row.sales30d) || 0,
       };
     });
@@ -483,6 +656,7 @@ export function buildListingHealthInsights(data, rows) {
     asOf: data.asOf,
     extra: data.issuesAvailable ? `listing issues from ${data.issuesSourceLabel}` : "listing issue codes unavailable",
   });
+  const stockState = insightInventoryState(data);
   const totalSales = rows.reduce((sum, row) => sum + (Number(row.sales30d) || 0), 0);
   const insights = [];
 
@@ -501,6 +675,10 @@ export function buildListingHealthInsights(data, rows) {
     if (row.gate === "stranded" && row.unitsOnHand > 0 && severity === "low") severity = "medium";
 
     const firstError = row.errors[0] || row.warnings[0] || null;
+    // FBA on-hand behind a stranded / inactive claim is DATED + QUALIFIED by its source (Listings refresh time or the
+    // saved Health bridge's snapshot date); a stale or bridge figure lowers confidence.
+    const fbaStockClaim = row.unitsOnHandSource === "listings" || row.unitsOnHandSource === "health-fallback";
+    const stockQualifier = fbaStockClaim && stockState.asOfPhrase ? ` (${stockState.sourceShort} ${stockState.asOfPhrase})` : "";
     insights.push(makeInsight({
       id: `listing-${row.gate}-${row.sku || row.asin}`,
       reportKey: "listing-health",
@@ -508,14 +686,14 @@ export function buildListingHealthInsights(data, rows) {
       category: row.gate,
       severity,
       title: row.gate === "stranded"
-        ? `${label} holds ${Math.round(row.unitsOnHand)} units with no buyable offer`
+        ? `${label} holds ${Math.round(row.unitsOnHand)} units with no buyable offer${stockQualifier}`
         : `${label} is ${row.gateMeta.label.toLowerCase()}${money > 0 ? ` and sold ${money.toFixed(0)} in the last 30 days` : ""}`,
       asin: row.asin, sku: row.sku, brand: row.brand, entityLabel: label,
       evidence: [
         { label: "Listing status", value: row.listingStatus || "unknown" },
         { label: "Fulfilment", value: row.fulfillmentChannel || "unknown" },
         { label: "Price", value: row.price === null ? "none" : Number(row.price).toFixed(2) },
-        { label: "Units on hand", value: Math.round(row.unitsOnHand) },
+        { label: fbaStockClaim ? `Units on hand (FBA, ${stockState.sourceShort})` : "Units on hand", value: row.unitsOnHand === null || row.unitsOnHand === undefined ? null : Math.round(row.unitsOnHand) },
         { label: "Sales, last 30 days", value: money.toFixed(2) },
         { label: "Units, last 30 days", value: Math.round(Number(row.units30d) || 0) },
         { label: "Amazon issue", value: firstError ? `${firstError.severity}${firstError.code ? ` ${firstError.code}` : ""}: ${firstError.message || ""}`.trim() : null },
@@ -526,9 +704,9 @@ export function buildListingHealthInsights(data, rows) {
       currency: row.currency,
       // Without the raw-issues table the gate rests on listing_status alone,
       // which is true but less specific, so confidence is medium not high.
-      confidence: data.issuesAvailable ? (firstError ? "high" : "medium") : "medium",
-      freshness,
-      why: row.gateMeta.blurb,
+      confidence: row.gate === "stranded" && fbaStockClaim && stockState.stale ? "medium" : (data.issuesAvailable ? (firstError ? "high" : "medium") : "medium"),
+      freshness: fbaStockClaim ? `${freshness} · ${stockState.label}` : freshness,
+      why: row.gate === "stranded" && stockQualifier ? `${row.gateMeta.blurb} On-hand FBA units${stockQualifier}.` : row.gateMeta.blurb,
       action: listingAction(row),
     }));
   }
@@ -634,40 +812,76 @@ export function buildListingHealthV3Insights(payload, selectedBrand = null) {
 
 const BUY_BOX_LABEL = "Buy Box Loss";
 
+// Buy Box cause attribution from the account's selected stock source (Listings inventory cutover):
+//   Listings source  -- stock: an FBA-channel SKU whose fba_quantity_available is a KNOWN 0; fulfilment:
+//                       listing_fulfillment_channel DEFAULT (merchant-fulfilled).
+//   saved Health bridge -- the last saved FBA Inventory Health snapshot (a temporary read-only bridge, DATED and
+//                       QUALIFIED): stock (a known zero available on a SKU it lists), and fulfilment only when the
+//                       account's Listings prove the SKU merchant-fulfilled only (a SKU absent from Health is unknown --
+//                       never inferred FBM).
+//   otherwise        -- unconfirmed. A SKU absent from the source, a conflicting SKU or an unknown quantity is NEVER read as
+//                       merchant-fulfilled or out of stock.
+// Competitive prices and the 30-day run rate were FBA Inventory Health metrics: FBA Inventory Health is no longer
+// requested, so NO price cause (and no low-stock-vs-run-rate cause) is evaluated, and no Listings price is substituted.
+const PRICE_NOT_EVALUATED_NOTE = "Competitive prices are not evaluated: they came from FBA Inventory Health, which is no longer refreshed (no Listings price is substituted).";
+
 export function buildBuyBoxRows(data, selectedBrand, thresholdPct) {
   if (!data || !Array.isArray(data.rows)) return [];
   const threshold = Number.isFinite(thresholdPct) ? thresholdPct : 90;
+  const stockState = insightInventoryState(data);
+  const fallback = stockState.source === "health-fallback";
   return data.rows
     .filter((row) => selectedBrand === "ALL" || row.brand === selectedBrand)
-    .map((row) => {
+    .map((sourceRow) => {
+      // A pre-phase-2 row's FBA Inventory Health fields (read without a source decision) are dropped so no consumer
+      // (table, CSV, insight, Priority Feed) can read them.
+      const {
+        price: _legacyPrice, available: _legacyAvailable, unitsShippedT30: _legacyRunRate, inventoryKnown: _legacyKnown,
+        ...row
+      } = sourceRow;
       const buyBoxPct = Number(row.buyBoxPct);
       const lossFraction = Math.max(0, Math.min(1, 1 - buyBoxPct / 100));
       const salesAtRisk = (Number(row.sales) || 0) * lossFraction;
-      const effectivePrice = row.price?.salesPrice ?? row.price?.yourPrice ?? null;
-      const featured = row.price?.featuredOfferPrice ?? null;
-      const lowest = row.price?.lowestPriceNewPlusShipping ?? null;
-      const available = row.available;
-      const dailyRate = row.unitsShippedT30 ? Number(row.unitsShippedT30) / 30 : null;
+      // A pre-cutover snapshot's `stock.health` (competitive prices / run rate) is dropped: never shown, never a cause.
+      const rawStock = stockState.available && row.stock && typeof row.stock === "object" ? row.stock : null;
+      const stock = rawStock ? (({ health: _retiredHealthMetrics, ...rest }) => rest)(rawStock) : null;
+      const usable = !!stock && stock.listed === true && !stock.conflict;
+      const channel = usable && stock.channel ? String(stock.channel).toUpperCase() : null;
+      const mfnOnly = usable && stock.fbaContext === "mfn-only";
+      const fulfillmentChannel = mfnOnly ? "FBM" : (channel ? (channel === "DEFAULT" ? "FBM" : "FBA") : null);
+      const fbaAvailable = usable && stock.fbaContext === "fba" ? knownQuantity(stock.fbaAvailable) : null;
+      const per = `Per the saved FBA Inventory Health snapshot${stockState.when ? ` of ${stockState.when}` : ""} (a temporary bridge; may have changed since)`;
+      // An FBA SKU: a Listings non-DEFAULT channel, or any SKU the saved Health bridge lists (Health lists FBA inventory).
+      const fbaSku = usable && stock.fbaContext === "fba" && (fallback || (channel && channel !== "DEFAULT"));
 
-      // Cause gates, checked in order, and each one requires its evidence to be
-      // present. When nothing is present the cause is explicitly unconfirmed.
       let cause = "unconfirmed";
-      let causeDetail = "The price and stock fields needed to explain this loss are not present on the latest FBA snapshot for this SKU.";
-      if (effectivePrice !== null && featured !== null && effectivePrice > featured * 1.001) {
-        cause = "price";
-        causeDetail = `Your offer is ${(effectivePrice - featured).toFixed(2)} above the featured offer price.`;
-      } else if (available !== null && available === 0) {
+      let causeDetail;
+      if (!stock) {
+        causeDetail = stockState.legacy
+          ? "This saved snapshot predates the per-account stock source, so no cause is named."
+          : `Stock and fulfilment evidence is unavailable for this account (${stockState.note || "no stock source"}), so no cause is named. ${PRICE_NOT_EVALUATED_NOTE}`;
+      } else if (!stock.listed) {
+        causeDetail = `This SKU is not in the account's ${fallback ? "saved FBA Inventory Health snapshot" : "saved Listings snapshot"}, so its stock and fulfilment channel are unknown; no cause is named. ${PRICE_NOT_EVALUATED_NOTE}`;
+      } else if (stock.conflict) {
+        causeDetail = `This SKU's Listings rows disagree, so its stock and fulfilment channel are Unavailable; no cause is named. ${PRICE_NOT_EVALUATED_NOTE}`;
+      } else if (fbaSku && fbaAvailable === 0 && !stockState.asOfPhrase) {
+        causeDetail = `The stock source reports zero FBA available units for this SKU but carries no observation time, so no stock cause is named. ${PRICE_NOT_EVALUATED_NOTE}`;
+      } else if (fbaSku && fbaAvailable === 0) {
         cause = "stock";
-        causeDetail = "The latest FBA snapshot reports zero available units, so the offer cannot be featured.";
-      } else if (available !== null && dailyRate !== null && dailyRate > 0 && available < dailyRate * 3) {
-        cause = "stock";
-        causeDetail = `Only ${Math.round(available)} units are available against a 30-day run rate of ${dailyRate.toFixed(1)} per day.`;
-      } else if (effectivePrice !== null && lowest !== null && effectivePrice > lowest * 1.001) {
-        cause = "price";
-        causeDetail = `Your offer is above the lowest new+shipping price by ${(effectivePrice - lowest).toFixed(2)}.`;
-      } else if (!row.inventoryKnown && (Number(row.units) || 0) > 0) {
+        causeDetail = `${stockState.sourceShort} (${stockState.asOfPhrase}) reports zero FBA available units for this FBA SKU, so the offer could not be featured then.`;
+      } else if (mfnOnly || (!fallback && channel === "DEFAULT")) {
         cause = "fulfilment";
-        causeDetail = "This SKU sold but has no FBA Inventory Health row, which usually means it is merchant-fulfilled; FBM offers lose the featured offer to Prime competitors.";
+        causeDetail = mfnOnly && fallback
+          ? "The account's Listings report this SKU as merchant-fulfilled only (no FBA stock); merchant-fulfilled offers often lose the featured offer to Prime (FBA) offers."
+          : "Listings reports this SKU's fulfillment channel as DEFAULT (merchant-fulfilled); merchant-fulfilled offers often lose the featured offer to Prime (FBA) offers.";
+      } else if (!fallback && !channel) {
+        causeDetail = `Listings does not report this SKU's fulfillment channel, so no cause is named. ${PRICE_NOT_EVALUATED_NOTE}`;
+      } else if (fbaAvailable === null) {
+        causeDetail = `This SKU's FBA available quantity is Unavailable in its stock source, so no cause is named. ${PRICE_NOT_EVALUATED_NOTE}`;
+      } else {
+        causeDetail = fallback
+          ? `${per}, ${Math.round(fbaAvailable)} FBA units were available, so stock does not explain the loss. ${PRICE_NOT_EVALUATED_NOTE}`
+          : `Listings shows ${Math.round(fbaAvailable)} FBA available units (${stockState.asOfPhrase || "refresh time unavailable"}), so stock does not explain the loss. ${PRICE_NOT_EVALUATED_NOTE}`;
       }
 
       return {
@@ -675,11 +889,10 @@ export function buildBuyBoxRows(data, selectedBrand, thresholdPct) {
         buyBoxPct,
         lossFraction,
         salesAtRisk,
-        effectivePrice,
-        featuredOfferPrice: featured,
-        lowestPrice: lowest,
-        priceGap: effectivePrice !== null && featured !== null ? effectivePrice - featured : null,
-        dailyRate,
+        stock,
+        stockSource: stockState.available ? stockState.source : null,
+        fbaAvailable,
+        fulfillmentChannel,
         cause,
         causeDetail,
         belowThreshold: buyBoxPct < threshold,
@@ -688,10 +901,9 @@ export function buildBuyBoxRows(data, selectedBrand, thresholdPct) {
 }
 
 const BUY_BOX_ACTIONS = {
-  price: "Reprice to at or below the featured offer, or confirm the margin floor in SKU P&L before matching.",
   stock: "Restock this SKU — the featured offer cannot be won without available units. See FBA Shipment Plan.",
   fulfilment: "Review fulfilment: consider moving this SKU to FBA, or confirm Prime eligibility and handling time for the FBM offer.",
-  unconfirmed: "Investigate manually in Seller Central: compare your offer against the current featured offer and confirm stock and fulfilment status.",
+  unconfirmed: "Investigate manually in Seller Central: compare your offer and price against the current featured offer and confirm stock and fulfilment status.",
 };
 
 /* ==================================================================== */
@@ -1603,10 +1815,12 @@ export function buildReturnsInsights(data, rows) {
 
 export function buildBuyBoxInsights(data, rows, thresholdPct) {
   if (!data) return [];
+  const stockState = insightInventoryState(data);
+  const fallback = stockState.source === "health-fallback";
   const freshness = freshnessNote({
     sourceLabel: data.sourceLabel,
     asOf: data.observedWindow?.to || data.asOf,
-    extra: `prices from the ${data.inventorySnapshotDate || "unavailable"} FBA snapshot`,
+    extra: stockState.available ? `stock and fulfilment channel: ${stockState.label}; competitive prices not evaluated` : "FBA stock unavailable; competitive prices not evaluated",
   });
   const totalSales = rows.reduce((sum, row) => sum + (Number(row.sales) || 0), 0);
   const insights = [];
@@ -1630,16 +1844,15 @@ export function buildBuyBoxInsights(data, rows, thresholdPct) {
       evidence: [
         { label: "Buy Box share", value: `${row.buyBoxPct.toFixed(1)}% (${row.buyBoxBasis}, ${row.buyBoxDays} of ${row.windowDays} days observed)` },
         { label: `Sales, last ${row.windowDays} days`, value: Number(row.sales || 0).toFixed(2) },
-        { label: "Your effective price", value: row.effectivePrice === null ? null : row.effectivePrice.toFixed(2) },
-        { label: "Featured offer price", value: row.featuredOfferPrice === null ? null : row.featuredOfferPrice.toFixed(2) },
-        { label: "Lowest new + shipping", value: row.lowestPrice === null ? null : row.lowestPrice.toFixed(2) },
-        { label: "FBA available", value: row.available === null ? null : Math.round(row.available) },
-        { label: "30-day run rate", value: row.dailyRate === null ? null : `${row.dailyRate.toFixed(1)} units/day` },
+        { label: `FBA available (${stockState.sourceShort || "unavailable"})`, value: row.fbaAvailable === null || row.fbaAvailable === undefined ? null : Math.round(row.fbaAvailable) },
+        { label: `Fulfillment channel (${fallback ? "Listings identity" : "Listings"})`, value: row.fulfillmentChannel || null },
+        // No competitive prices / run rate: they were FBA Inventory Health metrics, which is no longer requested.
       ],
       moneyAtRisk: row.salesAtRisk,
       moneyBasis: `sales x (1 − Buy Box share) over the last ${row.windowDays} days for this SKU`,
       currency: row.currency,
-      confidence: row.cause === "unconfirmed" ? "low" : "high",
+      // A cause resting on a saved-bridge figure, or on a Listings snapshot older than this report, is qualified.
+      confidence: row.cause === "unconfirmed" ? "low" : (fallback || (row.cause === "stock" && stockState.stale) ? "medium" : "high"),
       freshness,
       why: `Buy Box share is below the ${thresholdPct}% threshold on a SKU that is still selling. ${row.causeDetail}`,
       action: BUY_BOX_ACTIONS[row.cause],

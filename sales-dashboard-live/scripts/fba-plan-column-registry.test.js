@@ -55,11 +55,12 @@ writeSync(1, "fba-plan-column-registry\n");
   const sharedSig = FBA_PLAN_COLUMNS.map(norm).join("\n");
   const appSig = parsed.map(norm).join("\n");
   ok("drift: ids/groups/locked/awd + ORDER are byte-identical between the shared registry and App.jsx", sharedSig === appSig);
-  // The client's inline PLAN_DEFAULT_HIDDEN_COLS must equal the shared default.
-  const dm = /const PLAN_DEFAULT_HIDDEN_COLS = \[([^\]]*)\]/.exec(src);
-  ok("drift: located App.jsx PLAN_DEFAULT_HIDDEN_COLS", !!dm);
-  const appDefaults = (dm[1].match(/"([^"]+)"/g) || []).map((s) => s.replace(/"/g, ""));
-  ok("drift: the default hidden set matches the shared registry", appDefaults.join(",") === [...PLAN_DEFAULT_HIDDEN_COLS].join(","));
+  // The default hidden set has ONE source: the shared registry, read by the client hook. App.jsx keeps no inline
+  // mirror (the old one was unused and listed the retired FBA Inventory Health bucket columns).
+  ok("drift: App.jsx keeps no inline PLAN_DEFAULT_HIDDEN_COLS mirror", !/const PLAN_DEFAULT_HIDDEN_COLS = \[/.test(src));
+  const hook = readFileSync(new URL("../src/lib/use-fba-plan-columns.js", import.meta.url), "utf8");
+  ok("drift: the client hook reads the shared PLAN_DEFAULT_HIDDEN_COLS", /import \{[^}]*\bPLAN_DEFAULT_HIDDEN_COLS\b[^}]*\} from "\.\.\/\.\.\/lib\/fba-plan-columns\.js"/.test(hook));
+  ok("drift: the shared default hides no column (every Listings inventory column is shown by default)", PLAN_DEFAULT_HIDDEN_COLS.length === 0);
 })();
 
 /* ===================== SKU MOVEMENT regression (source guards) ===================== */

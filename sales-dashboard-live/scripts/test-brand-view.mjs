@@ -33,6 +33,9 @@ const {
   asinBrandFromSalesPayload,
   isCompactInventorySnapshot,
   selectAuthoritativeInventorySnapshot,
+  inventoryEvidenceOf,
+  brandViewHealthBridgeFloor,
+  compactInventoryFromFbaPlanPayload,
   isStrictCalendarDate,
   addDays,
   monthBack,
@@ -40,6 +43,9 @@ const {
   BRAND_VIEW_VERSION,
   BRAND_INVENTORY_SNAPSHOT_KEY,
   BRAND_INVENTORY_REPORT_VERSION,
+  assembleBrandViewPayload,
+  euPoolAllMarketRule,
+  EU_POOL_ALL_MARKET_WITHHELD_REASON,
 } = await import("../lib/server/reports/brand-view.js");
 
 const { assertAdmin, DashboardAccessError } = await import("../lib/server/supabase.js");
@@ -62,6 +68,10 @@ const {
   shareOf,
   tacos,
   unconvertibleCurrencies,
+  inventorySourceLabel,
+  inventoryFreshnessSummary,
+  inventoryFreshnessText,
+  euPoolAllMarketRule: clientEuPoolAllMarketRule,
 } = await import("../src/lib/brand-view.js");
 
 const { fxCacheDecision, fxRatesFromProviderPayload, FX_DISPLAY_CURRENCIES } = await import("../lib/server/fx.js");
@@ -142,7 +152,8 @@ await asyncTest("temporary Brand View source refresh is primary-only, sequential
   });
   assert.deepEqual(calls.find((c) => c.ids === "A1" && c.action === "brand-inventory"), {
     action: "brand-inventory",
-    reportVersion: "brand-inventory-shared-v1",
+    // v2 = Listings inventory cutover phase 2 (the browser constant equals the server BRAND_INVENTORY_REPORT_VERSION).
+    reportVersion: "brand-inventory-shared-v2",
     ids: "A1",
     to: "2026-08-12",
   });
@@ -187,10 +198,22 @@ const SNAPSHOTS = {
       ],
     },
   },
+  // A PHASE-2 saved FBA Shipment Plan (Listings inventory cutover): the account's validated Listings were the source
+  // (inventorySource "listings", inventoryModel "listings-v1"), so no inventory date is claimed (inventoryDate null) and
+  // the freshness is the Listings fetch time. Brand View consumes inventoryByBrandCountry per marketplace. IT and PL are
+  // BOTH pan-EU pool marketplaces with positive stock, so the EU all-market rule withholds the brand's all-market total.
   [`fba-plan|${ACCOUNT_A}`]: {
     source_refreshed_at: "2026-07-28T05:00:00.000Z",
     payload: {
-      inventoryDate: "2026-07-28",
+      inventoryModel: "listings-v1",
+      inventorySource: "listings",
+      inventoryListingsReasons: [],
+      inventoryHealthDate: null,
+      inventoryDate: null,
+      listingsRefreshedAt: "2026-07-28T04:30:00.000Z",
+      inventoryAvailable: true,
+      inventoryUnavailableReason: null,
+      inventoryConflicts: [],
       rows: [
         { asin: "B00BEBI001", brand: "Bebi Born", fbaAvailable: 700 },
         { asin: "B00BEBI002", brand: "Bebi Born", fbaAvailable: 195 },
@@ -355,172 +378,322 @@ test("brand names are read from catalogBrands and from row brands alike", () => 
   assert.deepEqual(brandNamesFromPayload({ rows: [{ brand: "B" }, { product_brand: "C" }] }).sort(), ["B", "C"]);
 });
 
-test("inventory is per marketplace when the saved plan has it, and account-wide otherwise", () => {
-  const detailed = brandInventory(SNAPSHOTS[`fba-plan|${ACCOUNT_A}`].payload, "Bebi Born", "IT");
+// assemble ONE account's slice(s) into the Brand View payload (account scope).
+const assembleFor = (slices, scope = "account") => assembleBrandViewPayload({ slices, brand: "Bebi Born", asOf: "2026-07-28", scope });
+
+test("inventory is per marketplace from a phase-2 payload; the account all-market total obeys the EU rule; an unknown or unrecognized payload is unavailable", () => {
+  const plan = SNAPSHOTS[`fba-plan|${ACCOUNT_A}`].payload;
+  const detailed = brandInventory(plan, "Bebi Born", "IT", "fba-plan");
   assert.equal(detailed.scope, "country");
+  assert.equal(detailed.source, "fba-plan");
+  assert.equal(detailed.inventorySource, "listings");
+  assert.equal(detailed.listingsRefreshedAt, plan.listingsRefreshedAt);
+  assert.equal(detailed.healthDate, null);
+  assert.equal(detailed.unknown, false);
   assert.equal(detailed.byCountry.get("IT"), 883);
+  assert.equal(detailed.byCountry.get("UK"), 912);
   assert.equal(detailed.byCountry.get("PL"), 368);
   assert.equal(detailed.byCountry.get("DE"), undefined);
-  assert.equal(detailed.accountTotal, 883 + 912 + 368);
+  // IT and PL are BOTH pan-EU pool marketplaces with positive stock: the account's all-market total is WITHHELD (pooled
+  // stock could be counted twice), while each marketplace keeps its own figure.
+  assert.equal(detailed.allMarketWithheld, true);
+  assert.equal(detailed.accountTotal, null, "never 883 + 912 + 368 (pooled EU stock may be counted twice)");
+  // Without the second pool marketplace the total is a plain sum (one pool marketplace + UK).
+  const onePool = brandInventory({ ...plan, inventoryByBrandCountry: plan.inventoryByBrandCountry.filter((e) => e.country !== "PL") }, "Bebi Born", "IT", "fba-plan");
+  assert.deepEqual([onePool.allMarketWithheld, onePool.accountTotal], [false, 883 + 912]);
 
-  const legacy = brandInventory({ rows: [{ brand: "Bebi Born", fbaAvailable: 40 }] }, "Bebi Born", "IT");
-  assert.equal(legacy.scope, "account");
-  assert.equal(legacy.accountTotal, 40);
-  assert.equal(legacy.byCountry.size, 0, "a legacy payload must not invent a country");
+  // The former account-wide fallback is gone: a rows-only legacy payload is unavailable (never an undated value).
+  for (const [label, payload] of [
+    ["a rows-only legacy payload", { rows: [{ brand: "Bebi Born", fbaAvailable: 40 }] }],
+    ["an unrecognized model", { ...plan, inventoryModel: "health-v0" }],
+    ["an unrecognized source", { ...plan, inventorySource: "guessed" }],
+    ["a phase-2 payload that is not available", { ...plan, inventoryAvailable: false, inventoryUnavailableReason: "no-validated-listings;no-fba-inventory-health-snapshot" }],
+    ["a phase-2 'unavailable' source", { ...plan, inventorySource: "unavailable", inventoryAvailable: false }],
+    ["a legacy Health payload without a date", { inventoryAvailable: true, inventoryByBrandCountry: [{ country: "IT", brand: "Bebi Born", fbaAvailable: 9 }] }],
+    ["no payload", null],
+  ]) {
+    const inv = brandInventory(payload, "Bebi Born", "IT");
+    assert.equal(inv.scope, "unavailable", label);
+    assert.equal(inv.accountTotal, null, label + ": never a number");
+    assert.equal(inv.byCountry.size, 0, label + ": no country is invented");
+  }
 
-  const none = brandInventory(null, "Bebi Born", "IT");
-  assert.equal(none.scope, "unavailable");
-  assert.equal(none.accountTotal, null);
+  // A LEGACY FBA Inventory Health payload (the production v1 compact / a pre-phase-2 fba-plan) is served as Health,
+  // labelled with its snapshot date -- never presented as Listings.
+  const legacy = brandInventory({ inventoryDate: "2026-07-27", inventoryAvailable: true, inventoryByBrandCountry: [{ country: "IT", brand: "Bebi Born", fbaAvailable: 500, skuCount: 2 }] }, "Bebi Born", "IT", "fba-plan");
+  assert.deepEqual([legacy.scope, legacy.inventorySource, legacy.healthDate, legacy.listingsRefreshedAt, legacy.accountTotal], ["country", "health-legacy", "2026-07-27", null, 500]);
+
+  // A null (unknown / conflicting SKU) bucket makes THAT country null and withholds the account total.
+  const unknown = brandInventory({ ...plan, inventoryByBrandCountry: [
+    { country: "IT", brand: "Bebi Born", fbaAvailable: null, skuCount: 2 },
+    { country: "UK", brand: "Bebi Born", fbaAvailable: 912, skuCount: 3 },
+  ] }, "Bebi Born", "IT", "fba-plan");
+  assert.deepEqual([unknown.scope, unknown.unknown, unknown.byCountry.get("IT"), unknown.byCountry.get("UK"), unknown.accountTotal], ["country", true, null, 912, null]);
+
+  // An `unattributed` marker (Listings stock on SKUs with no ASIN) makes its marketplace UNKNOWN for EVERY brand --
+  // even a brand with no bucket there -- never "no stock".
+  const marked = brandInventory({ ...plan, inventoryByBrandCountry: [
+    { country: "UK", brand: "Bebi Born", fbaAvailable: 912, skuCount: 3 },
+    { country: "IT", brand: null, fbaAvailable: null, skuCount: 4, unattributed: true },
+  ] }, "Bebi Born", "IT", "fba-plan");
+  assert.deepEqual([marked.byCountry.get("IT"), marked.byCountry.get("UK"), marked.unknown, marked.accountTotal], [null, 912, true, null], "the unattributed marketplace is unknown");
 });
 
-/* ============================== 2b. compact Brand View FBA inventory bridge ==============================
-   The temporary admin Brand View inventory refresh: a minimal FBA Inventory Health fold with STRICT row
-   validation, an AUTHORITATIVE compact snapshot, and NO live Product Catalog fallback. Window is asOf-10d..asOf.
+test("EU all-market rule: two positive pool marketplaces withhold; one pool marketplace + UK sums; a 0 / unknown pool marketplace never triggers", () => {
+  const r = (entries) => euPoolAllMarketRule(entries);
+  assert.deepEqual(r([["DE", 5], ["FR", 3]]), { withheld: true, poolMarkets: ["DE", "FR"], reason: EU_POOL_ALL_MARKET_WITHHELD_REASON });
+  assert.equal(r([["DE", 5], ["UK", 7], ["US", 9], ["IN", 1]]).withheld, false, "one pool marketplace + non-pool marketplaces add normally");
+  assert.equal(r([["DE", 5], ["GB", 7]]).withheld, false, "GB (UK) is not in the pan-EU pool");
+  assert.equal(r([["DE", 5], ["FR", 0]]).withheld, false, "a pool marketplace with 0 stock does not trigger the rule");
+  assert.equal(r([["DE", 5], ["FR", null]]).withheld, false, "an unknown pool marketplace is not 'positive' (its own unknown rule withholds the total)");
+  assert.equal(r(new Map([["SE", 1], ["PL", 2]])).withheld, true, "a Map works (SE + PL)");
+  assert.equal(r([{ country: "be", fbaAvailable: 1 }, { country: "IE", fbaAvailable: 4 }]).withheld, true, "objects + case-insensitive codes");
+  assert.match(EU_POOL_ALL_MARKET_WITHHELD_REASON, /two or more pan-EU marketplaces report positive/);
+});
+
+/* ============================== 2b. compact Brand View FBA inventory (phase 2) ==============================
+   The compact brand-inventory snapshot is built per account from selectAccountInventory (lib/server/inventory-source.js):
+   the account's SAVED canonical Listings rows when they are VALIDATED, else its last FBA Inventory Health snapshot as a
+   clearly labelled fallback, else Unavailable. FBA Inventory Health keeps running in phase 2. Rolled up by the shared
+   brandCountryInventory over selectionFoldView. Structural problems refuse the whole payload (previous snapshot kept).
 */
 
 const INV_TO = "2026-07-28";
-const INV_FROM = "2026-07-18"; // asOf - 10 days (PLAN_INVENTORY_LOOKBACK_DAYS)
+const INV_FROM = "2026-07-18";
+const INV_REFRESHED_AT = "2026-07-28T03:15:00.000Z"; // the Listings fetch time (validated_at of the saved Listings pointer)
 
-// Raw FBA Inventory Health rows for one account. Two marketplaces, a genuine zero,
-// a Nordfell row that must never leak into Bebi Born, and an OLDER (in-window) date
-// row that the "latest validated date only" rule must ignore.
 const INV_BRAND_BY_ASIN = new Map([
-  ["B00BEBI001", "Bebi Born"], ["B00BEBI002", "Bebi Born"],
-  ["B00BEBI003", "Bebi Born"], ["B00NORD001", "Nordfell"],
+  ["B00BEBI001", "Bebi Born"], ["B00BEBI002", "Bebi Born"], ["B00BEBI003", "Bebi Born"],
+  ["B00NORD001", "Nordfell"], ["B00MFN0001", "Merchant Only"],
 ]);
-const INV_ROWS = () => [
-  { date: "2026-07-28", marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "IT-1", available: 600 },
-  { date: "2026-07-28", marketplace_country_code: "IT", child_asin: "B00BEBI002", sku: "IT-2", available: 283 },
-  { date: "2026-07-28", marketplace_country_code: "UK", child_asin: "B00BEBI001", sku: "UK-1", available: 912 },
-  { date: "2026-07-28", marketplace_country_code: "DE", child_asin: "B00BEBI003", sku: "DE-1", available: 0 },
-  { date: "2026-07-28", marketplace_country_code: "IT", child_asin: "B00NORD001", sku: "IT-9", available: 4000 },
-  { date: "2026-07-27", marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "IT-old", available: 99999 },
+// One IT account's EXPANDED Listings rows (the three new inventory fields present as own keys). A consistent DUPLICATE
+// listing row (IT-2) that must be merged, never summed; a genuine FBA zero (IT-3); a Nordfell row that must never leak
+// into Bebi Born; and a merchant-fulfilled-only product (DEFAULT channel, every FBA quantity a known 0).
+const lrow = (sku, asin, available, over = {}) => ({
+  sku, child_asin: asin, fnsku: "X-" + sku, listing_fulfillment_channel: "AMAZON_EU", marketplace_country_code: "IT",
+  fba_quantity_available: available, fba_quantity_inbound: 0, fba_quantity_reserved: 0, fba_quantity_fc_transfer: 0, ...over,
+});
+const LISTINGS_ROWS = () => [
+  lrow("IT-1", "B00BEBI001", 600, { fba_quantity_inbound: 40, fba_quantity_reserved: 5 }),
+  lrow("IT-2", "B00BEBI002", 283),
+  lrow("IT-2", "B00BEBI002", 283), // the same listing reported twice (identical) -> merged, NEVER summed
+  lrow("IT-3", "B00BEBI003", 0),
+  lrow("IT-9", "B00NORD001", 4000),
+  lrow("IT-M", "B00MFN0001", 0, { listing_fulfillment_channel: "DEFAULT" }),
+];
+// The same account's saved FBA Inventory Health rows (as production persists them): two dates -- only the LATEST folds.
+const hrow = (date, sku, asin, available, over = {}) => ({ date, marketplace_country_code: "IT", sku, child_asin: asin, available, inbound_working: 0, inbound_shipped: 0, inbound_received: 0, ...over });
+const HEALTH_ROWS = () => [
+  hrow("2026-07-27", "IT-1", "B00BEBI001", 610),
+  hrow("2026-07-27", "IT-2", "B00BEBI002", 290),
+  hrow("2026-07-27", "IT-9", "B00NORD001", 3900),
+  hrow("2026-07-26", "IT-1", "B00BEBI001", 99999), // an OLDER date: never folded
 ];
 const buildInv = (over = {}) => buildBrandInventoryPayload({
-  accountId: ACCOUNT_A, invRows: INV_ROWS(), brandByAsin: INV_BRAND_BY_ASIN,
-  accountCountry: "IT", from: INV_FROM, to: INV_TO, rowLimit: 15000, ...over,
+  accountId: ACCOUNT_A, listingsRows: LISTINGS_ROWS(), healthRows: HEALTH_ROWS(), brandByAsin: INV_BRAND_BY_ASIN,
+  accountCountry: "IT", listingsRefreshedAt: INV_REFRESHED_AT, to: INV_TO, rowLimit: 15000, ...over,
 });
+const cellOf = (p, country, brand) => p.inventoryByBrandCountry.find((e) => e.country === country && e.brand === brand);
+// A Listings snapshot fetched BEFORE the cutover (no fba_quantity_inbound / _reserved / _fc_transfer keys): NOT validated.
+const preCutover = (rows) => rows.map((r) => { const c = { ...r }; delete c.fba_quantity_inbound; delete c.fba_quantity_reserved; delete c.fba_quantity_fc_transfer; return c; });
 
-/* ---- BLOCKER 1: strict FBA inventory row validation ---- */
-
-test("6/9/10. exact-window boundaries + available=0 accepted; folds ONLY the latest date, by country and exact brand", () => {
+test("phase 2 / Listings: VALIDATED Listings build the compact (duplicates merged, mfn-only not FBA stock); no date is claimed", () => {
   const p = buildInv();
-  assert.equal(p.inventoryDate, "2026-07-28", "latest snapshot date only");
+  assert.equal(p.inventoryModel, "listings-v1");
+  assert.equal(p.inventorySource, "listings");
+  assert.deepEqual(p.inventoryListingsReasons, []);
+  assert.equal(p.inventoryDate, null, "Listings has no date: no inventory day is ever claimed");
+  assert.equal(p.inventoryHealthDate, null);
+  assert.equal(p.listingsRefreshedAt, INV_REFRESHED_AT, "freshness = the Listings fetch time");
   assert.equal(p.inventoryAvailable, true);
-  const cell = (country, brand) => p.inventoryByBrandCountry.find((e) => e.country === country && e.brand === brand);
-  assert.equal(cell("IT", "Bebi Born").fbaAvailable, 883, "IT Bebi Born = 600 + 283, never the 99999 older-date row");
-  assert.equal(cell("IT", "Bebi Born").skuCount, 2);
-  assert.equal(cell("UK", "Bebi Born").fbaAvailable, 912);
-  assert.equal(cell("DE", "Bebi Born").fbaAvailable, 0, "available=0 is accepted as a genuine value");
-  assert.equal(cell("IT", "Nordfell").fbaAvailable, 4000, "Nordfell is a separate bucket, never folded into Bebi Born");
-  // Rows exactly ON each window boundary are accepted.
-  const boundary = [
-    { date: INV_FROM, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "F", available: 3 },
-    { date: INV_TO, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "T", available: 7 },
-  ];
-  const bp = buildInv({ invRows: boundary });
-  assert.equal(bp.inventoryDate, INV_TO);
-  assert.equal(bp.inventoryByBrandCountry.find((e) => e.country === "IT").fbaAvailable, 7, "only the latest boundary date folds");
+  assert.equal(p.inventoryUnavailableReason, null);
+  assert.equal(p.inventoryConflicts, 0);
+  assert.equal(cellOf(p, "IT", "Bebi Born").fbaAvailable, 883, "600 + 283 + 0 (the duplicate IT-2 row is NOT added again: never 1166; never the Health 900)");
+  assert.equal(cellOf(p, "IT", "Bebi Born").skuCount, 3);
+  assert.equal(cellOf(p, "IT", "Nordfell").fbaAvailable, 4000, "Nordfell is a separate bucket, never folded into Bebi Born");
+  assert.equal(cellOf(p, "IT", "Merchant Only"), undefined, "a merchant-fulfilled-only product creates no FBA bucket (never a 0 that reads as a stockout)");
+  // A UK account's buckets carry the canonical Amazon marketplace code (Brand View re-keys it onto the sales spelling).
+  const uk = buildInv({ accountCountry: "UK", listingsRows: [lrow("UK-1", "B00BEBI001", 912, { marketplace_country_code: "GB" })], healthRows: [] });
+  assert.deepEqual([uk.inventorySource, uk.inventoryByBrandCountry[0].country, uk.inventoryByBrandCountry[0].fbaAvailable], ["listings", "GB", 912]);
   assert.equal(isStrictCalendarDate("2024-02-29"), true, "a real leap day round-trips");
 });
 
-test("1/2/3. impossible, future, malformed and out-of-window dates are rejected (whole payload refused)", () => {
-  const one = (date) => () => buildInv({ invRows: [{ date, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "S", available: 1 }] });
-  const safe = (e) => e.brandInventorySafe === true;
-  assert.throws(one("2099-01-01"), safe, "future date");
-  assert.throws(one("2025-02-30"), safe, "impossible calendar date");
-  assert.throws(one("2026-13-40"), safe, "malformed date");
-  assert.throws(one("not-a-date"), safe, "non-date string");
-  assert.throws(one(addDays(INV_FROM, -1)), safe, "one day BEFORE the window");
-  assert.throws(one(addDays(INV_TO, 1)), safe, "one day AFTER the window");
-  assert.equal(isStrictCalendarDate("2025-02-30"), false, "the strict validator rejects the impossible date directly");
-  assert.equal(isStrictCalendarDate("2099-01-01"), true, "2099-01-01 is a valid CALENDAR date; the window check is what rejects it");
-});
-
-test("4/5. missing ASIN + non-object rows + PRESENT-malformed available reject; a NO-STOCK null/undefined available folds to an honest 0", () => {
-  const row = (over) => [{ date: INV_TO, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "S", available: 1, ...over }];
-  const safe = (e) => e.brandInventorySafe === true;
-  assert.throws(() => buildInv({ invRows: "not-an-array" }), safe, "invRows must be an array");
-  assert.throws(() => buildInv({ invRows: [null] }), safe, "a non-object row");
-  assert.throws(() => buildInv({ invRows: [["array-row"]] }), safe, "an array row");
-  assert.throws(() => buildInv({ invRows: row({ child_asin: "" }) }), safe, "missing ASIN");
-  assert.throws(() => buildInv({ invRows: row({ child_asin: "   " }) }), safe, "blank ASIN");
-  // A PRESENT malformed / negative / non-numeric value is corruption -> still rejected (never coerced), LKG preserved.
-  assert.throws(() => buildInv({ invRows: row({ available: -1 }) }), safe, "negative available");
-  assert.throws(() => buildInv({ invRows: row({ available: "5" }) }), safe, "a numeric STRING is not converted, it is rejected");
-  assert.throws(() => buildInv({ invRows: row({ available: NaN }) }), safe, "NaN available");
-  assert.throws(() => buildInv({ invRows: row({ available: Infinity }) }), safe, "non-finite available");
-  // A NULL / UNDEFINED available is a legitimate NO-STOCK ASIN (DataDoe returns null for a listed-but-unstocked SKU) --
-  // it folds to an HONEST 0 exactly like the canonical fba-plan derive's num(), NEVER rejected. This is the exact gate
-  // that had deferred 9 europe-au accounts whose valid D-1 FBA snapshots carried no-stock ASINs.
-  for (const noStock of [null, undefined]) {
-    const p = buildInv({ invRows: row({ available: noStock }) });
-    assert.equal(p.inventoryAvailable, true, `a no-stock (${String(noStock)}) available still yields a valid saved snapshot`);
-    const it = p.inventoryByBrandCountry.find((e) => e.country === "IT");
-    assert.ok(it && it.fbaAvailable === 0 && it.skuCount === 1, `the no-stock ASIN folds to fbaAvailable 0 (honest no-stock, never fabricated) for ${String(noStock)}`);
+test("phase 2 / Health fallback: Listings NOT validated + a saved Health snapshot -> the LATEST Health date, labelled with the Listings reasons", () => {
+  for (const [label, listingsRows, reason] of [
+    ["no Listings snapshot", [], "listings-empty"],
+    ["a pre-cutover (not expanded) Listings snapshot", preCutover(LISTINGS_ROWS()), "listings-not-expanded"],
+    ["an unresolved quantity conflict", [...LISTINGS_ROWS(), lrow("IT-2", "B00BEBI002", 290)], "listings-unresolved-conflicts:1"],
+    ["stock on a SKU with no ASIN (unattributed)", [...LISTINGS_ROWS(), lrow("IT-X", "__EMPTY__", 12)], "listings-unattributed-stock:1"],
+  ]) {
+    const p = buildInv({ listingsRows });
+    assert.equal(p.inventorySource, "health-fallback", label);
+    assert.ok(p.inventoryListingsReasons.includes(reason), `${label}: the reason is recorded (${p.inventoryListingsReasons.join(",")})`);
+    assert.equal(p.inventoryHealthDate, "2026-07-27", label + ": the LATEST Health date only");
+    assert.equal(p.inventoryDate, "2026-07-27", label + ": the fallback's inventoryDate IS its Health snapshot date");
+    assert.equal(p.listingsRefreshedAt, null, label + ": a Health value never carries a Listings freshness");
+    assert.equal(p.inventoryAvailable, true, label);
+    assert.equal(cellOf(p, "IT", "Bebi Born").fbaAvailable, 900, label + ": 610 + 290 from Health (never the older 99999 row)");
+    assert.equal(cellOf(p, "IT", "Nordfell").fbaAvailable, 3900, label);
+    assert.ok(!p.inventoryByBrandCountry.some((e) => e.unattributed === true), label + ": a Health fallback carries real ASINs (no Listings unattributed marker)");
   }
-  // MIXED: a no-stock null row alongside a real quantity row -> the real quantity is preserved, the null adds 0.
-  const mixed = buildInv({ invRows: [
-    { date: INV_TO, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "S1", available: 7 },
-    { date: INV_TO, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: "S2", available: null },
-  ] });
-  const itMixed = mixed.inventoryByBrandCountry.find((e) => e.country === "IT");
-  assert.ok(itMixed && itMixed.fbaAvailable === 7 && itMixed.skuCount === 2, "a null no-stock row adds 0 to a real 7 (fold matches the canonical num() derive)");
+  // A BLANK Health available is UNKNOWN in the shared fold (lib/server/inventory-source.js): the bucket is null, never 0.
+  const blank = buildInv({ listingsRows: [], healthRows: [hrow("2026-07-27", "IT-1", "B00BEBI001", 7), hrow("2026-07-27", "IT-2", "B00BEBI002", null)] });
+  assert.deepEqual([blank.inventorySource, cellOf(blank, "IT", "Bebi Born").fbaAvailable], ["health-fallback", null]);
 });
 
-test("8. an FBA inventory result exactly at the row cap is refused as truncated and not saved", () => {
-  const atCap = new Array(15000).fill(0).map((_, i) => ({ date: INV_TO, marketplace_country_code: "IT", child_asin: "B00BEBI001", sku: `S${i}`, available: 1 }));
-  assert.throws(() => buildInv({ invRows: atCap }), (error) => error.brandInventorySafe === true && /row cap/i.test(error.message));
-  assert.equal(buildInv({ invRows: atCap.slice(0, 14999) }).inventoryAvailable, true, "just under the cap is accepted");
+test("phase 2 / unavailable: neither validated Listings nor a usable Health snapshot -> Unavailable (reasons kept), never zero", () => {
+  const none = buildInv({ listingsRows: [], healthRows: [] });
+  assert.deepEqual([none.inventorySource, none.inventoryAvailable, none.inventoryDate, none.listingsRefreshedAt, none.inventoryByBrandCountry], ["unavailable", false, null, null, []]);
+  assert.deepEqual(none.inventoryListingsReasons, ["listings-empty"]);
+  assert.match(none.inventoryUnavailableReason, /no-validated-listings/);
+  assert.match(none.inventoryUnavailableReason, /no-fba-inventory-health-snapshot/);
+  assert.equal(brandInventory(none, "Bebi Born", "IT").scope, "unavailable", "Brand View shows unavailable, never zero");
+  // A malformed HEALTH row never refuses validated Listings (the Health evidence is simply not used); when the account
+  // DEPENDS on Health (no validated Listings) the payload is REFUSED like production (typed; previous compact kept).
+  for (const [label, row, why] of [
+    ["a blank ASIN", hrow("2026-07-27", "S", "", 1), "health-row-asin-missing"],
+    ["a negative available", hrow("2026-07-27", "S", "B00BEBI001", -1), "health-row-available-invalid"],
+    ["a numeric STRING available", hrow("2026-07-27", "S", "B00BEBI001", "5"), "health-row-available-invalid"],
+    ["an impossible date", hrow("2025-02-30", "S", "B00BEBI001", 1), "health-row-date-invalid"],
+    ["a date AFTER the requested day", hrow("2026-07-29", "S", "B00BEBI001", 1), "health-row-date-after-requested-day"],
+    ["another marketplace's row", hrow("2026-07-27", "S", "B00BEBI001", 1, { marketplace_country_code: "DE" }), "health-foreign-marketplace-rows"],
+  ]) {
+    assert.equal(buildInv({ healthRows: [row] }).inventorySource, "listings", label + ": validated Listings still serve");
+    assert.throws(() => buildInv({ listingsRows: [], healthRows: [row] }), (e) => e.brandInventorySafe === true && e.message.includes(why), `${label}: with no validated Listings the corrupt Health snapshot refuses the payload (${why})`);
+  }
 });
 
-test("11(z)/12. validated zero is a genuine zero; an absent brand or empty snapshot stays unavailable", () => {
+test("4/5/8. structural problems refuse the whole payload (previous snapshot preserved)", () => {
+  const safe = (e) => e.brandInventorySafe === true;
+  assert.throws(() => buildInv({ listingsRows: "not-an-array" }), safe, "listingsRows must be an array");
+  assert.throws(() => buildInv({ healthRows: "not-an-array" }), safe, "healthRows must be an array");
+  assert.throws(() => buildInv({ listingsRows: [null] }), safe, "a non-object Listings row");
+  assert.throws(() => buildInv({ healthRows: [["array-row"]] }), safe, "an array Health row");
+  assert.throws(() => buildInv({ accountCountry: "" }), safe, "no account marketplace");
+  const atCap = new Array(15000).fill(0).map((_, i) => hrow(INV_TO, `S${i}`, "B00BEBI001", 1));
+  assert.throws(() => buildInv({ healthRows: atCap }), (error) => safe(error) && /row cap/i.test(error.message), "Health at the cap may be truncated");
+  assert.equal(buildInv({ listingsRows: [], healthRows: atCap.slice(0, 14999) }).inventoryAvailable, true, "just under the cap is accepted");
+  const listingsAtCap = new Array(20).fill(0).map((_, i) => lrow(`L${i}`, "B00BEBI001", 1));
+  assert.throws(() => buildInv({ listingsRows: listingsAtCap, listingsRowLimit: 20 }), (error) => safe(error) && /Listings inventory reached its 20-row cap/.test(error.message), "the Listings cap is separate");
+  // `invRows` is still accepted as the former name of the Health input (with the report day the bridge needs).
+  assert.equal(buildBrandInventoryPayload({ accountId: ACCOUNT_A, invRows: HEALTH_ROWS(), brandByAsin: INV_BRAND_BY_ASIN, accountCountry: "IT", to: INV_TO }).inventorySource, "health-fallback");
+});
+
+test("cutover / bridge freshness: the saved Health snapshot drives figures ONLY while its date >= the report day - 2; older or no report day -> Unavailable (typed), never the stale figure", () => {
+  // Health dated 2026-07-27: report day 07-28 / 07-29 -> fresh bridge; 07-30 -> stale.
+  for (const to of ["2026-07-28", "2026-07-29"]) {
+    const ok = buildInv({ listingsRows: [], to });
+    assert.deepEqual([ok.inventorySource, ok.inventoryHealthDate, cellOf(ok, "IT", "Bebi Born").fbaAvailable], ["health-fallback", "2026-07-27", 900], to);
+  }
+  const stale = buildInv({ listingsRows: [], to: "2026-07-30" });
+  assert.deepEqual([stale.inventorySource, stale.inventoryAvailable, stale.inventoryDate, stale.inventoryByBrandCountry], ["unavailable", false, null, []]);
+  assert.equal(stale.inventoryUnavailableReason, "no-validated-listings;health-bridge-stale:2026-07-27");
+  assert.equal(brandInventory(stale, "Bebi Born", "IT").scope, "unavailable", "Brand View shows unavailable, never the stale 900 and never 0");
+  const noDay = buildInv({ listingsRows: [], to: null });
+  assert.deepEqual([noDay.inventorySource, noDay.inventoryUnavailableReason], ["unavailable", "no-validated-listings;health-bridge-as-of-missing"]);
+  // Validated Listings never need the bridge (a stale Health snapshot is irrelevant to them).
+  assert.equal(buildInv({ to: "2026-07-30" }).inventorySource, "listings");
+  // AAKRITI-style unresolved conflict + FR __EMPTY__ unattributed stock: the dated bridge while fresh, unavailable once old.
+  const aakriti = [...LISTINGS_ROWS(), lrow("IT-2", "B00BEBI002", 290)];
+  const fr = [...LISTINGS_ROWS(), lrow("IT-X", "__EMPTY__", 12)];
+  for (const rows of [aakriti, fr]) {
+    assert.equal(buildInv({ listingsRows: rows }).inventorySource, "health-fallback");
+    assert.equal(buildInv({ listingsRows: rows, to: "2026-07-30" }).inventorySource, "unavailable");
+  }
+  // A stale Listings pointer reported by the caller replaces the generic Listings reason.
+  const staleListings = buildInv({ listingsRows: [], listingsUnavailableReason: "listings-snapshot-stale" });
+  assert.deepEqual(staleListings.inventoryListingsReasons, ["listings-snapshot-stale"]);
+});
+
+await asyncTest("cutover / SERVE-time bridge freshness: a saved Health compact (bridge or legacy v1) older than the Brand View report day - 2 is Unavailable at READ time, even when the shared selection picks it", async () => {
+  const fallbackPayload = { accountId: ACCOUNT_A, inventoryModel: "listings-v1", inventorySource: "health-fallback", inventoryListingsReasons: ["listings-not-expanded"], inventoryHealthDate: "2026-07-27", inventoryDate: "2026-07-27", listingsRefreshedAt: null, inventoryAvailable: true, inventoryUnavailableReason: null, inventoryConflicts: 0, inventoryByBrandCountry: [{ country: "IT", brand: "Bebi Born", fbaAvailable: 700, skuCount: 2 }] };
+  // Brand View's as-of is the marketplace TODAY; its report day is the day before: 07-30 -> report day 07-29 -> floor 07-27.
+  assert.equal(brandViewHealthBridgeFloor("2026-07-30"), "2026-07-27");
+  assert.equal(inventoryEvidenceOf(fallbackPayload, { asOf: "2026-07-30" }).available, true);
+  const stale = inventoryEvidenceOf(fallbackPayload, { asOf: "2026-07-31" });
+  assert.deepEqual([stale.available, stale.unavailableReason], [false, "health-bridge-stale:2026-07-27"]);
+  assert.equal(brandInventory(fallbackPayload, "Bebi Born", "IT", "brand-inventory", { asOf: "2026-07-31" }).scope, "unavailable");
+  assert.equal(inventoryEvidenceOf(fallbackPayload).available, true, "no as-of: the build-time threshold already applied (unchanged)");
+  const legacyPayload = { accountId: ACCOUNT_A, inventoryDate: "2026-07-27", inventoryAvailable: true, inventoryByBrandCountry: [{ country: "IT", brand: "Bebi Born", fbaAvailable: 555, skuCount: 1 }] };
+  assert.equal(inventoryEvidenceOf(legacyPayload, { asOf: "2026-07-31" }).unavailableReason, "health-bridge-stale:2026-07-27", "a legacy v1 Health compact obeys the same limit");
+  // Selection stays the ONE shared function (the dependency fingerprint uses it too): an OLDER available bridge compact is
+  // still selected over a NEWER unavailable one -- but the Brand View slice reads it with its as-of, so once stale it is
+  // Unavailable (never the stale 700 and never 0).
+  const olderBridge = { params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-07-28" }, updated_at: "2026-07-28T06:00:00Z", payload: fallbackPayload };
+  const newerUnavailable = { params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-07-31" }, updated_at: "2026-07-31T06:00:00Z", payload: { ...fallbackPayload, inventorySource: "unavailable", inventoryAvailable: false, inventoryHealthDate: null, inventoryDate: null, inventoryUnavailableReason: "no-validated-listings;health-bridge-stale:2026-07-27", inventoryByBrandCountry: [] } };
+  assert.equal(selectAuthoritativeInventorySnapshot([olderBridge, newerUnavailable]), olderBridge, "the phase-2 available-first preference (unchanged, shared with the fingerprint)");
+  const sliceAt = (asOf) => buildAccountBrandSlice({ accountId: ACCOUNT_A, brand: "Bebi Born", asOf, account: { name: "Bebi EU", country: "IT" },
+    getSnapshot: fakeGetSnapshot, getAdsRows: fakeGetAdsRows, getCampaignMappings: getCampaignMappingsFake,
+    getInventorySnapshots: async () => [olderBridge, newerUnavailable] });
+  const fresh = await sliceAt("2026-07-30");
+  assert.deepEqual([fresh.inventory.inventorySource, fresh.inventory.byCountry.get("IT"), fresh.inventoryDate], ["health-fallback", 700, "2026-07-27"]);
+  const staleSlice = await sliceAt("2026-07-31");
+  assert.deepEqual([staleSlice.inventory.scope, staleSlice.inventory.unavailableReason, staleSlice.inventoryDate, staleSlice.inventory.byCountry.size], ["unavailable", "health-bridge-stale:2026-07-27", null, 0]);
+  // The fba-plan rebuild adapter never turns a too-old bridge plan into an available compact.
+  const plan = { ...fallbackPayload, inventoryByBrandCountry: fallbackPayload.inventoryByBrandCountry };
+  assert.ok(compactInventoryFromFbaPlanPayload(plan, ACCOUNT_A, { reportAsOf: "2026-07-29" }));
+  assert.equal(compactInventoryFromFbaPlanPayload(plan, ACCOUNT_A, { reportAsOf: "2026-07-30" }), null);
+});
+
+test("11(z)/12. a validated zero is a genuine zero; an absent brand or an mfn-only brand has no figure", () => {
   const p = buildInv();
-  const inv = brandInventory(p, "Bebi Born", "IT", null);
-  assert.equal(inv.byCountry.get("DE"), 0, "the covered DE marketplace reports a validated zero, not a blank");
-  assert.equal(inv.accountTotal, 883 + 912 + 0);
-  assert.equal(brandInventory(p, "Brand Not In Snapshot", "IT", null).accountTotal, null, "no invented zero for an absent brand");
-  const empty = buildBrandInventoryPayload({ accountId: ACCOUNT_A, invRows: [], brandByAsin: INV_BRAND_BY_ASIN, accountCountry: "IT", from: INV_FROM, to: INV_TO, rowLimit: 15000 });
-  assert.deepEqual([empty.inventoryAvailable, empty.inventoryDate, empty.inventoryByBrandCountry], [false, null, []]);
+  const zeroPayload = buildInv({ listingsRows: [lrow("Z-1", "B00ZERO001", 0)], brandByAsin: new Map([["B00ZERO001", "Zero Brand"]]) });
+  const zero = brandInventory(zeroPayload, "Zero Brand", "IT");
+  assert.deepEqual([zero.byCountry.get("IT"), zero.accountTotal], [0, 0], "a covered FBA SKU with 0 available is a validated zero, not a blank");
+  const absent = brandInventory(p, "Brand Not In Snapshot", "IT");
+  assert.deepEqual([absent.accountTotal, absent.byCountry.size], [null, 0], "no invented zero for an absent brand");
+  const mfnOnly = brandInventory(p, "Merchant Only", "IT");
+  assert.deepEqual([mfnOnly.accountTotal, mfnOnly.byCountry.size], [null, 0], "a merchant-fulfilled-only brand has no FBA figure (never a stockout 0)");
 });
 
-/* ---- BLOCKER 3: no second Product Catalog export; missing map fails before the FBA export ---- */
+/* ---- no Catalog export; a missing brand map fails before reading inventory ---- */
 
-await asyncTest("13. successful refresh spends exactly ONE FBA export and ZERO Catalog exports (<= 3 per account)", async () => {
-  let invCalls = 0;
+await asyncTest("13. a compact build reads the saved Health rows and the saved Listings rows exactly once each, and spends ZERO Catalog exports", async () => {
+  let healthCalls = 0;
+  let listingsCalls = 0;
   const { payload, asinBrandCount } = await buildBrandInventorySnapshot({
-    accountId: ACCOUNT_A, accountCountry: "IT", from: INV_FROM, to: INV_TO, rowLimit: 15000,
+    accountId: ACCOUNT_A, accountCountry: "IT", from: INV_FROM, to: INV_TO, rowLimit: 15000, listingsRefreshedAt: INV_REFRESHED_AT,
     getSnapshot: async ({ reportKey }) => (reportKey === "brand-sales"
-      ? { payload: { asinBrand: { B00BEBI001: "Bebi Born", B00BEBI002: "Bebi Born" } }, params: { to: INV_TO } } : null),
-    fetchInventoryRows: async () => { invCalls += 1; return INV_ROWS(); },
+      ? { payload: { asinBrand: { B00BEBI001: "Bebi Born", B00BEBI002: "Bebi Born", B00BEBI003: "Bebi Born" } }, params: { to: INV_TO } } : null),
+    fetchInventoryRows: async () => { healthCalls += 1; return HEALTH_ROWS(); },
+    fetchListingsRows: async () => { listingsCalls += 1; return LISTINGS_ROWS(); },
     // buildBrandInventorySnapshot has NO catalog fetcher parameter -> zero catalog exports by construction.
   });
-  assert.equal(invCalls, 1, "exactly one FBA Inventory Health export");
+  assert.deepEqual([healthCalls, listingsCalls], [1, 1]);
   assert.ok(asinBrandCount >= 1, "the saved brand-sales asinBrand map is reused");
-  assert.equal(payload.inventoryByBrandCountry.find((e) => e.country === "IT" && e.brand === "Bebi Born").fbaAvailable, 883);
+  assert.deepEqual([payload.inventorySource, payload.listingsRefreshedAt, payload.inventoryDate], ["listings", INV_REFRESHED_AT, null]);
+  assert.equal(cellOf(payload, "IT", "Bebi Born").fbaAvailable, 883);
+  // Without a Listings reader (or with no Listings rows) the same build is the labelled Health fallback.
+  const fallback = await buildBrandInventorySnapshot({
+    accountId: ACCOUNT_A, accountCountry: "IT", to: INV_TO, rowLimit: 15000,
+    getSnapshot: async () => ({ payload: { asinBrand: { B00BEBI001: "Bebi Born", B00BEBI002: "Bebi Born" } } }),
+    fetchInventoryRows: async () => HEALTH_ROWS(),
+  });
+  assert.deepEqual([fallback.payload.inventorySource, fallback.payload.inventoryHealthDate], ["health-fallback", "2026-07-27"]);
 });
 
-await asyncTest("11/12. a missing asinBrand (e.g. Brand Sales catalog just failed) fails BEFORE the FBA export: zero exports", async () => {
-  let invCalls = 0;
+await asyncTest("11/12. a missing asinBrand (e.g. Brand Sales catalog just failed) fails BEFORE any inventory read", async () => {
+  let reads = 0;
   await assert.rejects(
     () => buildBrandInventorySnapshot({
-      accountId: ACCOUNT_A, accountCountry: "IT", from: INV_FROM, to: INV_TO, rowLimit: 15000,
+      accountId: ACCOUNT_A, accountCountry: "IT", to: INV_TO, rowLimit: 15000,
       getSnapshot: async ({ reportKey }) => (reportKey === "brand-sales" ? { payload: { rows: [{ product_brand: "Bebi Born" }] } } : null), // no asinBrand map
-      fetchInventoryRows: async () => { invCalls += 1; return INV_ROWS(); },
+      fetchInventoryRows: async () => { reads += 1; return HEALTH_ROWS(); },
+      fetchListingsRows: async () => { reads += 1; return LISTINGS_ROWS(); },
     }),
     (error) => error.brandInventorySafe === true && /Brand Sales/i.test(error.message)
   );
-  assert.equal(invCalls, 0, "no FBA Inventory export is spent when the brand map is missing; no catalog fetcher exists at all");
+  assert.equal(reads, 0, "neither saved inventory is read when the brand map is missing; no catalog fetcher exists at all");
 });
 
-await asyncTest("7. an inventory DataDoe failure throws (nothing is saved) so a prior good snapshot survives", async () => {
+await asyncTest("7. an inventory read failure throws (nothing is saved) so a prior good snapshot survives", async () => {
   await assert.rejects(
     () => buildBrandInventorySnapshot({
-      accountId: ACCOUNT_A, accountCountry: "IT", from: INV_FROM, to: INV_TO, rowLimit: 15000,
+      accountId: ACCOUNT_A, accountCountry: "IT", to: INV_TO, rowLimit: 15000,
       getSnapshot: async () => ({ payload: { asinBrand: { B00BEBI001: "Bebi Born" } } }),
-      fetchInventoryRows: async () => { throw new Error("simulated DataDoe outage"); },
+      fetchInventoryRows: async () => { throw new Error("simulated saved-inventory read outage"); },
     }),
-    /simulated DataDoe outage/
+    /simulated saved-inventory read outage/
   );
 });
 
@@ -537,8 +710,9 @@ test("16. primary and legacy dd-secondary IDs never mix in the inventory refresh
   assert.deepEqual(eligible.map((a) => a.id), ["A1"]);
   assert.deepEqual(skipped.map((a) => a.id), ["dd-secondary:LEG"]);
   assert.deepEqual(brandInventoryRefreshParams({ id: "A1" }, "2026-08-12"), {
-    action: "brand-inventory", reportVersion: "brand-inventory-shared-v1", ids: "A1", to: "2026-08-12",
+    action: "brand-inventory", reportVersion: BRAND_INVENTORY_REPORT_VERSION, ids: "A1", to: "2026-08-12",
   }, "the public id is used verbatim; a dd-secondary account is never stripped onto the primary key");
+  assert.equal(BRAND_INVENTORY_REPORT_VERSION, "brand-inventory-shared-v2", "the browser refresh params carry the server's v2 compact version");
 });
 
 /* ---- BLOCKER 2: a valid compact snapshot is authoritative; no stale FBA Plan resurrection ---- */
@@ -551,11 +725,20 @@ function getSnapshotWithInventory(extra) {
     return fakeGetSnapshot({ reportKey, accountId });
   };
 }
-const compactSnap = (inventoryByBrandCountry, over = {}) => ({
+const COMPACT_REFRESHED_AT = "2026-07-29T05:40:00.000Z"; // the compact's Listings fetch time
+// A v2 (phase-2) compact payload; `over` switches it to a Health fallback / unavailable.
+const compactPayload = (inventoryByBrandCountry, over = {}) => ({
+  accountId: ACCOUNT_A, inventoryModel: "listings-v1", inventorySource: "listings", inventoryListingsReasons: [],
+  inventoryHealthDate: null, inventoryDate: null, listingsRefreshedAt: COMPACT_REFRESHED_AT,
+  inventoryAvailable: inventoryByBrandCountry.length > 0, inventoryUnavailableReason: inventoryByBrandCountry.length > 0 ? null : "no-validated-listings;no-fba-inventory-health-snapshot",
+  inventoryConflicts: 0, inventoryByBrandCountry, ...over,
+});
+const fallbackOver = { inventorySource: "health-fallback", inventoryListingsReasons: ["listings-not-expanded"], inventoryHealthDate: "2026-07-27", inventoryDate: "2026-07-27", listingsRefreshedAt: null };
+const compactSnap = (inventoryByBrandCountry, over = {}, payloadOver = {}) => ({
   [`${BRAND_INVENTORY_SNAPSHOT_KEY}|${ACCOUNT_A}`]: {
     source_refreshed_at: "2026-07-29T06:00:00.000Z",
     params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-07-28" },
-    payload: { accountId: ACCOUNT_A, inventoryDate: "2026-07-29", inventoryAvailable: inventoryByBrandCountry.length > 0, inventoryByBrandCountry },
+    payload: compactPayload(inventoryByBrandCountry, payloadOver),
     ...over,
   },
 });
@@ -563,22 +746,46 @@ const sliceFor = (getSnapshot) => buildAccountBrandSlice({
   accountId: ACCOUNT_A, brand: "Bebi Born", asOf: "2026-07-28",
   account: { name: "Bebi EU", country: "IT" }, getSnapshot, getAdsRows: fakeGetAdsRows, getCampaignMappings: getCampaignMappingsFake,
 });
+// The PRODUCTION v1 compact (folded from FBA Inventory Health; a dated payload with no source / model).
+const V1_HEALTH_COMPACT = { params: { reportVersion: "brand-inventory-shared-v1", to: "2026-07-28" }, source_refreshed_at: "2026-07-30T00:00:00.000Z", payload: { accountId: ACCOUNT_A, inventoryDate: "2026-07-27", inventoryAvailable: true, inventoryByBrandCountry: [{ country: "IT", brand: "Bebi Born", fbaAvailable: 555, skuCount: 1 }] } };
 
-test("isCompactInventorySnapshot validates the report version + compact shape", () => {
+test("isCompactInventorySnapshot: the v2 phase-2 shape and the legacy v1 Health compact are compacts; anything else is not", () => {
+  assert.equal(BRAND_INVENTORY_REPORT_VERSION, "brand-inventory-shared-v2");
   assert.equal(isCompactInventorySnapshot(compactSnap([])[`${BRAND_INVENTORY_SNAPSHOT_KEY}|${ACCOUNT_A}`]), true);
-  assert.equal(isCompactInventorySnapshot({ params: { reportVersion: "some-old-version" }, payload: { inventoryByBrandCountry: [] } }), false, "wrong version is not authoritative");
-  assert.equal(isCompactInventorySnapshot({ params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION }, payload: {} }), false, "no compact shape");
+  assert.equal(isCompactInventorySnapshot(compactSnap([], {}, fallbackOver)[`${BRAND_INVENTORY_SNAPSHOT_KEY}|${ACCOUNT_A}`]), true, "a v2 Health-fallback compact");
+  assert.equal(isCompactInventorySnapshot(V1_HEALTH_COMPACT), true, "the production v1 compact is still served (legacy Health) during the transition");
+  assert.equal(isCompactInventorySnapshot({ params: { reportVersion: "some-old-version" }, payload: compactPayload([]) }), false, "wrong version is not authoritative");
+  assert.equal(isCompactInventorySnapshot({ ...V1_HEALTH_COMPACT, params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION } }), false, "a v2-labelled payload WITHOUT the model + source is not authoritative");
+  assert.equal(isCompactInventorySnapshot({ params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION }, payload: compactPayload([], { inventorySource: "guessed" }) }), false, "an unrecognized source");
+  assert.equal(isCompactInventorySnapshot({ params: { reportVersion: "brand-inventory-shared-v1" }, payload: compactPayload([]) }), false, "a v1-labelled payload carrying the phase-2 model is not a legacy compact");
+  assert.equal(isCompactInventorySnapshot({ params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION }, payload: { inventoryModel: "listings-v1", inventorySource: "listings" } }), false, "no compact shape");
   assert.equal(isCompactInventorySnapshot(null), false);
 });
 
-await asyncTest("13(auth). a valid compact snapshot is AUTHORITATIVE and wins over the fba-plan snapshot", async () => {
+await asyncTest("13(auth). a valid v2 compact is AUTHORITATIVE and wins over the fba-plan snapshot; its source + freshness are carried", async () => {
   const slice = await sliceFor(getSnapshotWithInventory(compactSnap([
     { country: "IT", brand: "Bebi Born", fbaAvailable: 1234, skuCount: 5 },
     { country: "DE", brand: "Bebi Born", fbaAvailable: 0, skuCount: 1 },
   ])));
   assert.equal(slice.inventory.byCountry.get("IT"), 1234, "compact wins over the fba-plan value (883)");
   assert.equal(slice.inventory.byCountry.get("DE"), 0, "a validated zero is preserved");
-  assert.equal(slice.inventoryDate, "2026-07-29", "inventoryDate comes from the compact snapshot");
+  assert.equal(slice.inventory.source, "brand-inventory");
+  assert.equal(slice.inventory.inventorySource, "listings");
+  assert.equal(slice.inventoryDate, null, "Listings has no date: the slice never claims an inventory date");
+  assert.equal(slice.inventoryRefreshedAt, COMPACT_REFRESHED_AT, "freshness = the compact's Listings fetch time");
+  // A v2 Health-FALLBACK compact carries its Health snapshot date (and no Listings freshness).
+  const fb = await sliceFor(getSnapshotWithInventory(compactSnap([{ country: "IT", brand: "Bebi Born", fbaAvailable: 700, skuCount: 2 }], {}, fallbackOver)));
+  assert.deepEqual([fb.inventory.inventorySource, fb.inventory.byCountry.get("IT"), fb.inventoryDate, fb.inventoryRefreshedAt, fb.inventory.listingsReasons], ["health-fallback", 700, "2026-07-27", null, ["listings-not-expanded"]]);
+});
+
+await asyncTest("legacy v1: the production v1 (FBA Inventory Health) compact is still SERVED, labelled as Health with its date (never hidden, never Listings)", async () => {
+  const slice = await sliceFor(getSnapshotWithInventory({ [`${BRAND_INVENTORY_SNAPSHOT_KEY}|${ACCOUNT_A}`]: V1_HEALTH_COMPACT }));
+  assert.deepEqual([slice.inventory.inventorySource, slice.inventory.byCountry.get("IT"), slice.inventoryDate, slice.inventoryRefreshedAt], ["health-legacy", 555, "2026-07-27", null]);
+  const payload = assembleFor([slice]);
+  const src = payload.coverage.inventoryAccountSources[0];
+  assert.deepEqual([src.source, src.healthDate, src.listingsRefreshedAt], ["health-legacy", "2026-07-27", null]);
+  assert.equal(inventorySourceLabel(src), "FBA Inventory Health snapshot 2026-07-27 (saved, no longer refreshed)");
+  assert.ok(payload.notes.some((n) => /saved before the Listings inventory switch/.test(n)), "a note names the legacy Health source");
 });
 
 await asyncTest("8(b). an EMPTY valid compact snapshot shows unavailable, NOT a stale FBA Plan value", async () => {
@@ -586,6 +793,7 @@ await asyncTest("8(b). an EMPTY valid compact snapshot shows unavailable, NOT a 
   assert.equal(slice.inventory.accountTotal, null, "empty compact => unavailable");
   assert.equal(slice.inventory.byCountry.size, 0);
   assert.notEqual(slice.inventory.byCountry.get("IT"), 883, "the stale fba-plan IT value (883) is NOT resurrected");
+  assert.deepEqual([slice.inventoryDate, slice.inventoryRefreshedAt], [null, null], "an unavailable inventory claims no freshness");
 });
 
 await asyncTest("9(b). a compact snapshot WITHOUT the selected brand stays unavailable, not stale legacy data", async () => {
@@ -596,66 +804,89 @@ await asyncTest("9(b). a compact snapshot WITHOUT the selected brand stays unava
   assert.notEqual(slice.inventory.byCountry.get("IT"), 883, "no fallback to the stale fba-plan value");
 });
 
-await asyncTest("10. with NO compact snapshot the temporary legacy fba-plan fallback is still allowed", async () => {
-  const slice = await sliceFor(fakeGetSnapshot); // fixtures have an fba-plan snapshot, no brand-inventory
-  assert.equal(slice.inventory.byCountry.get("IT"), 883, "no compact snapshot => legacy fba-plan value is used");
-  // A wrong-version compact snapshot is treated as no valid compact snapshot -> legacy fallback.
-  const wrongVersion = { [`${BRAND_INVENTORY_SNAPSHOT_KEY}|${ACCOUNT_A}`]: { params: { reportVersion: "brand-inventory-OLD" }, payload: { inventoryByBrandCountry: [{ country: "IT", brand: "Bebi Born", fbaAvailable: 1 }] } } };
-  const slice2 = await sliceFor(getSnapshotWithInventory(wrongVersion));
-  assert.equal(slice2.inventory.byCountry.get("IT"), 883, "a wrong-version compact snapshot is not authoritative; legacy fallback applies");
+await asyncTest("10. with NO valid compact the saved fba-plan is used in its phase-2 shape or its OLD Health shape (labelled); a rows-only plan or a Listing Health v1 snapshot never serves", async () => {
+  const slice = await sliceFor(fakeGetSnapshot); // fixtures have a phase-2 (Listings) fba-plan snapshot, no brand-inventory
+  assert.equal(slice.inventory.byCountry.get("IT"), 883, "no compact snapshot => the phase-2 fba-plan value is used");
+  assert.deepEqual([slice.inventory.source, slice.inventory.inventorySource, slice.inventoryDate], ["fba-plan", "listings", null]);
+  assert.equal(slice.inventoryRefreshedAt, SNAPSHOTS[`fba-plan|${ACCOUNT_A}`].payload.listingsRefreshedAt, "freshness = the plan's Listings fetch time");
+  // A wrong-version compact is "no valid compact" -> the fba-plan.
+  const wrongVersion = { [`${BRAND_INVENTORY_SNAPSHOT_KEY}|${ACCOUNT_A}`]: { params: { reportVersion: "brand-inventory-OLD" }, payload: compactPayload([{ country: "IT", brand: "Bebi Born", fbaAvailable: 1 }]) } };
+  assert.equal((await sliceFor(getSnapshotWithInventory(wrongVersion))).inventory.byCountry.get("IT"), 883, "a wrong-version compact is not authoritative");
+  // The OLD (pre-phase-2) Health-shaped fba-plan: served as Health, labelled with its date (never as Listings).
+  const { inventoryModel: _m, inventorySource: _s, listingsRefreshedAt: _r, inventoryHealthDate: _h, inventoryListingsReasons: _l, ...rest } = SNAPSHOTS[`fba-plan|${ACCOUNT_A}`].payload;
+  const healthPlan = { [`fba-plan|${ACCOUNT_A}`]: { ...SNAPSHOTS[`fba-plan|${ACCOUNT_A}`], payload: { ...rest, inventoryDate: "2026-07-28" } } };
+  const old = await sliceFor(getSnapshotWithInventory(healthPlan));
+  assert.deepEqual([old.inventory.inventorySource, old.inventory.byCountry.get("IT"), old.inventoryDate, old.inventoryRefreshedAt], ["health-legacy", 883, "2026-07-28", null]);
+  // A rows-only (no marketplace dimension) plan is never read as inventory any more; nor is a Listing Health v1 snapshot.
+  const rowsOnly = { [`fba-plan|${ACCOUNT_A}`]: { source_refreshed_at: "2026-07-28T05:00:00.000Z", payload: { rows: [{ asin: "B00BEBI001", brand: "Bebi Born", fbaAvailable: 40 }] } }, [`listing-health|${ACCOUNT_A}`]: { source_refreshed_at: "2026-07-28T05:00:00.000Z", payload: { inventorySnapshotDate: "2026-07-27", rows: [{ brand: "Bebi Born", fbaAvailable: 40 }] } } };
+  const noFallback = await sliceFor(getSnapshotWithInventory(rowsOnly));
+  assert.deepEqual([noFallback.inventory.scope, noFallback.inventory.accountTotal, noFallback.inventoryDate], ["unavailable", null, null]);
 });
 
-/* ---- ROUND-4 Defect 2: SERVE SELECTION prefers a genuinely-available compact over a fresh unavailable placeholder ---- */
+/* ---- SERVE SELECTION prefers a genuinely-available compact; v2 over the legacy v1; never hides production stock ---- */
 
-test("selectAuthoritativeInventorySnapshot prefers an available compact over a NEWER unavailable placeholder", () => {
-  const ph = (to, refreshed, over = {}) => ({ params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to }, source_refreshed_at: refreshed, payload: { inventoryAvailable: false, inventoryByBrandCountry: [], ...over } });
-  const avail = (to, refreshed, rows) => ({ params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to }, source_refreshed_at: refreshed, payload: { inventoryDate: to, inventoryAvailable: true, inventoryByBrandCountry: rows } });
-  // A fresh (newest) unavailable placeholder must NOT shadow a lagging AVAILABLE compact.
+test("selectAuthoritativeInventorySnapshot: available v2 over a NEWER placeholder and over a NEWER v1; v1 available over a v2 placeholder (transition)", () => {
+  const ph = (to, refreshed, over = {}) => ({ params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to }, source_refreshed_at: refreshed, payload: { ...compactPayload([]), listingsRefreshedAt: null, ...over } });
+  const avail = (to, refreshed, rows, listingsAt) => ({ params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to }, source_refreshed_at: refreshed, payload: compactPayload(rows, { listingsRefreshedAt: listingsAt }) });
+  const v1 = (date, refreshed, available = true) => ({ params: { reportVersion: "brand-inventory-shared-v1", to: date }, source_refreshed_at: refreshed, payload: { inventoryDate: available ? date : null, inventoryAvailable: available, inventoryByBrandCountry: available ? [{ country: "IN", brand: "Acme", fbaAvailable: 99 }] : [] } });
   const placeholderNewest = ph("2026-09-08", "2026-09-08T18:00:00Z");
-  const laggingAvail = avail("2026-09-02", "2026-09-02T17:00:00Z", [{ country: "IN", brand: "Acme", fbaAvailable: 40 }]);
+  const laggingAvail = avail("2026-09-02", "2026-09-02T17:00:00Z", [{ country: "IN", brand: "Acme", fbaAvailable: 40 }], "2026-09-02T03:00:00Z");
   const chosen = selectAuthoritativeInventorySnapshot([placeholderNewest, laggingAvail]);
-  assert.equal(chosen.payload.inventoryAvailable, true, "the available compact is selected, not the newer unavailable placeholder");
-  assert.equal(chosen.payload.inventoryDate, "2026-09-02");
-  // Among multiple AVAILABLE compacts the newest real inventory date wins (updated_at breaks a tie).
-  const olderAvail = avail("2026-08-20", "2026-09-09T00:00:00Z", [{ country: "IN", brand: "Acme", fbaAvailable: 5 }]);
-  const newerAvail = avail("2026-09-05", "2026-09-06T00:00:00Z", [{ country: "IN", brand: "Acme", fbaAvailable: 9 }]);
-  assert.equal(selectAuthoritativeInventorySnapshot([olderAvail, newerAvail]).payload.inventoryDate, "2026-09-05", "newest inventory date wins even if its updated_at is older");
+  assert.equal(chosen, laggingAvail, "the available compact is selected, not the newer unavailable placeholder");
+  // Among AVAILABLE v2 compacts the newest freshness wins (updated_at breaks a tie).
+  const olderAvail = avail("2026-08-20", "2026-09-09T00:00:00Z", [{ country: "IN", brand: "Acme", fbaAvailable: 5 }], "2026-08-20T03:00:00Z");
+  const newerAvail = avail("2026-09-05", "2026-09-06T00:00:00Z", [{ country: "IN", brand: "Acme", fbaAvailable: 9 }], "2026-09-05T03:00:00Z");
+  assert.equal(selectAuthoritativeInventorySnapshot([olderAvail, newerAvail]), newerAvail, "the newest Listings fetch wins even if its updated_at is older");
+  const fb = { params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-09-06" }, source_refreshed_at: "2026-09-06T05:00:00Z", payload: compactPayload([{ country: "IN", brand: "Acme", fbaAvailable: 3 }], { ...fallbackOver, inventoryHealthDate: "2026-09-04", inventoryDate: "2026-09-04" }) };
+  assert.equal(selectAuthoritativeInventorySnapshot([fb, newerAvail]), newerAvail, "a Listings fetch on 09-05 is fresher than a Health snapshot dated 09-04");
+  // v2 vs the legacy v1: an available v2 beats even a NEWER available v1; with no available v2 the available v1 serves.
+  assert.equal(selectAuthoritativeInventorySnapshot([v1("2026-09-09", "2026-09-10T00:00:00Z"), newerAvail]), newerAvail, "v2 is preferred over the legacy v1");
+  const v1Avail = v1("2026-09-07", "2026-09-07T20:00:00Z");
+  assert.equal(selectAuthoritativeInventorySnapshot([placeholderNewest, v1Avail]), v1Avail, "the transition window: an available v1 is never hidden behind a v2 placeholder");
+  assert.equal(selectAuthoritativeInventorySnapshot([v1Avail]), v1Avail, "only v1 rows (web deployed before the scheduler) -> the v1 Health compact serves");
+  const v1Placeholder = v1("2026-09-08", "2026-09-08T20:00:00Z", false);
+  assert.equal(selectAuthoritativeInventorySnapshot([v1Placeholder, v1Avail]), v1Avail, "a v1 placeholder never shadows an available v1");
   // With NO available compact, the newest placeholder is returned (honest unavailable).
   const onlyPlaceholders = selectAuthoritativeInventorySnapshot([ph("2026-09-01", "2026-09-01T00:00:00Z"), ph("2026-09-08", "2026-09-08T00:00:00Z")]);
   assert.equal(onlyPlaceholders.params.to, "2026-09-08", "no available compact -> newest placeholder (unavailable)");
-  // Non-compacts are ignored; an empty/absent set -> null (caller uses the legacy fallback).
+  // Non-compacts are ignored; an empty/absent set -> null (caller uses the fba-plan fallback).
   assert.equal(selectAuthoritativeInventorySnapshot([{ params: { reportVersion: "old" }, payload: {} }, null]), null);
   assert.equal(selectAuthoritativeInventorySnapshot([]), null);
   assert.equal(selectAuthoritativeInventorySnapshot(undefined), null);
-  // Codex finding 3: MANY (>12) newer unavailable placeholders must NOT bury the authoritative available LKG. The
-  // selection prefers the available compact regardless of how many newer placeholders precede it (no recent-N cutoff).
+  // MANY (>12) newer unavailable placeholders must NOT bury the authoritative available LKG (no recent-N cutoff).
   const manyPlaceholders = Array.from({ length: 15 }, (_, i) => ph(`2026-09-${String(9 + i).padStart(2, "0")}`, `2026-09-${String(9 + i).padStart(2, "0")}T00:00:00Z`));
-  const buriedLkg = avail("2026-08-25", "2026-08-25T00:00:00Z", [{ country: "IN", brand: "Acme", fbaAvailable: 12 }]);
+  const buriedLkg = avail("2026-08-25", "2026-08-25T00:00:00Z", [{ country: "IN", brand: "Acme", fbaAvailable: 12 }], "2026-08-25T03:00:00Z");
   const picked = selectAuthoritativeInventorySnapshot([...manyPlaceholders, buriedLkg]);
-  assert.equal(picked.payload.inventoryAvailable, true, "the available LKG is selected even behind 15 newer placeholders (no latest-N cutoff)");
-  assert.equal(picked.payload.inventoryDate, "2026-08-25", "the LKG keeps its REAL (older) inventory date");
+  assert.equal(picked, buriedLkg, "the available LKG is selected even behind 15 newer placeholders");
+  assert.equal(picked.payload.listingsRefreshedAt, "2026-08-25T03:00:00Z", "the LKG keeps its REAL (older) Listings fetch time");
 });
 
-await asyncTest("13(serve). buildAccountBrandSlice serves the AVAILABLE compact over a newest unavailable placeholder (the placeholder-shadowing fix)", async () => {
-  // getInventorySnapshots yields BOTH a NEWEST unavailable placeholder (params.to = the cycle) AND a lagging AVAILABLE
-  // compact (params.to = an earlier date). A latest-by-updated_at read would serve the placeholder (unavailable); the
-  // authoritative selection serves the available compact with its REAL (older) inventory date -- Brand View does NOT
-  // regress to unavailable when the priority republishes the placeholder in the same cycle.
-  const placeholderNewest = { params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-07-28" }, source_refreshed_at: "2026-07-30T00:00:00.000Z", payload: { inventoryAvailable: false, inventoryByBrandCountry: [] } };
-  const laggingAvail = { params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-07-20" }, source_refreshed_at: "2026-07-25T00:00:00.000Z", payload: { inventoryDate: "2026-07-20", inventoryAvailable: true, inventoryByBrandCountry: [{ country: "IT", brand: "Bebi Born", fbaAvailable: 777, skuCount: 3 }] } };
+await asyncTest("13(serve). buildAccountBrandSlice serves the AVAILABLE v2 compact over a newest placeholder and over a v1 row", async () => {
+  const placeholderNewest = { params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-07-28" }, source_refreshed_at: "2026-07-30T00:00:00.000Z", payload: { ...compactPayload([]), listingsRefreshedAt: null } };
+  const laggingAvail = { params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-07-20" }, source_refreshed_at: "2026-07-25T00:00:00.000Z", payload: compactPayload([{ country: "IT", brand: "Bebi Born", fbaAvailable: 777, skuCount: 3 }], { listingsRefreshedAt: "2026-07-20T03:00:00.000Z" }) };
   const slice = await buildAccountBrandSlice({
     accountId: ACCOUNT_A, brand: "Bebi Born", asOf: "2026-07-28", account: { name: "Bebi EU", country: "IT" },
     getSnapshot: fakeGetSnapshot, getAdsRows: fakeGetAdsRows, getCampaignMappings: getCampaignMappingsFake,
-    getInventorySnapshots: async () => [placeholderNewest, laggingAvail],
+    getInventorySnapshots: async () => [placeholderNewest, V1_HEALTH_COMPACT, laggingAvail],
   });
-  assert.equal(slice.inventory.byCountry.get("IT"), 777, "the available compact wins over the newest unavailable placeholder");
-  assert.equal(slice.inventoryDate, "2026-07-20", "the served inventory keeps its REAL (older) inventory date");
-  assert.notEqual(slice.inventory.byCountry.get("IT"), 883, "not the legacy fba-plan value, and not the unavailable placeholder");
+  assert.equal(slice.inventory.byCountry.get("IT"), 777, "the available v2 compact wins (never the placeholder, never the v1 555, never the fba-plan 883)");
+  assert.deepEqual([slice.inventoryDate, slice.inventoryRefreshedAt], [null, "2026-07-20T03:00:00.000Z"]);
 });
 
-await asyncTest("13(serve-fallback). with NO multi-row reader buildAccountBrandSlice is byte-identical (legacy single read)", async () => {
-  const slice = await sliceFor(fakeGetSnapshot); // no getInventorySnapshots -> single latest read -> legacy fba-plan
-  assert.equal(slice.inventory.byCountry.get("IT"), 883, "no getInventorySnapshots reader -> unchanged legacy behavior");
+await asyncTest("13(serve-fallback). with NO multi-row reader buildAccountBrandSlice is byte-identical (single latest read)", async () => {
+  const slice = await sliceFor(fakeGetSnapshot); // no getInventorySnapshots -> single latest read -> the fba-plan
+  assert.equal(slice.inventory.byCountry.get("IT"), 883, "no getInventorySnapshots reader -> unchanged single-read behavior");
+});
+
+await asyncTest("a UK inventory bucket keyed GB is re-keyed onto the account's UK sales spelling (never a phantom FC-only row)", async () => {
+  const slice = await sliceFor(getSnapshotWithInventory(compactSnap([
+    { country: "GB", brand: "Bebi Born", fbaAvailable: 912, skuCount: 3 },
+    { country: "IT", brand: "Bebi Born", fbaAvailable: 883, skuCount: 4 },
+  ])));
+  assert.deepEqual([slice.inventory.byCountry.get("UK"), slice.inventory.byCountry.has("GB")], [912, false]);
+  const payload = assembleFor([slice]);
+  assert.ok(!payload.countries.some((c) => c.country === "GB"), "no separate GB row");
+  assert.equal(payload.countries.find((c) => c.country === "UK").fbaAvailable, 912);
 });
 
 await asyncTest("Campaign->brand mapping drives Brand View ad attribution (not the catalog); brand isolation holds", async () => {
@@ -1353,6 +1584,141 @@ test("the portfolio snapshot key is the account set plus the brand", () => {
   assert.notEqual(key, brandViewPortfolioScopeId([ACCOUNT_A, ACCOUNT_C], "Nordfell"));
 });
 
+/* ============ 7b2. phase 2: per-account inventory sources + the EU all-market rule (server merge AND client) ============ */
+
+const { portfolioKpis } = await import("../src/lib/brand-portfolio-view.js");
+const { REPORT_CAPABILITIES, CAPABILITY, resolveUserReportScope, BrandAccessError } = await import("../lib/server/report-authorization.js");
+const C_HEALTH_DATE = "2026-07-26";
+// ACCOUNT_C (Bebi Reseller, IT + DE) on a v2 Health-FALLBACK compact; ACCOUNT_A (Bebi EU) on its phase-2 Listings fba-plan.
+const cFallbackCompact = (buckets) => ({ [`${BRAND_INVENTORY_SNAPSHOT_KEY}|${ACCOUNT_C}`]: {
+  source_refreshed_at: "2026-07-28T06:00:00.000Z",
+  params: { reportVersion: BRAND_INVENTORY_REPORT_VERSION, to: "2026-07-28" },
+  payload: compactPayload(buckets, { ...fallbackOver, accountId: ACCOUNT_C, inventoryHealthDate: C_HEALTH_DATE, inventoryDate: C_HEALTH_DATE }),
+} });
+const portfolioWith = (extra) => buildBrandViewPortfolioSnapshot({
+  accountIds: [ACCOUNT_A, ACCOUNT_C], brand: "Bebi Born", asOf: "2026-07-28",
+  accountsById: { [ACCOUNT_A]: { name: "Bebi EU", country: "IT" }, [ACCOUNT_C]: { name: "Bebi Reseller", country: "IT" } },
+  getSnapshot: getSnapshotWithInventory(extra), getAdsRows: fakeGetAdsRows, getCampaignMappings: getCampaignMappingsFake,
+});
+// The single-account report over a compact with the given buckets (the brand's per-marketplace stock).
+const accountWith = async (buckets) => assembleFor([await sliceFor(getSnapshotWithInventory(compactSnap(buckets)))]);
+const usdTables = (payload) => buildBrandTables(brandViewModel(payload), { rangeFrom: "2026-07-27", rangeTo: "2026-07-27", displayCurrency: "USD", rates: RATES });
+const allMarketsRow = (tables) => tables.dailyTable.rows.find((row) => row.kind === "total");
+const countryRow = (tables, name) => tables.dailyTable.rows.find((row) => row.kind === "row" && row.label?.includes(name));
+
+await asyncTest("phase 2 portfolio: each account keeps its OWN labelled source (Listings / Health fallback); freshness is the oldest per source", async () => {
+  const p = await portfolioWith(cFallbackCompact([
+    { country: "IT", brand: "Bebi Born", fbaAvailable: 100, skuCount: 2 },
+    { country: "DE", brand: "Bebi Born", fbaAvailable: 50, skuCount: 1 },
+  ]));
+  const byId = Object.fromEntries(p.coverage.inventoryAccountSources.map((s) => [s.accountId, s]));
+  assert.deepEqual([byId[ACCOUNT_A].source, byId[ACCOUNT_A].listingsRefreshedAt, byId[ACCOUNT_A].healthDate], ["listings", SNAPSHOTS[`fba-plan|${ACCOUNT_A}`].payload.listingsRefreshedAt, null]);
+  assert.deepEqual([byId[ACCOUNT_C].source, byId[ACCOUNT_C].healthDate, byId[ACCOUNT_C].listingsRefreshedAt, byId[ACCOUNT_C].listingsReasons], ["health-fallback", C_HEALTH_DATE, null, ["listings-not-expanded"]]);
+  assert.equal(inventorySourceLabel(byId[ACCOUNT_C]), `FBA Inventory Health snapshot ${C_HEALTH_DATE} (saved bridge, no longer refreshed)`);
+  assert.match(inventorySourceLabel(byId[ACCOUNT_A]), /^Listings refreshed /);
+  assert.equal(p.coverage.inventoryDate, C_HEALTH_DATE, "the oldest Health snapshot date among Health-sourced accounts");
+  assert.equal(p.coverage.inventoryRefreshedAt, SNAPSHOTS[`fba-plan|${ACCOUNT_A}`].payload.listingsRefreshedAt, "the oldest Listings fetch among Listings-sourced accounts");
+  assert.ok(p.notes.some((n) => /Bebi Reseller \(FBA Inventory Health snapshot 2026-07-26\)/.test(n) && /temporary read-only bridge/.test(n)), "the bridge account is named with its Health date");
+  const summary = inventoryFreshnessSummary(p.coverage);
+  assert.equal(summary.label, "mixed sources (Listings for 1, saved FBA Inventory Health bridge for 1 accounts)");
+  assert.match(summary.title, /Bebi Reseller: FBA Inventory Health snapshot 2026-07-26 \(saved bridge, no longer refreshed\)/);
+  assert.match(inventoryFreshnessText(p.coverage, "FBA Inv."), /^FBA Inv\.: mixed sources/);
+  // A pre-phase-2 payload keeps the former wording.
+  assert.equal(inventoryFreshnessText({ inventoryDate: "2026-07-20" }, "FBA Inv."), "FBA Inv. as of 2026-07-20");
+  assert.equal(inventoryFreshnessText({}, "FBA inventory"), "FBA inventory unavailable");
+  // Per-marketplace figures are complete sums across accounts (IT = 883 + 100).
+  assert.equal(p.countries.find((c) => c.country === "IT").fbaAvailable, 983);
+  assert.equal(p.countries.find((c) => c.country === "DE").fbaAvailable, 50);
+});
+
+await asyncTest("EU rule (server merge + client): IT, PL and DE all positive -> the all-market total is WITHHELD everywhere; every marketplace keeps its own figure", async () => {
+  const p = await portfolioWith(cFallbackCompact([
+    { country: "IT", brand: "Bebi Born", fbaAvailable: 100, skuCount: 2 },
+    { country: "DE", brand: "Bebi Born", fbaAvailable: 50, skuCount: 1 },
+  ]));
+  assert.equal(p.coverage.inventoryAllMarketWithheld, true);
+  assert.equal(p.coverage.inventoryAllMarketWithheldReason, EU_POOL_ALL_MARKET_WITHHELD_REASON);
+  assert.deepEqual(p.coverage.inventoryPoolMarketsPositive, ["DE", "IT", "PL"]);
+  assert.equal(p.coverage.inventoryAccountTotal, null, "never 983 + 912 + 368 + 50");
+  assert.ok(p.notes.some((n) => /All Markets FBA inventory total is withheld/.test(n) && /DE, IT, PL/.test(n)));
+  assert.deepEqual(["IT", "UK", "PL", "DE"].map((c) => p.countries.find((e) => e.country === c).fbaAvailable), [983, 912, 368, 50], "per-market semantics kept");
+  // Client: the converted All Markets FBA cell + its cover are withheld (em dash + the plain reason); rows keep values.
+  const tables = usdTables(p);
+  const total = allMarketsRow(tables);
+  assert.equal(total.cells[5].t, "—");
+  assert.equal(total.cells[5].n, undefined, "no number reaches the export either");
+  assert.equal(total.hints[5], EU_POOL_ALL_MARKET_WITHHELD_REASON);
+  assert.equal(total.cells[6].t, "—", "FBA Cover over a withheld total is withheld too");
+  assert.equal(countryRow(tables, "Italy").cells[5].t, "983");
+  assert.equal(countryRow(tables, "Germany").cells[5].t, "50");
+  // The Brand Portfolio FBA Inventory KPI + FBA Cover are withheld with the reason, even though every group is known.
+  const k = portfolioKpis(tables);
+  assert.deepEqual([k.fba, k.cover, k.fbaWithheldReason], [null, null, EU_POOL_ALL_MARKET_WITHHELD_REASON]);
+  // The SAME rule object is shared by server and client.
+  assert.equal(clientEuPoolAllMarketRule, euPoolAllMarketRule);
+});
+
+await asyncTest("EU rule: ONE pool marketplace + UK is summed (server total, client All Markets, KPI)", async () => {
+  const p = await accountWith([
+    { country: "IT", brand: "Bebi Born", fbaAvailable: 883, skuCount: 4 },
+    { country: "UK", brand: "Bebi Born", fbaAvailable: 912, skuCount: 3 },
+  ]);
+  assert.deepEqual([p.coverage.inventoryAllMarketWithheld, p.coverage.inventoryAccountTotal, p.coverage.inventoryPoolMarketsPositive], [false, 1795, ["IT"]]);
+  const tables = usdTables(p);
+  assert.equal(allMarketsRow(tables).cells[5].n, 1795);
+  assert.equal(allMarketsRow(tables).hints[5], undefined);
+  const k = portfolioKpis(tables);
+  assert.deepEqual([k.fba, k.fbaWithheldReason], [1795, null]);
+});
+
+await asyncTest("EU rule: a pool marketplace with 0 stock does NOT trigger it; two POSITIVE pool marketplaces do (per-market still shown)", async () => {
+  const zero = await accountWith([
+    { country: "IT", brand: "Bebi Born", fbaAvailable: 883, skuCount: 4 },
+    { country: "DE", brand: "Bebi Born", fbaAvailable: 0, skuCount: 1 },
+    { country: "UK", brand: "Bebi Born", fbaAvailable: 912, skuCount: 3 },
+  ]);
+  assert.deepEqual([zero.coverage.inventoryAllMarketWithheld, zero.coverage.inventoryAccountTotal], [false, 1795]);
+  assert.equal(portfolioKpis(usdTables(zero)).fba, 1795);
+  const two = await accountWith([
+    { country: "IT", brand: "Bebi Born", fbaAvailable: 883, skuCount: 4 },
+    { country: "FR", brand: "Bebi Born", fbaAvailable: 10, skuCount: 1 },
+  ]);
+  assert.deepEqual([two.coverage.inventoryAllMarketWithheld, two.coverage.inventoryAccountTotal], [true, null]);
+  assert.deepEqual([two.countries.find((c) => c.country === "IT").fbaAvailable, two.countries.find((c) => c.country === "FR").fbaAvailable], [883, 10]);
+  // Original-currency mode: the EUR group (IT + FR) withholds its FBA total; the per-market rows stay.
+  const orig = buildBrandTables(brandViewModel(two), { rangeFrom: "2026-07-27", rangeTo: "2026-07-27", displayCurrency: ORIGINAL_CURRENCY, rates: null });
+  const eur = orig.dailyGroups.find((g) => g.rows.some((r) => r.country === "IT"));
+  assert.equal(eur.fbaWithheld, eur.rows.some((r) => r.country === "FR"), "the EUR group withholds when it holds both pool marketplaces");
+  const k = portfolioKpis(orig);
+  assert.deepEqual([k.fba, k.fbaWithheldReason], [null, EU_POOL_ALL_MARKET_WITHHELD_REASON], "the KPI applies the rule across every group (also a pre-rule payload's total)");
+  // A payload saved BEFORE the rule (its server total counted pooled stock twice) is still withheld by the client.
+  const preRule = { ...two, coverage: { ...two.coverage, inventoryAccountTotal: 893, inventoryAllMarketWithheld: undefined } };
+  assert.equal(portfolioKpis(usdTables(preRule)).fba, null);
+});
+
+await asyncTest("brand-limited users: the compact (every brand's buckets) is never served to them; the brand-scoped payload's new fields carry no other brand", async () => {
+  // Production authorization is unchanged: the compact brand-inventory is DENIED to brand-restricted users, Brand View
+  // is brand-filterable (a SELECTED_BRANDS user only ever requests a permitted brand).
+  assert.equal(REPORT_CAPABILITIES["brand-inventory"], CAPABILITY.DENY_FOR_BRAND_RESTRICTED_USERS);
+  assert.equal(REPORT_CAPABILITIES["brand-view"], CAPABILITY.BRAND_FILTERABLE);
+  const selected = { userId: "u1", role: "viewer", accountIds: [ACCOUNT_A], accountGrants: { [ACCOUNT_A]: { mode: "SELECTED_BRANDS", brandKeys: [bvBrandKey("Bebi Born")] } } };
+  const getTrustedBrands = async () => [{ key: bvBrandKey("Bebi Born"), display: "Bebi Born" }, { key: bvBrandKey("Nordfell"), display: "Nordfell" }];
+  await assert.rejects(() => resolveUserReportScope({ access: selected, requestedAccountId: ACCOUNT_A, requestedBrand: "Nordfell", action: "brand-view", getTrustedBrands }), (e) => e instanceof BrandAccessError);
+  await assert.rejects(() => resolveUserReportScope({ access: selected, requestedAccountId: ACCOUNT_A, requestedBrand: "ALL", action: "brand-inventory", getTrustedBrands }), (e) => e instanceof BrandAccessError);
+  const scope = await resolveUserReportScope({ access: selected, requestedAccountId: ACCOUNT_A, requestedBrand: "Bebi Born", action: "brand-view", getTrustedBrands });
+  assert.deepEqual([scope.restricted, scope.requestedBrandKey], [true, bvBrandKey("Bebi Born")]);
+  // The permitted brand's payload, built from a compact that ALSO holds Nordfell's stock, exposes nothing of Nordfell.
+  const p = await accountWith([
+    { country: "IT", brand: "Bebi Born", fbaAvailable: 883, skuCount: 4 },
+    { country: "IT", brand: "Nordfell", fbaAvailable: 4321, skuCount: 9 },
+  ]);
+  const json = JSON.stringify(p);
+  assert.ok(!json.includes("Nordfell") && !json.includes("4321"), "no other brand's name or stock in the brand-scoped payload");
+  for (const s of p.coverage.inventoryAccountSources) {
+    assert.deepEqual(Object.keys(s).sort(), ["accountId", "accountName", "healthDate", "listingsReasons", "listingsRefreshedAt", "source", "unavailableReason"], "per-account source entries carry no brand data");
+  }
+});
+
 /* ===================== 7c. the shared tables both pages render ============== */
 
 test("both reports build the same three tables from the same payload shape", () => {
@@ -1404,7 +1770,11 @@ test("the portfolio table names the accounts behind a shared marketplace", () =>
   assert.equal(italy.cells.length, 8);
   assert.equal(italy.cells[3].t, "—", "Ad Spend is an em dash where this marketplace has no Ads coverage");
   assert.equal(italy.cells[4].t, "—", "TACoS% is an em dash where Ad Spend is unavailable");
-  assert.equal(italy.cells[5].t, "883");
+  // Bebi Reseller (one of the two Italy accounts) has NO usable inventory snapshot, so Italy's FBA Inv. is withheld (n/a)
+  // -- never Bebi EU's 883 shown as if it were the complete Italy total.
+  assert.equal(italy.cells[5].t, "n/a", "a marketplace with an account of UNKNOWN inventory is withheld, never a partial sum");
+  assert.ok(PORTFOLIO.countries.find((c) => c.country === "IT").fbaUnknown === true);
+  assert.ok(PORTFOLIO.notes.some((n) => /Bebi Reseller/.test(n) && /not fully known/.test(n)), "the note names the account with unknown inventory");
   // More than one currency, so every group is introduced by a currency band.
   const bands = tables.dailyTable.rows.filter((row) => row.kind === "band");
   assert.equal(bands.length, tables.dailyGroups.length);

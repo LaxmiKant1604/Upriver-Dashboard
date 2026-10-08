@@ -114,22 +114,23 @@ export function daysToInbound(inboundEta, marketplaceToday) {
 }
 
 // The inventory-cover + reorder model, from NON-OVERLAPPING evidence:
-//   Existing Cover Raw = FBA Available + AWD Available + Inbound Pipeline - (WDD * Days to Inbound)
+//   Existing Cover Raw = FBA Available + AWD Available + FBA Inbound - (WDD * Days to Inbound)
 //   Existing Cover     = max(0, Existing Cover Raw)
 //   Ideal Cover        = WDD * Total Lead Time
 //   Reorder Status     = Reorder when Existing Cover < Ideal Cover (full precision), else Sufficient
 //   Suggested Reorder  = ceil(max(0, Ideal Cover - Existing Cover))
-// Total FBA Inventory is deliberately NOT used (it already contains inbound quantities -> double count). AWD/Inbound
-// that are genuinely absent (non-US AWD, or none inbound) contribute 0 SUPPLY, but only when FBA availability exists;
-// if demand, inventory or the lead-time/countdown settings are unavailable the status is "Unavailable" (never a false
-// "Sufficient"). Comparisons use full precision; unit outputs are whole units.
+// The FBA Supply total is deliberately NOT used (it already contains the inbound quantity -> double count). Since the
+// Listings inventory cutover every supply input must be KNOWN: an unknown FBA Inbound (null) or an unknown AWD Available
+// makes the cover Unavailable -- never a fabricated 0. AWD that does not apply to the marketplace is passed as an
+// explicit 0 by the caller. If demand, inventory or the lead-time/countdown settings are unavailable the status is
+// "Unavailable" (never a false "Sufficient"). Comparisons use full precision; unit outputs are whole units.
 export function coverModel({ wdd, totalLeadTime: tlt, daysToInbound: dti, fbaAvailable, awdAvailable, inboundPipeline } = {}) {
   const w = num(wdd), lt = num(tlt), dd = num(dti);
   const fba = num(fbaAvailable), awd = num(awdAvailable), inb = num(inboundPipeline);
   const idealExact = w == null || lt == null ? null : w * lt;
   let existingExact = null;
-  if (w != null && dd != null && fba != null) {
-    const supply = fba + (awd == null ? 0 : awd) + (inb == null ? 0 : inb);
+  if (w != null && dd != null && fba != null && awd != null && inb != null) {
+    const supply = fba + awd + inb;
     existingExact = Math.max(0, supply - w * dd);
   }
   let reorderStatus = "Unavailable";

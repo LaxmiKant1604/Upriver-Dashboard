@@ -197,10 +197,10 @@ ok("LISTINGS_SOURCE_KEY / LISTINGS_RAW_SOURCE_KEY match the migration table sour
   const sum2 = await run(cache, d, { readAliasMeta });
   // skippedStale = 6 (2 accounts x 3 read keys: listings + listings-raw + inventory alias); durable backfills the two
   // NEW-export families only (inventory has no durable source key -> persistDurable no-ops without counting).
-  ok("9: freshness guard trips (skippedStale=6, aliasesWritten=0) yet durable pointers are BACKFILLED (durableWritten=4)", sum2.skippedStale === 6 && sum2.aliasesWritten === 0 && sum2.durableWritten === 4 && d.count(LISTINGS_SOURCE_KEY) === 2 && d.count(LISTINGS_RAW_SOURCE_KEY) === 2);
+  ok("9: freshness guard trips (skippedStale=4: 2 accounts x 2 read keys, no inventory key since the Listings cutover; aliasesWritten=0) yet durable pointers are BACKFILLED (durableWritten=4)", sum2.skippedStale === 4 && sum2.aliasesWritten === 0 && sum2.durableWritten === 4 && d.count(LISTINGS_SOURCE_KEY) === 2 && d.count(LISTINGS_RAW_SOURCE_KEY) === 2);
   // Pass 3 = replay after backfill: the alias is still current AND the durable pointer now exists -> zero writes.
   const sum3 = await run(cache, d, { readAliasMeta });
-  ok("9: replay after backfill -> skippedStale=6, durableUnchanged=4, ZERO new writes (idempotent)", sum3.skippedStale === 6 && sum3.durableUnchanged === 4 && sum3.durableWritten === 0);
+  ok("9: replay after backfill -> skippedStale=4, durableUnchanged=4, ZERO new writes (idempotent)", sum3.skippedStale === 4 && sum3.durableUnchanged === 4 && sum3.durableWritten === 0);
 }
 
 // ---- (10) MISSING MEMBERSHIP != EMPTY: an owner whose seller is NOT a canonical member of the batch isolates to ----
@@ -225,7 +225,7 @@ ok("LISTINGS_SOURCE_KEY / LISTINGS_RAW_SOURCE_KEY match the migration table sour
   const cache = makeCache(); const d = makeDurable(); const p = plans();
   seedBatch(cache, p, { listings: SELLERS.map((s) => listingRow(s, "K1")), raw: SELLERS.map((s) => rawRow(s, "K1")) }); // inventory intentionally ABSENT
   const sum = await run(cache, d);
-  ok("11: Listings + Listings-Raw both persist with NO inventory/OLI/Catalog present (persistence is source-decoupled)", d.count(LISTINGS_SOURCE_KEY) === 2 && d.count(LISTINGS_RAW_SOURCE_KEY) === 2 && sum.durableWritten === 4 && sum.batchMissing === 2);
+  ok("11: Listings + Listings-Raw both persist with NO OLI/Catalog present (persistence is source-decoupled; no inventory read key exists since the Listings cutover)", d.count(LISTINGS_SOURCE_KEY) === 2 && d.count(LISTINGS_RAW_SOURCE_KEY) === 2 && sum.durableWritten === 4 && sum.batchMissing === 0);
 }
 
 writeSync(1, `\nlistings-durable-model: ${passed} assertions passed\n`);

@@ -68,9 +68,16 @@ async function mount(accountId) {
 /* ===================== load + sharing/isolation (render gate) ===================== */
 await (async () => {
   const { server, box } = await mount("X");
-  ok("load: before the GET resolves, hiddenCols is the DEFAULT (never blank/undefined, never another account)", box.api.hiddenCols instanceof Set && hiddenList(box).includes("reservedFcTransfer"));
+  ok("load: before the GET resolves, hiddenCols is the DEFAULT (never undefined, never another account; the default set is empty since the Listings cutover)", box.api.hiddenCols instanceof Set && hiddenList(box) === "");
   await act(async () => { server.releaseGet("X", ["m1", "wdd"]); }); await flush();
   ok("load: the account's SAVED layout renders after the GET", hiddenList(box) === "m1,wdd" && box.api.ready === true);
+})();
+
+/* ===================== Listings cutover: retired column ids are dropped on load ===================== */
+await (async () => {
+  const { server, box } = await mount("R");
+  await act(async () => { server.releaseGet("R", ["m1", "custReserved", "totalFbaInv", "inboundWorking", "pipeline"]); }); await flush();
+  ok("load: ids retired by the Listings cutover (custReserved / totalFbaInv / inboundWorking / pipeline) are dropped; m1 stays", hiddenList(box) === "m1");
 })();
 
 /* ===================== D: A->B delayed GET ===================== */
@@ -153,7 +160,7 @@ await (async () => {
   ok("cmd: Select All optimistically shows an empty hidden set + POSTs []", hiddenList(box) === "" && server.recorded[server.recorded.length - 1].hiddenColumns.length === 0);
   await act(async () => { server.releasePost("A", []); }); await flush();
   await act(async () => { box.api.reset(); }); await flush();
-  ok("cmd: Reset Default optimistically shows the default set + POSTs the default", hiddenList(box).includes("reservedFcTransfer") && server.recorded[server.recorded.length - 1].hiddenColumns.includes("inboundWorking"));
+  ok("cmd: Reset Default optimistically shows the default set (empty) + POSTs the default", hiddenList(box) === "" && server.recorded[server.recorded.length - 1].hiddenColumns.length === 0);
 })();
 
 writeSync(1, `\nfba-plan-columns-hook: ${passed} assertions passed\n`);

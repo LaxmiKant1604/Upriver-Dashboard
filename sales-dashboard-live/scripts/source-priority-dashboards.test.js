@@ -8,7 +8,8 @@
 //   P4  the release composition: deriveBucket takes ONLY the bucket (own deadline + own production preflight, no
 //       caller scope); finalizeBucket INDEPENDENTLY reconstructs the durable scope (fresh discovery + cycle row +
 //       reserved hash + org-scoped catalog job + accounts x 3 validated report jobs) and refuses everything else.
-//   P5  Brand View inventory renders missing FBA as inventoryAvailable:false.
+//   P5  Brand View inventory (the phase-2 v2 compact) renders missing inventory as inventoryAvailable:false; validated
+//       Listings serve, else the last FBA Inventory Health snapshot as a labelled fallback.
 //   P6  the REAL publisher returns not-successful for all 3 before finalization and publishes all 3 after.
 //   P7  the REAL buildAccountBrandSlice reads published brand-sales + brand-inventory and renders fresh sales,
 //       inventory unavailable.
@@ -32,6 +33,11 @@ const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ }
 const OLI = "order-line-items";
 const CATALOG = "product-catalog";
 const FBA = "fba-inventory-health";
+// The compact brand-inventory contract since the Listings inventory cutover PHASE 2 (v2: the compact records its
+// per-account source). An EMPTY compact is what the priority run publishes for an account with neither validated
+// Listings nor a saved FBA Inventory Health snapshot: honest Unavailable, never a zero.
+const BI_VERSION = "brand-inventory-shared-v2";
+const EMPTY_V2_COMPACT = Object.freeze({ inventoryModel: "listings-v1", inventorySource: "unavailable", inventoryListingsReasons: ["listings-empty"], inventoryHealthDate: null, listingsRefreshedAt: null, inventoryDate: null, inventoryAvailable: false, inventoryUnavailableReason: "no-validated-listings;no-fba-inventory-health-snapshot", inventoryConflicts: 0, inventoryByBrandCountry: [] });
 const ORG = "__organization";
 const TODAY = "2026-08-20";
 const ASOF = "2026-08-19";
@@ -213,11 +219,17 @@ function planPriorityBucket(bucket, n) {
 }
 test("P3a. US bucket (8): ZERO OLI + ZERO FBA jobs, EXACTLY one Catalog job", () => { const jf = planPriorityBucket("us", 8).summary.plannedJobsByFamily; assert.equal(jf[OLI] || 0, 0); assert.equal(jf[FBA] || 0, 0); assert.equal(jf[CATALOG], 1); });
 test("P3b. Non-US bucket (22): ZERO OLI + ZERO FBA jobs, EXACTLY one Catalog job", () => { const jf = planPriorityBucket("non-us", 22).summary.plannedJobsByFamily; assert.equal(jf[OLI] || 0, 0); assert.equal(jf[FBA] || 0, 0); assert.equal(jf[CATALOG], 1); });
-test("P3c. WITHOUT the priority pauses a normal plan WOULD create OLI + FBA (the cost the path avoids)", () => {
+test("P3c. WITHOUT the priority pauses a normal plan WOULD create OLI (the cost the path avoids) -- and NEVER the retired FBA Inventory Health", () => {
   const accounts = accountsFor("us", 8); const coverageByAccountId = {};
   for (const a of accounts) coverageByAccountId[a.accountId] = [];
-  const jf = planMod.planBucketSourceSync({ apiKey: "prim-key", bucket: "us", accounts, existingMembership: new Map(), coverageByAccountId, catalogSnapshot: null, fbaSnapshotsByAccount: {}, pausedSources: new Set(), asOf: ASOF, today: TODAY, catalogCarrierSeller: CARRIER }).summary.plannedJobsByFamily;
-  assert.ok((jf[OLI] || 0) > 0); assert.ok((jf[FBA] || 0) > 0);
+  const plan = planMod.planBucketSourceSync({ apiKey: "prim-key", bucket: "us", accounts, existingMembership: new Map(), coverageByAccountId, catalogSnapshot: null, fbaSnapshotsByAccount: {}, pausedSources: new Set(), asOf: ASOF, today: TODAY, catalogCarrierSeller: CARRIER });
+  const jf = plan.summary.plannedJobsByFamily;
+  assert.ok((jf[OLI] || 0) > 0);
+  assert.equal(jf[FBA] || 0, 0, "Health is retired: zero Health jobs even with nothing paused (a legacy fbaSnapshotsByAccount input is ignored)");
+  assert.ok(!plan.families.some((fam) => fam.sourceKey === FBA), "no fba-inventory-health family is ever planned");
+  // resolvedFbaSnapshot survives only as a READ-ONLY retired identity of a SAVED snapshot (bridge verification).
+  const ident = planMod.resolvedFbaSnapshot({ apiKey: "prim-key", account: { rawSellerId: "S1", country: "US" }, asOf: ASOF, bucket: "us" });
+  assert.ok(ident.retired === true && ident.readOnly === true, "read-only retired identity, never a planned job");
 });
 // The corrected org-wide Catalog request (mission items 1-4, 6-7, 10).
 function catalogJobOf(bucket, n) {
@@ -574,10 +586,37 @@ test("P4e. preflightAccount runs the SHARED publisher preflight for all 3 keys, 
 });
 
 /* ===================== P5. Brand View inventory renders missing FBA as unavailable ===================== */
-group("P5. Brand View inventory contract: missing FBA => inventoryAvailable:false");
-test("P5a. buildBrandInventoryPayload with empty rows yields inventoryAvailable:false, null date, empty table", () => {
+group("P5. Brand View inventory contract (phase-2 v2 compact): no inventory evidence => inventoryAvailable:false");
+const expandedRow = (sku, asin, available, over = {}) => ({ marketplace_country_code: "US", sku, child_asin: asin, fnsku: "X" + sku, listing_fulfillment_channel: "AMAZON_NA", fba_quantity_available: available, fba_quantity_inbound: 0, fba_quantity_reserved: 0, fba_quantity_fc_transfer: 0, ...over });
+const healthRow = (sku, asin, available) => ({ date: ASOF, marketplace_country_code: "US", sku, child_asin: asin, available, inbound_working: 0, inbound_shipped: 0, inbound_received: 0 });
+test("P5a. buildBrandInventoryPayload with no Listings and no Health rows yields the v2 'unavailable' compact (null date, empty table) the publisher validates", () => {
   const payload = brandView.buildBrandInventoryPayload({ accountId: "A01", invRows: [], brandByAsin: new Map([["B0A", "Acme"]]), accountCountry: "US", from: "2026-06-01", to: ASOF, rowLimit: 100000 });
   assert.equal(payload.inventoryAvailable, false); assert.equal(payload.inventoryDate, null); assert.deepEqual(payload.inventoryByBrandCountry, []);
+  assert.deepEqual(payload, { accountId: "A01", ...EMPTY_V2_COMPACT }, "the empty compact the priority run publishes");
+  assert.equal(reportDerivation.REPORT_DERIVATIONS["brand-inventory"].validatePayload(payload), true, "the publisher's validator accepts it");
+});
+test("P5b. VALIDATED Listings fold to (country, brand) with the Listings fetch time (no date claimed); the Health rows are not used", () => {
+  const at = "2026-08-19T04:00:00.000Z";
+  const payload = brandView.buildBrandInventoryPayload({ accountId: "A01", listingsRows: [expandedRow("S1", "B0A", 7), expandedRow("S2", "B0B", 3)], healthRows: [healthRow("S1", "B0A", 999)], brandByAsin: new Map([["B0A", "Acme"], ["B0B", "Beta"]]), accountCountry: "US", listingsRefreshedAt: at, to: ASOF, rowLimit: 100000 });
+  assert.deepEqual([payload.inventorySource, payload.inventoryAvailable, payload.inventoryDate, payload.listingsRefreshedAt], ["listings", true, null, at]);
+  const by = new Map(payload.inventoryByBrandCountry.map((r) => [r.brand, r]));
+  assert.deepEqual(by.get("Acme"), { country: "US", brand: "Acme", fbaAvailable: 7, skuCount: 1 });
+  assert.equal(reportDerivation.REPORT_DERIVATIONS["brand-inventory"].validatePayload(payload), true);
+});
+test("P5c. NOT validated Listings (a pre-cutover snapshot) + saved Health -> the labelled Health FALLBACK (its date; never Listings freshness)", () => {
+  const old = [expandedRow("S1", "B0A", 7)].map(({ fba_quantity_inbound, fba_quantity_reserved, fba_quantity_fc_transfer, ...rest }) => rest);
+  const payload = brandView.buildBrandInventoryPayload({ accountId: "A01", listingsRows: old, healthRows: [healthRow("S1", "B0A", 12)], brandByAsin: new Map([["B0A", "Acme"]]), accountCountry: "US", listingsRefreshedAt: "2026-08-19T04:00:00.000Z", to: ASOF, rowLimit: 100000 });
+  assert.deepEqual([payload.inventorySource, payload.inventoryHealthDate, payload.inventoryDate, payload.listingsRefreshedAt, payload.inventoryListingsReasons], ["health-fallback", ASOF, ASOF, null, ["listings-not-expanded"]]);
+  assert.equal(payload.inventoryByBrandCountry[0].fbaAvailable, 12);
+  assert.equal(reportDerivation.REPORT_DERIVATIONS["brand-inventory"].validatePayload(payload), true);
+  assert.equal(reportDerivation.REPORT_DERIVATIONS["brand-inventory"].validatePayload({ inventoryByBrandCountry: [], inventoryDate: null, inventoryAvailable: false }), false, "a v1 (pre-phase-2) compact never validates as v2");
+});
+test("P5d. structural refusals (non-array, malformed row, no marketplace, row cap) THROW admin-safe (the previous compact is preserved)", () => {
+  const base = { accountId: "A01", brandByAsin: new Map(), accountCountry: "US", rowLimit: 100000 };
+  assert.throws(() => brandView.buildBrandInventoryPayload({ ...base, listingsRows: "x" }), (e) => e.brandInventorySafe === true);
+  assert.throws(() => brandView.buildBrandInventoryPayload({ ...base, listingsRows: [expandedRow("S1", "B0A", 1), null] }), (e) => e.brandInventorySafe === true);
+  assert.throws(() => brandView.buildBrandInventoryPayload({ ...base, accountCountry: "", listingsRows: [] }), (e) => e.brandInventorySafe === true);
+  assert.throws(() => brandView.buildBrandInventoryPayload({ ...base, rowLimit: 2, healthRows: [healthRow("S1", "B0A", 1), healthRow("S2", "B0A", 1)] }), (e) => e.brandInventorySafe === true && /row cap/.test(e.message));
 });
 
 /* ===================== P6. the REAL publisher: not-successful before finalization, published after ===================== */
@@ -585,7 +624,7 @@ group("P6. real publisher terminal-cycle gate: all 3 refused before finalization
 const SPECS = {
   "daily-reporting": { version: "daily-reporting/v2f-campaign", params: { reportVersion: "daily-reporting/v2f-campaign", accountId: "A01", from: "2026-03-19", to: ASOF, brand: "ALL" }, payload: { rows: [], brandFiltered: false, adsAvailability: { status: "unavailable" } } },
   "brand-sales": { version: "brand-sales/v2d-2", params: { reportVersion: "brand-sales/v2d-2", accountId: "A01", from: "2025-01-01", to: ASOF }, payload: { rows: [], catalogBrands: [], asinBrand: { B0A: "Acme" } } },
-  "brand-inventory": { version: "brand-inventory-shared-v1", params: { reportVersion: "brand-inventory-shared-v1", accountId: "A01", to: ASOF }, payload: { inventoryByBrandCountry: [], inventoryDate: null, inventoryAvailable: false } },
+  "brand-inventory": { version: BI_VERSION, params: { reportVersion: BI_VERSION, accountId: "A01", to: ASOF }, payload: { ...EMPTY_V2_COMPACT } },
 };
 function hashFor(rk) { return reportStore.paramsHashFor(SPECS[rk].version, SPECS[rk].params); }
 function realPublisher(cycleStatus) {
@@ -639,7 +678,7 @@ test("P6d. the SHARED preflight returns 'ready' + the exact live identity for AL
 group("P7. Brand View slice reads fresh brand-sales + brand-inventory; fresh sales, inventory unavailable");
 test("P7a. the REAL buildAccountBrandSlice renders fresh sales from published brand-sales and inventory unavailable from an empty compact brand-inventory", async () => {
   const brandSalesPayload = { rows: [{ date: "2026-07-27", marketplace_country_code: "US", currency: "USD", product_brand: "Acme", total_sales: 210, total_units_sold: 21 }], catalogBrands: ["Acme"], asinBrand: { B0A: "Acme" } };
-  const compactInventory = { params: { reportVersion: "brand-inventory-shared-v1" }, payload: { inventoryByBrandCountry: [], inventoryDate: null, inventoryAvailable: false }, source_refreshed_at: TS };
+  const compactInventory = { params: { reportVersion: BI_VERSION }, payload: { ...EMPTY_V2_COMPACT }, source_refreshed_at: TS };
   const getSnapshot = async ({ reportKey }) => { if (reportKey === "brand-sales") return { params: SPECS["brand-sales"].params, payload: brandSalesPayload, source_refreshed_at: TS }; if (reportKey === "brand-inventory") return compactInventory; return null; };
   const slice = await brandView.buildAccountBrandSlice({ accountId: "A01", brand: "Acme", asOf: ASOF, account: { country: "US" }, getSnapshot, getAdsRows: async () => [] });
   assert.ok(slice.sales && slice.sales.series && slice.sales.series.size > 0, "fresh sales rendered");
@@ -986,7 +1025,7 @@ group("PP1. END-TO-END: a partial cycle publishes the HEALTHY subset; the deferr
 function shadowSpecFor(rk, accountId, dailyPayload) {
   if (rk === "daily-reporting") return { version: "daily-reporting/v2f-campaign", params: { reportVersion: "daily-reporting/v2f-campaign", accountId, from: "2026-03-19", to: ASOF, brand: "ALL" }, payload: dailyPayload || { rows: [], brandFiltered: false, adsAvailability: { status: "unavailable" } } };
   if (rk === "brand-sales") return { version: "brand-sales/v2d-2", params: { reportVersion: "brand-sales/v2d-2", accountId, from: "2025-01-01", to: ASOF }, payload: { rows: [], catalogBrands: [], asinBrand: { B0A: "Acme" } } };
-  return { version: "brand-inventory-shared-v1", params: { reportVersion: "brand-inventory-shared-v1", accountId, to: ASOF }, payload: { inventoryByBrandCountry: [], inventoryDate: null, inventoryAvailable: false } };
+  return { version: BI_VERSION, params: { reportVersion: BI_VERSION, accountId, to: ASOF }, payload: { ...EMPTY_V2_COMPACT } };
 }
 const shadowHashFor = (rk, a, dp) => reportStore.paramsHashFor(shadowSpecFor(rk, a, dp).version, shadowSpecFor(rk, a, dp).params);
 // The LIVE identity (report_key + account_id + params_hash) the publisher's fenced write targets.

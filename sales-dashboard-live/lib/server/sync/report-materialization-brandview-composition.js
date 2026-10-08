@@ -13,7 +13,7 @@ import { discoverPrimaryAccountIds } from "./priority-control-pg-store.js";
 import { accountInScope, REGION_SCOPES } from "./scheduler-scope.js";
 import {
   buildBrandViewSnapshot, buildBrandViewPortfolioSnapshot, buildBrandViewBrandDirectory, brandNamesFromPayload,
-  BRAND_VIEW_VERSION, BRAND_VIEW_PORTFOLIO_VERSION, BRAND_INVENTORY_REPORT_VERSION, selectAuthoritativeInventorySnapshot,
+  BRAND_VIEW_VERSION, BRAND_VIEW_PORTFOLIO_VERSION, BRAND_INVENTORY_REPORT_VERSION, BRAND_INVENTORY_SERVE_VERSIONS, selectAuthoritativeInventorySnapshot,
 } from "../reports/brand-view.js";
 import { paramsHashFor } from "../report-store.js";
 import { collectBrandViewDependencyFingerprint } from "../reports/brand-view-dependency-fingerprint.js";
@@ -106,7 +106,7 @@ export function buildBrandViewMaterializationRelease(overrides = {}) {
     // compact) flips the fingerprint even when the latest placeholder's metadata is unchanged, and the serve does
     // NOT needlessly rebuild when an unavailable placeholder republishes but the selection is unchanged. Writer +
     // serve use the SAME selection, so they agree.
-    getInventorySelected: (accountId) => getInventoryCandidates({ reportKey: BRAND_INVENTORY_LIVE_REPORT_KEY, accountId, reportVersion: BRAND_INVENTORY_REPORT_VERSION })
+    getInventorySelected: (accountId) => getInventoryCandidates({ reportKey: BRAND_INVENTORY_LIVE_REPORT_KEY, accountId, reportVersion: BRAND_INVENTORY_SERVE_VERSIONS })
       .then((rows) => selectAuthoritativeInventorySnapshot(rows)).catch(() => null),
   };
 
@@ -195,7 +195,7 @@ export function buildBrandViewMaterializationRelease(overrides = {}) {
   // (selectAuthoritativeInventorySnapshot) instead of trusting the latest-by-updated_at row -- two indexed reads
   // (newest AVAILABLE compact + newest overall), NO recent-N cutoff. Zero-export (durable rows only). The SAME
   // reader backs the serve (api/datadoe.js) so writer + serve select identically.
-  const getInventorySnapshots = ({ reportKey, accountId }) => getInventoryCandidates({ reportKey, accountId, reportVersion: BRAND_INVENTORY_REPORT_VERSION });
+  const getInventorySnapshots = ({ reportKey, accountId }) => getInventoryCandidates({ reportKey, accountId, reportVersion: BRAND_INVENTORY_SERVE_VERSIONS });
 
   return Object.freeze({
     operator, connections, hasPrimary: !!primaryApiKey,

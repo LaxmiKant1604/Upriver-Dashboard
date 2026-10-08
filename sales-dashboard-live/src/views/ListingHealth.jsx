@@ -9,6 +9,7 @@ import {
   buildListingHealthInsights,
   buildListingHealthRows,
   insightExportRows,
+  insightInventoryState,
 } from "../lib/insights.js";
 import { downloadCsv, reportFilename } from "../lib/csv.js";
 import { fmtDateHuman, fmtMoney, nInt } from "../lib/format.js";
@@ -46,7 +47,7 @@ const ACCESSORS = {
   status: (row) => String(row.listingStatus || "").toLowerCase(),
   channel: (row) => String(row.fulfillmentChannel || "").toLowerCase(),
   price: (row) => row.price,
-  unitsOnHand: (row) => row.unitsOnHand,
+  unitsOnHand: (row) => (row.unitsOnHand === null || row.unitsOnHand === undefined ? -1 : row.unitsOnHand),
   sales30d: (row) => Number(row.sales30d) || 0,
   units30d: (row) => Number(row.units30d) || 0,
   salesAtRisk: (row) => row.salesAtRisk,
@@ -62,6 +63,8 @@ export default function ListingHealth({ data, loading, error, accountName, selec
 
   const rows = useMemo(() => buildListingHealthRows(data, selectedBrand), [data, selectedBrand]);
   const insights = useMemo(() => buildListingHealthInsights(data, rows), [data, rows]);
+  // The account's FBA stock source for on-hand FBA units (validated Listings / the dated saved Health bridge / unavailable).
+  const stockState = useMemo(() => insightInventoryState(data), [data]);
 
   const counts = useMemo(() => {
     const result = Object.fromEntries(GATE_ORDER.map((gate) => [gate, 0]));
@@ -74,7 +77,7 @@ export default function ListingHealth({ data, loading, error, accountName, selec
     return {
       problems: problems.length,
       salesAtRisk: problems.reduce((sum, row) => sum + row.salesAtRisk, 0),
-      strandedUnits: rows.filter((row) => row.gate === "stranded").reduce((sum, row) => sum + row.unitsOnHand, 0),
+      strandedUnits: rows.filter((row) => row.gate === "stranded").reduce((sum, row) => sum + (Number(row.unitsOnHand) || 0), 0),
       blocked: rows.filter((row) => ["error", "suppressed", "inactive"].includes(row.gate)).length,
     };
   }, [rows]);
@@ -114,7 +117,9 @@ export default function ListingHealth({ data, loading, error, accountName, selec
     Fulfilment: row.fulfillmentChannel || "",
     Price: row.price === null ? "" : Number(row.price).toFixed(2),
     Currency: row.currency || currency || "",
-    "Units On Hand": Math.round(row.unitsOnHand),
+    // FBA on-hand from the account's stock source (unknown is blank, never 0); FBM from the merchant quantity.
+    "Units On Hand": row.unitsOnHand === null || row.unitsOnHand === undefined ? "" : Math.round(row.unitsOnHand),
+    "On Hand Source": row.unitsOnHandSource === "merchant" ? "Merchant quantity (Listings)" : row.unitsOnHandSource ? stockState.label : "",
     "Sales (30d)": Number(row.sales30d || 0).toFixed(2),
     "Units (30d)": Math.round(Number(row.units30d) || 0),
     "Sales At Risk": Number(row.salesAtRisk || 0).toFixed(2),
@@ -148,7 +153,7 @@ export default function ListingHealth({ data, loading, error, accountName, selec
         <FreshnessBar items={[
           `${data.sourceLabel} as of ${fmtDateHuman(data.asOf)}`,
           `sales at risk from ${data.salesSourceLabel}, ${data.salesWindow.days} days to ${fmtDateHuman(data.salesWindow.to)}`,
-          data.inventoryAvailable ? `FBA snapshot ${fmtDateHuman(data.inventorySnapshotDate)}` : "FBA snapshot unavailable",
+          `FBA on hand: ${stockState.label}`,
           data.issuesAvailable ? `Amazon issue codes from ${data.issuesSourceLabel}` : "Amazon issue codes unavailable",
           snapshotFreshnessLabel(data),
         ]} />
@@ -159,11 +164,12 @@ export default function ListingHealth({ data, loading, error, accountName, selec
           </Notice>
         )}
 
-        {!data.inventoryAvailable && (
+        {!stockState.available && (
           <Notice tone="warn">
-            The FBA inventory snapshot is unavailable, so units on hand fall back to the quantities on the listing record itself. Stranded-stock detection is less reliable until the snapshot returns.
+            {stockState.note} On-hand FBA units are shown as — (never 0) and FBA stranded stock is not detected until a stock source is available.
           </Notice>
         )}
+        {stockState.available && stockState.note && <Notice tone="warn">{stockState.note}</Notice>}
 
         {(data.currencies?.length || 0) > 1 && (
           <Notice>
@@ -214,7 +220,7 @@ export default function ListingHealth({ data, loading, error, accountName, selec
                   <SortTh label="Status" col="status" sort={sort} onSort={onSort} align="left" />
                   <SortTh label="Channel" col="channel" sort={sort} onSort={onSort} align="left" />
                   <SortTh label="Price" col="price" sort={sort} onSort={onSort} />
-                  <SortTh label="On Hand" col="unitsOnHand" sort={sort} onSort={onSort} hint="FBA snapshot units for FBA offers, merchant quantity for FBM. These views of stock are never added together." />
+                  <SortTh label="On Hand" col="unitsOnHand" sort={sort} onSort={onSort} hint={`FBA offers: FBA available units (${stockState.label}); FBM offers: the merchant quantity. These views of stock are never added together; unknown is —, never 0.`} />
                   <SortTh label="Sales (30d)" col="sales30d" sort={sort} onSort={onSort} />
                   <SortTh label="Units (30d)" col="units30d" sort={sort} onSort={onSort} />
                   <SortTh label="Sales at Risk" col="salesAtRisk" sort={sort} onSort={onSort} />
@@ -251,7 +257,7 @@ export default function ListingHealth({ data, loading, error, accountName, selec
         </div>
 
         <div className="footer-note">
-          Listing state comes from DataDoe <code>Listings</code>: <code>listing_status</code> is Amazon's own Active / Inactive / Incomplete value, <code>listing_fulfillment_channel</code> distinguishes FBM (<code>DEFAULT</code>) from FBA, and price, currency and quantities come from the same record. Sales at risk is the trailing {data.salesWindow.days}-day <code>total_sales</code> for that SKU from <code>Profit by SKU &amp; Date</code> — the money that stops while the listing cannot sell normally, not a forecast. Units on hand uses the FBA snapshot for FBA offers and the merchant quantity for FBM offers; these are different views of the same stock and are never added.
+          Listing state comes from DataDoe <code>Listings</code>: <code>listing_status</code> is Amazon's own Active / Inactive / Incomplete value, <code>listing_fulfillment_channel</code> distinguishes FBM (<code>DEFAULT</code>) from FBA, and price, currency and quantities come from the same record. Sales at risk is the trailing {data.salesWindow.days}-day <code>total_sales</code> for that SKU from <code>Profit by SKU &amp; Date</code> — the money that stops while the listing cannot sell normally, not a forecast. Units on hand uses, for FBA offers, the account's saved Listings FBA available units when those can be validated (shown as the time they were refreshed), otherwise its last saved FBA Inventory Health snapshot as a clearly labelled, dated, temporary read-only bridge (used only while it is at most two days older than this report — FBA Inventory Health is no longer refreshed — and possibly changed since), otherwise unavailable; unknown shows —, never 0. FBM offers use the merchant quantity; these are different views of the same stock and are never added.
           {" "}Gates are checked in order: reported ERROR issue, missing buyable/discoverable flag, Inactive, Incomplete, stock on hand with no active or buyable offer (stranded), Active with no price, then WARNING/INFO issues. Amazon's own issue severity, code and message require the non-default <code>Listings (Raw JSON)</code> table; when it is not enabled the report says so rather than inferring suppression. Currencies are never combined. Filters, search, sorting, paging and both exports run locally; only Refresh calls DataDoe, and it saves one shared snapshot for every user with access to this account.
         </div>
       </>}

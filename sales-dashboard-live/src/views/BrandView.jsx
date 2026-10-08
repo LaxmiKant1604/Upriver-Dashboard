@@ -27,7 +27,7 @@ import { CalendarRange, Coins, Inbox, RefreshCw, Store, Tag } from "lucide-react
 import { DataQualityAlert, EmptyState, ErrorState, ObservedUnitsBreakdown, SkeletonMetricGrid, SkeletonTable } from "../components/ui.jsx";
 import { FLAGS, fmtRangeLabel } from "../lib/format.js";
 import { marketplaceToday } from "../../lib/marketplaces.js";
-import { CURRENCY_OPTIONS, brandViewModel, isConvertedMode } from "../lib/brand-view.js";
+import { CURRENCY_OPTIONS, brandViewModel, isConvertedMode, inventoryFreshnessText } from "../lib/brand-view.js";
 import { DASH } from "../lib/brand-view-tables.js";
 import BrandReports, { buildExportModel, freshnessSummaryLine, fxSummaryLine } from "./BrandReports.jsx";
 import {
@@ -450,7 +450,8 @@ export default function BrandView({ accounts, accountsLoading, accountsError, lo
           />
           <div className="footer-note">
             Brand View is a shared Supabase snapshot for this account and brand. Sales come from the saved Dashboard
-            snapshot (Order Line Items joined to Product Catalog) and FBA inventory from the saved FBA Shipment Plan snapshot.
+            snapshot (Order Line Items joined to Product Catalog) and FBA inventory from the account's validated Listings snapshot
+            (its refresh time is shown), else its last saved FBA Inventory Health snapshot as a dated temporary bridge — no longer refreshed, and used only while it is at most two days old ({inventoryFreshnessText(model.coverage, "currently")}).
             FBA cover is calculated from available FBA units and average daily unit sales in the selected report range. A blank cell means the source cannot
             answer, never zero.{converted ? ` Converted figures use server-side cached rates. ${fx?.attribution || ""}` : ""}
           </div>

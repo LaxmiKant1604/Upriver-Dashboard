@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
 import {
-  buildAdvancedListingHealth, resolveListingHealthWindow, assessOliCoverage, latestInventoryBySku,
+  buildAdvancedListingHealth, resolveListingHealthWindow, assessOliCoverage,
 } from "../lib/server/reports/listing-health-advanced.js";
 import { planListingHealthSourceBatches } from "../lib/server/reports/listing-health-batching.js";
 import { isolateFragmentRowsForOwner } from "../lib/server/sync/source-account-isolation.js";
@@ -38,35 +38,52 @@ writeSync(1, "listing-health-advanced-regressions\n");
   ok("D1 coverage starting after requested start -> leading gap, coveredFrom null", late.complete === false && late.coveredFrom === null && late.gaps[0].from === "2026-09-01" && late.gaps[0].to === "2026-09-01");
 })();
 
-/* ===== D2: UNKNOWN STOCK (null available preserved; explicit Listings fallback; genuine zero kept) ===== */
+/* ===== D2: UNKNOWN STOCK (phase 2: ONE per-account source -- validated Listings, else the LATEST Health snapshot as a
+   labelled fallback, else Unavailable; null preserved, genuine zero kept, the two sources never mixed per SKU) ===== */
 (() => {
+  const X = { fba_quantity_inbound: 0, fba_quantity_reserved: 0, fba_quantity_fc_transfer: 0 }; // expanded Listings fields
   const base = {
     owner, asOf, window: resolveListingHealthWindow({ preset: "30D", asOf }),
     enrichedOliRows: [], oliCoverageWindows: [{ from: "2026-01-01", to: asOf }], completenessRows: [],
     catalogRows: [], rawRows: [], issuesAvailable: false,
-    listingRows: [{ sku: "SKU-N", child_asin: "ASIN-N", listing_status: "Active", listing_fulfillment_channel: "AMAZON_NA", fba_quantity_available: 7 }],
   };
-  // Reproduction: latest snapshot available:null + Listings fba 7 -> onHandFba must be 7 (listings-fallback), NOT 0/snapshot.
-  const nullSnap = buildAdvancedListingHealth({ ...base, inventoryRows: [{ date: "2026-09-03", sku: "SKU-N", available: null }] });
-  const rN = nullSnap.rows.find((r) => r.sku === "SKU-N");
-  ok("D2 null snapshot available falls back to Listings 7 (not a false snapshot 0)", rN.onHandFba === 7 && rN.onHandFbaSource === "listings-fallback");
-  // Genuine numeric zero in the snapshot is preserved as 0 (fba-snapshot).
-  const zeroSnap = buildAdvancedListingHealth({ ...base, inventoryRows: [{ date: "2026-09-03", sku: "SKU-N", available: 0 }] });
-  ok("D2 genuine snapshot zero is preserved as 0 (fba-snapshot)", zeroSnap.rows[0].onHandFba === 0 && zeroSnap.rows[0].onHandFbaSource === "fba-snapshot");
-  // Both unavailable -> null.
-  const noneAvail = buildAdvancedListingHealth({ ...base, listingRows: [{ sku: "SKU-N", child_asin: "ASIN-N", listing_status: "Active", listing_fulfillment_channel: "AMAZON_NA", fba_quantity_available: null }], inventoryRows: [{ date: "2026-09-03", sku: "SKU-N", available: "" }] });
-  ok("D2 unknown snapshot + no listing fallback -> null (unavailable)", noneAvail.rows[0].onHandFba === null && noneAvail.rows[0].onHandFbaSource === null);
-  // latestInventoryBySku preserves unknown across null/missing/blank/malformed/non-finite; keeps latest date.
-  const inv = latestInventoryBySku([
-    { date: "2026-09-01", sku: "SKU-N", available: 999 }, // older -> ignored
-    { date: "2026-09-03", sku: "A", available: null }, { date: "2026-09-03", sku: "B", available: "" },
-    { date: "2026-09-03", sku: "C", available: "abc" }, { date: "2026-09-03", sku: "D", available: 0 },
-    { date: "2026-09-03", sku: "E", available: 5 }, { date: "2026-09-03", sku: "F" }, // missing key
-  ]);
-  ok("D2 latest snapshot only (2026-09-03) and unknown-vs-zero preserved",
-    inv.snapshotDate === "2026-09-03" && inv.bySku.get("A").available === null && inv.bySku.get("B").available === null
-    && inv.bySku.get("C").available === null && inv.bySku.get("D").available === 0 && inv.bySku.get("E").available === 5
-    && inv.bySku.get("F").available === null && !inv.bySku.has("SKU-N"));
+  const lr15 = (fba) => [{ sku: "SKU-N", child_asin: "ASIN-N", listing_status: "Active", listing_fulfillment_channel: "AMAZON_NA", fba_quantity_available: fba }];
+  const lrX = (fba) => [{ ...lr15(fba)[0], ...X }];
+  const hr = (available, o = {}) => ({ date: "2026-09-03", sku: "SKU-N", child_asin: "ASIN-N", available, ...o });
+  // Reproduction of the old defect shape: latest Health available:null + a (non-validated, 15-column) Listings 7. The
+  // account's source is the Health fallback, so the SKU is UNKNOWN (null) -- never a false 0 and never the Listings 7.
+  const nullSnap = buildAdvancedListingHealth({ ...base, listingRows: lr15(7), inventoryRows: [hr(null)] });
+  ok("D2 Health-fallback null stays null: never a false 0, never mixed with the Listings 7",
+    nullSnap.inventory.source === "health-fallback" && nullSnap.rows[0].onHandFba === null && nullSnap.rows[0].onHandFbaSource === null);
+  // A genuine numeric zero in the Health snapshot is preserved as 0 (fba-health-fallback).
+  const zeroSnap = buildAdvancedListingHealth({ ...base, listingRows: lr15(7), inventoryRows: [hr(0)] });
+  ok("D2 genuine Health zero is preserved as 0 (fba-health-fallback)", zeroSnap.rows[0].onHandFba === 0 && zeroSnap.rows[0].onHandFbaSource === "fba-health-fallback");
+  // Validated Listings: its own value (incl. a genuine 0) wins over any Health value; no Health -> still Listings.
+  const lv = buildAdvancedListingHealth({ ...base, listingRows: lrX(7), inventoryRows: [hr(99)] });
+  ok("D2 validated Listings 7 -> 7 (listings); the Health 99 is never read", lv.inventory.source === "listings" && lv.rows[0].onHandFba === 7 && lv.rows[0].onHandFbaSource === "listings");
+  const l0 = buildAdvancedListingHealth({ ...base, listingRows: lrX(0), inventoryRows: [] });
+  ok("D2 validated Listings genuine 0 -> 0 (listings), never unknown", l0.rows[0].onHandFba === 0 && l0.rows[0].onHandFbaSource === "listings");
+  // A blank Listings FBA quantity is NOT validated evidence: Health fallback when present, else Unavailable (never 0).
+  const blankH = buildAdvancedListingHealth({ ...base, listingRows: lrX(""), inventoryRows: [hr(4)] });
+  ok("D2 blank Listings quantity -> the Health fallback 4 (reason listings-blank-fba-fields:1)",
+    blankH.rows[0].onHandFba === 4 && blankH.inventory.fallbackReasons.join(",") === "listings-blank-fba-fields:1");
+  const blankNone = buildAdvancedListingHealth({ ...base, listingRows: lrX(null), inventoryRows: [] });
+  ok("D2 blank Listings + no Health -> null (Unavailable, never 0)", blankNone.inventory.source === "unavailable" && blankNone.rows[0].onHandFba === null && blankNone.rows[0].onHandFbaSource === null);
+  // The Health fallback reads the LATEST date only and preserves unknown across null/missing/blank/malformed/negative.
+  const skus = ["A", "B", "C", "D", "E", "F", "G", "SKU-N"];
+  const sel = buildAdvancedListingHealth({ ...base,
+    listingRows: skus.map((s) => ({ sku: s, child_asin: `ASIN-${s}`, listing_status: "Active", listing_fulfillment_channel: "AMAZON_NA", fba_quantity_available: 3 })),
+    inventoryRows: [
+      { date: "2026-09-01", sku: "SKU-N", child_asin: "ASIN-SKU-N", available: 999 }, // older -> ignored
+      { date: "2026-09-03", sku: "A", child_asin: "ASIN-A", available: null }, { date: "2026-09-03", sku: "B", child_asin: "ASIN-B", available: "" },
+      { date: "2026-09-03", sku: "C", child_asin: "ASIN-C", available: "abc" }, { date: "2026-09-03", sku: "D", child_asin: "ASIN-D", available: 0 },
+      { date: "2026-09-03", sku: "E", child_asin: "ASIN-E", available: 5 }, { date: "2026-09-03", sku: "F", child_asin: "ASIN-F" }, // missing key
+      { date: "2026-09-03", sku: "G", child_asin: "ASIN-G", available: -1 },
+    ] });
+  const by = new Map(sel.rows.map((r) => [r.sku, r.onHandFba]));
+  ok("D2 latest Health snapshot only (2026-09-03) and unknown-vs-zero preserved (the Listings 3 is never used)",
+    sel.inventory.snapshotDate === "2026-09-03" && by.get("A") === null && by.get("B") === null && by.get("C") === null
+    && by.get("D") === 0 && by.get("E") === 5 && by.get("F") === null && by.get("G") === null && by.get("SKU-N") === null);
 })();
 
 /* ===== D3: BATCH IDENTITY (complete trusted identity; supported routing; reject contradictions) ===== */

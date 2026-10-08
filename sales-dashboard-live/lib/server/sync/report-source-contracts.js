@@ -140,15 +140,12 @@ const CONTENT_CHANGE_COLUMNS = ["event_time", "sp_api_notification_id", "sp_api_
 
 // fba-plan: derives per-ASIN monthly units + the current-month latest-sales-date probe from the ONE
 // shared canonical Order Line Items sales fragment (OLI_SALES_*, Blocker 1) -- no dedicated units export --
-// plus catalog + FBA Inventory Health + US-only AWD listings.
-// FBA Inventory Health (44fc5ba0ce): every field verified NUMBER via GET /exports/sources metadata. reserved_customer_order
-// is a SEPARATE reserved state (display-only, never usable stock). total_reserved_quantity + inbound_quantity (the
-// aggregates) are DELIBERATELY not requested -- inbound_quantity = sum(inbound_working, inbound_shipped, inbound_received)
-// per the source metadata, so requesting an aggregate alongside its components would double-count.
-// seller_or_vendor_id makes this contract seller-scoped so a marketplace-safe <=5-seller export splits back per
-// account (isolateFragmentRowsForOwner) + per marketplace (marketplace_country_code). Used ONLY by
-// fba-plan:inventory-health (the insight reports use INSIGHT_INVENTORY_COLUMNS), so adding it changes ONLY
-// fba-plan's request_hash -- no other report is affected.
+// plus catalog + the canonical Listings export (FBA inventory + AWD).
+// FBA Inventory Health (source key fba-inventory-health) is RETIRED as a FETCHED source (Listings inventory cutover,
+// 2026-10): NO contract below requests it, and lib/server/datadoe.js createExport refuses its source id. Its former
+// per-seller request recipe survives ONLY as RETIRED_FBA_HEALTH_REQUEST (below, outside REPORT_SOURCE_CONTRACTS) so the
+// READ-ONLY bridge readers can recompute + verify the request identity a SAVED Health snapshot was bound to (the dated
+// bridge of lib/server/inventory-source.js); it is never planned, never priced and never fetched.
 const FBA_HEALTH_COLUMNS = ["date", "marketplace_country_code", "seller_or_vendor_id", "child_asin", "sku", "fnsku", "product_name", "available", "reserved_customer_order", "reserved_fc_transfer", "reserved_fc_processing", "inbound_working", "inbound_shipped", "inbound_received"];
 // Listings (ba689c05d7) AWD -- US only. awd_total_inbound_quantity added (verified NUMBER); marketplace_country_code
 // carried so the US-only rows can never be attributed to another marketplace.
@@ -156,16 +153,37 @@ const FBA_HEALTH_COLUMNS = ["date", "marketplace_country_code", "seller_or_vendo
 // ONLY by fba-plan:awd, so it changes ONLY fba-plan's request_hash.
 const LISTINGS_AWD_COLUMNS = ["marketplace_country_code", "seller_or_vendor_id", "child_asin", "sku", "fnsku", "awd_available_distributable_quantity", "awd_total_inbound_quantity"];
 
+// RETIRED, READ-ONLY identity recipe of the former per-seller FBA Inventory Health request (the old
+// fba-plan:inventory-health contract, byte-identical columns / limit / order / grouping), kept OUTSIDE
+// REPORT_SOURCE_CONTRACTS: no planner, tranche, budget, readiness check or worker ever sees it, so it is never planned,
+// priced or fetched (and lib/server/datadoe.js createExport refuses the Health source id regardless). It exists ONLY so
+// the read-only bridge readers (the fba-plan / listing-health-v3 durable loaders + the FBA reconciler entrypoints, via
+// resolvedFbaSnapshot / fbaSnapshotRequestHash) can recompute the request_hash a SAVED source_snapshots
+// 'fba-inventory-health' row was bound to and verify it before reading. retired: true.
+export const RETIRED_FBA_HEALTH_REQUEST = Object.freeze({
+  requestKey: "fba-plan:inventory-health",
+  sourceKey: "fba-inventory-health",
+  retired: true,
+  strict: true,
+  columns: Object.freeze([...FBA_HEALTH_COLUMNS]),
+  limit: 50000,
+  groupBy: null,
+  aggregations: null,
+  orderByColumn: "date",
+  orderByDirection: "DESC",
+  windowKind: "single-day:inventoryAsOf (D-1) -- READ-ONLY identity of a saved snapshot; never fetched",
+});
+
 /* ---- insight-report constants (transcribed verbatim from lib/server/reports/*.js;
    parity-tested against the builder files). All insight DataDoe fetches use
    fetchExportRowsStrict (rejects rows.length >= limit) EXCEPT the Sales Movers
    latest-date probe. ROW_LIMITS (sources.js): aggregated/rawGrain 50000, catalog/
    listings 20000, inventory 15000, dateRollup 500. ---- */
 
-// common.js — identical across the reports that call fetchCatalog / fetchInventorySnapshot,
-// so those requests dedupe to one export per account (see REPORT_DERIVATION dedup groups).
+// common.js — identical across the reports that call fetchCatalog, so those requests dedupe to one export per account
+// (see REPORT_DERIVATION dedup groups). (The insight reports' FBA Inventory Health contract -- the former
+// INSIGHT_INVENTORY_COLUMNS -- is removed: FBA Inventory Health is retired and no insight report fetches it.)
 const INSIGHT_CATALOG_COLUMNS = ["child_asin", "parent_asin", "product_name", "product_brand"];
-const INSIGHT_INVENTORY_COLUMNS = ["date", "sku", "child_asin", "product_name", "currency", "available", "unfulfillable_quantity", "inbound_shipped", "inbound_received", "days_of_supply", "units_shipped_t30", "your_price", "sales_price", "featuredoffer_price", "lowest_price_new_plus_shipping", "alert"];
 
 // sales-movers.js
 const SM_LATEST_COLUMNS = ["date"];
@@ -237,10 +255,9 @@ const LH_SALES_AGGREGATIONS = [
 // seller_or_vendor_id + marketplace_country_code so a marketplace-safe <=5-seller batch splits back per account
 // (isolateFragmentRowsForOwner) + per marketplace (exact seller-marketplace pairs). Sales/units come from DURABLE
 // Order Line Items (a derived dependency, source_oli_daily_history), so there is NO Profit-by-SKU contract here at all.
-// The inventory + catalog contracts REUSE FBA_HEALTH_COLUMNS / INSIGHT_CATALOG_COLUMNS with the SAME limit/order, so
-// with the same window + account chunk they resolve to a request_hash byte-identical to fba-plan:inventory-health /
-// listing-health:catalog -- one shared export, no duplicate, and every existing FBA/insight hash is untouched (the
-// request-key is never folded into the hash).
+// FBA stock comes from the SAME canonical Listings rows (the former listing-health-v3:inventory contract, which reused
+// the FBA Inventory Health identity, is removed: FBA Inventory Health is retired); the catalog is a DERIVED durable
+// dependency. The request-key is never folded into a hash.
 const LH_V3_LISTING_COLUMNS = ["seller_or_vendor_id", "marketplace_country_code", "sku", "child_asin", "listing_name", "listing_status", "listing_price_value", "listing_price_currency", "listing_current_quantity", "fba_quantity_available", "listing_fulfillment_channel", "listing_open_date"];
 const LH_V3_LISTING_RAW_COLUMNS = ["seller_or_vendor_id", "marketplace_country_code", "child_asin", "sku", "summaries", "issues", "offers"];
 
@@ -251,7 +268,7 @@ const LH_V3_LISTING_RAW_COLUMNS = ["seller_or_vendor_id", "marketplace_country_c
 // request_hash (identical columns+limit+order+window+family) => ONE paid Listings export per <=5-seller batch, shared:
 // the fba job (which runs first) creates it, the v3 job ADOPTS it from source_export_cache (zero export), and each
 // derive projects only the columns it names (the AWD fold reads awd_* by name; v3 reads listing_* by name; extra
-// columns are ignored). This mirrors the existing fba-plan:inventory-health <-> listing-health-v3:inventory reuse.
+// columns are ignored).
 // Every AWD field (LISTINGS_AWD_COLUMNS) is a subset of this, so AWD values are byte-identical to the old dedicated
 // export; AWD capability is decided by the DERIVE gate (awdCapableMarketplace), NOT by column presence, so a non-AWD
 // marketplace stays honestly unavailable (never a fabricated zero). Listings Raw is a DIFFERENT source (id 6ea445cd)
@@ -399,9 +416,8 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       windowKind: "range:monthStart(asOf)-150..asOf",
     },
   ],
-  // FBA Shipment Plan (single account). Two Order Line Items exports with DIFFERENT
-  // columns (child_asin units vs date units) => distinct request identities, never
-  // shared. Catalog + Inventory Health ranges, and a US-only no-date AWD listing.
+  // FBA Shipment Plan (single account). The ONE owned export is the canonical no-date Listings (FBA inventory + AWD);
+  // FBA Inventory Health is retired (never requested; createExport refuses it).
   // Every fba-plan source is Scheduler-v2 strict: a result at (or above) its row cap is
   // indistinguishable from a truncated one and would derive UNDERSTATED sales/stock (or a missing
   // AWD/inventory ASIN). The legacy api/datadoe.js FBA route fetches these non-strict; the scheduler
@@ -412,29 +428,10 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     // (source_oli_daily_history) + the org Product Catalog snapshot through the report-worker loadDerivedContext
     // seam (makeFbaPlanDurableContextLoader), coverage-checked + provenance-bound + fail-closed per account
     // (missing/short durable OLI coverage => the derive blocks => last-known-good preserved). The OLI bridge
-    // (slicedOliSourceFromHistory) is proven byte-identical to a fetched OLI slice payload. Only the FBA
-    // Inventory Health snapshot + the US-only AWD listing remain owned exports below.
-    {
-      requestKey: "fba-plan:inventory-health",
-      strict: true,
-      sourceKey: "fba-inventory-health",
-      columns: FBA_HEALTH_COLUMNS,
-      limit: 50000, // PLAN_INVENTORY_ROW_LIMIT -- raised from 15000: a marketplace-safe <=5-seller FBA Health batch
-                    // of large-inventory accounts (e.g. India ~5k rows each) exceeds 15k and TRUNCATES; DataDoe
-                    // honours the requested limit, so 50k lets a full <=5-account batch return without truncation.
-      groupBy: null,
-      aggregations: null,
-      orderByColumn: "date",
-      orderByDirection: "DESC",
-      windowKind: "single-day:inventoryAsOf (D-1)",
-      // LATEST-SNAPSHOT inventory: FBA Plan consumes ONLY the latest inventory date, so the source worker reduces a
-      // single-seller payload to its latest PROVABLY-COMPLETE date (fitting the row cap + 8MB cache limit) instead of
-      // hard-failing an oversized/cap-sized response -- NEVER summing across dates. Execution policy only (NOT part of
-      // request_hash), so the shared identity with listing-health-v3:inventory is unchanged. Scoped to THIS contract:
-      // the insight reports' inventory (buy-box-loss/sales-movers, INSIGHT_INVENTORY_COLUMNS => a different hash) keep
-      // the generic strict validator.
-      latestSnapshot: true,
-    },
+    // (slicedOliSourceFromHistory) is proven byte-identical to a fetched OLI slice payload. The canonical Listings
+    // (fba-plan:awd: FBA inventory + AWD) is the ONLY owned export below -- the former fba-plan:inventory-health contract
+    // is removed (FBA Inventory Health is retired; a saved Health snapshot is read only through the dated read-only
+    // bridge, never fetched). See RETIRED_FBA_HEALTH_REQUEST for the read-only identity recipe.
     {
       // fba-plan:awd is the FBA Plan owner of the CANONICAL Listings export. It requests LISTINGS_CANONICAL_COLUMNS
       // (the v3+AWD union) at the 50,000-row ceiling for EVERY account across ALL marketplaces -- byte-identical to
@@ -603,21 +600,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       dependsOnRequestKey: "sales-movers:sales-latest-probe",
       activation: { type: "validated_success", requireReportedDate: true },
     },
-    {
-      requestKey: "sales-movers:inventory",
-      sourceKey: "fba-inventory-health",
-      columns: INSIGHT_INVENTORY_COLUMNS,
-      limit: 15000, // ROW_LIMITS.inventory
-      groupBy: null,
-      aggregations: null,
-      orderByColumn: "date",
-      orderByDirection: "DESC",
-      windowKind: "single-day:asOf-1 (D-1 snapshot; shared FBA inventory export)",
-      strict: true,
-      dependencyMode: "staged",
-      dependsOnRequestKey: "sales-movers:sales-latest-probe",
-      activation: { type: "validated_success", requireReportedDate: true },
-    },
+    // (sales-movers:inventory -- the FBA Inventory Health contract -- is removed: FBA Inventory Health is retired.)
     {
       requestKey: "sales-movers:catalog",
       sourceKey: "product-catalog",
@@ -667,18 +650,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       windowKind: "canonicalOliSlices:asOf-27d..asOf",
       strict: true,
     },
-    {
-      requestKey: "buy-box-loss:inventory",
-      sourceKey: "fba-inventory-health",
-      columns: INSIGHT_INVENTORY_COLUMNS,
-      limit: 15000, // ROW_LIMITS.inventory
-      groupBy: null,
-      aggregations: null,
-      orderByColumn: "date",
-      orderByDirection: "DESC",
-      windowKind: "single-day:asOf-1 (D-1 snapshot; shared FBA inventory export)",
-      strict: true,
-    },
+    // (buy-box-loss:inventory -- the FBA Inventory Health contract -- is removed: FBA Inventory Health is retired.)
     {
       requestKey: "buy-box-loss:catalog",
       sourceKey: "product-catalog",
@@ -791,18 +763,7 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       windowKind: "range:asOf-29d..asOf",
       strict: true,
     },
-    {
-      requestKey: "listing-health:inventory",
-      sourceKey: "fba-inventory-health",
-      columns: INSIGHT_INVENTORY_COLUMNS,
-      limit: 15000, // ROW_LIMITS.inventory
-      groupBy: null,
-      aggregations: null,
-      orderByColumn: "date",
-      orderByDirection: "DESC",
-      windowKind: "single-day:asOf-1 (D-1 snapshot; shared FBA inventory export)",
-      strict: true,
-    },
+    // (listing-health:inventory -- the FBA Inventory Health contract -- is removed: FBA Inventory Health is retired.)
     {
       requestKey: "listing-health:catalog",
       sourceKey: "product-catalog",
@@ -817,15 +778,16 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
     },
   ],
   // Advanced Listing Health (SHADOW / listing-health/v3-oli-window). Owned exports: listings + listings-raw (seller +
-  // marketplace, seller-scoped batchable) + inventory (REUSES fba-plan:inventory-health identity) + catalog (REUSES
-  // listing-health:catalog identity). OLI sales/units are a DERIVED durable dependency (REPORT_DERIVED_SOURCE_KEYS),
+  // marketplace, seller-scoped batchable). FBA stock comes from the SAME Listings rows (the former inventory contract,
+  // which reused the retired FBA Inventory Health identity, is removed). The catalog REUSES the listing-health:catalog
+  // identity. OLI sales/units are a DERIVED durable dependency (REPORT_DERIVED_SOURCE_KEYS),
   // never an owned export -- so a window change re-aggregates stored OLI and spends zero exports.
   "listing-health-v3": [
     {
       // REUSE: requests the CANONICAL Listings column set (LISTINGS_CANONICAL_COLUMNS) at the 50,000-row ceiling --
       // byte-identical columns/limit/order/window to fba-plan:awd -- so listing-health-v3:listings resolves to the
       // SAME request_hash as fba-plan:awd and ADOPTS the fba job's Listings export from source_export_cache (zero
-      // v3 create), exactly like listing-health-v3:inventory reuses fba-plan:inventory-health. v3 projects only the
+      // v3 create). v3 projects only the
       // listing_* columns it names; the extra awd_*/fnsku columns are ignored. Widening from LH_V3_LISTING_COLUMNS/
       // 20000 changes this request_hash once, so the next cycle re-fetches + re-persists the durable Listings snapshot.
       requestKey: "listing-health-v3:listings",
@@ -853,22 +815,8 @@ export const REPORT_SOURCE_CONTRACTS = Object.freeze({
       // Optional enrichment: a disabled Listings Raw table degrades (report saved with issuesAvailable:false), never blocks.
       availabilityPolicy: { disabledSource: "degraded", safeCode: "SOURCE_DISABLED", reportOutcome: "save-unavailable-snapshot" },
     },
-    {
-      requestKey: "listing-health-v3:inventory",
-      sourceKey: "fba-inventory-health",
-      columns: FBA_HEALTH_COLUMNS, // REUSE: identical columns/limit/order/window => same request_hash as fba-plan:inventory-health
-      limit: 50000, // PLAN_INVENTORY_ROW_LIMIT (matches fba-plan:inventory-health for hash reuse)
-      groupBy: null,
-      aggregations: null,
-      orderByColumn: "date",
-      orderByDirection: "DESC",
-      windowKind: "single-day:inventoryAsOf (D-1; REUSES the fba-plan:inventory-health export identity)",
-      strict: true,
-      // LATEST-SNAPSHOT inventory (same as fba-plan:inventory-health, whose export identity this REUSES): v3 consumes
-      // only the latest inventory date. Kept in lockstep with fba-plan:inventory-health so the shared canonical job
-      // carries the flag regardless of which report resolves it first. Execution policy only (not in request_hash).
-      latestSnapshot: true,
-    },
+    // (listing-health-v3:inventory -- the reuse of the FBA Inventory Health identity -- is removed: FBA Inventory Health
+    // is retired. v3 reads FBA stock from its own Listings rows, else the dated read-only Health bridge.)
     // NOTE: Product Catalog is NOT an owned export here. Like fba-plan, v3 reuses the canonical org Product Catalog
     // durable snapshot as a DERIVED dependency (REPORT_DERIVED_SOURCE_KEYS), injected via context -- no extra export,
     // and an org-wide catalog row never proves account ownership (ownership comes from the account-scoped
@@ -969,12 +917,16 @@ export const REPORT_DERIVED_SOURCE_KEYS = Object.freeze({
   // FBA Shipment Plan reads its Order Line Items sales + Product Catalog from ALREADY-persisted durable evidence
   // (source_oli_daily_history + the org Product Catalog snapshot the OLI/catalog scheduler maintains), NOT from an
   // owned fba-plan export -- so opening/refreshing/publishing fba-plan spends ZERO tokens on OLI/catalog. Only the
-  // FBA Inventory Health snapshot + the US-only AWD listing are owned (fetched) sources.
+  // canonical Listings export (FBA inventory + AWD) is an owned (fetched) source.
   "fba-plan": ["order-line-items", "product-catalog"],
   // Advanced Listing Health (shadow): OLI sales/units read from durable source_oli_daily_history AND the org Product
   // Catalog snapshot are DERIVED (no owned export), so a window change spends zero tokens. Its OWNED exports are only
-  // Listings + Listings Raw + inventory (the last reuses the fba-plan:inventory-health identity).
+  // Listings + Listings Raw (FBA stock is read from the Listings rows; FBA Inventory Health is retired).
   "listing-health-v3": ["order-line-items", "product-catalog"],
+  // Sales Movers / Buy Box Loss read FBA stock from the account's SAVED durable Listings snapshot (zero export; the
+  // retired FBA Inventory Health is never fetched) -- an already-persisted dependency, never an owned export.
+  "sales-movers": ["listings"],
+  "buy-box-loss": ["listings"],
 });
 
 // Reports that create ZERO owned DataDoe exports: every figure comes from other
@@ -1026,11 +978,11 @@ export function reportAccountScope(reportKey) {
 export const SELLER_SCOPED_REQUEST_KEYS = Object.freeze([
   "brand-sales:order-lines",
   "daily-reporting:oli-sales",
-  // fba-plan:oli-sales is GONE -- OLI is now a durable derived dependency for fba-plan (no owned export). The two
-  // fba-plan owned exports that ARE seller-scoped/batchable (marketplace-safe <=5-seller batches) are its FBA
-  // Inventory Health snapshot + US-only AWD listing; both carry seller_or_vendor_id so a batched export splits
-  // back per account (isolateFragmentRowsForOwner) and per marketplace (marketplace_country_code).
-  "fba-plan:inventory-health",
+  // fba-plan:oli-sales is GONE -- OLI is now a durable derived dependency for fba-plan (no owned export). The ONE
+  // fba-plan owned export (seller-scoped, marketplace-safe <=5-seller batches) is the canonical Listings
+  // (fba-plan:awd); it carries seller_or_vendor_id so a batched export splits back per account
+  // (isolateFragmentRowsForOwner) and per marketplace (marketplace_country_code). (The retired FBA Inventory Health
+  // request keys fba-plan:inventory-health / listing-health-v3:inventory are gone.)
   "fba-plan:awd",
   "buy-box-loss:oli-sales",
   "returns-leakage:oli-sales",
@@ -1040,7 +992,6 @@ export const SELLER_SCOPED_REQUEST_KEYS = Object.freeze([
   // back per account (isolateFragmentRowsForOwner) + per exact seller-marketplace pair. (Its catalog is org-wide.)
   "listing-health-v3:listings",
   "listing-health-v3:listings-raw",
-  "listing-health-v3:inventory",
 ]);
 const SELLER_SCOPED_SET = new Set(SELLER_SCOPED_REQUEST_KEYS);
 
@@ -1796,6 +1747,15 @@ export function reportSourceRequestHashes({ reportKey, apiKey, ids, windowsByReq
     }
   }
 
+  // A RETIRED source (FBA Inventory Health) is never resolved into a source job (fail closed, before any I/O).
+  for (const c of contracts) {
+    const sc = sourceContractForKey(c.sourceKey);
+    if (sc && sc.retired === true) {
+      const err = new Error(`Report "${reportKey}" request key "${c.requestKey}" names the RETIRED source "${c.sourceKey}"; refusing to plan (fail closed).`);
+      err.code = "HEALTH_SOURCE_RETIRED";
+      throw err;
+    }
+  }
   const windowsMap = windowsByRequestKey || {};
   const declaredKeys = contracts.map((c) => c.requestKey);
 

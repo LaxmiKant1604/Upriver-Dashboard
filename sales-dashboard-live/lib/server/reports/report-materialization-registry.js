@@ -69,7 +69,11 @@ export const CLIENT_OPEN_TRIGGERED_WRITE_GRANDFATHERED = Object.freeze([]);
 // report's contract), so a report may declare them even when its contract does not own them.
 const OLI = "order-line-items";
 const CATALOG = "product-catalog";
-const FBA = "fba-inventory-health";
+// FBA inventory evidence is the canonical Listings source since the Listings inventory cutover (2026-10). The retired FBA
+// Inventory Health source is NEVER fetched again; its last SAVED snapshot (source_snapshots 'fba-inventory-health') is
+// read only as a dated READ-ONLY bridge (lib/server/inventory-source.js), so it appears ONLY as an OPTIONAL dependency
+// (HEALTH_BRIDGE) of the inventory consumers -- never a required one.
+const HEALTH_BRIDGE = "fba-inventory-health";
 const ADS = "campaign-performance"; // durable Campaign Ads rows (ads_daily_source_rows, source_key campaign-performance-v1)
 const LISTINGS = "listings";
 const LISTINGS_RAW = "listings-raw";
@@ -107,17 +111,17 @@ export const REPORT_MATERIALIZATION = Object.freeze({
   },
   "brand-inventory": {
     reportKey: "brand-inventory", reportVersion: vTag("brand-inventory"),
-    requiredSources: [FBA], optionalSources: [],
+    requiredSources: [LISTINGS], optionalSources: [HEALTH_BRIDGE],
     sourceOwner: "scheduler-v2", materializationOwner: "scheduler-v2:priority",
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "latest-snapshot" },
     provenanceFields: ["source_refreshed_at", "inventorySnapshotDate"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["brand-inventory"],
     serveMode: "read-snapshot", bucket: "A", pageOpenWrite: false, clientOpenTriggeredWrite: false,
-    notes: "Compact FBA inventory snapshot (SOURCE_PROMOTED). Latest inventory date only; never summed across dates.",
+    notes: "Compact FBA inventory snapshot (SOURCE_PROMOTED) from the saved Listings snapshot when it validates (a current snapshot with no date: freshness is the Listings fetch time, never a D-1 inventory day), else the dated read-only FBA Inventory Health bridge (2-day limit), else Unavailable.",
   },
   "fba-plan": {
     reportKey: "fba-plan", reportVersion: vTag("fba-plan"),
-    requiredSources: [FBA, OLI, CATALOG], optionalSources: [LISTINGS], // contract owns fba-inventory-health + listings(AWD); OLI/catalog derived
+    requiredSources: [LISTINGS, OLI, CATALOG], optionalSources: [HEALTH_BRIDGE], // contract owns listings (FBA inventory + AWD); OLI/catalog derived; Health = read-only bridge
     sourceOwner: "scheduler-v2", materializationOwner: "scheduler-v2:fba",
     grain: "account", freshness: { maxAgeHours: 24, coverage: "latest-snapshot" },
     provenanceFields: ["source_refreshed_at", "inventorySnapshotDate", "asOf"], lkgPolicy: "serve-last-known-good",
@@ -147,17 +151,17 @@ export const REPORT_MATERIALIZATION = Object.freeze({
   },
   "brand-view": {
     reportKey: "brand-view", reportVersion: null,
-    requiredSources: [OLI, CATALOG], optionalSources: [ADS, FBA],
+    requiredSources: [OLI, CATALOG], optionalSources: [ADS, LISTINGS, HEALTH_BRIDGE],
     sourceOwner: "scheduler-v2", materializationOwner: "scheduler-v2:materialize",
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["adsAvailable", "fbaAvailable", "inventoryScope", "updating", "depFingerprint"], lkgPolicy: "serve-last-known-good",
     regionalScheduling: "per-region-daily", capability: REPORT_CAPABILITIES["brand-view"],
     serveMode: "read-snapshot", bucket: "B", pageOpenWrite: false, clientOpenTriggeredWrite: false,
-    notes: "Published by the FBA-aware Brand View materializer (report-materialization-brandview job) per (account,brand) at the exact serve identity {accountId,brand,asOf=marketplaceToday(country)}. FRESHNESS is a DEPENDENCY FINGERPRINT over the COMPLETE contributing set (brand-sales + compact brand-inventory + fba-plan + Ads coverage + campaign->brand mapping + catalog + version), computed identically by the writer and the serve: a read serves the stored snapshot and flags updating when ANY dependency changed (inventory became available, Ads advanced, a mapping was edited) -- not just when brand-sales advanced -- converging on the next scheduled publish with no page-open write. The compact brand-inventory is REBUILT from the fresh fba-plan by the materialize-inventory job AFTER fba, so fbaAvailable reflects same-day D-1 inventory (null only when no inventory snapshot); missing Ads mappings -> adsAvailable:false. Refresh=1 stays click-only.",
+    notes: "Published by the FBA-aware Brand View materializer (report-materialization-brandview job) per (account,brand) at the exact serve identity {accountId,brand,asOf=marketplaceToday(country)}. FRESHNESS is a DEPENDENCY FINGERPRINT over the COMPLETE contributing set (brand-sales + compact brand-inventory + fba-plan + Ads coverage + campaign->brand mapping + catalog + version), computed identically by the writer and the serve: a read serves the stored snapshot and flags updating when ANY dependency changed (inventory became available, Ads advanced, a mapping was edited) -- not just when brand-sales advanced -- converging on the next scheduled publish with no page-open write. The compact brand-inventory is REBUILT from the fresh fba-plan by the materialize-inventory job AFTER fba, so fbaAvailable reflects the same-day saved Listings inventory (freshness = the Listings fetch time, never a D-1 inventory day), else the dated read-only Health bridge (null only when neither); missing Ads mappings -> adsAvailable:false. Refresh=1 stays click-only.",
   },
   "brand-view-portfolio": {
     reportKey: "brand-view-portfolio", reportVersion: null,
-    requiredSources: [OLI, CATALOG], optionalSources: [ADS, FBA],
+    requiredSources: [OLI, CATALOG], optionalSources: [ADS, LISTINGS, HEALTH_BRIDGE],
     sourceOwner: "scheduler-v2", materializationOwner: "scheduler-v2:materialize",
     grain: "account-region", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["adsAvailable", "fbaAvailable", "updating", "depFingerprint"], lkgPolicy: "serve-last-known-good",
@@ -167,7 +171,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
   },
   "brand-portfolio": {
     reportKey: "brand-portfolio", reportVersion: null,
-    requiredSources: [OLI, CATALOG], optionalSources: [ADS, FBA],
+    requiredSources: [OLI, CATALOG], optionalSources: [ADS, LISTINGS, HEALTH_BRIDGE],
     sourceOwner: "scheduler-v2", materializationOwner: "serve:derive-durable",
     grain: "account-brand", freshness: { maxAgeHours: 24, coverage: "D-1" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "serve-last-known-good",
@@ -217,11 +221,12 @@ export const REPORT_MATERIALIZATION = Object.freeze({
   },
   "listing-health-v3": {
     reportKey: "listing-health-v3", reportVersion: vTag("listing-health-v3"),
-    // Optional-inventory contract (Section 3): LISTINGS is the only hard-required owned export. LISTINGS_RAW and FBA
-    // inventory are OPTIONAL/degradable -- the derive publishes listings + durable OLI per account even when this
-    // account's FBA failed, with inventory-dependent fields resolving unavailable (never a fabricated zero). This
-    // matches the derive contract (report-derivation.js listing-health-v3 optionalRequestKeys).
-    requiredSources: [LISTINGS], optionalSources: [LISTINGS_RAW, FBA, OLI, CATALOG],
+    // Optional-inventory contract (Section 3): LISTINGS is the only hard-required owned export; since the Listings
+    // inventory cutover FBA stock comes from the SAME Listings rows (no fetched inventory source -- FBA Inventory Health
+    // is retired; its last saved snapshot is only the dated read-only bridge). LISTINGS_RAW is OPTIONAL/degradable, and
+    // inventory-dependent fields resolve unavailable (never a fabricated zero) when neither Listings nor the bridge serves. This matches the derive contract (report-derivation.js
+    // listing-health-v3 optionalRequestKeys).
+    requiredSources: [LISTINGS], optionalSources: [LISTINGS_RAW, HEALTH_BRIDGE, OLI, CATALOG],
     sourceOwner: "scheduler-v2", materializationOwner: "scheduler-v2:v3-shadow",
     grain: "account", freshness: { maxAgeHours: 24, coverage: "latest-snapshot" },
     provenanceFields: ["inventory", "salesWindowStatus", "coverage", "evidence"], lkgPolicy: "serve-last-known-good",
@@ -283,7 +288,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
   },
   "sales-movers": {
     reportKey: "sales-movers", reportVersion: vTag("sales-movers"),
-    requiredSources: [SALES_TRAFFIC, CATALOG], optionalSources: [PROFIT_BY_SKU, FBA, ADS],
+    requiredSources: [SALES_TRAFFIC, CATALOG], optionalSources: [PROFIT_BY_SKU, LISTINGS, HEALTH_BRIDGE, ADS],
     sourceOwner: "manual-refresh", materializationOwner: "manual-refresh",
     grain: "account", freshness: { maxAgeHours: 168, coverage: "7d-compare" },
     provenanceFields: ["source_refreshed_at", "salesLatestDate"], lkgPolicy: "waiting-if-missing",
@@ -293,7 +298,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
   },
   "listing-health": {
     reportKey: "listing-health", reportVersion: vTag("listing-health"),
-    requiredSources: [LISTINGS, LISTINGS_RAW, PROFIT_BY_SKU, FBA, CATALOG], optionalSources: [],
+    requiredSources: [LISTINGS, LISTINGS_RAW, PROFIT_BY_SKU, CATALOG], optionalSources: [HEALTH_BRIDGE],
     sourceOwner: "manual-refresh", materializationOwner: "manual-refresh",
     grain: "account", freshness: { maxAgeHours: 168, coverage: "latest-snapshot" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",
@@ -303,7 +308,7 @@ export const REPORT_MATERIALIZATION = Object.freeze({
   },
   "buy-box-loss": {
     reportKey: "buy-box-loss", reportVersion: vTag("buy-box-loss"),
-    requiredSources: [PROFIT_BY_SKU, OLI, FBA, CATALOG], optionalSources: [],
+    requiredSources: [PROFIT_BY_SKU, OLI, LISTINGS, CATALOG], optionalSources: [HEALTH_BRIDGE],
     sourceOwner: "manual-refresh", materializationOwner: "manual-refresh",
     grain: "account", freshness: { maxAgeHours: 168, coverage: "window" },
     provenanceFields: ["source_refreshed_at"], lkgPolicy: "waiting-if-missing",

@@ -139,8 +139,16 @@ const moversData = {
   lagDays: 4,
   sourceLabel: "Sales & Traffic by ASIN & Date",
   dataUnavailable: false,
+  asOf: "2026-07-29",
+  inventoryModel: "inventory-source-v1",
+  inventorySource: "listings",
+  inventorySourceLabel: "Listings refreshed 2026-07-29T03:00:00Z",
   inventoryAvailable: true,
-  inventorySnapshotDate: "2026-07-29",
+  listingsRefreshedAt: "2026-07-29T03:00:00Z",
+  inventoryHealthDate: null,
+  inventoryFallbackReasons: [],
+  inventoryUnavailableReasons: [],
+  inventorySnapshotDate: null,
   windows: { recent: { from: "2026-07-19", to: "2026-07-25" }, prior: { from: "2026-07-12", to: "2026-07-18" } },
   currencies: ["INR"],
   rows: [
@@ -149,21 +157,21 @@ const moversData = {
       recent: { sales: 4000, units: 80, orders: 78, sessions: 1000, pageViews: 1200 },
       prior: { sales: 8000, units: 160, orders: 155, sessions: 2000, pageViews: 2400 },
       ads: { recentSpend: 100, recentSales: 300, priorSpend: 400, priorSales: 1200 },
-      inventory: { available: 50, inbound: 0, daysOfSupply: 12, unitsShippedT30: 300 },
+      stock: { source: "listings", listed: true, fbaContext: "fba", fbaAvailable: 50, fbaInbound: 0, conflict: false, health: null },
     },
     {
       asin: "B002", productName: "Stocked out ASIN", brand: "Alpha",
       recent: { sales: 2000, units: 40, orders: 40, sessions: 500, pageViews: 600 },
       prior: { sales: 2100, units: 42, orders: 42, sessions: 520, pageViews: 640 },
       ads: { recentSpend: 0, recentSales: 0, priorSpend: 0, priorSales: 0 },
-      inventory: { available: 0, inbound: 0, daysOfSupply: 0, unitsShippedT30: 120 },
+      stock: { source: "listings", listed: true, fbaContext: "fba", fbaAvailable: 0, fbaInbound: 0, conflict: false, health: null },
     },
     {
       asin: "B003", productName: "Other brand", brand: "Beta",
       recent: { sales: 900, units: 9, orders: 9, sessions: 300, pageViews: 320 },
       prior: { sales: 300, units: 3, orders: 3, sessions: 100, pageViews: 110 },
       ads: { recentSpend: 10, recentSales: 90, priorSpend: 5, priorSales: 20 },
-      inventory: { available: 80, inbound: 20, daysOfSupply: 40, unitsShippedT30: 30 },
+      stock: { source: "listings", listed: true, fbaContext: "fba", fbaAvailable: 80, fbaInbound: 20, conflict: false, health: null },
     },
   ],
 };
@@ -282,13 +290,19 @@ const listingData = {
   salesSourceLabel: "Profit by SKU & Date",
   issuesAvailable: true,
   issuesSourceLabel: "Listings (Raw JSON)",
+  inventoryModel: "inventory-source-v1",
+  inventorySource: "listings",
   inventoryAvailable: true,
+  listingsRefreshedAt: "2026-07-29T03:00:00Z",
+  inventoryHealthDate: null,
+  inventoryFallbackReasons: [],
+  inventorySnapshotDate: null,
   currencies: ["INR"],
   rows: [
     {
       sku: "SKU-ERR", asin: "B100", productName: "Blocked by error", brand: "Alpha",
       listingStatus: "Active", fulfillmentChannel: "FBA", price: 499, currency: "INR",
-      listingQuantity: 0, fbaAvailable: 10, snapshotAvailable: 10,
+      listingQuantity: 0, fbaAvailable: 10, onHandFba: 10, onHandFbaSource: "listings",
       sales30d: 15000, units30d: 30, hasSalesData: true,
       issues: [{ severity: "ERROR", code: "8541", message: "Missing required attribute" }],
       summary: { buyable: true, discoverable: true }, hasLiveOffer: true,
@@ -296,21 +310,21 @@ const listingData = {
     {
       sku: "SKU-STRAND", asin: "B101", productName: "Stranded stock", brand: "Alpha",
       listingStatus: "Inactive", fulfillmentChannel: "FBA", price: 299, currency: "INR",
-      listingQuantity: 0, fbaAvailable: 40, snapshotAvailable: 40,
+      listingQuantity: 0, fbaAvailable: 40, onHandFba: 40, onHandFbaSource: "listings",
       sales30d: 0, units30d: 0, hasSalesData: false,
       issues: [], summary: { buyable: false, discoverable: true }, hasLiveOffer: false,
     },
     {
       sku: "SKU-FBM", asin: "B102", productName: "FBM no price", brand: "Beta",
       listingStatus: "Active", fulfillmentChannel: "FBM", price: 0, currency: "INR",
-      listingQuantity: 12, fbaAvailable: 0, snapshotAvailable: null,
+      listingQuantity: 12, fbaAvailable: 0, onHandFba: null, onHandFbaSource: null,
       sales30d: 500, units30d: 2, hasSalesData: true,
       issues: [], summary: null, hasLiveOffer: null,
     },
     {
       sku: "SKU-OK", asin: "B103", productName: "Healthy", brand: "Beta",
       listingStatus: "Active", fulfillmentChannel: "FBA", price: 999, currency: "INR",
-      listingQuantity: 0, fbaAvailable: 5, snapshotAvailable: 5,
+      listingQuantity: 0, fbaAvailable: 5, onHandFba: 5, onHandFbaSource: "listings",
       sales30d: 9000, units30d: 9, hasSalesData: true,
       issues: [], summary: { buyable: true, discoverable: true }, hasLiveOffer: true,
     },
@@ -329,8 +343,9 @@ test("listing gates are applied in the documented order", () => {
 test("units on hand never adds two views of the same stock", () => {
   const rows = buildListingHealthRows(listingData, "ALL");
   const byS = Object.fromEntries(rows.map((row) => [row.sku, row]));
-  // FBA offer: snapshot value only, not snapshot + listing quantity.
+  // FBA offer: the account's stock source only, not stock + listing quantity.
   assert.equal(byS["SKU-ERR"].unitsOnHand, 10);
+  assert.equal(byS["SKU-ERR"].unitsOnHandSource, "listings");
   // FBM offer: merchant quantity only.
   assert.equal(byS["SKU-FBM"].unitsOnHand, 12);
 });
@@ -362,36 +377,39 @@ const buyBoxData = {
   window: { from: "2026-07-02", to: "2026-07-29", days: 28, sliceDays: 7 },
   observedWindow: { from: "2026-07-02", to: "2026-07-28" },
   sourceLabel: "Profit by SKU & Date",
+  inventoryModel: "inventory-source-v1",
+  inventorySource: "health-fallback",
   inventoryAvailable: true,
-  inventorySnapshotDate: "2026-07-29",
+  listingsRefreshedAt: null,
+  inventoryHealthDate: "2026-07-28",
+  inventoryFallbackReasons: ["listings-not-loaded"],
+  inventoryUnavailableReasons: [],
+  inventorySnapshotDate: "2026-07-28",
   currencies: ["INR"],
   rows: [
     {
       sku: "BB-PRICE", asin: "B200", productName: "Priced out", brand: "Alpha", currency: "INR",
       buyBoxPct: 40, buyBoxBasis: "page-view weighted", buyBoxDays: 28, windowDays: 28,
       sales: 10000, units: 50, pageViews: 4000,
-      price: { yourPrice: 550, salesPrice: 550, featuredOfferPrice: 499, lowestPriceNewPlusShipping: 495, currency: "INR" },
-      available: 100, unitsShippedT30: 60, inventoryKnown: true,
+      stock: { source: "health-fallback", listed: true, channel: null, fbaContext: "fba", fbaAvailable: 100, fbaInbound: null, conflict: false, health: { date: "2026-07-28", currency: "INR", yourPrice: 550, salesPrice: 550, featuredOfferPrice: 499, lowestPriceNewPlusShipping: 495, unitsShippedT30: 60 } },
     },
     {
       sku: "BB-STOCK", asin: "B201", productName: "Out of stock", brand: "Alpha", currency: "INR",
       buyBoxPct: 20, buyBoxBasis: "page-view weighted", buyBoxDays: 28, windowDays: 28,
       sales: 5000, units: 25, pageViews: 2000,
-      price: { yourPrice: 300, salesPrice: 300, featuredOfferPrice: 320, lowestPriceNewPlusShipping: 320, currency: "INR" },
-      available: 0, unitsShippedT30: 30, inventoryKnown: true,
+      stock: { source: "health-fallback", listed: true, channel: null, fbaContext: "fba", fbaAvailable: 0, fbaInbound: null, conflict: false, health: { date: "2026-07-28", currency: "INR", yourPrice: 300, salesPrice: 300, featuredOfferPrice: 320, lowestPriceNewPlusShipping: 320, unitsShippedT30: 30 } },
     },
     {
       sku: "BB-UNKNOWN", asin: "B202", productName: "No evidence", brand: "Beta", currency: "INR",
       buyBoxPct: 60, buyBoxBasis: "unweighted mean of observed days", buyBoxDays: 5, windowDays: 28,
       sales: 2000, units: 10, pageViews: 0,
-      price: null, available: null, unitsShippedT30: null, inventoryKnown: true,
+      stock: { source: "health-fallback", listed: true, channel: null, fbaContext: "fba", fbaAvailable: null, fbaInbound: null, conflict: false, health: { date: "2026-07-28", currency: "INR", yourPrice: null, salesPrice: null, featuredOfferPrice: null, lowestPriceNewPlusShipping: null, unitsShippedT30: null } },
     },
     {
       sku: "BB-FINE", asin: "B203", productName: "Winning", brand: "Beta", currency: "INR",
       buyBoxPct: 99, buyBoxBasis: "page-view weighted", buyBoxDays: 28, windowDays: 28,
       sales: 20000, units: 100, pageViews: 9000,
-      price: { yourPrice: 100, salesPrice: 100, featuredOfferPrice: 100, lowestPriceNewPlusShipping: 100, currency: "INR" },
-      available: 500, unitsShippedT30: 120, inventoryKnown: true,
+      stock: { source: "health-fallback", listed: true, channel: null, fbaContext: "fba", fbaAvailable: 500, fbaInbound: null, conflict: false, health: { date: "2026-07-28", currency: "INR", yourPrice: 100, salesPrice: 100, featuredOfferPrice: 100, lowestPriceNewPlusShipping: 100, unitsShippedT30: 120 } },
     },
   ],
 };
@@ -406,13 +424,27 @@ test("sales at risk is sales x (1 - buy box share)", () => {
 test("buy box causes are only claimed with evidence", () => {
   const rows = buildBuyBoxRows(buyBoxData, "ALL", 90);
   const byS = Object.fromEntries(rows.map((row) => [row.sku, row]));
-  assert.equal(byS["BB-PRICE"].cause, "price");
+  // Listings inventory CUTOVER: competitive prices were FBA Inventory Health metrics -- a saved snapshot's stock.health
+  // prices are NEVER a cause (no price cause is evaluated), never a column, never a CSV field.
+  assert.equal(byS["BB-PRICE"].cause, "unconfirmed");
+  assert.match(byS["BB-PRICE"].causeDetail, /Competitive prices are not evaluated/);
   assert.equal(byS["BB-STOCK"].cause, "stock");
   assert.equal(byS["BB-UNKNOWN"].cause, "unconfirmed");
+  for (const row of rows) {
+    for (const k of ["effectivePrice", "featuredOfferPrice", "lowestPrice", "priceGap", "dailyRate"]) assert.ok(!(k in row), `Health-only metric ${k} removed`);
+    assert.ok(!row.stock || !("health" in row.stock), "a saved stock.health block is dropped");
+  }
   const insights = buildBuyBoxInsights(buyBoxData, rows, 90);
   const unknown = insights.find((insight) => insight.sku === "BB-UNKNOWN");
   assert.equal(unknown.confidence, "low");
-  assert.ok(/not present/i.test(unknown.why));
+  assert.ok(/no cause is named/i.test(unknown.why));
+  // A bridge stock cause is dated + qualified (never presented as current) and carries medium confidence.
+  const stock = insights.find((insight) => insight.sku === "BB-STOCK");
+  assert.match(stock.why, /as of the saved FBA Inventory Health snapshot of 2026-07-28, may have changed since/);
+  assert.equal(stock.confidence, "medium");
+  for (const insight of insights) {
+    assert.ok(!insight.evidence.some((e) => /price|run rate/i.test(e.label)), "no competitive price / run-rate evidence");
+  }
 });
 
 test("the threshold is local and changes which rows are flagged", () => {

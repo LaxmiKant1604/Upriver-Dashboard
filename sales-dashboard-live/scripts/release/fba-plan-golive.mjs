@@ -2,17 +2,18 @@
 // SHARED fba-plan operation core (lib/server/sync/fba-plan-operation.js) wired by the reviewed release seam
 // (lib/server/sync/fba-plan-release-composition.js) -- the EXACT collaborators + pipeline the Data Sync Center
 // route uses -- so the CLI, the scheduler, and the manual route cannot drift. The core runs the reviewed
-// Scheduler-v2 machinery: the shadow dispatcher (batched marketplace-safe FBA Health/AWD fetch + durable
+// Scheduler-v2 machinery: the shadow dispatcher (batched marketplace-safe canonical Listings fetch -- FBA inventory +
+// AWD since the Listings inventory cutover; FBA Inventory Health is retired and never planned -- + durable
 // OLI/catalog derive), the four-gate CAS publisher, the guarded fba-plan control package, an apply-gates ->
 // publish -> read-back -> ownership -> ALWAYS-safe-close envelope, bounded by a hard token ceiling.
 //
 //   node scripts/release/fba-plan-golive.mjs --mode=dry-run   [--as-of=YYYY-MM-DD] [--inventory-as-of=YYYY-MM-DD] [--max-blocked=2] [--region=india|europe-au|us-ca|all] [--bucket=us|non-us|both]
 //   node scripts/release/fba-plan-golive.mjs --mode=go-live   [--as-of=YYYY-MM-DD] [--inventory-as-of=YYYY-MM-DD] [--max-tokens=80] [--max-blocked=2] [--region=...] [--bucket=...]
 //
-// --inventory-as-of: OPTIONAL. Overrides the inventory snapshot date (default: fbaInventoryAsOf() = the previous
-//   UTC date, D-1). Inventory is requested as EXACTLY [inventory-as-of .. inventory-as-of] (one snapshot day). The
-//   regional scheduler passes ONE shared inventory_asof (D-1) so this FBA run and the downstream Listing Health v3
-//   job adopt the SAME inventory identity. Manual callers that omit it get the same canonical D-1.
+// --inventory-as-of: OPTIONAL. Overrides the inventory as-of LABEL (default: fbaInventoryAsOf() = the previous UTC
+//   date). The canonical Listings export has NO date window (a current snapshot; its freshness is the Listings fetch
+//   time); the as-of names the dedicated cycle and is recorded as the saved Listings pointer's as_of. The regional
+//   scheduler passes ONE shared inventory_asof so this FBA run and the downstream Listing Health v3 job agree.
 //
 // SCOPE: `--region` (a region india|europe-au|us-ca, or `all`) is the ACTIVE routing used by the regional
 // coordinator -- it takes precedence when present and runs exactly that region (or all three). `--bucket`
@@ -87,7 +88,7 @@ const OPERATOR = process.env.PRIORITY_OPERATOR || "laxmikant@superboring.in";
 // priority publication and its manifest rows bind to the active attempt. A manual CLI run gets a
 // process-stable token (unique per run) so the lease still serializes it against concurrent operations.
 const runToken = (argOf("run-token") || "").trim() || ("fba-golive/" + (scopeLabel || "all") + "/" + process.pid + "-" + Date.now());
-const { resolveBootstrapScopeByDispatch, gateOnboardingBudget, recordOnboardingActualSpend, findApprovedStepEntry, bootstrapStepRef, assertBootstrapStepPlan, fbaPlanStructure } = await import("../../lib/server/sync/account-onboarding-bootstrap.js");
+const { resolveBootstrapScopeByDispatch, gateOnboardingBudget, recordOnboardingActualSpend, findApprovedStepEntry, bootstrapStepRef, assertBootstrapStepPlan, fbaPlanStructure, FBA_STEP_SOURCE_KEYS, fbaStepWindows } = await import("../../lib/server/sync/account-onboarding-bootstrap.js");
 const { bootstrapFbaCycleBucket, dispatchMembershipHash } = await import("../../lib/server/sync/account-onboarding.js");
 const { getDataDoeConnections } = await import("../../lib/server/datadoe-connections.js");
 
@@ -144,9 +145,8 @@ for (const bucket of selectedScopes) {
     process.exit(0);
   }
   if (!scope.asOf) { console.error("STOP " + bucket + " has no durable sales coverage; inventory export not started."); process.exit(1); }
-  // Adaptive self-heal: proactively route proven-overflow sellers (recent terminal TRUNCATED inventory evidence) into
-  // single-seller inventory jobs so a persistently-oversized batch does not waste one failed export every cycle. Empty
-  // => byte-identical default batching; fail-soft. Single-seller HARD STOPS are surfaced (never auto-raise the limit).
+  // (The former FBA Inventory Health overflow self-heal is retired: resolveOverflowSellers is a typed no-op and the
+  // canonical Listings batches are never split. Kept so the call shape stays unchanged.)
   const { overflowSellers, singleSellerHardStops } = await release.resolveOverflowSellers({ bucket, bucketAccounts, asOf: scope.asOf, inventoryAsOf });
   if (overflowSellers.size) log(bucket + " adaptive split: isolating " + overflowSellers.size + " proven-overflow seller(s) into single-seller inventory jobs");
   if (singleSellerHardStops.length) log(bucket + " WARN " + singleSellerHardStops.length + " single-seller inventory batch(es) still exceed 50000 (cannot split further; not auto-raising the limit)");
@@ -183,7 +183,7 @@ if (accountScope === "bootstrap") {
   const chk = assertBootstrapStepPlan(bootstrapEntry, {
     step: "fba", region: regionArg, accounts: bootstrapScope.frozenAccountIds, operationIds: bootstrapScope.operationIds,
     accountSetHash: bootstrapScope.accountSetHash, inventoryAsOf,
-    sourceKeys: ["fba-inventory-health"], windows: [{ sourceKey: "fba-inventory-health", from: inventoryAsOf, to: inventoryAsOf }],
+    sourceKeys: [...FBA_STEP_SOURCE_KEYS], windows: fbaStepWindows(),
     structure,
   });
   if (!chk.ok) { console.error("STOP BOOTSTRAP_STEP_PLAN_DRIFT (" + chk.reason + "): the runtime FBA plan structure does not match the approved stepPlanHash -- ZERO creates (fail closed before any reservation/POST)."); process.exit(1); }
@@ -228,7 +228,7 @@ try {
         runtime: release.runtime, publisher: release.publisher, controls: release.controls,
         readbackLive: release.readbackLive, ownershipBackfill: release.ownershipBackfill,
         verifyLease: release.verifyLease,
-        // ZERO-EXPORT durable FBA source persist: land source_snapshots(fba-inventory-health) from the just-fetched
+        // ZERO-EXPORT durable inventory persist collaborator (release.persistDurableFbaSnapshots) from the just-fetched
         // cache so the zero-export FBA reconciler can converge (the fba-plan derive alone never wrote it). The `plan`
         // above carries the per-account inventory request identities the persist reuses -- without it the backstop
         // silently persists nothing (the bug this repair closes).
@@ -257,7 +257,7 @@ try {
     if (df) {
       durableBackstop.push({ bucket, ...df });
       if (!df.ok) console.error("WARNING " + bucket + " durable FBA backstop UNRESOLVED: persisted " + df.persisted + "/" + df.expected + " (reason=" + (df.reason || "unknown") + (df.needsNextCycle && df.needsNextCycle.length ? "; need-next-cycle=" + df.needsNextCycle.length : "") + "). The zero-export reconciler cannot fully converge until this is resolved.");
-      else log(bucket + " durable FBA backstop OK: persisted " + df.persisted + "/" + df.expected + " durable source_snapshots(fba-inventory-health).");
+      else log(bucket + " durable FBA backstop OK: persisted " + df.persisted + "/" + df.expected + " durable inventory snapshots.");
     }
     if (result && result.phase === "complete" && result.ok === true && result.complete === true) {
       anyPublished += bucketPublished;
@@ -326,7 +326,7 @@ if (mode === "go-live") {
   ghOut("fba_complete", fbaComplete ? "true" : "false");
   ghOut("fba_durable_backstop_ok", backstopOk ? "true" : "false");
   ghOut("fba_durable_backstop", backstopPersisted + "/" + backstopExpected);
-  ghSum("### FBA durable backstop (zero export)\n- **fba_durable_backstop_ok=" + backstopOk + "** -- persisted " + backstopPersisted + "/" + backstopExpected + " durable source_snapshots(fba-inventory-health): " + (backstopSummary || "(no buckets)") + "\n- The durable source is what the zero-export FBA reconciler reads; an UNRESOLVED backstop means the reconciler cannot fully converge from saved data.");
+  ghSum("### FBA durable backstop (zero export)\n- **fba_durable_backstop_ok=" + backstopOk + "** -- persisted " + backstopPersisted + "/" + backstopExpected + " durable inventory snapshots: " + (backstopSummary || "(no buckets)") + "\n- The durable source is what the zero-export FBA reconciler reads; an UNRESOLVED backstop means the reconciler cannot fully converge from saved data.");
   // Emit a BOOLEAN string ("true"/"false"), not the numeric count -- the listing-health-v3 job gate is
   // `needs.fba.outputs.fba_published == 'true'` (a GitHub Actions STRING compare), so a count like "8" would never
   // equal "true" and would silently skip v3 on every region. true = at least one account published (partial OR

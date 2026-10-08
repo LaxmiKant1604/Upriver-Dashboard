@@ -69,6 +69,8 @@ let SCHEDULER_V2_READY_REPORT_KEYS;
 let CONTROLLED_REPORT_KEYS;
 let SHADOW_PLANNED_REPORT_KEYS;
 let paramsHashFor;
+let REPORT_DERIVATIONS;
+let BRAND_INVENTORY_REPORT_VERSION; // lib/server/reports/brand-view.js (the compact contract)
 let getSchedulerAccountRollout, getSchedulerPublishApproval, publishLiveSnapshotIfNewer;
 let insightConsts; // { key: [REPORT_KEY const, VERSION const] } from lib/server/reports/*.js
 
@@ -1267,8 +1269,9 @@ test("(F1) exactly 15 contracts (13 dispatch + the 2 source-promoted brand-inven
     "ppc-performance": "ppc-performance-v2-campaign",
     "listing-optimizer": "listing-optimizer-v1",
     // Round-6 fix 3: the source-promoted compact Brand View inventory -- publishable through the same
-    // four gates, NEVER dispatchable (not in CONTROLLED_REPORT_KEYS; proven below).
-    "brand-inventory": "brand-inventory-shared-v1",
+    // four gates, NEVER dispatchable (not in CONTROLLED_REPORT_KEYS; proven below). v2 = Listings inventory cutover
+    // phase 2 (the compact records its per-account source: validated Listings, else a labelled Health fallback).
+    "brand-inventory": "brand-inventory-shared-v2",
     // WORK D: the source-promoted advanced Listing Health (v3) -- publishable through the same four gates,
     // NEVER dispatchable (not in CONTROLLED_REPORT_KEYS; proven below). Live version DISTINCT from the shadow
     // snapshotVersion ("listing-health/v3-oli-window").
@@ -1286,6 +1289,12 @@ test("(F1) exactly 15 contracts (13 dispatch + the 2 source-promoted brand-inven
     assert.equal(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[key].liveReportKey, K, key + ": matches the live module's REPORT_KEY");
     assert.equal(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[key].liveReportVersion, V, key + ": matches the live module's VERSION");
   }
+  // brand-inventory: the live version IS the compact contract (brand-view.js BRAND_INVENTORY_REPORT_VERSION, which
+  // isCompactInventorySnapshot gates on), EQUALS the shadow snapshotVersion, and the browser's refresh constant agrees.
+  const BIV = BRAND_INVENTORY_REPORT_VERSION;
+  assert.equal(SCHEDULER_LIVE_SNAPSHOT_CONTRACTS["brand-inventory"].liveReportVersion, BIV, "brand-inventory: live version === the server compact constant");
+  assert.equal(REPORT_DERIVATIONS["brand-inventory"].snapshotVersion, BIV, "brand-inventory: shadow snapshotVersion === the live version");
+  assert.match(readFileSync(path.join(ROOT, "src", "lib", "brand-source-refresh.js"), "utf8"), /BRAND_INVENTORY_REPORT_VERSION = "brand-inventory-shared-v2"/, "brand-inventory: the browser constant is the same v2 version");
 });
 
 test("(F2) each params builder emits the EXACT live params shape and fails closed on malformed input", () => {
@@ -1423,6 +1432,8 @@ async function loadModules() {
   ({ SCHEDULER_V2_READY_REPORT_KEYS, CONTROLLED_REPORT_KEYS } = await import("../lib/server/sync/report-controls.js"));
   ({ SHADOW_PLANNED_REPORT_KEYS } = await import("../lib/server/sync/report-planner.js"));
   ({ paramsHashFor } = await import("../lib/server/report-store.js"));
+  ({ REPORT_DERIVATIONS } = await import("../lib/server/sync/report-derivation.js"));
+  ({ BRAND_INVENTORY_REPORT_VERSION } = await import("../lib/server/reports/brand-view.js"));
   // The GENUINE snapshot hash for the fixture params, from the SAME hasher the saver + publisher use.
   JOB_HASH = paramsHashFor(SHADOW_PARAMS.reportVersion, SHADOW_PARAMS);
   ({ getSchedulerAccountRollout, getSchedulerPublishApproval, publishLiveSnapshotIfNewer } = await import("../lib/server/supabase.js"));

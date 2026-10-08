@@ -12,7 +12,7 @@
 // `onWriteError(msg)` (surface a save error). `storage` defaults to window.localStorage (only to purge the old key).
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { makeScopedLoader } from "./scoped-loader.js";
-import { PLAN_DEFAULT_HIDDEN_COLS, validateHiddenColumns } from "../../lib/fba-plan-columns.js";
+import { PLAN_DEFAULT_HIDDEN_COLS, validateHiddenColumns, isRetiredFbaPlanColumnId } from "../../lib/fba-plan-columns.js";
 
 const uniq = (arr) => Array.from(new Set((Array.isArray(arr) ? arr : []).map(String)));
 const DEFAULT_HIDDEN = () => uniq(PLAN_DEFAULT_HIDDEN_COLS);
@@ -50,7 +50,9 @@ export function useFbaPlanColumns({ accountId, token, active = true, apiFetch, o
       if (!r || String(r.accountId) !== String(acct)) return;    // response is for a DIFFERENT account -> never apply
       // A SAVED layout (updatedAt present) wins even when empty (the user chose "Select all"); an unsaved account
       // uses the default. The durable server value is authoritative -- never a prior local value.
-      const hidden = r.updatedAt ? uniq(r.hiddenColumns) : DEFAULT_HIDDEN();
+      // Column ids RETIRED by the Listings inventory cutover (former FBA Inventory Health columns) are dropped so a later
+      // save is never refused by the server's strict validator. Every other saved id is applied exactly as before.
+      const hidden = r.updatedAt ? uniq(r.hiddenColumns).filter((id) => !isRetiredFbaPlanColumnId(id)) : DEFAULT_HIDDEN();
       setState({ accountId: acct, hidden });
     } catch { /* keep the gated default; column prefs are non-critical -- do not error the whole page on a GET */ }
   }, [accountId, apiFetch]);

@@ -140,6 +140,32 @@ test("every group known -> sum correctly", () => {
   assert.equal(VIEW.portfolioKpis(multiCountry()).fba, 12000 + 3852);
 });
 
+test("FAIL CLOSED: a group flagged fbaUnknown (an unknown marketplace) is never summed, even with a numeric partial or an overall total", () => {
+  const t = multiCountry();
+  t.dailyGroups[1].fbaUnknown = true; // its fbaAvailable (3852) is only the known marketplaces' partial sum
+  assert.deepEqual([VIEW.portfolioKpis(t).fba, VIEW.portfolioKpis(t).cover], [null, null]);
+  t.daily.inventoryAccountTotal = 15852;
+  assert.equal(VIEW.portfolioKpis(t).fba, null, "a partial overall total is never exposed either");
+});
+
+test("EU all-market rule: two pan-EU pool marketplaces with POSITIVE stock withhold the FBA KPI + Cover (reason given), even over an overall total", () => {
+  const t = multiCountry();
+  t.dailyGroups[0].rows = [{ country: "DE", fbaAvailable: 9000, coverUnits: 120 }, { country: "FR", fbaAvailable: 3000, coverUnits: 60 }];
+  t.dailyGroups[1].rows = [{ country: "UK", fbaAvailable: 3852, coverUnits: 30 }];
+  t.daily.inventoryAccountTotal = 15852; // e.g. a payload saved before the rule: pooled stock counted twice
+  const k = VIEW.portfolioKpis(t);
+  assert.deepEqual([k.fba, k.cover], [null, null]);
+  assert.match(k.fbaWithheldReason, /two or more pan-EU marketplaces report positive FBA stock/);
+});
+
+test("EU all-market rule: ONE pool marketplace + UK sums; a pool marketplace with 0 stock does not trigger it", () => {
+  const t = multiCountry();
+  t.dailyGroups[0].rows = [{ country: "DE", fbaAvailable: 12000, coverUnits: 120 }, { country: "FR", fbaAvailable: 0, coverUnits: 60 }];
+  t.dailyGroups[1].rows = [{ country: "UK", fbaAvailable: 3852, coverUnits: 30 }];
+  const k = VIEW.portfolioKpis(t);
+  assert.deepEqual([k.fba, k.fbaWithheldReason], [12000 + 3852, null]);
+});
+
 test("explicit zero inventory is retained as valid evidence, not null", () => {
   const zeroGroups = multiCountry();
   zeroGroups.dailyGroups.forEach((g) => { g.fbaAvailable = 0; });

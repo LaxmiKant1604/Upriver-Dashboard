@@ -16,7 +16,7 @@
 // This module never fetches anything and never changes a request identity: golden request_hash values are
 // untouched (the registry only DESCRIBES the families the contracts already declare).
 
-import { SOURCE_CONTRACTS, REPORT_SOURCE_REQUIREMENTS } from "../source-contracts.js";
+import { SOURCE_CONTRACTS, REPORT_SOURCE_REQUIREMENTS, isRetiredSourceKey } from "../source-contracts.js";
 import {
   REPORT_SOURCE_CONTRACTS, REPORT_DERIVED_SOURCE_KEYS, REPORT_DERIVED_ONLY, SELLER_SCOPED_REQUEST_KEYS,
 } from "./report-source-contracts.js";
@@ -39,8 +39,8 @@ export const SOURCE_BATCHING_MODES = Object.freeze([
 ]);
 
 // The DataDoe premium tables among the registered families (from source discovery `isPremium` / the
-// data-scheme): Profit by SKU & Date, Listings (COGS-enriched), FBA Inventory Health. The raw Listings twin
-// (listings-raw) is standard. Everything else registered here is standard (2 tokens).
+// data-scheme): Profit by SKU & Date, Listings (COGS-enriched). The raw Listings twin (listings-raw) is standard.
+// (FBA Inventory Health, also premium, is RETIRED and no longer registered.) Everything else registered here is standard (2 tokens).
 const rec = (r) => Object.freeze({
   ...r,
   usedByReports: Object.freeze([...r.usedByReports].sort()),
@@ -167,8 +167,11 @@ export const SOURCE_REGISTRY = Object.freeze([
     // own listings contract is NOT seller-scoped, so it still fetches per account (batching is driven by the
     // contract sourceScope, not this registry flag).
     batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
-    usedByReports: ["fba-plan", "listing-health", "listing-health-v3"],
-    usedByDashboards: ["fba-plan", "listing-health", "listing-health-v3", "priority-feed"],
+    // The canonical Listings export is ALSO the FBA inventory source since the Listings inventory cutover (FBA Shipment
+    // Plan, Listing Health v3, and the saved Listings snapshot Sales Movers / Buy Box Loss read). FBA Inventory Health is
+    // retired (not registered).
+    usedByReports: ["buy-box-loss", "fba-plan", "listing-health", "listing-health-v3", "sales-movers"],
+    usedByDashboards: ["brand-view", "buy-box-loss", "fba-plan", "listing-health", "listing-health-v3", "priority-feed", "sales-movers"],
     initialBackfill: { kind: "current-only" },
     incrementalRefresh: { kind: "daily-snapshot", perOrganization: false },
     tokenClass: "premium",
@@ -193,26 +196,11 @@ export const SOURCE_REGISTRY = Object.freeze([
     planning: "static",
     storage: "cycle-cache",
   }),
-  rec({
-    sourceKey: "fba-inventory-health",
-    dataDoeSourceId: "44fc5ba0ce81a7807601f6d7a9b8b7aaec64be4c7e046ea30dc6864d1a4aa823",
-    scope: "seller",
-    grain: "current-snapshot",
-    // fba-plan:inventory-health is a marketplace-safe seller-scoped batchable contract (FBA_HEALTH_COLUMNS carries
-    // seller_or_vendor_id + marketplace_country_code), so the source declares stable-batch/5. The insight reports'
-    // inventory contracts (sales-movers/listing-health/buy-box-loss, INSIGHT_INVENTORY_COLUMNS) are NOT
-    // seller-scoped, so they still fetch per account -- unaffected (batching follows the contract, not this flag).
-    batching: { mode: "stable-batch", maxAccountsPerExport: 5, marketplaceSafe: true },
-    usedByReports: ["fba-plan", "sales-movers", "listing-health", "listing-health-v3", "buy-box-loss"],
-    usedByDashboards: ["fba-plan", "sales-movers", "listing-health", "listing-health-v3", "buy-box-loss", "brand-view", "priority-feed"],
-    // The latest VALIDATED current snapshot is what matters; historical inventory is never repeatedly
-    // backfilled. Inventory ASINs join the SAME durable catalog brand map (never a second brand source).
-    initialBackfill: { kind: "current-only" },
-    incrementalRefresh: { kind: "daily-snapshot", perOrganization: false },
-    tokenClass: "premium",
-    planning: "static",
-    storage: "durable-snapshot",
-  }),
+  // FBA Inventory Health ("fba-inventory-health", 44fc5ba0ce...) is RETIRED (Listings inventory cutover, 2026-10): it is
+  // NOT registered -- no contract fetches it (consistency check #7 would refuse a registered-but-unfetched family), no
+  // tranche / bucket sync / Data Sync Center card plans or prices it, and lib/server/datadoe.js createExport refuses its
+  // source id. Its SAVED snapshots (source_snapshots 'fba-inventory-health') stay readable as the dated read-only bridge
+  // (lib/server/inventory-source.js), read by source key -- never through this registry.
   rec({
     sourceKey: "content-changes",
     dataDoeSourceId: "aec3d5976911a7a80110c08801a741e4f0a25dd997d639f5d918284d905a4758",
@@ -496,6 +484,10 @@ export function assertSourceRegistryConsistency(overrides = {}) {
 
   // 9) DERIVED-ONLY dashboards must not be registered as sources.
   for (const k of derivedOnly) if (seen.has(k)) die(`derived-only dashboard "${k}" must not be registered as a source family`);
+
+  // 10) RETIRED sources (FBA Inventory Health): never registered, never fetched by any report contract.
+  for (const r of registry) if (isRetiredSourceKey(r.sourceKey)) die(`"${r.sourceKey}" is a RETIRED source and must not be registered`);
+  for (const k of fetched) if (isRetiredSourceKey(k)) die(`RETIRED source "${k}" is fetched by a REPORT_SOURCE_CONTRACTS contract`);
 
   return true;
 }

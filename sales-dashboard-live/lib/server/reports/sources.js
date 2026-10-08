@@ -95,12 +95,14 @@ export const LISTINGS_RAW = {
   enableHint: "In DataDoe, open Settings > Data tables and enable Listings (Raw JSON) to add Amazon's own listing issue codes, severities and suppression flags to this report.",
 };
 
-// FBA Inventory Health. defaultDataset, premium. INITIAL 1 day and
-// RECURRING_DAILY 1 day. Every request asks for EXACTLY one snapshot day
-// ([D-1 .. D-1] -- the latest complete previous-day snapshot; the former
-// lookback-window field is removed). Carries the competitive prices used
-// for Buy Box cause attribution: your_price, sales_price, featuredoffer_price
-// and lowest_price_new_plus_shipping, plus `available` and `currency`.
+// FBA Inventory Health. RETIRED by the Listings inventory cutover (owner decision
+// 2026-10-08): NO insight report requests it any more (lib/server/datadoe.js
+// createExport refuses this id). The constant stays only as the source identity.
+// An insight report's stock comes from the account's saved Listings, else its
+// last SAVED durable Health snapshot as a dated read-only bridge (derivation-core
+// insightInventory + lib/server/reports/health-bridge.js); the Health-only
+// metrics (competitive prices, units_shipped_t30 run rate, days of supply,
+// unfulfillable, inbound shipped + received) are removed from every report.
 export const FBA_INVENTORY_HEALTH = {
   id: "44fc5ba0ce81a7807601f6d7a9b8b7aaec64be4c7e046ea30dc6864d1a4aa823",
   table: "amazon_fba_inventory_health",

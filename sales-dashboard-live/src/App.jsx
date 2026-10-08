@@ -33,6 +33,7 @@ import { csvCell } from "./lib/csv.js";
 import {
   computePlanRow as computePlanningRow, resolveHorizon, normalizeHorizon,
   DEFAULT_FORECAST_METHOD, DEFAULT_SAFETY_DAYS, SYSTEM_DEFAULT_HORIZON,
+  adaptFbaPlanPayload, fbaPlanInventoryView,
 } from "./lib/fba-planning.js";
 import { validateWarehouseImport, validateWarehouseRows, buildImportTemplateCsv, IMPORT_COLUMNS } from "./lib/warehouse-import.js";
 import { matchesPlanBrand, UNMAPPED_BRAND } from "./lib/plan-brand.js";
@@ -275,22 +276,15 @@ function computePlanRow(r, meta, targetDays) {
   const dailyRate = daysInMonth > 0 ? planningAvg / daysInMonth : 0;
   const targetUnits = dailyRate * Number(targetDays || 0);
 
-  // Inventory may be unavailable (null) for the whole snapshot; keep planning
-  // fields null in that case rather than treating unknown stock as zero.
-  const invKnown = r.fbaAvailable !== null && r.fbaAvailable !== undefined;
-  const fba = Number(r.fbaAvailable || 0);
-  const reserved = Number(r.reservedFcTransfer || 0) + Number(r.reservedFcProcessing || 0);
-  const inTransit = Number(r.inboundShipped || 0) + Number(r.inboundReceived || 0);
+  // FBA Available may be unknown (null): for the whole snapshot (no validated Listings and no FBA Inventory Health
+  // snapshot) or for one ASIN (absent from the selected source, a conflicting duplicate listing, or merchant-fulfilled
+  // only). Never treated as zero. `meta` is the ADAPTED payload (adaptFbaPlanPayload), so a pre-phase-2 saved plan counts.
+  const invKnown = meta.inventoryModel === "listings-v1" && meta.inventoryAvailable === true && r.fbaAvailable !== null && r.fbaAvailable !== undefined;
+  const fba = invKnown ? Number(r.fbaAvailable) : null;
   const isUS = !!meta.isUS;
-  const awd = isUS ? Number(r.awdAvailable || 0) : 0;
   // FBA days cover intentionally uses only physically available FBA units.
-  // Reserved, inbound, and AWD stock remain part of the shipment-plan total.
   const mtdDrr = elapsed > 0 ? mtdUnits / elapsed : null;
   const fbaDaysCover = invKnown && mtdDrr && mtdDrr > 0 ? fba / mtdDrr : null;
-
-  const coverage = invKnown ? fba + reserved + inTransit + awd : null;
-  const recommended = invKnown ? Math.max(0, Math.ceil(targetUnits - fba - reserved - inTransit - awd)) : null;
-  const remark = recommended === null ? null : recommended > 0 ? "Restock" : "OK";
 
   return {
     asin: r.asin,
@@ -302,13 +296,14 @@ function computePlanRow(r, meta, targetDays) {
     fbaAvailable: invKnown ? fba : null,
     mtdDrr,
     fbaDaysCover,
-    reserved: invKnown ? reserved : null,
-    inTransit: invKnown ? inTransit : null,
-    awd: isUS ? (invKnown || r.awdAvailable != null ? awd : null) : null,
-    coverage, recommended, remark, invKnown, isUS,
+    invKnown, isUS,
   };
 }
 
+// A WDD row whose demand, total lead time and days-to-inbound are all known but whose Existing Cover is missing can only
+// be missing an inventory input (FBA Available / FBA Inbound / AWD) -- its reorder figures are then Unavailable and a
+// footer total over the rows would be partial.
+const wddInventoryUnknown = (r) => !r.warehouseOnly && r.planning?.fbaContext !== "mfn-only" && r.wdd?.idealCover != null && r.wdd?.daysToInbound != null && r.wdd?.existingCover == null;
 function planSearchMatch(row, q) {
   if (!q) return true;
   const hay = `${row.asin || ""} ${row.sku || ""} ${row.productName || ""} ${row.brand || ""}`.toLowerCase();
@@ -329,12 +324,12 @@ const PLAN_SORT_ACCESSORS = {
   targetUnits: (r) => r.targetUnits,
   fbaAvailable: (r) => r.fbaAvailable,
   fbaDaysCover: (r) => r.fbaDaysCover,
-  custReserved: (r) => r.planning?.customerOrderReserved,
-  reserved: (r) => r.reserved,
-  inboundPipeline: (r) => r.inboundPipeline,
+  fbaInbound: (r) => r.fbaInbound,
+  fbaReservedTotal: (r) => r.planning?.fbaReservedTotal,
+  fbaFcTransfer: (r) => r.planning?.fbaFcTransfer,
   awd: (r) => r.awd,
   awdInbound: (r) => r.awdInbound,
-  totalFbaInv: (r) => r.totalFbaInv,
+  fbaSupply: (r) => r.fbaSupply,
   amazonNetwork: (r) => r.amazonNetwork,
   recommended: (r) => r.recommended,
   remark: (r) => r.remark || "",
@@ -357,22 +352,23 @@ function comparePlanRows(a, b, key, dir) {
 // Per-column export value (raw number/string; null -> "" so a missing value is blank, never a fabricated 0). The
 // identity column expands to Product Name / ASIN / SKU / Brand; every other column mirrors exactly what the table
 // shows, from the SAME canonical model. Keyed by column id so the export can never diverge from the visible columns.
-// Columns hidden by DEFAULT (each raw FBA state has its own column per the spec, but the default view shows the
-// combined Reserved (FC) / Inbound Pipeline; the raw components are revealable via the column chooser). "Reset
-// default" restores exactly this set; "Select all" reveals everything.
-const PLAN_DEFAULT_HIDDEN_COLS = ["reservedFcTransfer", "reservedFcProcessing", "inboundWorking", "inboundShipped", "inboundReceived"];
+// Columns hidden by DEFAULT: none since the Listings inventory cutover (the shared registry lib/fba-plan-columns.js owns
+// the default; the former raw FBA Inventory Health component columns no longer exist).
 const expNum = (v) => (v == null || !Number.isFinite(Number(v)) ? "" : Math.round(Number(v)));
+// FBA Shipment Plan (owner decision 2026-10-08): the tooltip of every "AWD blank treated as 0" marker.
+const PLAN_AWD_ASSUMED_TITLE = "AWD blank treated as 0: DataDoe returned no AWD quantity for this product, so 0 AWD units are assumed — not a verified AWD figure.";
+// The FBA inventory columns of a merchant-fulfilled-only product export "MFN", exactly as the table shows it.
+const expInv = (r, v) => (r.planning?.fbaContext === "mfn-only" ? "MFN" : expNum(v));
 // ADDITIVE: 2-decimal display for WDD / daily averages (an em dash when unavailable, never a fabricated 0).
 const wnum2 = (v) => (v == null || !Number.isFinite(Number(v)) ? "—" : Number(v).toFixed(2));
 const PLAN_EXPORT_VALUES = {
   m1: (r) => expNum(r.monthsDisplay?.[0]), m2: (r) => expNum(r.monthsDisplay?.[1]), m3: (r) => expNum(r.monthsDisplay?.[2]),
   mtdUnits: (r) => expNum(r.mtdUnits), threeMoAvg: (r) => expNum(r.planning?.threeMonthAverage), mtdProjected: (r) => expNum(r.planning?.mtdProjectedUnits),
-  targetUnits: (r) => expNum(r.targetUnits), fbaAvailable: (r) => expNum(r.fbaAvailable), fbaDaysCover: (r) => expNum(r.fbaDaysCover),
-  custReserved: (r) => expNum(r.planning?.customerOrderReserved), reserved: (r) => expNum(r.reserved), inboundPipeline: (r) => expNum(r.inboundPipeline),
-  reservedFcTransfer: (r) => expNum(r.planning?.reservedFcTransfer), reservedFcProcessing: (r) => expNum(r.planning?.reservedFcProcessing),
-  inboundWorking: (r) => expNum(r.planning?.inboundWorking), inboundShipped: (r) => expNum(r.planning?.inboundShipped), inboundReceived: (r) => expNum(r.planning?.inboundReceived),
-  awd: (r) => expNum(r.awd), awdInbound: (r) => expNum(r.awdInbound), totalFbaInv: (r) => expNum(r.totalFbaInv), amazonNetwork: (r) => expNum(r.amazonNetwork),
-  recommended: (r) => expNum(r.recommended), pipeline: (r) => expNum(r.planning?.amazonPipeline), horizon: (r) => horizonLabel(r.effectiveHorizon),
+  targetUnits: (r) => expNum(r.targetUnits), fbaAvailable: (r) => expInv(r, r.fbaAvailable), fbaDaysCover: (r) => expInv(r, r.fbaDaysCover),
+  fbaInbound: (r) => expInv(r, r.fbaInbound), fbaReservedTotal: (r) => expInv(r, r.planning?.fbaReservedTotal), fbaFcTransfer: (r) => expInv(r, r.planning?.fbaFcTransfer),
+  // AWD on a non-AWD marketplace exports "N/A" (it does not exist there), never a stock 0.
+  awd: (r) => (r.awdNA ? "N/A" : expNum(r.awd)), awdInbound: (r) => (r.awdNA ? "N/A" : expNum(r.awdInbound)), fbaSupply: (r) => expInv(r, r.fbaSupply), amazonNetwork: (r) => expInv(r, r.amazonNetwork),
+  recommended: (r) => expNum(r.recommended), horizon: (r) => horizonLabel(r.effectiveHorizon),
   horizonDemand: (r) => expNum(r.planning?.horizonDemand), safety: (r) => expNum(r.planning?.safetyStockUnits), targetInv: (r) => expNum(r.planning?.targetInventory),
   sellerWh: (r) => expNum(r.planning?.sellerWarehouseQty), shipWh: (r) => expNum(r.planning?.shipFromSellerWarehouse), produce: (r) => expNum(r.planning?.productionRequirement),
   stockout: (r) => r.planning?.estimatedStockoutDate || "", priority: (r) => r.planning?.planningPriority || "", remark: (r) => r.remark || "",
@@ -575,9 +571,9 @@ function SkuHorizonEditor({ target, accountDefault, onSave, onClose, busy }) {
   );
 }
 
-// Grouped show/hide column chooser (per-user prefs). Identity columns are locked visible; AWD columns are omitted
-// entirely for non-US accounts (never a fake toggle for data that does not exist).
-function PlanColumnChooser({ groups, hidden, isUS, onToggle, onSelectAll, onReset, onClose, busy }) {
+// Grouped show/hide column chooser (per-user prefs). Identity columns are locked visible. Since the Listings inventory
+// cutover the AWD columns are offered for EVERY marketplace: a non-AWD marketplace shows them as "N/A" (never a stock 0).
+function PlanColumnChooser({ groups, hidden, onToggle, onSelectAll, onReset, onClose, busy }) {
   return (
     <div className="plan-cols-pop" role="dialog" aria-label="Choose columns">
       <div className="plan-cols-head">
@@ -590,7 +586,7 @@ function PlanColumnChooser({ groups, hidden, isUS, onToggle, onSelectAll, onRese
       </div>
       <div className="plan-cols-body">
         {groups.map((g) => {
-          const cols = g.cols.filter((c) => isUS || !c.awd);
+          const cols = g.cols;
           if (cols.length === 0) return null;
           return (
             <div key={g.group} className="plan-cols-group">
@@ -2638,7 +2634,7 @@ function DashboardApp({ session, access, onSignOut }) {
     const cached = await readLargeApiCache(planParams);
     if (!isCurrentReq("fbaplan", myId)) return;
     if (cached) {
-      setPlanData(cached.body);
+      setPlanData(adaptFbaPlanPayload(cached.body));
       setPlanCachedAt(new Date(cached.cachedAt));
       setPlanError(null);
       setSnapshotNotice(null);
@@ -2656,7 +2652,7 @@ function DashboardApp({ session, access, onSignOut }) {
         setPlanCachedAt(null);
         setSnapshotNotice(body.message);
       } else {
-        setPlanData(body);
+        setPlanData(adaptFbaPlanPayload(body));
         setPlanCachedAt(new Date(cachedAt));
         setPlanError(null);
         setSnapshotNotice(null);
@@ -2673,7 +2669,7 @@ function DashboardApp({ session, access, onSignOut }) {
     setPlanError(null);
     refreshSharedReport(planParams)
       .then(({ body, cachedAt }) => {
-        setPlanData(body);
+        setPlanData(adaptFbaPlanPayload(body));
         setPlanCachedAt(new Date(cachedAt));
       })
       .catch((err) => setPlanError(err.message))
@@ -3271,6 +3267,16 @@ function DashboardApp({ session, access, onSignOut }) {
   // Everything here is local, so search/sort/target/config changes never refetch (ZERO DataDoe).
   // AWD is applicable for the AWD-capable marketplaces (US + EU5). The snapshot carries `awdEligible`; an OLDER snapshot
   // (pre-Europe-AWD) omits it, so fall back to isUS so US keeps working immediately on old snapshots (byte-identical).
+  // Listings inventory cutover, phase 2: planData is ALWAYS the adapted Listings-model shape (adaptFbaPlanPayload at
+  // load). Its inventory source is per account: validated Listings, else the labelled FBA Inventory Health fallback (or a
+  // pre-phase-2 saved Health plan), else Unavailable. Inventory figures are shown for Listings and the Health fallback.
+  const planInventory = useMemo(() => fbaPlanInventoryView(planData), [planData]);
+  const planInventoryOk = !!planData && planInventory.inventoryOk;
+  // The schedule refreshes Listings once a day per region: a Listings snapshot older than 36 h means this account's
+  // latest Listings batch failed or was skipped. The last-known values stay (fail-closed) but the age is shown as a
+  // warning (Listings source only; a Health snapshot carries its own date).
+  const planListingsAgeHours = planInventoryOk ? planInventory.listingsAgeHours : null;
+  const planListingsStale = planInventoryOk && planInventory.listingsStale;
   const planAwdEligible = useMemo(
     () => (planData ? (planData.awdEligible === undefined ? planData.isUS === true : planData.awdEligible === true) : false),
     [planData]
@@ -3281,8 +3287,14 @@ function DashboardApp({ session, access, onSignOut }) {
     const monthKeys = (planData.months || []).map((m) => m.key);
     const effectiveAsOf = planData.salesLatestDate || planData.asOf || null;
     const daysInCurrentMonth = planData.currentMonth?.daysInMonth || null;
-    // AWD validated = eligible marketplace (US + EU5) AND the AWD source is present. US byte-identical.
-    const awdSourceValidated = planAwdEligible && planData.awdAvailable === true;
+    // Listings inventory cutover, phase 2: every plan (incl. an adapted pre-phase-2 Health plan) is Listings-model shaped;
+    // inventory figures count when the source is Listings or the FBA Inventory Health fallback.
+    const listingsModel = planData.inventoryModel === "listings-v1";
+    const inventoryOk = listingsModel && fbaPlanInventoryView(planData).inventoryOk;
+    // AWD validated = eligible marketplace (US + EU5) AND the Listings (AWD) source is present in a Listings-model plan.
+    // Listings inventory cutover: a NON-AWD marketplace passes awdApplicable false (AWD contributes 0, shown "N/A"); an
+    // AWD marketplace whose AWD source is not validated leaves the network position unknown (never silently AWD-less).
+    const awdSourceValidated = listingsModel && planAwdEligible && planData.awdAvailable === true;
     const built = planData.rows.map((r) => {
       const legacy = computePlanRow(r, planData, targetDays); // preserved existing columns (unchanged)
       const wh = r.sku ? planWarehouseBySku.get(String(r.sku)) : null;
@@ -3291,11 +3303,10 @@ function DashboardApp({ session, access, onSignOut }) {
       });
       const planning = computePlanningRow({
         isUS: planData.isUS === true,
-        effectiveAsOf, daysInCurrentMonth, inventoryAvailable: planData.inventoryAvailable === true,
-        available: r.fbaAvailable, customerOrderReserved: r.customerOrderReserved ?? null,
-        reservedFcTransfer: r.reservedFcTransfer, reservedFcProcessing: r.reservedFcProcessing,
-        inboundWorking: r.inboundWorking, inboundShipped: r.inboundShipped, inboundReceived: r.inboundReceived,
-        awdValidated: awdSourceValidated, awdAvailable: r.awdAvailable, awdInbound: r.awdInbound ?? null,
+        effectiveAsOf, daysInCurrentMonth, inventoryAvailable: inventoryOk,
+        available: r.fbaAvailable ?? null, fbaInbound: r.fbaInbound ?? null,
+        fbaReservedTotal: r.fbaReservedTotal ?? null, fbaFcTransfer: r.fbaFcTransfer ?? null, fbaContext: r.fbaContext ?? null,
+        awdValidated: awdSourceValidated, awdApplicable: planAwdEligible, awdAvailable: r.awdAvailable ?? null, awdInbound: r.awdInbound ?? null,
         sellerWarehouseQty: wh ? wh.qty : null,
         // A completed month with proven evidence is a number (covered zero = 0); a genuinely absent month stays null
         // so the forecast engine never treats a missing month as 0.
@@ -3307,16 +3318,20 @@ function DashboardApp({ session, access, onSignOut }) {
       const monthsDisplay = monthKeys.map((k) => { const v = r.unitsByMonth?.[k]; return v == null ? null : Number(v); });
       const skuHasOverride = !!(r.sku && planSkuOverrides.get(String(r.sku)));
       // ONE canonical inventory model for every display/total/export/plan number: derived from the engine, so the
-      // table, footer, export and planning can never disagree. Demand uses the corrected daily run rate; supply is
-      // the amazonNetworkPosition (FBA + distributable AWD; awd_inbound + customer-reserve excluded).
+      // table, both Totals rows, export and planning can never disagree. Demand uses the corrected daily run rate; supply
+      // is the amazonNetworkPosition (FBA Available + FBA Inbound + distributable AWD; reserved / FC transfer / AWD
+      // inbound are display only).
       const amazonNetwork = planning.amazonNetworkPosition;
       const targetUnits = planning.dailyRunRate == null ? null : Math.round(planning.dailyRunRate * (Number(targetDays) || 0));
       const recommended = (amazonNetwork == null || targetUnits == null) ? null : Math.max(0, Math.ceil(targetUnits - amazonNetwork));
       return {
         ...legacy, planning, horizonSource, effectiveHorizon: resolvedHorizon, skuHasOverride, monthsDisplay,
-        reserved: planning.reservedFcTotal, inboundPipeline: planning.inboundPipeline,
+        fbaInbound: planning.fbaInbound,
         awd: planning.awdAvailable, awdInbound: planning.awdInbound,
-        totalFbaInv: planning.totalFbaInventory, amazonNetwork,
+        // awdNA: AWD does not apply to this marketplace ("N/A"). awdAssumedZero: this row's AWD includes a BLANK Listings
+        // AWD cell assumed 0 (owner decision) -- every AWD-dependent figure on the row is marked, never shown as verified.
+        awdNA: !planAwdEligible, awdAssumedZero: awdSourceValidated && r.awdAssumedZero === true && planning.awdAvailable != null,
+        fbaSupply: planning.fbaSupply, amazonNetwork,
         targetUnits, recommended, remark: recommended == null ? null : recommended > 0 ? "Restock" : "OK",
         rowKey: r.asin, warehouse: wh || null, marketplace: wh?.marketplace || planData.marketCountry || null,
       };
@@ -3336,9 +3351,8 @@ function DashboardApp({ session, access, onSignOut }) {
       });
       const planning = computePlanningRow({
         isUS: planData.isUS === true, effectiveAsOf, daysInCurrentMonth, inventoryAvailable: false,
-        available: null, customerOrderReserved: null, reservedFcTransfer: null, reservedFcProcessing: null,
-        inboundWorking: null, inboundShipped: null, inboundReceived: null,
-        awdValidated: false, awdAvailable: null, awdInbound: null, sellerWarehouseQty: wh.qty,
+        available: null, fbaInbound: null, fbaReservedTotal: null, fbaFcTransfer: null, fbaContext: null,
+        awdValidated: false, awdApplicable: planAwdEligible, awdAvailable: null, awdInbound: null, sellerWarehouseQty: wh.qty,
         monthlyValues: [null, null, null], mtdUnits: null, elapsedCompletedDays: planData.elapsedDays,
         forecastMethod: planAccountSettings.forecastMethod, forecastWeights: planAccountSettings.forecastWeights,
         horizon: resolvedHorizon, safetyDays: planAccountSettings.safetyDays,
@@ -3355,7 +3369,7 @@ function DashboardApp({ session, access, onSignOut }) {
         monthsDisplay: [null, null, null], m1: null, m2: null, m3: null, mtdUnits: null,
         threeMoAvg: null, mtdProjected: null, planningAvg: null, targetUnits: null,
         fbaAvailable: null, mtdDrr: null, fbaDaysCover: null, invKnown: false, isUS: planData.isUS === true,
-        reserved: null, inboundPipeline: null, awd: null, awdInbound: null, totalFbaInv: null, amazonNetwork: null,
+        fbaInbound: null, awd: null, awdInbound: null, awdNA: !planAwdEligible, awdAssumedZero: false, fbaSupply: null, amazonNetwork: null,
         recommended: null, remark: null, planning, horizonSource, effectiveHorizon: resolvedHorizon,
         skuHasOverride: !!planSkuOverrides.get(key), warehouse: wh, marketplace: wh.marketplace || planData.marketCountry || null,
       });
@@ -3372,39 +3386,68 @@ function DashboardApp({ session, access, onSignOut }) {
   }, [planComputed, planSearch, planSort, selectedBrand]);
 
   const planTotals = useMemo(() => {
-    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, mtdDrr: 0, fbaDaysCover: null, custReserved: 0, reserved: 0, inboundPipeline: 0, awd: 0, awdInbound: 0, totalFbaInv: 0, amazonNetwork: 0, recommended: 0, restockCount: 0, evaluatedCount: 0,
-      pipeline: 0, horizonDemand: 0, safetyStock: 0, targetInventory: 0, sellerWh: 0, shipWh: 0, production: 0 };
-    let anyInv = false, anyAwd = false, anyAwdInbound = false;
+    const t = { m1: 0, m2: 0, m3: 0, mtdUnits: 0, targetUnits: 0, fbaAvailable: 0, mtdDrr: 0, fbaDaysCover: null, fbaInbound: 0, fbaReservedTotal: 0, fbaFcTransfer: 0, awd: 0, awdInbound: 0, fbaSupply: 0, amazonNetwork: 0, recommended: 0, restockCount: 0, evaluatedCount: 0, unassessedCount: 0,
+      horizonDemand: 0, safetyStock: 0, targetInventory: 0, sellerWh: 0, shipWh: 0, production: 0, awdAssumedRows: 0 };
+    let anyInv = false;
+    // AWD totals exist only for a validated AWD source (AWD marketplace + the Listings rows present); otherwise Unavailable.
+    // Phase 2: AWD always comes from the Listings rows, whichever source the FBA figures use.
+    const awdOn = planAwdEligible && planData?.inventoryModel === "listings-v1" && planData?.awdAvailable === true;
     const add = (key, v) => { if (v != null && Number.isFinite(Number(v))) t[key] += Number(v); };
+    // Listings inventory cutover: an inventory-dependent total is a COMPLETE sum or Unavailable (null) -- never a partial
+    // sum shown as a total. A row counts when it is an FBA product on Amazon: warehouse-only rows (no Amazon listing) and
+    // merchant-fulfilled-only rows (no FBA stock) are not FBA figures and are excluded; any other row with an unknown
+    // value (absent from Listings, a conflicting duplicate listing, an unknown inbound...) makes that total Unavailable.
+    const strict = (key, v, counts) => { if (!counts || t[key] === null) return; if (v == null || !Number.isFinite(Number(v))) { t[key] = null; return; } t[key] += Number(v); };
     planRows.forEach((r) => {
-      t.m1 += r.m1; t.m2 += r.m2; t.m3 += r.m3; t.mtdUnits += r.mtdUnits;
+      t.m1 += r.m1 || 0; t.m2 += r.m2 || 0; t.m3 += r.m3 || 0; t.mtdUnits += r.mtdUnits || 0;
       add("targetUnits", r.targetUnits);
-      if (r.fbaAvailable !== null) {
+      const fbaRow = !r.warehouseOnly && r.planning?.fbaContext !== "mfn-only";
+      if (r.fbaAvailable !== null && r.fbaAvailable !== undefined) {
         anyInv = true;
-        t.fbaAvailable += r.fbaAvailable;
-        if (r.mtdDrr !== null) t.mtdDrr += r.mtdDrr;
-        add("reserved", r.reserved); add("inboundPipeline", r.inboundPipeline);
-        add("totalFbaInv", r.totalFbaInv); add("amazonNetwork", r.amazonNetwork);
-        add("custReserved", r.planning?.customerOrderReserved);
-        add("pipeline", r.planning?.amazonPipeline);
+        if (r.mtdDrr !== null && t.fbaAvailable !== null) t.mtdDrr += r.mtdDrr;
       }
-      if (r.awd !== null) { anyAwd = true; t.awd += r.awd; }
-      if (r.awdInbound != null) { anyAwdInbound = true; t.awdInbound += Number(r.awdInbound); }
-      if (r.recommended !== null) t.recommended += r.recommended;
+      strict("fbaAvailable", r.fbaAvailable, fbaRow); strict("fbaInbound", r.fbaInbound, fbaRow);
+      strict("fbaReservedTotal", r.planning?.fbaReservedTotal, fbaRow); strict("fbaFcTransfer", r.planning?.fbaFcTransfer, fbaRow);
+      strict("fbaSupply", r.fbaSupply, fbaRow); strict("amazonNetwork", r.amazonNetwork, fbaRow);
+      strict("recommended", r.recommended, fbaRow && r.targetUnits != null);
+      strict("awd", r.awd, awdOn && fbaRow); strict("awdInbound", r.awdInbound, awdOn && fbaRow);
       // A row is ACTUALLY assessed for restock only when a recommendation could be computed (inventory + a run
       // rate). remark is null otherwise. evaluatedCount lets the KPI/footer show "unavailable" instead of a
       // misleading 0/OK when inventory is unavailable and nothing was assessed (Defect D). No formula change.
       if (r.remark != null) t.evaluatedCount += 1;
       if (r.remark === "Restock") t.restockCount += 1;
-      // Planning outputs (each null-safe; a null contributes nothing but never fabricates a 0 header total).
+      // Rows whose AWD includes a BLANK Listings AWD cell assumed 0 (owner decision): the AWD-dependent totals + KPIs that
+      // count them say "AWD blank treated as 0" (never presented as fully verified).
+      if (fbaRow && r.awdAssumedZero === true) t.awdAssumedRows += 1;
+      // An FBA product with a run rate but an UNKNOWN supply could not be assessed: the restock count is then a lower
+      // bound, so the Remark footer and the Needs Restock KPI are withheld (never a false "OK" or an undercount).
+      if (fbaRow && r.targetUnits != null && r.remark == null) t.unassessedCount += 1;
+      // Planning outputs (each null-safe; a null contributes nothing but never fabricates a 0 header total). Ship WH /
+      // Produce depend on the supply, so they follow the strict rule.
       add("horizonDemand", r.planning?.horizonDemand); add("safetyStock", r.planning?.safetyStockUnits);
       add("targetInventory", r.planning?.targetInventory); add("sellerWh", r.planning?.sellerWarehouseQty);
-      add("shipWh", r.planning?.shipFromSellerWarehouse); add("production", r.planning?.productionRequirement);
+      strict("shipWh", r.planning?.shipFromSellerWarehouse, fbaRow && r.planning?.targetInventory != null);
+      strict("production", r.planning?.productionRequirement, fbaRow && r.planning?.targetInventory != null);
     });
-    t.fbaDaysCover = t.mtdDrr > 0 ? t.fbaAvailable / t.mtdDrr : null;
-    t.anyInv = anyInv; t.anyAwd = anyAwd; t.anyAwdInbound = anyAwdInbound;
+    t.fbaDaysCover = t.fbaAvailable !== null && t.mtdDrr > 0 ? t.fbaAvailable / t.mtdDrr : null;
+    if (!awdOn) { t.awd = null; t.awdInbound = null; }
+    // Listings stock on SKUs with NO (resolvable) ASIN cannot be placed on any row (e.g. DataDoe's "__EMPTY__" ASIN on
+    // whole FR accounts): every inventory total would be partial, so each is withheld (rows keep their own values).
+    if (planInventoryOk && planData?.inventoryUnattributed && planData.inventoryUnattributed.skusWithStock > 0) {
+      for (const k of ["fbaAvailable", "fbaInbound", "fbaReservedTotal", "fbaFcTransfer", "awd", "awdInbound", "fbaSupply", "amazonNetwork", "recommended", "shipWh", "production"]) t[k] = null;
+      t.fbaDaysCover = null;
+    }
+    // AWD stock on Listings SKUs with no (resolvable) ASIN: the AWD totals -- and every total that counts AWD as supply
+    // (network position, Recommend, Ship WH, Produce) -- would be partial, so they are withheld.
+    if (awdOn && Number(planData?.awdUnattributedSkus) > 0) {
+      for (const k of ["awd", "awdInbound", "amazonNetwork", "recommended", "shipWh", "production"]) t[k] = null;
+    }
+    t.anyInv = anyInv; t.anyAwd = t.awd !== null; t.anyAwdInbound = t.awdInbound !== null;
+    // A non-AWD marketplace: the AWD totals are "N/A" (AWD does not exist there), not an unknown "—".
+    t.awdNA = !planAwdEligible;
+    t.restockKnown = t.evaluatedCount > 0 && t.unassessedCount === 0;
     return t;
-  }, [planRows]);
+  }, [planRows, planInventoryOk, planAwdEligible, planData]);
 
   // ================= ADDITIVE WDD / lead-time / reorder derivation (client-side, ZERO DataDoe) =================
   // Per-ASIN demand evidence from the shared SKU Movement v2 payload (dailyUnits over its proven axis + coverage).
@@ -3437,11 +3480,12 @@ function DashboardApp({ session, access, onSignOut }) {
       const wdd = computeAsinWdd({
         dailyUnits: demand?.dailyUnits, effectiveAsOf: fbaDemandByAsin.effectiveAsOf, coverageFrom: fbaDemandByAsin.coverageFrom,
         weights: resolved.weights, leadTime: lt, marketplaceToday: planMarketToday,
-        fbaAvailable: r.planning?.immediatelyAvailable, awdAvailable: r.planning?.awdAvailable, inboundPipeline: r.planning?.inboundPipeline,
+        // AWD that does not apply to the marketplace contributes an explicit 0; an unknown AWD / FBA Inbound stays null.
+        fbaAvailable: r.planning?.immediatelyAvailable, awdAvailable: planAwdEligible ? r.planning?.awdAvailable : 0, inboundPipeline: r.planning?.fbaInbound,
       });
       return { ...r, wdd: { ...wdd, weightSource: resolved.source, weights: resolved.weights, leadTime: lt } };
     });
-  }, [planRows, fbaDemandByAsin, wddWeightsByKey, leadTimeByAsin, planMarketToday]);
+  }, [planRows, fbaDemandByAsin, wddWeightsByKey, leadTimeByAsin, planMarketToday, planAwdEligible]);
 
   // The WDD-weight editor targets the SELECTED brand's canonical key, or '' (the account default) for All Brands /
   // Unmapped -- never inferring one brand's weights from another.
@@ -3468,12 +3512,29 @@ function DashboardApp({ session, access, onSignOut }) {
 
   // The full ordered column model (identity + sales + forecast + inventory + planning + status). Each column owns its
   // header metadata + cell + footer renderer, so the grouped column chooser and the table stay perfectly in sync. AWD
-  // columns are tagged so they vanish for non-US accounts (never a fake 0). `nInt` renders null as an em dash.
+  // columns are tagged (awd: true) and render "N/A" on a non-AWD marketplace (never a fake 0). `nInt` renders null as an
+  // em dash.
   const planColumns = useMemo(() => {
     if (!planData) return [];
     const months = planData.months || [];
     const mLabel = (i) => monthKeyLabel(months[i]?.key) || `Month ${i + 1}`;
     const td = (key, val, cls = "mono") => <td key={key} className={cls}>{nInt(val)}</td>;
+    // FBA inventory cell: "MFN" for a merchant-fulfilled-only product (not FBA stock; never an FBA stockout), else the value.
+    const invTd = (key, val, r) => (r.planning?.fbaContext === "mfn-only"
+      ? <td key={key} className="mono" title="Merchant-fulfilled listing — no FBA stock (not an FBA stockout)">MFN</td>
+      : td(key, val));
+    // Listings inventory cutover -- AWD (owner decision 2026-10-08). "AWD blank treated as 0": a row whose AWD includes a
+    // BLANK Listings AWD cell carries a "*" marker + tooltip on the AWD cell and on every AWD-dependent figure (network,
+    // Recommend, Ship WH, Produce, reorder cover); a total that counts such rows carries it too. An explicit DataDoe 0 is
+    // never marked. A non-AWD marketplace shows "N/A" for AWD (AWD does not exist there; it contributes 0).
+    const awdMark = (r) => (r.awdAssumedZero ? <sup className="plan-awd-assumed" title={PLAN_AWD_ASSUMED_TITLE} data-awd-assumed="true">*</sup> : null);
+    const tdA = (key, val, r, cls = "mono") => <td key={key} className={cls} title={r.awdAssumedZero ? PLAN_AWD_ASSUMED_TITLE : undefined}>{nInt(val)}{val != null ? awdMark(r) : null}</td>;
+    const invTdA = (key, val, r) => (r.planning?.fbaContext === "mfn-only" ? invTd(key, val, r) : tdA(key, val, r));
+    const awdNaTd = (key) => <td key={key} className="mono plan-awd-na" title="AWD does not apply to this marketplace (it contributes 0 to the network position)">N/A</td>;
+    const footA = (key, content, t, cls = "mono") => {
+      const marked = t.awdAssumedRows > 0 && content !== "—";
+      return <td key={key} className={cls} title={marked ? `Includes ${t.awdAssumedRows} row${t.awdAssumedRows === 1 ? "" : "s"} where AWD blank treated as 0` : undefined}>{content}{marked ? <sup className="plan-awd-assumed" data-awd-assumed="total">*</sup> : null}</td>;
+    };
     return [
       { id: "asin", group: "Identity", label: "Product / ASIN", chooserLabel: "Product / ASIN", align: "left", sortKey: "asin", locked: true,
         cell: (r) => (<td key="asin" className="pt-id"><div className="pt-name" title={r.productName || r.asin}>{r.productName || "(no product name)"}</div><div className="pt-meta mono">{r.asin || (r.warehouseOnly ? "warehouse only" : "")}{r.sku ? `${r.asin || r.warehouseOnly ? " · " : ""}${r.sku}` : ""}</div>{r.brand && <div className="pt-brand">{r.brand}</div>}</td>),
@@ -3485,32 +3546,28 @@ function DashboardApp({ session, access, onSignOut }) {
       { id: "threeMoAvg", group: "Forecast", label: "3M Avg", chooserLabel: "3-month average", sortKey: "threeMoAvg", cell: (r) => td("threeMoAvg", r.planning?.threeMonthAverage), foot: () => <td key="threeMoAvg" className="mono">—</td> },
       { id: "mtdProjected", group: "Forecast", label: "MTD Proj.", chooserLabel: "MTD projected", sortKey: "mtdProjected", cell: (r) => td("mtdProjected", r.planning?.mtdProjectedUnits), foot: () => <td key="mtdProjected" className="mono">—</td> },
       { id: "targetUnits", group: "Forecast", label: `Target Units (${targetDays || 0}d)`, chooserLabel: "Target units (target-days)", sortKey: "targetUnits", thTitle: "Corrected daily run rate (the account forecast method) × the target-days input. Unavailable (em dash) when the forecast can't be derived.", cell: (r) => td("targetUnits", r.targetUnits, "mono pt-strong pt-target"), foot: (t) => td("targetUnits", t.targetUnits, "mono pt-strong pt-target") },
-      { id: "fbaAvailable", group: "Inventory", label: "FBA Avail", chooserLabel: "FBA available", sortKey: "fbaAvailable", cell: (r) => td("fbaAvailable", r.fbaAvailable), foot: (t) => <td key="fbaAvailable" className="mono">{t.anyInv ? nInt(t.fbaAvailable) : "—"}</td> },
-      { id: "fbaDaysCover", group: "Inventory", label: "FBA Days (MTD DRR)", chooserLabel: "FBA days cover", sortKey: "fbaDaysCover", cell: (r) => td("fbaDaysCover", r.fbaDaysCover), foot: (t) => <td key="fbaDaysCover" className="mono">{t.anyInv ? nInt(t.fbaDaysCover) : "—"}</td> },
-      { id: "custReserved", group: "Inventory", label: "Cust. Reserved", chooserLabel: "Customer reserved", thTitle: "reserved_customer_order — units already allocated to placed customer orders. DISPLAY ONLY: already sold, never counted as usable/planning stock.", cell: (r) => td("custReserved", r.planning?.customerOrderReserved), foot: (t) => <td key="custReserved" className="mono">{t.anyInv ? nInt(t.custReserved) : "—"}</td> },
-      { id: "reserved", group: "Inventory", label: "Reserved (FC)", chooserLabel: "Reserved (FC transfer + processing)", sortKey: "reserved", thTitle: "reserved_fc_transfer + reserved_fc_processing (raw, no subtraction) — in-FC, temporarily unavailable, becoming sellable. Distinct from Cust. Reserved.", cell: (r) => td("reserved", r.reserved), foot: (t) => <td key="reserved" className="mono">{t.anyInv ? nInt(t.reserved) : "—"}</td> },
-      { id: "reservedFcTransfer", group: "Inventory", label: "FC Transfer", chooserLabel: "· reserved_fc_transfer (raw)", defaultHidden: true, thTitle: "reserved_fc_transfer (raw). A component of Reserved (FC).", cell: (r) => td("reservedFcTransfer", r.planning?.reservedFcTransfer), foot: () => <td key="reservedFcTransfer" className="mono">—</td> },
-      { id: "reservedFcProcessing", group: "Inventory", label: "FC Processing", chooserLabel: "· reserved_fc_processing (raw)", defaultHidden: true, thTitle: "reserved_fc_processing (raw). A component of Reserved (FC).", cell: (r) => td("reservedFcProcessing", r.planning?.reservedFcProcessing), foot: () => <td key="reservedFcProcessing" className="mono">—</td> },
-      { id: "inboundPipeline", group: "Inventory", label: "Inbound Pipeline", chooserLabel: "Inbound pipeline (working+shipped+received)", sortKey: "inboundPipeline", thTitle: "inbound_working + inbound_shipped + inbound_received — en route to the FBA network, not yet sellable.", cell: (r) => td("inboundPipeline", r.inboundPipeline), foot: (t) => <td key="inboundPipeline" className="mono">{t.anyInv ? nInt(t.inboundPipeline) : "—"}</td> },
-      { id: "inboundWorking", group: "Inventory", label: "Inbound Working", chooserLabel: "· inbound_working (raw)", defaultHidden: true, thTitle: "inbound_working (raw). A component of Inbound Pipeline.", cell: (r) => td("inboundWorking", r.planning?.inboundWorking), foot: () => <td key="inboundWorking" className="mono">—</td> },
-      { id: "inboundShipped", group: "Inventory", label: "Inbound Shipped", chooserLabel: "· inbound_shipped (raw)", defaultHidden: true, thTitle: "inbound_shipped (raw). A component of Inbound Pipeline.", cell: (r) => td("inboundShipped", r.planning?.inboundShipped), foot: () => <td key="inboundShipped" className="mono">—</td> },
-      { id: "inboundReceived", group: "Inventory", label: "Inbound Received", chooserLabel: "· inbound_received (raw)", defaultHidden: true, thTitle: "inbound_received (raw). A component of Inbound Pipeline.", cell: (r) => td("inboundReceived", r.planning?.inboundReceived), foot: () => <td key="inboundReceived" className="mono">—</td> },
-      { id: "awd", group: "Inventory", label: "AWD Avail", chooserLabel: "AWD available (distributable)", sortKey: "awd", awd: true, thTitle: "awd_available_distributable_quantity — distributable AWD stock; counts as usable replenishment supply. US only.", cell: (r) => td("awd", r.awd), foot: (t) => <td key="awd" className="mono">{t.anyAwd ? nInt(t.awd) : "—"}</td> },
-      { id: "awdInbound", group: "Inventory", label: "AWD Inbound", chooserLabel: "AWD inbound (not yet distributable)", awd: true, thTitle: "awd_total_inbound_quantity — inbound TO the AWD warehouse, NOT yet distributable. DISPLAY ONLY: excluded from usable supply. US only.", cell: (r) => td("awdInbound", r.awdInbound), foot: (t) => <td key="awdInbound" className="mono">{t.anyAwdInbound ? nInt(t.awdInbound) : "—"}</td> },
-      { id: "totalFbaInv", group: "Inventory", label: "Total FBA Inv.", chooserLabel: "Total FBA inventory (FBA only)", sortKey: "totalFbaInv", thTitle: "Sellable Now + Reserved (FC) + Inbound Pipeline. FBA network only — excludes AWD, seller warehouse and customer-order reserve.", cell: (r) => td("totalFbaInv", r.totalFbaInv), foot: (t) => <td key="totalFbaInv" className="mono">{t.anyInv ? nInt(t.totalFbaInv) : "—"}</td> },
-      { id: "amazonNetwork", group: "Inventory", label: "Amazon Network Pos.", chooserLabel: "Amazon network position (FBA + AWD avail)", sortKey: "amazonNetwork", thTitle: "Total FBA Inv. + AWD Available — all Amazon-held stock that is or will become sellable. This is the planning supply.", cell: (r) => td("amazonNetwork", r.amazonNetwork), foot: (t) => <td key="amazonNetwork" className="mono">{t.anyInv ? nInt(t.amazonNetwork) : "—"}</td> },
-      { id: "recommended", group: "Inventory", label: "Recommend", chooserLabel: "Recommend (target-days)", sortKey: "recommended", thTitle: "ceil(Target Units − Amazon Network Position), floored at 0.", cell: (r) => td("recommended", r.recommended, "mono pt-strong" + (Number(r.recommended) > 0 ? " pt-reco" : "")), foot: (t) => <td key="recommended" className={"mono pt-strong" + (t.anyInv && Number(t.recommended) > 0 ? " pt-reco" : "")}>{t.anyInv ? nInt(t.recommended) : "—"}</td> },
-      { id: "pipeline", group: "Planning", label: "Pipeline", chooserLabel: "Pipeline", thTitle: "In-network stock not yet sellable: inbound working + shipped + received + FC processing + FC transfer (customer-order-reserved excluded)", cell: (r) => td("pipeline", r.planning?.amazonPipeline), foot: (t) => <td key="pipeline" className="mono">{t.anyInv ? nInt(t.pipeline) : "—"}</td> },
+      // Listings inventory (FBA Inventory Health is retired). A merchant-fulfilled-only product shows "MFN" (not FBA stock,
+      // never an FBA stockout); an unknown value is an em dash (never 0). Totals: a complete sum or an em dash.
+      { id: "fbaAvailable", group: "Inventory", label: "FBA Avail", chooserLabel: "FBA available", sortKey: "fbaAvailable", thTitle: "fba_quantity_available (Listings) — sellable now. Listings is a current snapshot (no date): see “Listings refreshed” above. In the labelled FBA Inventory Health fallback: available.", cell: (r) => invTd("fbaAvailable", r.fbaAvailable, r), foot: (t) => <td key="fbaAvailable" className="mono">{t.anyInv ? nInt(t.fbaAvailable) : "—"}</td> },
+      { id: "fbaDaysCover", group: "Inventory", label: "FBA Days (MTD DRR)", chooserLabel: "FBA days cover", sortKey: "fbaDaysCover", thTitle: "FBA Available ÷ MTD daily run rate.", cell: (r) => invTd("fbaDaysCover", r.fbaDaysCover, r), foot: (t) => <td key="fbaDaysCover" className="mono">{t.anyInv ? nInt(t.fbaDaysCover) : "—"}</td> },
+      { id: "fbaInbound", group: "Inventory", label: "FBA Inbound", chooserLabel: "FBA inbound (all inbound states)", sortKey: "fbaInbound", thTitle: "fba_quantity_inbound (Listings) — units inbound to FBA, not yet sellable. Listings reports one total for all inbound states (the working / shipped / received split is not available). In the labelled FBA Inventory Health fallback: inbound working + shipped + received. Counted in FBA Supply.", cell: (r) => invTd("fbaInbound", r.fbaInbound, r), foot: (t) => <td key="fbaInbound" className="mono">{t.anyInv ? nInt(t.fbaInbound) : "—"}</td> },
+      { id: "fbaReservedTotal", group: "Inventory", label: "FBA Reserved (Total)", chooserLabel: "FBA reserved (total) — display only", sortKey: "fbaReservedTotal", thTitle: "fba_quantity_reserved (Listings) — reserved units (customer orders and FC processing). DISPLAY ONLY: never counted as supply. Listings does not split it into customer-order / FC-processing reserves. Not available in the FBA Inventory Health fallback (shown as —).", cell: (r) => invTd("fbaReservedTotal", r.planning?.fbaReservedTotal, r), foot: (t) => <td key="fbaReservedTotal" className="mono">{t.anyInv ? nInt(t.fbaReservedTotal) : "—"}</td> },
+      { id: "fbaFcTransfer", group: "Inventory", label: "FC Transfer", chooserLabel: "FC transfer — display only", sortKey: "fbaFcTransfer", thTitle: "fba_quantity_fc_transfer (Listings) — units moving between fulfilment centres. DISPLAY ONLY: not counted in supply until its overlap with the other buckets is proven beyond the initial five-seller check. Not available in the FBA Inventory Health fallback (shown as —).", cell: (r) => invTd("fbaFcTransfer", r.planning?.fbaFcTransfer, r), foot: (t) => <td key="fbaFcTransfer" className="mono">{t.anyInv ? nInt(t.fbaFcTransfer) : "—"}</td> },
+      { id: "awd", group: "Inventory", label: "AWD Avail", chooserLabel: "AWD available (distributable)", sortKey: "awd", awd: true, thTitle: "awd_available_distributable_quantity (Listings) — distributable AWD stock; counts as usable replenishment supply. A blank AWD cell is treated as 0 (marked *). N/A on marketplaces without AWD.", cell: (r) => (r.awdNA ? awdNaTd("awd") : tdA("awd", r.awd, r)), foot: (t) => (t.awdNA ? awdNaTd("awd") : footA("awd", t.anyAwd ? nInt(t.awd) : "—", t)) },
+      { id: "awdInbound", group: "Inventory", label: "AWD Inbound", chooserLabel: "AWD inbound (not yet distributable)", awd: true, thTitle: "awd_total_inbound_quantity (Listings) — inbound TO the AWD warehouse, NOT yet distributable. DISPLAY ONLY: excluded from usable supply. A blank AWD cell is treated as 0 (marked *). N/A on marketplaces without AWD.", cell: (r) => (r.awdNA ? awdNaTd("awdInbound") : tdA("awdInbound", r.awdInbound, r)), foot: (t) => (t.awdNA ? awdNaTd("awdInbound") : footA("awdInbound", t.anyAwdInbound ? nInt(t.awdInbound) : "—", t)) },
+      { id: "fbaSupply", group: "Inventory", label: "FBA Supply", chooserLabel: "FBA supply (available + inbound)", sortKey: "fbaSupply", thTitle: "FBA Available + FBA Inbound. FBA only — excludes AWD, seller warehouse, FBA Reserved and FC Transfer. Replaces the former “Total FBA Inv.”, which was built from FBA Inventory Health buckets.", cell: (r) => invTd("fbaSupply", r.fbaSupply, r), foot: (t) => <td key="fbaSupply" className="mono">{t.anyInv ? nInt(t.fbaSupply) : "—"}</td> },
+      { id: "amazonNetwork", group: "Inventory", label: "Amazon Network Pos.", chooserLabel: "Amazon network position (FBA supply + AWD avail)", sortKey: "amazonNetwork", thTitle: "FBA Supply + AWD Available (AWD marketplaces; 0 AWD where AWD does not apply) — the planning supply. Unavailable when any input is unknown. * = AWD blank treated as 0.", cell: (r) => invTdA("amazonNetwork", r.amazonNetwork, r), foot: (t) => footA("amazonNetwork", t.anyInv ? nInt(t.amazonNetwork) : "—", t) },
+      { id: "recommended", group: "Inventory", label: "Recommend", chooserLabel: "Recommend (target-days)", sortKey: "recommended", thTitle: "ceil(Target Units − Amazon Network Position), floored at 0. Unavailable when the supply is unknown. * = AWD blank treated as 0.", cell: (r) => tdA("recommended", r.recommended, r, "mono pt-strong" + (Number(r.recommended) > 0 ? " pt-reco" : "")), foot: (t) => footA("recommended", t.anyInv ? nInt(t.recommended) : "—", t, "mono pt-strong" + (t.anyInv && Number(t.recommended) > 0 ? " pt-reco" : "")) },
       { id: "horizon", group: "Planning", label: "Horizon", chooserLabel: "Planning horizon", thTitle: "Effective planning horizon (per-SKU override or account default). Click a SKU's value to override.", cell: (r) => <SkuHorizonCell key="horizon" row={r} onOpen={(row) => setSkuHorizonEdit({ sku: row.sku, asin: row.asin, effective: row.effectiveHorizon, source: row.horizonSource, hasOverride: row.skuHasOverride })} />, foot: () => <td key="horizon" className="mono">—</td> },
       { id: "horizonDemand", group: "Planning", label: "Horizon Demand", chooserLabel: "Horizon demand", thTitle: "Daily run rate × effective horizon days (calendar-aware from the effective-through date)", cell: (r) => td("horizonDemand", r.planning?.horizonDemand), foot: (t) => td("horizonDemand", t.horizonDemand) },
       { id: "safety", group: "Planning", label: "Safety", chooserLabel: "Safety stock", thTitle: "Daily run rate × safety days", cell: (r) => td("safety", r.planning?.safetyStockUnits), foot: (t) => td("safety", t.safetyStock) },
       { id: "targetInv", group: "Planning", label: "Target Inv", chooserLabel: "Target inventory", thTitle: "ceil(Horizon Demand + Safety Stock)", cell: (r) => td("targetInv", r.planning?.targetInventory, "mono pt-strong"), foot: (t) => td("targetInv", t.targetInventory, "mono pt-strong") },
       { id: "sellerWh", group: "Planning", label: "Seller WH", chooserLabel: "Seller warehouse", thTitle: "Your OWN uncommitted warehouse units for this SKU (click to edit). Never Amazon inventory and never units already in inbound working.", cell: (r) => <WarehouseCell key="sellerWh" row={r} onSave={saveWarehouseQty} busy={planActionsBusy} />, foot: (t) => td("sellerWh", t.sellerWh) },
-      { id: "shipWh", group: "Planning", label: "Ship WH", chooserLabel: "Ship from warehouse", thTitle: "min(Seller WH, shortage after Amazon/AWD network stock)", cell: (r) => td("shipWh", r.planning?.shipFromSellerWarehouse), foot: (t) => td("shipWh", t.shipWh) },
-      { id: "produce", group: "Planning", label: "Produce", chooserLabel: "Production requirement", thTitle: "max(0, shortage after Amazon/AWD network stock − Seller WH)", cell: (r) => td("produce", r.planning?.productionRequirement, "mono pt-strong"), foot: (t) => td("produce", t.production, "mono pt-strong") },
+      { id: "shipWh", group: "Planning", label: "Ship WH", chooserLabel: "Ship from warehouse", thTitle: "min(Seller WH, shortage after Amazon/AWD network stock). * = AWD blank treated as 0.", cell: (r) => tdA("shipWh", r.planning?.shipFromSellerWarehouse, r), foot: (t) => footA("shipWh", nInt(t.shipWh), t) },
+      { id: "produce", group: "Planning", label: "Produce", chooserLabel: "Production requirement", thTitle: "max(0, shortage after Amazon/AWD network stock − Seller WH). * = AWD blank treated as 0.", cell: (r) => tdA("produce", r.planning?.productionRequirement, r, "mono pt-strong"), foot: (t) => footA("produce", nInt(t.production), t, "mono pt-strong") },
       { id: "stockout", group: "Planning", label: "Est. Stockout", chooserLabel: "Estimated stockout", thTitle: "Effective-through date + floor(Immediately Available / daily run rate)", cell: (r) => <td key="stockout" className="mono" title={r.planning?.estimatedStockoutDate ? "" : (r.planning?.stockoutReason || "")}>{r.planning?.estimatedStockoutDate ? fmtDateHuman(r.planning.estimatedStockoutDate) : <span className="dr-dash">—</span>}</td>, foot: () => <td key="stockout" className="mono">—</td> },
       { id: "priority", group: "Planning", label: "Priority", chooserLabel: "Priority", align: "left", cell: (r) => <td key="priority">{r.planning?.planningPriority && r.planning.planningPriority !== "Unknown" ? <span className={"pt-badge plan-prio-" + String(r.planning.planningPriority).toLowerCase()} title={r.planning.recommendedAction || ""}>{r.planning.planningPriority}</span> : "—"}</td>, foot: () => <td key="priority">—</td> },
-      { id: "remark", group: "Status", label: "Remark", chooserLabel: "Stock remark", align: "left", sortKey: "remark", cell: (r) => <td key="remark">{r.remark ? <span className={"pt-badge " + (r.remark === "Restock" ? "pt-badge-restock" : "pt-badge-ok")}>{r.remark}</span> : "—"}</td>, foot: (t) => <td key="remark">{!t.evaluatedCount ? "—" : t.restockCount > 0 ? `${t.restockCount} restock` : "OK"}</td> },
+      { id: "remark", group: "Status", label: "Remark", chooserLabel: "Stock remark", align: "left", sortKey: "remark", cell: (r) => <td key="remark" title={r.remark && r.awdAssumedZero ? PLAN_AWD_ASSUMED_TITLE : undefined}>{r.remark ? <span className={"pt-badge " + (r.remark === "Restock" ? "pt-badge-restock" : "pt-badge-ok")}>{r.remark}</span> : "—"}{r.remark ? awdMark(r) : null}</td>, foot: (t) => <td key="remark" title={t.unassessedCount > 0 ? `${t.unassessedCount} FBA product(s) could not be assessed (Listings inventory unknown)` : (t.awdAssumedRows > 0 ? `Includes ${t.awdAssumedRows} row${t.awdAssumedRows === 1 ? "" : "s"} where AWD blank treated as 0` : undefined)}>{!t.restockKnown ? "—" : t.restockCount > 0 ? `${t.restockCount} restock` : "OK"}{t.restockKnown && t.awdAssumedRows > 0 ? <sup className="plan-awd-assumed" data-awd-assumed="total">*</sup> : null}</td> },
 
       // ================= ADDITIVE columns: WDD demand + lead time + reorder (sit BESIDE the existing columns) =========
       // Demand reuses the shared SKU Movement v2 ordered-unit evidence; a missing/uncovered value is an em dash (never a
@@ -3528,22 +3585,23 @@ function DashboardApp({ session, access, onSignOut }) {
       { id: "inboundEta", group: "Lead Time", label: "Inbound ETA", chooserLabel: "Inbound ETA + Start/Reset", align: "left", thTitle: "Set on an explicit Start/Reset: marketplace-local start date + Production + Shipping + AWD Transfer (Safety excluded).", cell: (r) => <InboundEtaCell key="inboundEta" row={r} marketToday={planMarketToday} busy={planActionsBusy} onStart={(asin) => { const lt = (r.wdd && r.wdd.leadTime) || {}; saveLeadTime({ childAsin: asin, production: lt.production, shipping: lt.shipping, awd: lt.awd, safety: lt.safety, action: "start", startedDate: planMarketToday }); }} />, foot: () => <td key="inboundEta" className="mono">—</td> },
       { id: "daysToInbound", group: "Lead Time", label: "Days to Inbound", chooserLabel: "Days to inbound", thTitle: "max(0, Inbound ETA − marketplace-local current date). Derived live; 'Not configured' with no ETA.", cell: (r) => <td key="daysToInbound" className="mono">{r.wdd?.daysToInbound == null ? <span className="plan-wh-empty">Not configured</span> : nInt(r.wdd.daysToInbound)}</td>, foot: () => <td key="daysToInbound" className="mono">—</td> },
       { id: "idealCover", group: "Reorder", label: "Ideal Cover", chooserLabel: "Ideal cover (units)", thTitle: "WDD × Total Lead Time (whole units).", cell: (r) => <td key="idealCover" className="mono">{r.wdd?.idealCover == null ? <span className="dr-dash">—</span> : nInt(r.wdd.idealCover)}</td>, foot: () => <td key="idealCover" className="mono">—</td> },
-      { id: "existingCover", group: "Reorder", label: "Existing Cover", chooserLabel: "Existing cover at inbound (units)", thTitle: "max(0, FBA Available + AWD Available + Inbound Pipeline − WDD × Days to Inbound). Total FBA Inventory is deliberately excluded (it already contains inbound).", cell: (r) => <td key="existingCover" className="mono">{r.wdd?.existingCover == null ? <span className="dr-dash">—</span> : nInt(r.wdd.existingCover)}</td>, foot: () => <td key="existingCover" className="mono">—</td> },
-      { id: "reorderStatus", group: "Reorder", label: "Reorder Status", chooserLabel: "Reorder status", align: "left", thTitle: "Reorder when Existing Cover < Ideal Cover (full precision), else Sufficient. Unavailable when demand, inventory or settings are missing (never a false Sufficient).", cell: (r) => { const s = r.wdd?.reorderStatus; return <td key="reorderStatus">{s === "Reorder" ? <span className="pt-badge pt-badge-restock">Reorder</span> : s === "Sufficient" ? <span className="pt-badge pt-badge-ok">Sufficient</span> : <span className="pt-badge sku-badge-neutral" title="Demand, inventory or lead-time settings not configured">Unavailable</span>}</td>; }, foot: (t, rows) => { const n = (rows || []).filter((r) => r.wdd?.reorderStatus === "Reorder").length; return <td key="reorderStatus">{n > 0 ? `${n} reorder` : "—"}</td>; } },
-      { id: "suggestedReorder", group: "Reorder", label: "Suggested Reorder", chooserLabel: "Suggested reorder (units)", thTitle: "ceil(max(0, Ideal Cover − Existing Cover)) — whole units.", cell: (r) => <td key="suggestedReorder" className="mono pt-strong">{r.wdd?.suggestedReorder == null ? <span className="dr-dash">—</span> : nInt(r.wdd.suggestedReorder)}</td>, foot: (t, rows) => { const sum = (rows || []).reduce((s, r) => s + (r.wdd?.suggestedReorder || 0), 0); return <td key="suggestedReorder" className="mono pt-strong">{sum > 0 ? nInt(sum) : "—"}</td>; } },
+      { id: "existingCover", group: "Reorder", label: "Existing Cover", chooserLabel: "Existing cover at inbound (units)", thTitle: "max(0, FBA Available + FBA Inbound + AWD Available (AWD marketplaces; 0 where AWD does not apply) − WDD × Days to Inbound). FBA Reserved (Total) and FC Transfer are display only and excluded. Unavailable when any Listings input is unknown. * = AWD blank treated as 0.", cell: (r) => (r.wdd?.existingCover == null ? <td key="existingCover" className="mono"><span className="dr-dash">—</span></td> : tdA("existingCover", r.wdd.existingCover, r)), foot: () => <td key="existingCover" className="mono">—</td> },
+      { id: "reorderStatus", group: "Reorder", label: "Reorder Status", chooserLabel: "Reorder status", align: "left", thTitle: "Reorder when Existing Cover < Ideal Cover (full precision), else Sufficient. Unavailable when demand, inventory or settings are missing (never a false Sufficient). * = AWD blank treated as 0.", cell: (r) => { const s = r.wdd?.reorderStatus; return <td key="reorderStatus" title={(s === "Reorder" || s === "Sufficient") && r.awdAssumedZero ? PLAN_AWD_ASSUMED_TITLE : undefined}>{s === "Reorder" ? <span className="pt-badge pt-badge-restock">Reorder</span> : s === "Sufficient" ? <span className="pt-badge pt-badge-ok">Sufficient</span> : <span className="pt-badge sku-badge-neutral" title="Demand, inventory or lead-time settings not configured">Unavailable</span>}{s === "Reorder" || s === "Sufficient" ? awdMark(r) : null}</td>; }, foot: (t, rows) => { const n = (rows || []).filter((r) => r.wdd?.reorderStatus === "Reorder").length; const unknown = (rows || []).some(wddInventoryUnknown); return <td key="reorderStatus" title={unknown ? "Withheld: at least one configured product's Listings inventory is unknown" : undefined}>{!unknown && n > 0 ? `${n} reorder` : "—"}</td>; } },
+      { id: "suggestedReorder", group: "Reorder", label: "Suggested Reorder", chooserLabel: "Suggested reorder (units)", thTitle: "ceil(max(0, Ideal Cover − Existing Cover)) — whole units. * = AWD blank treated as 0.", cell: (r) => (r.wdd?.suggestedReorder == null ? <td key="suggestedReorder" className="mono pt-strong"><span className="dr-dash">—</span></td> : tdA("suggestedReorder", r.wdd.suggestedReorder, r, "mono pt-strong")), foot: (t, rows) => { const unknown = (rows || []).some(wddInventoryUnknown); const sum = (rows || []).reduce((s, r) => s + (r.wdd?.suggestedReorder || 0), 0); return <td key="suggestedReorder" className="mono pt-strong" title={unknown ? "Withheld: at least one configured product's Listings inventory is unknown, so the total would be partial" : undefined}>{!unknown && sum > 0 ? nInt(sum) : "—"}</td>; } },
     ];
   }, [planData, targetDays, saveWarehouseQty, saveLeadTime, planActionsBusy, planMarketToday]);
 
-  // Visible columns = model minus the user's hidden set, minus AWD columns for non-US accounts.
+  // Visible columns = model minus the user's hidden set. Since the Listings inventory cutover the AWD columns are shown for
+  // EVERY marketplace: a non-AWD marketplace renders them "N/A" (AWD contributes 0 there), never hidden and never a 0.
   const planVisibleColumns = useMemo(
-    () => planColumns.filter((c) => (c.locked || !planHiddenCols.has(c.id)) && (planAwdEligible || !c.awd)),
-    [planColumns, planHiddenCols, planAwdEligible]
+    () => planColumns.filter((c) => c.locked || !planHiddenCols.has(c.id)),
+    [planColumns, planHiddenCols]
   );
-  // "N hidden" uses the EFFECTIVE hidden set: only columns that are actually AVAILABLE (AWD columns excluded for
-  // non-AWD marketplaces) and hideable (not the locked Product / ASIN). A saved-but-unavailable AWD id never counts.
+  // "N hidden" uses the EFFECTIVE hidden set: only hideable columns (not the locked Product / ASIN). The AWD columns are
+  // available on every marketplace since the Listings inventory cutover (N/A where AWD does not apply).
   const planHiddenEffectiveCount = useMemo(
-    () => planColumns.filter((c) => !c.locked && (planAwdEligible || !c.awd) && planHiddenCols.has(c.id)).length,
-    [planColumns, planHiddenCols, planAwdEligible]
+    () => planColumns.filter((c) => !c.locked && planHiddenCols.has(c.id)).length,
+    [planColumns, planHiddenCols]
   );
   // Presentation-only: consecutive same-group runs of the visible columns, for a
   // clear grouped header row (Identity / Sales / Forecast / Inventory / ...).
@@ -4985,7 +5043,7 @@ function DashboardApp({ session, access, onSignOut }) {
         <div className="controls-bar plan-head">
           <div className="plan-head-main">
             <div className="page-title">FBA Shipment Plan</div>
-            <div className="page-sub">Per-ASIN restock recommendation for {refreshScopeAccount?.name || "the selected account"}{selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`} from sales velocity and live FBA{planAwdEligible ? " + AWD" : ""} inventory</div>
+            <div className="page-sub">Per-ASIN restock recommendation for {refreshScopeAccount?.name || "the selected account"}{selectedBrand === "ALL" ? "" : ` · ${selectedBrand}`} from sales velocity and FBA{planAwdEligible ? " + AWD" : ""} inventory ({planInventory.source === "listings" ? "Listings" : planInventory.source === "health-fallback" ? (planInventory.legacy ? "FBA Inventory Health snapshot" : "saved FBA Inventory Health snapshot, temporary bridge") : "inventory unavailable"})</div>
           </div>
           {planData && (
             <div className="plan-meta" aria-label="Report scope">
@@ -4995,7 +5053,7 @@ function DashboardApp({ session, access, onSignOut }) {
               </div>
               <div className="plan-meta-item">
                 <span className="plan-meta-k">Inventory</span>
-                <span className={"plan-meta-badge " + (planData.inventoryAvailable ? "is-ok" : "is-warn")}>{planData.inventoryAvailable ? "Available" : "Unavailable"}</span>
+                <span className={"plan-meta-badge " + (planInventoryOk ? "is-ok" : "is-warn")}>{planInventoryOk ? "Available" : "Unavailable"}</span>
               </div>
               {planData.marketCountry && (
                 <div className="plan-meta-item">
@@ -5048,7 +5106,7 @@ function DashboardApp({ session, access, onSignOut }) {
             </button>
             {planColsOpen && planData && (
               <PlanColumnChooser
-                groups={planColumnGroups} hidden={planHiddenCols} isUS={planAwdEligible} busy={planColsBusy}
+                groups={planColumnGroups} hidden={planHiddenCols} busy={planColsBusy}
                 onToggle={(id) => planColsApi.toggle(id)}
                 onSelectAll={() => planColsApi.selectAll()}
                 onReset={() => planColsApi.reset()}
@@ -5077,16 +5135,69 @@ function DashboardApp({ session, access, onSignOut }) {
               <span className="live-dot" style={{ position: "relative", top: 1 }} />
               <span>Sales through <strong>{planData.salesLatestDate ? fmtDateHuman(planData.salesLatestDate) : "—"}</strong></span>
               <span className="plan-fresh-sep">·</span>
-              <span>FBA inventory snapshot <strong>{planData.inventoryDate ? fmtDateHuman(planData.inventoryDate) : "unavailable"}</strong></span>
-              {planData.inventoryStale && <span className="warning-text">Latest available; requested through {fmtDateHuman(planData.inventoryRequestedThrough)}</span>}
-              {(["US", "UK", "GB", "DE", "FR", "IT", "ES"].includes(String(planData.marketCountry || "").toUpperCase())) && <><span className="plan-fresh-sep">·</span><span>Listings/AWD {planData.awdFetchedAt ? `refreshed ${new Date(planData.awdFetchedAt).toLocaleString()}` : (planData.awdAvailable ? "included" : "unavailable")}</span></>}
+              {/* The inventory SOURCE of this account's plan, with its own honest freshness: Listings has no inventory date
+                  (its fetch time is shown, never a D-1 snapshot date); the READ-ONLY FBA Inventory Health bridge shows its
+                  saved snapshot date, clearly labelled as saved, no longer refreshed and temporary. */}
+              {planInventory.source === "listings" ? (
+                <span data-inventory-source="listings">Listings refreshed <strong>{planData.listingsRefreshedAt ? new Date(planData.listingsRefreshedAt).toLocaleString() : "(time unavailable)"}</strong></span>
+              ) : planInventory.source === "health-fallback" ? (
+                <span data-inventory-source={planInventory.legacy ? "health-saved" : "health-fallback"}>FBA Inventory Health snapshot <strong>{planInventory.healthDate ? fmtDateHuman(planInventory.healthDate) : "(date unavailable)"}</strong>{planInventory.legacy ? "" : " (saved, no longer refreshed — temporary bridge)"}</span>
+              ) : (
+                <span data-inventory-source="unavailable">FBA inventory <strong>unavailable</strong></span>
+              )}
+              {planInventory.source === "health-fallback" && planData.inventoryStale && planData.inventoryRequestedThrough && <span className="warning-text">Latest available; requested through {fmtDateHuman(planData.inventoryRequestedThrough)}</span>}
+              {planAwdEligible && planInventory.source !== "listings" && <><span className="plan-fresh-sep">·</span><span>Listings AWD {planData.awdAvailable === true && (planData.listingsRefreshedAt || planData.awdFetchedAt) ? <>refreshed <strong>{new Date(planData.listingsRefreshedAt || planData.awdFetchedAt).toLocaleString()}</strong></> : (planData.awdAvailable === true ? "included" : "unavailable")}</span></>}
               <span className="plan-fresh-sep">·</span>
               <span>{planCachedAt ? `cached ${planCachedAt.toLocaleString()}` : ""}</span>
             </div>
 
-            {!planData.inventoryAvailable && (
-              <div className="alert warning">
-                <AlertTriangle size={15} /> Live FBA inventory is unavailable for this account right now, so coverage and recommendations show “—”. Sales velocity is still shown.
+            {planInventory.fallback && (
+              <div className="alert warning" data-inventory-fallback="health">
+                <AlertTriangle size={15} /> FBA inventory for this account comes from the saved FBA Inventory Health snapshot of {planInventory.healthDate ? fmtDateHuman(planInventory.healthDate) : "an unknown date"} (saved, no longer refreshed — temporary bridge), because {planInventory.reasons.length ? planInventory.reasons.join("; ") : "its Listings snapshot is not validated"}. The snapshot is used only while it is at most {planInventory.bridgeMaxAgeDays} day{planInventory.bridgeMaxAgeDays === 1 ? "" : "s"} older than this plan's inventory date; after that inventory shows as unavailable. FBA Reserved (Total) and FC Transfer are not available from it{planAwdEligible ? "; AWD still comes from the Listings snapshot" : ""}. The plan switches to Listings automatically once this account's Listings snapshot validates.
+              </div>
+            )}
+            {planInventory.legacy && planInventoryOk && (
+              <div className="alert warning" data-inventory-legacy="health">
+                <AlertTriangle size={15} /> This saved plan was built before FBA inventory moved to Listings: its FBA figures are from the FBA Inventory Health snapshot of {planInventory.healthDate ? fmtDateHuman(planInventory.healthDate) : "an unknown date"}. FBA Reserved (Total) and FC Transfer are not available from FBA Inventory Health. The next scheduled plan uses this account's Listings snapshot (or, temporarily, its last saved FBA Inventory Health snapshot, labelled).
+              </div>
+            )}
+            {!planInventoryOk && (
+              <div className="alert warning" data-inventory-unavailable="true" data-health-bridge={planInventory.bridgeStale ? "stale" : (planInventory.healthReasonCodes.length ? "unusable" : undefined)}>
+                <AlertTriangle size={15} /> {planInventory.legacy
+                  ? "This saved plan has no FBA inventory snapshot, so coverage and recommendations show “—”. Sales velocity is still shown."
+                  : planInventory.bridgeStale
+                    ? `FBA inventory is unavailable for this account: there is no validated Listings snapshot${planInventory.reasons.length ? ` (${planInventory.reasons.join("; ")})` : ""}, and the saved FBA Inventory Health snapshot of ${planInventory.bridgeSnapshotDate ? fmtDateHuman(planInventory.bridgeSnapshotDate) : "an unknown date"} is more than ${planInventory.bridgeMaxAgeDays} day${planInventory.bridgeMaxAgeDays === 1 ? "" : "s"} older than this plan's inventory date${planInventory.inventoryAsOf ? ` (${fmtDateHuman(planInventory.inventoryAsOf)})` : ""}. FBA Inventory Health is no longer refreshed, so that snapshot is not used. Coverage and recommendations show “—”. Sales velocity is still shown.`
+                    : `FBA inventory is unavailable for this account right now: there is no validated Listings snapshot${planInventory.reasons.length ? ` (${planInventory.reasons.join("; ")})` : ""} and no usable saved FBA Inventory Health snapshot${planInventory.healthReasons.length ? ` (${planInventory.healthReasons.join("; ")})` : ""}, so coverage and recommendations show “—”. Sales velocity is still shown.`}
+              </div>
+            )}
+            {planInventory.awdAssumedZeroSkus > 0 && (
+              <div className="alert warning" data-awd-assumed-zero={planInventory.awdAssumedZeroSkus}>
+                <AlertTriangle size={15} /> AWD blank treated as 0 ({planInventory.awdAssumedZeroSkus.toLocaleString("en-US")} SKU{planInventory.awdAssumedZeroSkus === 1 ? "" : "s"}): DataDoe returned no AWD quantity for {planInventory.awdAssumedZeroSkus === 1 ? "it" : "them"}, so 0 AWD units are assumed — not a verified AWD figure. Amazon Network Pos., Recommend, Ship WH, Produce, Needs Restock and the reorder cover on rows marked * rely on that assumption.
+              </div>
+            )}
+            {planAwdEligible && planData.awdAvailable === true && Number(planData.awdUnattributedSkus) > 0 && (
+              <div className="alert warning" data-awd-unattributed={Number(planData.awdUnattributedSkus)}>
+                <AlertTriangle size={15} /> {Number(planData.awdUnattributedSkus)} Listings SKU{Number(planData.awdUnattributedSkus) === 1 ? " holds" : "s hold"} AWD stock (or an unknown AWD quantity) with no ASIN, so it cannot be placed on a product. AWD totals (and the network, Recommend, Ship WH and Produce totals that count AWD) are withheld rather than shown as partial.
+              </div>
+            )}
+            {planListingsStale && (
+              <div className="alert warning" data-listings-stale={Math.floor(planListingsAgeHours)}>
+                <AlertTriangle size={15} /> Listings inventory was last refreshed {new Date(planData.listingsRefreshedAt).toLocaleString()} ({Math.floor(planListingsAgeHours / 24)} day{Math.floor(planListingsAgeHours / 24) === 1 ? "" : "s"} ago). The scheduled Listings run has not refreshed this account since, so these inventory figures may be out of date. Check the Data Sync Center.
+              </div>
+            )}
+            {planInventoryOk && planData.inventoryUnattributed && planData.inventoryUnattributed.skusWithStock > 0 && (
+              <div className="alert warning" data-inventory-unattributed={planData.inventoryUnattributed.skusWithStock}>
+                <AlertTriangle size={15} /> {planData.inventoryUnattributed.skusWithStock} Listings SKU{planData.inventoryUnattributed.skusWithStock === 1 ? " holds" : "s hold"} FBA stock with no ASIN ({(planData.inventoryUnattributed.sample || []).slice(0, 5).join(", ")}{planData.inventoryUnattributed.skusWithStock > 5 ? ", …" : ""}), so it cannot be placed on a product. Inventory totals are withheld rather than shown as partial.
+              </div>
+            )}
+            {planInventory.source === "listings" && Array.isArray(planData.inventoryConflicts) && planData.inventoryConflicts.length > 0 && (
+              <div className="alert warning" data-inventory-conflicts={planData.inventoryConflicts.length}>
+                <AlertTriangle size={15} /> {planData.inventoryConflicts.length} SKU{planData.inventoryConflicts.length === 1 ? " has" : "s have"} duplicate Listings rows that disagree ({planData.inventoryConflicts.slice(0, 5).map((c) => c.sku).join(", ")}{planData.inventoryConflicts.length > 5 ? ", …" : ""}); their inventory is shown as unavailable rather than guessed.
+              </div>
+            )}
+            {planInventory.source === "listings" && Array.isArray(planData.inventoryResolvedConflicts) && planData.inventoryResolvedConflicts.length > 0 && (
+              <div className="footer-note" data-inventory-resolved={planData.inventoryResolvedConflicts.length}>
+                {planData.inventoryResolvedConflicts.length} SKU{planData.inventoryResolvedConflicts.length === 1 ? " has" : "s have"} duplicate Listings rows for one physical stock, resolved from this account's own evidence (counted once): {planData.inventoryResolvedConflicts.slice(0, 5).map((c) => `${c.sku} → ${c.asin}${(c.rules || []).includes("R3-fba-stock-channel") ? " (FBA stock)" : ""}${(c.rules || []).includes("R2-sales-asin") ? " (sales ASIN)" : ""}`).join(", ")}{planData.inventoryResolvedConflicts.length > 5 ? ", …" : ""}.
               </div>
             )}
 
@@ -5098,23 +5209,23 @@ function DashboardApp({ session, access, onSignOut }) {
               </div>
               <div className="plan-stat plan-stat--amber">
                 <div className="plan-stat-label">Needs Restock</div>
-                <div className="plan-stat-value mono">{planTotals.evaluatedCount > 0 ? planTotals.restockCount.toLocaleString("en-US") : "—"}</div>
-                <div className="plan-stat-sub">{planData.inventoryAvailable ? "SKUs to reorder" : "Requires live inventory"}</div>
+                <div className="plan-stat-value mono">{planTotals.restockKnown ? planTotals.restockCount.toLocaleString("en-US") : "—"}</div>
+                <div className="plan-stat-sub">{!planInventoryOk ? "Requires FBA inventory" : planTotals.unassessedCount > 0 ? `${planTotals.unassessedCount.toLocaleString("en-US")} with unknown inventory` : "SKUs to reorder"}{planInventoryOk && planTotals.awdAssumedRows > 0 ? <span data-awd-assumed="kpi"> · AWD blank treated as 0</span> : null}</div>
               </div>
               <div className="plan-stat plan-stat--amber">
                 <div className="plan-stat-label">Recommended Units</div>
                 <div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.recommended) : "—"}</div>
-                <div className="plan-stat-sub">{planData.inventoryAvailable ? "Units to ship" : "Inventory required"}</div>
+                <div className="plan-stat-sub">{planInventoryOk ? "Units to ship" : "Inventory required"}{planInventoryOk && planTotals.awdAssumedRows > 0 ? <span data-awd-assumed="kpi"> · AWD blank treated as 0</span> : null}</div>
               </div>
               <div className="plan-stat plan-stat--blue">
                 <div className="plan-stat-label">FBA Available</div>
                 <div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.fbaAvailable) : "—"}</div>
-                <div className="plan-stat-sub">{planData.inventoryAvailable ? "Sellable now" : "Inventory unavailable"}</div>
+                <div className="plan-stat-sub">{planInventoryOk ? "Sellable now" : "Inventory unavailable"}</div>
               </div>
               <div className="plan-stat plan-stat--neutral">
-                <div className="plan-stat-label">Total FBA Inv.</div>
-                <div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.totalFbaInv) : "—"}</div>
-                <div className="plan-stat-sub">{planData.inventoryAvailable ? "FBA network total" : "FBA + AWD unavailable"}</div>
+                <div className="plan-stat-label">FBA Supply</div>
+                <div className="plan-stat-value mono">{planTotals.anyInv ? nInt(planTotals.fbaSupply) : "—"}</div>
+                <div className="plan-stat-sub">{planInventoryOk ? "Available + inbound" : "Inventory unavailable"}</div>
               </div>
               <div className="plan-stat plan-stat--blue">
                 <div className="plan-stat-label">Planning Horizon</div>
@@ -5182,9 +5293,9 @@ function DashboardApp({ session, access, onSignOut }) {
         <summary>Restock logic, inventory attribution, and lead-time calculations</summary>
         <div className="footer-note">
           Unit sales come from DataDoe <code>Sales &amp; Traffic by ASIN &amp; Date</code> (total_units), summed per ASIN for the 3 completed months and the current month to date. A genuinely missing month shows an em dash — never a fabricated 0 — so the 3-month average is only shown when all three completed months have proven data.
-          One canonical, non-overlapping inventory model drives every number here (table, totals, export and planning agree). From <code>FBA Inventory Health</code>, each unit is in exactly one bucket: <strong>FBA Available</strong> = <code>available</code> (sellable now); <strong>Reserved (FC)</strong> = <code>reserved_fc_transfer</code> + <code>reserved_fc_processing</code> shown RAW (no subtraction — the reserved FC states and the inbound states are distinct buckets, proven by the source metadata); <strong>Inbound Pipeline</strong> = <code>inbound_working</code> + <code>inbound_shipped</code> + <code>inbound_received</code>. <strong>Cust. Reserved</strong> = <code>reserved_customer_order</code> is already-sold stock, shown for reference and never counted as usable supply.
-          {planData?.isUS ? <> <strong>AWD Available</strong> = <code>awd_available_distributable_quantity</code> is distributable and counts as usable supply; <strong>AWD Inbound</strong> = <code>awd_total_inbound_quantity</code> is inbound to the AWD warehouse, not yet distributable, so it is display-only (US only).</> : <> AWD does not apply to non-US accounts and its columns are hidden (never shown as 0).</>}
-          {" "}<strong>Total FBA Inv.</strong> = FBA Available + Reserved (FC) + Inbound Pipeline (FBA network only — no AWD, no seller warehouse). <strong>Amazon Network Pos.</strong> = Total FBA Inv.{planData?.isUS ? " + AWD Available" : ""} and is the planning supply. <strong>Seller WH</strong> holds your OWN uncommitted warehouse units (edit inline or bulk-import); never Amazon inventory and never units already in inbound working. Target Units = the corrected daily run rate × the entered coverage days; Recommend = ceil(Target Units − Amazon Network Pos.), floored at 0. FBA Days (MTD DRR) = FBA Available ÷ MTD daily run rate (excludes reserved, inbound and AWD). Planning columns (Pipeline, Horizon Demand, Safety, Target Inv, Ship WH, Produce, Est. Stockout, Priority) come from the per-account/per-SKU planning settings. Live inventory freshness is independent of sales-report freshness; both dates are shown above. Settings, warehouse edits, the column chooser, filters, sorting, and the target-days input recompute locally without new DataDoe requests.
+          FBA inventory comes from the DataDoe <code>Listings</code> export — a current snapshot with no date, so the freshness shown above is when Listings was fetched. FBA Inventory Health is no longer refreshed. While an account's Listings snapshot is not yet validated (for example it does not carry the new inventory fields, or duplicate rows disagree), the plan uses that account's last saved <code>FBA Inventory Health</code> snapshot as a temporary bridge, clearly labelled with its snapshot date, and only while that date is at most {planInventory.bridgeMaxAgeDays} days older than the plan's inventory date (after that inventory shows as unavailable, never 0): FBA Available = <code>available</code>, FBA Inbound = <code>inbound_working</code> + <code>inbound_shipped</code> + <code>inbound_received</code>, and FBA Reserved (Total) / FC Transfer are not available from it. One inventory model drives every number here (table, both Totals rows, export and planning agree): <strong>FBA Available</strong> = <code>fba_quantity_available</code> (sellable now); <strong>FBA Inbound</strong> = <code>fba_quantity_inbound</code> (one total for all inbound states); <strong>FBA Reserved (Total)</strong> = <code>fba_quantity_reserved</code> and <strong>FC Transfer</strong> = <code>fba_quantity_fc_transfer</code> are shown for reference only and are never counted as supply. Listings has one row per listing: duplicate rows of a SKU are counted once, and duplicates that disagree are shown as unavailable. A product listed only as merchant-fulfilled shows “MFN”, never an FBA stockout. Any unknown value shows “—”, never 0, and a total over an unknown value shows “—”.
+          {planAwdEligible ? <> <strong>AWD Available</strong> = <code>awd_available_distributable_quantity</code> is distributable and counts as usable supply; <strong>AWD Inbound</strong> = <code>awd_total_inbound_quantity</code> is inbound to the AWD warehouse, not yet distributable, so it is display-only. A blank AWD cell is treated as 0 (an assumption, marked * and counted above — an explicit 0 from DataDoe is not marked).</> : <> AWD does not apply to this marketplace: its columns show N/A and AWD contributes 0 to the network position (never shown as a stock 0).</>}
+          {" "}<strong>FBA Supply</strong> = FBA Available + FBA Inbound (FBA only — no AWD, no seller warehouse). <strong>Amazon Network Pos.</strong> = FBA Supply{planAwdEligible ? " + AWD Available" : ""} and is the planning supply. <strong>Seller WH</strong> holds your OWN uncommitted warehouse units (edit inline or bulk-import); never Amazon inventory and never units already in inbound working. Target Units = the corrected daily run rate × the entered coverage days; Recommend = ceil(Target Units − Amazon Network Pos.), floored at 0. FBA Days (MTD DRR) = FBA Available ÷ MTD daily run rate (excludes reserved, inbound and AWD). Planning columns (Horizon Demand, Safety, Target Inv, Ship WH, Produce, Est. Stockout, Priority) come from the per-account/per-SKU planning settings. Listings freshness is independent of sales-report freshness; both are shown above. Settings, warehouse edits, the column chooser, filters, sorting, and the target-days input recompute locally without new DataDoe requests.
         </div>
         </details>
         {skuHorizonEdit && (

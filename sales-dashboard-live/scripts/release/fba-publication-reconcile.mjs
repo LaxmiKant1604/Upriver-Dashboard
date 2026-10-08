@@ -52,7 +52,6 @@ console.log(`fba-reconcile: bucket=${bucket} as-of=${asOf} mode=${mode} ${dryRun
 const { buildFbaPublicationReconciler } = await import("../../lib/server/sync/fba-publication-reconciler.js");
 const { fbaDependentLiveReportKeys } = await import("../../lib/server/sync/fba-dependent-reports.js");
 const { FBA_INVENTORY_SOURCE_KEY } = await import("../../lib/server/sync/source-durable-model.js");
-const { resolvedFbaSnapshot } = await import("../../lib/server/sync/source-bucket-sync.js");
 const { organizationFingerprint, sha256 } = await import("../../lib/server/source-identity.js");
 const { getDataDoeConnections, classifyDirectoryAccounts, resolveDataDoeAccountIds } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccounts: fetchDirectory } = await import("../../lib/server/datadoe.js");
@@ -208,8 +207,8 @@ async function runReleaseForAccount({ bucket: b, accountId, requestedAsOf, revis
     getCycleByBucketDate: (bk, date, opt) => sb.getBaseSyncCycleByBucketDate(bk, date, opt),
     claimCycle: (cycleId, opt) => sb.claimSyncCycle(cycleId, opt),
     readFbaSnapshot,
+    readListingsSnapshot: readListingsRevisionSnapshot,
     loadSnapshotPayload: (path, opt) => sb.getSourceSnapshotPayload(path, opt),
-    resolveExpectedRequestHash,
     resolveAccountCountry,
     // BLOCKER 1: ONE publisher-identical Brand Sales candidate (resolveValidatedLiveCandidate wires these) -- the
     // canonical live brand-sales PROVEN to be the promotion of the LATEST PROMOTABLE brand-sales job's shadow. Its
@@ -268,23 +267,19 @@ async function bucketAccounts(b) {
   return out;
 }
 
-// The durable FBA snapshot reader (per account). read!='ok' or a missing snapshot is a PER-ACCOUNT defer inside the
-// FBA adapter (LKG preserved), never a whole-run failure.
+// The saved FBA Inventory Health snapshot reader (per account) for the brand-inventory RELEASE: since the Listings
+// inventory cutover it is only the dated READ-ONLY bridge (no Health export refreshes it). read!='ok' or a missing
+// snapshot -> the release builds from Listings alone or shows inventory unavailable, never 0.
 async function readFbaSnapshot({ organizationFingerprint: org, connectionId, accountId, signal = null }) {
   return sb.getSourceSnapshot({ organizationFingerprint: org, connectionId, sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: accountId, signal });
 }
 
-// The recomputed D-1 request hash for EXACTLY the single-day inventory export -- the identity the durable snapshot's
-// source_request_hash must equal to prove it is the requested-D-1 snapshot. Blank when the account is unresolvable
-// (no rawSellerId / no marketplace country) -> the FBA revision defers that account (never publishes stale as fresh).
-async function resolveExpectedRequestHash({ accountId, requestedAsOf }) {
-  const meta = await loadDirectoryMeta();
-  const m = meta.get(String(accountId));
-  if (!m || !m.rawSellerId || !m.country) return "";
-  try {
-    const identity = resolvedFbaSnapshot({ apiKey: primaryConn.apiKey, account: { rawSellerId: m.rawSellerId, country: m.country }, asOf: requestedAsOf, bucket });
-    return String(identity && (identity.requestHash ?? identity.request_hash) || "");
-  } catch { return ""; }
+// The reconciler's per-account REVISION evidence: the SAVED LISTINGS pointer (public.source_listings_snapshot) -- the
+// inventory snapshot that still advances after the cutover (the fba job persists it for the cycle's inventory as-of).
+// read!='ok' or a missing pointer is a PER-ACCOUNT defer inside the FBA adapter (LKG preserved), never a whole-run
+// failure. The requested-day proof is the pointer's as_of (computeFbaAccountRevision; no request-hash resolver).
+async function readListingsRevisionSnapshot({ organizationFingerprint: org, connectionId, accountId, signal = null }) {
+  return sb.getSourceListingsSnapshot({ organizationFingerprint: org, connectionId, accountId, signal });
 }
 
 const deadlineSec = Number(argOf("deadline-seconds")) || 0;
@@ -316,8 +311,7 @@ const awaitSettled = (p) => {
 const reconciler = buildFbaPublicationReconciler({
   resolveOrg: async () => ({ organizationFingerprint: orgFp, connectionId: "primary" }),
   bucketAccounts,
-  readFbaSnapshot,
-  resolveExpectedRequestHash,
+  readFbaSnapshot: readListingsRevisionSnapshot,
   readLatestReportJob: ({ reportKey, accountId }) => sb.getLatestReportJobLineage(reportKey, accountId),
   readShadowSnapshot: (args) => sb.getReportSnapshot(args),
   readLiveSnapshot: (args) => sb.getReportSnapshot(args),

@@ -30,19 +30,22 @@ import { paramsHashFor } from "../report-store.js";
 import { brandViewDependencyFingerprint } from "../reports/brand-view-dependency-fingerprint.js";
 
 // CONTENT fingerprint of a compact brand-inventory payload (Item 1): a stable sha256 over the CONTENT that decides
-// what Brand View shows -- inventoryAvailable + inventoryDate + the per-(country,brand) fold. It changes when the
-// content changes (e.g. inventoryAvailable false -> true, or a fold value changes) EVEN when the fba-plan provenance
-// timestamp is unchanged/equal, and is byte-stable on a replay of the same content (so a re-run is a zero-write
-// no-op). Reuses the same canonical-JSON sha256 as every other dependency fingerprint (no new hashing framework).
+// what Brand View shows -- inventoryAvailable + the inventory source + its freshness (the Listings fetch time, else the
+// Health snapshot date -- Listings inventory cutover phase 2) + the per-(country,brand) fold (an UNKNOWN fbaAvailable is
+// hashed as null, never as 0, so an unknown -> 0 change is a content change). It changes when the content changes
+// (e.g. inventoryAvailable false -> true, or a fold value changes) EVEN when the fba-plan provenance timestamp is
+// unchanged/equal, and is byte-stable on a replay of the same content (so a re-run is a zero-write no-op). Reuses the
+// same canonical-JSON sha256 as every other dependency fingerprint (no new hashing framework).
 export function compactInventoryContentFingerprint(payload) {
   const rows = Array.isArray(payload && payload.inventoryByBrandCountry) ? payload.inventoryByBrandCountry : [];
   const canonRows = rows
-    .map((r) => `${String((r && r.country) ?? "")}|${String((r && r.brand) ?? "")}|${Number((r && r.fbaAvailable) || 0)}|${Number((r && r.skuCount) || 0)}`)
+    .map((r) => `${String((r && r.country) ?? "")}|${String((r && r.brand) ?? "")}|${r && r.fbaAvailable != null ? Number(r.fbaAvailable) : "null"}|${Number((r && r.skuCount) || 0)}${r && r.unattributed === true ? "|u" : ""}`)
     .sort();
   return brandViewDependencyFingerprint({
     v: BRAND_INVENTORY_REPORT_VERSION,
     available: !!(payload && payload.inventoryAvailable),
-    date: String((payload && payload.inventoryDate) || ""),
+    source: String((payload && payload.inventorySource) || ""),
+    date: String((payload && (payload.listingsRefreshedAt || payload.inventoryHealthDate || payload.inventoryDate)) || ""),
     rows: canonRows,
   });
 }
@@ -130,7 +133,9 @@ export async function runBrandInventoryRebuild({ region, accounts, inventoryAsOf
         return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "skipped", reason: "unauthorized-no-current-cycle-publication", preservedLkg: true, tokens: 0 };
       }
       const plan = await readFbaPlan({ accountId });
-      const payload = compactInventoryFromFbaPlanPayload(plan && plan.payload, accountId);
+      // reportAsOf = this cycle's D-1: a plan whose saved Health BRIDGE is older than its threshold never becomes an
+      // available compact (Listings inventory cutover; the saved Health snapshot is no longer refreshed).
+      const payload = compactInventoryFromFbaPlanPayload(plan && plan.payload, accountId, { reportAsOf: cycleAsOf });
       if (!payload) {
         // fba-plan absent / no available inventory / no strict date -> leave the existing compact (honest unavailable).
         return { report: BRAND_INVENTORY_SNAPSHOT_KEY, account: accountId, status: "unavailable", preservedLkg: true, blockedBy: [{ reason: "fba-plan-no-available-inventory" }], tokens: 0 };
@@ -141,8 +146,12 @@ export async function runBrandInventoryRebuild({ region, accounts, inventoryAsOf
       // -- even one whose source_refreshed_at is numerically newer (it can carry the run's sales provenance) -- must
       // NEVER suppress a fresh inventoryAvailable:true fold; that placeholder-collision was the exact way Defect A
       // stayed unavailable. A same-{to} placeholder therefore falls through to the write below.
+      // IDENTITY (Listings inventory cutover phase 2): the authorized current-cycle identity {to: cycleAsOf} -- the SAME
+      // identity the FBA reconciler and the priority run publish. A Listings compact carries NO inventory date
+      // (inventoryDate null), so the identity is the cycle label, never a claimed data day; the honest freshness is
+      // payload.listingsRefreshedAt (Listings) / payload.inventoryHealthDate (the labelled Health fallback).
       if (!dryRun && typeof readSnapshot === "function" && sourceRefreshedAt) {
-        const paramsHash = paramsHashFor(BRAND_INVENTORY_REPORT_VERSION, { to: payload.inventoryDate });
+        const paramsHash = paramsHashFor(BRAND_INVENTORY_REPORT_VERSION, { to: cycleAsOf });
         const existing = await readSnapshot({ reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, accountId, paramsHash }).catch(() => null);
         if (existing && existing.payload && existing.payload.inventoryAvailable === true
             && String(existing.source_refreshed_at || "") > String(sourceRefreshedAt)) {
@@ -163,7 +172,7 @@ export async function runBrandInventoryRebuild({ region, accounts, inventoryAsOf
       const depFingerprint = compactInventoryContentFingerprint(payload);
       return materializeSnapshot({
         reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, reportVersion: BRAND_INVENTORY_REPORT_VERSION,
-        accountId, params: { to: payload.inventoryDate }, scopeLabel: "brand-inventory",
+        accountId, params: { to: cycleAsOf }, scopeLabel: "brand-inventory",
         derived: { payload, sourceRefreshedAt, depFingerprint },
         dryRun, now, readSnapshot, persistSnapshot, claimLock, releaseLock,
       });

@@ -8,8 +8,13 @@
 // reported units, never at today.
 //
 // Advertising context comes from Profit by SKU & Date, grouped to child ASIN
-// with SUM aggregations only. Stock context comes from the latest FBA Inventory
-// Health snapshot. Buy Box is deliberately NOT diagnosed here: aggregating
+// with SUM aggregations only. Stock context (Listings inventory cutover) comes,
+// per account, from its validated SAVED Listings snapshot (zero export), else from
+// its last SAVED FBA Inventory Health snapshot as a dated read-only bridge (only
+// while it is within HEALTH_BRIDGE_MAX_AGE_DAYS of the as-of), else Unavailable;
+// never mixed. No FBA Inventory Health export is requested, and its Health-only
+// metrics (days of supply, inbound shipped + received) are removed. Buy Box is
+// deliberately NOT diagnosed here: aggregating
 // buybox_percentage needs a weighted average over raw daily rows, which the Buy
 // Box Loss report does properly on its own scope. This report reports "buy box
 // not evaluated" instead of guessing.
@@ -19,10 +24,11 @@ import {
   brandLabel,
   fetchCatalog,
   fetchExportRowsStrict,
-  fetchInventorySnapshot,
   fetchSalesTrafficLatestDate,
+  readInsightInventoryEvidence,
   sumField,
 } from "./common.js";
+import { insightAsinStock, insightInventory, insightInventoryFields } from "./derivation-core.js";
 import { PROFIT_BY_SKU, ROW_LIMITS, SALES_TRAFFIC } from "./sources.js";
 
 export const SALES_MOVERS_REPORT_KEY = "sales-movers";
@@ -153,8 +159,11 @@ function adsFor(recent, prior) {
  * @param {string} options.apiKey
  * @param {string[]} options.ids   exactly one authorised account
  * @param {string} options.to      as-of date (YYYY-MM-DD)
+ * @param {object} [options.listings] saved-evidence identity/readers for readInsightInventoryEvidence
+ *        ({ organizationFingerprint, connectionId, readPointer, readPayload, healthScopeKey, readHealthPointer,
+ *        readHealthPayload }); zero export either way (no FBA Inventory Health export is requested).
  */
-export async function buildSalesMovers({ apiKey, ids, to }) {
+export async function buildSalesMovers({ apiKey, ids, to, listings = {} }) {
   // Anchor on real reported data, not the calendar. Look back far enough to
   // find the latest completed date even after a long weekend of lag.
   const probeFrom = addDaysStr(to, -(SALES_TRAFFIC.lagDays + WINDOW_DAYS * 3));
@@ -181,7 +190,10 @@ export async function buildSalesMovers({ apiKey, ids, to }) {
   const priorTraffic = await fetchTrafficWindow(apiKey, ids, prior);
   const recentAds = await fetchAdsWindow(apiKey, ids, recent);
   const priorAds = await fetchAdsWindow(apiKey, ids, prior);
-  const inventory = await fetchInventorySnapshot(apiKey, ids, to);
+  // The per-account stock source: the saved Listings when they validate, else the saved Health bridge (read-only,
+  // threshold measured against the as-of), else Unavailable. ZERO export.
+  const evidence = await readInsightInventoryEvidence({ apiKey, ids, to, listings });
+  const inventory = insightInventory({ listings: evidence.listings, healthBridge: evidence.healthBridge, asOf: to, sellerId: ids[0] });
   const catalog = await fetchCatalog(apiKey, ids);
 
   const asins = new Set([...recentTraffic.byAsin.keys(), ...priorTraffic.byAsin.keys()]);
@@ -197,7 +209,6 @@ export async function buildSalesMovers({ apiKey, ids, to }) {
     ) continue;
 
     const meta = catalog.byAsin.get(asin) || {};
-    const stock = inventory.byAsin.get(asin) || null;
     rows.push({
       asin,
       productName: meta.name || recentTraffic.nameByAsin.get(asin) || priorTraffic.nameByAsin.get(asin) || null,
@@ -205,15 +216,8 @@ export async function buildSalesMovers({ apiKey, ids, to }) {
       recent: recentTotals,
       prior: priorTotals,
       ads: adsFor(recentAds.byAsin.get(asin), priorAds.byAsin.get(asin)),
-      // null (not 0) when the whole snapshot is missing, so the UI can say so.
-      inventory: inventory.available
-        ? {
-          available: num(stock?.available),
-          inbound: num(stock?.inbound),
-          daysOfSupply: stock?.daysOfSupply ?? null,
-          unitsShippedT30: num(stock?.unitsShippedT30),
-        }
-        : null,
+      // The account's selected FBA stock source: null when Unavailable (never zero).
+      stock: insightAsinStock(inventory, asin),
     });
   }
 
@@ -231,8 +235,7 @@ export async function buildSalesMovers({ apiKey, ids, to }) {
     // than combined.
     currencies,
     buyBoxEvaluated: false,
-    inventoryAvailable: inventory.available,
-    inventorySnapshotDate: inventory.snapshotDate,
+    ...insightInventoryFields(inventory),
     rows,
     catalogBrands: catalog.catalogBrands,
   };

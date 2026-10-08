@@ -571,6 +571,12 @@ export function reconciliationPayload({ from, to, months, orderRows, settlementR
   };
 }
 
+// Phase 2 of the Listings inventory cutover (FBA Shipment Plan only): the ONE per-account inventory-source decision
+// (validated Listings, else the labelled FBA Inventory Health fallback, else Unavailable) + the shared roll-up. Both are
+// PURE leaves (no transport). Aliased so these bindings can never collide with another fold's imports in this module.
+import { selectAccountInventory as fbaSelectAccountInventory, selectionFoldView as fbaSelectionFoldView, HEALTH_BRIDGE_MAX_AGE_DAYS as FBA_HEALTH_BRIDGE_MAX_AGE_DAYS } from "../inventory-source.js";
+import { brandCountryInventory as fbaBrandCountryInventory, listingsAsin as fbaListingsAsin, LISTINGS_INVENTORY_MODEL as FBA_LISTINGS_INVENTORY_MODEL } from "../listings-inventory.js";
+
 // ---- FBA Shipment Plan cores. A verbatim transcription of the PURE assembly in the api/datadoe.js
 //      `fba-plan` handler (the DataDoe fetches are replaced by injected saved source rows). Kept
 //      dependency-free here; proven equal to the route formula by the FBA parity harness. ----
@@ -626,8 +632,8 @@ export function foldOliSalesToFbaInputs(rows, completed, current) {
 }
 
 /**
- * Full FBA Shipment Plan payload, byte-identical to the api/datadoe.js `fba-plan` handler, derived
- * PURELY from saved source rows. Inputs (all already validated + scoped by the caller):
+ * Full FBA Shipment Plan payload, derived PURELY from saved source rows (sales / forecast / SKU directory as the former
+ * api/datadoe.js `fba-plan` handler). Inputs (all already validated + scoped by the caller):
  *   asOf, accountName, marketCountry, isUS  -- authoritative account metadata (String(to)/name/country).
  *   completed  -- [{key,from,to}] x3 completed months (from planMonthWindows).
  *   current    -- {key,from,to,daysInMonth} current MTD month (from planMonthWindows).
@@ -635,9 +641,28 @@ export function foldOliSalesToFbaInputs(rows, completed, current) {
  *   mtdUnitRows       -- grouped child_asin units for the current MTD window.
  *   dailyDateRows     -- grouped date units for the current month (salesLatestDate + elapsedDays).
  *   catalogRows       -- product catalog rows (brand + product name).
- *   invRows           -- FBA inventory-health rows (DESC by date; latest snapshot folded).
- *   awdRows           -- US-only AWD listing rows (ignored when !isUS; [] = validated empty).
- * ASIN row order follows the route: completed-month ASINs, then MTD ASINs, then inventory ASINs.
+ *   invRows           -- the READ-ONLY FBA Inventory Health BRIDGE rows: the account's LAST SAVED durable Health
+ *                        snapshot (no Health export is created any more; only its latest date is read). It may drive
+ *                        figures only while its date >= inventoryAsOf - HEALTH_BRIDGE_MAX_AGE_DAYS (2); older -> the
+ *                        inventory is Unavailable (never 0). Its rows feed identity (SKU directory / product names)
+ *                        only when it IS the selected source (a stale bridge is never evidence).
+ *   inventoryAsOf     -- the plan's inventory as-of (the cycle's D-1; defaults to asOf): the bridge freshness anchor.
+ *   healthBridgeReason -- set by the caller when the bridge itself was refused upstream (missing / unreadable /
+ *                        foreign): reported as the account's inventoryHealthReasons, never a block.
+ *   listingsRows      -- the account's isolated rows of the canonical Listings export (fba-plan:awd): FBA inventory for
+ *                        EVERY marketplace + AWD (US + EU5). `awdRows` is the former name of the same input, read only
+ *                        when listingsRows is omitted.
+ *   listingsUnavailableReason -- set by the caller when the Listings fragment is missing / failed / malformed / capped:
+ *                        its rows are then never used (not for inventory, identity, AWD or the SKU directory).
+ *   salesSkuAsinRows  -- [{ sku, child_asin }] of THIS account's own sales in the plan window: the account-local
+ *                        SKU -> ASIN evidence (a missing "__EMPTY__" Listings ASIN and the R2 identity rule).
+ * INVENTORY (Listings inventory cutover): selectAccountInventory (lib/server/inventory-source.js) decides per account --
+ * "listings" (this account's Listings snapshot is VALIDATED), "health-fallback" (the READ-ONLY bridge: the last saved FBA
+ * Inventory Health snapshot while its date >= inventoryAsOf - 2 days, labelled with the Listings reasons) or
+ * "unavailable" (neither; inventoryHealthReasons says why the bridge was not used). Whatever the source the payload has ONE
+ * Listings-model shape (inventoryModel "listings-v1"); per row fbaContext / inventoryConflict / fbaAvailable / fbaInbound /
+ * fbaReservedTotal / fbaFcTransfer / awdAvailable / awdInbound, where null is UNKNOWN (never 0) and an ASIN absent from
+ * the selected source is "absent" (unknown). ASIN row order: completed-month ASINs, then MTD ASINs, then inventory ASINs.
  */
 export function fbaPlanPayload({
   asOf, accountName, marketCountry, isUS,
@@ -647,9 +672,13 @@ export function fbaPlanPayload({
   awdEligible = undefined,
   completed, current,
   completedUnitRows = [], mtdUnitRows = [], dailyDateRows = [],
-  catalogRows = [], invRows = [], awdRows = [],
+  catalogRows = [], invRows = [], listingsRows = undefined, awdRows = [],
+  listingsUnavailableReason = null, salesSkuAsinRows = [],
+  inventoryAsOf = undefined, healthBridgeReason = null,
 }) {
   const awdOn = awdEligible === undefined ? (isUS === true) : (awdEligible === true);
+  // The bridge freshness anchor: the plan's inventory as-of (D-1), else its sales as-of (legacy callers).
+  const bridgeAsOf = inventoryAsOf != null && String(inventoryAsOf) !== "" ? String(inventoryAsOf) : (asOf != null ? String(asOf) : null);
   const awdMarket = canonicalAwdMarketplace(marketCountry) || (isUS ? "US" : "");
   // 1) Per-ASIN units for each completed month.
   const asinSet = new Set();
@@ -690,65 +719,104 @@ export function fbaPlanPayload({
     if (name && !nameByAsin.has(asin)) nameByAsin.set(asin, name);
   }
 
-  // 4) Latest FBA inventory-health snapshot, folded SKU->ASIN + a (marketplace, brand) roll-up.
-  let inventoryDate = null;
-  for (const r of invRows || []) {
-    if (r.date && (!inventoryDate || r.date > inventoryDate)) inventoryDate = r.date;
+  // 4) FBA inventory -- the phase-2 per-account source decision (Listings inventory cutover; FBA Inventory Health keeps
+  //    running as the labelled fallback). asinForSku is THIS account's own sales evidence: a SKU its sales map to
+  //    exactly ONE ASIN (never ambiguous, never another account's), used by the shared fold for a missing ("__EMPTY__")
+  //    Listings ASIN and the R2 identity rule. The scheduler derive passes the OLI rows (salesSkuAsinRows) because the
+  //    per-month unit rows are ASIN-grouped and carry no SKU.
+  const salesAsinsBySku = new Map();
+  for (const r of [...(completedUnitRows || []).flat(), ...(mtdUnitRows || []), ...(salesSkuAsinRows || [])]) {
+    const sku = String((r && r.sku) || "").trim();
+    const asin = fbaListingsAsin(r && r.child_asin);
+    if (!sku || !asin) continue;
+    if (!salesAsinsBySku.has(sku)) salesAsinsBySku.set(sku, new Set());
+    salesAsinsBySku.get(sku).add(asin);
   }
-  const invByAsin = {};
+  const asinForSku = (sku) => { const set = salesAsinsBySku.get(String(sku == null ? "" : sku).trim()); return set && set.size === 1 ? [...set][0] : null; };
+  const listingsInput = listingsUnavailableReason ? [] : (Array.isArray(listingsRows) ? listingsRows : (Array.isArray(awdRows) ? awdRows : []));
+  // Listings inventory cutover: the Health input is the READ-ONLY bridge (the last saved snapshot). selectAccountInventory
+  // applies the 2-day bridge rule against the plan's inventory as-of (no as-of -> the bridge is refused, never guessed).
+  const bridgeRows = healthBridgeReason ? [] : (invRows || []);
+  const sel = fbaSelectAccountInventory({ listingsRows: listingsInput, healthRows: bridgeRows, marketplace: marketCountry || "", awdEligible: awdOn, asinForSku, asOf: bridgeAsOf });
+  const inventorySource = sel.source;
+  const inventoryAvailable = inventorySource !== "unavailable";
+  // Why Listings is not this account's inventory source (empty when it is): the caller's fragment-level reason when the
+  // fragment itself was unusable, else the shared validation reasons.
+  const inventoryListingsReasons = listingsUnavailableReason ? [String(listingsUnavailableReason)] : [...sel.listingsReasons];
+  // Why the saved Health bridge is not used (only when Listings is not this account's source and the bridge was not
+  // selected): the caller's upstream refusal, else the shared reasons (health-snapshot-missing / health-bridge-stale:<date>
+  // / health-bridge-as-of-missing / health-foreign-marketplace-rows).
+  const inventoryHealthReasons = inventorySource === "unavailable"
+    ? (healthBridgeReason && (!sel.healthReasons.length || sel.healthReasons[0] === "health-snapshot-missing") ? [String(healthBridgeReason)] : [...sel.healthReasons])
+    : [];
+  // The saved Health snapshot's date whenever the bridge was evaluated (also when it was too old to use), so the page can
+  // name it; null for a Listings-sourced plan (the bridge is never consulted) or when there is no snapshot.
+  const inventoryBridgeSnapshotDate = sel.health && sel.health.date ? sel.health.date : null;
+  const lf = sel.listingsFold;
+  // The Listings rows are usable AWD / SKU-identity evidence whenever present and not refused by the caller. Exactly as
+  // before the cutover, a row of ANOTHER marketplace is dropped row by row (the shared fold excludes and counts it), so
+  // one marketplace's AWD never attaches to another; for the FBA inventory the same row is an integrity failure
+  // (listings-foreign-marketplace-rows -> the labelled Health fallback).
+  const listingsUsable = listingsInput.length > 0;
+  // The bridge is read at its LATEST snapshot date only, and ONLY when it is the selected source: a bridge that is too old
+  // (or not needed because Listings validates) is never identity / product-name / reserved-row evidence.
+  const identityHealthRows = inventorySource === "health-fallback" ? bridgeRows : [];
+  let healthLatestDate = null;
+  for (const r of identityHealthRows) { const d = String((r && r.date) || "").slice(0, 10); if (d && (!healthLatestDate || d > healthLatestDate)) healthLatestDate = d; }
+  const healthLatest = (r) => !healthLatestDate || String((r && r.date) || "").slice(0, 10) === healthLatestDate;
+  const inventoryHealthDate = inventorySource === "health-fallback" ? (sel.healthDate || null) : null;
   const skusByAsin = {};
   const invProductName = new Map();
-  const invByCountryBrand = new Map();
-  for (const r of invRows || []) {
-    if (inventoryDate && r.date !== inventoryDate) continue; // latest snapshot only
+  for (const r of identityHealthRows) {
+    if (!healthLatest(r)) continue;
     const asin = String(r.child_asin || "").trim();
-    if (!asin) continue;
-    asinSet.add(asin);
-    const cur = invByAsin[asin] || (invByAsin[asin] = {
-      available: 0, customerOrderReserved: 0, fcTransfer: 0, fcProcessing: 0,
-      inboundShipped: 0, inboundReceived: 0, inboundWorking: 0,
-    });
-    cur.available += num(r.available);
-    cur.customerOrderReserved += num(r.reserved_customer_order); // display-only; never usable stock
-    cur.fcTransfer += num(r.reserved_fc_transfer);
-    cur.fcProcessing += num(r.reserved_fc_processing);
-    cur.inboundShipped += num(r.inbound_shipped);
-    cur.inboundReceived += num(r.inbound_received);
-    cur.inboundWorking += num(r.inbound_working);
-    const sku = String(r.sku || "").trim();
-    if (sku) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
     const nm = String(r.product_name || "").trim();
-    if (nm && !invProductName.has(asin)) invProductName.set(asin, nm);
-    const invCountry = String(r.marketplace_country_code || marketCountry || "").trim().toUpperCase();
-    const invBrand = brandByAsin.get(asin) || null;
-    const countryBrandKey = `${invCountry}|${invBrand || ""}`;
-    const bucket = invByCountryBrand.get(countryBrandKey)
-      || { country: invCountry || null, brand: invBrand, fbaAvailable: 0, skus: new Set() };
-    bucket.fbaAvailable += num(r.available);
-    if (sku) bucket.skus.add(sku);
-    invByCountryBrand.set(countryBrandKey, bucket);
+    if (asin && nm && !invProductName.has(asin)) invProductName.set(asin, nm);
   }
-  const inventoryAvailable = (invRows || []).length > 0;
+  if (listingsUsable) {
+    for (const r of listingsInput) {
+      const asin = fbaListingsAsin(r && r.child_asin);
+      const nm = String((r && r.listing_name) || "").trim();
+      if (asin && nm && !invProductName.has(asin)) invProductName.set(asin, nm);
+    }
+  }
+  for (const [asin, a] of sel.byAsin) {
+    asinSet.add(asin);
+    for (const sku of a.skus) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
+  }
+  // (marketplace, brand) roll-up of FBA Available for Brand View -- the SHARED definition over the SELECTED source
+  // (brandCountryInventory + selectionFoldView): an mfn-only ASIN creates no bucket; an UNKNOWN available makes its bucket
+  // null (never a partial sum); Listings stock with no ASIN makes the marketplace Unavailable.
+  const inventoryByBrandCountry = inventoryAvailable
+    ? fbaBrandCountryInventory(fbaSelectionFoldView(sel), { country: marketCountry, brandOf: (asin) => brandByAsin.get(asin) || null })
+    : [];
 
-  // 5) AWD available + inbound (AWD-capable marketplaces: US + EU5), folded SKU->ASIN. A defensive marketplace check
-  //    drops any row whose marketplace is not THIS account's own canonical marketplace, so one marketplace's AWD can
-  //    never attach to another (US byte-identical: awdMarket === "US"). AWD stays honestly unavailable when there are
-  //    no rows -- never a fabricated zero.
-  const awdByAsin = {};
-  const awdInboundByAsin = {};
-  let awdAvailable = false;
-  if (awdOn) {
-    const rows = awdRows || [];
-    awdAvailable = rows.length > 0;
-    for (const r of rows) {
-      const mkt = canonicalAwdMarketplace(r.marketplace_country_code);
-      if (mkt && awdMarket && mkt !== awdMarket) continue; // never let another marketplace's AWD row leak in
-      const asin = String(r.child_asin || "").trim();
-      if (!asin) continue;
-      awdByAsin[asin] = (awdByAsin[asin] || 0) + num(r.awd_available_distributable_quantity);
-      awdInboundByAsin[asin] = (awdInboundByAsin[asin] || 0) + num(r.awd_total_inbound_quantity);
-      const sku = String(r.sku || "").trim();
-      if (sku) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
+  // 5) AWD available + inbound (AWD-capable marketplaces: US + EU5) from the SAME Listings rows, per ASIN over ALL of its
+  //    Listings SKUs, whatever the FBA source: an explicit number is that number; a BLANK cell is ASSUMED 0 (owner
+  //    decision 2026-10-08, an unverified assumption -- flagged per row as awdAssumedZero and counted per account as
+  //    awdAssumedZeroSkus so the page says "AWD blank treated as 0"; an explicit DataDoe 0 is never flagged); a sold ASIN
+  //    without a Listings row is unknown. The shared fold drops another marketplace's rows (never attached). A non-AWD
+  //    marketplace carries no AWD (null; the page shows N/A and AWD contributes 0 there).
+  const awdAvailable = awdOn && listingsUsable;
+  const awdOf = (asin, k) => { if (!awdAvailable) return null; const a = lf.byAsin.get(asin); return a ? a[k] : null; };
+  const awdAssumedZeroOf = (asin) => { if (!awdAvailable) return false; const a = lf.byAsin.get(asin); return !!(a && a.awdAssumedZero === true && a.awdAvailable !== null); };
+  const awdAssumedZeroSkus = awdAvailable ? (Number(lf.awdAssumedZeroSkus) || 0) : 0;
+  // The AWD rows' SKUs join their ASIN's SKU set exactly as before (an AWD-only ASIN still creates no row by itself:
+  // rows come from sales and the selected inventory source).
+  if (awdAvailable) {
+    for (const [asin, a] of lf.byAsin) {
+      for (const sku of a.skus) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
+    }
+  }
+  // Listings SKUs with no (resolvable) ASIN holding AWD (positive or unknown) cannot be placed on a row: the client then
+  // withholds the AWD-dependent totals (never a partial sum). A merchant-fulfilled SKU with known-zero FBA stock is not
+  // counted (the shared fold's rule for unattributed stock).
+  let awdUnattributedSkus = 0;
+  if (awdAvailable) {
+    for (const e of lf.skus.values()) {
+      if (e.asin) continue;
+      const mfnZero = String(e.channel || "").toUpperCase() === "DEFAULT" && ["fbaAvailable", "fbaInbound", "fbaReserved", "fbaFcTransfer"].every((k) => e[k] === 0);
+      if (!mfnZero && (e.awdAvailable === null || e.awdAvailable > 0)) awdUnattributedSkus += 1;
     }
   }
 
@@ -784,9 +852,22 @@ export function fbaPlanPayload({
       if (!e.productName) e.productName = nameByAsin.get(ca) || invName || invProductName.get(ca) || null;
     } else if (!e.productName && invName) { e.productName = invName; }
   };
-  // Priority (first writer sets provenance): inventory > AWD > sales.
-  for (const r of invRows || []) { if (inventoryDate && r.date !== inventoryDate) continue; putSku(r.sku, r.child_asin, r.marketplace_country_code || marketCountry, "inventory", String(r.product_name || "").trim() || null); }
-  if (awdOn) for (const r of awdRows || []) { const mkt = canonicalAwdMarketplace(r.marketplace_country_code); if (mkt && awdMarket && mkt !== awdMarket) continue; putSku(r.sku, r.child_asin, awdMarket || mkt, "awd", null); }
+  // Priority (first writer sets provenance): Health inventory (the bridge, only when it is the selected source) >
+  // Listings > sales.
+  for (const r of identityHealthRows) { if (!healthLatest(r)) continue; putSku(r.sku, r.child_asin, r.marketplace_country_code || marketCountry, "inventory", String(r.product_name || "").trim() || null); }
+  // Listings SKUs (every marketplace since phase 2; provenance "awd" on an AWD marketplace exactly as before, "listings"
+  // elsewhere) through the shared fold: a missing "__EMPTY__" ASIN is never registered as an ASIN (it takes the fold's
+  // account-local resolution, else null), and a SKU the fold saw under several ASINs is registered under EACH of them so
+  // the directory flags it ambiguous (skuAsinConflicts) instead of silently keeping the first-seen ASIN.
+  if (listingsUsable) {
+    const listingsProvenance = awdOn ? "awd" : "listings";
+    const conflictAsinsBySku = new Map(lf.conflicts.map((c) => [c.sku, c.asins]));
+    for (const e of lf.skus.values()) {
+      const asins = [...new Set([e.asin, ...(conflictAsinsBySku.get(e.sku) || [])].filter(Boolean))];
+      for (const asin of asins) putSku(e.sku, asin, awdMarket || marketCountry, listingsProvenance, null);
+      if (!asins.length) putSku(e.sku, null, awdMarket || marketCountry, listingsProvenance, null);
+    }
+  }
   for (const arr of completedUnitRows || []) for (const r of arr || []) putSku(r?.sku, r?.child_asin, marketCountry, "sales", null);
   for (const r of mtdUnitRows || []) putSku(r?.sku, r?.child_asin, marketCountry, "sales", null);
   // A SKU that maps to two DIFFERENT nonblank child ASINs is an AMBIGUOUS identity -- most commonly a SKU relisted /
@@ -814,9 +895,20 @@ export function fbaPlanPayload({
   const accountSkuDirectory = [...skuDir.values()].sort((a, b) => a.sku.localeCompare(b.sku));
 
   // 6) Assemble one row per ASIN (representative SKU = first localeCompare SKU; drop zero-activity).
+  // The FBA quantities the selected source provides: Listings -> available / inbound / reserved total / FC transfer;
+  // the Health fallback -> available / inbound only (its reserved + FC transfer are not Listings figures: null).
+  const fbaKeys = inventorySource === "listings" ? ["fbaAvailable", "fbaInbound", "fbaReserved", "fbaFcTransfer"] : ["fbaAvailable", "fbaInbound"];
+  // A Health ASIN holding ONLY reserved units (customer orders / FC transfer / FC processing) stays a row exactly as
+  // before the cutover (its reserved figures are shown as unavailable, never relabelled as Listings ones).
+  const healthReservedAsins = new Set();
+  if (inventorySource === "health-fallback") {
+    for (const r of identityHealthRows) {
+      if (String((r && r.date) || "").slice(0, 10) !== sel.healthDate) continue;
+      if (num(r.reserved_customer_order) + num(r.reserved_fc_transfer) + num(r.reserved_fc_processing) > 0) healthReservedAsins.add(String(r.child_asin || "").trim().toUpperCase());
+    }
+  }
   const rows = [];
   for (const asin of asinSet) {
-    const inv = invByAsin[asin] || null;
     // Exclude AMBIGUOUS SKUs (seen under >1 ASIN) from the representative-SKU pick: their child-ASIN identity is
     // unresolvable, so the client must not attribute their (SKU-keyed) seller-warehouse quantity to THIS ASIN row --
     // doing so would double-count one physical pool across the relisted product's two ASIN rows. A non-ambiguous SKU
@@ -832,16 +924,22 @@ export function fbaPlanPayload({
     }
     const mtdUnits = num(mtdByAsin.get(asin));
     salesTotal += mtdUnits;
-    // Activity total for the drop check (customer-order-reserved counts as activity so a customer-reserved-only SKU
-    // is kept). These are DISTINCT states per the source metadata; the inbound_quantity aggregate proves the 3 inbound
-    // states sum to it, and reserved_fc_transfer is a separate reserved state -- so there is NO transfer/shipped overlap
-    // to subtract. Each state is counted exactly once (no double count).
-    const invTotal = inv
-      ? inv.available + inv.customerOrderReserved + inv.fcTransfer + inv.fcProcessing + inv.inboundShipped + inv.inboundReceived + inv.inboundWorking
-      : 0;
-    const awdUnits = awdOn ? num(awdByAsin[asin]) : 0;
-    const awdInboundUnits = awdOn ? num(awdInboundByAsin[asin]) : 0;
-    if (salesTotal <= 0 && invTotal <= 0 && awdUnits <= 0 && awdInboundUnits <= 0) continue;
+    // Inventory for this ASIN from the SELECTED source. Absent from it (e.g. a sold ASIN whose listing is gone) ->
+    // fbaContext "absent", every FBA figure UNKNOWN (null), never 0. mfn-only (a merchant-fulfilled-only product) -> the
+    // FBA figures are null with fbaContext "mfn-only" (never an FBA stockout). A conflicting Listings SKU makes the
+    // ASIN's figures null (reported in inventoryConflicts).
+    const inv = sel.byAsin.get(asin) || null;
+    const mfnOnly = !!inv && inv.fbaContext === "mfn-only";
+    const fbaVal = (k) => (!inventoryAvailable || !inv || mfnOnly ? null : inv[k]);
+    const awdA = awdOf(asin, "awdAvailable");
+    const awdI = awdOf(asin, "awdInbound");
+    // Drop check: keep an ASIN with sales, any positive stock (FBA, AWD, or a Health reserved bucket), or any UNKNOWN FBA
+    // quantity of the selected source (an Unavailable figure is shown, never silently hidden). Unknown stock counts only
+    // when inventory is available, so a not-validated snapshot never turns every zero-activity listing into a row.
+    const fbaQty = inv && !mfnOnly ? fbaKeys.map((k) => inv[k]) : [];
+    const anyStock = [...fbaQty, awdA, awdI].some((v) => v !== null && v > 0) || healthReservedAsins.has(asin);
+    const anyUnknownStock = inventoryAvailable && !!inv && !mfnOnly && fbaQty.some((v) => v === null);
+    if (salesTotal <= 0 && !anyStock && !anyUnknownStock) continue;
     rows.push({
       asin,
       productName: nameByAsin.get(asin) || invProductName.get(asin) || null,
@@ -849,21 +947,23 @@ export function fbaPlanPayload({
       sku: skus[0] || null,
       unitsByMonth,
       mtdUnits,
-      // FBA fields are null ONLY when the whole snapshot is unavailable; when the snapshot exists
-      // but this ASIN is absent, it genuinely holds no FBA stock (0). reserved_fc_transfer is stored RAW (no
-      // inbound-shipped subtraction -- that overlap was never proven by the source metadata).
-      fbaAvailable: inventoryAvailable ? num(inv?.available) : null,
-      customerOrderReserved: inventoryAvailable ? num(inv?.customerOrderReserved) : null,
-      reservedFcTransfer: inventoryAvailable ? num(inv?.fcTransfer) : null,
-      reservedFcProcessing: inventoryAvailable ? num(inv?.fcProcessing) : null,
-      inboundShipped: inventoryAvailable ? num(inv?.inboundShipped) : null,
-      inboundReceived: inventoryAvailable ? num(inv?.inboundReceived) : null,
-      inboundWorking: inventoryAvailable ? num(inv?.inboundWorking) : null,
-      awdAvailable: awdOn ? awdUnits : null,
-      awdInbound: awdOn ? awdInboundUnits : null,
+      fbaContext: !inv ? "absent" : inv.fbaContext,
+      inventoryConflict: !!(inv && inv.conflict),
+      fbaAvailable: fbaVal("fbaAvailable"),
+      // Listings fba_quantity_inbound, or (fallback) Health inbound working + shipped + received.
+      fbaInbound: fbaVal("fbaInbound"),
+      // DISPLAY ONLY (never supply): Listings reserved total and FC transfer between fulfilment centres. Always null in
+      // the Health fallback (Health's reserved buckets have different definitions).
+      fbaReservedTotal: fbaVal("fbaReserved"),
+      fbaFcTransfer: fbaVal("fbaFcTransfer"),
+      awdAvailable: awdA,
+      awdInbound: awdI,
+      // True when this row's AWD includes a BLANK Listings AWD cell assumed 0 (never for an explicit DataDoe 0).
+      awdAssumedZero: awdAssumedZeroOf(asin),
     });
   }
 
+  const unattributed = lf.unattributed || { skus: 0, skusWithStock: 0, fbaAvailable: 0, sample: [] };
   return {
     asOf: String(asOf),
     accountName: accountName || null,
@@ -873,12 +973,40 @@ export function fbaPlanPayload({
     currentMonth: current,
     salesLatestDate,
     elapsedDays,
-    inventoryDate,
+    // Listings inventory cutover, phase 2: ONE Listings-model shape whatever the source; the source + its evidence.
+    inventoryModel: FBA_LISTINGS_INVENTORY_MODEL,
+    inventorySource,
+    inventoryListingsReasons,
+    // The FBA Inventory Health snapshot date -- ONLY for the Health fallback (Listings carries no inventory date; its
+    // freshness is listingsRefreshedAt, stamped by the caller).
+    inventoryHealthDate,
+    inventoryDate: inventoryHealthDate,
     inventoryAvailable,
+    inventoryUnavailableReason: inventoryAvailable ? null
+      : (!inventoryHealthReasons.length || inventoryHealthReasons[0] === "health-snapshot-missing" ? "listings-not-validated-and-no-health-snapshot" : `listings-not-validated-and-${inventoryHealthReasons[0]}`),
+    // Listings inventory cutover -- the READ-ONLY bridge: why the saved Health snapshot is not used (unavailable plans
+    // only), its date whenever it was evaluated (also when too old), the freshness rule and the as-of it was judged at.
+    inventoryHealthReasons,
+    inventoryBridgeSnapshotDate,
+    inventoryBridgeMaxAgeDays: FBA_HEALTH_BRIDGE_MAX_AGE_DAYS,
+    inventoryAsOf: bridgeAsOf,
+    // Unresolved duplicate-SKU conflicts (quantities unknown) and the account-local resolutions (R2 sales ASIN / R3 FBA
+    // stock channel) of the Listings fold -- always reported, never silent.
+    inventoryConflicts: sel.conflicts,
+    inventoryResolvedConflicts: sel.resolvedConflicts,
+    // Listings SKUs with no (resolvable) ASIN (Listings source only; null when none).
+    inventoryUnattributed: inventorySource === "listings" && unattributed.skus > 0
+      ? { skus: unattributed.skus, skusWithStock: unattributed.skusWithStock, fbaAvailable: unattributed.fbaAvailable, sample: unattributed.sample }
+      : null,
+    inventoryAsinResolvedFromSales: lf.asinResolved,
     awdAvailable,
     // Whether AWD is applicable for this account's marketplace (US + EU5). Drives the client's AWD column visibility +
     // the AWD-source-validated gate, so European AWD renders exactly like US. US byte-identical (awdEligible === isUS).
     awdEligible: awdOn,
+    awdUnattributedSkus,
+    // Owner decision 2026-10-08: the number of this account's Listings SKUs whose BLANK AWD cell is ASSUMED 0 (0 when AWD
+    // does not apply or the Listings rows are not usable). The page shows "AWD blank treated as 0" with this count.
+    awdAssumedZeroSkus,
     rows,
     accountSkus: accountSkuDirectory.map((e) => e.sku), // backward compat for readers of the old string-only allowlist
     accountSkuDirectory,
@@ -889,10 +1017,7 @@ export function fbaPlanPayload({
     // Org-wide Product Catalog ASIN -> brand/name. ENRICHES manual/warehouse SKUs + proves an ASIN exists; it does NOT
     // prove account membership (that is the account-scoped directory above).
     catalogByAsin: Object.fromEntries([...catalogAsinSet].map((a) => [a, { brand: brandByAsin.get(a) || null, productName: nameByAsin.get(a) || null }])),
-    inventoryByBrandCountry: [...invByCountryBrand.values()].map(({ skus, ...entry }) => ({
-      ...entry,
-      skuCount: skus.size,
-    })),
+    inventoryByBrandCountry,
   };
 }
 
@@ -940,6 +1065,14 @@ export function keywordRankPayload({ accountId, cadence, periods, weeklyPeriodCo
   };
 }
 
+// Insight-report FBA stock (Sales Movers / Buy Box Loss / Listing Health v1), phase 2 of the Listings inventory cutover:
+// the ONE per-account source decision (inventory-consumer.js -> lib/server/inventory-source.js). PURE leaves (no
+// transport). Aliased so these bindings never collide with another fold's imports in this module.
+import {
+  INVENTORY_SOURCE_HEALTH_FALLBACK as INSIGHT_SOURCE_HEALTH_FALLBACK, INVENTORY_SOURCE_UNAVAILABLE as INSIGHT_SOURCE_UNAVAILABLE,
+  asinForSkuFrom as insightAsinForSkuFrom, inventorySourceFields as insightSourceFields, selectConsumerInventory as insightSelectInventory,
+} from "./inventory-consumer.js";
+
 // ---- Sales Movers cores -------------------------------------------------------------------
 //
 // Verbatim PURE transcription of the post-fetch folds in lib/server/reports/sales-movers.js and
@@ -948,7 +1081,7 @@ export function keywordRankPayload({ accountId, cadence, periods, weeklyPeriodCo
 // byte-identical to buildSalesMovers() for the same rows. Only the fields the Sales Movers payload
 // actually consumes are folded (prices are per-SKU and unused here).
 
-// numOrNull: preserve "no value" so a missing days-of-supply is null, never a fabricated 0. Byte-identical
+// numOrNull: preserve "no value" so a missing ratio is null, never a fabricated 0. Byte-identical
 // to lib/server/datadoe.js numOrNull.
 const numOrNull = (v) => {
   if (v === null || v === undefined || v === "") return null;
@@ -1045,39 +1178,116 @@ export function salesMoversAdsFor(recent, prior) {
   };
 }
 
-// Inventory fold: pick the LATEST snapshot date present, then fold that snapshot to ASIN. `available` is
-// false when the whole snapshot is missing (=> the payload renders null stock, never zero). Verbatim from
-// common.js fetchInventorySnapshot (only the byAsin fields the Sales Movers payload reads).
-export function salesMoversInventoryFold(rows) {
-  const all = Array.isArray(rows) ? rows : [];
-  let snapshotDate = null;
-  for (const row of all) {
-    if (row && row.date && (!snapshotDate || row.date > snapshotDate)) snapshotDate = row.date;
-  }
-  const current = snapshotDate ? all.filter((row) => row.date === snapshotDate) : [];
-  const byAsin = new Map();
-  for (const row of current) {
-    const asin = String(row.child_asin || "").trim();
-    if (!asin) continue;
-    const entry = {
-      available: num(row.available),
-      unfulfillable: num(row.unfulfillable_quantity),
-      inbound: num(row.inbound_shipped) + num(row.inbound_received),
-      daysOfSupply: numOrNull(row.days_of_supply),
-      unitsShippedT30: num(row.units_shipped_t30),
-    };
-    const folded = byAsin.get(asin) || { asin, available: 0, unfulfillable: 0, inbound: 0, unitsShippedT30: 0, daysOfSupply: null, skuCount: 0 };
-    folded.available += entry.available;
-    folded.unfulfillable += entry.unfulfillable;
-    folded.inbound += entry.inbound;
-    folded.unitsShippedT30 += entry.unitsShippedT30;
-    if (entry.daysOfSupply !== null) {
-      folded.daysOfSupply = folded.daysOfSupply === null ? entry.daysOfSupply : Math.min(folded.daysOfSupply, entry.daysOfSupply);
-    }
-    folded.skuCount += 1;
-    byAsin.set(asin, folded);
-  }
-  return { snapshotDate, available: current.length > 0, byAsin };
+// ---- Insight-report FBA stock: the Listings inventory CUTOVER (owner decision 2026-10-08) ----
+// No FBA Inventory Health export is requested any more (not by a manual refresh, not by the scheduler). Each insight
+// report decides its account's stock source ONCE (selectConsumerInventory): the account's VALIDATED saved Listings
+// ("Listings refreshed <time>"; no inventory date), else its LAST SAVED durable FBA Inventory Health snapshot as a dated,
+// read-only, temporary BRIDGE -- only while that snapshot is no older than the report as-of - HEALTH_BRIDGE_MAX_AGE_DAYS
+// (the core decides; `asOf` is REQUIRED) -- else Unavailable. The two sources are never mixed inside one account. Rules:
+//   * unknown stays null (never 0); a SKU / ASIN ABSENT from the selected source is "not listed" (null stock) -- never a
+//     stockout; a merchant-fulfilled-only listing is fbaContext "mfn-only" with null FBA stock -- never an FBA stockout;
+//   * FBA inbound = Listings fba_quantity_inbound, or the bridge's working + shipped + received;
+//   * Health-only METRICS (days of supply, units shipped t30 / run rate, competitive prices, unfulfillable, Health
+//     inbound shipped + received) are REMOVED: no stock object carries them, so no consumer can show them -- never from a
+//     stale bridge.
+// The saved evidence reaches the scheduled derive through its derived context (insightInventoryEvidence: the saved
+// Listings + the saved Health bridge, both read-only); a derive without it reports listings-not-loaded /
+// health-bridge-not-loaded (Unavailable, never 0).
+export const INSIGHT_LISTINGS_NOT_LOADED = "listings-not-loaded";
+export const INSIGHT_HEALTH_BRIDGE_NOT_LOADED = "health-bridge-not-loaded";
+// The derive-context key (report-derivation.js derivedContextKeys) that carries { listings, healthBridge } -- the SAME
+// saved evidence the manual refresh reads (lib/server/reports/common.js readInsightInventoryEvidence).
+export const INSIGHT_INVENTORY_CONTEXT_KEY = "insightInventoryEvidence";
+const insightTrim = (v) => String(v == null ? "" : v).trim();
+
+/** The { listings, healthBridge } saved evidence a derive context carries (each null when absent / malformed). */
+export function insightEvidenceFromContext(context) {
+  const ev = context && typeof context === "object" ? context[INSIGHT_INVENTORY_CONTEXT_KEY] : null;
+  if (!ev || typeof ev !== "object" || Array.isArray(ev)) return { listings: null, healthBridge: null };
+  const obj = (v) => (v && typeof v === "object" && !Array.isArray(v) ? v : null);
+  return { listings: obj(ev.listings), healthBridge: obj(ev.healthBridge) };
+}
+
+/**
+ * One account's insight inventory evidence (never throws).
+ *   listings     -- { rows, unavailableReason, refreshedAt, marketplace } from the saved Listings pointer, or null when
+ *                   this caller has no Listings loader (=> listings-not-loaded).
+ *   healthBridge -- { rows, unavailableReason, snapshotDate, savedAt } from the account's last SAVED durable FBA Inventory
+ *                   Health snapshot (lib/server/reports/health-bridge.js; read-only), or null (=> health-bridge-not-loaded).
+ *   asOf         -- the report's as-of (YYYY-MM-DD): the bridge's freshness threshold is measured against it.
+ *   sellerId     -- the account's raw DataDoe seller id: a Listings / bridge row of another seller refuses that source.
+ *   asinForSku   -- the account's own unambiguous SKU -> ASIN (e.g. its sales rows), for a missing / duplicate Listings ASIN.
+ * Returns { sel }.
+ */
+export function insightInventory({ listings = null, healthBridge = null, asOf = null, marketplace = "", sellerId = null, asinForSku = null } = {}) {
+  const l = listings && typeof listings === "object" ? listings : null;
+  let listingsReason = !l ? INSIGHT_LISTINGS_NOT_LOADED
+    : (insightTrim(l.unavailableReason) || (Array.isArray(l.rows) ? null : INSIGHT_LISTINGS_NOT_LOADED));
+  const seller = insightTrim(sellerId);
+  const foreignSeller = (rows) => !!seller && rows.some((r) => { const v = insightTrim(r && r.seller_or_vendor_id); return !!v && v !== seller; });
+  if (!listingsReason && foreignSeller(l.rows)) listingsReason = "listings-foreign-seller-rows";
+  const h = healthBridge && typeof healthBridge === "object" ? healthBridge : null;
+  let healthReason = !h ? INSIGHT_HEALTH_BRIDGE_NOT_LOADED
+    : (insightTrim(h.unavailableReason) || (Array.isArray(h.rows) ? null : INSIGHT_HEALTH_BRIDGE_NOT_LOADED));
+  if (!healthReason && foreignSeller(h.rows)) healthReason = "health-foreign-seller-rows";
+  const healthRows = healthReason ? [] : h.rows;
+  const sel = insightSelectInventory({
+    listingsRows: listingsReason ? [] : l.rows,
+    listingsUnavailableReason: listingsReason,
+    listingsRefreshedAt: l ? l.refreshedAt : null,
+    healthRows,
+    healthUnavailableReason: healthReason || (healthRows.length ? null : "health-snapshot-empty"),
+    marketplace: insightTrim(l && l.marketplace) || marketplace || "",
+    awdEligible: false,
+    asinForSku,
+    asOf,
+  });
+  return { sel };
+}
+
+/**
+ * The payload-level inventory fields every insight report carries: the source decision (inventoryModel / source /
+ * label / Listings refreshed time / bridge date / fallback reasons) plus inventoryAvailable and inventorySnapshotDate --
+ * the latter is the saved Health BRIDGE's snapshot date only when the bridge is the source (Listings has no date, so a
+ * Listings account claims none). It is never a D-1 claim: the label says the snapshot is no longer refreshed.
+ */
+export function insightInventoryFields(inv) {
+  const sel = inv && inv.sel ? inv.sel : null;
+  const fields = insightSourceFields(sel);
+  return { ...fields, inventorySnapshotDate: fields.inventorySource === INSIGHT_SOURCE_HEALTH_FALLBACK ? fields.inventoryHealthDate : null };
+}
+
+// One ASIN's FBA stock (Sales Movers). null when the account's inventory is Unavailable; an ASIN absent from the selected
+// source is { listed:false, ...null } -- unknown, never 0. No Health-only metric is carried.
+export function insightAsinStock(inv, asin) {
+  const sel = inv && inv.sel;
+  if (!sel || sel.source === INSIGHT_SOURCE_UNAVAILABLE) return null;
+  const key = insightTrim(asin).toUpperCase();
+  const a = sel.byAsin.get(key);
+  if (!a) return { source: sel.source, listed: false, fbaContext: null, fbaAvailable: null, fbaInbound: null, conflict: false };
+  const conflict = !!a.conflict;
+  const mfnOnly = !conflict && a.fbaContext === "mfn-only";
+  return {
+    source: sel.source, listed: true, fbaContext: mfnOnly ? "mfn-only" : "fba",
+    fbaAvailable: conflict || mfnOnly ? null : a.fbaAvailable, fbaInbound: conflict || mfnOnly ? null : a.fbaInbound,
+    conflict,
+  };
+}
+
+// One SKU's FBA stock + fulfillment channel (Buy Box Loss / Listing Health v1). null when Unavailable; an absent SKU is
+// { listed:false, ...null } -- never read as merchant-fulfilled and never as a stockout. A bridge SKU has no channel
+// (Health does not report one) unless the account's Listings identity proves it merchant-fulfilled-only. No competitive
+// price / run rate is carried (Health-only metrics are removed).
+export function insightSkuStock(inv, sku) {
+  const sel = inv && inv.sel;
+  if (!sel || sel.source === INSIGHT_SOURCE_UNAVAILABLE) return null;
+  const key = insightTrim(sku);
+  const e = sel.skus.get(key);
+  if (!e) return { source: sel.source, listed: false, channel: null, fbaContext: null, fbaAvailable: null, fbaInbound: null, conflict: false };
+  return {
+    source: sel.source, listed: true, channel: e.channel || null, fbaContext: e.fbaContext,
+    fbaAvailable: e.conflict ? null : e.fbaAvailable, fbaInbound: e.conflict ? null : e.fbaInbound, conflict: !!e.conflict,
+  };
 }
 
 // Catalog fold -> { byAsin {name, brand, parentAsin}, catalogBrands locale-sorted }. Verbatim from
@@ -1102,19 +1312,23 @@ export function salesMoversCatalogFold(rows) {
 }
 
 /**
- * Full Sales Movers payload, byte-identical to buildSalesMovers() for the same saved rows. Zero-tail
- * ASINs (both windows fully zero) are dropped; product-name precedence is catalog -> recent traffic ->
- * prior traffic; inventory is null unless the snapshot is available; buy box is never evaluated. Pure.
+ * Full Sales Movers payload, byte-identical to buildSalesMovers() for the same saved rows (and the same Listings
+ * evidence). Zero-tail ASINs (both windows fully zero) are dropped; product-name precedence is catalog -> recent
+ * traffic -> prior traffic; row `stock` is the account's selected inventory source (null when Unavailable); buy box is
+ * never evaluated. `listings` = the saved-Listings evidence, `healthBridge` = the saved FBA Inventory Health bridge
+ * (each omitted => not loaded); the bridge threshold is measured against `asOf`. No Health export is read. Pure.
  */
 export function salesMoversPayload({
   accountId, asOf, latestReportedDate, recent, prior, lagDays, sourceLabel, windowDays,
-  recentTrafficRows, priorTrafficRows, recentAdsRows, priorAdsRows, inventoryRows, catalogRows,
+  recentTrafficRows, priorTrafficRows, recentAdsRows, priorAdsRows, catalogRows,
+  listings = null, healthBridge = null, marketplace = "", sellerId = null,
 }) {
   const recentTraffic = salesMoversTrafficFold(recentTrafficRows);
   const priorTraffic = salesMoversTrafficFold(priorTrafficRows);
   const recentAds = salesMoversAdsFold(recentAdsRows);
   const priorAds = salesMoversAdsFold(priorAdsRows);
-  const inventory = salesMoversInventoryFold(inventoryRows);
+  // Traffic / ads rows are ASIN-grain (no SKU), so no account-local SKU -> ASIN evidence exists here.
+  const inventory = insightInventory({ listings, healthBridge, asOf, marketplace, sellerId });
   const catalog = salesMoversCatalogFold(catalogRows);
 
   const asins = new Set([...recentTraffic.byAsin.keys(), ...priorTraffic.byAsin.keys()]);
@@ -1129,7 +1343,6 @@ export function salesMoversPayload({
       && recentTotals.sessions === 0 && priorTotals.sessions === 0
     ) continue;
     const meta = catalog.byAsin.get(asin) || {};
-    const stock = inventory.byAsin.get(asin) || null;
     rows.push({
       asin,
       productName: meta.name || recentTraffic.nameByAsin.get(asin) || priorTraffic.nameByAsin.get(asin) || null,
@@ -1137,14 +1350,8 @@ export function salesMoversPayload({
       recent: recentTotals,
       prior: priorTotals,
       ads: salesMoversAdsFor(recentAds.byAsin.get(asin), priorAds.byAsin.get(asin)),
-      inventory: inventory.available
-        ? {
-          available: num(stock?.available),
-          inbound: num(stock?.inbound),
-          daysOfSupply: stock?.daysOfSupply ?? null,
-          unitsShippedT30: num(stock?.unitsShippedT30),
-        }
-        : null,
+      // The account's selected FBA stock source: null when Unavailable (never zero).
+      stock: insightAsinStock(inventory, asin),
     });
   }
   const currencies = [...new Set([...recentAds.currencies, ...priorAds.currencies])];
@@ -1158,8 +1365,7 @@ export function salesMoversPayload({
     windows: { recent, prior, days: windowDays },
     currencies,
     buyBoxEvaluated: false,
-    inventoryAvailable: inventory.available,
-    inventorySnapshotDate: inventory.snapshotDate,
+    ...insightInventoryFields(inventory),
     rows,
     catalogBrands: catalog.catalogBrands,
   };
@@ -1184,49 +1390,15 @@ export function salesMoversUnavailablePayload({ accountId, asOf, lagDays, source
 }
 
 /* ================================ Buy Box Loss ================================ */
-// PURE cores for Buy Box Loss, transcribed VERBATIM from lib/server/reports/buy-box.js +
-// common.js fetchInventorySnapshot. buybox_percentage is a RATIO on Profit by SKU & Date, so it is
+// PURE cores for Buy Box Loss, transcribed VERBATIM from lib/server/reports/buy-box.js (its former
+// FBA Inventory Health fetch is removed by the cutover). buybox_percentage is a RATIO on Profit by SKU & Date, so it is
 // NEVER summed: the share is page-view weighted, falling back to an unweighted mean over OBSERVED days
 // only when no observed day had page views. Null buy-box observations are EXCLUDED (a sole seller with
 // no competition is not a 0% loss). Currency+SKU is the aggregation identity; two currencies for one SKU
-// never merge. Missing inventory snapshot stays unavailable/null, never a fabricated zero.
-
-/**
- * Latest FBA Inventory Health snapshot folded by SKU, byte-identical to common.js fetchInventorySnapshot's
- * `bySku`. Keeps only the newest date present; first row wins per SKU. Competitive prices are nullable and
- * kept null (a missing price is never read as "priced at zero"). `available` is snapshot-level presence.
- */
-export function buyBoxInventoryFold(rows) {
-  const all = Array.isArray(rows) ? rows : [];
-  let snapshotDate = null;
-  for (const row of all) {
-    if (row && row.date && (!snapshotDate || row.date > snapshotDate)) snapshotDate = row.date;
-  }
-  const current = snapshotDate ? all.filter((row) => row.date === snapshotDate) : [];
-  const bySku = new Map();
-  for (const row of current) {
-    const sku = String(row.sku || "").trim();
-    const asin = String(row.child_asin || "").trim();
-    const entry = {
-      sku: sku || null,
-      asin: asin || null,
-      productName: String(row.product_name || "").trim() || null,
-      currency: String(row.currency || "").trim() || null,
-      available: num(row.available),
-      unfulfillable: num(row.unfulfillable_quantity),
-      inbound: num(row.inbound_shipped) + num(row.inbound_received),
-      daysOfSupply: numOrNull(row.days_of_supply),
-      unitsShippedT30: num(row.units_shipped_t30),
-      yourPrice: numOrNull(row.your_price),
-      salesPrice: numOrNull(row.sales_price),
-      featuredOfferPrice: numOrNull(row.featuredoffer_price),
-      lowestPriceNewPlusShipping: numOrNull(row.lowest_price_new_plus_shipping),
-      alert: String(row.alert || "").trim() || null,
-    };
-    if (sku && !bySku.has(sku)) bySku.set(sku, entry);
-  }
-  return { snapshotDate, available: current.length > 0, bySku };
-}
+// never merge. Stock + channel evidence comes from the account's selected inventory source (insightInventory:
+// validated Listings, else the dated read-only saved FBA Inventory Health bridge); competitive prices and the 30-day
+// run rate were FBA Inventory Health metrics and are REMOVED (no price cause is evaluated). Unavailable stays null,
+// never a fabricated zero.
 
 /**
  * Fold the ordered raw daily slices (an array of row-arrays, oldest slice first, each ordered by date
@@ -1313,15 +1485,20 @@ export function buyBoxOrderedFold(sliceRowArrays) {
  * come from the Order Line Items slices (joined on currency|sku); buybox_percentage + page_views + the
  * page-view-weighted share come from the Profit by SKU daily slices. Excludes SKUs with no ordered sales/units
  * and SKUs with no observed buy-box data; page-view-weighted share with an unweighted-mean fallback;
- * price/stock evidence null when the snapshot did not carry the SKU. Currency never merges. Pure.
+ * row `stock` = the SKU's evidence from the account's selected inventory source (null when Unavailable; no competitive
+ * price / run rate -- Health-only metrics are removed). `listings` / `healthBridge` omitted => not loaded; the bridge
+ * threshold is measured against `asOf`. Currency never merges. Pure.
  */
 export function buyBoxLossPayload({
-  accountId, asOf, from, windowDays, sliceDays, sourceLabel, priceSourceLabel,
-  dailySliceRows, orderedSliceRows, inventoryRows, catalogRows,
+  accountId, asOf, from, windowDays, sliceDays, sourceLabel,
+  dailySliceRows, orderedSliceRows, catalogRows,
+  listings = null, healthBridge = null, marketplace = "", sellerId = null,
 }) {
   const daily = buyBoxDailyFold(dailySliceRows);
   const ordered = buyBoxOrderedFold(orderedSliceRows);
-  const inventory = buyBoxInventoryFold(inventoryRows);
+  // The account's own daily rows (SKU + ASIN) are the only SKU -> ASIN evidence the Listings fold may use.
+  const inventory = insightInventory({ listings, healthBridge, asOf, marketplace, sellerId,
+    asinForSku: insightAsinForSkuFrom((Array.isArray(dailySliceRows) ? dailySliceRows : []).flat()) });
   // The shared common-insight catalog fold (child_asin -> { name, brand, parentAsin }); identical to
   // common.js fetchCatalog, so Buy Box + Sales Movers + other insight reports share one catalog identity.
   const catalog = salesMoversCatalogFold(catalogRows);
@@ -1340,7 +1517,6 @@ export function buyBoxLossPayload({
       ? entry.buyBoxWeighted / entry.buyBoxWeight
       : entry.buyBoxSum / entry.buyBoxDays;
 
-    const stock = inventory.bySku.get(entry.sku) || null;
     const meta = entry.asin ? catalog.byAsin.get(entry.asin) || {} : {};
     if (entry.currency) currencies.add(entry.currency);
 
@@ -1357,20 +1533,9 @@ export function buyBoxLossPayload({
       sales: sold.sales,
       units: sold.units,
       pageViews: entry.pageViews,
-      // Price and stock evidence. null means the snapshot did not carry it, and the client must then
-      // refuse to name a cause.
-      price: stock
-        ? {
-          yourPrice: stock.yourPrice,
-          salesPrice: stock.salesPrice,
-          featuredOfferPrice: stock.featuredOfferPrice,
-          lowestPriceNewPlusShipping: stock.lowestPriceNewPlusShipping,
-          currency: stock.currency,
-        }
-        : null,
-      available: stock ? stock.available : null,
-      unitsShippedT30: stock ? stock.unitsShippedT30 : null,
-      inventoryKnown: Boolean(stock),
+      // Stock / channel evidence. null => Unavailable, and the client must then refuse to name a cause (a SKU absent
+      // from the selected source is never read as merchant-fulfilled or out of stock).
+      stock: insightSkuStock(inventory, entry.sku),
     });
   }
 
@@ -1380,9 +1545,7 @@ export function buyBoxLossPayload({
     window: { from, to: asOf, days: windowDays, sliceDays },
     observedWindow: daily.observedFrom && daily.observedTo ? { from: daily.observedFrom, to: daily.observedTo } : null,
     sourceLabel,
-    priceSourceLabel,
-    inventoryAvailable: inventory.available,
-    inventorySnapshotDate: inventory.snapshotDate,
+    ...insightInventoryFields(inventory),
     currencies: [...currencies].sort(),
     rows,
     catalogBrands: catalog.catalogBrands,
@@ -1642,8 +1805,9 @@ export function returnsLeakagePayload({
 // Primary source Listings (no-date) gives status / price / channel / quantities; optional Listings (Raw
 // JSON) adds Amazon's own issues + buyable/discoverable summaries + live-offer detection; Profit by SKU &
 // Date over a trailing 30d window gives sales/units/profit per SKU|currency (currencies NEVER merged);
-// the shared FBA inventory snapshot gives the latest available quantity; the shared catalog gives name/
-// brand. Reuses the shared sumField/brand/catalog/inventory folds. Zero transport imports.
+// on-hand FBA comes from the account's selected inventory source (saved Listings, else the dated read-only saved FBA
+// Inventory Health bridge); the shared catalog gives name/brand. Reuses the shared sumField/brand/catalog/inventory
+// folds. Zero transport imports.
 
 // JSON helpers -- byte-identical to listing-health.js.
 export function listingHealthParseJson(value) {
@@ -1730,19 +1894,32 @@ export function listingHealthRawFold(rows) {
   return rawBySku;
 }
 
+// A Listings quantity cell -> number | null: null / undefined / "" / negative / non-numeric is UNKNOWN (null), never 0.
+// The same rule as lib/server/listings-inventory.js listingsQuantity (which the live builder imports).
+export function listingHealthQuantity(v) {
+  if (v === null || v === undefined || (typeof v === "string" && v.trim() === "")) return null;
+  const n = typeof v === "number" ? v : (typeof v === "string" && /^\s*\d+(\.\d+)?\s*$/.test(v) ? Number(v) : NaN);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
 /**
  * Full Listing Health payload, byte-identical to buildListingHealth() for the same saved rows. `issuesAvailable`
  * + `issuesUnavailableReason` are resolved by the CALLER (the adapter distinguishes a validated Raw success
  * from the approved degraded/disabled state); when issues are unavailable `rawRows` is [] so every row reports
- * empty issues / null summary / null live-offer. Currencies never merge; inventory stock is null unless the
- * snapshot carries the SKU; product-name precedence is catalog -> listing name; brand from catalog. Pure.
+ * empty issues / null summary / null live-offer. Currencies never merge; on-hand FBA (`onHandFba`) is the SKU's
+ * FBA available from the account's selected inventory source (validated saved Listings, else the dated read-only saved
+ * FBA Inventory Health bridge within its threshold of `asOf`; null when unknown / absent / Unavailable -- never 0); the
+ * listing record's own FBA quantities are kept as reported (null when blank, never 0); product-name precedence is
+ * catalog -> listing name; brand from catalog. `listings` / `healthBridge` omitted => not loaded. Pure.
  */
 export function listingHealthPayload({
   accountId, asOf, salesFrom, windowDays, sourceLabel, salesSourceLabel, issuesSourceLabel,
-  issuesAvailable, issuesUnavailableReason, listingRows, salesRows, inventoryRows, catalogRows, rawRows,
+  issuesAvailable, issuesUnavailableReason, listingRows, salesRows, catalogRows, rawRows,
+  listings = null, healthBridge = null, marketplace = "", sellerId = null,
 }) {
   const { salesBySku, currencies } = listingHealthSalesFold(salesRows);
-  const inventory = buyBoxInventoryFold(inventoryRows);
+  // The account's own 30-day sales rows (SKU + ASIN) are the only SKU -> ASIN evidence the Listings fold may use.
+  const inventory = insightInventory({ listings, healthBridge, asOf, marketplace, sellerId, asinForSku: insightAsinForSkuFrom(salesRows) });
   const catalog = salesMoversCatalogFold(catalogRows);
   const rawBySku = issuesAvailable ? listingHealthRawFold(rawRows) : new Map();
 
@@ -1753,13 +1930,13 @@ export function listingHealthPayload({
     if (!sku && !asin) continue;
     const meta = catalog.byAsin.get(asin) || {};
     const sales = salesBySku.get(sku) || null;
-    const stock = sku ? inventory.bySku.get(sku) || null : null;
+    const stock = sku ? insightSkuStock(inventory, sku) : null;
     const raw = rawBySku.get(sku) || null;
     const channelRaw = String(listing.listing_fulfillment_channel || "").trim().toUpperCase();
 
-    const fbaAvailable = num(listing.fba_quantity_available);
     const listingQuantity = num(listing.listing_current_quantity);
-    const snapshotAvailable = stock ? num(stock.available) : null;
+    // On-hand FBA from the account's selected source (never mixed with the listing record's own fields).
+    const onHandFba = stock && stock.listed && stock.fbaContext === "fba" ? stock.fbaAvailable : null;
 
     rows.push({
       sku: sku || null,
@@ -1774,10 +1951,13 @@ export function listingHealthPayload({
         : num(listing.listing_price_value),
       currency: String(listing.listing_price_currency || "").trim() || sales?.currency || null,
       listingQuantity,
-      fbaAvailable,
-      fbaInbound: num(listing.fba_quantity_inbound),
-      fbaReserved: num(listing.fba_quantity_reserved),
-      snapshotAvailable,
+      // The listing record's own FBA quantities, as reported (unknown => null, never 0). Display only: on-hand stock
+      // claims use onHandFba.
+      fbaAvailable: listingHealthQuantity(listing.fba_quantity_available),
+      fbaInbound: listingHealthQuantity(listing.fba_quantity_inbound),
+      fbaReserved: listingHealthQuantity(listing.fba_quantity_reserved),
+      onHandFba,
+      onHandFbaSource: onHandFba === null ? null : inventory.sel.source,
       openDate: listing.listing_open_date || null,
       sales30d: sales ? sales.sales : 0,
       units30d: sales ? sales.units : 0,
@@ -1798,8 +1978,7 @@ export function listingHealthPayload({
     issuesAvailable,
     issuesUnavailableReason,
     issuesSourceLabel,
-    inventoryAvailable: inventory.available,
-    inventorySnapshotDate: inventory.snapshotDate,
+    ...insightInventoryFields(inventory),
     currencies: [...currencies].sort(),
     listingCount: (Array.isArray(listingRows) ? listingRows : []).length,
     rows,

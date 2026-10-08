@@ -17,7 +17,7 @@
 
 import { regionForMarketplace, REGIONS, REGION_SCHEDULE } from "./sync/campaign-region-routing.js";
 import {
-  OLI_SOURCE_KEY, CATALOG_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY,
+  OLI_SOURCE_KEY, CATALOG_SOURCE_KEY,
   LISTINGS_SOURCE_KEY, LISTINGS_RAW_SOURCE_KEY, ORGANIZATION_SCOPE_KEY,
 } from "./sync/source-durable-model.js";
 import { REPORT_SOURCE_REQUIREMENTS } from "./source-contracts.js";
@@ -69,19 +69,17 @@ export function normalizeDeliveryRegion(region) {
   return REGION_VALUES.has(r) ? r : REGIONS.INDIA; // default to the first region; never throw for a bad param
 }
 
-// ---- The six source columns of the matrix, in display order. Each declares how its per-account EXPORT evidence is
+// ---- The five source columns of the matrix, in display order. Each declares how its per-account EXPORT evidence is
 // read + whether that evidence is calendar-DATED (D-1 coverage) or a DATE-FREE current-state snapshot (validated_at
-// only). Listings/Listings-Raw are DATE-FREE: their freshness is validated_at, NOT the as_of cycle LABEL. ----
+// only). Listings/Listings-Raw are DATE-FREE: their freshness is validated_at, NOT the as_of cycle LABEL. Since the
+// Listings inventory cutover (2026-10) the Listings column IS the FBA inventory evidence (the saved Listings pointer the
+// fba job persists; its validated_at is the Listings fetch time, never a D-1 inventory day); FBA Inventory Health is
+// retired and has no column. ----
 export const DELIVERY_SOURCES = Object.freeze([
   { sourceKey: OLI_SOURCE_KEY, label: "Order Line Items", evidence: "oli-coverage", dated: true },
   { sourceKey: CATALOG_SOURCE_KEY, label: "Product Catalog", evidence: "org-snapshot", dated: false },
   { sourceKey: ADS_CAMPAIGN_SOURCE_KEY, label: "Campaign Ads", evidence: "ads-state", dated: true },
-  // FBA Inventory Health has NO standalone durable source pointer (unlike OLI coverage / Catalog+Listings snapshots):
-  // it is fetched as an OWNED export of fba-plan and consumed. Its per-account export proof is therefore the fba-plan
-  // report JOB (validated + latest_data_date === the single-day D-1 it fetched) -- a DATED signal. NOTE: this is
-  // EXPORT evidence (the source was fetched + validated), NOT publication (a validated job is never a publish proof).
-  { sourceKey: FBA_INVENTORY_SOURCE_KEY, label: "FBA Inventory", evidence: "fba-plan-job", dated: true },
-  { sourceKey: LISTINGS_SOURCE_KEY, label: "Listings", evidence: "listings-pointer", dated: false },
+  { sourceKey: LISTINGS_SOURCE_KEY, label: "Listings (FBA inventory)", evidence: "listings-pointer", dated: false },
   { sourceKey: LISTINGS_RAW_SOURCE_KEY, label: "Listings Raw", evidence: "listings-raw-pointer", dated: false },
 ]);
 
@@ -93,12 +91,12 @@ export const LIVE_PUBLISHABLE_REPORT_KEYS = Object.freeze(Object.keys(SCHEDULER_
 // A live-publishable report is a REAL current publication target ONLY when the canonical materialization registry says
 // it is published per region daily. A report the registry marks otherwise has NO live publisher today and must NOT be
 // counted as an expected publication -- otherwise it fabricates a permanent partial fraction. The two cases that matter
-// for the six-source matrix:
+// for the five-source matrix:
 //   - ppc-performance: SUPERSEDED by the durable Campaign Ads workspace (materialization registry: regionalScheduling
 //     "shadow", "the ppc-performance snapshot itself has no live publisher"). It stays in ADS_LINEAGE_DEPENDS_ON (the
 //     durable-lineage inverse) but has no live promotion, so counting it inflated Campaign Ads to a permanent K/2.
 //   - listing-health-v3: regionalScheduling "shadow" until its DOUBLE serve gate flips on (handled separately below).
-// Every other live-publishable key here is either per-region-daily (kept) or not a dependent of any of the six sources
+// Every other live-publishable key here is either per-region-daily (kept) or not a dependent of any of the five sources
 // (irrelevant to the matrix). A future report flips automatically when its registry owner changes -- no edit here.
 const MATERIALIZATION_BY_REPORT_KEY = new Map(Object.values(REPORT_MATERIALIZATION).map((e) => [S(e.reportKey), e]));
 export function reportHasActiveLivePublisher(reportKey) {
@@ -110,7 +108,7 @@ export function reportHasActiveLivePublisher(reportKey) {
 export const NO_LIVE_PUBLISHER_REPORT_KEYS = Object.freeze(LIVE_PUBLISHABLE_REPORT_KEYS.filter((rk) => !reportHasActiveLivePublisher(rk)));
 
 // FBA Shipment Plan is the ONE scheduler-published (non-reconciler) dashboard built DIRECTLY on the sources it OWNS
-// as fetched exports -- FBA Inventory Health + Listings (AWD). It has a live publication contract but no saved-data
+// as a fetched export -- the canonical Listings (FBA inventory + AWD). It has a live publication contract but no saved-data
 // reconciler of its own, so the lineage maps alone would omit it. We add it for EXACTLY its owned sources (from
 // REPORT_SOURCE_REQUIREMENTS minus REPORT_DERIVED_SOURCE_KEYS -- so if fba-plan's contract ever changes, this tracks
 // it). This is the only named dashboard here; every other dependency is pure reconciler-lineage.
@@ -122,13 +120,17 @@ function reportDependsOnSource(reportKey, sourceKey) {
     const fams = map[reportKey];
     if (Array.isArray(fams) && fams.includes(sourceKey)) return true;
   }
-  // (2) FBA Shipment Plan for exactly the FBA-inventory / Listings exports it OWNS (owned = required and NOT
-  //     durably-derived). This surfaces FBA -> {Brand Inventory, FBA Plan} and Listings -> {FBA Plan AWD, LHv3}.
+  // (2) FBA Shipment Plan for exactly the Listings export it OWNS (owned = required and NOT
+  //     durably-derived). With the FBA lineage this surfaces Listings -> {Brand Inventory, FBA Plan, LHv3}.
   if (reportKey === FBA_PLAN_LIVE_KEY) {
     const req = REPORT_SOURCE_REQUIREMENTS[reportKey];
     const derived = REPORT_DERIVED_SOURCE_KEYS[reportKey];
     if (Array.isArray(req) && req.includes(sourceKey) && !(Array.isArray(derived) && derived.includes(sourceKey))) return true;
   }
+  // (3) The compact Brand View inventory (brand-inventory) reads the account's SAVED Listings snapshot first since the
+  //     Listings inventory cutover (the retired FBA Inventory Health snapshot only as a dated read-only bridge), so it is
+  //     a Listings dependent as well -- shown under the "Listings (FBA inventory)" column.
+  if (reportKey === "brand-inventory" && sourceKey === LISTINGS_SOURCE_KEY) return true;
   return false;
 }
 
@@ -167,7 +169,7 @@ export function classifyExport({ evidence, cycle, dated } = {}) {
     if (evidence.present) return c.terminal ? No("D1_COVERAGE_MISSING", "export-coverage") : Waiting("export-coverage");
     return c.terminal ? No("SOURCE_EVIDENCE_MISSING", "export-evidence") : Waiting("export-pending");
   }
-  // DATE-FREE current-state source (Catalog / FBA snapshot / Listings / Listings-Raw): freshness is a real
+  // DATE-FREE current-state source (Catalog / Listings / Listings-Raw): freshness is a real
   // validated_at timestamp on a present durable pointer -- NEVER the as_of cycle label. A present pointer with a
   // malformed/absent validated_at is Unavailable (cannot be trusted), never a fabricated Yes.
   if (evidence.present && validatedAt) return Yes();
@@ -246,7 +248,7 @@ export function accountRemark({ eligible, reports }) {
   const code = (c) => (c ? " (" + S(c) + ")" : "");
   const frac = (r) => S(r.publicationCount) + "/" + S(r.publicationExpected);
   // Actionable failures first (a proven miss outranks a not-yet-readable source), then unavailability, then LKG, then
-  // in-flight. Each names the exact source so an admin never has to guess WHICH of the six failed.
+  // in-flight. Each names the exact source so an admin never has to guess WHICH of the five failed.
   const exNo = firstExport("No");
   if (exNo) return exNo.label + " export failed" + code(exNo.safeCode);
   const pubNo = firstPublish("No");
@@ -430,7 +432,7 @@ export async function loadDeliveryStatus({ region, cycleDate, failuresOnly } = {
     getAccountDirectoryRows, getAccountOnboardingRows,
     getRecentSyncCycleIds, getSyncCycle,
     getSourceCoverageWindows, getSourceSnapshot, getSourceListingsSnapshot, getSourceListingsRawSnapshot,
-    getAdsSyncStates, getReportSnapshotsMeta, getLatestReportJobLineage,
+    getAdsSyncStates, getReportSnapshotsMeta,
     now = () => new Date(), signal = null,
   } = deps;
 
@@ -531,12 +533,9 @@ export async function loadDeliveryStatus({ region, cycleDate, failuresOnly } = {
       return;
     }
     const idArgs = { organizationFingerprint: org, connectionId: a.connectionId, accountId: a.accountId, signal };
-    // FBA Inventory: read the fba-plan report JOB (getLatestReportJobLineage throws on a real DB error -> read-failed,
-    // returns null when there is simply no job -> absent). It is NOT a typed-wrapper reader, so wrap it explicitly.
-    const fbaJobP = (async () => { try { return { job: await getLatestReportJobLineage("fba-plan", a.accountId, { signal }), read: "ok" }; } catch { return { job: null, read: "read-failed" }; } })();
-    const [oli, fbaJobRes, listings, listingsRaw] = await Promise.all([
+    // (FBA inventory evidence IS the saved Listings pointer below -- the retired FBA Inventory Health has no column.)
+    const [oli, listings, listingsRaw] = await Promise.all([
       settle(getSourceCoverageWindows({ ...idArgs, sourceKey: OLI_SOURCE_KEY }), { windows: [], read: "read-failed", error: "OLI_READ_FAILED" }),
-      fbaJobP,
       settle(getSourceListingsSnapshot(idArgs), { snapshot: null, read: "read-failed", error: "LISTINGS_READ_FAILED" }),
       settle(getSourceListingsRawSnapshot(idArgs), { snapshot: null, read: "read-failed", error: "LISTINGS_RAW_READ_FAILED" }),
     ]);
@@ -545,11 +544,6 @@ export async function loadDeliveryStatus({ region, cycleDate, failuresOnly } = {
     ev[CATALOG_SOURCE_KEY] = { read: cat.read, present: !!cat.snapshot, validatedAt: cat.snapshot ? cat.snapshot.validated_at : null, sourceAsOf: null };
     if (adsReadFailed || !workerKey) ev[ADS_CAMPAIGN_SOURCE_KEY] = { read: "read-failed", present: false, error: "ADS_STATE_READ_FAILED" };
     else { const st = adsByAccount.get(a.accountId) || null; const covered = isDate(cycleAsOf) && st && isDate(st.latest_metric_date) && st.latest_metric_date >= cycleAsOf; ev[ADS_CAMPAIGN_SOURCE_KEY] = { read: "ok", present: !!(st && String(st.last_status) === "succeeded" && isDate(st.latest_metric_date)), validatedAt: st ? st.last_daily_sync_at : null, sourceAsOf: st ? st.latest_metric_date : null, coversCycle: !!covered }; }
-    const fbaJob = fbaJobRes.job;
-    const fbaCovers = isDate(cycleAsOf) && fbaJob && isDate(fbaJob.latestDataDate) && fbaJob.latestDataDate >= cycleAsOf;
-    ev[FBA_INVENTORY_SOURCE_KEY] = fbaJobRes.read === "read-failed"
-      ? { read: "read-failed", present: false, error: "FBA_JOB_READ_FAILED" }
-      : { read: "ok", present: !!(fbaJob && fbaJob.validated === true), validatedAt: null, sourceAsOf: fbaJob ? fbaJob.latestDataDate : null, coversCycle: !!fbaCovers };
     ev[LISTINGS_SOURCE_KEY] = { read: listings.read, present: !!listings.snapshot, validatedAt: listings.snapshot ? listings.snapshot.validated_at : null, sourceAsOf: null };
     ev[LISTINGS_RAW_SOURCE_KEY] = { read: listingsRaw.read, present: !!listingsRaw.snapshot, validatedAt: listingsRaw.snapshot ? listingsRaw.snapshot.validated_at : null, sourceAsOf: null };
     exportEvidenceByAccount[a.accountId] = ev;

@@ -21,8 +21,9 @@
 //   E. The priority dry-run performs ZERO writes and builds exactly 24 India approvals.
 //   F. The REAL priority-control composition is exercised (runControlPackageCli + buildPriorityControlPackage
 //      from the shipped lib), not a copied model or a static assertion alone.
-//   G. FBA overflow is UNCHANGED: the normal India inventory plan is [5,3]; with the whale batch truncated it
-//      splits to [5,1,1,1] (exactly 3 single-seller recovery exports => 15-token premium ceiling).
+//   G. FBA inventory batching (Listings inventory cutover): the India FBA inventory plan is the canonical Listings
+//      export packed [5,3]; FBA Inventory Health is retired (ZERO Health requests) and the Listings export is NEVER
+//      split -- a non-empty overflowSellers set is ignored (byte-identical plan).
 //
 // 7-bit ASCII, LF.
 
@@ -305,31 +306,26 @@ await (async () => {
 })();
 
 /* ============================================================================================================
- * G. FBA overflow UNCHANGED: normal India inventory [5,3]; whale-batch truncation -> [5,1,1,1] (3 x premium).
+ * G. FBA inventory batching (Listings cutover): India Listings [5,3]; zero Health; Listings is never split.
  * ============================================================================================================ */
 (() => {
   const conns = [{ id: "primary", apiKey: "fixture-key", accountPrefix: "" }];
   const asOf = "2026-09-08";
   const IN8 = Array.from({ length: 8 }, (_, i) => ({ accountId: `in-${i}`, country: "IN", currency: "INR" }));
-  const invOf = (plan) => [...new Map(plan.flatMap((r) => r.sources.filter((s) => s.requestKey === "fba-plan:inventory-health").map((s) => [s.requestHash, s]))).values()];
+  const uniq = (plan) => [...new Map(plan.flatMap((r) => r.sources.map((s) => [s.requestHash, s]))).values()];
 
-  const baseInv = invOf(planFbaPlanBucketBatched({ accounts: IN8, connections: conns, asOfFor: () => asOf, inventoryAsOf: asOf }));
-  const baseSizes = baseInv.map((s) => s.sellerOrVendorIds.length).sort((a, b) => a - b).join(",");
-  ok("G: normal India inventory plan is [5,3] (unchanged default batching)", baseSizes === "3,5");
+  const base = uniq(planFbaPlanBucketBatched({ accounts: IN8, connections: conns, asOfFor: () => asOf, inventoryAsOf: asOf }));
+  ok("G: the India FBA plan requests ZERO FBA Inventory Health exports (retired source)",
+    !base.some((s) => s.sourceKey === "fba-inventory-health" || /inventory-health/.test(String(s.requestKey))));
+  const baseSizes = base.filter((s) => s.requestKey === "fba-plan:awd").map((s) => s.sellerOrVendorIds.length).sort((a, b) => a - b).join(",");
+  ok("G: the India FBA inventory plan is the canonical Listings export packed [5,3]", baseSizes === "3,5" && base.length === 2);
+  ok("G: each Listings batch is a strict 50000-capped no-date export", base.every((s) => s.sourceKey === "listings" && s.strict === true && s.limit === 50000 && s.from === null && s.to === null));
 
-  const whale = baseInv.find((s) => s.sellerOrVendorIds.length === 3).sellerOrVendorIds.map(String);
-  const splitInv = invOf(planFbaPlanBucketBatched({ accounts: IN8, connections: conns, asOfFor: () => asOf, inventoryAsOf: asOf, overflowSellers: new Set(whale) }));
-  const splitSizes = splitInv.map((s) => s.sellerOrVendorIds.length).sort((a, b) => a - b).join(",");
-  ok("G: whale-batch truncation splits India inventory to [5,1,1,1]", splitSizes === "1,1,1,5");
-
-  const singles = splitInv.filter((s) => s.sellerOrVendorIds.length === 1);
-  ok("G: exactly 3 single-seller recovery exports (the isolated whales)", singles.length === 3);
-  ok("G: each recovery child is a strict 50000-capped inventory export", singles.every((s) => s.strict === true && s.limit === 50000));
-  const PREMIUM_TOKENS = 5; // DataDoe premium (inventory) export = 5 tokens/create
-  ok("G: dedicated recovery token ceiling is exactly 15 (3 single-seller premium creates)", singles.length * PREMIUM_TOKENS === 15);
-  // An empty overflow set is byte-identical to the default (no accidental split).
-  const noneInv = invOf(planFbaPlanBucketBatched({ accounts: IN8, connections: conns, asOfFor: () => asOf, inventoryAsOf: asOf, overflowSellers: new Set() }));
-  ok("G: empty overflow set == default plan (byte-identical hashes)", new Set(noneInv.map((s) => s.requestHash)).size === new Set(baseInv.map((s) => s.requestHash)).size && noneInv.every((s) => baseInv.some((b) => b.requestHash === s.requestHash)));
+  // The Listings export is NEVER split: a non-empty overflow set is ignored (byte-identical request hashes).
+  const whale = base.find((s) => s.sellerOrVendorIds.length === 3).sellerOrVendorIds.map(String);
+  const withOverflow = uniq(planFbaPlanBucketBatched({ accounts: IN8, connections: conns, asOfFor: () => asOf, inventoryAsOf: asOf, overflowSellers: new Set(whale) }));
+  ok("G: an overflow set never splits the Listings batches (byte-identical hashes, no single-seller recovery export)",
+    withOverflow.length === base.length && withOverflow.every((s) => base.some((b) => b.requestHash === s.requestHash)));
 })();
 
 writeSync(1, `\nrelease-env-ordering: ${passed} assertions passed\n`);

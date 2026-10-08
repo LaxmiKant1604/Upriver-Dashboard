@@ -1,18 +1,24 @@
 // PRODUCTION-SHAPE integration for the FBA brand-inventory reconciler (blockers 1-3). Drives the REAL composition end
 // to end over FAITHFUL in-memory stores -- NOTHING about the release/lineage/publish/candidate-binding is injected as a
 // fake success:
-//   - the REAL buildFbaPublicationReconciler + shared saved-data core + REAL revision/binding;
-//   - the REAL dedicated buildFbaBrandInventoryRelease (open cycle -> read durable FBA -> resolve ONE publisher-
-//     identical brand-sales candidate via the REAL resolveValidatedLiveCandidate -> buildBrandInventorySnapshot ->
-//     upsert report-job lineage + durable_content_deps -> claim -> shadow CAS -> reconcile -> finalize_sync_cycle ->
-//     publish -> read back);
+//   - the REAL buildFbaPublicationReconciler + shared saved-data core + REAL revision/binding, wired EXACTLY like
+//     scripts/release/fba-publication-reconcile.mjs since the Listings inventory cutover: the reconciler's
+//     readFbaSnapshot is the SAVED LISTINGS pointer reader (public.source_listings_snapshot -- the revision evidence;
+//     requested-day proof = pointer as_of === requestedAsOf), never the retired FBA Inventory Health snapshot;
+//   - the REAL dedicated buildFbaBrandInventoryRelease (read the saved Health BRIDGE + the saved Listings pointer -> resolve
+//     ONE publisher-identical brand-sales candidate via the REAL resolveValidatedLiveCandidate ->
+//     buildBrandInventorySnapshot -> open cycle -> upsert report-job lineage + durable_content_deps (Health bridge token
+//     when one was read + Listings token when a fresh pointer was read) -> claim -> shadow CAS -> reconcile ->
+//     finalize_sync_cycle -> publish -> read back);
 //   - the REAL buildSchedulerV2Publisher (four durable gates + fenced live CAS) wired to in-memory backing;
 //   - the REAL buildLiveReadback (canonical live identity + payload contract), used for BOTH the brand-inventory
 //     read-back AND the brand-sales candidate live read-back;
 //   - the REAL runControlPackageCli control apply/safe-close over the faithful in-memory control store.
 //
-// It PROVES: unpromoted -> derive+publish+readback; replay -> zero-write no-op; same-date content correction -> STALE
-// -> republish + verify; valid-empty -> inventoryAvailable false (never zero); and -- CRITICALLY --
+// It PROVES: unpromoted -> derive+publish+readback; replay -> zero-write no-op; same-day LISTINGS content correction ->
+// STALE -> republish + verify; a Health-bridge-only change never makes the account stale (the bridge never drives the
+// revision); a Listings pointer for another day / no pointer -> defer with zero writes; valid-empty -> inventoryAvailable
+// false (never zero); and -- CRITICALLY --
 //   BLOCKER 1 (bind Brand Sales to its exact validated lineage): the brand-inventory payload + lineage come from ONE
 //     proven brand-sales candidate. A newer UNPROMOTED brand-sales job, a mismatched job/shadow hash, a wrong
 //     account/report-version, an impossible as-of, an invalid/unreadable storage-first payload, or a missing/mismatched
@@ -34,7 +40,7 @@ import { SCHEDULER_LIVE_SNAPSHOT_CONTRACTS } from "../lib/server/sync/report-pub
 import { REPORT_DERIVATIONS } from "../lib/server/sync/report-derivation.js";
 import { paramsHashFor } from "../lib/server/report-store.js";
 import { runControlPackageCli } from "../lib/server/sync/source-priority-control-package.js";
-import { fbaContentProvenanceToken } from "../lib/server/sync/fba-inventory-revision.js";
+import { fbaContentProvenanceToken, FBA_INVENTORY_DURABLE_SOURCE_KEY } from "../lib/server/sync/fba-inventory-revision.js";
 import { FBA_INVENTORY_SOURCE_KEY } from "../lib/server/sync/source-durable-model.js";
 
 let passed = 0;
@@ -71,9 +77,24 @@ function inMemoryControlStore() {
   };
 }
 
+// An EXPANDED (post-cutover) saved Listings row: carries every FBA inventory field, so a payload of these validates as
+// the account's Listings inventory (lib/server/listings-inventory.js listingsValidation).
+const lrow = (sku, asin, available) => ({ sku, child_asin: asin, fnsku: "X" + sku, listing_fulfillment_channel: "AMAZON_NA", marketplace_country_code: "US", fba_quantity_available: available, fba_quantity_inbound: 0, fba_quantity_reserved: 0, fba_quantity_fc_transfer: 0 });
+// A PRE-CUTOVER (non-expanded) saved Listings row: no fba_quantity_* fields, so it NEVER validates as Listings inventory
+// (listings-not-expanded) -- the figures stay on the saved Health BRIDGE. The default world uses it so the cases that
+// assert Health-derived figures keep proving them while the Listings POINTER (as_of = ASOF) is the revision evidence.
+const PRE_CUTOVER_LISTINGS_ROW = Object.freeze({ sku: "S1", child_asin: "ASIN1", listing_fulfillment_channel: "AMAZON_NA", marketplace_country_code: "US" });
+// The two durable content tokens: the Health BRIDGE token (provenance only) and the Listings token (the REVISION's
+// contentDeps entry since the cutover -- computeFbaAccountRevision keys on the saved Listings pointer).
+const healthTokenOf = (sha) => fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: A, connectionId: "primary", requestHash: "rh-A01", contentSha: sha });
+const listingsTokenOf = (sha) => fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_DURABLE_SOURCE_KEY, accountId: A, connectionId: "primary", requestHash: "lrh-A01", contentSha: sha });
+
 // A faithful in-memory WORLD: report_snapshots (shadow + live) + sync_report_jobs + sync_cycles + the durable FBA
-// source_snapshots + ONE publisher-identical brand-sales candidate (job + scheduler-v2/brand-sales shadow + canonical
-// brand-sales live). Every REAL module reads/writes THIS backing.
+// Inventory Health source_snapshots row (the read-only BRIDGE) + the account's SAVED LISTINGS pointer
+// (source_listings_snapshot; the revision evidence) + ONE publisher-identical brand-sales candidate (job +
+// scheduler-v2/brand-sales shadow + canonical brand-sales live). Every REAL module reads/writes THIS backing.
+// Listings overrides: listingsRows (default [PRE_CUTOVER_LISTINGS_ROW]), listingsSha, listingsAsOf (default ASOF),
+// listingsRowCount, listingsValidatedAt, noListings (no pointer at all).
 function makeWorld(over = {}) {
   const snaps = new Map();           // report_snapshots: report_key|account_id|params_hash -> row
   const jobs = [];                   // sync_report_jobs rows
@@ -82,13 +103,27 @@ function makeWorld(over = {}) {
   let seq = 0;
   const fbaSnapshot = { object_path: "obj/fba/A01", payload_sha: over.fbaPayloadSha || "ps-A01", source_request_hash: "rh-A01", row_count: over.fbaRowCount != null ? over.fbaRowCount : 2, validated_at: "2026-09-10T09:00:00Z" };
   const fbaRows = over.fbaRows || [{ date: ASOF, child_asin: "ASIN1", available: 10, marketplace_country_code: "US" }];
+  // The account's saved Listings pointer + rows: present for the requested day by default (the fba job records as_of =
+  // the cycle's inventory as-of); a case moves it to another day or removes it.
+  const listingsRows = over.listingsRows || [{ ...PRE_CUTOVER_LISTINGS_ROW }];
+  const listingsSnapshot = over.noListings ? null : {
+    object_path: "obj/listings/A01", payload_sha: over.listingsSha || "lsha-A01", source_request_hash: "lrh-A01",
+    row_count: over.listingsRowCount != null ? over.listingsRowCount : listingsRows.length,
+    validated_at: over.listingsValidatedAt || "2026-09-10T04:00:00Z", as_of: over.listingsAsOf || ASOF,
+  };
+  // Durable storage objects by path (a case mutates world.payloads to model a same-day content change).
+  const payloads = { [fbaSnapshot.object_path]: fbaRows };
+  if (listingsSnapshot) payloads[listingsSnapshot.object_path] = listingsRows;
 
   const world = {
-    snaps, jobs, cycles, writes, fbaSnapshot,
-    // --- durable FBA reader + hydration (signal accepted + ignored by the store, threaded by the release) ---
-    readFbaSnapshot: async () => (over.noFba ? { read: "ok", snapshot: null } : { read: "ok", snapshot: { ...fbaSnapshot } }),
-    loadSnapshotPayload: async () => ({ rows: fbaRows }),
-    resolveExpectedRequestHash: async () => fbaSnapshot.source_request_hash, // proven-D-1
+    snaps, jobs, cycles, writes, fbaSnapshot, listingsSnapshot, payloads,
+    // --- durable readers + hydration (signal accepted + ignored by the store, threaded by the release) ---
+    // The saved Health snapshot (the release's read-only BRIDGE; production readFbaSnapshot).
+    readFbaSnapshot: async () => (over.noFba ? { read: "ok", snapshot: null } : { read: "ok", snapshot: { ...world.fbaSnapshot } }),
+    // The saved Listings pointer (production readListingsRevisionSnapshot: the reconciler's revision evidence AND the
+    // release's readListingsSnapshot).
+    readListingsSnapshot: async () => ({ read: "ok", snapshot: world.listingsSnapshot ? { ...world.listingsSnapshot } : null }),
+    loadSnapshotPayload: async (path) => (Object.prototype.hasOwnProperty.call(world.payloads, path) ? { rows: world.payloads[path] } : null),
     resolveAccountCountry: async () => "US",
     // --- report_snapshots (shadow + live) ---
     getReportSnapshot: async ({ reportKey, accountId, paramsHash }) => snaps.get(reportKey + "|" + accountId + "|" + paramsHash) || null,
@@ -236,8 +271,10 @@ function wireRelease(world, { leaseFence, aborted = () => false, controller = nu
   const release = buildFbaBrandInventoryRelease({
     resolveOrg: async () => ({ organizationFingerprint: "org-1", connectionId: "primary" }),
     openCycle: wrapAbort("open", world.openCycle), getCycleByBucketDate: world.getBaseSyncCycleByBucketDate, claimCycle: (cycleId) => world.claimCycle(cycleId),
-    readFbaSnapshot: world.readFbaSnapshot, loadSnapshotPayload: world.loadSnapshotPayload,
-    resolveExpectedRequestHash: world.resolveExpectedRequestHash, resolveAccountCountry: world.resolveAccountCountry,
+    // The entrypoint's exact reader wiring: readFbaSnapshot = the saved Health BRIDGE, readListingsSnapshot = the saved
+    // Listings pointer (no resolveExpectedRequestHash -- retired with the Health D-1 proof).
+    readFbaSnapshot: world.readFbaSnapshot, readListingsSnapshot: world.readListingsSnapshot, loadSnapshotPayload: world.loadSnapshotPayload,
+    resolveAccountCountry: world.resolveAccountCountry,
     // BLOCKER 1: the candidate readers (resolveValidatedLiveCandidate wires these) -- the entrypoint's exact wiring.
     readReportJob: (reportKey, a, opt) => world.getLatestReportJobLineage(reportKey, a, opt),
     readSnapshot: (args, opt) => world.getReportSnapshot(args, opt),
@@ -283,8 +320,9 @@ function buildProd(world, over = {}) {
   const reconciler = buildFbaPublicationReconciler({
     resolveOrg: async () => ({ organizationFingerprint: "org-1", connectionId: "primary" }),
     bucketAccounts: async () => [{ accountId: A }],
-    readFbaSnapshot: world.readFbaSnapshot,
-    resolveExpectedRequestHash: world.resolveExpectedRequestHash,
+    // EXACTLY the entrypoint: the reconciler's revision evidence is the saved LISTINGS pointer (readFbaSnapshot =
+    // readListingsRevisionSnapshot), never the saved Health bridge (which never advances again).
+    readFbaSnapshot: world.readListingsSnapshot,
     readLatestReportJob: ({ reportKey, accountId }) => world.getLatestReportJobLineage(reportKey, accountId),
     readShadowSnapshot: (args) => world.getReportSnapshot(args),
     readLiveSnapshot: (args) => world.getReportSnapshot(args),
@@ -306,10 +344,14 @@ test("blocker 3: UNPROMOTED brand-inventory -> REAL dedicated release derives+pu
   const h = buildProd(world);
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
   ok("A01 READBACK_VERIFIED via the real dedicated release", st(out) === FBA_RECONCILE_STATUS.READBACK_VERIFIED && out.ok === true);
-  ok("a REAL live brand-inventory row was written (canonical readback passed)", !!liveRow(world) && liveRow(world).payload.inventoryAvailable === true);
+  ok("the revision is the saved Listings pointer for the requested day (status available)", out.perAccount[0].eligible === true && out.perAccount[0].status === "available");
+  ok("a REAL live brand-inventory row was written (canonical readback passed); the pre-cutover Listings payload never validates, so the dated Health bridge drives the figures",
+    !!liveRow(world) && liveRow(world).payload.inventoryAvailable === true && liveRow(world).payload.inventorySource === "health-fallback"
+    && JSON.stringify(liveRow(world).payload.inventoryListingsReasons) === JSON.stringify(["listings-not-expanded"])
+    && liveRow(world).payload.inventoryByBrandCountry.some((r) => r.country === "US" && r.fbaAvailable === 10));
   ok("ONLY brand-inventory published/written -- NEVER daily-reporting or brand-sales", world.writes.publishedLiveKeys.join(",") === RK && [...new Set(world.writes.upsertedReportKeys)].join(",") === RK && [...new Set(world.writes.shadowSavedKeys)].join(",") === SHADOW);
-  const expectedToken = fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: A, connectionId: "primary", requestHash: "rh-A01", contentSha: "ps-A01" });
-  ok("the brand-inventory report job recorded the EXACT durable FBA content token + the PROVEN brand-sales candidate's OLI deps", world.jobs.some((j) => j.report_key === RK && j.durable_content_deps.length === 1 && j.durable_content_deps[0] === expectedToken && j.depends_on.join(",") === "oli-h,catalog"));
+  ok("the brand-inventory report job recorded EXACTLY [the Health bridge token, the Listings revision token] + the PROVEN brand-sales candidate's OLI deps",
+    world.jobs.some((j) => j.report_key === RK && JSON.stringify(j.durable_content_deps) === JSON.stringify([healthTokenOf("ps-A01"), listingsTokenOf("lsha-A01")]) && j.depends_on.join(",") === "oli-h,catalog"));
   ok("zero provider export", out.dataDoeCreates === 0 && out.dataDoeTokens === 0);
 });
 
@@ -319,34 +361,87 @@ test("blocker 1: after a successful reconciliation, the NEXT unchanged pass is P
   await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" }); // pass 1: publish
   const publishedBefore = world.writes.publishedLiveKeys.length;
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" }); // pass 2: replay
-  ok("replay: PUBLICATION_NOT_REQUIRED (the job's durable_content_deps covers the current FBA content token)", st(out) === "PUBLICATION_NOT_REQUIRED");
+  ok("replay: PUBLICATION_NOT_REQUIRED (the job's durable_content_deps covers the current Listings revision token)", st(out) === "PUBLICATION_NOT_REQUIRED");
   ok("zero additional live writes on the unchanged replay", world.writes.publishedLiveKeys.length === publishedBefore);
 });
 
-test("lifecycle: R/content A published -> durable changes to R/content B -> STALE -> re-derive consumes B -> publish + readback B; then replay is zero-write", async () => {
-  const world = makeWorld({ fbaPayloadSha: "ps-A", fbaRows: [{ date: ASOF, child_asin: "ASIN1", available: 10, marketplace_country_code: "US" }] });
+test("lifecycle: Listings content A published -> the SAME-DAY saved Listings pointer changes to content B -> STALE -> re-derive consumes B -> publish + readback B; then replay is zero-write", async () => {
+  const world = makeWorld({ listingsSha: "lsha-A", listingsRows: [lrow("S1", "ASIN1", 7)] });
   const h = buildProd(world);
   await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" }); // publish content A
   const liveA = JSON.stringify(liveRow(world).payload);
-  // SAME request hash (same D-1), NEW payload_sha + NEW rows (a same-date correction).
-  world.fbaSnapshot.payload_sha = "ps-B"; world.fbaSnapshot.validated_at = "2026-09-10T18:00:00Z";
-  world.loadSnapshotPayload = async () => ({ rows: [{ date: ASOF, child_asin: "ASIN1", available: 99, marketplace_country_code: "US" }] });
+  ok("content A published from the validated Listings (7)", liveRow(world).payload.inventorySource === "listings" && liveRow(world).payload.inventoryByBrandCountry.some((r) => r.fbaAvailable === 7));
+  // SAME as_of (the requested day) + same request hash, NEW payload_sha + NEW rows (a same-day Listings re-fetch /
+  // correction). The Health bridge is untouched.
+  world.listingsSnapshot.payload_sha = "lsha-B"; world.listingsSnapshot.validated_at = "2026-09-10T18:00:00Z";
+  world.payloads[world.listingsSnapshot.object_path] = [lrow("S1", "ASIN1", 99)];
+  const dry = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic", dryRun: true });
+  ok("the Listings content change is detected: STALE (fba-revision-changed), dry-run zero writes", st(dry) === "STALE" && dry.perAccount[0].reports[RK].reason === "fba-revision-changed" && JSON.stringify(liveRow(world).payload) === liveA);
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
-  ok("same-date correction -> STALE -> re-derived + re-published (READBACK_VERIFIED)", st(out) === FBA_RECONCILE_STATUS.READBACK_VERIFIED);
+  ok("same-day Listings correction -> STALE -> re-derived + re-published (READBACK_VERIFIED)", st(out) === FBA_RECONCILE_STATUS.READBACK_VERIFIED);
   const liveB = JSON.stringify(liveRow(world).payload);
-  ok("the live payload CHANGED to content B (the corrected inventory was published)", liveA !== liveB && liveRow(world).payload.inventoryByBrandCountry.some((r) => r.fbaAvailable === 99));
+  ok("the live payload CHANGED to content B (the corrected Listings inventory was published, with its new fetch time)",
+    liveA !== liveB && liveRow(world).payload.inventoryByBrandCountry.some((r) => r.fbaAvailable === 99) && liveRow(world).payload.listingsRefreshedAt === "2026-09-10T18:00:00Z");
+  const latest = world.jobs.filter((j) => j.report_key === RK).sort((a, b) => b.created_at - a.created_at)[0];
+  ok("the re-derived job binds the NEW Listings revision token (content B)", latest.durable_content_deps.includes(listingsTokenOf("lsha-B")) && !latest.durable_content_deps.includes(listingsTokenOf("lsha-A")));
   const publishedAfterB = world.writes.publishedLiveKeys.length;
   const out2 = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" }); // replay of B
   ok("a subsequent unchanged pass is a zero-write no-op (PUBLICATION_NOT_REQUIRED)", st(out2) === "PUBLICATION_NOT_REQUIRED" && world.writes.publishedLiveKeys.length === publishedAfterB);
 });
 
-test("valid FBA empty (row_count=0, rows=[]) publishes inventoryAvailable:false, NEVER a manufactured zero", async () => {
-  const world = makeWorld({ fbaRowCount: 0, fbaRows: [], fbaPayloadSha: "ps-empty" });
+test("CUTOVER: a Health-BRIDGE-only content change does NOT make the account stale (the bridge never drives the revision) -- zero writes, live unchanged", async () => {
+  const world = makeWorld({ fbaPayloadSha: "ps-H1" }); // pre-cutover Listings rows -> the bridge drives the figures (10)
+  const h = buildProd(world);
+  await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  const liveBefore = JSON.stringify(liveRow(world).payload);
+  const before = { published: world.writes.publishedLiveKeys.length, opens: world.writes.openCalls, upserts: world.writes.upsertedReportKeys.length, shadows: world.writes.shadowSavedKeys.length, jobs: world.jobs.length, gen: h.store._s.gen };
+  ok("published from the Health bridge (10)", liveRow(world).payload.inventorySource === "health-fallback" && liveRow(world).payload.inventoryByBrandCountry.some((r) => r.fbaAvailable === 10));
+  // The saved Health snapshot changes (new payload_sha + new rows); the saved Listings pointer does NOT.
+  world.fbaSnapshot.payload_sha = "ps-H2"; world.fbaSnapshot.validated_at = "2026-09-10T18:00:00Z";
+  world.payloads[world.fbaSnapshot.object_path] = [{ date: ASOF, child_asin: "ASIN1", available: 55, marketplace_country_code: "US" }];
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("PUBLICATION_NOT_REQUIRED (the Listings-keyed revision is still covered by the job)", st(out) === "PUBLICATION_NOT_REQUIRED" && out.ok === true);
+  ok("ZERO writes: no publish, no cycle, no job, no shadow, controls never re-opened",
+    world.writes.publishedLiveKeys.length === before.published && world.writes.openCalls === before.opens && world.writes.upsertedReportKeys.length === before.upserts
+    && world.writes.shadowSavedKeys.length === before.shadows && world.jobs.length === before.jobs && h.store._s.gen === before.gen);
+  ok("the live payload is byte-for-byte unchanged (the bridge's 55 was never published)", JSON.stringify(liveRow(world).payload) === liveBefore);
+});
+
+test("valid Listings EMPTY (requested-day pointer row_count=0, rows=[]) + an empty Health bridge publishes inventoryAvailable:false, NEVER a manufactured zero", async () => {
+  const world = makeWorld({ listingsRows: [], listingsSha: "lsha-empty", fbaRowCount: 0, fbaRows: [], fbaPayloadSha: "ps-empty" });
   const h = buildProd(world);
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("the revision is PROVEN-EMPTY (eligible) for the requested day", out.perAccount[0].eligible === true && out.perAccount[0].status === "proven-empty");
   ok("A01 published a valid-empty brand-inventory (READBACK_VERIFIED)", st(out) === FBA_RECONCILE_STATUS.READBACK_VERIFIED);
   const lr = liveRow(world);
-  ok("inventoryAvailable is FALSE (unavailable), NOT zero rows presented as data", lr && lr.payload.inventoryAvailable === false);
+  ok("inventoryAvailable is FALSE (unavailable), NOT zero rows presented as data",
+    lr && lr.payload.inventoryAvailable === false && lr.payload.inventorySource === "unavailable" && lr.payload.inventoryByBrandCountry.length === 0
+    && lr.payload.inventoryUnavailableReason === "no-validated-listings;no-fba-inventory-health-snapshot");
+  ok("the job binds the proven-empty Listings token (so the replay is covered)", world.jobs.some((j) => j.report_key === RK && j.durable_content_deps.includes(listingsTokenOf("lsha-empty"))));
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// REVISION requested-day proof (the saved Listings pointer). The reconciler defers BEFORE any write when the pointer is
+// not the requested day's (even one inside the release's 2-day freshness lag) or absent: DEFERRED_PROVENANCE, LKG kept.
+// ---------------------------------------------------------------------------------------------------------------------
+async function expectRevisionDefer(name, over, reason) {
+  const world = makeWorld(over);
+  const h = buildProd(world);
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  const fp = invFootprint(world);
+  ok(name + ": DEFERRED_PROVENANCE (" + reason + ")", st(out) === FBA_RECONCILE_STATUS.DEFERRED_PROVENANCE && out.perAccount[0].reports[RK].reason === reason && out.perAccount[0].eligible === false && out.ok === true);
+  ok(name + ": ZERO writes (no controls, no cycle, no job, no shadow, no publish)",
+    fp.published === 0 && fp.shadow === 0 && fp.invJobs === 0 && fp.live === false && world.writes.openCalls === 0 && world.writes.upsertedReportKeys.length === 0
+    && world.writes.claimCalls === 0 && world.writes.finalizeCalls === 0 && world.writes.publishedLiveKeys.length === 0 && h.store._s.gen === 0);
+  ok(name + ": zero provider export", out.dataDoeCreates === 0 && out.dataDoeTokens === 0);
+}
+
+test("revision: a saved Listings pointer for ANOTHER day (as_of = requestedAsOf-1, inside the release's lag) -> defer listings-snapshot-not-requested-day; zero writes", async () => {
+  await expectRevisionDefer("listings-other-day", { listingsAsOf: "2026-09-09", listingsRows: [lrow("S1", "ASIN1", 7)] }, "listings-snapshot-not-requested-day");
+});
+
+test("revision: NO saved Listings pointer (even with a valid Health bridge) -> defer no-durable-listings-snapshot; zero writes", async () => {
+  await expectRevisionDefer("no-listings-pointer", { noListings: true }, "no-durable-listings-snapshot");
 });
 
 test("dry-run performs ZERO writes even with a stale account (no controls, no cycle, no publish)", async () => {
@@ -576,9 +671,11 @@ export { makeWorld, wireRelease, buildProd, liveRow };
 
 // ---------------------------------------------------------------------------------------------------------------------
 // NO-STOCK null-available fold (the 9-account europe-au defer). A valid D-1 FBA snapshot whose rows include a listed-but-
-// unstocked ASIN (DataDoe returns `available: null` + null reserved/inbound) MUST derive + publish -- folding the null to
-// an honest 0 exactly like the canonical fba-plan derive -- instead of throwing "malformed or negative available" and
-// deferring forever. A PRESENT malformed value (negative) still defers (corruption guard). Reproduces + proves convergence.
+// unstocked ASIN (DataDoe returns `available: null` + null reserved/inbound) MUST derive + publish -- never throw and defer
+// forever. Listings inventory cutover PHASE 2: the Health rows feed the SHARED per-account fold
+// (lib/server/inventory-source.js), where a BLANK Health available is UNKNOWN (never folded to 0), so that brand's bucket
+// publishes as null (Unavailable) with the Health snapshot labelled as the fallback. A PRESENT malformed value (negative)
+// still defers (corruption guard). Reproduces + proves convergence.
 // ---------------------------------------------------------------------------------------------------------------------
 test("NO-STOCK FIX: a valid D-1 snapshot with null-available rows DERIVES + PUBLISHES (was 'brand-inventory-derive-refused' -> the 9-account defer)", async () => {
   const world = makeWorld({ fbaPayloadSha: "ps-nostock", fbaRowCount: 3, fbaRows: [
@@ -590,13 +687,15 @@ test("NO-STOCK FIX: a valid D-1 snapshot with null-available rows DERIVES + PUBL
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
   ok("READBACK_VERIFIED (the null-available snapshot now publishes, never deferred)", st(out) === FBA_RECONCILE_STATUS.READBACK_VERIFIED && out.ok === true);
   const lr = liveRow(world);
-  ok("live folds null as 0: fbaAvailable = 12 + 0 + 0 = 12, all 3 SKUs counted (byte-parity with the canonical num() derive)", lr && lr.payload.inventoryAvailable === true && lr.payload.inventoryByBrandCountry.some((r) => r.country === "US" && r.fbaAvailable === 12 && r.skuCount === 3));
-  const token = fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: A, connectionId: "primary", requestHash: "rh-A01", contentSha: "ps-nostock" });
-  ok("the FBA content token is bound to the REAL derive (the durable_content_deps gap is filled, not stamped)", world.jobs.some((j) => j.report_key === RK && j.durable_content_deps.length === 1 && j.durable_content_deps[0] === token));
+  ok("phase 2: the labelled Health FALLBACK publishes; the blank available is UNKNOWN in the shared fold -> the bucket is null (never 12 presented as complete), all 3 SKUs counted",
+    lr && lr.payload.inventoryAvailable === true && lr.payload.inventorySource === "health-fallback" && lr.payload.inventoryHealthDate === ASOF
+    && lr.payload.inventoryByBrandCountry.some((r) => r.country === "US" && r.fbaAvailable === null && r.skuCount === 3));
+  ok("the content tokens are bound to the REAL derive (the durable_content_deps gap is filled, not stamped): [the Health bridge read, the Listings revision]",
+    world.jobs.some((j) => j.report_key === RK && JSON.stringify(j.durable_content_deps) === JSON.stringify([healthTokenOf("ps-nostock"), listingsTokenOf("lsha-A01")])));
   ok("zero export", out.dataDoeCreates === 0 && out.dataDoeTokens === 0);
 });
 
-test("NO-STOCK FIX: an OLDER promotable brand-inventory job with EMPTY durable_content_deps + a valid D-1 snapshot -> STALE -> re-derive CONVERGES (binds the token 0->1)", async () => {
+test("NO-STOCK FIX: an OLDER promotable brand-inventory job with EMPTY durable_content_deps + a requested-day Listings pointer -> STALE -> re-derive CONVERGES (binds the tokens 0->2)", async () => {
   const world = makeWorld({ fbaPayloadSha: "ps-conv", fbaRows: [
     { date: ASOF, child_asin: "ASIN1", available: 5, marketplace_country_code: "US", sku: "S1" },
     { date: ASOF, child_asin: "ASIN1", available: null, marketplace_country_code: "US", sku: "S2" },
@@ -608,9 +707,18 @@ test("NO-STOCK FIX: an OLDER promotable brand-inventory job with EMPTY durable_c
   const h = buildProd(world);
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
   ok("the empty-dcd job is STALE -> re-derived + published (READBACK_VERIFIED) -- converges", st(out) === FBA_RECONCILE_STATUS.READBACK_VERIFIED);
-  const token = fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: A, connectionId: "primary", requestHash: "rh-A01", contentSha: "ps-conv" });
   const latest = world.jobs.filter((j) => j.report_key === RK).sort((a, b) => b.created_at - a.created_at)[0];
-  ok("the NEW brand-inventory job binds the FBA content token (durable_content_deps 0 -> 1)", latest.durable_content_deps.length === 1 && latest.durable_content_deps[0] === token);
+  ok("the NEW brand-inventory job binds [the Health bridge token, the Listings revision token] (durable_content_deps 0 -> 2)",
+    JSON.stringify(latest.durable_content_deps) === JSON.stringify([healthTokenOf("ps-conv"), listingsTokenOf("lsha-A01")]));
+  // The CUTOVER transition: a pre-cutover job that bound ONLY the Health token (the old Health-keyed revision) is not
+  // covered by the Listings-keyed revision -> STALE -> re-derive converges onto the Listings token.
+  const pre = makeWorld({ fbaPayloadSha: "ps-pre" });
+  pre.cycles.set("bi-pre", { id: "cyc-bi-pre", bucket: "priority-partial-india-pre", cycle_date: ASOF, status: "succeeded", trigger: "manual", created_at: "2026-09-10T09:00:00Z" });
+  pre.jobs.push({ cycle_id: "cyc-bi-pre", report_key: RK, account_id: A, connection_id: "primary", bucket: "india", depends_on: ["oli-h", "catalog"], durable_content_deps: [healthTokenOf("ps-pre")], derive_status: "succeeded", save_status: "succeeded", validated: true, snapshot_params_hash: "old-bi-hash", latest_data_date: ASOF, created_at: -1 });
+  const outPre = await buildProd(pre).reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  const latestPre = pre.jobs.filter((j) => j.report_key === RK).sort((a, b) => b.created_at - a.created_at)[0];
+  ok("a pre-cutover Health-token-only job is STALE -> re-derived (READBACK_VERIFIED) and the new job binds the Listings revision token",
+    st(outPre) === FBA_RECONCILE_STATUS.READBACK_VERIFIED && latestPre.durable_content_deps.includes(listingsTokenOf("lsha-A01")));
 });
 
 test("NO-STOCK FIX: after a null-available account publishes, a replay is PUBLICATION_NOT_REQUIRED (idempotent; no duplicate inventory)", async () => {
@@ -625,7 +733,7 @@ test("NO-STOCK FIX: after a null-available account publishes, a replay is PUBLIC
   ok("replay: PUBLICATION_NOT_REQUIRED, zero additional writes (no duplicate inventory)", st(out2) === "PUBLICATION_NOT_REQUIRED" && world.writes.publishedLiveKeys.length === publishedBefore);
 });
 
-test("NO-STOCK FIX: the fold keys by marketplace (a null in GB never leaks to DE; each market folds independently, null->0)", async () => {
+test("phase 2: a Health snapshot carrying ANOTHER marketplace's rows is an integrity failure for a Health-dependent account -> DEFERS (LKG untouched)", async () => {
   const world = makeWorld({ fbaPayloadSha: "ps-eu", fbaRows: [
     { date: ASOF, child_asin: "ASIN1", available: 4, marketplace_country_code: "GB", sku: "G1" },
     { date: ASOF, child_asin: "ASIN1", available: null, marketplace_country_code: "GB", sku: "G2" },
@@ -633,11 +741,74 @@ test("NO-STOCK FIX: the fold keys by marketplace (a null in GB never leaks to DE
   ] });
   const h = buildProd(world);
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  // The durable Health snapshot is isolated per seller + marketplace, and the shared fold attributes every Health row to
+  // the account's marketplace, so GB / DE rows under a US account can never be folded truthfully: refused, never guessed.
+  const fp = invFootprint(world);
+  ok("DEFERRED (typed refusal) -- never a mis-attributed fold", st(out) === FBA_RECONCILE_STATUS.DEFERRED_DEPENDENCY);
+  ok("zero brand-inventory live/shadow/job writes (LKG preserved)", fp.published === 0 && fp.shadow === 0 && fp.invJobs === 0 && fp.live === false);
+});
+
+test("phase 2: VALIDATED saved Listings are the source AND the revision (the saved Health snapshot is only a read-only bridge); both content tokens are recorded", async () => {
+  const world = makeWorld({ fbaPayloadSha: "ps-lst", fbaRows: [{ date: ASOF, child_asin: "ASIN1", available: 10, marketplace_country_code: "US", sku: "S1" }], listingsRows: [lrow("S1", "ASIN1", 7), lrow("S2", "ASIN1", 5)] });
+  const h = buildProd(world);
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
   ok("READBACK_VERIFIED", st(out) === FBA_RECONCILE_STATUS.READBACK_VERIFIED);
   const lr = liveRow(world);
-  const gb = lr.payload.inventoryByBrandCountry.find((r) => r.country === "GB");
-  const de = lr.payload.inventoryByBrandCountry.find((r) => r.country === "DE");
-  ok("GB folds 4 + 0(null) = 4 (2 SKUs); DE folds 9 (1 SKU) -- per-market, the null never crosses marketplaces", gb && gb.fbaAvailable === 4 && gb.skuCount === 2 && de && de.fbaAvailable === 9 && de.skuCount === 1);
+  ok("the live compact is the Listings source: 7 + 5 = 12 (never the Health 10), the Listings fetch time, no inventory date",
+    lr && lr.payload.inventorySource === "listings" && lr.payload.listingsRefreshedAt === "2026-09-10T04:00:00Z" && lr.payload.inventoryDate === null
+    && lr.payload.inventoryByBrandCountry.some((r) => r.country === "US" && r.fbaAvailable === 12 && r.skuCount === 2));
+  ok("durable_content_deps = [the Health bridge token, the Listings revision token] (the Listings-keyed revision is covered: a subset check; the Health token is bridge provenance only)",
+    world.jobs.some((j) => j.report_key === RK && JSON.stringify(j.durable_content_deps) === JSON.stringify([healthTokenOf("ps-lst"), listingsTokenOf("lsha-A01")])));
+  const out2 = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("replay: PUBLICATION_NOT_REQUIRED (the extra Health bridge token never makes the revision look stale)", st(out2) === "PUBLICATION_NOT_REQUIRED");
+});
+
+test("CUTOVER: NO saved Health snapshot at all + a validated requested-day Listings pointer -> publishes from Listings; durable_content_deps = [the Listings token] only; replay zero-write", async () => {
+  const world = makeWorld({ noFba: true, listingsRows: [lrow("S1", "ASIN1", 4)] });
+  const h = buildProd(world);
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("READBACK_VERIFIED from Listings (4) with no Health bridge", st(out) === FBA_RECONCILE_STATUS.READBACK_VERIFIED && liveRow(world).payload.inventorySource === "listings" && liveRow(world).payload.inventoryByBrandCountry.some((r) => r.fbaAvailable === 4));
+  ok("no Health snapshot read -> no Health token; the Listings token alone", world.jobs.some((j) => j.report_key === RK && JSON.stringify(j.durable_content_deps) === JSON.stringify([listingsTokenOf("lsha-A01")])));
+  const publishedBefore = world.writes.publishedLiveKeys.length;
+  const out2 = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("replay: PUBLICATION_NOT_REQUIRED, zero additional writes", st(out2) === "PUBLICATION_NOT_REQUIRED" && world.writes.publishedLiveKeys.length === publishedBefore);
+});
+
+// The reconciler can never hand the release a pointer older than the requested day (its requested-day proof defers
+// first -- see the listings-snapshot-not-requested-day case), so the release's OWN freshness gate (as_of >= requestedAsOf
+// - 2) is driven DIRECTLY through the REAL release (as a pointer replaced between the revision read and the release read
+// would reach it).
+test("CUTOVER freshness proof (release): a Listings pointer older than requestedAsOf-2 is NEVER used (listings-snapshot-stale) -- the saved Health bridge (within its threshold) is the source; only the Health token is recorded", async () => {
+  const world = makeWorld({ fbaPayloadSha: "ps-lst-stale", fbaRows: [{ date: ASOF, child_asin: "ASIN1", available: 10, marketplace_country_code: "US", sku: "S1" }], listingsRows: [lrow("S1", "ASIN1", 7)], listingsAsOf: "2026-09-05", listingsValidatedAt: "2026-09-05T04:00:00Z" });
+  const { release } = wireRelease(world, { leaseFence: { ownerToken: "op", generation: 1 } });
+  const res = await release.runForAccount({ accountId: A, requestedAsOf: ASOF, cycleBucket: "priority-partial-india-x" });
+  ok("the release publishes + reads back", res.ok === true && world.writes.publishedLiveKeys.filter((k) => k === RK).length === 1);
+  const lr = liveRow(world);
+  ok("a stale Listings pointer is never presented as current: the dated bridge (10), reason listings-snapshot-stale",
+    lr && lr.payload.inventorySource === "health-fallback" && lr.payload.inventoryHealthDate === ASOF && JSON.stringify(lr.payload.inventoryListingsReasons) === JSON.stringify(["listings-snapshot-stale"])
+    && lr.payload.inventoryByBrandCountry.some((r) => r.country === "US" && r.fbaAvailable === 10));
+  ok("durable_content_deps = [the Health bridge token] only (the stale pointer was never read as content)",
+    world.jobs.some((j) => j.report_key === RK && JSON.stringify(j.durable_content_deps) === JSON.stringify([healthTokenOf("ps-lst-stale")])));
+  // A pointer exactly at the lag edge (requestedAsOf - 2) is still fresh for the release.
+  const edge = makeWorld({ fbaPayloadSha: "ps-lst-edge", listingsRows: [lrow("S1", "ASIN1", 7)], listingsAsOf: "2026-09-08" });
+  const resEdge = await wireRelease(edge, { leaseFence: { ownerToken: "op", generation: 1 } }).release.runForAccount({ accountId: A, requestedAsOf: ASOF, cycleBucket: "priority-partial-india-x" });
+  ok("asOf-2 Listings pointer: used (Listings source, 7) + its token recorded", resEdge.ok === true && liveRow(edge).payload.inventorySource === "listings" && liveRow(edge).payload.inventoryByBrandCountry.some((r) => r.fbaAvailable === 7)
+    && edge.jobs.some((j) => j.report_key === RK && j.durable_content_deps.includes(listingsTokenOf("lsha-A01"))));
+});
+
+test("CUTOVER freshness proof: the release no longer requires a NEW D-1 Health snapshot -- a saved Health snapshot dated older than requestedAsOf-2 publishes an honest UNAVAILABLE compact (never the stale figure, never 0)", async () => {
+  const world = makeWorld({ fbaPayloadSha: "ps-old-bridge", fbaRows: [{ date: "2026-09-07", child_asin: "ASIN1", available: 10, marketplace_country_code: "US", sku: "S1" }] });
+  const h = buildProd(world);
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("READBACK_VERIFIED (the honest state is published)", st(out) === FBA_RECONCILE_STATUS.READBACK_VERIFIED);
+  const lr = liveRow(world);
+  ok("unavailable compact: no bucket, no inventory date, the typed stale-bridge reason",
+    lr && lr.payload.inventorySource === "unavailable" && lr.payload.inventoryAvailable === false && lr.payload.inventoryDate === null
+    && lr.payload.inventoryByBrandCountry.length === 0 && lr.payload.inventoryUnavailableReason === "no-validated-listings;health-bridge-stale:2026-09-07");
+  // A bridge exactly at the threshold (requestedAsOf - 2) still serves.
+  const edge = makeWorld({ fbaPayloadSha: "ps-edge-bridge", fbaRows: [{ date: "2026-09-08", child_asin: "ASIN1", available: 10, marketplace_country_code: "US", sku: "S1" }] });
+  await buildProd(edge).reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("asOf-2 bridge: served, dated", liveRow(edge) && liveRow(edge).payload.inventorySource === "health-fallback" && liveRow(edge).payload.inventoryHealthDate === "2026-09-08");
 });
 
 test("GUARD: a PRESENT malformed (negative) available still DEFERS the derive (corruption guard preserved) -> zero brand-inventory writes, LKG untouched", async () => {

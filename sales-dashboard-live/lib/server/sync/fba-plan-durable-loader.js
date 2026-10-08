@@ -12,11 +12,17 @@
 // fba-plan derive throws -> derive-invalid -> last-known-good preserved. It NEVER fabricates zero-sales tail days
 // from short coverage. Provenance: the durable history rows carry source_request_hash; the catalog snapshot carries
 // validated_at; the effective as-of is the planned asOf the account must independently prove.
+//
+// Listings inventory cutover (2026-10-08): no FBA Inventory Health export is created any more, so the loader also reads
+// the account's LAST SAVED durable Health snapshot (source_snapshots 'fba-inventory-health', scope = the account)
+// READ-ONLY as the temporary BRIDGE (fbaPlanHealthBridge; fba-plan-health-bridge.js). It is SOFT: a missing / unreadable
+// bridge never blocks (the derive uses validated Listings or shows inventory Unavailable, never 0).
 
 import { resolveDataDoeAccountIds } from "../datadoe-connections.js";
 import { organizationFingerprint as organizationFingerprintOf } from "../source-identity.js";
 import { planMonthWindows } from "../date-windows.js";
 import { slicedOliSourceFromHistory } from "./durable-dashboards.js";
+import { FBA_PLAN_HEALTH_BRIDGE_SOURCE_KEY, fbaPlanHealthBridgeFromSnapshot, fbaPlanHealthBridgeUnavailable } from "./fba-plan-health-bridge.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const isDate = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
@@ -67,18 +73,51 @@ export function buildDurableCatalog({ catalogRows, rawSellerId, from, to }) {
 }
 
 /**
+ * Read the account's READ-ONLY FBA Inventory Health BRIDGE (Listings inventory cutover): its LAST SAVED durable
+ * snapshot source_snapshots(fba-inventory-health, scope = the account) + its content-verified rows. NEVER an export,
+ * never a write. Every failure is SOFT (fbaPlanHealthBridgeFromSnapshot's typed { available:false, reason }) -- the
+ * derive then uses validated Listings or shows inventory Unavailable. The snapshot DATE travels with it; the 2-day
+ * freshness rule is applied by the derive (selectAccountInventory with the plan's inventory as-of).
+ */
+export async function readFbaPlanHealthBridge({ getSnapshot, loadPayload, organizationFingerprint, connectionId, accountId, rawSellerId }) {
+  if (typeof getSnapshot !== "function" || typeof loadPayload !== "function") return fbaPlanHealthBridgeUnavailable("health-bridge-reader-missing");
+  let read;
+  try {
+    read = await getSnapshot({ organizationFingerprint, connectionId, sourceKey: FBA_PLAN_HEALTH_BRIDGE_SOURCE_KEY, scopeKey: S(accountId) });
+  } catch (_e) {
+    return fbaPlanHealthBridgeUnavailable("health-bridge-read-failed");
+  }
+  const snapshot = read && typeof read === "object" && "snapshot" in read ? read.snapshot : read;
+  if (read && typeof read === "object" && "read" in read && read.read !== "ok") return fbaPlanHealthBridgeUnavailable("health-bridge-read-failed");
+  if (!snapshot || !snapshot.object_path) return fbaPlanHealthBridgeUnavailable("health-snapshot-missing");
+  let rows = null;
+  try {
+    const payload = await loadPayload(snapshot.object_path);
+    rows = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.rows) ? payload.rows : null);
+  } catch (_e) {
+    rows = null;
+  }
+  return fbaPlanHealthBridgeFromSnapshot({ snapshot, rows, accountId: S(accountId), rawSellerId, organizationFingerprint, connectionId });
+}
+
+/**
  * Make the report-worker `loadDerivedContext` callback for fba-plan. For every OTHER report it returns {}.
  * For fba-plan it resolves the authoritative durable identity (org fingerprint + connection + raw seller id)
  * from account metadata, checks the account's durable OLI coverage proves the whole derive window (else {} ->
- * fail closed), reads the durable OLI history + org catalog snapshot, and returns
- * { fbaPlanDurableOli, fbaPlanDurableCatalog }. Injected (all Supabase, cache-only; NEVER a DataDoe export):
+ * fail closed), reads the durable OLI history + org catalog snapshot + the READ-ONLY FBA Inventory Health bridge, and
+ * returns { fbaPlanDurableOli, fbaPlanDurableCatalog, fbaPlanHealthBridge }. Injected (all Supabase, cache-only; NEVER
+ * a DataDoe export):
  *   connections        -- DataDoe connections (for resolveDataDoeAccountIds); default is production.
  *   getOliCoverage     -- ({organizationFingerprint, connectionId, accountId, sourceKey}) -> { read, windows }.
  *   getOliHistory      -- ({organizationFingerprint, connectionId, accountIds, from, to}) -> durable OLI rows.
  *   getCatalogSnapshot -- ({organizationFingerprint, connectionId, sourceKey, scopeKey}) -> { snapshot, read }.
  *   loadCatalogPayload -- (objectPath) -> { rows } (durable catalog storage payload).
+ *   getHealthSnapshot  -- the same pointer reader for the bridge (default getCatalogSnapshot: both are
+ *                         supabase getSourceSnapshot); loadHealthPayload -- its payload reader (default
+ *                         loadCatalogPayload: getSourceSnapshotPayload, content-hash verified).
+ * The bridge is SOFT: a missing / unreadable / foreign bridge arrives as { available:false, reason } and never blocks.
  */
-export function makeFbaPlanDurableContextLoader({ connections, getOliCoverage, getOliHistory, getCatalogSnapshot, loadCatalogPayload }) {
+export function makeFbaPlanDurableContextLoader({ connections, getOliCoverage, getOliHistory, getCatalogSnapshot, loadCatalogPayload, getHealthSnapshot = getCatalogSnapshot, loadHealthPayload = loadCatalogPayload }) {
   return async ({ reportKey, accountId, planned }) => {
     if (reportKey !== "fba-plan") return {};
     const context = (planned && planned.context) || {};
@@ -145,6 +184,9 @@ export function makeFbaPlanDurableContextLoader({ connections, getOliCoverage, g
     }
     const fbaPlanDurableCatalog = buildDurableCatalog({ catalogRows, rawSellerId, from, to });
 
-    return { fbaPlanDurableOli, fbaPlanDurableCatalog };
+    // 3) The READ-ONLY FBA Inventory Health bridge (the account's last saved snapshot; soft -- never blocks).
+    const fbaPlanHealthBridge = await readFbaPlanHealthBridge({ getSnapshot: getHealthSnapshot, loadPayload: loadHealthPayload, organizationFingerprint: orgFingerprint, connectionId, accountId: S(accountId), rawSellerId });
+
+    return { fbaPlanDurableOli, fbaPlanDurableCatalog, fbaPlanHealthBridge };
   };
 }

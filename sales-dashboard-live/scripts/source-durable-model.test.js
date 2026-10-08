@@ -301,7 +301,8 @@ test("E1. once-daily refresh decision; the catalog scope is the ORGANIZATION (ne
   assert.deepEqual(model.snapshotRefreshDecision({ sourceKey: "product-catalog", lastValidatedAt: null, today: ASOF }), { refresh: true, reason: "never-validated" });
   assert.deepEqual(model.snapshotRefreshDecision({ sourceKey: "product-catalog", lastValidatedAt: "2026-08-14T22:00:00Z", today: ASOF }), { refresh: true, reason: "stale-day" });
   assert.deepEqual(model.snapshotRefreshDecision({ sourceKey: "product-catalog", lastValidatedAt: "2026-08-15T02:00:00Z", today: ASOF }), { refresh: false, reason: "fresh-today" });
-  assert.deepEqual(model.snapshotRefreshDecision({ sourceKey: "fba-inventory-health", lastValidatedAt: "2026-08-15T02:00:00Z", today: ASOF }), { refresh: false, reason: "fresh-today" });
+  // The retired FBA Inventory Health family is unregistered (Listings inventory cutover): no refresh decision exists for it.
+  assert.throws(() => model.snapshotRefreshDecision({ sourceKey: "fba-inventory-health", lastValidatedAt: "2026-08-15T02:00:00Z", today: ASOF }), /UNREGISTERED_SOURCE/);
   assert.throws(() => model.snapshotRefreshDecision({ sourceKey: "order-line-items", lastValidatedAt: null, today: ASOF }), /not a daily-snapshot source/);
   assert.equal(model.catalogSnapshotScope(), "__organization");
 });

@@ -13,20 +13,26 @@
 // large catalogue, so the window is fetched in 7-day slices and any slice that
 // reaches the cap aborts the refresh rather than returning a partial share.
 //
-// Cause attribution uses the competitive prices on the latest FBA Inventory
-// Health snapshot (your_price, sales_price, featuredoffer_price,
-// lowest_price_new_plus_shipping) plus `available`. A cause is only claimed when
-// those fields are actually present; otherwise the row says the cause is
-// unconfirmed.
+// Cause evidence (Listings inventory cutover) comes, per account, from its
+// validated SAVED Listings snapshot (zero export: fba_quantity_available +
+// listing_fulfillment_channel per SKU), else from its last SAVED FBA Inventory
+// Health snapshot as a dated read-only bridge (available units only, while within
+// HEALTH_BRIDGE_MAX_AGE_DAYS of the as-of), else Unavailable. No FBA Inventory
+// Health export is requested: its competitive prices and units_shipped_t30 run
+// rate are REMOVED, so no price cause is evaluated. A cause is only claimed when
+// its evidence is present; a SKU absent from the selected source is never read as
+// merchant-fulfilled or out of stock -- the cause is unconfirmed.
 
 import { addDaysStr, num, numOrNull, splitDateRangeByDays, canonicalOliSlices } from "../datadoe.js";
 import {
   brandLabel,
   fetchCatalog,
   fetchExportRowsStrict,
-  fetchInventorySnapshot,
+  readInsightInventoryEvidence,
   sumField,
 } from "./common.js";
+import { insightInventory, insightInventoryFields, insightSkuStock } from "./derivation-core.js";
+import { asinForSkuFrom } from "./inventory-consumer.js";
 import { isCancelledStatus } from "../sync/oli-order-rules.js";
 import { OLI_ROW_LIMIT, ORDER_LINE_ITEMS, PROFIT_BY_SKU, ROW_LIMITS } from "./sources.js";
 
@@ -63,7 +69,9 @@ const OLI_SALES_AGGREGATIONS = [
   { column: "quantity", aggregation: "sum", alias: "total_units_sum" },
 ];
 
-export async function buildBuyBoxLoss({ apiKey, ids, to }) {
+// `listings` = saved-evidence identity/readers for readInsightInventoryEvidence (saved Listings + the saved Health
+// bridge); zero export either way (no FBA Inventory Health export is requested).
+export async function buildBuyBoxLoss({ apiKey, ids, to, listings = {} }) {
   const from = addDaysStr(to, -(WINDOW_DAYS - 1));
   const slices = splitDateRangeByDays(from, to, SLICE_DAYS);
 
@@ -73,6 +81,8 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
   const bySkuOrdered = new Map();
   let observedFrom = null;
   let observedTo = null;
+  // The account's own daily (SKU, ASIN) pairs: the only SKU -> ASIN evidence the Listings fold may use.
+  const skuAsinRows = [];
 
   for (const slice of slices) {
     const rows = await fetchExportRowsStrict(
@@ -83,6 +93,7 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
     for (const row of rows) {
       const sku = String(row.sku || "").trim();
       if (!sku) continue;
+      skuAsinRows.push({ sku, child_asin: row.child_asin });
       const currency = String(row.currency || "").trim() || null;
       const key = `${currency || "?"}|${sku}`;
       let entry = bySku.get(key);
@@ -156,7 +167,10 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
     }
   }
 
-  const inventory = await fetchInventorySnapshot(apiKey, ids, to);
+  // The per-account stock source: the saved Listings when they validate, else the saved Health bridge (read-only,
+  // threshold measured against the as-of), else Unavailable. ZERO export.
+  const evidence = await readInsightInventoryEvidence({ apiKey, ids, to, listings });
+  const inventory = insightInventory({ listings: evidence.listings, healthBridge: evidence.healthBridge, asOf: to, sellerId: ids[0], asinForSku: asinForSkuFrom(skuAsinRows) });
   const catalog = await fetchCatalog(apiKey, ids);
 
   const rows = [];
@@ -173,7 +187,6 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
       ? entry.buyBoxWeighted / entry.buyBoxWeight
       : entry.buyBoxSum / entry.buyBoxDays;
 
-    const stock = inventory.bySku.get(entry.sku) || null;
     const meta = entry.asin ? catalog.byAsin.get(entry.asin) || {} : {};
     if (entry.currency) currencies.add(entry.currency);
 
@@ -190,20 +203,9 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
       sales: sold.sales,
       units: sold.units,
       pageViews: entry.pageViews,
-      // Price and stock evidence. null means the snapshot did not carry it, and
-      // the client must then refuse to name a cause.
-      price: stock
-        ? {
-          yourPrice: stock.yourPrice,
-          salesPrice: stock.salesPrice,
-          featuredOfferPrice: stock.featuredOfferPrice,
-          lowestPriceNewPlusShipping: stock.lowestPriceNewPlusShipping,
-          currency: stock.currency,
-        }
-        : null,
-      available: stock ? stock.available : null,
-      unitsShippedT30: stock ? stock.unitsShippedT30 : null,
-      inventoryKnown: Boolean(stock),
+      // Stock / channel evidence. null => Unavailable, and the client must then refuse to name a cause (a SKU absent
+      // from the selected source is never read as FBM or out of stock).
+      stock: insightSkuStock(inventory, entry.sku),
     });
   }
 
@@ -213,9 +215,7 @@ export async function buildBuyBoxLoss({ apiKey, ids, to }) {
     window: { from, to, days: WINDOW_DAYS, sliceDays: SLICE_DAYS },
     observedWindow: observedFrom && observedTo ? { from: observedFrom, to: observedTo } : null,
     sourceLabel: PROFIT_BY_SKU.label,
-    priceSourceLabel: "FBA Inventory Health",
-    inventoryAvailable: inventory.available,
-    inventorySnapshotDate: inventory.snapshotDate,
+    ...insightInventoryFields(inventory),
     currencies: [...currencies].sort(),
     rows,
     catalogBrands: catalog.catalogBrands,

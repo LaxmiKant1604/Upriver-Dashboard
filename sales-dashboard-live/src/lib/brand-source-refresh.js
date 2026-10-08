@@ -1,7 +1,9 @@
 import { addDays, monthStart } from "./format.js";
 
 export const BRAND_SALES_REPORT_VERSION = "brand-sales-shared-v1";
-export const BRAND_INVENTORY_REPORT_VERSION = "brand-inventory-shared-v1";
+// v2 = Listings inventory cutover phase 2 (equals the server's BRAND_INVENTORY_REPORT_VERSION; v1 compacts are still
+// served by the server as legacy FBA Inventory Health snapshots during the transition).
+export const BRAND_INVENTORY_REPORT_VERSION = "brand-inventory-shared-v2";
 const SECONDARY_PREFIX = "dd-secondary:";
 
 export function brandSalesRefreshParams(account, today) {
@@ -19,8 +21,10 @@ export function brandSalesRefreshParams(account, today) {
 
 // Compact FBA inventory refresh for one account. It fetches at most one FBA
 // Inventory Health export (reusing the preceding brand-sales catalog identity) and
-// saves the { accountId, inventoryDate, inventoryAvailable, inventoryByBrandCountry }
-// snapshot Brand View consumes before the legacy fba-plan / listing-health fallback.
+// saves the compact brand-inventory snapshot Brand View consumes before the saved
+// fba-plan fallback. Phase 2 of the Listings inventory cutover: the compact uses the
+// account's validated saved Listings inventory, else that FBA Inventory Health
+// snapshot as a labelled fallback, else unavailable.
 export function brandInventoryRefreshParams(account, today) {
   const accountId = String(account?.id || "").trim();
   if (!accountId) throw new Error("A mapped account id is required.");

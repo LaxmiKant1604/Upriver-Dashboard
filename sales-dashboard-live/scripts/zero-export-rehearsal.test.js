@@ -252,7 +252,8 @@ test("SEED: one normal OFFLINE pass populates the durable caches (fixture; still
   seededSinks = flow.sinks;
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   assert.equal(rollup.globalDrained, true);
-  assert.ok(seededStore._cache.size >= 4, "durable caches exist for OLI slices + catalog + FBA");
+  assert.ok(seededStore._cache.size >= 2, "durable caches exist for OLI slices + catalog (no FBA family: FBA Inventory Health is retired)");
+  assert.ok([...seededStore._cache.values()].every((e) => !/inventory-health/.test(JSON.stringify(e.source_id || ""))), "no Health cache entry was ever produced");
 });
 
 test("(1)(2)(4)(15)(17) the REHEARSAL adopts every job atomically with ZERO create/poll/download on a fake clock", async () => {
@@ -274,8 +275,8 @@ test("(1)(2)(4)(15)(17) the REHEARSAL adopts every job atomically with ZERO crea
     assert.equal(row.create_export_count, 0, "(2) atomic CAS adoption spends nothing");
     assert.ok(row.cache_object_path, "(2) the adopted evidence points at the existing object");
   }
-  // (15) the one-minute cooldown between families ran entirely on the injected fake clock.
-  assert.ok(rehearsalWaits.length >= 2, "cooldowns happened");
+  // (15) the one-minute cooldown between families (OLI -> Catalog) ran entirely on the injected fake clock.
+  assert.ok(rehearsalWaits.length >= 1, "cooldowns happened");
   assert.equal(rehearsalWaits.reduce((a, b) => a + b, 0) % 60_000, 0, "whole 60s units on the fake clock; the suite never slept");
 });
 
@@ -444,10 +445,10 @@ test("(14) source pause prevents work WITHOUT deleting durable history", async (
   const dd = tripwired(makeDataDoe());
   const flow = runFlow({
     store, dd, cycleDate: "2026-08-24", reuseOnly: true,
-    pausedSources: new Set(["order-line-items", "product-catalog", "fba-inventory-health"]),
+    pausedSources: new Set(["order-line-items", "product-catalog"]),
   });
   const rollup = await flow.promise;
-  assert.deepEqual(rollup.skippedPaused.sort(), ["fba-inventory-health", "order-line-items", "product-catalog"]);
+  assert.deepEqual(rollup.skippedPaused.sort(), ["order-line-items", "product-catalog"]);
   assert.equal(dd.totalCreates(), 0, "zero work while paused");
   assert.equal(store._cache.size, cacheBefore, "(14) durable evidence untouched by the pause");
   assert.equal(flow.sinks.history.length, 0, "no writes while paused");

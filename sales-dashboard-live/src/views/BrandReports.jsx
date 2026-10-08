@@ -16,7 +16,7 @@ import { AlertTriangle, Info } from "lucide-react";
 
 import { DataQualityAlert, GradientKpi, MoneyShare } from "../components/ui.jsx";
 import { fmtRangeLabel, monthLongLabel, nInt } from "../lib/format.js";
-import { isConvertedMode } from "../lib/brand-view.js";
+import { isConvertedMode, inventoryFreshnessText } from "../lib/brand-view.js";
 import { DASH, buildBrandTables } from "../lib/brand-view-tables.js";
 
 /* ------------------------------------------------------------------ table */
@@ -127,7 +127,8 @@ export function freshnessSummaryLine(model) {
     coverage.salesCompleteThrough && coverage.salesCompleteThrough !== coverage.salesLatestDate
       ? `all accounts complete through ${coverage.salesCompleteThrough}`
       : null,
-    coverage.inventoryDate ? `FBA inventory as of ${coverage.inventoryDate}` : "FBA inventory unavailable",
+    // Per-account inventory source: Listings refresh time, or the saved FBA Inventory Health snapshot date (the bridge).
+    inventoryFreshnessText(coverage, "FBA inventory"),
   ].filter(Boolean).join(" · ");
 }
 
@@ -261,7 +262,7 @@ export default function BrandReports({
           subtitle={[
             rangeLabel,
             lastYear ? `LY compares ${fmtRangeLabel(lastYear.from, lastYear.to)}` : "LY unavailable for this window",
-            coverage.inventoryDate ? `FBA Inv. as of ${coverage.inventoryDate}` : "FBA Inv. unavailable",
+            inventoryFreshnessText(coverage, "FBA Inv."),
             currencyLabel,
           ].filter(Boolean).join(" · ")}
           headers={tables.dailyTable.headers}

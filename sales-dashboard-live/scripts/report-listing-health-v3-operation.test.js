@@ -174,12 +174,13 @@ await (async () => {
 
   const costStale = await planListingHealthV3IngestionCost({ plan, getSourceExportCache: mkCache(stale) });
   ok("H: a STALE date-free cache (fetched_at < freshnessNotBefore) is NOT adoptable -> counted as a create", costStale.creates === costStale.newExports && costStale.newExports === 2);
-  ok("H: stale inventory is NOT adoptable (reuse-only precondition fails)", costStale.inventoryAdoptable === false);
+  // Listings inventory cutover: FBA Inventory Health is retired -- the v3 plan has NO inventory (reused) source, so the
+  // cost reports zero reused exports and inventory is never adoptable (v3 reads stock from its Listings rows).
+  ok("H: the plan has NO inventory source; zero reused exports; inventory never adoptable", v3.every((r) => r.sources.every((x) => !/inventory/.test(x.requestKey))) && costStale.reusedExports === 0 && costStale.inventoryAdoptable === false);
 
   const costFresh = await planListingHealthV3IngestionCost({ plan, getSourceExportCache: mkCache(fresh) });
   ok("H: a CURRENT-cycle cache (fetched_at >= freshnessNotBefore) is adoptable -> zero creates (reuse, zero tokens)", costFresh.creates === 0 && costFresh.estimatedTokens === 0);
-  ok("H: fresh inventory is adoptable (reuse-only satisfied)", costFresh.inventoryAdoptable === true);
-  ok("H: inventory is never counted as a new export (reused only)", costFresh.reusedExports === 1 && costFresh.newExports === 2);
+  ok("H: exactly the 2 Listings/Listings-Raw exports are planned (one batch); nothing reused", costFresh.newExports === 2 && costFresh.reusedExports === 0 && costFresh.inventoryAdoptableCount === 0);
 
   // Replay of the SAME cycle after a successful fetch: the cache is now fresh -> zero new creates (no duplicates).
   ok("H: same-cycle replay against the now-fresh cache creates nothing", (await planListingHealthV3IngestionCost({ plan, getSourceExportCache: mkCache(fresh) })).creates === 0);

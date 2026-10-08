@@ -25,11 +25,11 @@ const S = (v) => (v == null ? "" : String(v));
 /**
  * Build the FBA-inventory publication reconciler. FBA-specific collaborators:
  *   readFbaSnapshot({ organizationFingerprint, connectionId, accountId }) -> { read, snapshot }
- *       -- the durable source_snapshots row for (account, fba-inventory-health). read!='ok' or a throw is a PER-ACCOUNT
- *          defer (that account keeps its LKG); it NEVER fails the whole run (per-account isolation).
- *   resolveExpectedRequestHash({ accountId, requestedAsOf }) -> "<request hash>" | ""
- *       -- the recomputed resolvedFbaSnapshot({asOf:requestedAsOf}).requestHash for EXACTLY the D-1 single-day export
- *          (proves the durable snapshot IS the requested-D-1 snapshot). "" => cannot prove D-1 for this account (defer).
+ *       -- the account's durable SAVED LISTINGS pointer (public.source_listings_snapshot; the one saved inventory snapshot
+ *          since the Listings inventory cutover -- FBA Inventory Health is retired). read!='ok' or a throw is a PER-ACCOUNT
+ *          defer (that account keeps its LKG); it NEVER fails the whole run (per-account isolation). The requested-day
+ *          proof is the pointer's as_of (computeFbaAccountRevision); no request-hash resolver is needed any more.
+ *   resolveExpectedRequestHash -- accepted for call-site compatibility and IGNORED.
  * Every other collaborator is passed straight through to the shared core.
  */
 export function buildFbaPublicationReconciler({
@@ -45,27 +45,24 @@ export function buildFbaPublicationReconciler({
   reportKeys = fbaDependentLiveReportKeys(),
   withTimeout = (p) => p, clock = () => new Date(), log = () => {},
 } = {}) {
-  for (const [name, fn] of [["readFbaSnapshot", readFbaSnapshot], ["resolveExpectedRequestHash", resolveExpectedRequestHash]]) {
-    if (typeof fn !== "function") throw new Error(`buildFbaPublicationReconciler requires ${name} (fail closed).`);
-  }
+  if (typeof readFbaSnapshot !== "function") throw new Error("buildFbaPublicationReconciler requires readFbaSnapshot (fail closed).");
+  void resolveExpectedRequestHash; // retired: the saved Listings pointer proves the requested day by its as_of
 
-  // The FBA ADAPTER. readScopeEvidence reads each account's durable FBA snapshot + recomputed D-1 request hash with
+  // The FBA ADAPTER. readScopeEvidence reads each account's durable SAVED LISTINGS pointer with
   // PER-ACCOUNT isolation: a per-account read error/absence stores null evidence (that account defers), and never
-  // aborts the scope. computeAccountRevision proves the snapshot is the requested-D-1 snapshot (fba-inventory-revision).
+  // aborts the scope. computeAccountRevision proves the pointer is the requested day's (its as_of; fba-inventory-revision).
   const adapter = {
     async readScopeEvidence({ organizationFingerprint, connectionId, scope, requestedAsOf, withTimeout: wt }) {
       const timeout = typeof wt === "function" ? wt : withTimeout;
       const perAccount = new Map();
       for (const accountId of scope) {
         let snapshot = null;
-        let expectedRequestHash = "";
         try {
           const res = await timeout(readFbaSnapshot({ organizationFingerprint, connectionId, accountId }), "fba-snapshot:" + accountId);
           // read!='ok' (schema-missing / read-failed) -> treat as no durable snapshot for THIS account (defer, LKG kept).
           snapshot = res && res.read === "ok" ? (res.snapshot || null) : null;
         } catch { snapshot = null; }
-        try { expectedRequestHash = S(await resolveExpectedRequestHash({ accountId, requestedAsOf })); } catch { expectedRequestHash = ""; }
-        perAccount.set(accountId, { snapshot, expectedRequestHash });
+        perAccount.set(accountId, { snapshot });
       }
       return { ok: true, perAccount };
     },
@@ -73,7 +70,6 @@ export function buildFbaPublicationReconciler({
       return computeFbaAccountRevision({
         organizationFingerprint, connectionId, accountId, requestedAsOf,
         snapshot: evidence && evidence.snapshot,
-        expectedRequestHash: evidence && evidence.expectedRequestHash,
       });
     },
   };

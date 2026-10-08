@@ -11,6 +11,10 @@
 // reordered/cross-account oli-sales fragment rejection, last-known-good preservation, and idempotent
 // derivation.
 // Also parity-checks the shared planMonthWindows helper against the route formula.
+// Listings inventory cutover, PHASE 2 (snapshot fba-plan/v3-phase2): the inventory part is the per-account source decision
+// (validated Listings, else the labelled FBA Inventory Health fallback, else unavailable) in ONE Listings-model shape; a
+// sold ASIN absent from the selected source is unknown (never 0); scripts/fba-plan-phase2.test.js covers the source
+// selection itself.
 //
 // 7-bit ASCII, LF, no top-level await, synchronous writeSync progress, dynamic imports after a dummy
 // Supabase env. Nothing high-entropy in the bytes.
@@ -31,7 +35,8 @@ const mark = (m) => { try { writeSync(2, "[+" + (Date.now() - START) + "ms] " + 
 const out = (s) => { try { writeSync(1, s + "\n"); } catch (_e) { /* ignore */ } };
 
 // Assigned in main() after the dummy env is set.
-let assembleSources, deriveReportSnapshot, runReportJobs, sanitizeReportDiagnostic;
+let assembleSources, deriveReportSnapshot, runReportJobs, sanitizeReportDiagnostic, REPORT_DERIVATIONS;
+const REPORT_ENTRY = () => REPORT_DERIVATIONS["fba-plan"];
 let fbaPlanPayload, foldPlanAsinUnits;
 let planMonthWindows, addDaysStr, planFbaPlan, canonicalOliSlices;
 let slicedOliSourceFromHistory;
@@ -72,10 +77,14 @@ function buildSources(planned, rowsByHash, statusOverride = {}) {
 }
 
 // Build the ONE canonical fba-plan:oli-sales source (its fragments ARE canonicalOliSlices(
-// completed[0].from, asOf)) plus catalog / inventory-health / AWD. `oliByIdx` aligns canonical rows to
+// completed[0].from, asOf)) plus catalog / AWD. `oliByIdx` aligns canonical rows to
 // WINS (0..2 completed months, 3 the current MTD month); each row is bucketed into the slice whose window
 // contains its `date`, so foldOliSalesToFbaInputs reconstructs the SAME per-ASIN monthly + MTD units and
 // current-month latest-date probe the former monthly-units + current-daily-dates fragments encoded.
+// Listings inventory CUTOVER: NO FBA Inventory Health fragment is planned any more. `invRows` are the account's LAST
+// SAVED Health snapshot rows -- the READ-ONLY bridge the durable loader injects as context.fbaPlanHealthBridge -- carried
+// on rows[BRIDGE] (never a planned source) and attached by deriveFba / fbaReportPlan below. invRows === null = no bridge.
+const BRIDGE = "__fbaPlanHealthBridgeRows";
 function fbaPlanned({ oliByIdx = [[], [], [], []], catalogRows = [], invRows = [], awdRows = [], ids = [ID], includeAwd = true } = {}) {
   const planned = [];
   const rows = {};
@@ -86,21 +95,26 @@ function fbaPlanned({ oliByIdx = [[], [], [], []], catalogRows = [], invRows = [
     rows[f.requestHash] = allOli.filter((r) => r.date >= s.from && r.date <= s.to);
   }
   const cat = frag("fba-plan:catalog", WINS[0].from, WINS[3].to, ids); planned.push(cat); rows[cat.requestHash] = catalogRows;
-  const inv = frag("fba-plan:inventory-health", INV_WINDOW.from, INV_WINDOW.to, ids); planned.push(inv); rows[inv.requestHash] = invRows;
+  Object.defineProperty(rows, BRIDGE, { value: invRows, enumerable: false });
   if (includeAwd) { const awd = frag("fba-plan:awd", null, null, ids); planned.push(awd); rows[awd.requestHash] = awdRows; }
   return { planned, rows };
 }
+// The READ-ONLY bridge exactly as fba-plan-health-bridge.js delivers it (soft: none -> { available:false }).
+const bridgeOf = (rows) => (rows && Array.isArray(rows[BRIDGE])
+  ? { available: true, rows: rows[BRIDGE], snapshotDate: null, validatedAt: null }
+  : { available: false, reason: "health-snapshot-missing", rows: [] });
 
 const usContext = (over = {}) => ({ to: ASOF, rawSellerId: ID, accountName: "Acme Co", marketCountry: "US", isUS: true, ...over });
 // OLI sales + Product Catalog are now DERIVED durable dependencies injected via the derive CONTEXT
 // (fbaPlanDurableOli / fbaPlanDurableCatalog), not owned source fragments. assembleSources produces the exact
 // { available, rows, fragments } shape the loader emits, so relocating those two entries from `sources` to
-// `context` exercises the identical derive path the report worker's loadDerivedContext feeds. inventory-health +
-// AWD remain owned (fetched) sources. A test that omits the OLI/catalog fragments leaves the durable input absent
-// -> the derive fails closed, exactly as in production.
+// `context` exercises the identical derive path the report worker's loadDerivedContext feeds. The READ-ONLY Health
+// bridge arrives the same way (fbaPlanHealthBridge); only the canonical Listings (AWD) remains an owned (fetched) source.
+// A test that omits the OLI/catalog fragments leaves the durable input absent -> the derive fails closed, exactly as in
+// production.
 const deriveFba = (planned, rows, context = usContext(), statusOverride) => {
   const sources = buildSources(planned, rows, statusOverride);
-  const ctx = { ...context, fbaPlanDurableOli: sources["fba-plan:oli-sales"], fbaPlanDurableCatalog: sources["fba-plan:catalog"] };
+  const ctx = { ...context, fbaPlanDurableOli: sources["fba-plan:oli-sales"], fbaPlanDurableCatalog: sources["fba-plan:catalog"], fbaPlanHealthBridge: bridgeOf(rows) };
   return deriveReportSnapshot({ reportKey: "fba-plan", sources, context: ctx });
 };
 
@@ -133,18 +147,18 @@ function makeReportStore() {
 }
 
 // Build a planned report + a seeded store for the worker, from fbaPlanned() fragments. OLI + catalog are DERIVED
-// (no owned export): only inventory-health + AWD are owned sources; the durable OLI/catalog reach the derive via
-// an injected loadDerivedContext exactly as makeFbaPlanDurableContextLoader supplies them in production.
+// (no owned export): only the canonical Listings (AWD) is an owned source; the durable OLI/catalog + the READ-ONLY Health
+// bridge reach the derive via an injected loadDerivedContext exactly as makeFbaPlanDurableContextLoader supplies them.
 function fbaReportPlan(planned, rows) {
   const store = makeReportStore();
-  const owned = planned.filter((p) => p.requestKey === "fba-plan:inventory-health" || p.requestKey === "fba-plan:awd");
+  const owned = planned.filter((p) => p.requestKey === "fba-plan:awd");
   for (const p of owned) store.seedSourceSucceeded(p.requestHash);
   const sources = owned.map((p) => ({ ...p, optional: p.requestKey === "fba-plan:awd" }));
-  const plannedReport = { reportKey: "fba-plan", accountId: ID, connectionId: "primary", bucket: "us", reportVersion: "fba-plan/v2d-5", sources, context: usContext() };
+  const plannedReport = { reportKey: "fba-plan", accountId: ID, connectionId: "primary", bucket: "us", reportVersion: "fba-plan/v3-cutover", sources, context: usContext() };
   const sourceRows = (hash) => (Object.prototype.hasOwnProperty.call(rows, hash) ? { rows: rows[hash] } : { rows: [] });
   const derived = buildSources(planned, rows); // the assembled { available, rows, fragments } shapes, incl. OLI + catalog
   const loadDerivedContext = async ({ reportKey }) => (reportKey === "fba-plan"
-    ? { fbaPlanDurableOli: derived["fba-plan:oli-sales"], fbaPlanDurableCatalog: derived["fba-plan:catalog"] }
+    ? { fbaPlanDurableOli: derived["fba-plan:oli-sales"], fbaPlanDurableCatalog: derived["fba-plan:catalog"], fbaPlanHealthBridge: bridgeOf(rows) }
     : {});
   return { store, plannedReport, sourceRows, loadDerivedContext };
 }
@@ -168,8 +182,7 @@ const CATALOG = [{ child_asin: "ASIN1", product_brand: "Acme", product_name: "Wi
 const INV = [
   { date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-1", marketplace_country_code: "US", available: 100, reserved_customer_order: 4, reserved_fc_transfer: 8, reserved_fc_processing: 1, inbound_shipped: 5, inbound_received: 2, inbound_working: 0, product_name: "Widget Inv" },
 ];
-// A row from ANY other date (e.g. an older snapshot day) must now be REJECTED by the single-day window
-// validation -- it can never be silently ignored or summed (see the cross-date test below).
+// A saved bridge snapshot is read at its LATEST date only: a row from an older day is never summed (cross-date test below).
 const INV_WITH_CROSS_DATE_ROW = [...INV, { date: "2025-08-01", child_asin: "ASIN1", sku: "SKU-OLD", available: 999 }];
 const AWD = [{ marketplace_country_code: "US", child_asin: "ASIN1", sku: "SKU-1", awd_available_distributable_quantity: 42, awd_total_inbound_quantity: 15 }];
 // The SAME AWD row as it arrives on the UNIFIED canonical "Listings" export (LISTINGS_CANONICAL_COLUMNS = the union of
@@ -183,7 +196,13 @@ const AWD_UNION = [{
   awd_available_distributable_quantity: 42, awd_total_inbound_quantity: 15,
 }];
 
-// Hand-computed expected payload, transcribed from the api/datadoe.js `fba-plan` handler formula.
+// Hand-computed expected payload. Sales / forecast / SKU directory are transcribed from the api/datadoe.js `fba-plan`
+// handler formula; the inventory is the Listings inventory CUTOVER model: this fixture's Listings rows carry no
+// fba_quantity_inbound / _reserved / _fc_transfer (a pre-expansion snapshot), so the account uses its SAVED FBA Inventory
+// Health snapshot (the READ-ONLY bridge, dated the plan's own as-of, so fresh) as the labelled fallback -- available 100,
+// inbound = working 0 + shipped 5 + received 2 = 7, reserved /
+// FC transfer null (Health buckets are never relabelled as Listings ones) -- while AWD comes from the Listings rows. A
+// sold ASIN absent from Health (ASIN2) is UNKNOWN ("absent", null), never a fabricated 0.
 const EXPECTED = {
   asOf: "2025-08-06",
   accountName: "Acme Co",
@@ -197,19 +216,39 @@ const EXPECTED = {
   currentMonth: { key: "2025-08", from: "2025-08-01", to: "2025-08-06", daysInMonth: 31 },
   salesLatestDate: "2025-08-05",
   elapsedDays: 5,
+  inventoryModel: "listings-v1",
+  inventorySource: "health-fallback",
+  inventoryListingsReasons: ["listings-not-expanded"],
+  inventoryHealthDate: "2025-08-06",
   inventoryDate: "2025-08-06",
   inventoryAvailable: true,
+  inventoryUnavailableReason: null,
+  // Listings inventory cutover -- the READ-ONLY bridge: used (fresh: its date IS the plan's inventory as-of), so no
+  // health reasons; its date, the 2-day rule and the as-of it was judged at are carried.
+  inventoryHealthReasons: [],
+  inventoryBridgeSnapshotDate: "2025-08-06",
+  inventoryBridgeMaxAgeDays: 2,
+  inventoryAsOf: "2025-08-06",
+  inventoryConflicts: [],
+  inventoryResolvedConflicts: [],
+  inventoryUnattributed: null,
+  inventoryAsinResolvedFromSales: 0,
   awdAvailable: true,
   awdEligible: true, // ADDITIVE (Europe AWD): US is AWD-eligible exactly as before (awdEligible === isUS for US).
+  awdUnattributedSkus: 0,
+  awdAssumedZeroSkus: 0, // the fixture's AWD cells are explicit numbers (never assumed)
   rows: [
-    { asin: "ASIN1", productName: "Widget", brand: "Acme", sku: "SKU-1", unitsByMonth: { "2025-05": 10, "2025-06": 20, "2025-07": 7 }, mtdUnits: 3, fbaAvailable: 100, customerOrderReserved: 4, reservedFcTransfer: 8, reservedFcProcessing: 1, inboundShipped: 5, inboundReceived: 2, inboundWorking: 0, awdAvailable: 42, awdInbound: 15 },
-    { asin: "ASIN2", productName: "Gadget", brand: "Beta", sku: null, unitsByMonth: { "2025-05": 5, "2025-06": 0, "2025-07": 0 }, mtdUnits: 0, fbaAvailable: 0, customerOrderReserved: 0, reservedFcTransfer: 0, reservedFcProcessing: 0, inboundShipped: 0, inboundReceived: 0, inboundWorking: 0, awdAvailable: 0, awdInbound: 0 },
+    { asin: "ASIN1", productName: "Widget", brand: "Acme", sku: "SKU-1", unitsByMonth: { "2025-05": 10, "2025-06": 20, "2025-07": 7 }, mtdUnits: 3, fbaContext: "fba", inventoryConflict: false, fbaAvailable: 100, fbaInbound: 7, fbaReservedTotal: null, fbaFcTransfer: null, awdAvailable: 42, awdInbound: 15, awdAssumedZero: false },
+    { asin: "ASIN2", productName: "Gadget", brand: "Beta", sku: null, unitsByMonth: { "2025-05": 5, "2025-06": 0, "2025-07": 0 }, mtdUnits: 0, fbaContext: "absent", inventoryConflict: false, fbaAvailable: null, fbaInbound: null, fbaReservedTotal: null, fbaFcTransfer: null, awdAvailable: null, awdInbound: null, awdAssumedZero: false },
   ],
   accountSkus: ["SKU-1"],
   accountSkuDirectory: [{ sku: "SKU-1", childAsin: "ASIN1", productName: "Widget", brand: "Acme", marketplace: "US", provenance: "inventory" }],
   skuAsinConflicts: [], // no SKU maps to >1 child ASIN in this fixture (Fix B: the field is present + empty when clean)
   catalogByAsin: { ASIN1: { brand: "Acme", productName: "Widget" }, ASIN2: { brand: "Beta", productName: "Gadget" } },
   inventoryByBrandCountry: [{ country: "US", brand: "Acme", fbaAvailable: 100, skuCount: 1 }],
+  // Per-source freshness stamps (the assembled test fragments carry no fetch time).
+  listingsRefreshedAt: null,
+  healthFetchedAt: null,
 };
 
 /* ============================= route-payload parity (US + AWD) ============================= */
@@ -236,7 +275,7 @@ test("fba-plan: accountSkus is the FULL SKU universe -- includes multi-SKU ASINs
   const inv = [
     { date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-B", available: 1 },   // ASIN1 has TWO SKUs; only one is the row rep
     { date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-A", available: 1 },
-    { date: "2025-08-06", child_asin: "ASIN9", sku: "SKU-ZERO", available: 0, inbound_working: 0 }, // zero-activity ASIN -> dropped from rows
+    { date: "2025-08-06", child_asin: "ASIN9", sku: "SKU-ZERO", available: 0, inbound_working: 0, inbound_shipped: 0, inbound_received: 0 }, // zero-activity ASIN -> dropped from rows (every Health cell known: a blank one is UNKNOWN, never 0)
   ];
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: inv, awdRows: [] });
   const p = deriveFba(planned, rows).payload;
@@ -314,29 +353,29 @@ test("fba-plan: DURABLE-bridged OLI produces a BYTE-IDENTICAL payload to fetched
   const bridged = slicedOliSourceFromHistory({ historyRows: durableRows, accountId: ID, rawSellerId: ID, from: WINS[0].from, to: ASOF });
   const sources = buildSources(planned, rows);
   // The durable OLI reaches the derive via CONTEXT (fbaPlanDurableOli), exactly as makeFbaPlanDurableContextLoader
-  // supplies it; the catalog comes from the same durable path. inventory-health + AWD remain owned sources.
-  const context = { ...usContext(), fbaPlanDurableOli: { available: true, rows: bridged.rows, fragments: bridged.fragments }, fbaPlanDurableCatalog: sources["fba-plan:catalog"] };
+  // supplies it; the catalog + the READ-ONLY Health bridge come from the same durable path; AWD remains an owned source.
+  const context = { ...usContext(), fbaPlanDurableOli: { available: true, rows: bridged.rows, fragments: bridged.fragments }, fbaPlanDurableCatalog: sources["fba-plan:catalog"], fbaPlanHealthBridge: bridgeOf(rows) };
   const durable = deriveReportSnapshot({ reportKey: "fba-plan", sources, context });
   assert.equal(durable.status, "derived", "durable-bridged OLI derives");
   assert.deepEqual(durable.payload, fetched.payload, "durable OLI => byte-identical fba-plan payload; no derive change needed");
 });
 
-test("fba-plan: reserved_fc_transfer is stored RAW -- NO inbound-shipped subtraction (unproven overlap removed)", () => {
-  // The authoritative source metadata (inbound_quantity = sum of the 3 inbound states; reserved_fc_transfer is a
-  // SEPARATE reserved state) proves the two do NOT overlap, so reserved_fc_transfer is returned in full.
-  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  assert.equal(deriveFba(planned, rows).payload.rows[0].reservedFcTransfer, 8, "full reserved_fc_transfer, never 8-5");
-  // Even when inbound_shipped exceeds reserved_fc_transfer, the transfer reserve is returned in full (no floor-at-zero).
-  const inv2 = [{ date: "2025-08-06", child_asin: "ASIN1", sku: "SKU-1", available: 1, reserved_fc_transfer: 2, inbound_shipped: 9 }];
-  const two = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: inv2, awdRows: [] });
-  assert.equal(deriveFba(two.planned, two.rows).payload.rows[0].reservedFcTransfer, 2, "raw 2, never subtracted to 0");
-});
-
-test("fba-plan: reserved_customer_order + AWD inbound are folded (US); customer-order-reserved is display-only", () => {
+test("fba-plan (phase 2, Health fallback): inbound = working + shipped + received; Health reserved buckets are NEVER relabelled as Listings figures (reserved total / FC transfer null)", () => {
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const a1 = deriveFba(planned, rows).payload.rows.find((r) => r.asin === "ASIN1");
-  assert.equal(a1.customerOrderReserved, 4, "reserved_customer_order folded + displayed separately");
-  assert.equal(a1.awdInbound, 15, "awd_total_inbound_quantity folded (US)");
+  assert.equal(a1.fbaInbound, 0 + 5 + 2, "inbound working + shipped + received");
+  assert.equal(a1.fbaReservedTotal, null, "Health reserved (customer orders / FC) is not the Listings reserved total");
+  assert.equal(a1.fbaFcTransfer, null, "Health reserved_fc_transfer includes inbound units -- never shown as FC transfer");
+  for (const k of ["customerOrderReserved", "reservedFcTransfer", "reservedFcProcessing", "inboundWorking", "inboundShipped", "inboundReceived"]) assert.ok(!(k in a1), "the former Health row field " + k + " is gone");
+  assert.equal(a1.awdInbound, 15, "awd_total_inbound_quantity folded (US) from the Listings rows");
+});
+
+test("fba-plan (phase 2): a Health ASIN holding ONLY reserved units stays a row exactly as before (its reserved figures shown as unavailable)", () => {
+  const inv = [...INV, { date: "2025-08-06", child_asin: "ASIN7", sku: "SKU-7", available: 0, inbound_working: 0, inbound_shipped: 0, inbound_received: 0, reserved_customer_order: 3, reserved_fc_transfer: 0, reserved_fc_processing: 0 }];
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: inv, awdRows: AWD });
+  const a7 = deriveFba(planned, rows).payload.rows.find((r) => r.asin === "ASIN7");
+  assert.ok(a7, "the reserved-only ASIN is still a row");
+  assert.deepEqual([a7.fbaAvailable, a7.fbaInbound, a7.fbaReservedTotal, a7.fbaFcTransfer], [0, 0, null, null]);
 });
 
 test("fba-plan: completed-month + MTD units are preserved per ASIN", () => {
@@ -353,16 +392,17 @@ test("fba-plan: only the latest inventory snapshot date is folded", () => {
   assert.equal(p.rows[0].fbaAvailable, 100, "the older 999 snapshot row is ignored");
 });
 
-test("fba-plan: inventoryByBrandCountry folds per (marketplace, brand)", () => {
+test("fba-plan: inventoryByBrandCountry folds per (marketplace, brand) -- the SHARED roll-up over the selected source, keyed by the account's own marketplace", () => {
   const inv = [
-    { date: "2025-08-06", child_asin: "ASIN1", sku: "S1", marketplace_country_code: "US", available: 10 },
-    { date: "2025-08-06", child_asin: "ASIN2", sku: "S2", marketplace_country_code: "CA", available: 4 },
+    { date: "2025-08-06", child_asin: "ASIN1", sku: "S1", marketplace_country_code: "CA", available: 10, inbound_working: 0, inbound_shipped: 0, inbound_received: 0 },
+    { date: "2025-08-06", child_asin: "ASIN2", sku: "S2", marketplace_country_code: "CA", available: 4, inbound_working: 0, inbound_shipped: 1, inbound_received: 0 },
+    { date: "2025-08-06", child_asin: "ASIN3", sku: "S3", marketplace_country_code: "CA", available: 6, inbound_working: 0, inbound_shipped: 0, inbound_received: 0 },
   ];
-  const cat = [{ child_asin: "ASIN1", product_brand: "Acme" }, { child_asin: "ASIN2", product_brand: "Beta" }];
+  const cat = [{ child_asin: "ASIN1", product_brand: "Acme" }, { child_asin: "ASIN2", product_brand: "Beta" }, { child_asin: "ASIN3", product_brand: "Acme" }];
   const { planned, rows } = fbaPlanned({ oliByIdx: [[], [], [], []], catalogRows: cat, invRows: inv, awdRows: [] });
-  const fold = deriveFba(planned, rows).payload.inventoryByBrandCountry;
+  const fold = deriveFba(planned, rows, usContext({ marketCountry: "CA", isUS: false })).payload.inventoryByBrandCountry;
   assert.deepEqual(fold, [
-    { country: "US", brand: "Acme", fbaAvailable: 10, skuCount: 1 },
+    { country: "CA", brand: "Acme", fbaAvailable: 16, skuCount: 2 },
     { country: "CA", brand: "Beta", fbaAvailable: 4, skuCount: 1 },
   ]);
 });
@@ -397,11 +437,15 @@ test("fba-plan: a US account with a FAILED AWD source blocks", () => {
   assert.equal(res.status, "invalid");
 });
 
-test("fba-plan: a VALIDATED EMPTY AWD source is NOT a failure (no AWD rows -> genuine zero)", () => {
+test("fba-plan: a VALIDATED EMPTY Listings (AWD) source is NOT a failure; AWD is unavailable and a row's AWD is UNKNOWN (null), never a fabricated 0", () => {
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: [] });
-  const p = deriveFba(planned, rows, usContext()).payload;
-  assert.equal(p.awdAvailable, false, "empty AWD => availability false");
-  assert.equal(p.rows[0].awdAvailable, 0, "US row AWD is a genuine 0, not null");
+  const res = deriveFba(planned, rows, usContext());
+  assert.equal(res.status, "derived", "an empty Listings fragment derives (no block)");
+  const p = res.payload;
+  assert.equal(p.awdAvailable, false, "empty Listings => AWD availability false");
+  assert.equal(p.rows[0].awdAvailable, null, "row AWD unknown (null): no Listings evidence, never a fabricated 0");
+  assert.deepEqual(p.inventoryListingsReasons, ["listings-empty"]);
+  assert.equal(p.inventorySource, "health-fallback");
 });
 
 test("fba-plan: AWD projects BYTE-IDENTICALLY from a UNION-column canonical Listings row (extra listing_* columns ignored)", () => {
@@ -430,16 +474,19 @@ test("fba-plan: an EMPTY inventory snapshot makes every FBA field null (not zero
   const p = deriveFba(planned, rows).payload;
   assert.equal(p.inventoryAvailable, false);
   const a1 = p.rows.find((r) => r.asin === "ASIN1");
+  assert.equal(p.inventorySource, "unavailable");
   assert.equal(a1.fbaAvailable, null);
-  assert.equal(a1.reservedFcTransfer, null);
-  assert.equal(a1.inboundShipped, null);
+  assert.equal(a1.fbaInbound, null);
+  assert.equal(a1.fbaReservedTotal, null);
+  assert.equal(a1.fbaFcTransfer, null);
 });
 
-test("fba-plan: a present snapshot with the ASIN absent yields genuine ZERO FBA stock", () => {
+test("fba-plan (phase 2): a present snapshot with a SOLD ASIN absent from it is UNKNOWN (fbaContext absent, null) -- never a fabricated 0", () => {
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const a2 = deriveFba(planned, rows).payload.rows.find((r) => r.asin === "ASIN2");
-  assert.equal(a2.fbaAvailable, 0, "snapshot exists but ASIN2 absent => 0");
-  assert.equal(a2.reservedFcTransfer, 0);
+  assert.equal(a2.fbaContext, "absent");
+  assert.equal(a2.fbaAvailable, null, "snapshot exists but ASIN2 absent => unknown");
+  assert.equal(a2.fbaInbound, null);
 });
 
 test("fba-plan: zero-sales + zero-stock ASINs are dropped from rows", () => {
@@ -497,14 +544,16 @@ test("fba-plan: derivation performs ZERO fetch/DataDoe calls", async () => {
   assert.equal(calls.length, 0);
 });
 
-test("fba-plan: an unavailable required source preserves last-known-good (no snapshot)", () => {
-  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  // inventory-health is now the required OWNED source (OLI + catalog are durable derived deps). A failed required
-  // owned source yields "unavailable" (retryable) -> zero writes -> last-known-good preserved.
-  const invHash = planned.find((p) => p.requestKey === "fba-plan:inventory-health").requestHash;
-  const res = deriveFba(planned, rows, usContext(), { [invHash]: "failed" });
-  assert.equal(res.status, "unavailable");
-  assert.equal(res.payload, null);
+test("fba-plan (cutover): NO FBA Inventory Health source is required -- a missing READ-ONLY bridge never blocks; inventory is Unavailable (never 0) when Listings is not validated", () => {
+  assert.ok(!REPORT_ENTRY().requiredRequestKeys.includes("fba-plan:inventory-health"), "the retired Health request is never a required source");
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: null, awdRows: AWD });
+  const res = deriveFba(planned, rows, usContext());
+  assert.equal(res.status, "derived", "a US account with only its Listings derives (the retired Health source never blocks)");
+  assert.equal(res.payload.inventorySource, "unavailable");
+  assert.deepEqual(res.payload.inventoryHealthReasons, ["health-snapshot-missing"]);
+  assert.equal(res.payload.inventoryUnavailableReason, "listings-not-validated-and-no-health-snapshot");
+  assert.equal(res.payload.rows.find((r) => r.asin === "ASIN1").fbaAvailable, null, "never a fabricated 0");
+  assert.equal(res.payload.rows.find((r) => r.asin === "ASIN1").awdAvailable, 42, "AWD still comes from the Listings rows");
 });
 
 test("fba-plan: a MISSING durable OLI context is UNAVAILABLE (retryable defer), NOT terminal invalid; LKG preserved (defect 3)", () => {
@@ -566,11 +615,12 @@ test("planMonthWindows: matches the route formula (3 completed months + current 
   assert.deepEqual(planMonthWindows("2024-05-31").completed.map((m) => m.to), ["2024-02-29", "2024-03-31", "2024-04-30"]);
 });
 
-test("planFbaPlan: US account emits ONLY the owned FBA Health + AWD sources (OLI/catalog are derived), single-account, deterministic hashes", () => {
+test("planFbaPlan: US account emits ONLY the owned canonical Listings source (OLI/catalog are derived; FBA Inventory Health is retired), single-account, deterministic hashes", () => {
   const req = planFbaPlan({ accountId: ID, name: "Acme Co", country: "US", currency: "USD", connections: PL_CONN, asOf: ASOF });
   const keys = [...new Set(req.sources.map((s) => s.requestKey))].sort();
-  // OLI + catalog are durable derived dependencies -> NOT planned exports. Only FBA Health + US AWD are owned.
-  assert.deepEqual(keys, ["fba-plan:awd", "fba-plan:inventory-health"]);
+  // OLI + catalog are durable derived dependencies -> NOT planned exports; the saved Health snapshot is a READ-ONLY
+  // derived bridge. The canonical Listings (fba-plan:awd: FBA inventory + AWD) is the ONLY owned export.
+  assert.deepEqual(keys, ["fba-plan:awd"]);
   assert.ok(req.sources.every((s) => s.sellerOrVendorIds.length === 1 && s.sellerOrVendorIds[0] === ID));
   assert.deepEqual(req.context, { to: ASOF, rawSellerId: ID, accountName: "Acme Co", marketCountry: "US", isUS: true });
   const b = planFbaPlan({ accountId: ID, name: "Acme Co", country: "US", currency: "USD", connections: PL_CONN, asOf: ASOF }).sources.map((s) => s.requestHash);
@@ -603,32 +653,41 @@ test("foldPlanAsinUnits: sums grouped child_asin units in first-seen order", () 
 
 group("fba-plan: exact inventory + AWD window pinning");
 
-test("fba-plan: the canonical inventory window IS the EXACT single day asOf..asOf and AWD is null/null", () => {
+test("fba-plan (cutover): the inventory as-of is the plan's D-1 anchor of the READ-ONLY bridge (no Health window exists); AWD is null/null", () => {
   assert.equal(INV_WINDOW.from, ASOF);
   assert.equal(INV_WINDOW.to, ASOF);
 });
 
-test("fba-plan: ANY lookback window (from < asOf, e.g. the retired asOf-10 shape) blocks; payload null", () => {
-  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
-  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -10) };
+test("fba-plan (cutover): a bridge snapshot up to 2 days older than the inventory as-of is used (labelled + stale-flagged); 3 days older -> inventory Unavailable, the date + the rule reported, never 0", () => {
+  const at = (d) => INV.map((r) => ({ ...r, date: d }));
+  const ok = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: at(addDaysStr(ASOF, -2)), awdRows: AWD });
+  const p = deriveFba(ok.planned, ok.rows, usContext({ inventoryAsOf: ASOF })).payload;
+  assert.equal(p.inventorySource, "health-fallback");
+  assert.equal(p.inventoryHealthDate, addDaysStr(ASOF, -2));
+  assert.equal(p.inventoryStale, true, "older than the requested D-1: shown with its own date");
+  const old = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: at(addDaysStr(ASOF, -3)), awdRows: AWD });
+  const q = deriveFba(old.planned, old.rows, usContext({ inventoryAsOf: ASOF })).payload;
+  assert.equal(q.inventorySource, "unavailable");
+  assert.deepEqual(q.inventoryHealthReasons, ["health-bridge-stale:" + addDaysStr(ASOF, -3)]);
+  assert.equal(q.inventoryBridgeSnapshotDate, addDaysStr(ASOF, -3));
+  assert.equal(q.inventoryBridgeMaxAgeDays, 2);
+  assert.equal(q.rows.find((r) => r.asin === "ASIN1").fbaAvailable, null, "a stale bridge never drives a figure (never 0)");
+  assert.equal(q.inventoryDate, null, "a stale bridge is never the plan's inventory date");
+  assert.ok(!q.accountSkuDirectory.some((e) => e.provenance === "inventory"), "a stale bridge is never identity evidence");
+});
+
+test("fba-plan (cutover): a bridge snapshot dated AFTER the plan's inventory as-of is refused (typed), never folded", () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV.map((r) => ({ ...r, date: addDaysStr(ASOF, 1) })), awdRows: AWD });
+  const p = deriveFba(planned, rows).payload;
+  assert.equal(p.inventorySource, "unavailable");
+  assert.deepEqual(p.inventoryHealthReasons, ["health-bridge-after-as-of:" + addDaysStr(ASOF, 1)]);
+});
+
+test("fba-plan (cutover): a bridge row of ANOTHER seller blocks (fail closed: never folded, LKG preserved)", () => {
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV.map((r) => ({ ...r, seller_or_vendor_id: "OTHER" })), awdRows: AWD });
   const res = deriveFba(planned, rows);
   assert.equal(res.status, "invalid");
   assert.equal(res.payload, null);
-});
-
-test("fba-plan: a single-day window on the WRONG day (from = to = asOf-1) blocks", () => {
-  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
-  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -1), to: addDaysStr(ASOF, -1) };
-  assert.equal(deriveFba(planned, rows).status, "invalid");
-});
-
-test("fba-plan: a wrong inventory `to` (!= asOf) blocks", () => {
-  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
-  planned[idx] = { ...planned[idx], to: addDaysStr(ASOF, -1) };
-  assert.equal(deriveFba(planned, rows).status, "invalid");
 });
 
 test("fba-plan: a DATED AWD fragment (from/to not null) blocks; payload null", () => {
@@ -645,27 +704,24 @@ test("fba-plan: EXACT canonical windows still derive the identical payload", () 
   assert.deepEqual(deriveFba(planned, rows).payload, EXPECTED);
 });
 
-test("fba-plan: an inventory row dated on ANY other day than the requested D-1 blocks (no cross-date fold)", () => {
+test("fba-plan (cutover): a saved bridge snapshot is read at its LATEST date only (an older day's row is never summed or blocking)", () => {
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV_WITH_CROSS_DATE_ROW, awdRows: AWD });
   const res = deriveFba(planned, rows);
-  assert.equal(res.status, "invalid");
-  assert.equal(res.payload, null);
+  assert.equal(res.status, "derived");
+  assert.equal(res.payload.rows.find((r) => r.asin === "ASIN1").fbaAvailable, 100, "the older day's 999 is ignored");
 });
 
-test("planFbaPlan emits the canonical single-day inventory (asOf..asOf) + no-date AWD windows the derivation requires", () => {
+test("planFbaPlan emits NO FBA Inventory Health request (retired) + the no-date canonical Listings window the derivation requires", () => {
   const req = planFbaPlan({ accountId: ID, name: "Acme Co", country: "US", currency: "USD", connections: PL_CONN, asOf: ASOF });
-  const inv = req.sources.find((s) => s.requestKey === "fba-plan:inventory-health");
-  assert.equal(inv.from, ASOF);
-  assert.equal(inv.to, ASOF);
+  assert.equal(req.sources.find((s) => s.requestKey === "fba-plan:inventory-health"), undefined, "no Health request is ever planned");
   const awd = req.sources.find((s) => s.requestKey === "fba-plan:awd");
   assert.equal(awd.from, null);
   assert.equal(awd.to, null);
 });
 
-test("fba-plan worker: a shortened-inventory derive writes ZERO snapshots and preserves last-known-good", async () => {
-  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
-  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -9) }; // shortened -> derive invalid before save
+test("fba-plan worker: a bridge-integrity derive failure writes ZERO snapshots and preserves last-known-good", async () => {
+  // A bridge row of another seller (an isolation breach upstream) -> derive invalid before save.
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV.map((r) => ({ ...r, seller_or_vendor_id: "OTHER" })), awdRows: AWD });
   const { store, plannedReport, sourceRows, loadDerivedContext } = fbaReportPlan(planned, rows);
   const LKG = { asOf: "2025-07-01", rows: [{ asin: "PRIOR" }] };
   store.seedSnapshot("scheduler-v2/fba-plan", ID, LKG); // prior good (shadow-namespaced) snapshot
@@ -686,12 +742,17 @@ const durableOliRows = () => OLI.flat().map((r) => ({
   child_asin: r.child_asin, currency: r.item_price_currency || "USD", sales_amount: 0, units: r.total_units_sum,
 }));
 const fullCoverage = { read: "ok", windows: [{ from: WINS[0].from, to: ASOF }] };
+// The account's SAVED FBA Inventory Health pointer (source_snapshots 'fba-inventory-health', scope = the account): the
+// READ-ONLY bridge. The getters below answer it ONLY for that exact key (getSourceSnapshot semantics).
+const healthPointer = (over = {}) => ({ source_key: "fba-inventory-health", scope_key: ID, connection_id: "primary", object_path: "fba/" + ID + ".json", payload_sha: "s1", row_count: INV.length, source_request_hash: "hh", validated_at: "2025-08-06T03:05:00.000Z", ...over });
 const makeLoader = (over = {}) => makeFbaPlanDurableContextLoader({
   connections: PL_CONN,
   getOliCoverage: over.getOliCoverage || (async () => fullCoverage),
   getOliHistory: over.getOliHistory || (async () => durableOliRows()),
-  getCatalogSnapshot: over.getCatalogSnapshot || (async () => ({ read: "ok", snapshot: { object_path: "cat/x.json", validated_at: "2025-08-06T00:00:00Z" } })),
+  getCatalogSnapshot: over.getCatalogSnapshot || (async ({ sourceKey }) => ({ read: "ok", snapshot: sourceKey === "product-catalog" ? { object_path: "cat/x.json", validated_at: "2025-08-06T00:00:00Z" } : null })),
   loadCatalogPayload: over.loadCatalogPayload || (async () => ({ rows: CATALOG })),
+  getHealthSnapshot: over.getHealthSnapshot || (async ({ sourceKey, scopeKey, connectionId }) => ({ read: "ok", snapshot: sourceKey === "fba-inventory-health" && scopeKey === ID ? healthPointer({ connection_id: connectionId }) : null })),
+  loadHealthPayload: over.loadHealthPayload || (async (p) => ({ rows: p === "fba/" + ID + ".json" ? INV.map((r) => ({ ...r, seller_or_vendor_id: ID })) : [] })),
 });
 const loaderArgs = (over = {}) => ({ reportKey: "fba-plan", accountId: ID, planned: { context: usContext(over) } });
 
@@ -706,15 +767,43 @@ test("loader: returns {} for every report that is NOT fba-plan", async () => {
   assert.deepEqual(await makeLoader()({ reportKey: "daily-reporting", accountId: ID, planned: { context: usContext() } }), {});
 });
 
-test("loader: full durable coverage yields OLI + Catalog context that derives BYTE-IDENTICALLY", async () => {
+test("loader: full durable coverage yields OLI + Catalog + the READ-ONLY Health bridge context that derives BYTE-IDENTICALLY", async () => {
   const ctx = await makeLoader()(loaderArgs());
   assert.equal(ctx.fbaPlanDurableOli.available, true);
   assert.equal(ctx.fbaPlanDurableCatalog.available, true);
+  assert.equal(ctx.fbaPlanHealthBridge.available, true, "the account's last saved Health snapshot is read (read-only)");
+  assert.equal(ctx.fbaPlanHealthBridge.snapshotDate, ASOF);
+  assert.equal(ctx.fbaPlanHealthBridge.validatedAt, "2025-08-06T03:05:00.000Z");
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const sources = buildSources(planned, rows);
   const out = deriveReportSnapshot({ reportKey: "fba-plan", sources, context: { ...usContext(), ...ctx } });
   assert.equal(out.status, "derived");
-  assert.deepEqual(out.payload, EXPECTED, "durable loader OLI+catalog => byte-identical fba-plan payload");
+  assert.deepEqual({ ...out.payload, healthFetchedAt: null }, EXPECTED, "durable loader OLI + catalog + bridge => byte-identical fba-plan payload (modulo the bridge's recorded instant)");
+  assert.equal(out.payload.healthFetchedAt, "2025-08-06T03:05:00.000Z", "the bridge's recorded instant is stamped (it drives this plan)");
+});
+
+test("loader: the READ-ONLY Health bridge is SOFT -- missing / unreadable / another account's pointer / a foreign seller's rows arrive typed and never block", async () => {
+  const none = await makeLoader({ getHealthSnapshot: async () => ({ read: "ok", snapshot: null }) })(loaderArgs());
+  assert.deepEqual([none.fbaPlanHealthBridge.available, none.fbaPlanHealthBridge.reason], [false, "health-snapshot-missing"]);
+  assert.equal(none.fbaPlanDurableOli.available, true, "OLI + catalog still delivered");
+  const failed = await makeLoader({ getHealthSnapshot: async () => ({ read: "read-failed", snapshot: null }) })(loaderArgs());
+  assert.equal(failed.fbaPlanHealthBridge.reason, "health-bridge-read-failed");
+  const threw = await makeLoader({ getHealthSnapshot: async () => { throw new Error("boom"); } })(loaderArgs());
+  assert.equal(threw.fbaPlanHealthBridge.reason, "health-bridge-read-failed");
+  const foreignScope = await makeLoader({ getHealthSnapshot: async () => ({ read: "ok", snapshot: healthPointer({ scope_key: "OTHER" }) }) })(loaderArgs());
+  assert.equal(foreignScope.fbaPlanHealthBridge.reason, "health-bridge-pointer-integrity:cross-account-scope");
+  const foreignRows = await makeLoader({ loadHealthPayload: async () => ({ rows: INV.map((r) => ({ ...r, seller_or_vendor_id: "OTHER" })) }) })(loaderArgs());
+  assert.equal(foreignRows.fbaPlanHealthBridge.reason, "health-bridge-rows-invalid:cross-account");
+  const badCount = await makeLoader({ loadHealthPayload: async () => ({ rows: [] }) })(loaderArgs());
+  assert.equal(badCount.fbaPlanHealthBridge.reason, "health-bridge-rows-invalid:row-count-mismatch");
+  const unreadable = await makeLoader({ loadHealthPayload: async () => { throw new Error("SOURCE_SNAPSHOT_PAYLOAD_MISMATCH"); } })(loaderArgs());
+  assert.equal(unreadable.fbaPlanHealthBridge.reason, "health-bridge-payload-unreadable");
+  // A refused bridge never blocks: the derive proceeds (inventory Unavailable here: this fixture's Listings is not expanded).
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  const out = deriveReportSnapshot({ reportKey: "fba-plan", sources: buildSources(planned, rows), context: { ...usContext(), ...foreignRows } });
+  assert.equal(out.status, "derived");
+  assert.equal(out.payload.inventorySource, "unavailable");
+  assert.deepEqual(out.payload.inventoryHealthReasons, ["health-bridge-rows-invalid:cross-account"]);
 });
 
 test("loader: SHORT durable OLI coverage (ends before asOf) fails closed -> no OLI context (derive blocks)", async () => {
@@ -772,9 +861,8 @@ test("fba-plan worker: a missing durable OLI records SOURCE_UNAVAILABLE (retryab
 });
 
 test("fba-plan worker: an UNCODED genuine integrity error records DERIVE_INVALID with a SAFE per-stage STATIC message (raw detail NOT persisted) (defect 3 diagnostics)", async () => {
-  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  const idx = planned.findIndex((p) => p.requestKey === "fba-plan:inventory-health");
-  planned[idx] = { ...planned[idx], from: addDaysStr(ASOF, -9) }; // wrong inventory window => genuine integrity invalid (uncoded)
+  // A bridge row of another seller => genuine integrity invalid (uncoded).
+  const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV.map((r) => ({ ...r, seller_or_vendor_id: "OTHER" })), awdRows: AWD });
   const base = capturingReportPlan(planned, rows);
   let saveCalls = 0; const saveSnapshot = async () => { saveCalls += 1; return { paramsHash: "ph" }; };
   await runReportJobs({ store: base.store, cycleId: "cycI", sourceRows: base.sourceRows, saveSnapshot, plannedReports: [base.plannedReport], loadDerivedContext: base.loadDerivedContext });
@@ -924,11 +1012,11 @@ function makeLifecycleStore() {
 test("fba-plan worker/store: an UNAVAILABLE dependency in cycle A recovers in cycle B when saved inputs arrive -- LKG preserved, no duplicate export/write (defect 3 next-cycle lifecycle)", async () => {
   const { planned, rows } = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
   const store = makeLifecycleStore();
-  // Owned source deps (inventory-health + AWD) are the shared cache, seeded succeeded ONCE (never re-created).
-  const owned = planned.filter((p) => p.requestKey === "fba-plan:inventory-health" || p.requestKey === "fba-plan:awd");
+  // The owned source dep (the canonical Listings / AWD) is the shared cache, seeded succeeded ONCE (never re-created).
+  const owned = planned.filter((p) => p.requestKey === "fba-plan:awd");
   for (const p of owned) store.seedSourceSucceeded(p.requestHash);
   const sources = owned.map((p) => ({ ...p, optional: p.requestKey === "fba-plan:awd" }));
-  const plannedReport = { reportKey: "fba-plan", accountId: ID, connectionId: "primary", bucket: "us", reportVersion: "fba-plan/v2d-5", sources, context: usContext() };
+  const plannedReport = { reportKey: "fba-plan", accountId: ID, connectionId: "primary", bucket: "us", reportVersion: "fba-plan/v3-cutover", sources, context: usContext() };
   const sourceRows = (hash) => (Object.prototype.hasOwnProperty.call(rows, hash) ? { rows: rows[hash] } : { rows: [] });
   const derived = buildSources(planned, rows);
   store.seedSnapshot("scheduler-v2/fba-plan", ID, { asOf: "2025-07-01", rows: [{ asin: "PRIOR-LKG" }] }); // prior good snapshot
@@ -968,10 +1056,12 @@ const bAsOfFor = () => ASOF;
 test("planFbaPlanBucketBatched: single-marketplace <=5 batches, per-account owner metadata, all-marketplace canonical Listings", () => {
   const reqs = planFbaPlanBucketBatched({ accounts: bAccounts, connections: PL_CONN, asOfFor: bAsOfFor });
   assert.equal(reqs.length, 3, "one report request per account");
-  // US1+US2 share ONE FBA batch hash; IN1 is a SEPARATE marketplace batch (never mixed with US).
-  const invHash = (id) => reqs.find((r) => r.accountId === id).sources.find((s) => s.requestKey === "fba-plan:inventory-health").requestHash;
-  assert.equal(invHash("US1"), invHash("US2"), "US1 + US2 share ONE batched FBA export (<=5, same marketplace)");
-  assert.notEqual(invHash("US1"), invHash("IN1"), "IN never batches with US (marketplace-safe)");
+  // US1+US2 share ONE canonical Listings batch hash; IN1 is a SEPARATE marketplace batch (never mixed with US). No FBA
+  // Inventory Health request is planned (retired).
+  const lstHash = (id) => reqs.find((r) => r.accountId === id).sources.find((s) => s.requestKey === "fba-plan:awd").requestHash;
+  assert.ok(reqs.every((r) => !r.sources.some((s) => s.requestKey === "fba-plan:inventory-health")), "no Health request planned");
+  assert.equal(lstHash("US1"), lstHash("US2"), "US1 + US2 share ONE batched Listings export (<=5, same marketplace)");
+  assert.notEqual(lstHash("US1"), lstHash("IN1"), "IN never batches with US (marketplace-safe)");
   // The canonical Listings (fba-plan:awd) is now planned for EVERY marketplace (shared byte-for-byte with
   // listing-health-v3:listings): US AND IN carry it. AWD ELIGIBILITY is decided in the DERIVE (awdCapableMarketplace),
   // so IN fetches the shared Listings snapshot but its AWD stays honestly unavailable -- never a fabricated zero.
@@ -1006,9 +1096,8 @@ test("planFbaPlanBucketBatched: UK accounts batch under the GB marketplace (neve
   const reqs = planFbaPlanBucketBatched({ accounts: uk, connections: PL_CONN, asOfFor: bAsOfFor });
   assert.equal(reqs.length, 2, "one request per UK account");
   for (const r of reqs) for (const s of r.sources) assert.equal(s.marketplaceConstraint, "GB", "UK batch marketplace normalized to GB");
-  // Both UK accounts share ONE batched FBA export (same GB marketplace partition).
-  const invHashes = new Set(reqs.map((r) => r.sources.find((s) => s.requestKey === "fba-plan:inventory-health").requestHash));
-  assert.equal(invHashes.size, 1, "UK accounts batch together under GB");
+  // No FBA Inventory Health request (retired); both UK accounts share ONE batched Listings export (GB partition, below).
+  assert.ok(reqs.every((r) => !r.sources.some((s) => s.requestKey === "fba-plan:inventory-health")), "no Health request planned");
   // UK is an AWD-capable EU5 marketplace (Europe AWD support): it NOW resolves the AWD source (batched under GB).
   assert.ok(reqs.every((r) => r.sources.some((s) => s.requestKey === "fba-plan:awd")), "UK (EU5) resolves AWD");
   const awdHashes = new Set(reqs.map((r) => r.sources.find((s) => s.requestKey === "fba-plan:awd").requestHash));
@@ -1026,16 +1115,14 @@ test("planFbaPlanBucketBatched: an Australia account STILL plans the canonical L
   assert.equal(awdCapableMarketplace("AU"), false, "Australia is excluded from AWD eligibility (derive gate)");
 });
 
-test("fba-plan BATCHED derive ISOLATES each account's rows from a shared <=5-seller FBA/AWD export (no cross-account leak)", async () => {
+test("fba-plan BATCHED derive ISOLATES each account's rows from a shared <=5-seller canonical Listings export (no cross-account leak)", async () => {
   const reqs = planFbaPlanBucketBatched({ accounts: [bAccounts[0], bAccounts[1]], connections: PL_CONN, asOfFor: bAsOfFor });
-  // The two US accounts share ONE FBA + ONE AWD export. Its rows carry BOTH accounts (tagged by seller_or_vendor_id).
-  const invRow = (seller, asin, avail) => ({ date: ASOF, seller_or_vendor_id: seller, child_asin: asin, sku: "S-" + seller, marketplace_country_code: "US", available: avail, reserved_customer_order: 0, reserved_fc_transfer: 0, reserved_fc_processing: 0, inbound_working: 0, inbound_shipped: 0, inbound_received: 0, product_name: "P-" + asin });
-  const awdRow = (seller, asin, qty) => ({ marketplace_country_code: "US", seller_or_vendor_id: seller, child_asin: asin, sku: "S-" + seller, awd_available_distributable_quantity: qty, awd_total_inbound_quantity: 0 });
-  const invHash = reqs[0].sources.find((s) => s.requestKey === "fba-plan:inventory-health").requestHash;
+  // The two US accounts share ONE canonical Listings export (FBA inventory + AWD; no Health export exists). Its rows carry
+  // BOTH accounts (tagged by seller_or_vendor_id); each account's EXPANDED Listings validates, so FBA comes from Listings.
+  const awdRow = (seller, asin, qty, avail) => ({ marketplace_country_code: "US", seller_or_vendor_id: seller, child_asin: asin, sku: "S-" + seller, fnsku: "X-" + seller, listing_fulfillment_channel: "AMAZON_NA", fba_quantity_available: avail, fba_quantity_inbound: 0, fba_quantity_reserved: 0, fba_quantity_fc_transfer: 0, awd_available_distributable_quantity: qty, awd_total_inbound_quantity: 0 });
   const awdHash = reqs[0].sources.find((s) => s.requestKey === "fba-plan:awd").requestHash;
   const rowsByHash = {
-    [invHash]: [invRow("US1", "ASIN1", 100), invRow("US2", "ASIN2", 50)], // BOTH accounts in the one shared export
-    [awdHash]: [awdRow("US1", "ASIN1", 10), awdRow("US2", "ASIN2", 20)],
+    [awdHash]: [awdRow("US1", "ASIN1", 10, 100), awdRow("US2", "ASIN2", 20, 50)], // BOTH accounts in the one shared export
   };
   // Durable OLI (empty -> valid canonical slice sequence, zero sales) + org catalog for both ASINs, per account.
   const catalog = [{ child_asin: "ASIN1", product_brand: "B1", product_name: "P-ASIN1" }, { child_asin: "ASIN2", product_brand: "B2", product_name: "P-ASIN2" }];
@@ -1048,7 +1135,7 @@ test("fba-plan BATCHED derive ISOLATES each account's rows from a shared <=5-sel
     };
   };
   const store = makeReportStore();
-  for (const h of [invHash, awdHash]) store.seedSourceSucceeded(h);
+  for (const h of [awdHash]) store.seedSourceSucceeded(h);
   const saved = new Map();
   const saveSnapshot = async ({ reportKey, accountId, payload }) => { saved.set(accountId, payload); return { paramsHash: "ph-" + accountId }; };
   const sourceRows = (h) => (Object.prototype.hasOwnProperty.call(rowsByHash, h) ? { rows: rowsByHash[h] } : { rows: [] });
@@ -1073,10 +1160,9 @@ test("fba-plan BATCHED derive ISOLATES each account's rows from a shared <=5-sel
 test("fba-plan BATCHED derive FAILS CLOSED without owner metadata (a batched source can never leak the full batch)", async () => {
   const reqs = planFbaPlanBucketBatched({ accounts: [bAccounts[0], bAccounts[1]], connections: PL_CONN, asOfFor: bAsOfFor });
   const stripped = reqs.map((r) => ({ ...r, owner: undefined })); // simulate a bug dropping owner metadata
-  const invHash = reqs[0].sources.find((s) => s.requestKey === "fba-plan:inventory-health").requestHash;
   const awdHash = reqs[0].sources.find((s) => s.requestKey === "fba-plan:awd").requestHash;
   const store = makeReportStore();
-  for (const h of [invHash, awdHash]) store.seedSourceSucceeded(h);
+  for (const h of [awdHash]) store.seedSourceSucceeded(h);
   let saveCalls = 0;
   const saveSnapshot = async () => { saveCalls += 1; return { paramsHash: "x" }; };
   await runReportJobs({ store, cycleId: "cycC", sourceRows: () => ({ rows: [] }), saveSnapshot, plannedReports: stripped, loadDerivedContext: async () => ({}) });
@@ -1149,13 +1235,22 @@ test("the SAME truncated shared canonical Listings is INERT for a NON-AWD (CA) c
   // AWD-capable: the derive never reads fba-plan:awd for it, so its outcome must be byte-identical with or without the
   // truncation. Compare a HEALTHY-AWD CA derive against the truncated-AWD CA derive: identical status AND payload.
   const caCtx = usContext({ marketCountry: "CA", isUS: false });
-  const healthy = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
-  const truncated = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV, awdRows: AWD });
+  // The CA account's OWN Health rows carry its marketplace (real snapshots are isolated per seller + marketplace; a
+  // Health row of another marketplace is an integrity failure in the phase-2 fold).
+  const INV_CA = INV.map((r) => ({ ...r, marketplace_country_code: "CA" }));
+  const healthy = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV_CA, awdRows: AWD });
+  const truncated = fbaPlanned({ oliByIdx: OLI, catalogRows: CATALOG, invRows: INV_CA, awdRows: AWD });
   const awdHashT = truncated.planned.find((p) => p.requestKey === "fba-plan:awd").requestHash;
   const resHealthy = deriveFba(healthy.planned, healthy.rows, caCtx);
   const resTruncated = deriveFba(truncated.planned, truncated.rows, caCtx, { [awdHashT]: "truncated" });
-  assert.equal(resTruncated.status, resHealthy.status, "CA's derive status is identical with or without the shared Listings truncation");
-  assert.deepEqual(resTruncated.payload, resHealthy.payload, "and CA's payload is byte-identical -> a co-member's Listings truncation cannot leak into a non-AWD account");
+  // Phase 2: CA now READS the shared Listings (its FBA inventory evidence). A truncated Listings is never used (the strict
+  // source worker refused it): CA still derives -- never blocked -- from its labelled FBA Inventory Health fallback, with
+  // the typed reason; its FBA rows are the same Health figures either way (this fixture's Listings is pre-expansion).
+  assert.equal(resTruncated.status, "derived", "CA still derives with a truncated shared Listings (never blocked by a co-member's export)");
+  assert.equal(resTruncated.status, resHealthy.status);
+  assert.equal(resTruncated.payload.inventorySource, "health-fallback");
+  assert.deepEqual(resTruncated.payload.inventoryListingsReasons, ["listings-source-unavailable"], "the truncated Listings is labelled, never used");
+  assert.deepEqual(resTruncated.payload.rows, resHealthy.payload.rows, "CA's plan rows are identical -> a co-member's Listings truncation cannot leak into another account");
   assert.equal(resTruncated.payload && resTruncated.payload.awdEligible, false, "CA is not AWD-eligible (its AWD stays honestly unavailable, never a fabricated zero)");
 });
 
@@ -1164,7 +1259,7 @@ test("the SAME truncated shared canonical Listings is INERT for a NON-AWD (CA) c
 async function main() {
   mark("main(): loading fba-plan modules");
   ({ assembleSources, runReportJobs, sanitizeReportDiagnostic } = await import("../lib/server/sync/report-worker.js"));
-  ({ deriveReportSnapshot } = await import("../lib/server/sync/report-derivation.js"));
+  ({ deriveReportSnapshot, REPORT_DERIVATIONS } = await import("../lib/server/sync/report-derivation.js"));
   ({ fbaPlanPayload, foldPlanAsinUnits } = await import("../lib/server/reports/derivation-core.js"));
   ({ planMonthWindows, addDaysStr, canonicalOliSlices } = await import("../lib/server/date-windows.js"));
   ({ planFbaPlan, planFbaPlanBucketBatched, marketplaceCodeFor } = await import("../lib/server/sync/report-planner.js"));

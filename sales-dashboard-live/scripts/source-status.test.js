@@ -137,7 +137,7 @@ test("B3. an unhealthy Ads/inventory source DEGRADES its dashboard half without 
   assert.deepEqual([...daily.degradedBy], [{ sourceKey: "ads-campaign-date", reason: "last-run-failed" }], "Daily degrades on the CAMPAIGN grain only");
   const bv = summary.find((r) => r.dashboard === "brand-view");
   assert.equal(bv.ready, true);
-  // Post ASIN->Campaign cutover Brand View degrades on the ACTIVE Campaign grain (+ FBA health), never ASIN.
+  // Post ASIN->Campaign cutover Brand View degrades on the ACTIVE Campaign grain (+ the Listings inventory), never ASIN.
   assert.deepEqual([...bv.degradedBy], [{ sourceKey: "ads-campaign-date", reason: "last-run-failed" }], "Brand View degrades on the active Campaign grain, not ASIN");
   assert.ok(!bv.degradedBy.some((d) => d.sourceKey === "ads-asin-date"), "no active Brand View readiness references ads-asin-date");
 });
@@ -189,6 +189,8 @@ function makeComposition({ paused = [], calls, adsCoverage = null } = {}) {
     readSourceControls: async () => ({ rows: paused.map((k) => ({ source_key: k, paused: true, schedule_enabled: false })), read: "ok", error: null }),
     readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: "2026-08-19" }], read: "ok", error: null }),
     readSnapshot: async () => ({ snapshot: null, read: "ok", error: null }),
+    // The saved Listings pointer (FBA inventory evidence since the Listings inventory cutover): none yet.
+    readListingsSnapshot: async () => ({ snapshot: null, read: "ok", error: null }),
     readAdsCoverage: async (accountId, sourceKey) => {
       record.adsCoverageReads.push({ accountId, sourceKey });
       return adsCoverage ? adsCoverage(sourceKey, accountId) : { windows: [], read: "ok", error: null };
@@ -215,7 +217,7 @@ test("C1. construction performs ZERO I/O; run() discovers once and scopes onlySo
   assert.equal(record.discovery, 1, "exactly one accounts GET");
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   assert.deepEqual(record.creates.map((c) => c.sourceKey), ["product-catalog"], "ONLY the requested family exported");
-  assert.deepEqual(rollup.skippedPaused.sort(), ["fba-inventory-health", "order-line-items"], "the other sync families were scope-paused for this run");
+  assert.deepEqual(rollup.skippedPaused.sort(), ["order-line-items"], "the other sync family was scope-paused for this run (no FBA family: FBA Inventory Health is retired)");
 });
 
 test("C2. a durably PAUSED source cannot be force-synced (typed 409); unknown source fails closed", async () => {
@@ -277,11 +279,11 @@ test("C-ADS3. a forged manual ASIN card action is refused BEFORE any preflight/c
   assert.equal(record.adsCoverageReads.length, 0, "refused BEFORE any coverage / DataDoe / token I/O");
 });
 
-test("C-ADS4. active readiness identities use the ACTIVE Campaign grain (Brand View also FBA); NO ads-asin-date; derived from the single authority; rollback stays possible", () => {
+test("C-ADS4. active readiness identities use the ACTIVE Campaign grain (Brand View also the Listings inventory); NO ads-asin-date; derived from the single authority; rollback stays possible", () => {
   const daily = status.PRIORITY_DASHBOARD_SOURCES["daily-reporting"];
   const bv = status.PRIORITY_DASHBOARD_SOURCES["brand-view"];
   assert.deepEqual([...daily.degrading], ["ads-campaign-date"], "Daily degrades on the active Campaign grain");
-  assert.deepEqual([...bv.degrading], ["ads-campaign-date", "fba-inventory-health"], "Brand View degrades on Campaign Ads + FBA health");
+  assert.deepEqual([...bv.degrading], ["ads-campaign-date", "listings"], "Brand View degrades on Campaign Ads + the Listings inventory source (FBA Inventory Health is retired)");
   for (const d of [daily, bv]) {
     assert.ok(!d.degrading.includes("ads-asin-date") && !d.blocking.includes("ads-asin-date"), "no active readiness references ads-asin-date");
   }
@@ -294,6 +296,15 @@ test("C-ADS4. active readiness identities use the ACTIVE Campaign grain (Brand V
   assert.equal(adsSrc.ADS_ACTIVE_SOURCE, "campaign", "Campaign is the single active READ source");
   assert.deepEqual([...adsSrc.RETIRED_ADS_REGISTRY_KEYS], [], "nothing retired");
   assert.deepEqual([...adsSrc.RUNNER_ONLY_ADS_EXPORT_SOURCE_KEYS], ["asin-performance-v1"], "ASIN exports are runner-only while Campaign is the read grain");
+});
+
+test("C-LST. Listings inventory cutover: NO Data Sync Center card, readiness source or degrading source names the retired fba-inventory-health; the Listings card exists in both buckets", () => {
+  for (const bucket of status.CARD_BUCKETS) {
+    const cards = status.shapeSourceCards({ bucket, controls: [], runStatuses: [] });
+    assert.ok(!JSON.stringify(cards).includes("inventory-health"), bucket + ": no card names fba-inventory-health");
+    assert.ok(cards.some((c) => (c.sourceKey ?? c.source_key) === "listings"), bucket + ": the Listings card exists");
+  }
+  assert.ok(!JSON.stringify(status.PRIORITY_DASHBOARD_SOURCES).includes("inventory-health"), "no dashboard readiness names fba-inventory-health");
 });
 
 group("D. endpoint structural pins");

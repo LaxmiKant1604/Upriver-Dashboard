@@ -336,7 +336,7 @@ const OLI_ASOF = "2025-08-10";
 const bbOli = () => reportSourceRequestHashes({ reportKey: "buy-box-loss", apiKey: "k", ids: ["A1"], windowsByRequestKey: {
   "buy-box-loss:daily": [{ from: "2025-07-14", to: "2025-07-20" }],
   "buy-box-loss:oli-sales": canonicalOliSlices(addDaysStr(OLI_ASOF, -27), OLI_ASOF),
-  "buy-box-loss:inventory": [{ from: "2025-07-31", to: OLI_ASOF }],
+  // (no buy-box-loss:inventory window: FBA Inventory Health is retired)
   "buy-box-loss:catalog": [{ from: null, to: null }],
 } }).filter((r) => r.requestKey === "buy-box-loss:oli-sales");
 const ppcOli = () => reportSourceRequestHashes({ reportKey: "ppc-performance", apiKey: "k", ids: ["A1"], windowsByRequestKey: {

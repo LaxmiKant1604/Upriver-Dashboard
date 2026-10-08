@@ -28,12 +28,12 @@ const TERMINAL = new Set(["succeeded", "partial", "failed"]);
 const OK_FINALIZE = new Set(["finalized", "already-terminal"]);
 const OK_PUBLISH = new Set(["published", "already-current", "newer-live"]);
 
-// The FBA source cards the Data Sync Center + scheduler drive through THIS operation. Both map to the ONE
-// fba-plan pipeline: the pipeline fetches FBA Inventory Health for the bucket and, for the AWD-CAPABLE marketplaces
-// (US + the EU5 -- GB/UK, DE, FR, IT, ES; see lib/server/reports/awd-capability.js), Listings/AWD. Syncing either card
-// runs the same bucket pipeline (the pipeline decides AWD eligibility per-account by marketplace capability); Listings
-// on a non-AWD marketplace is therefore a no-op source for that account.
-export const FBA_OPERATION_SOURCE_KEYS = Object.freeze(["fba-inventory-health", "listings"]);
+// The FBA source card the Data Sync Center + scheduler drive through THIS operation maps to the ONE fba-plan pipeline:
+// the pipeline fetches the canonical Listings export for the bucket (FBA inventory for every marketplace; AWD decided
+// per account by marketplace capability -- US + the EU5, see lib/server/reports/awd-capability.js).
+// Listings inventory cutover: the canonical Listings export is the ONLY owned fba-plan source (FBA inventory + AWD);
+// FBA Inventory Health is retired and is no longer an FBA operation source (or a Data Sync Center card).
+export const FBA_OPERATION_SOURCE_KEYS = Object.freeze(["listings"]);
 export function isFbaOperationSource(sourceKey) { return FBA_OPERATION_SOURCE_KEYS.includes(S(sourceKey).trim()); }
 
 // The dedicated fba-plan cycle bucket namespace (us-fba / non-us-fba) -- NEVER collides with the scheduler-v2
@@ -210,8 +210,9 @@ export async function advanceFbaPlanBucket({
   verifyLease = null,
   // ZERO-EXPORT durable FBA source-snapshot persist (backstop enabler). Injected async collaborator:
   //   ({ reportRequests, includedIds, inventoryAsOf, bucket, accountsById, outOfTime }) => { persisted, skipped, failed }
-  // It reuses the ALREADY-FETCHED source-job cache (never a create) to write public.source_snapshots(
-  // fba-inventory-health) per account -- the exact durable evidence the zero-export FBA reconciler reads. Runs ONCE
+  // It reuses the ALREADY-FETCHED source-job cache (never a create) to write the saved Listings pointer
+  // (public.source_listings_snapshot; FBA Inventory Health is retired) per account -- the exact durable evidence the
+  // zero-export FBA reconciler reads. Runs ONCE
   // after the cycle drains (before publish), so a fetch that already spent tokens also lands the durable source the
   // backstop needs. NON-FATAL + idempotent + per-account isolated. Default null => byte-identical prior behavior.
   persistDurableFbaSnapshots = null,
@@ -308,7 +309,7 @@ export async function advanceFbaPlanBucket({
   }
   base.cycleId = S(cycleId); // the durable FBA cycle this operation published from (evidence provenance)
 
-  // The ZERO-EXPORT durable-source persist (public.source_snapshots(fba-inventory-health), the FBA backstop enabler)
+  // The ZERO-EXPORT durable-source persist (the saved Listings pointer, public.source_listings_snapshot -- the FBA backstop enabler)
   // runs AFTER the publish phase converges -- see runDurableFbaBackstop() below. It was DELIBERATELY moved off the
   // pre-publish path: it iterates included accounts sequentially (cache read + storage write + record per account),
   // and on the BOUNDED manual route (~50s slice) that sequential work, run BEFORE publish, could consume the whole
@@ -425,7 +426,7 @@ export async function advanceFbaPlanBucket({
     } catch (e) { log(bucket + " WARN ownership backfill failed (re-runnable, non-fatal): " + S(e && e.message ? e.message : e)); }
   }
 
-  // ---------------- DURABLE SOURCE persist (ZERO export): land public.source_snapshots(fba-inventory-health) ----
+  // ---------------- DURABLE SOURCE persist (ZERO export): land the saved Listings snapshot (source_listings_snapshot) ----
   // Runs AFTER publish + read-back + ownership (the live-publication work gets the bounded slice FIRST), but BEFORE
   // every terminal outcome return -- so the backstop is attempted on complete AND partial AND zero-published AND
   // read-back-mismatch (it is most needed exactly when publish did not fully succeed), yet never on a publish
@@ -450,10 +451,9 @@ export async function advanceFbaPlanBucket({
     } else {
       try {
         const accountsById = new Map((bucketAccounts || []).filter((a) => a && a.accountId).map((a) => [S(a.accountId), { country: S(a.country) }]));
-        // The FBA durable identity binds inventoryAsOf (the D-1 snapshot day), NEVER the sales asOf -- the reconciler
-        // recomputes resolveExpectedRequestHash({asOf:inventoryAsOf}); a snapshot bound to asOf would defer forever
-        // (snapshot-not-d1) when sales-asOf != D-1. inventoryAsOf||asOf is only a fallback for the (natural) case where
-        // the two are the same day; when they legitimately differ, inventoryAsOf is authoritative.
+        // The saved Listings pointer's as_of is the cycle's inventoryAsOf (the day the zero-export readers prove freshness
+        // against), NEVER the sales asOf. inventoryAsOf||asOf is only a fallback for the (natural) case where the two
+        // are the same day. Listings itself carries no date; validated_at is the Listings fetch time.
         const pr = await persistDurableFbaSnapshots({ reportRequests, includedIds: included, inventoryAsOf: inventoryAsOf || asOf, bucket, accountsById, outOfTime, log });
         const persisted = pr && Array.isArray(pr.persisted) ? pr.persisted : [];
         const skipped = pr && Array.isArray(pr.skipped) ? pr.skipped : [];

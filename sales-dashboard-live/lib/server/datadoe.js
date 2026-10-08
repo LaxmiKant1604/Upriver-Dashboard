@@ -251,7 +251,35 @@ export async function fetchAccounts(apiKey, attempt = 0) {
   return detailed.map(({ readiness: _readiness, ...account }) => account);
 }
 
+// RETIRED DataDoe sources: no code path may create an export for them. FBA Inventory Health (44fc5ba0ce...) is retired by
+// the Listings inventory cutover (2026-10): FBA inventory comes from the canonical Listings export. Refused HERE -- the
+// single create path every report builder, scheduler source job, Data Sync Center sync, onboarding step and recovery
+// operator goes through -- BEFORE authorization or any network call, so no scheduled, retried, recovered, onboarding or
+// manual path can spend a token on it. A short (>= 10-char) id prefix is refused too. The SAVED Health snapshots
+// (source_snapshots 'fba-inventory-health') stay READABLE as the dated read-only bridge (lib/server/inventory-source.js);
+// only creation is refused.
+export const RETIRED_DATADOE_SOURCE_IDS = Object.freeze(["44fc5ba0ce81a7807601f6d7a9b8b7aaec64be4c7e046ea30dc6864d1a4aa823"]);
+export const RETIRED_SOURCE_ERROR_CODE = "HEALTH_SOURCE_RETIRED";
+export const RETIRED_SOURCE_MESSAGE = "FBA Inventory Health is retired: FBA inventory comes from the canonical Listings export (the last saved Health snapshot is shown only as a dated read-only bridge). No export was created.";
+export function isRetiredDataDoeSourceId(sourceId) {
+  const id = String(sourceId || "").trim().toLowerCase();
+  if (!id) return false;
+  return RETIRED_DATADOE_SOURCE_IDS.some((r) => r === id || (id.length >= 10 && r.startsWith(id)));
+}
+export function isRetiredSourceError(error) {
+  return !!error && error.code === RETIRED_SOURCE_ERROR_CODE;
+}
+export function assertSourceNotRetired(sourceId) {
+  if (!isRetiredDataDoeSourceId(sourceId)) return;
+  const err = new Error(RETIRED_SOURCE_MESSAGE);
+  err.code = RETIRED_SOURCE_ERROR_CODE;
+  err.status = 409;
+  err.retryable = false;
+  throw err;
+}
+
 export async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit, options = {}) {
+  assertSourceNotRetired(sourceId); // a retired source is refused before authorization or any network call
   const { groupBy, aggregations, orderByColumn = "date", orderByDirection = "ASC" } = options;
   const r = await ddFetch(ENDPOINTS.exportsCreate, {
     method: "POST",
@@ -520,6 +548,9 @@ async function fetchSourceChunk(apiKey, sourceId, columns, ids, from, to, limit,
 // aggregations, date window, row cap and ordering; incompatible requests can
 // never collide.
 export async function fetchExportRows(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit, options = {}) {
+  // A retired source is refused BEFORE the export cache, the manual continuation marker and any create: no builder fetches
+  // it through this path (a saved Health snapshot is read only through the dated read-only bridge, never the export cache).
+  assertSourceNotRetired(sourceId);
   const chunks = chunkArray(sellerOrVendorIds, MAX_SELLER_OR_VENDOR_IDS_PER_EXPORT);
   const allRows = [];
 

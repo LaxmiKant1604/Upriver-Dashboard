@@ -13,6 +13,8 @@ import { assertAdmin, getDashboardAccess, insertAuditLog, getSourceControls, get
 import { primaryOrganizationFingerprint } from "../../lib/server/datadoe-connections.js";
 import { shapeSourceCards, dashboardReadinessSummary, CARD_BUCKETS } from "../../lib/server/sync/source-status.js";
 import { sourceRegistryEntry } from "../../lib/server/sync/source-registry.js";
+import { isRetiredSourceKey } from "../../lib/server/source-contracts.js";
+import { RETIRED_SOURCE_ERROR_CODE, RETIRED_SOURCE_MESSAGE } from "../../lib/server/datadoe.js";
 import { buildBucketSourceSyncRuntime } from "../../lib/server/sync/source-bucket-sync-runtime.js";
 import { validateSourceSyncRequest, runReleaseSlice, ORCHESTRATED_SOURCE_KEYS } from "../../lib/server/sync/source-sync-operation.js";
 import { isFbaOperationSource, resolveFbaPlanScope, planFbaBucketCost, buildFbaBucketPlan, fbaBucketAccounts, advanceFbaPlanBucket, fbaServerCeiling, fbaCycleBucket, fbaInventoryAsOf } from "../../lib/server/sync/fba-plan-operation.js";
@@ -117,6 +119,11 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
 
     if (req.method === "PATCH") {
       const sourceKey = String(body.sourceKey || "");
+      // A RETIRED DataDoe source (FBA Inventory Health) has no control to operate: typed refusal, zero writes.
+      if (isRetiredSourceKey(sourceKey)) {
+        res.status(409).json({ error: RETIRED_SOURCE_ERROR_CODE, code: RETIRED_SOURCE_ERROR_CODE, sourceKey, retryable: false, message: RETIRED_SOURCE_MESSAGE });
+        return;
+      }
       try { sourceRegistryEntry(sourceKey); } catch {
         res.status(400).json({ error: "Unknown source." });
         return;
@@ -157,6 +164,12 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
         return;
       }
       const onlySourceKey = body.sourceKey ? String(body.sourceKey) : null;
+      // A RETIRED DataDoe source (FBA Inventory Health): typed, user-readable, NEVER-retryable refusal BEFORE any preview /
+      // token estimate / runtime / audit / DataDoe work (no card exists for it; a forged or stale POST lands here).
+      if (onlySourceKey && isRetiredSourceKey(onlySourceKey)) {
+        res.status(409).json({ error: RETIRED_SOURCE_ERROR_CODE, code: RETIRED_SOURCE_ERROR_CODE, sourceKey: onlySourceKey, retryable: false, message: RETIRED_SOURCE_MESSAGE });
+        return;
+      }
       if (onlySourceKey) {
         try { sourceRegistryEntry(onlySourceKey); } catch {
           res.status(400).json({ error: "Unknown source." });
@@ -176,7 +189,7 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
       // ---------------- FBA Shipment Plan sync (fba-inventory-health / US Listings-AWD) ----------------
       // The FBA source cards run the SHARED, decoupled fba-plan operation core -- the SAME deadline-aware,
       // bounded-resumable pipeline the CLI operator + the automatic GitHub scheduler use (batched marketplace-safe
-      // FBA Health/AWD fetch -> durable OLI + Catalog derive -> four-gate CAS publish -> exact live read-back ->
+      // canonical Listings fetch -> durable OLI + Catalog derive -> four-gate CAS publish -> exact live read-back ->
       // ownership backfill -> ALWAYS safe-close). There is NO parallel implementation. ONE bounded slice per POST;
       // the UI re-POSTs the SAME body until phase==="complete". The durable operation identity (the DEDICATED
       // `${bucket}-fba` cycle at server-resolved as-of=D-1) makes every replay -- concurrent poll, retry, or the
@@ -245,9 +258,9 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
             runtime: release.runtime, publisher: release.publisher, controls: release.controls,
             readbackLive: release.readbackLive, ownershipBackfill: release.ownershipBackfill,
             verifyLease: release.verifyLease,
-            // ZERO-EXPORT durable FBA source persist (backstop enabler): lands source_snapshots(fba-inventory-health)
-            // from the just-fetched cache. The `plan` above carries the per-account inventory request identities it
-            // reuses -- required on the terminal/publish pass too (the scheduled go-live is authoritative overall).
+            // ZERO-EXPORT durable inventory persist collaborator (backstop enabler) from the just-fetched cache. FBA
+            // Inventory Health is retired: the plan carries no Health fragment, so no Health snapshot is (re)written --
+            // the last saved one stays as the dated read-only bridge. Required on the terminal/publish pass too.
             persistDurableFbaSnapshots: release.persistDurableFbaSnapshots,
             trigger: "vercel", deadlineMs: fbaDeadline.deadlineMs, reserveMs: fbaDeadline.reserveMs, outOfTime: fbaDeadline.outOfTime,
           });

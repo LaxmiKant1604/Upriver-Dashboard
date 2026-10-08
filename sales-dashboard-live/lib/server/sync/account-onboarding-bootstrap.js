@@ -166,9 +166,20 @@ export function buildOnboardingStepEntry({
   };
 }
 
+// The FBA inventory request family of a built FBA plan: since the Listings inventory cutover (2026-10) FBA inventory +
+// AWD come from the ONE canonical Listings request "fba-plan:awd" (shared with listing-health-v3). The retired FBA
+// Inventory Health family ("fba-plan:inventory-health") is never planned and is never keyed on here.
+export const FBA_INVENTORY_REQUEST_KEY = "fba-plan:awd";
+// The fba bootstrap step's approved source keys + windows, shared by the wave planner (onboarding-wave-plan.mjs) AND the
+// FBA operator (fba-plan-golive.mjs) so both compute the SAME stepPlanHash. The canonical Listings export is a current
+// snapshot with NO date window (never a D-1 inventory day); the inventoryAsOf the entry also binds is the saved Listings
+// pointer's as_of label.
+export const FBA_STEP_SOURCE_KEYS = Object.freeze(["listings"]);
+export function fbaStepWindows() { return [{ sourceKey: "listings", snapshotIdentity: "current" }]; }
+
 /**
  * The canonical, STABLE FBA seller-batch membership of a built FBA plan -- the sorted seller-id groups of
- * every FBA-inventory source request (deterministic from the frozen sellers + inventoryAsOf, independent
+ * every FBA-inventory (canonical Listings) source request (deterministic from the frozen sellers, independent
  * of the sales asOf). Shared by the wave planner AND the FBA operator so both hash identically.
  */
 export function fbaSellerBatches(fbaPlan) {
@@ -177,8 +188,8 @@ export function fbaSellerBatches(fbaPlan) {
   const batches = [];
   for (const r of requests) {
     for (const s of (r && Array.isArray(r.sources) ? r.sources : [])) {
-      const family = S(s && (s.requestKey || s.sourceKey));
-      if (!/inventory-health/i.test(family)) continue; // the FBA inventory family is "fba-plan:inventory-health"
+      const family = S(s && s.requestKey);
+      if (family !== FBA_INVENTORY_REQUEST_KEY) continue; // the FBA inventory family is the canonical Listings request
       const sellers = [...new Set((s.sellerOrVendorIds || []).map(S).filter(Boolean))].sort();
       const key = sellers.join(",");
       if (!key || seen.has(key)) continue;
@@ -193,10 +204,10 @@ export function fbaSellerBatches(fbaPlan) {
  * The CANONICAL FBA plan STRUCTURE (Round-6 blocker 6) -- the exact approved FBA work bound into the step
  * hash, extracted from a DEFAULT (no-overflow) FBA plan so it is retry-stable yet detects any modified
  * seller/marketplace-pair/default-batch/request-hash/source/limit/inventoryAsOf. Includes ONLY the
- * fba-plan:* source families (asOf-independent). Adaptive single-seller overflow-splitting is represented
- * NOT by the actual runtime split (which varies) but by the `adaptiveSplitAllowed` flag on the entry -- a
- * reviewed deterministic split envelope over these exact default batches -- so a legitimate split never
- * drifts while a changed seller/pair/batch/request/limit does. Returns a canonical object.
+ * fba-plan:* source families (asOf-independent). Since the Listings inventory cutover the only FBA export is
+ * the canonical Listings request (fba-plan:awd), which is NEVER split (one shared hash with listing-health-v3),
+ * so `adaptiveSplitAllowed` is false: any change to a seller/pair/batch/request/limit drifts. Returns a
+ * canonical object.
  */
 export function fbaPlanStructure(fbaPlan, inventoryAsOf) {
   const requests = (fbaPlan && Array.isArray(fbaPlan.reportRequests)) ? fbaPlan.reportRequests : [];
@@ -221,7 +232,7 @@ export function fbaPlanStructure(fbaPlan, inventoryAsOf) {
       for (const p of (Array.isArray(s.marketplacePairs) ? s.marketplacePairs : [])) {
         pairs.add(S(p && p.sellerId) + "@" + S(p && p.marketplace));
       }
-      if (/inventory-health/i.test(family)) { // the FBA inventory family is "fba-plan:inventory-health"
+      if (family === FBA_INVENTORY_REQUEST_KEY) { // the FBA inventory family is the canonical Listings request
         const key = batchSellers.join(",");
         if (key && !seenBatch.has(key)) { seenBatch.add(key); batches.push(batchSellers); }
       }
@@ -235,7 +246,7 @@ export function fbaPlanStructure(fbaPlan, inventoryAsOf) {
     requestHashes: [...requestHashes].sort(),
     sourceKeys: [...sourceKeys].sort(),
     rowLimits: [...limits].sort((a, b) => a - b),
-    adaptiveSplitAllowed: true,
+    adaptiveSplitAllowed: false, // the canonical Listings batches are never split (Health overflow splitting retired)
   };
 }
 

@@ -26,7 +26,8 @@ import { isValidCalendarDate } from "./report-source-contracts.js";
 const DRIVER_CONNECTION_ID = { primary: "primary", secondary: "dd-secondary" };
 
 const PROBE_KEY = "sales-movers:sales-latest-probe";
-const DOWNSTREAM_KEYS = ["sales-movers:traffic", "sales-movers:ads", "sales-movers:inventory", "sales-movers:catalog"];
+// (sales-movers:inventory -- the FBA Inventory Health fragment -- is gone: FBA Inventory Health is retired, never staged.)
+const DOWNSTREAM_KEYS = ["sales-movers:traffic", "sales-movers:ads", "sales-movers:catalog"];
 
 // A probe signal has a usable reported date only when it is a validated success carrying a REAL calendar
 // date (a no-date validated probe is a valid completed "data unavailable" state, not a staging trigger).

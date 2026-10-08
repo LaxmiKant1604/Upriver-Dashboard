@@ -108,6 +108,126 @@ const dateOnly = (v) => { const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(v || ""))
 const daysBetween = (a, b) => { if (!/^\d{4}-\d{2}-\d{2}$/.test(a || "") || !/^\d{4}-\d{2}-\d{2}$/.test(b || "")) return null; return Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000); };
 export const isEvidenceStale = (asOf, reportAsOf) => { const d = daysBetween(asOf, reportAsOf); return d !== null && d > 2; };
 
+// The On Hand FBA source model the server stamps on every payload since phase 2 of the Listings inventory cutover: ONE
+// source per account -- validated Listings, else the account's last SAVED FBA Inventory Health snapshot as a dated,
+// read-only, temporary bridge (used by the server only while it is within 2 days of the report as-of; FBA Inventory
+// Health is no longer refreshed), else Unavailable. A payload
+// WITHOUT it predates phase 2 (e.g. a browser-cached response): its On Hand FBA chained Health and Listings per SKU, so
+// it is never shown.
+export const V3_INVENTORY_SOURCE_MODEL = "inventory-source-v1";
+export const isInventorySourcePayload = (payload) => !!(payload && payload.inventory && payload.inventory.model === V3_INVENTORY_SOURCE_MODEL);
+
+// A pre-phase-2 row: its FBA on-hand (and a "stranded stock" flag that rested on it) came from a per-SKU Health/Listings
+// chain, so EVERY on-hand FBA becomes Unavailable and an FBA-channel stranded reason is withdrawn (flagged / sales-at-risk
+// follow). FBM on-hand and every other Amazon finding are kept.
+function withoutLegacyInventory(r) {
+  const fbaChannel = r.channel !== "FBM"; // FBA or unknown channel: the stranded gate read the FBA on-hand
+  const reasons = Array.isArray(r.flagReasons) ? r.flagReasons : [];
+  const flagReasons = fbaChannel ? reasons.filter((x) => !(x && x.code === "stranded_stock")) : reasons;
+  const flagged = flagReasons.length > 0;
+  return { ...r, onHandFba: null, onHandFbaSource: null, flagReasons, flagged, salesAtRisk: flagged ? r.salesAtRisk : 0 };
+}
+
+// Plain-language text for the server's inventory-source reason codes (Listings validation + Health availability).
+// An unknown code is shown as-is (never hidden).
+const INVENTORY_REASON_TEXT = {
+  "listings-empty": "no saved Listings rows",
+  "listings-foreign-marketplace-rows": "Listings rows from another marketplace",
+  "listings-not-expanded": "the saved Listings export has no inventory fields",
+  "listings-invalid-rows": "invalid Listings rows",
+  "listings-unresolved-conflicts": "SKUs with conflicting duplicate Listings rows",
+  "listings-unattributed-stock": "SKUs with stock but no ASIN in Listings",
+  "listings-blank-fba-fields": "FBA SKUs with blank Listings stock fields",
+  "health-snapshot-missing": "no saved FBA Inventory Health snapshot",
+  "health-snapshot-empty": "the saved FBA Inventory Health snapshot is empty",
+  "health-snapshot-read-failed": "the saved FBA Inventory Health snapshot could not be read",
+  "health-payload-unreadable": "the saved FBA Inventory Health snapshot could not be read",
+  "health-payload-row-count-mismatch": "the saved FBA Inventory Health snapshot failed its integrity check",
+  "health-payload-malformed": "the saved FBA Inventory Health snapshot failed its integrity check",
+  "health-snapshot-identity-mismatch": "the saved FBA Inventory Health snapshot does not belong to this account",
+  "health-identity-unavailable": "this account's saved FBA Inventory Health snapshot could not be identified",
+  "health-foreign-seller-rows": "the saved FBA Inventory Health snapshot contains another seller's rows",
+  "health-foreign-marketplace-rows": "the saved FBA Inventory Health snapshot contains another marketplace's rows",
+  "health-foreign-seller-or-marketplace-rows": "the saved FBA Inventory Health snapshot contains another seller's or marketplace's rows",
+  "health-bridge-not-loaded": "the saved FBA Inventory Health snapshot was not loaded",
+  "health-bridge-as-of-missing": "the saved FBA Inventory Health snapshot cannot be checked against a report date",
+};
+export function v3InventoryReasonText(code) {
+  const s = String(code == null ? "" : code).trim();
+  // health-bridge-stale:<date> -- the last saved Health snapshot is too old to use (FBA Inventory Health is no longer
+  // refreshed); it drives no figure.
+  const stale = /^health-bridge-stale:(\d{4}-\d{2}-\d{2})?$/.exec(s);
+  if (stale) return `the last saved FBA Inventory Health snapshot${stale[1] ? ` (${stale[1]})` : ""} is too old to use (no longer refreshed)`;
+  const m = /^([a-z0-9-]+):(\d+)$/.exec(s);
+  const key = m ? m[1] : s;
+  const text = INVENTORY_REASON_TEXT[key];
+  if (!text) return s;
+  return m ? `${text} (${m[2]})` : text;
+}
+const reasonsText = (codes) => (Array.isArray(codes) ? codes : []).map(v3InventoryReasonText).filter(Boolean).join("; ");
+
+// An ISO time -> "YYYY-MM-DD HH:MM UTC" (a non-ISO string is shown as-is; never a fabricated time).
+function utcMinute(v) {
+  const at = typeof v === "string" && v.trim() ? v.trim() : null;
+  if (!at) return null;
+  const t = Date.parse(at);
+  return Number.isFinite(t) ? new Date(t).toISOString().slice(0, 16).replace("T", " ") + " UTC" : at;
+}
+
+/**
+ * The On Hand FBA freshness/source the page shows, for the account's ONE inventory source. Returns
+ * { label, tone, note|null, conflicts, source, hint }:
+ *   listings        -> "Listings refreshed <YYYY-MM-DD HH:MM UTC>" (Listings has no inventory date);
+ *   health-fallback -> "FBA Inventory Health snapshot <date> (saved, no longer refreshed -- temporary bridge: <reasons>)",
+ *                      warn, with a note that the values come from that dated saved snapshot because this account's
+ *                      Listings could not be validated;
+ *   unavailable     -> "On Hand FBA unavailable" + the reasons (never 0);
+ *   legacy (no inventory-source-v1 model) -> On Hand FBA Unavailable until the snapshot is refreshed.
+ */
+export function v3InventoryFreshness(payload) {
+  const inv = (payload && payload.inventory) || null;
+  if (!isInventorySourcePayload(payload)) {
+    return {
+      label: "On Hand FBA unavailable", tone: "warn", conflicts: 0, source: "legacy",
+      hint: "On Hand FBA is unavailable for this saved snapshot (never shown as 0)",
+      note: "This saved Listing Health snapshot predates the per-account inventory source, so On Hand FBA is shown as Unavailable until it is refreshed.",
+    };
+  }
+  const conflicts = Array.isArray(inv.conflicts) ? inv.conflicts.length : 0;
+  if (inv.source === "listings" && inv.available === true) {
+    const when = utcMinute(inv.refreshedAt);
+    return {
+      label: when ? `Listings refreshed ${when}` : "Listings refresh time unavailable",
+      tone: conflicts ? "warn" : "ok",
+      conflicts,
+      source: "listings",
+      hint: "FBA available from this account's validated Listings (as of the Listings refresh time; no inventory date)",
+      note: conflicts ? `${conflicts} SKU${conflicts === 1 ? " has" : "s have"} conflicting Listings rows; their On Hand FBA is Unavailable (duplicate rows are never summed).` : null,
+    };
+  }
+  if (inv.source === "health-fallback" && inv.available === true) {
+    const date = typeof inv.snapshotDate === "string" && inv.snapshotDate.trim() ? inv.snapshotDate.trim() : "(date unavailable)";
+    const why = reasonsText(inv.fallbackReasons) || "Listings not validated";
+    return {
+      label: `FBA Inventory Health snapshot ${date} (saved, no longer refreshed — temporary bridge: ${why})`,
+      tone: "warn",
+      conflicts,
+      source: "health-fallback",
+      hint: `FBA available from the last saved FBA Inventory Health snapshot ${date} (a temporary read-only bridge; Listings not validated for this account)`,
+      note: `On Hand FBA comes from the last saved FBA Inventory Health snapshot (${date}) because this account's Listings could not be validated (${why}). FBA Inventory Health is no longer refreshed: this is a temporary bridge, and stock may have changed since that date.`,
+    };
+  }
+  const why = reasonsText(inv.unavailableReasons && inv.unavailableReasons.length ? inv.unavailableReasons : inv.fallbackReasons);
+  return {
+    label: "On Hand FBA unavailable",
+    tone: "warn",
+    conflicts,
+    source: "unavailable",
+    hint: "On Hand FBA unavailable for this account (never shown as 0)",
+    note: `On Hand FBA is Unavailable for this account (it is never shown as 0)${why ? `: ${why}` : ""}.`,
+  };
+}
+
 /**
  * Build the 16-column presentation rows from the server v3 payload. Optionally filter to a selected brand (client
  * display filter, mirroring v1). Sales/units are the server's durable-OLI numbers (never re-derived here). Returns
@@ -119,12 +239,14 @@ export function buildV3Rows(payload, selectedBrand = null) {
   const prov = (payload && payload.provenance) || {};
   const reportAsOf = (payload && payload.asOf) || null;
   // The evidence as-of for a row's HEALTH finding: the saved Listings/Raw snapshot's fetched_at (falling back to the
-  // inventory snapshot date, then the report as-of). Never a fabricated date -- null when nothing is available.
-  const evidenceAsOf = dateOnly(prov.rawFetchedAt) || dateOnly(prov.listingsFetchedAt) || dateOnly(prov.inventorySnapshotDate) || reportAsOf || null;
+  // report as-of). Never a fabricated date and never the inventory day -- null when nothing is available.
+  const evidenceAsOf = dateOnly(prov.rawFetchedAt) || dateOnly(prov.listingsFetchedAt) || reportAsOf || null;
   const evidenceStale = isEvidenceStale(evidenceAsOf, reportAsOf);
+  const legacyInventory = rows.length > 0 && !isInventorySourcePayload(payload);
   const out = [];
-  for (const r of rows) {
-    if (wantBrand && brandKey(r.brand) !== wantBrand) continue;
+  for (const src of rows) {
+    if (wantBrand && brandKey(src.brand) !== wantBrand) continue;
+    const r = legacyInventory ? withoutLegacyInventory(src) : src;
     const gate = v3GateForRow(r);
     out.push({
       ...r,

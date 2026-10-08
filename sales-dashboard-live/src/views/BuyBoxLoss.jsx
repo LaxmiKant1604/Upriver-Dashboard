@@ -1,5 +1,7 @@
 // Buy Box Loss — SKUs losing the featured offer, the revenue that costs, and
-// whether price, stock or fulfilment explains it.
+// whether stock or fulfilment explains it (from the account's saved Listings, or
+// the dated saved FBA Inventory Health bridge). Competitive prices are not
+// evaluated: they were FBA Inventory Health metrics, which is no longer requested.
 
 import React, { useMemo, useState } from "react";
 import { Trophy } from "lucide-react";
@@ -8,6 +10,7 @@ import {
   buildBuyBoxInsights,
   buildBuyBoxRows,
   insightExportRows,
+  insightInventoryState,
 } from "../lib/insights.js";
 import { downloadCsv, reportFilename } from "../lib/csv.js";
 import { fmtDateHuman, fmtMoney, fmtRate, nInt } from "../lib/format.js";
@@ -35,14 +38,12 @@ import {
 const PAGE_SIZE = 50;
 
 const CAUSE_LABEL = {
-  price: "Price",
   stock: "Stock",
   fulfilment: "Fulfilment",
   unconfirmed: "Unconfirmed",
 };
 
 const CAUSE_TONE = {
-  price: "warn",
   stock: "bad",
   fulfilment: "warn",
   unconfirmed: "ok",
@@ -56,10 +57,7 @@ const ACCESSORS = {
   sales: (row) => Number(row.sales) || 0,
   units: (row) => Number(row.units) || 0,
   salesAtRisk: (row) => row.salesAtRisk,
-  effectivePrice: (row) => row.effectivePrice,
-  featuredOfferPrice: (row) => row.featuredOfferPrice,
-  priceGap: (row) => row.priceGap,
-  available: (row) => row.available,
+  available: (row) => row.fbaAvailable,
   cause: (row) => row.cause,
 };
 
@@ -78,6 +76,9 @@ export default function BuyBoxLoss({ data, loading, error, accountName, selected
   const insights = useMemo(() => buildBuyBoxInsights(data, rows, safeThreshold), [data, rows, safeThreshold]);
 
   const losing = useMemo(() => rows.filter((row) => row.belowThreshold), [rows]);
+  // The account's FBA stock source (validated Listings / the dated saved Health bridge / unavailable). No competitive
+  // prices exist any more (they were FBA Inventory Health metrics), so no price cause or price column is shown.
+  const stockState = useMemo(() => insightInventoryState(data), [data]);
 
   const totals = useMemo(() => ({
     tracked: rows.length,
@@ -91,8 +92,8 @@ export default function BuyBoxLoss({ data, loading, error, accountName, selected
       if (weight <= 0) return null;
       return rows.reduce((sum, row) => sum + row.buyBoxPct * (Number(row.sales) || 0), 0) / weight;
     })(),
-    priceCaused: losing.filter((row) => row.cause === "price").length,
     stockCaused: losing.filter((row) => row.cause === "stock").length,
+    fulfilmentCaused: losing.filter((row) => row.cause === "fulfilment").length,
     unconfirmed: losing.filter((row) => row.cause === "unconfirmed").length,
   }), [rows, losing]);
 
@@ -130,13 +131,11 @@ export default function BuyBoxLoss({ data, loading, error, accountName, selected
     [`Sales (${row.windowDays}d)`]: Number(row.sales || 0).toFixed(2),
     [`Units (${row.windowDays}d)`]: Math.round(Number(row.units) || 0),
     "Sales at Risk": Number(row.salesAtRisk || 0).toFixed(2),
-    "Your Effective Price": row.effectivePrice === null ? "" : row.effectivePrice.toFixed(2),
-    "Featured Offer Price": row.featuredOfferPrice === null ? "" : row.featuredOfferPrice.toFixed(2),
-    "Lowest New + Shipping": row.lowestPrice === null ? "" : row.lowestPrice.toFixed(2),
-    "Price Gap": row.priceGap === null ? "" : row.priceGap.toFixed(2),
-    "FBA Available": row.available === null ? "" : Math.round(row.available),
-    "30-day Run Rate": row.dailyRate === null ? "" : row.dailyRate.toFixed(2),
-    "Likely Cause": CAUSE_LABEL[row.cause],
+    "FBA Available": row.fbaAvailable === null || row.fbaAvailable === undefined ? "" : Math.round(row.fbaAvailable),
+    "Fulfillment Channel": row.fulfillmentChannel || "",
+    "FBA Stock Source": stockState.label,
+    // No competitive prices / run rate: FBA Inventory Health metrics, no longer requested (never from a stale bridge).
+    "Likely Cause": CAUSE_LABEL[row.cause] || "Unconfirmed",
     "Cause Evidence": row.causeDetail,
   })), reportFilename("buy-box-loss", accountName, data?.asOf));
 
@@ -156,19 +155,21 @@ export default function BuyBoxLoss({ data, loading, error, accountName, selected
       {data && !data.snapshotMissing && <>
         <FreshnessBar items={[
           `${data.sourceLabel}, ${data.window.days} days${data.observedWindow ? ` (${fmtDateHuman(data.observedWindow.from)} – ${fmtDateHuman(data.observedWindow.to)} observed)` : ""}`,
-          data.inventoryAvailable ? `competitive prices from the ${fmtDateHuman(data.inventorySnapshotDate)} FBA snapshot` : "FBA snapshot unavailable — no price or stock evidence",
+          stockState.available ? `stock and fulfilment channel: ${stockState.label}` : "FBA stock unavailable — no stock or fulfilment evidence",
+          "competitive prices not evaluated (FBA Inventory Health is no longer refreshed)",
           snapshotFreshnessLabel(data),
         ]} />
 
-        {!data.inventoryAvailable && (
+        {!stockState.available && (
           <Notice tone="warn">
-            The FBA Inventory Health snapshot is unavailable for this account, so no Buy Box loss can be attributed to price or stock. Every affected SKU is reported with an unconfirmed cause rather than a guessed one.
+            {stockState.note} No Buy Box loss can be attributed to stock or fulfilment, so every affected SKU is reported with an unconfirmed cause rather than a guessed one.
           </Notice>
         )}
+        {stockState.available && stockState.note && <Notice tone="warn">{stockState.note} Stock causes from it are dated and may have changed since.</Notice>}
 
         {(data.currencies?.length || 0) > 1 && (
           <Notice>
-            This account reports {data.currencies.join(", ")}. Each SKU keeps its own currency and prices are compared only within a currency; the combined totals below are only meaningful for a single-currency scope.
+            This account reports {data.currencies.join(", ")}. Each SKU keeps its own currency; the combined totals below are only meaningful for a single-currency scope.
           </Notice>
         )}
 
@@ -177,7 +178,7 @@ export default function BuyBoxLoss({ data, loading, error, accountName, selected
           { label: `Below ${safeThreshold}%`, value: nInt(totals.losing), tone: totals.losing ? "bad" : "good" },
           { label: "Sales at risk", value: totalMoney(totals.salesAtRisk, money, fmtMoney), tone: totals.salesAtRisk > 0 && !money.mixed ? "bad" : undefined, hint: money.mixed ? "This account reports more than one currency, so a combined total would be meaningless." : undefined },
           { label: "Sales-weighted Buy Box", value: totals.weightedBuyBox === null ? "—" : fmtRate(totals.weightedBuyBox) },
-          { label: "Price / stock / unclear", value: `${totals.priceCaused} / ${totals.stockCaused} / ${totals.unconfirmed}` },
+          { label: "Stock / fulfilment / unclear", value: `${totals.stockCaused} / ${totals.fulfilmentCaused} / ${totals.unconfirmed}` },
         ]} />
 
         <PriorityActions
@@ -206,9 +207,8 @@ export default function BuyBoxLoss({ data, loading, error, accountName, selected
               onChange={setCauseFilter}
               options={[
                 { value: "ALL", label: `All causes (${losing.length})` },
-                { value: "price", label: `Price (${totals.priceCaused})` },
                 { value: "stock", label: `Stock (${totals.stockCaused})` },
-                { value: "fulfilment", label: `Fulfilment (${losing.filter((row) => row.cause === "fulfilment").length})` },
+                { value: "fulfilment", label: `Fulfilment (${totals.fulfilmentCaused})` },
                 { value: "unconfirmed", label: `Unconfirmed (${totals.unconfirmed})` },
               ]}
             />
@@ -224,10 +224,7 @@ export default function BuyBoxLoss({ data, loading, error, accountName, selected
                   <SortTh label={`Sales (${data.window.days}d)`} col="sales" sort={sort} onSort={onSort} />
                   <SortTh label="Sales at Risk" col="salesAtRisk" sort={sort} onSort={onSort} hint="Sales × (1 − Buy Box share)" />
                   <SortTh label="Units" col="units" sort={sort} onSort={onSort} />
-                  <SortTh label="Your Price" col="effectivePrice" sort={sort} onSort={onSort} />
-                  <SortTh label="Featured Offer" col="featuredOfferPrice" sort={sort} onSort={onSort} />
-                  <SortTh label="Gap" col="priceGap" sort={sort} onSort={onSort} />
-                  <SortTh label="FBA Avail" col="available" sort={sort} onSort={onSort} />
+                  <SortTh label="FBA Avail" col="available" sort={sort} onSort={onSort} hint={stockState.available ? `FBA available units: ${stockState.label}. Unknown is shown as —, never 0.` : "FBA stock unavailable"} />
                   <SortTh label="Likely Cause" col="cause" sort={sort} onSort={onSort} align="left" />
                 </tr>
               </thead>
@@ -239,12 +236,9 @@ export default function BuyBoxLoss({ data, loading, error, accountName, selected
                     <td className="mono">{fmtMoney(row.sales, row.currency || currency)}</td>
                     <td className="mono pt-strong sku-neg">{fmtMoney(row.salesAtRisk, row.currency || currency)}</td>
                     <td className="mono">{nInt(row.units)}</td>
-                    <td className="mono">{row.effectivePrice === null ? "—" : fmtMoney(row.effectivePrice, row.currency || currency, 2)}</td>
-                    <td className="mono">{row.featuredOfferPrice === null ? "—" : fmtMoney(row.featuredOfferPrice, row.currency || currency, 2)}</td>
-                    <td className={"mono" + (row.priceGap !== null && row.priceGap > 0 ? " sku-neg" : "")}>{row.priceGap === null ? "—" : fmtMoney(row.priceGap, row.currency || currency, 2)}</td>
-                    <td className="mono">{row.available === null ? "—" : nInt(row.available)}</td>
+                    <td className="mono">{row.fbaAvailable === null || row.fbaAvailable === undefined ? (row.fulfillmentChannel === "FBM" ? "MFN" : "—") : nInt(row.fbaAvailable)}</td>
                     <td className="pt-left buybox-cause">
-                      <span className={"pt-badge sku-badge-" + CAUSE_TONE[row.cause]} title={row.causeDetail}>{CAUSE_LABEL[row.cause]}</span>
+                      <span className={"pt-badge sku-badge-" + (CAUSE_TONE[row.cause] || "ok")} title={row.causeDetail}>{CAUSE_LABEL[row.cause] || "Unconfirmed"}</span>
                       <div className="buybox-cause-detail">{row.causeDetail}</div>
                     </td>
                   </tr>
@@ -266,7 +260,7 @@ export default function BuyBoxLoss({ data, loading, error, accountName, selected
 
         <div className="footer-note">
           Amazon publishes no dedicated Buy Box table. <code>buybox_percentage</code> lives on DataDoe <code>Profit by SKU &amp; Date</code> at SKU/day grain, and it is a ratio, so it is never summed and never averaged naively: this report fetches the raw daily rows for {data.window.days} days (in {data.window.sliceDays}-day slices to stay under the export row cap, rejecting any slice that hits the cap) and computes a <strong>page-view-weighted</strong> share, so a day with two page views cannot count as much as a day with two thousand. Days where Amazon reported no featured-offer competition are excluded from the share rather than treated as 0%, because a sole seller has not lost anything.
-          {" "}Sales at risk = sales × (1 − Buy Box share) over the same window. Cause attribution uses only the competitive prices and stock on the latest <code>FBA Inventory Health</code> snapshot: your offer above <code>featuredoffer_price</code> is Price; zero or near-zero <code>available</code> against the 30-day run rate is Stock; a selling SKU with no FBA row at all is flagged Fulfilment because it is almost certainly merchant-fulfilled. When none of those fields is present the cause is <strong>Unconfirmed</strong> and confidence drops — the report will not name a cause it cannot evidence. Currencies are never combined. The threshold, filters, search, sorting, paging and both exports are local; only Refresh calls DataDoe, and it saves one shared snapshot for every user with access to this account.
+          {" "}Sales at risk = sales × (1 − Buy Box share) over the same window. Cause evidence comes, for this account, from its saved <code>Listings</code> snapshot when that can be validated: zero <code>fba_quantity_available</code> on an FBA listing is Stock and <code>listing_fulfillment_channel</code> DEFAULT (merchant-fulfilled) is Fulfilment; When the Listings cannot be validated, the account's last saved <code>FBA Inventory Health</code> snapshot is a clearly labelled, temporary read-only bridge (used only while it is at most two days older than this report): zero <code>available</code> on a SKU it lists is Stock — dated by that snapshot and marked as possibly changed since. Competitive prices and the 30-day run rate came from FBA Inventory Health, which is no longer refreshed, so no price cause is named and no Listings price is substituted. A SKU missing from the stock source is never assumed merchant-fulfilled or out of stock. When the evidence is not present the cause is <strong>Unconfirmed</strong> and confidence drops — the report will not name a cause it cannot evidence. Currencies are never combined. The threshold, filters, search, sorting, paging and both exports are local; only Refresh calls DataDoe, and it saves one shared snapshot for every user with access to this account.
         </div>
       </>}
     </div>

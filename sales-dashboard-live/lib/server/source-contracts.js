@@ -6,7 +6,7 @@
 // prevents future reports from using a convenient-but-wrong dataset (for
 // example, Order Line Items cannot provide sessions or conversion).
 
-const contract = ({ key, ids, label, grain, fields, consumers, cacheHours = 12 }) => ({
+const contract = ({ key, ids, label, grain, fields, consumers, cacheHours = 12, retired = false }) => ({
   key,
   ids,
   label,
@@ -14,6 +14,7 @@ const contract = ({ key, ids, label, grain, fields, consumers, cacheHours = 12 }
   fields: new Set(fields),
   consumers,
   cacheHours,
+  ...(retired === true ? { retired: true } : {}),
 });
 
 export const SOURCE_CONTRACTS = [
@@ -78,10 +79,14 @@ export const SOURCE_CONTRACTS = [
   contract({
     key: "fba-inventory-health",
     ids: ["44fc5ba0ce81a7807601f6d7a9b8b7aaec64be4c7e046ea30dc6864d1a4aa823"],
-    label: "FBA Inventory Health",
+    // RETIRED (Listings inventory cutover, 2026-10): no report fetches it -- lib/server/datadoe.js createExport refuses this
+    // id. Kept ONLY as an identity so the refusal and the SAVED snapshots (source_snapshots 'fba-inventory-health', the
+    // dated read-only bridge of lib/server/inventory-source.js) stay describable / hash-verifiable. retired: true.
+    label: "FBA Inventory Health (retired)",
+    retired: true,
     grain: "sku-snapshot-day",
     fields: ["date", "marketplace_country_code", "seller_or_vendor_id", "sku", "fnsku", "child_asin", "product_name", "currency", "available", "reserved_fc_transfer", "reserved_fc_processing", "inbound_working", "inbound_shipped", "inbound_received", "unfulfillable_quantity", "days_of_supply", "units_shipped_t30", "your_price", "sales_price", "featuredoffer_price", "lowest_price_new_plus_shipping", "alert"],
-    consumers: ["fba-plan", "sales-movers", "listing-health", "listing-health-v3", "buy-box-loss", "brand-view"],
+    consumers: [],
     cacheHours: 8,
   }),
   contract({
@@ -185,17 +190,19 @@ export const REPORT_SOURCE_REQUIREMENTS = Object.freeze({
   "brand-sales": ["order-line-items", "product-catalog"],
   "daily-reporting": ["order-line-items", "product-catalog", "ads-campaign-date"],
   reconciliation: ["order-line-items", "settlements", "product-catalog"],
-  "fba-plan": ["order-line-items", "product-catalog", "fba-inventory-health", "listings"],
+  // FBA Inventory Health is RETIRED as a FETCHED source (Listings inventory cutover): no report requires it. The saved
+  // Health snapshots are read only as the dated read-only bridge (lib/server/inventory-source.js), never fetched.
+  "fba-plan": ["order-line-items", "product-catalog", "listings"],
   "sku-pl": ["profit-by-sku-date"],
   "keyword-rank": ["sqp-weekly", "sqp-monthly", "product-catalog"],
   "content-changes": ["content-changes", "product-catalog"],
-  "sales-movers": ["sales-traffic-asin-date", "profit-by-sku-date", "fba-inventory-health", "product-catalog"],
-  "listing-health": ["listings", "listings-raw", "profit-by-sku-date", "fba-inventory-health", "product-catalog"],
+  "sales-movers": ["sales-traffic-asin-date", "profit-by-sku-date", "listings", "product-catalog"],
+  "listing-health": ["listings", "listings-raw", "profit-by-sku-date", "product-catalog"],
   // Advanced Listing Health (shadow, listing-health/v3-oli-window): OLI (durable derived) replaces Profit-by-SKU;
-  // Listings + Listings Raw carry seller+marketplace for exact per-account attribution; FBA inventory + catalog reuse
-  // the existing request identities (no new export).
-  "listing-health-v3": ["order-line-items", "listings", "listings-raw", "fba-inventory-health", "product-catalog"],
-  "buy-box-loss": ["order-line-items", "profit-by-sku-date", "fba-inventory-health", "product-catalog"],
+  // Listings + Listings Raw carry seller+marketplace for exact per-account attribution; FBA stock comes from the same
+  // Listings rows (FBA Inventory Health is retired); the catalog reuses the existing request identity (no new export).
+  "listing-health-v3": ["order-line-items", "listings", "listings-raw", "product-catalog"],
+  "buy-box-loss": ["order-line-items", "profit-by-sku-date", "listings", "product-catalog"],
   "returns-leakage": ["returns", "settlements", "order-line-items", "product-catalog"],
   "ppc-performance": ["ads-campaign-date", "ads-targeting-date", "ads-search-terms-date", "order-line-items", "product-catalog"],
   "listing-optimizer": ["sqp-weekly", "product-catalog"],
@@ -216,6 +223,12 @@ export function sourceContractForId(sourceId) {
 
 export function sourceContractForKey(sourceKey) {
   return CONTRACT_BY_KEY.get(String(sourceKey || "")) || null;
+}
+
+// True for a source whose contract is RETIRED (FBA Inventory Health): it may be described / hash-verified, never fetched.
+export function isRetiredSourceKey(sourceKey) {
+  const item = sourceContractForKey(sourceKey);
+  return !!(item && item.retired === true);
 }
 
 export function sourceSupports(sourceKey, { grain, fields = [] } = {}) {

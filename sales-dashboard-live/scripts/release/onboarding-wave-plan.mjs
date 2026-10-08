@@ -28,7 +28,7 @@ const log = (m) => console.log("wave-plan[" + asOf + "]: " + m);
 const { getDataDoeConnections } = await import("../../lib/server/datadoe-connections.js");
 const { fetchAccountsDetailed } = await import("../../lib/server/datadoe.js");
 const { computeOnboardingWaveIdentity, onboardingPlanFingerprint, ONBOARDING_REGIONS } = await import("../../lib/server/sync/account-onboarding.js");
-const { resolveBootstrapScope, buildOnboardingStepEntry, fbaPlanStructure } = await import("../../lib/server/sync/account-onboarding-bootstrap.js");
+const { resolveBootstrapScope, buildOnboardingStepEntry, fbaPlanStructure, FBA_STEP_SOURCE_KEYS, fbaStepWindows } = await import("../../lib/server/sync/account-onboarding-bootstrap.js");
 const { getAccountOnboardingRows, getSourceCoverageWindows, getSourceExportCache } = await import("../../lib/server/supabase.js");
 const { oliBucketPlan, OLI_TOKENS_PER_CREATE } = await import("../../lib/server/sync/source-scheduled-oli.js");
 const { OLI_SOURCE_KEY, windowsProve } = await import("../../lib/server/sync/source-durable-model.js");
@@ -122,7 +122,7 @@ for (const region of ONBOARDING_REGIONS) {
   }
   const fbaEntry = buildOnboardingStepEntry({
     ...common, step: "fba", planAsOf: asOf, inventoryAsOf: asOf,
-    sourceKeys: ["fba-inventory-health"], windows: [{ sourceKey: "fba-inventory-health", from: asOf, to: asOf }],
+    sourceKeys: [...FBA_STEP_SOURCE_KEYS], windows: fbaStepWindows(),
     structure: fbaStructure, plannedCreates: fbaCreates, plannedTokens: fbaTokens,
   });
 

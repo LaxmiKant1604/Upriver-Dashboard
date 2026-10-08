@@ -63,11 +63,14 @@ test("the group-band label map covers every column group (Identity/Sales/Forecas
 });
 
 /* --------------------------------------------- US / non-US AWD behaviour preserved */
-test("US/non-US AWD behaviour is unchanged (columns tagged, chooser filters, never a fake 0)", () => {
+test("US/non-US AWD behaviour (Listings inventory cutover): AWD columns tagged, shown everywhere, N/A on a non-AWD marketplace -- never a fake 0", () => {
   has(APP, 'id: "awd", group: "Inventory"', "the AWD Available column still exists");
-  has(APP, "awd: true", "AWD columns stay tagged so they vanish for non-US accounts");
-  has(APP, "g.cols.filter((c) => isUS || !c.awd)", "the column chooser still hides AWD columns for non-US");
-  has(VIEW, 'live FBA{planAwdEligible ? " + AWD" : ""}', "the subtitle still reflects AWD eligibility dynamically");
+  has(APP, "awd: true", "AWD columns stay tagged");
+  assert.ok(!APP.includes("g.cols.filter((c) => isUS || !c.awd)"), "the column chooser offers the AWD columns on every marketplace");
+  has(APP, "(r.awdNA ? awdNaTd(\"awd\") : tdA(\"awd\", r.awd, r))", "a non-AWD marketplace renders AWD Avail as N/A (never 0)");
+  has(VIEW, 'from sales velocity and FBA{planAwdEligible ? " + AWD" : ""} inventory', "the subtitle still reflects AWD eligibility dynamically");
+  // Phase 2: the subtitle names the account's inventory SOURCE (Listings, or the labelled FBA Inventory Health snapshot).
+  has(VIEW, 'planInventory.source === "listings" ? "Listings" : planInventory.source === "health-fallback" ? (planInventory.legacy ? "FBA Inventory Health snapshot" : "saved FBA Inventory Health snapshot, temporary bridge")', "the subtitle names the inventory source (the bridge as saved + temporary)");
 });
 
 /* -------------------------------------------- missing inventory stays an em dash */
@@ -75,11 +78,16 @@ test("missing inventory stays an em dash -- never a fabricated zero", () => {
   // KPI cells gate every inventory total on anyInv/evaluatedCount and fall back to em dash.
   has(VIEW, 'planTotals.anyInv ? nInt(planTotals.recommended) : "—"', "Recommended Units KPI is an em dash without inventory");
   has(VIEW, 'planTotals.anyInv ? nInt(planTotals.fbaAvailable) : "—"', "FBA Available KPI is an em dash without inventory");
-  has(VIEW, 'planTotals.anyInv ? nInt(planTotals.totalFbaInv) : "—"', "Total FBA Inv. KPI is an em dash without inventory");
-  has(VIEW, 'planTotals.evaluatedCount > 0 ? planTotals.restockCount.toLocaleString("en-US") : "—"', "Needs Restock KPI is an em dash when nothing is evaluated");
+  has(VIEW, 'planTotals.anyInv ? nInt(planTotals.fbaSupply) : "—"', "FBA Supply KPI is an em dash without inventory");
+  // Needs Restock: an em dash when nothing is evaluated OR any FBA product with a run rate could not be assessed
+  // (unknown Listings supply) -- a lower-bound count is never shown as the total.
+  has(VIEW, 'planTotals.restockKnown ? planTotals.restockCount.toLocaleString("en-US") : "—"', "Needs Restock KPI is an em dash unless every FBA product was assessed");
+  has(APP, "t.restockKnown = t.evaluatedCount > 0 && t.unassessedCount === 0;", "restockKnown requires an evaluation and no unassessed FBA product");
   // Inventory column foots keep the same anyInv-gated em dash.
   has(APP, 't.anyInv ? nInt(t.fbaAvailable) : "—"', "the FBA Available column total stays an em dash without inventory");
-  has(APP, 't.anyInv ? nInt(t.totalFbaInv) : "—"', "the Total FBA Inv. column total stays an em dash without inventory");
+  has(APP, 't.anyInv ? nInt(t.fbaSupply) : "—"', "the FBA Supply column total stays an em dash without inventory");
+  // Listings cutover: an inventory total over ANY unknown FBA row is withheld (null -> em dash), never a partial sum.
+  has(APP, "const strict = (key, v, counts) =>", "inventory totals use the strict complete-or-Unavailable rule");
 });
 
 test("no invented status is introduced (no fake row badge or disconnected-feed language)", () => {
@@ -87,7 +95,14 @@ test("no invented status is introduced (no fake row badge or disconnected-feed l
     assert.ok(!APP.includes(bad), `App.jsx must not introduce the invented status "${bad}"`);
   }
   // The real unavailable-inventory copy is preserved.
-  has(VIEW, "Live FBA inventory is unavailable for this account right now", "the honest inventory-unavailable warning is preserved");
+  has(VIEW, "FBA inventory is unavailable for this account right now: there is no validated Listings snapshot", "the honest inventory-unavailable warning is preserved (phase-2 wording: neither Listings nor Health)");
+  // Phase 2: the Health fallback is clearly labelled (banner + freshness), and a pre-phase-2 saved plan is labelled too.
+  has(VIEW, "FBA inventory for this account comes from the saved FBA Inventory Health snapshot of", "the bridge banner names the saved Health snapshot");
+  has(VIEW, "(saved, no longer refreshed — temporary bridge)", "the bridge is labelled saved, no longer refreshed and temporary");
+  has(VIEW, "FBA Reserved (Total) and FC Transfer are not available from it", "the bridge explains the unavailable reserved / FC transfer columns");
+  has(VIEW, "This saved plan was built before FBA inventory moved to Listings", "a pre-phase-2 saved plan is labelled as Health-sourced (its stock is still shown)");
+  has(VIEW, 'Listings refreshed <strong>', "the Listings source shows its fetch time");
+  has(VIEW, 'FBA Inventory Health snapshot <strong>', "the Health source shows its snapshot date");
 });
 
 /* ------------------------------------------- KPI + emphasis presentation (no logic) */
@@ -96,7 +111,8 @@ test("the six KPI cells include Planning Horizon as a presentation of the existi
   has(VIEW, ">Needs Restock<", "Needs Restock KPI present");
   has(VIEW, ">Recommended Units<", "Recommended Units KPI present");
   has(VIEW, ">FBA Available<", "FBA Available KPI present");
-  has(VIEW, ">Total FBA Inv.<", "Total FBA Inv. KPI present");
+  has(VIEW, ">FBA Supply<", "FBA Supply KPI present (replaces the former Total FBA Inv.)");
+  assert.ok(!VIEW.includes(">Total FBA Inv.<"), "the old Total FBA Inv. KPI is gone (renamed, not silently redefined)");
   has(VIEW, ">Planning Horizon<", "Planning Horizon KPI present (the sixth cell)");
   has(VIEW, "planHorizonKpiValue(planAccountSettings.horizon)", "Planning Horizon reads the existing account setting, not a new calculation");
   has(VIEW, "PLAN_FORECAST_LABEL[planAccountSettings.forecastMethod]", "its subtext is the existing forecast-method setting");
@@ -114,8 +130,11 @@ test("the methodology footer is an accessible disclosure that keeps its operatio
   has(VIEW, '<details className="plan-methodology">', "methodology is a collapsible disclosure");
   has(VIEW, "<summary>Restock logic, inventory attribution, and lead-time calculations</summary>", "the disclosure summary matches the approved label");
   // The important attribution + AWD distinction + unavailable-data policy survive verbatim.
-  has(VIEW, "Total FBA Inv.</strong> = FBA Available + Reserved (FC) + Inbound Pipeline", "the Total FBA Inv. formula is preserved");
-  has(VIEW, "AWD does not apply to non-US accounts and its columns are hidden (never shown as 0)", "the non-US AWD policy is preserved");
+  has(VIEW, "FBA Supply</strong> = FBA Available + FBA Inbound", "the FBA Supply formula is documented");
+  has(VIEW, "are shown for reference only and are never counted as supply", "Reserved (Total) + FC Transfer are documented as display only");
+  has(VIEW, "AWD does not apply to this marketplace: its columns show N/A and AWD contributes 0 to the network position (never shown as a stock 0)", "the non-AWD marketplace policy (N/A, 0 contribution)");
+  has(VIEW, "A blank AWD cell is treated as 0 (an assumption, marked * and counted above", "the AWD blank-as-0 assumption is documented");
+  assert.ok(!VIEW.includes("FBA Inventory Health</code>, each unit"), "the methodology no longer describes FBA Inventory Health buckets");
   has(VIEW, "recompute locally without new DataDoe requests", "the zero-DataDoe policy statement is preserved");
 });
 

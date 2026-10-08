@@ -48,12 +48,26 @@ writeSync(1, "scheduled-family-registry (release guard)\n");
 
 // 4. P1 contract: FBA emits a machine-readable completion; v3 gates on it (not on job success).
 {
-  const fba = SCHEDULED_FAMILY_REGISTRY["fba-inventory-health"];
-  ok("G5 (P1): fba completionOutput = fba_complete-job-output + partial stays visibly partial",
-    fba.completionOutput === "fba_complete-job-output" && fba.partialBehavior === "stay-visibly-partial");
+  const fba = SCHEDULED_FAMILY_REGISTRY["listings"];
+  ok("G5 (P1): the fba job's inventory family (listings) completionOutput = fba_complete-job-output + partial stays visibly partial",
+    fba.schedulerOwner === "scheduler-v2:fba" && fba.completionOutput === "fba_complete-job-output" && fba.partialBehavior === "stay-visibly-partial");
   const v3 = SCHEDULED_FAMILY_REGISTRY["listing-health-v3"];
-  ok("G6 (optional-inventory): listing-health-v3 depends on fba-inventory-health + stays visibly partial (per-account inventory adopted where fresh)",
-    v3.dependencies.includes("fba-inventory-health") && v3.partialBehavior === "stay-visibly-partial" && v3.completionOutput === "terminal-succeeded-gate");
+  ok("G6 (optional-inventory): listing-health-v3 depends on listings + stays visibly partial",
+    v3.dependencies.includes("listings") && v3.partialBehavior === "stay-visibly-partial" && v3.completionOutput === "terminal-succeeded-gate");
+}
+
+// 4b. Listings inventory cutover: FBA Inventory Health is RETIRED -- no family declares, depends on or requires it, and
+//     re-declaring it (or depending on it) FAILS the guard.
+{
+  ok("G5b: no scheduled family is (or depends on) fba-inventory-health; it is not a required daily family",
+    !SCHEDULED_FAMILY_REGISTRY["fba-inventory-health"]
+    && Object.values(SCHEDULED_FAMILY_REGISTRY).every((d) => !d.dependencies.includes("fba-inventory-health"))
+    && !REQUIRED_DAILY_FAMILIES.includes("fba-inventory-health") && REQUIRED_DAILY_FAMILIES.includes("listings")
+    && !JSON.stringify(SCHEDULED_FAMILY_REGISTRY).includes("inventory-health"));
+  const redeclared = validateScheduledFamilyRegistry({ ...SCHEDULED_FAMILY_REGISTRY, "fba-inventory-health": { ...SCHEDULED_FAMILY_REGISTRY.listings, family: "fba-inventory-health" } });
+  ok("G5c: re-declaring the retired fba-inventory-health family FAILS the guard", redeclared.ok === false && redeclared.problems.some((p) => /RETIRED/.test(p)));
+  const dependsRetired = validateScheduledFamilyRegistry({ ...SCHEDULED_FAMILY_REGISTRY, "fba-inventory-health": { ...SCHEDULED_FAMILY_REGISTRY.listings, family: "fba-inventory-health" }, materialize: { ...SCHEDULED_FAMILY_REGISTRY.materialize, dependencies: ["fba-inventory-health"] } });
+  ok("G5d: a family depending on the retired fba-inventory-health FAILS the guard", dependsRetired.ok === false && dependsRetired.problems.some((p) => /depends on RETIRED/.test(p)));
 }
 
 // 5. Workflow parity: the declared owners/gates match the REAL scheduler-v2.yml.
@@ -70,7 +84,7 @@ writeSync(1, "scheduled-family-registry (release guard)\n");
 // 6. Source-registry parity: the durable daily source families are real registered sources.
 {
   const reg = readFileSync(path.join(ROOT, "lib/server/sync/source-registry.js"), "utf8");
-  for (const fam of ["order-line-items", "product-catalog", "fba-inventory-health"]) {
+  for (const fam of ["order-line-items", "product-catalog", "listings"]) {
     ok("G10: durable daily family is a registered source: " + fam, reg.includes(`sourceKey: "${fam}"`));
   }
 }

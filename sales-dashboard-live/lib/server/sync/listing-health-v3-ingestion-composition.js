@@ -9,12 +9,12 @@
 // api route / cron / watchdog, and the operator core still requires an explicit authorization + the default-disabled
 // ingestion gate before any live run.
 //
-// SOURCE EXECUTION is a deliberate TWO-PASS split so inventory is REUSE-ONLY:
-//   Pass 1 (create): a source tranche selecting ONLY listings + listings-raw, under the FROZEN per-region budget
-//     (atomic pre-POST reservation) -- so at most `maxCreates` (<= the region ceiling) creates ever POST.
-//   Pass 2 (reuse-only): a source tranche selecting ONLY fba-inventory-health with reuseOnly=true -- it ADOPTS the
-//     current FBA Plan inventory cache (zero create) or returns MISSING_REUSABLE_SOURCE; it can NEVER create a v3
-//     inventory export. OLI + Catalog are DERIVED durable dependencies (zero exports), injected at report-derive time.
+// SOURCE EXECUTION is ONE pass: a source tranche selecting ONLY listings + listings-raw, under the FROZEN per-region
+// budget (atomic pre-POST reservation) -- so at most `maxCreates` (<= the region ceiling) creates ever POST. The
+// Listings request is byte-identical to fba-plan:awd (ONE paid Listings export per <=5-seller batch: whichever job runs
+// first creates it, the other adopts the fresh cache). There is NO inventory pass: FBA Inventory Health is retired and
+// on-hand FBA is derived from the Listings rows. OLI + Catalog are DERIVED durable dependencies (zero exports), injected
+// at report-derive time.
 
 import { buildSchedulerV2Runtime, makeProductionDiscoverAccounts } from "./runtime-composition.js";
 import { runStagedSourceCycle } from "./source-sync-driver.js";
@@ -24,19 +24,14 @@ import { makeSourceTranche } from "./source-tranche.js";
 import { computeFrozenTrancheBudget } from "./source-tranche-budget.js";
 import { registryBudgetPlanner } from "./source-fixpoint.js";
 import { getDataDoeConnections } from "../datadoe-connections.js";
-import { getSourceExportCache, saveSourceExportCache, getSourceExportCacheMeta, getRecentSyncCycleIds, getSyncSourceJobsWithMeta, getSyncSourceJobOwnersForCycle, saveSourceSnapshotPayload, recordSourceListingsSnapshot, recordSourceListingsRawSnapshot, isSchemaMissingError, isFunctionSignatureMissingError } from "../supabase.js";
-import { organizationFingerprint as orgFingerprintOf } from "../source-identity.js";
+import { getSourceExportCache, saveSourceExportCache, getSourceExportCacheMeta, saveSourceSnapshotPayload, recordSourceListingsSnapshot, recordSourceListingsRawSnapshot, isSchemaMissingError, isFunctionSignatureMissingError } from "../supabase.js";
 import { getDataDoeTokenBalance } from "../datadoe-usage.js";
 import { discoverPrimaryAccountIds } from "./priority-control-pg-store.js";
 import { buildListingHealthV3Plan, planListingHealthV3IngestionCost } from "./listing-health-v3-operation.js";
 import { materializeListingHealthV3PerAccount, LISTING_HEALTH_V3_REGION_EXPORT_CEILING, expectedListingHealthV3NewExports } from "./listing-health-v3-materialize.js";
-import { planFbaPlanBucketBatched } from "./report-planner.js";
-import { fbaCycleBucket } from "./fba-plan-operation.js";
-import { defaultInventoryBatchesOf, overflowSellersFromTruncated, readRecentTruncatedInventoryOwnership, DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS } from "./fba-inventory-overflow.js";
-import { readRecentReadinessRejectionOwnership, readinessIsolationFrom } from "./source-readiness-isolation.js";
 
+// The ONLY source families a v3 ingestion ever runs (and may create): the canonical Listings + Listings-Raw.
 const V3_NEW_SOURCE_KEYS = Object.freeze(["listings", "listings-raw"]);
-const V3_INVENTORY_SOURCE_KEY = "fba-inventory-health";
 
 // The dedicated per-region cycle namespace -- NEVER collides with the scheduler-v2 daily (region, cycle_date) cycle.
 export function listingHealthV3CycleBucket(region) { return `listing-health-v3-${String(region)}`; }
@@ -62,11 +57,6 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     runReportsFn = runReportJobs,
     materializeFn = materializeListingHealthV3PerAccount,
     regionCeilings = LISTING_HEALTH_V3_REGION_EXPORT_CEILING,
-    // Injectable durable evidence readers for the inventory-only overflow derivation (default: the real Supabase
-    // readers). A build-time test seam ONLY -- kept injectable so the composition stays offline-testable.
-    getRecentCycleIds = getRecentSyncCycleIds,
-    getSourceJobsWithMeta = getSyncSourceJobsWithMeta,
-    getSourceJobOwners = getSyncSourceJobOwnersForCycle,
     // WORK B durable-persistence writers (default: the real Supabase functions). ZERO export -- the payload object is
     // content-addressed storage + the pointer is the as_of-dominant CAS RPC. Injectable for offline tests.
     saveDurablePayload = saveSourceSnapshotPayload,
@@ -97,56 +87,10 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
 
   const resolveCost = ({ plan }) => planListingHealthV3IngestionCost({ plan, getSourceExportCache: getExportCache });
 
-  // Derive the INVENTORY-ONLY overflow split from the SAME proven terminal-TRUNCATED evidence the FBA plan uses (the
-  // region's `<region>-fba` cycle), so a v3 inventory read hash matches the FBA single-seller child recovered for a
-  // whale seller. This is the ONLY way an overflow account's inventory is adoptable with zero new inventory exports.
-  // Fails soft to an empty set (no split => default batching) -- it never blocks planning. Listings/Listings-Raw are
-  // unaffected (the planner splits inventory only).
-  const resolveInventoryOverflowSellers = async ({ accounts, cycleDate, region, maxAgeDays = DEFAULT_OVERFLOW_EVIDENCE_MAX_AGE_DAYS, now = () => Date.now() }) => {
-    if (!accounts || !accounts.length) return new Set();
-    let defaultInventoryBatches = [];
-    try {
-      const fbaPlan = planFbaPlanBucketBatched({ accounts, connections, asOfFor: () => cycleDate, inventoryAsOf: cycleDate });
-      defaultInventoryBatches = defaultInventoryBatchesOf(fbaPlan);
-    } catch (_e) { return new Set(); }
-    const primary = (connections || []).find((c) => c && c.id === "primary");
-    const org = primary ? (primary.organizationFingerprint || orgFingerprintOf(primary.apiKey)) : null;
-    let truncatedOwnership = [];
-    try {
-      truncatedOwnership = await readRecentTruncatedInventoryOwnership({
-        cycleBucket: fbaCycleBucket(region), now, maxAgeDays, connectionId: "primary", organizationFingerprint: org,
-        readRecentCycleIds: (cb, since) => getRecentCycleIds(cb, since),
-        readSourceJobs: (cid) => getSourceJobsWithMeta(cid),
-        readOwners: (cid) => getSourceJobOwners(cid),
-      });
-    } catch (_e) { return new Set(); }
-    const { overflowSellers } = overflowSellersFromTruncated({ defaultInventoryBatches, truncatedOwnership });
-    // BATCH-POISONING SELF-HEAL: fold readiness-isolation (DATADOE_INITIAL_LOAD_INCOMPLETE) for the v3 inventory
-    // source into the SAME single-seller inventory split channel, so a readiness-poisoned inventory seller is
-    // isolated off its shared batch (healthy batch-mates never poisoned; self-clears on the next single-seller
-    // success). Fail-soft: any read error adds nothing.
-    try {
-      // v3 inventory REUSES the fba-plan:inventory-health export identity, so its durable owners carry request_key
-      // "fba-plan:inventory-health" under the <region>-fba cycle bucket (exactly what the TRUNCATED reader above
-      // matches). Read the SAME shared inventory evidence -- keying on "listing-health-v3:inventory" would match no
-      // owner and make the fold inert.
-      const { isolateScopeHashes } = await readRecentReadinessRejectionOwnership({
-        requestKey: "fba-plan:inventory-health", cycleBucket: fbaCycleBucket(region), now, maxAgeDays, connectionId: "primary", organizationFingerprint: org,
-        readRecentCycleIds: (cb, since) => getRecentCycleIds(cb, since),
-        readSourceJobs: (cid) => getSourceJobsWithMeta(cid),
-        readOwners: (cid) => getSourceJobOwners(cid),
-      });
-      for (const s of readinessIsolationFrom({ defaultBatches: defaultInventoryBatches, isolateScopeHashes }).isolateSellers) overflowSellers.add(s);
-    } catch (_e) { /* fail-soft: no readiness isolation */ }
-    return overflowSellers;
-  };
-
-  // Production plan builder: derive the inventory-only overflow split, then build the frozen v3 plan with it. buildPlan
-  // is awaited by the operator, so returning a Promise is fine. `region` is required to scope the FBA overflow evidence.
-  const buildPlan = async ({ accounts, connections: conns, cycleDate, region }) => {
-    const overflowSellers = await resolveInventoryOverflowSellers({ accounts, cycleDate, region });
-    return buildListingHealthV3Plan({ accounts, connections: conns || connections, cycleDate, overflowSellers });
-  };
+  // Production plan builder: the frozen v3 plan (Listings + Listings-Raw in stable <=5-seller batches; no inventory
+  // source and no overflow split, so the Listings batch hash stays byte-identical to fba-plan:awd). PURE planning --
+  // zero durable reads. buildPlan is awaited by the operator.
+  const buildPlan = async ({ accounts, connections: conns, cycleDate }) => buildListingHealthV3Plan({ accounts, connections: conns || connections, cycleDate });
 
   const checkBalance = async () => {
     if (!primaryApiKey) return { usable: null };
@@ -169,7 +113,7 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     emit, runId,
   });
 
-  // The frozen NEW-tranche budget (listings + listings-raw ONLY; inventory is never in it), computed WITHOUT persisting.
+  // The frozen NEW-tranche budget (listings + listings-raw -- the only v3 source families), computed WITHOUT persisting.
   // The operation binds the standing authorization to exactly this (fingerprint + hashes + ceilings) BEFORE paid work.
   const newTranche = (region) => makeSourceTranche({ sourceKeys: [...V3_NEW_SOURCE_KEYS], name: `lhv3-new#${region}` });
   const freezeBudget = ({ plan, region }) => {
@@ -191,8 +135,7 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
   const runSources = async ({ plan, region, cycleDate, authorizationBinding = null }) => {
     const cycleBucket = listingHealthV3CycleBucket(region);
     const NEW = newTranche(region);
-    const INV = makeSourceTranche({ sourceKeys: [V3_INVENTORY_SOURCE_KEY], name: `lhv3-inv#${region}` });
-    // Freeze the create budget for the NEW tranche ONLY (listings + listings-raw). Inventory is never in it.
+    // Freeze the create budget for the NEW tranche (listings + listings-raw -- the only v3 source families).
     const plannedJobs = resolveFromGenericPlan(plan)().sourceJobs;
     const frozen = freezeBudget({ plan, region });
     // EXACT BINDING ENFORCEMENT (fail closed BEFORE openCycle/persistBudget/reservation/POST): the operation's bound
@@ -239,28 +182,19 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     if (ack !== "created" && ack !== "exists") throw new Error(`listing-health-v3 ingestion: persistBudget returned "${ack}"; refusing (fail closed).`);
     const budget = { trancheKey: frozen.trancheKey, planFingerprint: frozen.planFingerprint };
 
-    // Pass 1: create listings + listings-raw within the frozen budget (atomic pre-POST reservation).
+    // The ONE source pass: create (or adopt) listings + listings-raw within the frozen budget (atomic pre-POST
+    // reservation). A Listings job ADOPTS the fresh shared canonical Listings cache when fba-plan:awd already created it.
     const p1 = await runSourceCycle({
       store: runtime.store, dataDoe: runtime.dataDoe, resolvePlan: resolveFromGenericPlan(plan),
       bucket: region, cycleBucket, cycleDate, trigger: "manual", deadlineMs: Infinity, reserveMs: 0,
       sourceTranche: NEW, reuseOnly: false, budget,
     });
-    // Pass 2: inventory REUSE-ONLY (adopt the current FBA Plan cache; never a v3 create). OPTIONAL-INVENTORY:
-    // completeUnavailableOnMissingReuse marks an account with no adoptable FBA inventory cache COMPLETE-AS-UNAVAILABLE
-    // (terminal 'skipped') instead of leaving a blocking pending job, so the dedicated cycle DRAINS + finalizes
-    // 'succeeded' for the accounts whose required listings/OLI published while inventory stays unavailable for the
-    // FBA-failed accounts. This flag is set ONLY on the INV pass (Pass 1 NEW listings stays fail-closed on a miss).
-    const p2 = await runSourceCycle({
-      store: runtime.store, dataDoe: runtime.dataDoe, resolvePlan: resolveFromGenericPlan(plan),
-      bucket: region, cycleBucket, cycleDate, trigger: "manual", deadlineMs: Infinity, reserveMs: 0,
-      sourceTranche: INV, reuseOnly: true, completeUnavailableOnMissingReuse: true, budget: null,
-    });
 
     // Actual creates = NEW-tranche jobs whose create_export_count > 0 (honest evidence, not the reserved ceiling).
     const jobs = await runtime.store.listSourceJobs(p1.cycleId || cycleId);
     const newHashes = new Set(frozen.hashes.map((h) => h.requestHash));
-    const invSourceKey = V3_INVENTORY_SOURCE_KEY;
-    const createdNewJobs = jobs.filter((j) => newHashes.has(j.request_hash ?? j.requestHash) && Number(j.create_export_count ?? j.createExportCount ?? 0) > 0);
+    const created = (j) => Number(j.create_export_count ?? j.createExportCount ?? 0) > 0;
+    const createdNewJobs = jobs.filter((j) => newHashes.has(j.request_hash ?? j.requestHash) && created(j));
     const creates = createdNewJobs.length;
     // Observed tokens priced by the SAME per-source token class the frozen budget froze (frozen.hashes[].tokenCost:
     // premium listings=5 / standard listings-raw=2), NOT a flat creates*2 -- so the reported spend cannot understate a
@@ -268,12 +202,18 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     // reserved frozen budget.
     const tokenCostByHash = new Map(frozen.hashes.map((h) => [h.requestHash, Number(h.tokenCost) || 0]));
     const tokens = createdNewJobs.reduce((sum, j) => sum + (tokenCostByHash.get(j.request_hash ?? j.requestHash) || 0), 0);
-    const inventoryCreated = jobs.some((j) => (j.source_key ?? j.sourceKey) === invSourceKey && Number(j.create_export_count ?? j.createExportCount ?? 0) > 0);
+    // STRUCTURAL GUARD: any created job of a source family OTHER than listings / listings-raw (e.g. the retired FBA
+    // Inventory Health) is a contract violation the operator fails closed on.
+    const unplannedCreated = jobs.some((j) => !V3_NEW_SOURCE_KEYS.includes(String(j.source_key ?? j.sourceKey ?? "")) && created(j));
     return {
       cycleId: p1.cycleId || cycleId,
-      drained: !!(p1.drained && p2.drained),
+      drained: !!p1.drained,
       creates, maxCreates: frozen.maxCreates, tokens, // observed estimate (rowCountBilling=true), real per-source pricing
-      inventoryCreated, inventoryPass: { succeeded: p2.succeeded, skipped: p2.skipped }, newPass: { succeeded: p1.succeeded, failed: p1.failed },
+      // inventoryCreated keeps the operator's existing hard guard (listing-health-v3-operation.js fails closed on it):
+      // ANY created job outside listings / listings-raw (e.g. the retired FBA Inventory Health) is a contract violation.
+      // inventoryPass is retained for evidence-shape compatibility: there is no inventory pass any more.
+      unplannedCreated, inventoryCreated: unplannedCreated, inventoryPass: { succeeded: 0, skipped: 0, retired: true },
+      newPass: { succeeded: p1.succeeded, failed: p1.failed },
     };
   };
 

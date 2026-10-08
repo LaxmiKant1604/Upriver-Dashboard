@@ -2,7 +2,10 @@
 //
 // Part A drives deriveReportSnapshot("buy-box-loss") against hand-built saved fragments and proves the
 // pure payload deep-equals a hand-computed production-route fixture, plus the weighted/unweighted branches,
-// null-observation exclusion, currency+SKU isolation, price/stock evidence, inventory null-vs-genuine-zero,
+// null-observation exclusion, currency+SKU isolation, stock evidence (Listings inventory CUTOVER: no
+// buy-box-loss:inventory fragment exists; the derive reads the SAVED evidence from context.insightInventoryEvidence --
+// here the saved Health bridge with no saved Listings -- and competitive prices / run rate are REMOVED, even when a saved
+// Health row still carries them), inventory null-vs-genuine-zero,
 // exact four-slice window validation, wrong/missing/dup/reordered/partial/extra/cross-account fail-closed,
 // public-vs-raw identity, zero network, and idempotency. Part B drives the REAL planBuyBoxLoss + the generic
 // owner-scoped runSourceJobs + runReportJobs and proves shared-hash dedup, coexistence, strict-cap fail,
@@ -35,7 +38,6 @@ const CONNS = [
   { id: "secondary", apiKey: dash("sec", "key"), accountPrefix: dash("dd", "secondary") + ":" },
 ];
 const SOURCE_LABEL = "Profit by SKU & Date";
-const PRICE_LABEL = "FBA Inventory Health";
 const DRIVER_CONNECTION_ID = { primary: "primary", secondary: "dd-secondary" };
 
 // Windows (computed once main() has imported the helpers). SLICES = the four 7-day daily buy-box slices;
@@ -94,18 +96,21 @@ const canonicalOrderedFromDaily = (dailySlices, ids = [ID]) => {
 // ordered OLI slices (each under ONE request key, buy-box-loss:oli-sales), inventory, catalog. The ordered
 // slices default to being derived + re-binned from the daily slices (so the re-aggregated per-SKU sales/units
 // resolve to the same totals) but may be supplied explicitly (already aligned to OLI_SLICES).
+// `inventory` = the account's SAVED durable FBA Inventory Health rows (the read-only bridge), delivered to the derive as
+// context evidence (never a fragment); null => no bridge evidence at all.
 function bbPlanned({ slices = [[], [], [], []], ordered = null, inventory = [], catalog = [], ids = [ID] } = {}) {
   const planned = []; const rows = {};
+  const evidence = inventory == null ? null : { listings: null, healthBridge: { rows: inventory, unavailableReason: null, snapshotDate: null, savedAt: null } };
   const orderedSlices = ordered || canonicalOrderedFromDaily(slices, ids);
   SLICES.forEach((w, i) => { const f = frag("buy-box-loss:daily", w.from, w.to, ids); planned.push(f); rows[f.requestHash] = slices[i] || []; });
   OLI_SLICES.forEach((w, i) => { const f = frag("buy-box-loss:oli-sales", w.from, w.to, ids); planned.push(f); rows[f.requestHash] = orderedSlices[i] || []; });
-  const inv = frag("buy-box-loss:inventory", INV_FROM, INV_FROM, ids); planned.push(inv); rows[inv.requestHash] = inventory; // EXACT single day [asOf-1 .. asOf-1]
   const cat = frag("buy-box-loss:catalog", null, null, ids); planned.push(cat); rows[cat.requestHash] = catalog;
-  return { planned, rows };
+  return { planned, rows, evidence };
 }
 const ctx = (over = {}) => ({ to: ASOF, rawSellerId: ID, accountId: ID, ...over });
 const deriveBB = (built, context = ctx(), statusOverride) =>
-  deriveReportSnapshot({ reportKey: "buy-box-loss", sources: buildSources(built.planned, built.rows, statusOverride), context });
+  deriveReportSnapshot({ reportKey: "buy-box-loss", sources: buildSources(built.planned, built.rows, statusOverride),
+    context: built.evidence && !("insightInventoryEvidence" in context) ? { ...context, insightInventoryEvidence: built.evidence } : context });
 
 const daily = (date, sku, asin, brand, currency, bb, sales, units, pv, name) => ({
   date, sku, child_asin: asin, product_name: name || `Prod ${sku}`, product_brand: brand, currency,
@@ -113,7 +118,7 @@ const daily = (date, sku, asin, brand, currency, bb, sales, units, pv, name) => 
 });
 const invRow = (date, sku, asin, currency, available, prices, unitsShippedT30, dos) => ({
   date, sku, child_asin: asin, product_name: `Prod ${sku}`, currency, available,
-  unfulfillable_quantity: 0, inbound_shipped: 0, inbound_received: 0, days_of_supply: dos ?? null,
+  unfulfillable_quantity: 0, inbound_working: 0, inbound_shipped: 0, inbound_received: 0, days_of_supply: dos ?? null,
   units_shipped_t30: unitsShippedT30,
   your_price: prices ? prices.yourPrice : null, sales_price: prices ? prices.salesPrice : null,
   featuredoffer_price: prices ? prices.featuredOfferPrice : null,
@@ -146,7 +151,8 @@ const FIXTURE = () => ({
     ],
   ],
   inventory: [
-    // EXACTLY the single previous day (asOf-1 = 2025-08-09); a row on any other date is now rejected.
+    // The account's LAST SAVED Health snapshot (2025-08-09, within asOf - 2): the read-only bridge. Its legacy competitive
+    // prices / run rate / days of supply must NEVER surface.
     invRow("2025-08-09", "SKU-W", "ASIN-W", "USD", 8, { yourPrice: 21.99, salesPrice: 20.99, featuredOfferPrice: 19.99, lowestPriceNewPlusShipping: 22.0 }, 40, 12),
     invRow("2025-08-09", "SKU-U", "ASIN-U", "USD", 0, null, 0, null), // genuine zero stock, null prices
   ],
@@ -155,19 +161,29 @@ const FIXTURE = () => ({
     { child_asin: "ASIN-N", parent_asin: "P2", product_name: "Catalog N", product_brand: "BetaCat" },
   ],
 });
-const wPrice = { yourPrice: 21.99, salesPrice: 20.99, featuredOfferPrice: 19.99, lowestPriceNewPlusShipping: 22.0, currency: "USD" };
+// The saved Health bridge: available + inbound (working + shipped + received) only; NO Health-only metric.
+const HF = "health-fallback";
+const wStock = () => ({ source: HF, listed: true, channel: null, fbaContext: "fba", fbaAvailable: 8, fbaInbound: 0, conflict: false });
+const absentStock = () => ({ source: HF, listed: false, channel: null, fbaContext: null, fbaAvailable: null, fbaInbound: null, conflict: false });
+const INV_FIELDS = () => ({
+  inventoryModel: "inventory-source-v1", inventorySource: HF,
+  inventorySourceLabel: "FBA Inventory Health snapshot 2025-08-09 (saved, no longer refreshed -- temporary bridge: listings-not-loaded)",
+  inventoryAvailable: true, listingsRefreshedAt: null, inventoryHealthDate: "2025-08-09",
+  inventoryFallbackReasons: ["listings-not-loaded"], inventoryUnavailableReasons: [], inventoryResolvedConflicts: 0,
+  inventorySnapshotDate: "2025-08-09",
+});
 const expectedFixturePayload = () => ({
   accountId: "A1", asOf: "2025-08-10",
   window: { from: "2025-07-14", to: "2025-08-10", days: 28, sliceDays: 7 },
   observedWindow: { from: "2025-07-15", to: "2025-08-05" },
-  sourceLabel: SOURCE_LABEL, priceSourceLabel: PRICE_LABEL,
-  inventoryAvailable: true, inventorySnapshotDate: "2025-08-09",
+  sourceLabel: SOURCE_LABEL,
+  ...INV_FIELDS(),
   currencies: ["CAD", "USD"],
   rows: [
-    { sku: "SKU-W", asin: "ASIN-W", productName: "Widget W", brand: "Acme", currency: "USD", buyBoxPct: 87.5, buyBoxBasis: "page-view weighted", buyBoxDays: 2, windowDays: 28, sales: 300, units: 30, pageViews: 200, price: { ...wPrice }, available: 8, unitsShippedT30: 40, inventoryKnown: true },
-    { sku: "SKU-N", asin: "ASIN-N", productName: "NullBB N", brand: "Acme", currency: "USD", buyBoxPct: 75, buyBoxBasis: "page-view weighted", buyBoxDays: 1, windowDays: 28, sales: 100, units: 10, pageViews: 50, price: null, available: null, unitsShippedT30: null, inventoryKnown: false },
-    { sku: "SKU-U", asin: "ASIN-U", productName: "Unweighted U", brand: "Beta", currency: "USD", buyBoxPct: 50, buyBoxBasis: "unweighted mean of observed days", buyBoxDays: 2, windowDays: 28, sales: 80, units: 8, pageViews: 0, price: { yourPrice: null, salesPrice: null, featuredOfferPrice: null, lowestPriceNewPlusShipping: null, currency: "USD" }, available: 0, unitsShippedT30: 0, inventoryKnown: true },
-    { sku: "SKU-W", asin: "ASIN-W", productName: "Widget W", brand: "Acme", currency: "CAD", buyBoxPct: 70, buyBoxBasis: "page-view weighted", buyBoxDays: 1, windowDays: 28, sales: 500, units: 50, pageViews: 100, price: { ...wPrice }, available: 8, unitsShippedT30: 40, inventoryKnown: true },
+    { sku: "SKU-W", asin: "ASIN-W", productName: "Widget W", brand: "Acme", currency: "USD", buyBoxPct: 87.5, buyBoxBasis: "page-view weighted", buyBoxDays: 2, windowDays: 28, sales: 300, units: 30, pageViews: 200, stock: wStock() },
+    { sku: "SKU-N", asin: "ASIN-N", productName: "NullBB N", brand: "Acme", currency: "USD", buyBoxPct: 75, buyBoxBasis: "page-view weighted", buyBoxDays: 1, windowDays: 28, sales: 100, units: 10, pageViews: 50, stock: absentStock() },
+    { sku: "SKU-U", asin: "ASIN-U", productName: "Unweighted U", brand: "Beta", currency: "USD", buyBoxPct: 50, buyBoxBasis: "unweighted mean of observed days", buyBoxDays: 2, windowDays: 28, sales: 80, units: 8, pageViews: 0, stock: { source: HF, listed: true, channel: null, fbaContext: "fba", fbaAvailable: 0, fbaInbound: 0, conflict: false } },
+    { sku: "SKU-W", asin: "ASIN-W", productName: "Widget W", brand: "Acme", currency: "CAD", buyBoxPct: 70, buyBoxBasis: "page-view weighted", buyBoxDays: 1, windowDays: 28, sales: 500, units: 50, pageViews: 100, stock: wStock() },
   ],
   catalogBrands: ["AcmeCat", "BetaCat"],
 });
@@ -219,31 +235,32 @@ test("6. currency + SKU is the aggregation identity; two currencies for one SKU 
   assert.deepEqual(p.currencies, ["CAD", "USD"], "account currencies reported, never combined");
 });
 
-test("7. price/stock cause evidence is preserved from the latest snapshot", () => {
+test("7. stock evidence from the saved bridge ONLY: competitive prices / run rate / days of supply are REMOVED (never carried, even though the saved rows still hold them)", () => {
   const p = deriveBB(bbPlanned(FIXTURE())).payload;
   const w = p.rows.find((r) => r.sku === "SKU-W" && r.currency === "USD");
-  assert.deepEqual(w.price, wPrice, "competitive prices + currency from the latest snapshot");
-  assert.equal(w.available, 8);
-  assert.equal(w.unitsShippedT30, 40);
-  assert.equal(w.inventoryKnown, true);
+  assert.equal(p.inventorySource, "health-fallback");
+  assert.ok(!("health" in w.stock), "no Health-only metric rides on a row");
+  assert.ok(!("priceSourceLabel" in p), "no FBA Inventory Health price source");
+  assert.ok(!JSON.stringify(p).match(/featured|yourPrice|salesPrice|lowestPrice|unitsShipped|daysOfSupply/i), "no price / run-rate / days-of-supply field anywhere in the payload");
+  assert.equal(w.stock.fbaAvailable, 8);
+  assert.ok(!("price" in w) && !("available" in w) && !("inventoryKnown" in w), "the pre-phase-2 row fields are gone");
 });
 
 test("8. inventory: genuine zero when the SKU is in the snapshot; null (never zero) when it is missing", () => {
   const p = deriveBB(bbPlanned(FIXTURE())).payload;
   const u = p.rows.find((r) => r.sku === "SKU-U");
-  assert.equal(u.available, 0, "genuine zero stock is preserved (SKU present in snapshot)");
-  assert.equal(u.inventoryKnown, true);
+  assert.equal(u.stock.fbaAvailable, 0, "genuine zero stock is preserved (SKU present in snapshot)");
+  assert.equal(u.stock.listed, true);
   const n = p.rows.find((r) => r.sku === "SKU-N");
-  assert.equal(n.available, null, "a SKU absent from the snapshot is null, never fabricated zero");
-  assert.equal(n.price, null);
-  assert.equal(n.inventoryKnown, false);
+  assert.deepEqual(n.stock, absentStock(), "a SKU absent from the snapshot is not listed (unknown), never zero and never FBM");
 });
 
 test("9. a missing/unavailable inventory snapshot leaves every row unavailable/null (never zero)", () => {
   const p = deriveBB(bbPlanned({ ...FIXTURE(), inventory: [] })).payload;
   assert.equal(p.inventoryAvailable, false);
+  assert.equal(p.inventorySource, "unavailable");
   assert.equal(p.inventorySnapshotDate, null);
-  assert.ok(p.rows.every((r) => r.price === null && r.available === null && r.unitsShippedT30 === null && r.inventoryKnown === false));
+  assert.ok(p.rows.every((r) => r.stock === null), "no stock source -> every row's evidence is null (never zero)");
 });
 
 test("10. product-name/brand precedence: entry (daily) wins; catalog fills a blank", () => {
@@ -294,11 +311,9 @@ test("12. wrong / missing / duplicate / reordered / partial / extra daily window
   assert.equal(deriveBB(dup).status, "invalid", "duplicate slice window => invalid");
 });
 
-test("13. wrong inventory / dated-or-missing catalog windows fail closed (invalid)", () => {
+test("13. dated-or-missing catalog windows fail closed (invalid); no inventory fragment exists any more", () => {
   const good = FIXTURE();
-  const badInv = bbPlanned(good); const ii = badInv.planned.findIndex((p) => p.requestKey === "buy-box-loss:inventory");
-  badInv.planned[ii] = { ...badInv.planned[ii], from: addDaysStr(INV_FROM, -1) };
-  assert.equal(deriveBB(badInv).status, "invalid", "shifted inventory window => invalid");
+  assert.ok(!bbPlanned(good).planned.some((p) => p.requestKey === "buy-box-loss:inventory"), "no buy-box-loss:inventory fragment");
   const datedCat = bbPlanned(good); const ci = datedCat.planned.findIndex((p) => p.requestKey === "buy-box-loss:catalog");
   datedCat.planned[ci] = { ...datedCat.planned[ci], from: SLICES[0].from, to: SLICES[0].to };
   assert.equal(deriveBB(datedCat).status, "invalid", "dated catalog fragment => invalid");
@@ -309,9 +324,9 @@ test("14. cross-account fragments fail closed (invalid)", () => {
   const cross = bbPlanned(good); const di = cross.planned.findIndex((p) => p.requestKey === "buy-box-loss:daily");
   cross.planned[di] = { ...cross.planned[di], sellerOrVendorIds: ["OTHER"] };
   assert.equal(deriveBB(cross).status, "invalid", "cross-account daily slice => invalid");
-  const crossInv = bbPlanned(good); const ii = crossInv.planned.findIndex((p) => p.requestKey === "buy-box-loss:inventory");
-  crossInv.planned[ii] = { ...crossInv.planned[ii], sellerOrVendorIds: ["OTHER"] };
-  assert.equal(deriveBB(crossInv).status, "invalid", "cross-account inventory => invalid");
+  // A saved bridge carrying ANOTHER seller's row is refused (never another account's stock): stock Unavailable.
+  const crossInv = deriveBB(bbPlanned({ ...good, inventory: [...good.inventory, { ...good.inventory[0], seller_or_vendor_id: "OTHER" }] })).payload;
+  assert.deepEqual([crossInv.inventorySource, crossInv.inventoryUnavailableReasons], ["unavailable", ["listings-not-loaded", "health-foreign-seller-rows"]]);
 });
 
 test("15. a missing/failed required source => unavailable, ZERO writes, last-known-good preserved", () => {
@@ -320,10 +335,11 @@ test("15. a missing/failed required source => unavailable, ZERO writes, last-kno
   const built = bbPlanned(good);
   const firstDailyHash = built.planned.find((p) => p.requestKey === "buy-box-loss:daily").requestHash;
   assert.equal(deriveBB(built, ctx(), { [firstDailyHash]: "failed" }).status, "unavailable", "failed daily slice => unavailable (LKG kept)");
-  // Failed inventory (all-required) => unavailable.
-  const built2 = bbPlanned(good);
-  const invHash = built2.planned.find((p) => p.requestKey === "buy-box-loss:inventory").requestHash;
-  assert.equal(deriveBB(built2, ctx(), { [invHash]: "failed" }).status, "unavailable", "failed inventory => unavailable (LKG kept)");
+  // No saved inventory evidence at all never blocks the report: it derives with stock Unavailable (never zero).
+  const noEvidence = deriveBB(bbPlanned({ ...good, inventory: null }));
+  assert.equal(noEvidence.status, "derived");
+  assert.deepEqual(noEvidence.payload.inventoryUnavailableReasons, ["listings-not-loaded", "health-bridge-not-loaded"]);
+  assert.ok(noEvidence.payload.rows.every((r) => r.stock === null));
 });
 
 group("buy-box derive: every source ROW date is bound to its validated window (Blocker 1)");
@@ -361,11 +377,16 @@ test("15e. a FUTURE daily date (2099-01-01) => invalid", () => {
   assert.equal(deriveBB(bbPlanned(withDailyRow(3, dailyRow("2099-01-01")))).status, "invalid");
 });
 
-test("15f. inventory row dated off the exact single day (asOf-1) => invalid", () => {
-  const before = bbPlanned({ ...FIXTURE(), inventory: [invRow(addDaysStr(INV_FROM, -1), "SKU-W", "ASIN-W", "USD", 8, null, 40, 12)] });
-  assert.equal(deriveBB(before).status, "invalid", "inventory before the exact day => invalid");
-  const after = bbPlanned({ ...FIXTURE(), inventory: [invRow(ASOF, "SKU-W", "ASIN-W", "USD", 8, null, 40, 12)] });
-  assert.equal(deriveBB(after).status, "invalid", "inventory after the exact day (even asOf itself) => invalid");
+test("15f. the saved bridge drives stock ONLY while its date >= asOf - 2: a stale bridge => Unavailable (typed), never the stale figure", () => {
+  const edge = deriveBB(bbPlanned({ ...FIXTURE(), inventory: [invRow(addDaysStr(ASOF, -2), "SKU-W", "ASIN-W", "USD", 8, null, 40, 12)] })).payload;
+  assert.equal(edge.inventorySource, "health-fallback", "asOf - 2 still serves");
+  const stale = deriveBB(bbPlanned({ ...FIXTURE(), inventory: [invRow(addDaysStr(ASOF, -3), "SKU-W", "ASIN-W", "USD", 8, null, 40, 12)] })).payload;
+  assert.deepEqual([stale.inventorySource, stale.inventorySnapshotDate], ["unavailable", null]);
+  assert.deepEqual(stale.inventoryUnavailableReasons, ["listings-not-loaded", `health-bridge-stale:${addDaysStr(ASOF, -3)}`]);
+  assert.ok(stale.rows.every((r) => r.stock === null), "never the stale 8 and never 0");
+  // The bridge reads its LATEST date only: an older-dated row is never summed in.
+  const older = deriveBB(bbPlanned({ ...FIXTURE(), inventory: [...FIXTURE().inventory, invRow(addDaysStr(ASOF, -5), "SKU-W", "ASIN-W", "USD", 999, null, 40, 12)] })).payload;
+  assert.equal(older.rows.find((r) => r.sku === "SKU-W" && r.currency === "USD").stock.fbaAvailable, 8);
 });
 
 test("15g. the exact Codex repro: daily 2099-01-01 + inventory 2099-01-02 no longer derives (=> invalid)", () => {
@@ -488,7 +509,7 @@ function makeDataDoe(opts = {}) {
     // `to` = asOf, inside [asOf-10d, asOf]) so post-Blocker-1 row-date validation accepts canonical rows.
     if (rk.includes("oli-sales")) return [{ date: fp.from || "2025-08-05", seller_or_vendor_id: ID, sku: "SKU-W", child_asin: "ASIN-W", item_price_currency: "USD", total_sales_sum: 200, total_units_sum: 20 }];
     if (rk.includes("daily")) return [daily(fp.from || "2025-08-05", "SKU-W", "ASIN-W", "Acme", "USD", 90, 200, 20, 150, "Widget W")];
-    if (rk.includes("inventory")) return [invRow(fp.to || "2025-08-09", "SKU-W", "ASIN-W", "USD", 8, { yourPrice: 21.99, salesPrice: 20.99, featuredOfferPrice: 19.99, lowestPriceNewPlusShipping: 22.0 }, 40, 12)];
+    if (rk.includes("inventory") || job.sourceKey === "fba-inventory-health") throw new Error("an FBA Inventory Health export was requested (the cutover forbids it)");
     if (rk.includes("catalog")) return [{ child_asin: "ASIN-W", parent_asin: "P1", product_name: "Catalog W", product_brand: "AcmeCat" }];
     return [{ child_asin: "ASIN-W" }];
   };
@@ -507,30 +528,30 @@ const ownerIdsOf = (jobs) => [...new Set(jobs.map((j) => j.owner.ownerId))];
 const runSrc = (store, dd, plannedJobs, extra = {}) => runSourceJobs({ store, dataDoe: dd, plannedJobs, ownerIds: ownerIdsOf(plannedJobs), bucket: "us", cycleDate: "2026-08-11", ...extra });
 const srcOf = (plan, key) => plan.sources.find((s) => s.requestKey === key);
 
-test("21. shared inventory + catalog canonical hashes MATCH Sales Movers; primary vs dd-secondary are isolated", () => {
+test("21. shared catalog canonical hash MATCHES Sales Movers; NEITHER plans an FBA Inventory Health source; primary vs dd-secondary are isolated", () => {
   const bb = bbPlan();
   const sm = smPlanWithInventory();
-  assert.equal(srcOf(bb, "buy-box-loss:inventory").requestHash, srcOf(sm, "sales-movers:inventory").requestHash, "shared FBA inventory canonical identity");
+  assert.ok(![...bb.sources, ...sm.sources].some((x) => /:inventory$/.test(x.requestKey) || x.sourceKey === "fba-inventory-health"), "no FBA Inventory Health source is ever planned");
   assert.equal(srcOf(bb, "buy-box-loss:catalog").requestHash, srcOf(sm, "sales-movers:catalog").requestHash, "shared no-date catalog canonical identity");
   // Primary vs dormant secondary: different org scope => different hashes; secondary never routed to primary.
   const bbSec = planBuyBoxLoss({ accountId: PUB1, country: "US", currency: "USD", connections: CONNS, asOf: ASOF });
   assert.equal(bb.connectionId, "primary"); assert.equal(bbSec.connectionId, "secondary");
   assert.notEqual(srcOf(bb, "buy-box-loss:daily").requestHash, srcOf(bbSec, "buy-box-loss:daily").requestHash, "primary/dd-secondary daily hashes isolated");
-  assert.notEqual(srcOf(bb, "buy-box-loss:inventory").requestHash, srcOf(bbSec, "buy-box-loss:inventory").requestHash, "primary/dd-secondary inventory hashes isolated");
+  assert.notEqual(srcOf(bb, "buy-box-loss:catalog").requestHash, srcOf(bbSec, "buy-box-loss:catalog").requestHash, "primary/dd-secondary catalog hashes isolated");
 });
 
 test("22. one canonical export per shared request_hash across TWO report owners (Buy Box + Sales Movers)", async () => {
   const store = makeStore(); const dd = makeDataDoe();
   const bbJobs = jobsFromPlan(bbPlan());
-  const invJob = bbJobs.find((j) => j.requestKey === "buy-box-loss:inventory");
-  // A SECOND owner (Sales Movers) for the SAME canonical inventory hash: identical org/account scope, so
+  const invJob = bbJobs.find((j) => j.requestKey === "buy-box-loss:catalog");
+  // A SECOND owner (Sales Movers) for the SAME canonical catalog hash: identical org/account scope, so
   // the recomputed owner_id differs only by report family; the canonical job dedups on request_hash.
   const smOwnerId = sourceJobOwnerId({ reportKey: "sales-movers", connectionId: invJob.connectionId, organizationFingerprint: invJob.organizationFingerprint, accountScopeHash: invJob.accountScopeHash });
-  const smInvJob = { ...invJob, requestKey: "sales-movers:inventory", owner: { ownerId: smOwnerId, requestKey: "sales-movers:inventory", reportKey: "sales-movers", accountId: ID } };
+  const smInvJob = { ...invJob, requestKey: "sales-movers:catalog", owner: { ownerId: smOwnerId, requestKey: "sales-movers:catalog", reportKey: "sales-movers", accountId: ID } };
   const plannedJobs = [...bbJobs, smInvJob];
   const r = await runSrc(store, dd, plannedJobs);
-  assert.equal(dd.createCount(invJob.requestHash), 1, "the shared inventory export is created exactly once");
-  assert.equal(store.listSourceJobs(r.cycleId).filter((j) => j.request_hash === invJob.requestHash).length, 1, "one canonical inventory row");
+  assert.equal(dd.createCount(invJob.requestHash), 1, "the shared catalog export is created exactly once");
+  assert.equal(store.listSourceJobs(r.cycleId).filter((j) => j.request_hash === invJob.requestHash).length, 1, "one canonical catalog row");
   assert.equal(store._owners(r.cycleId).filter((m) => m.request_hash === invJob.requestHash).length, 2, "two owner memberships share the one canonical hash");
 });
 
@@ -585,7 +606,7 @@ test("25. E2E: generic cycle -> runReportJobs -> saved snapshot keyed by the acc
   assert.equal(saved[0].accountId, "A1", "report + snapshot keyed by the account id");
   assert.equal(saved[0].payload.accountId, "A1", "payload accountId matches the snapshot key");
   assert.equal(saved[0].payload.sourceLabel, SOURCE_LABEL);
-  assert.equal(saved[0].payload.priceSourceLabel, PRICE_LABEL);
+  assert.ok(!("priceSourceLabel" in saved[0].payload), "no FBA Inventory Health price source (competitive prices removed)");
   // Report idempotency: a second invocation writes no duplicate snapshot.
   const before = store.saveCalls;
   await runReportJobs({ store, cycleId: r1.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: [plan] });
@@ -596,7 +617,7 @@ test("26. partial invocation (maxJobs) resumes without a duplicate create-export
   const store = makeStore(); const dd = makeDataDoe();
   const plan = bbPlan();
   const jobs = jobsFromPlan(plan);
-  const r1 = await runSrc(store, dd, jobs, { maxJobs: 2 }); // only 2 of the 12 canonical jobs this invocation
+  const r1 = await runSrc(store, dd, jobs, { maxJobs: 2 }); // only 2 of the 11 canonical jobs this invocation
   assert.ok(r1.processed <= 2);
   const r2 = await runSrc(store, dd, jobs); // resume the rest
   assert.ok(store.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all sources complete after resume");
@@ -605,14 +626,14 @@ test("26. partial invocation (maxJobs) resumes without a duplicate create-export
 
 test("27. deferral (poll deadline) resumes without a duplicate create-export", async () => {
   const store = makeStore();
-  const dd1 = makeDataDoe({ deferKey: "inventory" });
+  const dd1 = makeDataDoe({ deferKey: "catalog" });
   const plan = bbPlan();
   const jobs = jobsFromPlan(plan);
-  const invHash = jobs.find((j) => j.requestKey === "buy-box-loss:inventory").requestHash;
+  const invHash = jobs.find((j) => j.requestKey === "buy-box-loss:catalog").requestHash;
   await runSrc(store, dd1, jobs);
   const dd2 = makeDataDoe();
   const r2 = await runSrc(store, dd2, jobs);
-  assert.equal(dd1.createCount(invHash) + dd2.createCount(invHash), 1, "the inventory export is created exactly once across the deferral+resume");
+  assert.equal(dd1.createCount(invHash) + dd2.createCount(invHash), 1, "the catalog export is created exactly once across the deferral+resume");
   assert.ok(store.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all sources complete after the deferral resume");
 });
 
@@ -655,32 +676,29 @@ const resolveFromPlan = (plan) => () => ({
 });
 const runGeneric = (store, dd, plan, opts = {}) => runStagedSourceCycle({ store, dataDoe: dd, resolvePlan: resolveFromPlan(plan), bucket: "us", cycleDate: "2026-08-11", ...opts });
 
-test("C1. default AND explicit planning include buy-box-loss; the plan holds exactly twelve canonical jobs with exact windows/deps/owner/context", () => {
+test("C1. default AND explicit planning include buy-box-loss; the plan holds exactly eleven canonical jobs (NO FBA Inventory Health) with exact windows/deps/owner/context", () => {
   assert.ok(SHADOW_PLANNED_REPORT_KEYS.includes("buy-box-loss"), "buy-box-loss is a default generic report key");
   assert.ok(shadowPlan(ACCTS).reportRequests.some((r) => r.reportKey === "buy-box-loss"), "DEFAULT plan includes buy-box-loss");
   const plan = shadowPlan(ACCTS, ["buy-box-loss"]);
   const bb = plan.reportRequests.find((r) => r.reportKey === "buy-box-loss");
-  // Exactly twelve canonical source jobs: four 7-day daily buy-box slices + six canonicalOliSlices ordered
-  // OLI slices + one inventory + one no-date catalog.
-  assert.equal(plan.sourceJobs.length, 12, "exactly twelve deduplicated canonical source jobs");
+  // Exactly eleven canonical source jobs: four 7-day daily buy-box slices + six canonicalOliSlices ordered
+  // OLI slices + one no-date catalog. (The FBA Inventory Health source is retired: never planned.)
+  assert.equal(plan.sourceJobs.length, 11, "exactly eleven deduplicated canonical source jobs");
   const dailies = bb.sources.filter((s) => s.requestKey === "buy-box-loss:daily");
   assert.deepEqual(dailies.map((s) => `${s.from}..${s.to}`), SLICES.map((s) => `${s.from}..${s.to}`), "four ordered 7-day daily slice windows");
   const ordered = bb.sources.filter((s) => s.requestKey === "buy-box-loss:oli-sales");
   assert.deepEqual(ordered.map((s) => `${s.from}..${s.to}`), OLI_SLICES.map((s) => `${s.from}..${s.to}`), "six canonicalOliSlices ordered OLI slice windows");
-  const inv = bb.sources.find((s) => s.requestKey === "buy-box-loss:inventory");
-  // The PLANNER models the SCHEDULED path where asOf is ALREADY D-1: its explicit inventoryAsOf
-  // defaults to asOf itself (a scheduled plan must NEVER resolve asOf-1 = D-2).
-  assert.deepEqual([inv.from, inv.to], [ASOF, ASOF], "planned inventory window is the exact single day asOf..asOf (scheduled asOf IS D-1)");
+  assert.ok(!bb.sources.some((s) => s.requestKey === "buy-box-loss:inventory" || s.sourceKey === "fba-inventory-health"), "no FBA Inventory Health source is planned");
   const cat = bb.sources.find((s) => s.requestKey === "buy-box-loss:catalog");
   assert.deepEqual([cat.from, cat.to], [null, null], "no-date catalog");
-  // Report dependency map = all twelve canonical hashes; context carries the raw seller id + asOf.
+  // Report dependency map = all eleven canonical hashes; context carries the raw seller id + asOf.
   const rj = plan.reportJobs.find((j) => j.reportKey === "buy-box-loss");
-  assert.equal(rj.dependsOn.length, 12, "report depends on all twelve canonical sources");
-  assert.deepEqual([...rj.dependsOn].sort(), plan.sourceJobs.map((j) => j.requestHash).sort(), "report deps == the twelve canonical hashes");
+  assert.equal(rj.dependsOn.length, 11, "report depends on all eleven canonical sources");
+  assert.deepEqual([...rj.dependsOn].sort(), plan.sourceJobs.map((j) => j.requestHash).sort(), "report deps == the eleven canonical hashes");
   assert.deepEqual(bb.context, { to: ASOF, inventoryAsOf: ASOF, rawSellerId: ID }, "context carries asOf + the explicit inventory snapshot day + raw seller id");
   // Owner metadata: every planned source job is owned by the buy-box-loss owner, recomputed + validated.
   const jobs = resolveFromPlan(plan)().sourceJobs;
-  assert.equal(jobs.length, 12);
+  assert.equal(jobs.length, 11);
   assert.ok(jobs.every((j) => j.owner && j.owner.reportKey === "buy-box-loss" && j.owner.accountId === ID && j.owner.ownerId), "each job carries buy-box-loss owner metadata");
   assert.equal(new Set(jobs.map((j) => j.owner.ownerId)).size, 1, "one owner for the single account/org");
 });
@@ -690,15 +708,15 @@ test("C2. Buy Box stays PENDING until every required source succeeds, then the s
   const plan = shadowPlan(ACCTS, ["buy-box-loss"]);
   const saved = [];
   const saveSnapshot = async ({ reportKey, accountId, payload }) => { store.saveCalls += 1; store.seedSnapshot(reportKey, accountId, payload); saved.push({ reportKey, accountId, payload }); return { paramsHash: "ph" }; };
-  // Bounded first invocation: only some of the twelve sources succeed => the report is still PENDING.
+  // Bounded first invocation: only some of the eleven sources succeed => the report is still PENDING.
   const r1 = await runGeneric(store, dd, plan, { maxJobs: 3 });
-  assert.ok(store.listSourceJobs(r1.cycleId).filter((j) => j.fetch_status === "succeeded").length < 12, "not all sources succeeded yet");
+  assert.ok(store.listSourceJobs(r1.cycleId).filter((j) => j.fetch_status === "succeeded").length < 11, "not all sources succeeded yet");
   let res = await runReportJobs({ store, cycleId: r1.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: plan.reportRequests });
   assert.equal(res.succeeded, 0, "report is PENDING while a required source is missing (no save)");
   assert.equal(saved.length, 0, "zero snapshot writes while pending");
   // Resume the generic driver to completion.
   const r2 = await runGeneric(store, dd, plan);
-  assert.ok(store.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all twelve sources succeeded after resume");
+  assert.ok(store.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all eleven sources succeeded after resume");
   const realFetch = globalThis.fetch; let hits = 0;
   globalThis.fetch = () => { hits += 1; throw new Error("network during derivation"); };
   try { res = await runReportJobs({ store, cycleId: r2.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: plan.reportRequests }); } finally { globalThis.fetch = realFetch; }
@@ -720,38 +738,37 @@ test("C3. maxJobs partial + poll/download deferral resume through the real drive
   const r = await runGeneric(s1, d1, plan);
   assert.ok(s1.listSourceJobs(r.cycleId).every((j) => j.fetch_status === "succeeded"), "all sources complete after maxJobs resume");
   for (const j of s1.listSourceJobs(r.cycleId)) assert.ok(d1.createCount(j.request_hash) <= 1, j.request_key + " exported at most once (maxJobs resume)");
-  // Poll-deferral resume: the first invocation defers inventory (no reconcile, memberships stay active).
+  // Poll-deferral resume: the first invocation defers the catalog (no reconcile, memberships stay active).
   const s2 = makeStore();
-  const dDefer = makeDataDoe({ deferKey: "inventory" });
+  const dDefer = makeDataDoe({ deferKey: "catalog" });
   const r1 = await runGeneric(s2, dDefer, plan);
   assert.ok((r1.deferred || 0) > 0, "the driver surfaces the resumable deferral");
-  const invReq = plan.reportRequests[0].sources.find((s) => s.requestKey === "buy-box-loss:inventory").requestHash;
+  const invReq = plan.reportRequests[0].sources.find((s) => s.requestKey === "buy-box-loss:catalog").requestHash;
   assert.ok(s2._owners(r1.cycleId).every((m) => m.owner_status === "active"), "no membership staled by a deferral (plan not yet at fixpoint)");
   const dOk = makeDataDoe();
   const r2 = await runGeneric(s2, dOk, plan);
-  assert.equal(dDefer.createCount(invReq) + dOk.createCount(invReq), 1, "inventory export created exactly once across the deferral + resume");
+  assert.equal(dDefer.createCount(invReq) + dOk.createCount(invReq), 1, "catalog export created exactly once across the deferral + resume");
   assert.ok(s2.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all sources complete after the deferral resume");
 });
 
-test("C4. Buy Box owner reconciliation is owner-scoped: a second owner sharing the inventory/catalog hash is neither staled nor failed", async () => {
+test("C4. Buy Box owner reconciliation is owner-scoped: a second owner sharing the catalog hash is neither staled nor failed", async () => {
   const store = makeStore(); const dd = makeDataDoe();
   const plan = shadowPlan(ACCTS, ["buy-box-loss"]);
   // Run the real generic driver to its fixpoint (this is when reconciliation of buy-box owners runs).
   const r = await runGeneric(store, dd, plan);
   const cid = r.cycleId;
-  const invReq = plan.reportRequests[0].sources.find((s) => s.requestKey === "buy-box-loss:inventory");
   const catReq = plan.reportRequests[0].sources.find((s) => s.requestKey === "buy-box-loss:catalog");
-  // A SECOND owner (Sales Movers) holds a membership on the SAME shared inventory + catalog canonical hashes.
-  for (const [reqKey, src] of [["sales-movers:inventory", invReq], ["sales-movers:catalog", catReq]]) {
+  // A SECOND owner (Sales Movers) holds a membership on the SAME shared catalog canonical hash.
+  for (const [reqKey, src] of [["sales-movers:catalog", catReq]]) {
     const ownerId = sourceJobOwnerId({ reportKey: "sales-movers", connectionId: "primary", organizationFingerprint: src.organizationFingerprint, accountScopeHash: src.accountScopeHash });
     store.upsertSourceJobOwners([{ cycleId: cid, requestHash: src.requestHash, ownerId, requestKey: reqKey, reportKey: "sales-movers", accountId: ID, connectionId: "primary", organizationFingerprint: src.organizationFingerprint, accountScopeHash: src.accountScopeHash }]);
   }
   // Re-run the Buy Box generic driver to fixpoint: its reconciliation must touch ONLY buy-box owners.
   await runGeneric(store, dd, plan);
   const smMemberships = store._owners(cid).filter((m) => m.report_key === "sales-movers");
-  assert.equal(smMemberships.length, 2, "the second owner's two shared memberships still exist");
+  assert.equal(smMemberships.length, 1, "the second owner's shared membership still exists");
   assert.ok(smMemberships.every((m) => m.owner_status === "active"), "buy-box reconciliation never stales/fails the second owner");
-  assert.ok(store.listSourceJobs(cid).filter((j) => j.request_hash === invReq.requestHash).every((j) => j.fetch_status === "succeeded"), "the shared canonical inventory job stays succeeded");
+  assert.ok(store.listSourceJobs(cid).filter((j) => j.request_hash === catReq.requestHash).every((j) => j.fetch_status === "succeeded"), "the shared canonical catalog job stays succeeded");
 });
 
 test("C5. primary-only: a stale dd-secondary account is skipped read-only with ZERO DataDoe calls and is never routed through the primary key", async () => {
@@ -766,7 +783,7 @@ test("C5. primary-only: a stale dd-secondary account is skipped read-only with Z
   assert.ok(jobs.every((j) => j.connection_id === "primary"), "no dd-secondary jobs; nothing routed to the primary key for the stale account");
   assert.ok(jobs.every((j) => !String(j.request_key).includes(dash("dd", "secondary"))), "no dd-secondary source was ever staged");
   // Zero DataDoe create-exports carry the secondary account (it spent no token).
-  assert.equal(jobs.length, 12, "exactly the twelve primary-account canonical jobs ran");
+  assert.equal(jobs.length, 11, "exactly the eleven primary-account canonical jobs ran (no Health job)");
 });
 
 async function main() {

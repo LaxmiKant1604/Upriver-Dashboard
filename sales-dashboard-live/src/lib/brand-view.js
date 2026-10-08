@@ -16,12 +16,78 @@
 //     never the converted value of an original-currency total, so the visible
 //     rows always add up to the visible total apart from display rounding.
 //  4. Unit counts and inventory unit counts are never converted.
+//  5. (EU all-market rule) an FBA total over two or more pan-EU pool marketplaces with positive stock is WITHHELD --
+//     the SAME server definition (euPoolAllMarketRule), applied to every group total, the KPI and FBA Cover.
 
 import {
   addDays, daysInMonth, monthBack, monthStart, parseDateStr, shiftYear,
+  euPoolAllMarketRule, EU_POOL_ALL_MARKET_WITHHELD_REASON,
 } from "../../lib/server/reports/brand-view.js";
 
-export { addDays, monthBack, monthStart, shiftYear };
+export { addDays, monthBack, monthStart, shiftYear, euPoolAllMarketRule, EU_POOL_ALL_MARKET_WITHHELD_REASON };
+
+/* ========================= INVENTORY SOURCE LABELS ========================= */
+
+// Display a Listings fetch time (ISO) in the viewer's locale; an unparseable value is shown verbatim.
+function fetchTimeLabel(value) {
+  const t = Date.parse(String(value || ""));
+  return Number.isFinite(t) ? new Date(t).toLocaleString() : String(value || "");
+}
+
+/**
+ * The per-account inventory source label (Listings inventory cutover):
+ *   listings        -> "Listings refreshed <time>"
+ *   health-fallback -> "FBA Inventory Health snapshot <date> (saved bridge, no longer refreshed)" -- the account's last
+ *                      saved Health snapshot, a temporary read-only bridge (the server drops it once it is too old)
+ *   health-legacy   -> "FBA Inventory Health snapshot <date> (saved, no longer refreshed)" (a compact saved before the
+ *                      Listings switch, within the same age limit)
+ *   otherwise       -> "FBA inventory unavailable" (+ "saved FBA Inventory Health snapshot <date> too old" when that is why)
+ */
+export function inventorySourceLabel(entry) {
+  const e = entry || {};
+  if (e.source === "listings") return e.listingsRefreshedAt ? `Listings refreshed ${fetchTimeLabel(e.listingsRefreshedAt)}` : "Listings (refresh time unavailable)";
+  if (e.source === "health-fallback") return `FBA Inventory Health snapshot ${e.healthDate || "(date unavailable)"} (saved bridge, no longer refreshed)`;
+  if (e.source === "health-legacy") return `FBA Inventory Health snapshot ${e.healthDate || "(date unavailable)"} (saved, no longer refreshed)`;
+  const stale = /health-bridge-stale:(\d{4}-\d{2}-\d{2})/.exec(String(e.unavailableReason || ""));
+  if (stale) return `FBA inventory unavailable (the saved FBA Inventory Health snapshot ${stale[1]} is too old to use)`;
+  return "FBA inventory unavailable";
+}
+
+/**
+ * One short freshness line for the inventory of a Brand View payload + a per-account tooltip.
+ * `coverage` is the payload coverage. A payload built before phase 2 (no inventoryAccountSources) keeps the former
+ * wording ("as of <date>" / "unavailable").
+ *   -> { label, title, legacy }  (title = one "Account: label" line per account, or undefined; legacy = a pre-phase-2
+ *      payload, whose label keeps the former "as of <date>" / "unavailable" wording)
+ */
+export function inventoryFreshnessSummary(coverage) {
+  const c = coverage || {};
+  const sources = Array.isArray(c.inventoryAccountSources) ? c.inventoryAccountSources : null;
+  if (!sources) return { label: c.inventoryDate ? `as of ${c.inventoryDate}` : "unavailable", title: undefined, legacy: true };
+  const title = sources.map((s) => `${s.accountName || s.accountId}: ${inventorySourceLabel(s)}`).join("\n") || undefined;
+  if (sources.length === 1) return { label: inventorySourceLabel(sources[0]), title };
+  const kinds = new Set(sources.map((s) => s.source));
+  if (kinds.size === 1) {
+    const only = sources[0].source;
+    if (only === "listings") return { label: c.inventoryRefreshedAt ? `Listings refreshed ${fetchTimeLabel(c.inventoryRefreshedAt)} (oldest account)` : "Listings", title };
+    if (only === "health-fallback") return { label: `FBA Inventory Health snapshot ${c.inventoryDate || "(date unavailable)"} (saved bridge, no longer refreshed; oldest account)`, title };
+    if (only === "health-legacy") return { label: `FBA Inventory Health snapshot ${c.inventoryDate || "(date unavailable)"} (saved, no longer refreshed; oldest account)`, title };
+    return { label: "unavailable", title };
+  }
+  const count = (kind) => sources.filter((s) => s.source === kind).length;
+  const parts = [];
+  if (count("listings")) parts.push(`Listings for ${count("listings")}`);
+  if (count("health-fallback")) parts.push(`saved FBA Inventory Health bridge for ${count("health-fallback")}`);
+  if (count("health-legacy")) parts.push(`saved FBA Inventory Health for ${count("health-legacy")}`);
+  if (count("unavailable")) parts.push(`unavailable for ${count("unavailable")}`);
+  return { label: `mixed sources (${parts.join(", ")} accounts)`, title };
+}
+
+/** "<prefix>: <label>" (phase 2) or the former "<prefix> as of <date>" / "<prefix> unavailable" (a legacy payload). */
+export function inventoryFreshnessText(coverage, prefix = "FBA inventory") {
+  const summary = inventoryFreshnessSummary(coverage);
+  return summary.legacy ? `${prefix} ${summary.label}` : `${prefix}: ${summary.label}`;
+}
 
 /* ============================== CURRENCY MODEL ============================== */
 
@@ -149,6 +215,7 @@ export function brandViewModel(payload) {
       hasSales: false,
       adsAvailable: false,
       fbaAvailable: null,
+      fbaUnknown: false,
       currencyConflict: false,
       // Which accounts sell this brand in this marketplace. Empty for the
       // single-account report; populated for the cross-account one, where it is
@@ -165,6 +232,8 @@ export function brandViewModel(payload) {
     entry.hasSales = Boolean(meta.hasSales);
     entry.adsAvailable = Boolean(meta.adsAvailable);
     entry.fbaAvailable = meta.fbaAvailable === null || meta.fbaAvailable === undefined ? null : Number(meta.fbaAvailable);
+    // UNKNOWN (not merely absent): a contributing account's inventory here is unknown -- totals over it are withheld.
+    entry.fbaUnknown = meta.fbaUnknown === true;
     entry.currencyConflict = Boolean(meta.currencyConflict);
     entry.accounts = Array.isArray(meta.accounts) ? meta.accounts : [];
   }
@@ -357,6 +426,11 @@ export function currencyGroups(rows, displayCurrency, rates, moneyFields) {
       totals: Object.fromEntries(moneyFields.map((field) => [field, null])),
       units: 0,
       fbaAvailable: null,
+      // A row of UNKNOWN inventory withholds the group's FBA total (never a partial sum).
+      fbaUnknown: false,
+      // EU all-market rule over THIS group's marketplaces (set after every row is in).
+      fbaWithheld: false,
+      fbaWithheldReason: null,
       unconvertible: false,
     };
 
@@ -372,8 +446,15 @@ export function currencyGroups(rows, displayCurrency, rates, moneyFields) {
     }
     bucket.units += Number(row.units) || 0;
     bucket.fbaAvailable = addMaybe(bucket.fbaAvailable, row.fbaAvailable);
+    if (row.fbaUnknown === true) bucket.fbaUnknown = true;
     bucket.rows.push(displayRow);
     buckets.set(groupKey, bucket);
+  }
+  // The group FBA total is an all-market figure across its marketplaces: the EU all-market rule applies to it.
+  for (const bucket of buckets.values()) {
+    const eu = euPoolAllMarketRule(bucket.rows.map((row) => [row.country, row.fbaAvailable]));
+    bucket.fbaWithheld = eu.withheld;
+    bucket.fbaWithheldReason = eu.reason;
   }
 
   return [...buckets.values()].sort((a, b) => String(a.key).localeCompare(String(b.key)));
@@ -425,6 +506,7 @@ export function dailySnapshotRows(model, { from, to }) {
       adSpend,
       lySales,
       fbaAvailable: country.fbaAvailable,
+      fbaUnknown: country.fbaUnknown === true,
       coverUnits: current.units,
       coverDays,
       salesOnly: !country.hasSales,

@@ -72,7 +72,16 @@ import {
   projectBrandSalesPayload, projectSkuMovementPayload, projectBrandDirectoryPayload, projectReturnsLeakagePayload, accountBrandPairAuthorized,
 } from "../lib/server/report-authorization.js";
 import { brandKey as canonicalBrandKey } from "../lib/server/reports/brand-membership.js";
-import { awdCapableMarketplace, canonicalAwdMarketplace } from "../lib/server/reports/awd-capability.js";
+import { awdCapableMarketplace } from "../lib/server/reports/awd-capability.js";
+// Phase 2 of the Listings inventory cutover: the browser FBA Shipment Plan refresh builds its payload with the SAME pure
+// fbaPlanPayload as the scheduler derive, and reads the account's SAVED Listings snapshot (zero export) for inventory.
+import { fbaPlanPayload, foldOliSalesToFbaInputs } from "../lib/server/reports/derivation-core.js";
+import { readSavedListingsRows } from "../lib/server/reports/common.js";
+import { readSavedHealthBridge } from "../lib/server/reports/health-bridge.js";
+
+// The single canonical previous UTC day (D-1): the cycle inventory as-of the saved-Health bridge threshold is measured
+// against (the scheduler's fba-plan / brand-inventory derive uses the same day).
+const previousUtcDay = () => new Date(Date.now() - 86400000).toISOString().slice(0, 10);
 // The single ASIN->Campaign cutover authority: block a retired ASIN Ads export create from ANY raw-sourceId path
 // (e.g. the admin discovery `sample` probe) before the DataDoe request, so the browser can never mint an ASIN export;
 // and gate the legacy ASIN-attributed portfolio read to the rollback path so no ASIN ad metrics reach the browser.
@@ -102,6 +111,10 @@ import {
   splitDateRangeByMonth,
   canonicalOliSlices,
   withDataDoeDeadline,
+  isRetiredDataDoeSourceId,
+  isRetiredSourceError,
+  RETIRED_SOURCE_ERROR_CODE,
+  RETIRED_SOURCE_MESSAGE,
 } from "../lib/server/datadoe.js";
 import {
   connectionForApiKey,
@@ -167,7 +180,7 @@ function brandViewDepFingerprintReaders() {
     // Round-4 Defect 2: fingerprint the SELECTED authoritative compact (available LKG the builder serves), NOT the
     // latest brand-inventory row -- so a selected-row change flips the serve fingerprint even when the latest
     // placeholder is unchanged. Identical selection to the materializer => writer + serve agree.
-    getInventorySelected: (accountId) => getInventorySnapshotCandidates({ reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, accountId, reportVersion: BRAND_INVENTORY_REPORT_VERSION })
+    getInventorySelected: (accountId) => getInventorySnapshotCandidates({ reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, accountId, reportVersion: BRAND_INVENTORY_SERVE_VERSIONS })
       .then((rows) => selectAuthoritativeInventorySnapshot(rows)).catch(() => null),
   };
 }
@@ -201,6 +214,7 @@ import {
   BRAND_VIEW_VERSION,
   BRAND_INVENTORY_SNAPSHOT_KEY,
   BRAND_INVENTORY_REPORT_VERSION,
+  BRAND_INVENTORY_SERVE_VERSIONS,
   brandViewPortfolioScopeId,
   brandViewScopeId,
   buildBrandViewBrandDirectory,
@@ -790,24 +804,36 @@ async function buildBrandPortfolioSnapshot({ brand, accountIds, asOf }) {
     // Inventory is read from the latest saved FBA-plan snapshot.  Its ASIN
     // mapping is already joined to the product brand and its fields are live
     // FBA Health values, so no client-side inference is needed.
+    // Phase 2 of the Listings inventory cutover: the saved plan's inventory is Listings (validated) or a labelled FBA
+    // Inventory Health fallback (inventorySource); a pre-phase-2 plan is FBA Inventory Health. A brand row with an
+    // UNKNOWN FBA Available withholds the account's figure (never a partial sum); a merchant-fulfilled-only row is not
+    // FBA stock. The figure carries its source + time (Listings refresh time / Health snapshot date).
     const planSnapshot = await getLatestReportSnapshot({ reportKey: "fba-plan", accountId });
     const planPayload = planSnapshot?.payload;
+    const planSource = planPayload?.inventorySource || (planPayload ? "health-legacy" : null);
+    const planUsable = !!planPayload && planPayload.inventoryAvailable !== false && planSource !== "unavailable";
     let fbaAvailable = 0;
     let fbaKnown = false;
-    for (const row of planPayload?.rows || []) {
+    let fbaUnknown = false;
+    for (const row of (planUsable ? planPayload.rows : null) || []) {
       if (String(row.brand || "").trim() !== brand) continue;
-      if (row.fbaAvailable === null || row.fbaAvailable === undefined) continue;
+      if (row.fbaContext === "mfn-only") continue;
+      if (row.fbaAvailable === null || row.fbaAvailable === undefined) { fbaUnknown = true; continue; }
       fbaKnown = true;
       fbaAvailable += num(row.fbaAvailable);
     }
-    if (fbaKnown) {
+    if (!planUsable) unavailable.push({ accountId, reason: "FBA inventory unavailable: no saved FBA Shipment Plan inventory for this account" });
+    else if (fbaUnknown) unavailable.push({ accountId, reason: "FBA inventory withheld: at least one of this brand's products has unknown inventory" });
+    if (fbaKnown && !fbaUnknown) {
       const sample = sourceRows.find((row) => String(row.product_brand || "").trim() === brand) || sourceRows[0];
       inventory.push({
         accountId,
         country: sample.marketplace_country_code || null,
         currency: sample.currency || null,
         fbaAvailable,
-        snapshotDate: planPayload?.inventoryDate || null,
+        inventorySource: planSource,
+        snapshotDate: planSource === "listings" ? null : (planPayload?.inventoryHealthDate || planPayload?.inventoryDate || null),
+        refreshedAt: planSource === "listings" ? (planPayload?.listingsRefreshedAt || null) : null,
       });
     }
 
@@ -1764,9 +1790,12 @@ function legacySharedDescriptor({ action, req, access, publicAccountIds, account
       };
     case "brand-inventory":
       if (!accountId || !to) return null;
-      // Compact per-account FBA inventory for Brand View. A non-refresh read serves
-      // the saved Supabase snapshot only (zero DataDoe); a refresh is admin-gated in
-      // the handler and creates at most ONE FBA Inventory Health export.
+      // Compact per-account FBA inventory for Brand View. A read serves the saved Supabase snapshot only (zero
+      // DataDoe); the route-owned builder is retired (respondRouteOwnedBuilderRetired), so no refresh can create an
+      // export (FBA Inventory Health is retired; createExport refuses it).
+      // ONE version: serveSharedReport is a single-version contract (paramsHashFor(reportVersion, params) exact read +
+      // the stale fallback's reportVersion equality), so a version LIST here would never match any row. The phase-2
+      // v2/v1 window applies to the Brand View candidate reads (BRAND_INVENTORY_SERVE_VERSIONS), not this raw read.
       return {
         reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, reportVersion: BRAND_INVENTORY_REPORT_VERSION, accountId,
         params: { to }, label: "Brand View FBA inventory",
@@ -2048,27 +2077,8 @@ const SQP_MONTHLY_LOOKBACK_DAYS = 365;
 // quantity (ordered units) and is the canonical sales/demand source. It is used
 // here for the 3 completed months and current-month MTD unit velocity.
 const PLAN_SALES_SOURCE_ID = "89b27535d27c2a94db5ae39af4717f542624ff4df7802fd633e16c78674a1778";
-// Live FBA inventory snapshot. "FBA Inventory Health" (44fc5ba0...) is the only
-// source that splits reserved into reserved_fc_transfer / reserved_fc_processing
-// / reserved_customer_order and splits inbound into working / shipped / received,
-// which is exactly what the shipment-plan definition requires. It is per SKU per
-// snapshot date; the latest snapshot date is kept and SKUs are folded to ASIN.
-const FBA_HEALTH_SOURCE_ID = "44fc5ba0ce81a7807601f6d7a9b8b7aaec64be4c7e046ea30dc6864d1a4aa823";
-const FBA_HEALTH_COLUMNS = [
-  "date",
-  "marketplace_country_code",
-  "child_asin",
-  "sku",
-  "fnsku",
-  "product_name",
-  "available",
-  "reserved_customer_order",
-  "reserved_fc_transfer",
-  "reserved_fc_processing",
-  "inbound_working",
-  "inbound_shipped",
-  "inbound_received",
-];
+// (The retired FBA Inventory Health constants of the former paid fba-plan builder are removed: FBA inventory comes from
+// the canonical Listings export, and lib/server/datadoe.js createExport refuses the Health source id.)
 // AWD available inventory (US marketplace only). The "Listings" source
 // (ba689c05...) exposes awd_available_distributable_quantity per SKU. Listings
 // has no date column, so its exports must not send a date range or a date
@@ -2082,13 +2092,6 @@ const LISTINGS_AWD_COLUMNS = [
   "awd_available_distributable_quantity",
   "awd_total_inbound_quantity",
 ];
-// Inventory Health is a daily snapshot. Every request asks for EXACTLY the single previous UTC day
-// [D-1 .. D-1] -- the same canonical snapshot-day identity the scheduler uses (fbaInventoryAsOf), so a
-// manual browser refresh adopts the scheduler's cached export instead of creating a new one, and no
-// cross-date row can ever arrive. The former 10-day lookback constant is removed.
-const planInventoryDay = (now = Date.now()) => new Date(now - 86400000).toISOString().slice(0, 10);
-const PLAN_INVENTORY_ROW_LIMIT = 50000; // raised from 15000 so a marketplace-safe <=5-seller FBA Health batch of large-inventory accounts returns without truncation (parity with the fba-plan:inventory-health contract limit).
-
 const DASHBOARD_ROW_LIMIT = 5000; // legacy aggregated "dashboard" source (b24cd69c06), NOT the OLI order grain -- unrelated cap, left as-is
 // Order rows are grouped by day and ASIN before download. Per direct DataDoe-team confirmation (2026-09-21) the
 // Order Line Items source permits up to 50,000 rows per export; the former 5,000 value was a stale application
@@ -2605,6 +2608,12 @@ export function classifyDataDoeRouteError(err) {
   // or when another invocation durably owns the in-progress marker). A plain object, an arbitrary
   // MANUAL_SOURCE_* code, or any error lacking that flag can never be retryable.
   const durable = err != null && err.durableContinuation === true;
+  // A RETIRED source (FBA Inventory Health) refused by createExport / fetchExportRows: a typed, user-readable,
+  // NEVER-retryable 409 (a retry would be refused again; no export was created). A report whose builder still asks for
+  // Health shows this instead of a generic failure or a spinner.
+  if (isRetiredSourceError(err)) {
+    return { status: 409, body: { error: RETIRED_SOURCE_MESSAGE, code: RETIRED_SOURCE_ERROR_CODE, retryable: false } };
+  }
   if (isDataDoeDeadlineError(err) || isDataDoePollPendingError(err)) {
     return {
       status: 504,
@@ -2906,7 +2915,7 @@ async function handleDataDoe(req, res) {
           // compact + newest overall; NO recent-N cutoff) so a fresh unavailable placeholder cannot shadow a lagging
           // available LKG and a long run of placeholders can never bury it. The SAME reader backs the materializer,
           // so writer + serve select identically.
-          getInventorySnapshots: ({ reportKey, accountId: id }) => getInventorySnapshotCandidates({ reportKey, accountId: id, reportVersion: BRAND_INVENTORY_REPORT_VERSION }),
+          getInventorySnapshots: ({ reportKey, accountId: id }) => getInventorySnapshotCandidates({ reportKey, accountId: id, reportVersion: BRAND_INVENTORY_SERVE_VERSIONS }),
         }),
       });
       return;
@@ -3012,7 +3021,7 @@ async function handleDataDoe(req, res) {
         deadline: portfolioDeadline,
         getCampaignMappings: campaignMappingsReader(),
         // Round-4 Defect 2: same authoritative-compact selection for every account in the portfolio rollup.
-        getInventorySnapshots: ({ reportKey, accountId: id }) => getInventorySnapshotCandidates({ reportKey, accountId: id, reportVersion: BRAND_INVENTORY_REPORT_VERSION }),
+        getInventorySnapshots: ({ reportKey, accountId: id }) => getInventorySnapshotCandidates({ reportKey, accountId: id, reportVersion: BRAND_INVENTORY_SERVE_VERSIONS }),
       });
       await serveSharedReport({
         res,
@@ -3394,6 +3403,9 @@ async function handleDataDoe(req, res) {
     // reuses the Product Catalog source cache from the preceding brand-sales
     // refresh (or the saved brand-sales asinBrand map) instead of a duplicate
     // catalog export. Truncated/failed source is refused so a good snapshot survives.
+    // Phase 2 of the Listings inventory cutover: the compact (brand-inventory-shared-v2)
+    // uses the account's SAVED canonical Listings snapshot when it validates (zero
+    // export), else that ONE FBA Inventory Health export as a labelled fallback.
     if (action === "brand-inventory") {
       if (!accountScope || accountScope.accountIds.length !== 1) {
         res.status(400).json({ error: "Brand View inventory requires exactly one selected account." });
@@ -3414,14 +3426,25 @@ async function handleDataDoe(req, res) {
         return;
       }
       const sellerOrVendorIds = accountScope.rawAccountIds;
-      // Best-effort account country for the rare inventory row that omits a
-      // marketplace code. A directory miss is non-fatal (the rows carry it).
+      // The account's marketplace (the phase-2 compact is folded per account marketplace). A directory miss falls
+      // back to the saved Listings pointer's marketplace below; with neither the payload is refused (LKG preserved).
       const inventoryDirectory = await getLatestReportSnapshot({ reportKey: "account-directory", accountId: "__account-directory__" }).catch(() => null);
       const accountCountry = (inventoryDirectory?.payload?.accounts || []).find((entry) => String(entry.id) === publicAccountId)?.country || null;
 
-      // The EXACT expected inventory window the fold validates every row against: the single canonical
-      // previous UTC day (D-1), the same snapshot-day identity the scheduler fetches.
-      const inventoryDay = planInventoryDay();
+      // The cycle inventory as-of (D-1): the saved-Health bridge is used only while its date >= this day - 2 days.
+      const inventoryDay = previousUtcDay();
+      // The account's LAST SAVED FBA Inventory Health snapshot (read-only bridge; no Health export is ever created).
+      const healthBridge = await readSavedHealthBridge({
+        apiKey, organizationFingerprint: accountScope.connection?.organizationFingerprint || null, connectionId: "primary",
+        accountId: publicAccountId, rawSellerId: sellerOrVendorIds[0],
+      });
+      // The account's SAVED canonical Listings rows (read-only, zero export, FAIL-SOFT: no usable snapshot simply means
+      // no Listings evidence). Its pointer's marketplace also stands in for a directory miss: the phase-2 fold needs the
+      // account marketplace (a payload without one is refused, previous snapshot preserved).
+      const savedListings = await readSavedListingsRows({
+        apiKey, accountId: sellerOrVendorIds[0], asOf: to,
+        organizationFingerprint: accountScope.connection?.organizationFingerprint || null, connectionId: "primary",
+      });
       let payload;
       try {
         // No live Product Catalog fallback: brand-inventory uses ONLY the saved
@@ -3429,16 +3452,15 @@ async function handleDataDoe(req, res) {
         // just-failed Brand Sales catalog can never cause a second Catalog export.
         ({ payload } = await buildBrandInventorySnapshot({
           accountId: publicAccountId,
-          accountCountry,
+          accountCountry: accountCountry || savedListings.marketplace || null,
           from: inventoryDay,
           to: inventoryDay,
-          rowLimit: PLAN_INVENTORY_ROW_LIMIT,
+          // The canonical Listings export ceiling (every listing of the account, incl. merchant-fulfilled / inactive).
+          listingsRowLimit: 50000,
           getSnapshot: getLatestReportSnapshotHydrated,
-          fetchInventoryRows: () => fetchExportRows(
-            apiKey, FBA_HEALTH_SOURCE_ID, FBA_HEALTH_COLUMNS, sellerOrVendorIds,
-            inventoryDay, inventoryDay, PLAN_INVENTORY_ROW_LIMIT,
-            { orderByColumn: "date", orderByDirection: "DESC" }
-          ),
+          fetchInventoryRows: async () => (healthBridge.rows || []),
+          fetchListingsRows: async () => savedListings.rows || [],
+          listingsRefreshedAt: savedListings.rows ? (savedListings.refreshedAt || null) : null,
         }));
       } catch (buildError) {
         // Never surface a raw DataDoe/Supabase body. A validated refusal (missing brand
@@ -3738,10 +3760,12 @@ async function handleDataDoe(req, res) {
     }
 
     // FBA Shipment Plan: one selected account only. Combines per-ASIN unit
-    // velocity (3 completed months + current-month MTD) with the latest FBA
-    // inventory-health snapshot and (US only) AWD available inventory. All
-    // derived planning metrics are computed in the browser so filter/target
-    // changes never trigger a DataDoe request.
+    // velocity (3 completed months + current-month MTD) with the account's
+    // inventory and (US + EU5) AWD available inventory. Phase 2 of the Listings
+    // inventory cutover: the inventory is the account's validated saved Listings
+    // snapshot, else the D-1 FBA Inventory Health snapshot as a labelled fallback
+    // (the shared fbaPlanPayload). All derived planning metrics are computed in
+    // the browser so filter/target changes never trigger a DataDoe request.
     if (action === "fba-plan") {
       const { ids, to } = req.query;
       if (!ids || !to) {
@@ -3759,10 +3783,9 @@ async function handleDataDoe(req, res) {
       const accounts = await fetchAccountsRaw(apiKey);
       const account = accounts.find((a) => a.id === sellerOrVendorIds[0]) || null;
       const isUS = String(account?.country || "").toUpperCase() === "US";
-      // AWD is fetched/folded for the AWD-capable marketplaces (US + EU5); US byte-identical. awdMarket is the account's
-      // OWN canonical marketplace so AWD never attaches to another marketplace. See lib/server/reports/awd-capability.js.
+      // AWD is folded for the AWD-capable marketplaces (US + EU5); the shared fbaPlanPayload attaches AWD ONLY to the
+      // account's OWN canonical marketplace (never another marketplace's). See lib/server/reports/awd-capability.js.
       const awdEligible = awdCapableMarketplace(account?.country);
-      const awdMarket = canonicalAwdMarketplace(account?.country) || (isUS ? "US" : "");
 
       // 1) ONE canonical Order Line Items sales fragment over [completed[0].from .. asOf] (Blocker 1).
       // Per-ASIN ordered units per month AND the current-month latest sales date are DERIVED from this
@@ -3784,243 +3807,76 @@ async function handleDataDoe(req, res) {
         }
         oliSalesRows.push(...sliceRows);
       }
-      const asinSet = new Set();
-      const unitsByAsinByMonth = {}; // asin -> { monthKey: units }
-      const mtdByAsin = new Map();   // asin -> current-month units
-      const unitsByDate = new Map(); // current-month date -> summed units (latest-date probe)
-      const completedMonthKeys = new Set(completed.map((m) => m.key));
-      for (const r of oliSalesRows) {
-        const date = String(r.date || "");
-        const mk = date.slice(0, 7);
-        const asin = String(r.child_asin || "").trim();
-        const units = num(r.total_units_sum ?? r.quantity);
-        if (asin && (mk === current.key || completedMonthKeys.has(mk))) {
-          asinSet.add(asin);
-          const byMonth = unitsByAsinByMonth[asin] || (unitsByAsinByMonth[asin] = {});
-          byMonth[mk] = (byMonth[mk] || 0) + units;
-          if (mk === current.key) mtdByAsin.set(asin, (mtdByAsin.get(asin) || 0) + units);
-        }
-        if (mk === current.key && date) unitsByDate.set(date, (unitsByDate.get(date) || 0) + units);
-      }
-      // 2b) Latest current-month date whose summed units > 0. Elapsed days are measured to this date so
-      // the MTD projection is not diluted by dates the source has not populated yet.
-      let salesLatestDate = null;
-      for (const [date, units] of unitsByDate) {
-        if (units > 0 && (!salesLatestDate || date > salesLatestDate)) salesLatestDate = date;
-      }
-      // Elapsed days = day-of-month of the latest completed sales date, so the
-      // MTD projection uses the true covered days rather than the raw calendar
-      // day (the sales source can lag a few days).
-      const elapsedDays = (salesLatestDate && salesLatestDate >= current.from && salesLatestDate <= current.to)
-        ? Number(salesLatestDate.slice(8, 10))
-        : 0;
 
-      // 3) Catalog brand + product name. Use the full 3-month + MTD window so a
+      // 2) Catalog brand + product name. Use the full 3-month + MTD window so a
       // product released before the current month is still resolved to a brand.
       const catalog = await fetchExportRows(
         apiKey, PRODUCT_CATALOG_SOURCE_ID, PRODUCT_CATALOG_COLUMNS, sellerOrVendorIds, completed[0].from, current.to, CATALOG_ROW_LIMIT,
         { orderByColumn: "child_asin" }
       );
-      const brandByAsin = new Map();
-      const nameByAsin = new Map();
-      const catalogAsinSet = new Set();
-      for (const c of catalog) {
-        const asin = String(c.child_asin || "").trim();
-        if (!asin) continue;
-        catalogAsinSet.add(asin);
-        const brand = String(c.product_brand || "").trim();
-        if (brand && !brandByAsin.has(asin)) brandByAsin.set(asin, brand);
-        const name = String(c.product_name || "").trim();
-        if (name && !nameByAsin.has(asin)) nameByAsin.set(asin, name);
-      }
 
-      // 4) The EXACT single previous-UTC-day (D-1) FBA inventory-health snapshot, folded from SKU to ASIN.
-      const planInvDay = planInventoryDay();
-      const invRows = await fetchExportRows(
-        apiKey, FBA_HEALTH_SOURCE_ID, FBA_HEALTH_COLUMNS, sellerOrVendorIds,
-        planInvDay, planInvDay, PLAN_INVENTORY_ROW_LIMIT,
-        { orderByColumn: "date", orderByDirection: "DESC" }
-      );
-      let inventoryDate = null;
-      for (const r of invRows) {
-        if (r.date && (!inventoryDate || r.date > inventoryDate)) inventoryDate = r.date;
-      }
-      const invByAsin = {};
-      const skusByAsin = {};
-      const invProductName = new Map();
-      // ADDITIVE ONLY. FBA Inventory Health is per marketplace, but the per-ASIN
-      // rows below intentionally fold that dimension away for the shipment plan.
-      // The account-scoped Brand View needs FBA inventory per country, so the
-      // same rows are also folded to (marketplace, brand) here. Nothing existing
-      // reads this key, so the FBA Shipment Plan report is unchanged.
-      const invByCountryBrand = new Map();
-      for (const r of invRows) {
-        if (inventoryDate && r.date !== inventoryDate) continue; // latest snapshot only
-        const asin = String(r.child_asin || "").trim();
-        if (!asin) continue;
-        asinSet.add(asin);
-        const cur = invByAsin[asin] || (invByAsin[asin] = {
-          available: 0, customerOrderReserved: 0, fcTransfer: 0, fcProcessing: 0,
-          inboundShipped: 0, inboundReceived: 0, inboundWorking: 0,
-        });
-        cur.available += num(r.available);
-        cur.customerOrderReserved += num(r.reserved_customer_order); // display-only; never usable stock
-        cur.fcTransfer += num(r.reserved_fc_transfer);
-        cur.fcProcessing += num(r.reserved_fc_processing);
-        cur.inboundShipped += num(r.inbound_shipped);
-        cur.inboundReceived += num(r.inbound_received);
-        cur.inboundWorking += num(r.inbound_working);
-        const sku = String(r.sku || "").trim();
-        if (sku) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
-        const nm = String(r.product_name || "").trim();
-        if (nm && !invProductName.has(asin)) invProductName.set(asin, nm);
-        // Per-marketplace roll-up for Brand View. `brandByAsin` is the same
-        // catalog map the per-ASIN rows use, so a brand's country inventory can
-        // never disagree with its shipment-plan inventory.
-        const invCountry = String(r.marketplace_country_code || account?.country || "").trim().toUpperCase();
-        const invBrand = brandByAsin.get(asin) || null;
-        const countryBrandKey = `${invCountry}|${invBrand || ""}`;
-        const bucket = invByCountryBrand.get(countryBrandKey)
-          || { country: invCountry || null, brand: invBrand, fbaAvailable: 0, skus: new Set() };
-        bucket.fbaAvailable += num(r.available);
-        if (sku) bucket.skus.add(sku);
-        invByCountryBrand.set(countryBrandKey, bucket);
-      }
-      const inventoryAvailable = invRows.length > 0;
+      // 3) The account's LAST SAVED FBA Inventory Health snapshot -- the READ-ONLY bridge (Listings inventory cutover: no
+      //    Health export is created any more), used only when this account's Listings snapshot does not validate and only
+      //    while its date >= the plan's inventory as-of (D-1) - 2 days; otherwise inventory is Unavailable, never 0.
+      const planInvDay = previousUtcDay();
+      const planHealthBridge = await readSavedHealthBridge({
+        apiKey, organizationFingerprint: (accountScope && accountScope.connection && accountScope.connection.organizationFingerprint) || null,
+        connectionId: "primary", accountId: (accountScope && accountScope.accountIds && accountScope.accountIds[0]) || sellerOrVendorIds[0],
+        rawSellerId: sellerOrVendorIds[0],
+      });
+      const invRows = planHealthBridge.rows || [];
+      const healthBridgeReason = planHealthBridge.rows ? null : (planHealthBridge.unavailableReason || "health-snapshot-missing");
+      const healthFetchedAt = planHealthBridge.rows ? (planHealthBridge.savedAt || null) : null;
 
-      // 5) AWD available + inbound (AWD-capable marketplaces: US + EU5), folded from SKU to ASIN. Defensive
-      //    own-marketplace guard so one marketplace's AWD never attaches to another (US byte-identical: awdMarket "US").
-      const awdByAsin = {};
-      const awdInboundByAsin = {};
-      let awdAvailable = false;
-      let awdRows = [];
-      if (awdEligible) {
-        awdRows = await fetchExportRows(
+      // 4) Listings (phase 2): the account's SAVED canonical Listings snapshot (zero export; the scheduler's fba-plan:awd
+      //    rows) -- FBA inventory for every marketplace when it validates, and AWD on US + EU5. Only when no usable saved
+      //    snapshot exists does an AWD-capable marketplace fall back to the former live AWD Listings export (AWD only: its
+      //    columns carry no FBA quantities, so the FBA figures then come from the labelled Health fallback).
+      const planConnection = (accountScope && accountScope.connection) || null;
+      const savedListings = await readSavedListingsRows({
+        apiKey, accountId: sellerOrVendorIds[0], asOf: String(to),
+        organizationFingerprint: (planConnection && planConnection.organizationFingerprint) || null,
+        connectionId: planConnection && planConnection.id === "secondary" ? "dd-secondary" : "primary",
+      });
+      let liveAwdRows = null;
+      let awdFetchedAt = null;
+      if (!savedListings.rows && awdEligible) {
+        liveAwdRows = await fetchExportRows(
           apiKey, LISTINGS_SOURCE_ID, LISTINGS_AWD_COLUMNS, sellerOrVendorIds,
           null, null, CATALOG_ROW_LIMIT,
           { orderByColumn: "child_asin" }
         );
-        awdAvailable = awdRows.length > 0;
-        for (const r of awdRows) {
-          const mkt = canonicalAwdMarketplace(r.marketplace_country_code);
-          if (mkt && awdMarket && mkt !== awdMarket) continue; // never let another marketplace's AWD row leak in
-          const asin = String(r.child_asin || "").trim();
-          if (!asin) continue;
-          awdByAsin[asin] = (awdByAsin[asin] || 0) + num(r.awd_available_distributable_quantity);
-          awdInboundByAsin[asin] = (awdInboundByAsin[asin] || 0) + num(r.awd_total_inbound_quantity);
-          const sku = String(r.sku || "").trim();
-          if (sku) (skusByAsin[asin] || (skusByAsin[asin] = new Set())).add(sku);
-        }
+        awdFetchedAt = new Date().toISOString();
       }
 
-      // 5b) The durable ACCOUNT SKU DIRECTORY -- one entry per SKU proven in an ACCOUNT-scoped source (inventory, AWD,
-      // sales), enriched with the org-wide Product Catalog's ASIN -> brand/name. A SUPERSET of the representative SKUs
-      // the per-ASIN rows show, so a dropped/warehouse-only SKU keeps its identity + canonical brand. Priority (first
-      // writer sets provenance): inventory > AWD > sales. A SKU maps to exactly one child ASIN.
-      const skuDir = new Map();
-      const skuAsinConflicts = new Map(); // sku -> {a, b}  (two DIFFERENT nonblank ASINs for one SKU)
-      const putSku = (sku, asin, marketplace, provenance, invName) => {
-        const s = String(sku || "").trim();
-        if (!s) return;
-        const a = String(asin || "").trim() || null;
-        const mkt = String(marketplace || "").trim().toUpperCase() || null;
-        let e = skuDir.get(s);
-        if (!e) { e = { sku: s, childAsin: a, productName: null, brand: null, marketplace: mkt, provenance }; skuDir.set(s, e); }
-        // Two DIFFERENT nonblank child ASINs for one SKU is an unresolvable identity error (never a silent pick).
-        if (e.childAsin && a && a !== e.childAsin) { if (!skuAsinConflicts.has(s)) skuAsinConflicts.set(s, { a: e.childAsin, b: a }); }
-        if (!e.childAsin && a) e.childAsin = a;
-        if (!e.marketplace && mkt) e.marketplace = mkt;
-        const ca = e.childAsin;
-        if (ca) {
-          if (!e.brand) e.brand = brandByAsin.get(ca) || null;
-          if (!e.productName) e.productName = nameByAsin.get(ca) || invName || invProductName.get(ca) || null;
-        } else if (!e.productName && invName) { e.productName = invName; }
-      };
-      for (const r of invRows) { if (inventoryDate && r.date !== inventoryDate) continue; putSku(r.sku, r.child_asin, r.marketplace_country_code || account?.country, "inventory", String(r.product_name || "").trim() || null); }
-      for (const r of awdRows) { const mkt = canonicalAwdMarketplace(r.marketplace_country_code); if (mkt && awdMarket && mkt !== awdMarket) continue; putSku(r.sku, r.child_asin, awdMarket || mkt, "awd", null); }
-      for (const r of oliSalesRows) putSku(r?.sku, r?.child_asin, account?.country, "sales", null);
-      if (skuAsinConflicts.size > 0) {
-        const [conflictSku, c] = [...skuAsinConflicts.entries()][0];
-        const err = new Error(`fba-plan: SKU ${conflictSku} maps to conflicting child ASINs (${c.a} vs ${c.b}) across sources; snapshot blocked (last-known-good preserved).`);
-        err.code = "FBA_PLAN_SKU_ASIN_CONFLICT";
-        throw err;
-      }
-      const accountSkuDirectory = [...skuDir.values()].sort((a, b) => a.sku.localeCompare(b.sku));
-
-      // 6) Assemble one row per ASIN. Representative SKU = first non-empty SKU
-      // in ascending (localeCompare) order, so it is stable across refreshes.
-      // Only ASINs with real activity are kept: any unit sales in the window, or
-      // any live FBA/AWD stock. This drops the large tail of zero-sales,
-      // zero-stock ASINs that the Product Catalog lists but Order Line Items never sold.
-      const rows = [];
-      for (const asin of asinSet) {
-        const inv = invByAsin[asin] || null;
-        const skus = skusByAsin[asin] ? [...skusByAsin[asin]].sort((a, b) => a.localeCompare(b)) : [];
-        const unitsByMonth = {};
-        let salesTotal = 0;
-        for (const mo of completed) {
-          const u = num(unitsByAsinByMonth[asin]?.[mo.key]);
-          unitsByMonth[mo.key] = u;
-          salesTotal += u;
-        }
-        const mtdUnits = num(mtdByAsin.get(asin));
-        salesTotal += mtdUnits;
-        // Activity total for the drop check (customer-order-reserved kept as activity). All states are DISTINCT per the
-        // source metadata (inbound_quantity = sum of the 3 inbound states; reserved_fc_transfer is a separate reserved
-        // state), so there is NO transfer/shipped overlap to subtract -- reserved_fc_transfer is stored RAW.
-        const invTotal = inv
-          ? inv.available + inv.customerOrderReserved + inv.fcTransfer + inv.fcProcessing + inv.inboundShipped + inv.inboundReceived + inv.inboundWorking
-          : 0;
-        const awdUnits = awdEligible ? num(awdByAsin[asin]) : 0;
-        const awdInboundUnits = awdEligible ? num(awdInboundByAsin[asin]) : 0;
-        if (salesTotal <= 0 && invTotal <= 0 && awdUnits <= 0 && awdInboundUnits <= 0) continue;
-        rows.push({
-          asin,
-          productName: nameByAsin.get(asin) || invProductName.get(asin) || null,
-          brand: brandByAsin.get(asin) || null,
-          sku: skus[0] || null,
-          unitsByMonth,
-          mtdUnits,
-          // Inventory numbers: when the snapshot exists but this ASIN is absent,
-          // it genuinely holds no FBA stock (0). When the whole snapshot is
-          // unavailable, inventory fields are null so the UI can flag it.
-          fbaAvailable: inventoryAvailable ? num(inv?.available) : null,
-          customerOrderReserved: inventoryAvailable ? num(inv?.customerOrderReserved) : null,
-          reservedFcTransfer: inventoryAvailable ? num(inv?.fcTransfer) : null,
-          reservedFcProcessing: inventoryAvailable ? num(inv?.fcProcessing) : null,
-          inboundShipped: inventoryAvailable ? num(inv?.inboundShipped) : null,
-          inboundReceived: inventoryAvailable ? num(inv?.inboundReceived) : null,
-          inboundWorking: inventoryAvailable ? num(inv?.inboundWorking) : null,
-          awdAvailable: awdEligible ? awdUnits : null,
-          awdInbound: awdEligible ? awdInboundUnits : null,
-        });
-      }
-
-      await sendLegacyPayload({
+      // 5) ONE definition of the plan payload (lib/server/reports/derivation-core.js fbaPlanPayload -- the scheduler's
+      //    fba-plan derive): per-ASIN sales velocity + the per-account inventory source decision (validated Listings,
+      //    else the labelled FBA Inventory Health fallback, else Unavailable), AWD, the account SKU directory and the
+      //    (marketplace, brand) roll-up Brand View reads.
+      const payload = fbaPlanPayload({
         asOf: String(to),
         accountName: account?.name || null,
         marketCountry: account?.country || null,
         isUS,
         awdEligible,
-        months: completed,
-        currentMonth: current,
-        salesLatestDate,
-        elapsedDays,
-        inventoryDate,
-        inventoryAvailable,
-        awdAvailable,
-        rows,
-        accountSkus: accountSkuDirectory.map((e) => e.sku), // backward compat for readers of the old string-only allowlist
-        accountSkuDirectory,
-        catalogByAsin: Object.fromEntries([...catalogAsinSet].map((a) => [a, { brand: brandByAsin.get(a) || null, productName: nameByAsin.get(a) || null }])),
-        // Additive: consumed only by the account-scoped Brand View. Bounded by
-        // (marketplaces x brands), so it stays small for accounts with
-        // thousands of SKUs.
-        inventoryByBrandCountry: [...invByCountryBrand.values()].map(({ skus, ...entry }) => ({
-          ...entry,
-          skuCount: skus.size,
-        })),
+        completed, current,
+        ...foldOliSalesToFbaInputs(oliSalesRows, completed, current),
+        catalogRows: catalog,
+        invRows,
+        listingsRows: savedListings.rows || liveAwdRows || [],
+        listingsUnavailableReason: savedListings.rows || liveAwdRows ? null : "listings-source-unavailable",
+        salesSkuAsinRows: oliSalesRows,
+        inventoryAsOf: planInvDay,
+        healthBridgeReason,
       });
+      // The live AWD rows are AWD evidence only: name the real reason Listings is not this account's inventory source.
+      if (!savedListings.rows && liveAwdRows) payload.inventoryListingsReasons = ["listings-source-unavailable"];
+      // Honest freshness of the inputs (Listings carries no inventory date -- its age is the saved snapshot's fetch time).
+      payload.listingsRefreshedAt = savedListings.rows ? (savedListings.refreshedAt || null) : null;
+      payload.healthFetchedAt = healthFetchedAt;
+      if (awdFetchedAt) payload.awdFetchedAt = awdFetchedAt;
+
+      await sendLegacyPayload(payload);
       return;
     }
 
@@ -4032,7 +3888,22 @@ async function handleDataDoe(req, res) {
        `refresh=1` a database lock is claimed first, so two people clicking
        Refresh cannot spend DataDoe tokens twice, and the validated result is
        saved once for every user permitted on that account.
+       FBA stock for Sales Movers / Buy Box Loss / Listing Health (Listings
+       inventory cutover): the account's SAVED durable Listings snapshot when
+       it validates, else its last SAVED FBA Inventory Health snapshot as a
+       dated read-only bridge (within its freshness threshold), else
+       Unavailable. A refresh requests NO FBA Inventory Health export.
        ============================================================ */
+
+    // The saved-evidence identity for this account's connection (read-only; the org fingerprint falls back to the
+    // connection API key inside the readers, exactly like the Listing Health v3 preview). healthScopeKey = the durable
+    // FBA Inventory Health snapshot's scope key (the public account id) for the read-only bridge.
+    const insightConnection = (accountScope && accountScope.connection) || null;
+    const insightListings = {
+      organizationFingerprint: (insightConnection && insightConnection.organizationFingerprint) || null,
+      connectionId: insightConnection && insightConnection.id === "secondary" ? "dd-secondary" : "primary",
+      healthScopeKey: (accountScope && Array.isArray(accountScope.accountIds) && accountScope.accountIds[0]) || null,
+    };
 
     if (action === "sales-movers") {
       const ids = singleAccountId(req, res, "Sales Movers");
@@ -4048,7 +3919,7 @@ async function handleDataDoe(req, res) {
         params: { to },
         userId: access.userId,
         label: "Sales Movers",
-        build: () => buildSalesMovers({ apiKey, ids, to }),
+        build: () => buildSalesMovers({ apiKey, ids, to, listings: insightListings }),
       });
       return;
     }
@@ -4067,7 +3938,7 @@ async function handleDataDoe(req, res) {
         params: { to },
         userId: access.userId,
         label: "Listing Health",
-        build: () => buildListingHealth({ apiKey, ids, to }),
+        build: () => buildListingHealth({ apiKey, ids, to, listings: insightListings }),
       });
       return;
     }
@@ -4140,7 +4011,7 @@ async function handleDataDoe(req, res) {
         params: { to },
         userId: access.userId,
         label: "Buy Box Loss",
-        build: () => buildBuyBoxLoss({ apiKey, ids, to }),
+        build: () => buildBuyBoxLoss({ apiKey, ids, to, listings: insightListings }),
       });
       return;
     }
@@ -4262,6 +4133,12 @@ async function handleDataDoe(req, res) {
       // DataDoe export for it. While Campaign is the active read grain, an ASIN Ads export may be created ONLY by the
       // reviewed regional ASIN runner (its exact reduced-grain request, 5-seller batches, coverage + token ceilings) --
       // block it here BEFORE the create (single authority; the browser never selects an ads grain to export).
+      // A RETIRED source (FBA Inventory Health, long id or a >= 10-char prefix) is refused before any create: this probe
+      // takes a browser-supplied id and POSTs directly (it does not go through createExport).
+      if (isRetiredDataDoeSourceId(sourceId)) {
+        res.status(409).json({ error: RETIRED_SOURCE_ERROR_CODE, code: RETIRED_SOURCE_ERROR_CODE, sourceId, retryable: false, note: RETIRED_SOURCE_MESSAGE });
+        return;
+      }
       if (isAdsExportRunnerOnlyForSourceId(sourceId)) {
         res.status(409).json({ error: "ASIN_ADS_EXPORT_RUNNER_ONLY", sourceId, note: "ASIN Ads exports are created only by the scheduled ASIN Ads runner (or its admin Data Sync Center card); this probe cannot create one." });
         return;

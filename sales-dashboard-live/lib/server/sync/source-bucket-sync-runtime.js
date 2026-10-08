@@ -50,11 +50,12 @@ import {
 import { ACTIVE_ADS_SOURCE_KEY, ACTIVE_ADS_REGISTRY_KEY, CAMPAIGN_ADS_SOURCE_KEY } from "../active-ads-source.js";
 import { shadowSnapshotKey, REPORT_DERIVATIONS } from "./report-derivation.js";
 import { buildBrandInventorySnapshot, BRAND_INVENTORY_SNAPSHOT_KEY, BRAND_INVENTORY_REPORT_VERSION } from "../reports/brand-view.js";
+import { HEALTH_BRIDGE_MAX_AGE_DAYS } from "../inventory-source.js";
 import { fbaContentProvenanceToken } from "./fba-inventory-revision.js";
 import { adsContentProvenanceToken } from "./ads-publication-revision.js";
 import { ADS_CAMPAIGN_SOURCE_KEY } from "./ads-dependent-reports.js";
 import {
-  getSourceControls, getSourceCoverageWindows, getSourceSnapshot,
+  getSourceControls, getSourceCoverageWindows, getSourceSnapshot, getSourceListingsSnapshot,
   recordSourceSnapshot, upsertSourceRunStatus,
   replaceOliHistoryWindow, replaceOliDimensionalWindow, recordOliCompleteness, saveSourceSnapshotPayload, getSourceSnapshotPayload,
   getSourceOliHistoryRows, getSourceOliZeroRowProof, getDailyAdsCoverage, getAsinAdsDailyRows, getActiveAdsDailyRows,
@@ -96,6 +97,9 @@ export const DEFAULT_ROUTE_RESERVE_MS = 5_000;
 // EXACT single-day [asOf .. asOf] fold window (the durable FBA evidence is fetched as exactly that one
 // snapshot day) and the truncation-refusal cap.
 const BRAND_INVENTORY_ROW_LIMIT = 15000;
+// Listings inventory cutover PHASE 2: the account's SAVED Listings rows (every listing, incl. merchant-fulfilled /
+// inactive; the largest account is ~4k rows) -- the cap is the canonical Listings export ceiling.
+const BRAND_INVENTORY_LISTINGS_ROW_LIMIT = 50000;
 
 // Round-5 blocker 4: ONE route-owned deadline. Symbol.for so a deadline created by the route and checked by
 // the runtime share the SAME marker even across module instances.
@@ -283,6 +287,11 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
     readSourceControls = getSourceControls,
     readCoverage = getSourceCoverageWindows,
     readSnapshot = getSourceSnapshot,
+    // Listings inventory cutover PHASE 2: the account's SAVED LISTINGS pointer (public.source_listings_snapshot) -- the
+    // preferred inventory evidence of the compact brand-inventory (FBA Inventory Health stays the labelled fallback).
+    // null = the production reader when the production source_snapshots reader is in use, else NO Listings evidence
+    // (an injected test world that does not model Listings keeps its Health-only behaviour).
+    readListingsSnapshot = null,
     readAdsCoverage = getDailyAdsCoverage,
     // Daily Reporting reads the durable ASIN grain (asin-performance-v1) -- the SINGLE reusable Ads source,
     // shared with Brand View. (Was getAdDailyMetrics / the campaign grain, now PPC-only.)
@@ -554,7 +563,12 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       if (snapRead.read !== "ok") { readBlockers.push({ sourceKey, accountId, reason: "snapshot-" + snapRead.read, blocksSales }); return { snapshot: null, rows: null }; }
       const snapshot = snapRead.snapshot;
       if (!snapshot) return { snapshot: null, rows: null }; // honestly absent (readiness reports no-validated-snapshot)
-      if (today) {
+      // The SAVED FBA Inventory Health snapshot is a READ-ONLY bridge since the Listings inventory cutover: no Health export
+      // refreshes it any more, so the daily-refresh policy (stale-day -> a SALES-BLOCKING readiness blocker) must NOT apply
+      // to it -- otherwise every account's Brand View readiness would block the day after the cutover. Its freshness is
+      // the bridge's own as-of rule (lib/server/inventory-source.js HEALTH_BRIDGE_MAX_AGE_DAYS); the source is not
+      // registered any more, so snapshotRefreshDecision would refuse it anyway.
+      if (today && sourceKey !== FBA_INVENTORY_SOURCE_KEY) {
         try {
           const decision = snapshotRefreshDecision({ sourceKey, lastValidatedAt: snapshot.validated_at, today });
           if (decision.refresh) {
@@ -1425,26 +1439,50 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
       }
     } catch (e) { if (dl.isDeadlineError(e)) return deriveResumable(e); throw e; }
 
-    // Round-5 blocker 2: wire the DURABLE FBA evidence into Brand View's REAL production read path -- build
-    // the validated compact brand-inventory snapshot via the EXISTING buildBrandInventorySnapshot contract
-    // (asinBrand ONLY from the just-derived brand-sales payload; fetchInventoryRows returns the HYDRATED
-    // durable FBA rows -- ZERO DataDoe) and save it under the EXISTING shadow key/version, so
+    // Round-5 blocker 2: wire the DURABLE inventory evidence into Brand View's REAL production read path -- build
+    // the validated compact brand-inventory snapshot via buildBrandInventorySnapshot (the phase-2 contract:
+    // asinBrand ONLY from the just-derived brand-sales payload; fetchInventoryRows returns the HYDRATED durable FBA
+    // Inventory Health rows and fetchListingsRows the account's SAVED Listings rows -- ZERO DataDoe; validated Listings
+    // win, else the Health snapshot is the labelled fallback) and save it under the shadow key/version, so
     // buildAccountBrandSlice consumes it through its normal compact-snapshot gate with no new mechanism.
-    // A contract refusal (missing brand map, truncation, invalid row) preserves the previous compact
+    // A contract refusal (missing brand map, truncation, malformed row) preserves the previous compact
     // snapshot and is recorded TYPED per account.
     const brandInventory = { saved: 0, skipped: [] };
     const invWindow = { from: asOfStr, to: asOfStr };
     const brandSalesByAccount = new Map(derived.brandView.snapshots.map((s) => [s.accountId, s]));
+    const readListingsPointer = typeof readListingsSnapshot === "function" ? readListingsSnapshot
+      : (readSnapshot === getSourceSnapshot ? getSourceListingsSnapshot : null);
+    // The account's SAVED Listings evidence, read lazily HERE (only the compact uses it; never a readiness input) and
+    // FAIL-SOFT: no reader / no pointer / a non-ok read / a dangling or row-count-mismatched payload = no Listings
+    // evidence. A deadline expiry stays typed-resumable. CUTOVER freshness (the SAME rule as fba-brand-inventory-release
+    // and the insight reports): a pointer whose cycle as_of is older than asOf - HEALTH_BRIDGE_MAX_AGE_DAYS is never used
+    // (listings-snapshot-stale); the compact then uses the saved Health bridge (within its own threshold) or is Unavailable.
+    const readListingsEvidence = async (accountId) => {
+      const none = (reason) => ({ snapshot: null, rows: [], reason });
+      if (!readListingsPointer) return none(null);
+      try {
+        const lr = await dl.bound("listings-snapshot-read", (signal) => readListingsPointer({ organizationFingerprint: orgFingerprint, connectionId: "primary", accountId, signal }));
+        const snap = lr && lr.read === "ok" ? (lr.snapshot || null) : null;
+        if (!snap || !snap.object_path) return none(null);
+        const cycle = String(snap.as_of ?? snap.asOf ?? "").slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(cycle) || cycle < addDaysStr(asOfStr, -HEALTH_BRIDGE_MAX_AGE_DAYS)) return none("listings-snapshot-stale");
+        const payload = await dl.bound("listings-snapshot-hydration", (signal) => loadSnapshotPayload(snap.object_path, { signal }));
+        const rows = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.rows) ? payload.rows : null);
+        if (!Array.isArray(rows) || rows.length !== Number(snap.row_count)) return none(null);
+        return { snapshot: snap, rows, reason: null };
+      } catch (e) { if (dl.isDeadlineError(e)) throw e; return none(null); }
+    };
     try {
       for (const account of accounts) {
         let invRows = evidence.fbaRowsByAccount ? evidence.fbaRowsByAccount[account.accountId] : undefined;
         const sales = brandSalesByAccount.get(account.accountId);
+        const listings = sales ? await readListingsEvidence(account.accountId) : { snapshot: null, rows: [] };
         if (!Array.isArray(invRows)) {
-          // PRIORITY DASHBOARDS PATH: no durable FBA snapshot for this account -> represent inventory as
-          // UNAVAILABLE (empty rows => buildBrandInventoryPayload yields inventoryAvailable:false) rather than
-          // skipping, so Brand View publishes for every covered account with zero FBA export. The normal
-          // (non-priority) path still preserves the previous compact snapshot and records the typed skip.
-          if (priority) { invRows = []; }
+          // No durable FBA Inventory Health snapshot for this account. PRIORITY DASHBOARDS PATH (or saved Listings
+          // evidence exists): build anyway -- validated Listings serve, else inventory is UNAVAILABLE (never a
+          // fabricated zero) -- so Brand View publishes for every covered account with zero export. The normal
+          // (non-priority) path with no inventory evidence at all preserves the previous compact + records the skip.
+          if (priority || listings.snapshot) { invRows = []; }
           else { brandInventory.skipped.push({ accountId: account.accountId, reason: "no-validated-fba-snapshot" }); continue; }
         }
         if (!sales) { brandInventory.skipped.push({ accountId: account.accountId, reason: "no-brand-sales-snapshot" }); continue; }
@@ -1453,9 +1491,13 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         try {
           built = await buildBrandInventorySnapshot({
             accountId: account.accountId, accountCountry: account.country,
-            from: invWindow.from, to: invWindow.to, rowLimit: BRAND_INVENTORY_ROW_LIMIT,
+            from: invWindow.from, to: invWindow.to,
+            rowLimit: BRAND_INVENTORY_ROW_LIMIT, listingsRowLimit: BRAND_INVENTORY_LISTINGS_ROW_LIMIT,
             getSnapshot: async ({ reportKey }) => (reportKey === "brand-sales" ? { payload: sales.payload } : null),
             fetchInventoryRows: async () => invRows,
+            fetchListingsRows: async () => listings.rows,
+            listingsRefreshedAt: listings.snapshot ? (listings.snapshot.validated_at ?? listings.snapshot.validatedAt ?? null) : null,
+            listingsUnavailableReason: listings.reason || null,
           });
         } catch (e) {
           if (dl.isDeadlineError(e)) throw e;
@@ -1471,6 +1513,13 @@ export function buildBucketSourceSyncRuntime(overrides = {}) {
         const durableContentDeps = fbaSnap
           ? [fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: account.accountId, connectionId: "primary", requestHash: fbaSnap.source_request_hash ?? fbaSnap.sourceRequestHash, contentSha: fbaSnap.payload_sha ?? fbaSnap.payloadSha })]
           : [];
+        // + the saved Listings content this derive read: since the Listings inventory cutover this IS the FBA reconciler's
+        // revision token (computeFbaAccountRevision keys on the saved Listings pointer); the Health token above is
+        // provenance of the read-only bridge only.
+        const lSnap = listings.snapshot;
+        if (lSnap && (lSnap.source_request_hash ?? lSnap.sourceRequestHash) && (lSnap.payload_sha ?? lSnap.payloadSha)) {
+          durableContentDeps.push(fbaContentProvenanceToken({ sourceKey: "listings", accountId: account.accountId, connectionId: "primary", requestHash: lSnap.source_request_hash ?? lSnap.sourceRequestHash, contentSha: lSnap.payload_sha ?? lSnap.payloadSha }));
+        }
         const snap = {
           reportKey: shadowSnapshotKey(BRAND_INVENTORY_SNAPSHOT_KEY), productionReportKey: BRAND_INVENTORY_SNAPSHOT_KEY,
           accountId: account.accountId, version: BRAND_INVENTORY_REPORT_VERSION,

@@ -305,10 +305,13 @@ test("A1. required vs optional families per report; tranche annotations + budget
   assert.deepEqual(g.reports["daily-reporting"].requiredFamilies, ["order-line-items", "product-catalog"]);
   assert.deepEqual(g.reports["brand-sales"].requiredFamilies, ["order-line-items", "product-catalog"]);
   assert.equal(g.reports["brand-view"].derivedOnly, true, "brand-view is snapshot-derived (no source families of its own)");
-  // fba-plan fetches ONLY its FBA Inventory Health snapshot; OLI + Product Catalog are durable DERIVED deps (not
-  // fetched), so they are not required source families for fba-plan's own planning.
-  assert.deepEqual(g.reports["fba-plan"].requiredFamilies, ["fba-inventory-health"]);
-  assert.deepEqual(g.reports["fba-plan"].optionalFamilies, ["listings"], "fba-plan:awd is optional");
+  // fba-plan fetches ONLY the canonical Listings export (FBA inventory + AWD since the Listings inventory cutover; FBA
+  // Inventory Health is retired); OLI + Product Catalog are durable DERIVED deps (not fetched), so they are not required
+  // source families for fba-plan's own planning.
+  // Whether the derive gate marks the Listings fragment required or optional is the fba-plan derive's own decision
+  // (REPORT_DERIVATIONS optionalRequestKeys); the ONLY fetched family is the canonical Listings either way.
+  assert.deepEqual([...g.reports["fba-plan"].requiredFamilies, ...g.reports["fba-plan"].optionalFamilies].sort(), ["listings"], "fba-plan's ONLY fetched family is the canonical Listings");
+  assert.ok(!JSON.stringify(g).includes("inventory-health"), "no tranche / report names the retired FBA Inventory Health family");
   assert.deepEqual(g.reports["keyword-rank"].requiredFamilies, ["product-catalog", "sqp-weekly"]);
   assert.deepEqual(g.reports["keyword-rank"].optionalFamilies, ["sqp-monthly"]);
   const byName = Object.fromEntries(g.tranches.map((t) => [t.name, t]));

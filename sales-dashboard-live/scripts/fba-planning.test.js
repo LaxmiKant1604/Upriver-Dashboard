@@ -1,7 +1,7 @@
 // FBA Shipment Plan PLANNING helpers -- pure, offline regressions for the configurable planner. Proves horizons,
 // calendar-aware windows, the unchanged current-month MTD projection, every forecast method + weight validation, the
-// non-overlapping inventory equation (no double count), US-only AWD, "missing is never a fabricated 0", and the
-// shortage/ship/production/stockout outputs. 7-bit ASCII, LF.
+// LISTINGS inventory model (Supply = FBA Available + FBA Inbound; Reserved (Total) + FC Transfer display only; AWD only
+// when validated), "missing is never a fabricated 0", and the shortage/ship/production/stockout outputs. 7-bit ASCII, LF.
 
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
@@ -82,37 +82,39 @@ test("5. weighted weights must total EXACTLY 100; otherwise invalid + no forecas
   assert.equal(baseMonthlyForecast({ method: "weighted", monthlyValues: [1, 2, 3], mtdProjected: 4, weights: [10, 20, 30, 39] }), null, "invalid weights -> null (Unavailable), never a wrong number");
 });
 
-/* ===== 11/12/13. non-overlapping inventory equation ===== */
-test("11/12. Customer Order Reserved is displayed but EXCLUDED from usable stock; no quantity is double-counted", () => {
+/* ===== 11/12/13. the Listings inventory model (Listings inventory cutover) ===== */
+test("11/12. Supply = FBA Available + FBA Inbound; FBA Reserved (Total) + FC Transfer are DISPLAY ONLY (never counted)", () => {
   const r = computePlanRow({
     isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true,
-    available: 100, customerOrderReserved: 40, reservedFcTransfer: 10, reservedFcProcessing: 5,
-    inboundWorking: 20, inboundShipped: 8, inboundReceived: 12,
+    available: 100, fbaInbound: 40, fbaReservedTotal: 25, fbaFcTransfer: 15,
     monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28,
     horizon: { kind: "months", months: 2 }, safetyDays: 14, forecastMethod: "three-month",
   });
-  // immediatelyAvailable = available; customer-order-reserved is separate + NOT in any usable total.
   assert.equal(r.immediatelyAvailable, 100);
-  assert.equal(r.customerOrderReserved, 40);
-  // amazonPipeline = working + shipped + received + fcProcessing + reserved_fc_transfer (RAW, no subtraction) = 20+8+12+5+10
-  assert.equal(r.amazonPipeline, 20 + 8 + 12 + 5 + 10);
-  assert.equal(r.reservedFcTransfer, 10, "reserved_fc_transfer is RAW -- no inbound-shipped subtraction");
-  // totalAmazonAwdStock = 100 + 55 + 0(no AWD, non-US) ; customer reserved NOT added.
-  assert.equal(r.totalAmazonAwdStock, 100 + 55);
-  // Prove no double count: the sum of the distinct display components equals totalAmazonAwdStock, and adding
-  // customerOrderReserved would OVER-count (guard).
-  const distinct = r.immediatelyAvailable + r.inboundWorking + r.inboundShipped + r.inboundReceived + r.reservedFcProcessing + r.reservedFcTransfer;
-  assert.equal(distinct, r.totalAmazonAwdStock, "every distinct inventory component is counted exactly once");
-  assert.notEqual(r.totalAmazonAwdStock, distinct + r.customerOrderReserved, "customer-order-reserved is never added into usable stock");
+  assert.equal(r.fbaInbound, 40);
+  assert.equal(r.fbaReservedTotal, 25, "reserved is surfaced for display");
+  assert.equal(r.fbaFcTransfer, 15, "FC transfer is surfaced for display");
+  assert.equal(r.fbaSupply, 140, "supply = available + inbound only");
+  assert.equal(r.totalAmazonAwdStock, 140, "no AWD (non-AWD marketplace); reserved + FC transfer never added");
+  assert.notEqual(r.totalAmazonAwdStock, 140 + 25, "reserved is never supply");
+  assert.notEqual(r.totalAmazonAwdStock, 140 + 15, "FC transfer is never supply (non-overlap not proven beyond the canary)");
+  for (const k of ["customerOrderReserved", "reservedFcTotal", "inboundPipeline", "amazonPipeline", "totalFbaInventory"]) assert.ok(!(k in r), `retired Health field ${k} is gone`);
 });
 
-test("no transfer/shipped subtraction: reserved_fc_transfer + inbound_shipped are both counted in full (distinct states)", () => {
-  // A SKU with fc_transfer=30 and inbound_shipped=25 -- the OLD code would have subtracted to fc_transfer=5. The
-  // authoritative source metadata (inbound_quantity = sum of inbound states; fc_transfer separate) proves no overlap,
-  // so BOTH are counted in full.
-  const r = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 0, reservedFcTransfer: 30, inboundShipped: 25, monthlyValues: [30, 30, 30], mtdUnits: 28, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
-  assert.equal(r.reservedFcTransfer, 30, "no subtraction: full reserved_fc_transfer");
-  assert.equal(r.amazonPipeline, 25 + 30, "inbound_shipped + reserved_fc_transfer both counted in full");
+test("an UNKNOWN FBA Inbound (or Available) makes supply / network / shortage null and priority Unknown -- never 0 / never OK", () => {
+  const r = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 50, fbaInbound: null, monthlyValues: [30, 30, 30], mtdUnits: 28, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
+  assert.equal(r.immediatelyAvailable, 50, "the known Available still shows");
+  assert.equal(r.fbaSupply, null);
+  assert.equal(r.amazonNetworkPosition, null);
+  assert.equal(r.shortageBeforeWarehouse, null);
+  assert.equal(r.productionRequirement, null);
+  assert.equal(r.planningPriority, "Unknown", "an unknown shortage is never reported as OK");
+  assert.ok(r.estimatedStockoutDate !== null, "the stockout date only needs Available + demand");
+});
+
+test("13. fields that are not Listings inputs (Health aggregates, supply_at_fba) are never referenced by the helper", () => {
+  const r = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 50, fbaInbound: 0, total_reserved_quantity: 999, inbound_quantity: 999, fba_inventory_supply_at_fba: 999, reservedFcTransfer: 999, inboundShipped: 999, monthlyValues: [30, 30, 30], mtdUnits: 28, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
+  assert.equal(r.totalAmazonAwdStock, 50, "non-input fields are ignored; only Available + Inbound count");
 });
 
 /* ===== forecast engine: a missing month/MTD is Unavailable, never treated as 0 ===== */
@@ -129,55 +131,44 @@ test("forecast requires proven inputs: missing month -> three-month Unavailable;
   assert.equal(baseMonthlyForecast({ method: "weighted", monthlyValues: [300, null, 420], mtdProjected: 500, weights: [50, 0, 25, 25] }), Math.round((0.5 * 300 + 0.25 * 420 + 0.25 * 500) * 100) / 100, "a zero-weight missing month is fine");
 });
 
-test("13. aggregate fields (total_reserved_quantity / inbound_quantity) are never referenced by the helper", () => {
-  // The helper's inputs are the individual components only; passing aggregate-named fields has no effect.
-  const r = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 50, total_reserved_quantity: 999, inbound_quantity: 999, monthlyValues: [30, 30, 30], mtdUnits: 28, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
-  assert.equal(r.totalAmazonAwdStock, 50, "aggregate fields are ignored; only components count");
-});
-
 /* ===== 14/15/16. AWD US-only ===== */
 test("14/15. AWD counts for ANY validated marketplace (US + EU5); an UNVALIDATED account contributes nothing (null, never 0)", () => {
-  const us = computePlanRow({ isUS: true, awdValidated: true, awdAvailable: 30, awdInbound: 15, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
+  const us = computePlanRow({ isUS: true, awdValidated: true, awdAvailable: 30, awdInbound: 15, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, fbaInbound: 0, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
   assert.equal(us.awdAvailable, 30);
   assert.equal(us.awdInbound, 15);
   // ONLY distributable AWD (awd_available) is usable supply; awd_inbound (inbound TO the AWD warehouse) is NOT yet
   // distributable and is EXCLUDED from every usable/network total (display-only).
-  assert.equal(us.totalFbaInventory, 100, "Total FBA Inventory is FBA-only, never includes AWD");
+  assert.equal(us.fbaSupply, 100, "FBA Supply is FBA-only, never includes AWD");
   assert.equal(us.amazonNetworkPosition, 100 + 30, "network position adds distributable AWD only");
   assert.equal(us.totalAmazonAwdStock, 100 + 30, "awd_inbound (15) is NOT added to usable stock");
   // A VALIDATED European account (isUS false, awdValidated true) counts AWD IDENTICALLY -- the caller encodes the
   // marketplace eligibility (US + EU5) in awdValidated, so European AWD flows through the SAME (unchanged) formulas.
-  const eu = computePlanRow({ isUS: false, awdValidated: true, awdAvailable: 30, awdInbound: 15, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
+  const eu = computePlanRow({ isUS: false, awdValidated: true, awdAvailable: 30, awdInbound: 15, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, fbaInbound: 0, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
   assert.equal(eu.awdAvailable, 30, "European (validated) AWD is counted, exactly like US");
-  assert.equal(eu.totalFbaInventory, 100, "European Total FBA Inventory still excludes AWD (no double count)");
+  assert.equal(eu.fbaSupply, 100, "European FBA Supply still excludes AWD (no double count)");
   assert.equal(eu.amazonNetworkPosition, 130);
   assert.equal(eu.totalAmazonAwdStock, 130);
   // An UNVALIDATED account (a non-AWD marketplace, or a missing/failed source) contributes nothing: null, never 0.
-  const unval = computePlanRow({ isUS: false, awdValidated: false, awdAvailable: null, awdInbound: null, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
+  const unval = computePlanRow({ isUS: false, awdValidated: false, awdAvailable: null, awdInbound: null, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, fbaInbound: 0, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
   assert.equal(unval.awdAvailable, null, "unvalidated AWD is Unavailable (null), never 0");
   assert.equal(unval.awdInbound, null);
   assert.equal(unval.totalAmazonAwdStock, 100, "unvalidated AWD never contributes to stock");
   assert.equal(unval.amazonNetworkPosition, 100);
+  // VALIDATED AWD but THIS ASIN's AWD unknown -> the network position is unknown (null), never FBA-only presented as complete.
+  const awdUnknown = computePlanRow({ isUS: true, awdValidated: true, awdAvailable: null, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, fbaInbound: 0, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
+  assert.equal(awdUnknown.fbaSupply, 100);
+  assert.equal(awdUnknown.amazonNetworkPosition, null, "validated AWD + unknown ASIN AWD -> network Unavailable");
 });
 
-test("canonical model: one non-overlapping equation; each raw state counted exactly once; AWD-inbound + customer-reserve excluded", () => {
+test("canonical model: Supply = Available + Inbound; network = Supply + AWD Available; AWD inbound / reserved / FC transfer excluded", () => {
   const r = computePlanRow({
     isUS: true, awdValidated: true, awdAvailable: 7, awdInbound: 99, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31,
-    inventoryAvailable: true, available: 100, customerOrderReserved: 40, reservedFcTransfer: 10, reservedFcProcessing: 5,
-    inboundWorking: 20, inboundShipped: 8, inboundReceived: 12, sellerWarehouseQty: 25,
+    inventoryAvailable: true, available: 100, fbaInbound: 40, fbaReservedTotal: 30, fbaFcTransfer: 10, sellerWarehouseQty: 25,
     monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 },
   });
-  // Buckets are the raw states, each summed once.
-  assert.equal(r.reservedFcTotal, 10 + 5);
-  assert.equal(r.inboundPipeline, 20 + 8 + 12);
-  assert.equal(r.amazonPipeline, r.reservedFcTotal + r.inboundPipeline, "pipeline = reservedFc + inbound, no aggregate reused");
-  assert.equal(r.totalFbaInventory, 100 + (10 + 5) + (20 + 8 + 12), "Total FBA Inv = sellable + reservedFc + inbound (no AWD)");
-  assert.equal(r.amazonNetworkPosition, r.totalFbaInventory + 7, "+ distributable AWD only (awd_inbound 99 excluded)");
+  assert.equal(r.fbaSupply, 100 + 40, "FBA Supply = sellable + inbound (no AWD, no reserved, no FC transfer)");
+  assert.equal(r.amazonNetworkPosition, r.fbaSupply + 7, "+ distributable AWD only (awd_inbound 99 excluded)");
   assert.equal(r.totalNetworkPosition, r.amazonNetworkPosition + 25, "+ seller warehouse");
-  // No double count: the disjoint raw components sum to exactly totalFbaInventory; adding customer reserve would over-count.
-  const disjoint = r.immediatelyAvailable + r.reservedFcTransfer + r.reservedFcProcessing + r.inboundWorking + r.inboundShipped + r.inboundReceived;
-  assert.equal(disjoint, r.totalFbaInventory, "each distinct FBA state counted exactly once");
-  assert.notEqual(r.totalFbaInventory, disjoint + r.customerOrderReserved, "customer-order reserve never in the usable total");
   assert.equal(r.amazonNetworkPosition, r.totalAmazonAwdStock, "alias parity");
 });
 
@@ -188,9 +179,10 @@ test("16. missing US AWD evidence is Unavailable (null), never a fabricated 0", 
 
 /* ===== missing inventory => Unavailable, never zero ===== */
 test("missing inventory snapshot => every FBA figure is null (Unavailable), never 0; no NaN/Infinity", () => {
-  const r = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: false, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
+  const r = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: false, available: 5, fbaInbound: 5, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 } });
   assert.equal(r.immediatelyAvailable, null);
-  assert.equal(r.amazonPipeline, null);
+  assert.equal(r.fbaInbound, null);
+  assert.equal(r.fbaSupply, null);
   assert.equal(r.totalAmazonAwdStock, null);
   assert.equal(r.shortageBeforeWarehouse, null, "no shortage computed without inventory evidence");
   assert.equal(r.estimatedStockoutDate, null);
@@ -203,7 +195,7 @@ test("9. shortage/ship/production: warehouse covers part of the network shortfal
   // dailyRunRate = 300/31 ~= 9.677; horizon 2 months from 2026-08-28 -> end 2026-10-28, ~61 days; safety 14 days.
   const r = computePlanRow({
     isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true,
-    available: 50, reservedFcProcessing: 0, inboundWorking: 0, inboundShipped: 0, inboundReceived: 0, reservedFcTransfer: 0,
+    available: 50, fbaInbound: 0, fbaReservedTotal: 0, fbaFcTransfer: 0,
     sellerWarehouseQty: 200, monthlyValues: [300, 300, 300], mtdUnits: 0, elapsedCompletedDays: 28,
     horizon: { kind: "months", months: 2 }, safetyDays: 14, forecastMethod: "three-month",
   });
@@ -216,7 +208,7 @@ test("9. shortage/ship/production: warehouse covers part of the network shortfal
   assert.equal(r.horizonDemand, horizonDemand);
   assert.equal(r.safetyStockUnits, safety);
   assert.equal(r.targetInventory, target);
-  const shortage = Math.max(0, target - 50); // amazon network = 50, no pipeline/awd
+  const shortage = Math.max(0, target - 50); // amazon network = 50 (available 50 + inbound 0), no AWD
   assert.equal(r.shortageBeforeWarehouse, shortage);
   assert.equal(r.shipFromSellerWarehouse, Math.min(200, shortage));
   assert.equal(r.productionRequirement, Math.max(0, shortage - 200));
@@ -225,11 +217,11 @@ test("9. shortage/ship/production: warehouse covers part of the network shortfal
 });
 
 test("stockout/priority: no demand -> no stockout date + reason; sufficient stock -> OK priority", () => {
-  const noDemand = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, monthlyValues: [0, 0, 0], mtdUnits: 0, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
+  const noDemand = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, fbaInbound: 0, monthlyValues: [0, 0, 0], mtdUnits: 0, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
   assert.equal(noDemand.estimatedStockoutDate, null);
   assert.equal(noDemand.stockoutReason, "no recent demand");
   assert.equal(noDemand.dailyRunRate, 0);
-  const covered = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100000, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 }, safetyDays: 14 });
+  const covered = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100000, fbaInbound: 0, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 }, safetyDays: 14 });
   assert.equal(covered.shortageBeforeWarehouse, 0);
   assert.equal(covered.planningPriority, "OK");
 });
@@ -241,12 +233,13 @@ test("display: threeMonthAverage requires all three completed months; one missin
   assert.equal(missing.threeMonthAverage, null);
 });
 
-test("customer-order reserve is DISPLAY ONLY: it is surfaced but never in immediatelyAvailable/pipeline/network totals", () => {
-  const r = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 100, customerOrderReserved: 40, reservedFcProcessing: 5, inboundWorking: 3, monthlyValues: [30, 30, 30], mtdUnits: 10, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
-  assert.equal(r.customerOrderReserved, 40);
-  assert.equal(r.immediatelyAvailable, 100, "sellable = available only");
-  assert.equal(r.amazonPipeline, 8, "pipeline = fc_processing + inbound_working; customer reserve excluded");
-  assert.equal(r.totalAmazonAwdStock, 108, "customer reserve never counted as usable stock");
+test("merchant-fulfilled-only product (fbaContext mfn-only): no FBA figures, no stockout date, an explicit reason", () => {
+  const r = computePlanRow({ isUS: false, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: null, fbaInbound: null, fbaContext: "mfn-only", monthlyValues: [30, 30, 30], mtdUnits: 10, elapsedCompletedDays: 28, horizon: { kind: "months", months: 1 } });
+  assert.equal(r.fbaContext, "mfn-only");
+  assert.equal(r.immediatelyAvailable, null);
+  assert.equal(r.estimatedStockoutDate, null, "an MFN-only product is never an FBA stockout");
+  assert.match(r.stockoutReason, /merchant-fulfilled/);
+  assert.equal(r.planningPriority, "Unknown");
 });
 
 test("AWD inbound is folded US-only when validated; Non-US and unvalidated stay null (never a fake 0)", () => {
@@ -258,10 +251,10 @@ test("AWD inbound is folded US-only when validated; Non-US and unvalidated stay 
 });
 
 test("seller warehouse is counted EXACTLY ONCE (ship-from-WH + production) and never in FBA/AWD/Amazon totals", () => {
-  const r = computePlanRow({ isUS: true, awdValidated: true, awdAvailable: 5, awdInbound: 40, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 10, reservedFcProcessing: 3, inboundShipped: 2, sellerWarehouseQty: 100, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 }, safetyDays: 0 });
+  const r = computePlanRow({ isUS: true, awdValidated: true, awdAvailable: 5, awdInbound: 40, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 10, fbaInbound: 5, fbaReservedTotal: 3, sellerWarehouseQty: 100, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 }, safetyDays: 0 });
   // Seller WH is NOT part of the Amazon-side inventory/network figures.
-  assert.equal(r.totalFbaInventory, 10 + 3 + 2, "FBA inventory excludes seller WH (and AWD)");
-  assert.equal(r.amazonNetworkPosition, 10 + 3 + 2 + 5, "Amazon network = FBA + AWD available; no seller WH");
+  assert.equal(r.fbaSupply, 10 + 5, "FBA Supply excludes seller WH (and AWD, reserved)");
+  assert.equal(r.amazonNetworkPosition, 10 + 5 + 5, "Amazon network = FBA Supply + AWD available; no seller WH");
   // It appears ONCE in the total NETWORK position (Amazon network + seller WH).
   assert.equal(r.totalNetworkPosition, r.amazonNetworkPosition + 100);
   // The shortage after the Amazon network is covered by WH first, then production -- WH counted once across the split.
@@ -270,10 +263,10 @@ test("seller warehouse is counted EXACTLY ONCE (ship-from-WH + production) and n
 });
 
 test("changing ONLY the seller warehouse quantity never changes any FBA/AWD/Amazon inventory figure", () => {
-  const base = { isUS: true, awdValidated: true, awdAvailable: 5, awdInbound: 40, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 10, reservedFcProcessing: 3, inboundShipped: 2, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 }, safetyDays: 0 };
+  const base = { isUS: true, awdValidated: true, awdAvailable: 5, awdInbound: 40, effectiveAsOf: "2026-08-28", daysInCurrentMonth: 31, inventoryAvailable: true, available: 10, fbaInbound: 5, fbaReservedTotal: 3, monthlyValues: [300, 300, 300], mtdUnits: 280, elapsedCompletedDays: 28, horizon: { kind: "months", months: 2 }, safetyDays: 0 };
   const a = computePlanRow({ ...base, sellerWarehouseQty: 0 });
   const b = computePlanRow({ ...base, sellerWarehouseQty: 999 });
-  for (const k of ["immediatelyAvailable", "amazonPipeline", "totalFbaInventory", "awdAvailable", "awdInbound", "amazonNetworkPosition"]) {
+  for (const k of ["immediatelyAvailable", "fbaInbound", "fbaSupply", "awdAvailable", "awdInbound", "amazonNetworkPosition"]) {
     assert.equal(a[k], b[k], `seller WH must not change ${k}`);
   }
   assert.notEqual(a.totalNetworkPosition, b.totalNetworkPosition, "only the network position (which includes WH) moves");

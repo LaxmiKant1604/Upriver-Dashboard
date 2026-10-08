@@ -4,7 +4,6 @@ import {
   getAccountOnboardingRows,
   getAdsSyncStates,
   getDashboardAccess,
-  getLatestReportJobLineage,
   getRecentSyncCycleIds,
   getReportSnapshotsMeta,
   getReportSyncSettings,
@@ -94,7 +93,7 @@ export default async function handler(req, res) {
             getAccountDirectoryRows, getAccountOnboardingRows,
             getRecentSyncCycleIds, getSyncCycle,
             getSourceCoverageWindows, getSourceSnapshot, getSourceListingsSnapshot, getSourceListingsRawSnapshot,
-            getAdsSyncStates, getReportSnapshotsMeta, getLatestReportJobLineage,
+            getAdsSyncStates, getReportSnapshotsMeta,
           },
         );
         res.status(200).json(payload);

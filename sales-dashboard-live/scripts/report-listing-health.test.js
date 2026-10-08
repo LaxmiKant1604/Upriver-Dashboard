@@ -61,8 +61,11 @@ function buildSources(planned, rowsByHash, statusOverride = {}, errorOverride = 
 // "missing". A "disabled" state carries the DURABLE error_code SOURCE_DISABLED; a plain "failed" carries a
 // NON-disabled code (EXPORT_ERROR) -- proving only SOURCE_DISABLED (not policy presence) degrades. Returns
 // { planned, rows, statusOverride, errorOverride } wired for the requested raw state.
+// `inventory` = the account's SAVED durable FBA Inventory Health rows (the read-only bridge), delivered to the derive as
+// context evidence (Listings inventory CUTOVER: no listing-health:inventory fragment exists); null => no evidence at all.
 function lhPlanned({ listings = [], raw = [], sales = [], inventory = [], catalog = [], ids = [ID], rawState = "success", rawErrorCode = null } = {}) {
   const planned = []; const rows = {}; const statusOverride = {}; const errorOverride = {};
+  const evidence = inventory == null ? null : { listings: null, healthBridge: { rows: inventory, unavailableReason: null, snapshotDate: null, savedAt: null } };
   const add = (key, from, to, data, extra) => { const f = frag(key, from, to, ids, extra); planned.push(f); rows[f.requestHash] = data; return f; };
   add("listing-health:listings", null, null, listings);
   if (rawState !== "missing") {
@@ -73,13 +76,13 @@ function lhPlanned({ listings = [], raw = [], sales = [], inventory = [], catalo
     else if (rawState === "pending") statusOverride[f.requestHash] = "pending";
   }
   add("listing-health:sales", SALES_FROM, ASOF, sales);
-  add("listing-health:inventory", INV_FROM, INV_FROM, inventory); // EXACT single day [asOf-1 .. asOf-1]
   add("listing-health:catalog", null, null, catalog);
-  return { planned, rows, statusOverride, errorOverride };
+  return { planned, rows, statusOverride, errorOverride, evidence };
 }
 const ctx = (over = {}) => ({ to: ASOF, rawSellerId: ID, accountId: ID, ...over });
 const deriveLH = (built, context = ctx(), extraStatus = {}, extraError = {}) =>
-  deriveReportSnapshot({ reportKey: "listing-health", sources: buildSources(built.planned, built.rows, { ...built.statusOverride, ...extraStatus }, { ...built.errorOverride, ...extraError }), context });
+  deriveReportSnapshot({ reportKey: "listing-health", sources: buildSources(built.planned, built.rows, { ...built.statusOverride, ...extraStatus }, { ...built.errorOverride, ...extraError }),
+    context: built.evidence && !("insightInventoryEvidence" in context) ? { ...context, insightInventoryEvidence: built.evidence } : context });
 
 // ---- row builders ----
 const listing = (sku, asin, o = {}) => ({
@@ -114,7 +117,7 @@ const FIXTURE = () => ({
     sale("", "ASIN-X", "USD", 99, 9, 9), // blank sku -> skipped
   ],
   inventory: [
-    // EXACTLY the single previous day (asOf-1 = 2025-08-09); a row on any other date is now rejected.
+    // The account's LAST SAVED Health snapshot (2025-08-09, within asOf - 2): the read-only bridge.
     inv("2025-08-09", "SKU-A", "ASIN-A", 75),
     inv("2025-08-09", "SKU-B", "ASIN-B", 0),  // genuine zero
   ],
@@ -128,12 +131,17 @@ const expectedFixturePayload = () => ({
   salesWindow: { from: SALES_FROM, to: "2025-08-10", days: 30 },
   sourceLabel: SOURCE_LABEL, salesSourceLabel: SALES_LABEL,
   issuesAvailable: true, issuesUnavailableReason: null, issuesSourceLabel: ISSUES_LABEL,
-  inventoryAvailable: true, inventorySnapshotDate: "2025-08-09",
+  // No saved Listings evidence here -> the account's saved Health snapshot is the dated read-only bridge.
+  inventoryModel: "inventory-source-v1", inventorySource: "health-fallback",
+  inventorySourceLabel: "FBA Inventory Health snapshot 2025-08-09 (saved, no longer refreshed -- temporary bridge: listings-not-loaded)",
+  inventoryAvailable: true, listingsRefreshedAt: null, inventoryHealthDate: "2025-08-09",
+  inventoryFallbackReasons: ["listings-not-loaded"], inventoryUnavailableReasons: [], inventoryResolvedConflicts: 0,
+  inventorySnapshotDate: "2025-08-09",
   currencies: ["CAD", "USD"], listingCount: 4,
   rows: [
-    { sku: "SKU-A", asin: "ASIN-A", productName: "Catalog A", brand: "Acme", listingStatus: "Active", fulfillmentChannel: "FBA", fulfillmentChannelRaw: "AMAZON_NA", price: 19.99, currency: "USD", listingQuantity: 100, fbaAvailable: 80, fbaInbound: 10, fbaReserved: 3, snapshotAvailable: 75, openDate: "2024-01-15", sales30d: 1000, units30d: 50, profit30d: 300, hasSalesData: true, issues: [{ severity: "ERROR", code: "8001", message: "Listing suppressed" }, { severity: "WARNING", code: null, message: "Low quality image" }], summary: { buyable: true, discoverable: true, status: "BUYABLE,DISCOVERABLE" }, hasLiveOffer: true },
-    { sku: "SKU-B", asin: "ASIN-B", productName: "Listing B", brand: "Beta", listingStatus: "Inactive", fulfillmentChannel: "FBM", fulfillmentChannelRaw: "DEFAULT", price: null, currency: "CAD", listingQuantity: 0, fbaAvailable: 0, fbaInbound: 0, fbaReserved: 0, snapshotAvailable: 0, openDate: null, sales30d: 200, units30d: 10, profit30d: 40, hasSalesData: true, issues: [], summary: { buyable: false, discoverable: true, status: "DISCOVERABLE" }, hasLiveOffer: null },
-    { sku: "SKU-C", asin: "ASIN-C", productName: null, brand: "Unassigned", listingStatus: "Incomplete", fulfillmentChannel: null, fulfillmentChannelRaw: null, price: 0, currency: "USD", listingQuantity: 20, fbaAvailable: 0, fbaInbound: 0, fbaReserved: 0, snapshotAvailable: null, openDate: "2023-06-01", sales30d: 0, units30d: 0, profit30d: 0, hasSalesData: false, issues: [], summary: null, hasLiveOffer: null },
+    { sku: "SKU-A", asin: "ASIN-A", productName: "Catalog A", brand: "Acme", listingStatus: "Active", fulfillmentChannel: "FBA", fulfillmentChannelRaw: "AMAZON_NA", price: 19.99, currency: "USD", listingQuantity: 100, fbaAvailable: 80, fbaInbound: 10, fbaReserved: 3, onHandFba: 75, onHandFbaSource: "health-fallback", openDate: "2024-01-15", sales30d: 1000, units30d: 50, profit30d: 300, hasSalesData: true, issues: [{ severity: "ERROR", code: "8001", message: "Listing suppressed" }, { severity: "WARNING", code: null, message: "Low quality image" }], summary: { buyable: true, discoverable: true, status: "BUYABLE,DISCOVERABLE" }, hasLiveOffer: true },
+    { sku: "SKU-B", asin: "ASIN-B", productName: "Listing B", brand: "Beta", listingStatus: "Inactive", fulfillmentChannel: "FBM", fulfillmentChannelRaw: "DEFAULT", price: null, currency: "CAD", listingQuantity: 0, fbaAvailable: 0, fbaInbound: 0, fbaReserved: 0, onHandFba: 0, onHandFbaSource: "health-fallback", openDate: null, sales30d: 200, units30d: 10, profit30d: 40, hasSalesData: true, issues: [], summary: { buyable: false, discoverable: true, status: "DISCOVERABLE" }, hasLiveOffer: null },
+    { sku: "SKU-C", asin: "ASIN-C", productName: null, brand: "Unassigned", listingStatus: "Incomplete", fulfillmentChannel: null, fulfillmentChannelRaw: null, price: 0, currency: "USD", listingQuantity: 20, fbaAvailable: 0, fbaInbound: 0, fbaReserved: 0, onHandFba: null, onHandFbaSource: null, openDate: "2023-06-01", sales30d: 0, units30d: 0, profit30d: 0, hasSalesData: false, issues: [], summary: null, hasLiveOffer: null },
   ],
   catalogBrands: ["Acme", "Beta"],
 });
@@ -175,19 +183,26 @@ test("5. 30-day sales/units/profit joined by SKU; hasSalesData flag", () => {
   assert.deepEqual([p.rows.find((r) => r.sku === "SKU-C").sales30d, p.rows.find((r) => r.sku === "SKU-C").hasSalesData], [0, false]);
 });
 
-test("6. latest inventory snapshot: available quantity per SKU, genuine zero vs null-when-missing", () => {
+test("6. on-hand FBA from the saved Health bridge (no saved Listings evidence): genuine zero vs null-when-missing, dated", () => {
   const p = deriveLH(lhPlanned(FIXTURE())).payload;
   assert.equal(p.inventorySnapshotDate, "2025-08-09", "the newest snapshot date wins");
-  assert.equal(p.rows.find((r) => r.sku === "SKU-A").snapshotAvailable, 75);
-  assert.equal(p.rows.find((r) => r.sku === "SKU-B").snapshotAvailable, 0, "genuine zero (SKU present in snapshot)");
-  assert.equal(p.rows.find((r) => r.sku === "SKU-C").snapshotAvailable, null, "SKU absent from snapshot => null, never fabricated zero");
+  assert.equal(p.inventorySource, "health-fallback");
+  assert.equal(p.rows.find((r) => r.sku === "SKU-A").onHandFba, 75, "the Health figure, never the listing record's own 80");
+  assert.equal(p.rows.find((r) => r.sku === "SKU-B").onHandFba, 0, "genuine zero (SKU present in snapshot)");
+  assert.equal(p.rows.find((r) => r.sku === "SKU-C").onHandFba, null, "SKU absent from snapshot => null, never fabricated zero");
+  assert.ok(p.rows.every((r) => !("snapshotAvailable" in r)), "the pre-phase-2 Health field is gone");
 });
 
-test("7. inventory snapshot unavailable => every snapshotAvailable null, inventoryAvailable false", () => {
+test("7. no Listings + no Health snapshot => Unavailable: every onHandFba null, inventoryAvailable false; a blank listing quantity is null, never 0", () => {
   const p = deriveLH(lhPlanned({ ...FIXTURE(), inventory: [] })).payload;
   assert.equal(p.inventoryAvailable, false);
+  assert.equal(p.inventorySource, "unavailable");
   assert.equal(p.inventorySnapshotDate, null);
-  assert.ok(p.rows.every((r) => r.snapshotAvailable === null));
+  assert.ok(p.rows.every((r) => r.onHandFba === null && r.onHandFbaSource === null));
+  const blank = FIXTURE();
+  blank.listings[0] = { ...blank.listings[0], fba_quantity_available: null, fba_quantity_reserved: "" };
+  const a = deriveLH(lhPlanned(blank)).payload.rows.find((r) => r.sku === "SKU-A");
+  assert.deepEqual([a.fbaAvailable, a.fbaInbound, a.fbaReserved], [null, 10, null], "the listing record's own quantities: unknown => null, never 0");
 });
 
 test("8. product-name (catalog -> listing name) + brand (catalog only) precedence; blank => Unassigned", () => {
@@ -341,17 +356,16 @@ test("b2f. worker-level: a mixed-currency SKU => report NOT saved, prior last-kn
 
 group("listing-health derive: window + account validation fail closed");
 
-test("15. exact source windows (sales asOf-29d..asOf; inventory the single day asOf-1..asOf-1; no-date listings/raw/catalog)", () => {
+test("15. exact source windows (sales asOf-29d..asOf; no-date listings/raw/catalog); NO inventory fragment exists", () => {
   assert.equal(deriveLH(lhPlanned(FIXTURE())).status, "derived");
   assert.equal(SALES_FROM, addDaysStr(ASOF, -29));
-  assert.equal(INV_FROM, addDaysStr(ASOF, -1));
+  assert.ok(!lhPlanned(FIXTURE()).planned.some((x) => x.requestKey === "listing-health:inventory"));
 });
 
-test("16. wrong-window sales/inventory + dated no-date sources fail closed (invalid)", () => {
+test("16. wrong-window sales + dated no-date sources fail closed (invalid)", () => {
   const good = FIXTURE();
   const shift = (key) => { const b = lhPlanned(good); const i = b.planned.findIndex((p) => p.requestKey === key); b.planned[i] = { ...b.planned[i], from: addDaysStr(b.planned[i].from || ASOF, -1) }; return deriveLH(b).status; };
   assert.equal(shift("listing-health:sales"), "invalid", "shifted sales window => invalid");
-  assert.equal(shift("listing-health:inventory"), "invalid", "shifted inventory window => invalid");
   for (const key of ["listing-health:listings", "listing-health:catalog", "listing-health:listings-raw"]) {
     const b = lhPlanned(good); const i = b.planned.findIndex((p) => p.requestKey === key);
     b.planned[i] = { ...b.planned[i], from: SALES_FROM, to: ASOF };
@@ -359,29 +373,39 @@ test("16. wrong-window sales/inventory + dated no-date sources fail closed (inva
   }
 });
 
-test("17. inventory ROW dates must be real calendar dates EXACTLY on the single day asOf-1 (never silently filtered)", () => {
-  const bad = (date) => deriveLH(lhPlanned({ ...FIXTURE(), inventory: [inv(date, "SKU-A", "ASIN-A", 5)] })).status;
-  assert.equal(bad("2025-02-30"), "invalid", "impossible date");
-  assert.equal(bad(addDaysStr(INV_FROM, -1)), "invalid", "before the exact day");
-  assert.equal(bad(ASOF), "invalid", "after the exact day (even asOf itself)");
-  assert.equal(bad("2099-01-01"), "invalid", "future date");
+test("17. the saved bridge drives on-hand FBA ONLY while its date >= asOf - 2 (stale => Unavailable, typed); its latest date only", () => {
+  const at = (date) => deriveLH(lhPlanned({ ...FIXTURE(), inventory: [inv(date, "SKU-A", "ASIN-A", 5)] })).payload;
+  assert.equal(at(addDaysStr(ASOF, -2)).inventorySource, "health-fallback", "asOf - 2 still serves");
+  const stale = at(addDaysStr(ASOF, -3));
+  assert.deepEqual([stale.inventorySource, stale.inventorySnapshotDate], ["unavailable", null]);
+  assert.deepEqual(stale.inventoryUnavailableReasons, ["listings-not-loaded", `health-bridge-stale:${addDaysStr(ASOF, -3)}`]);
+  assert.ok(stale.rows.every((r) => r.onHandFba === null), "never the stale 5 and never 0");
+  const older = deriveLH(lhPlanned({ ...FIXTURE(), inventory: [...FIXTURE().inventory, inv("2025-08-01", "SKU-A", "ASIN-A", 999)] })).payload;
+  assert.equal(older.rows.find((r) => r.sku === "SKU-A").onHandFba, 75, "an older-dated bridge row is never folded");
 });
 
 test("18. cross-account fragments fail closed (invalid)", () => {
-  for (const key of ["listing-health:listings", "listing-health:sales", "listing-health:inventory", "listing-health:catalog", "listing-health:listings-raw"]) {
+  for (const key of ["listing-health:listings", "listing-health:sales", "listing-health:catalog", "listing-health:listings-raw"]) {
     const b = lhPlanned(FIXTURE());
     const i = b.planned.findIndex((p) => p.requestKey === key);
     b.planned[i] = { ...b.planned[i], sellerOrVendorIds: ["OTHER"] };
     assert.equal(deriveLH(b).status, "invalid", `cross-account ${key} => invalid`);
   }
+  // A saved bridge row of ANOTHER seller is refused (never another account's stock): on-hand Unavailable.
+  const crossInv = deriveLH(lhPlanned({ ...FIXTURE(), inventory: [...FIXTURE().inventory, { ...inv("2025-08-09", "SKU-X", "ASIN-X", 1), seller_or_vendor_id: "OTHER" }] })).payload;
+  assert.deepEqual([crossInv.inventorySource, crossInv.inventoryUnavailableReasons], ["unavailable", ["listings-not-loaded", "health-foreign-seller-rows"]]);
 });
 
 test("19. a missing/failed REQUIRED source => unavailable, ZERO writes, last-known-good preserved", () => {
-  for (const key of ["listing-health:listings", "listing-health:sales", "listing-health:inventory", "listing-health:catalog"]) {
+  for (const key of ["listing-health:listings", "listing-health:sales", "listing-health:catalog"]) {
     const b = lhPlanned(FIXTURE());
     const hash = b.planned.find((p) => p.requestKey === key).requestHash;
     assert.equal(deriveLH(b, ctx(), { [hash]: "failed" }).status, "unavailable", `failed ${key} => unavailable`);
   }
+  // No saved inventory evidence at all never blocks the report: it derives with on-hand FBA Unavailable (never 0).
+  const noEvidence = deriveLH(lhPlanned({ ...FIXTURE(), inventory: null }));
+  assert.equal(noEvidence.status, "derived");
+  assert.deepEqual(noEvidence.payload.inventoryUnavailableReasons, ["listings-not-loaded", "health-bridge-not-loaded"]);
 });
 
 group("listing-health derive: public-vs-raw identity + purity");
@@ -463,7 +487,7 @@ function makeDataDoe(opts = {}) {
     if (rk.includes("listings-raw")) return [rawRow("SKU-A", "ASIN-A", JSON.stringify([{ severity: "ERROR", code: 1, message: "x" }]), [{ status: ["BUYABLE"] }], [{ price: { amount: 9.99 } }])];
     if (rk.includes("listing-health:listings")) return [listing("SKU-A", "ASIN-A", { name: "Listing A", channel: "AMAZON_NA", price: 9.99, qty: 10, fbaAvail: 5 })];
     if (rk.includes("sales")) return [sale("SKU-A", "ASIN-A", "USD", 100, 10, 30)];
-    if (rk.includes("inventory")) return [inv(fp.to || ASOF, "SKU-A", "ASIN-A", 5)];
+    if (rk.includes("inventory") || job.sourceKey === "fba-inventory-health") throw new Error("an FBA Inventory Health export was requested (the cutover forbids it)");
     if (rk.includes("catalog")) return [cat("ASIN-A", "P1", "Catalog A", "Acme")];
     return [{ child_asin: "ASIN-A" }];
   };
@@ -484,55 +508,51 @@ const resolveFromPlan = (plan) => () => ({
 const runGeneric = (store, dd, plan, opts = {}) => runStagedSourceCycle({ store, dataDoe: dd, resolvePlan: resolveFromPlan(plan), bucket: "us", cycleDate: "2026-08-11", ...opts });
 const srcOf = (plan, key) => plan.reportRequests[0].sources.find((s) => s.requestKey === key);
 
-test("24. default AND explicit planning include listing-health; exactly FIVE canonical jobs with exact windows/deps/owner/context", () => {
+test("24. default AND explicit planning include listing-health; exactly FOUR canonical jobs (NO FBA Inventory Health) with exact windows/deps/owner/context", () => {
   assert.ok(SHADOW_PLANNED_REPORT_KEYS.includes("listing-health"));
   assert.ok(shadowPlan(ACCTS).reportRequests.some((r) => r.reportKey === "listing-health"), "DEFAULT plan includes listing-health");
   const plan = shadowPlan(ACCTS, ["listing-health"]);
   const lh = plan.reportRequests.find((r) => r.reportKey === "listing-health");
-  assert.equal(plan.sourceJobs.length, 5, "exactly five deduplicated canonical source jobs");
+  assert.equal(plan.sourceJobs.length, 4, "exactly four deduplicated canonical source jobs");
   for (const key of ["listing-health:listings", "listing-health:listings-raw", "listing-health:catalog"]) {
     assert.deepEqual([srcOf(plan, key).from, srcOf(plan, key).to], [null, null], `${key} is no-date`);
   }
   assert.deepEqual([srcOf(plan, "listing-health:sales").from, srcOf(plan, "listing-health:sales").to], [SALES_FROM, ASOF]);
-  // The PLANNER models the SCHEDULED path where asOf is ALREADY D-1: its explicit inventoryAsOf
-  // defaults to asOf itself (a scheduled plan must NEVER resolve asOf-1 = D-2).
-  assert.deepEqual([srcOf(plan, "listing-health:inventory").from, srcOf(plan, "listing-health:inventory").to], [ASOF, ASOF]);
+  assert.equal(srcOf(plan, "listing-health:inventory"), undefined, "no FBA Inventory Health source is planned");
   const rj = plan.reportJobs.find((j) => j.reportKey === "listing-health");
-  assert.equal(rj.dependsOn.length, 5);
+  assert.equal(rj.dependsOn.length, 4);
   assert.deepEqual([...rj.dependsOn].sort(), plan.sourceJobs.map((j) => j.requestHash).sort());
   assert.deepEqual(lh.context, { to: ASOF, inventoryAsOf: ASOF, rawSellerId: ID });
-  // listings-raw is OPTIONAL; the four others are required.
+  // listings-raw is OPTIONAL; the three others are required.
   assert.equal(srcOf(plan, "listing-health:listings-raw").optional, true, "listings-raw is the optional source");
-  assert.ok(["listing-health:listings", "listing-health:sales", "listing-health:inventory", "listing-health:catalog"].every((k) => srcOf(plan, k).optional === false), "the four non-raw sources are required");
+  assert.ok(["listing-health:listings", "listing-health:sales", "listing-health:catalog"].every((k) => srcOf(plan, k).optional === false), "the three non-raw sources are required");
 });
 
-test("25. inventory + catalog canonical hashes are SHARED with Sales Movers, Buy Box (+ Returns catalog)", () => {
+test("25. the catalog canonical hash is SHARED with Sales Movers, Buy Box (+ Returns); none plans an FBA Inventory Health source", () => {
   const lh = shadowPlan(ACCTS, ["listing-health"]);
   const bb = planBuyBoxLoss({ accountId: ID, country: "US", currency: "USD", connections: CONNS, asOf: ASOF });
   const sm = planSalesMovers({ accountId: ID, country: "US", currency: "USD", connections: CONNS, asOf: ASOF, probeSignal: { status: "success", validated: true, latestReportedDate: "2025-08-08" } });
   const ret = shadowPlan(ACCTS, ["returns-leakage"]).reportRequests[0];
-  const lhInv = srcOf(lh, "listing-health:inventory").requestHash;
   const lhCat = srcOf(lh, "listing-health:catalog").requestHash;
-  assert.equal(lhInv, bb.sources.find((s) => s.requestKey === "buy-box-loss:inventory").requestHash, "shared inventory identity with Buy Box");
-  assert.equal(lhInv, sm.sources.find((s) => s.requestKey === "sales-movers:inventory").requestHash, "shared inventory identity with Sales Movers");
+  assert.ok(![...lh.reportRequests[0].sources, ...bb.sources, ...sm.sources].some((x) => /:inventory$/.test(x.requestKey) || x.sourceKey === "fba-inventory-health"), "no FBA Inventory Health source anywhere");
   assert.equal(lhCat, bb.sources.find((s) => s.requestKey === "buy-box-loss:catalog").requestHash, "shared catalog identity with Buy Box");
   assert.equal(lhCat, sm.sources.find((s) => s.requestKey === "sales-movers:catalog").requestHash, "shared catalog identity with Sales Movers");
   assert.equal(lhCat, ret.sources.find((s) => s.requestKey === "returns-leakage:catalog").requestHash, "shared catalog identity with Returns");
 });
 
-test("26. one canonical export per shared inventory/catalog hash across Listing Health + Buy Box owners", async () => {
+test("26. one canonical export per shared catalog hash across Listing Health + Buy Box owners", async () => {
   const store = makeStore(); const dd = makeDataDoe();
   const plan = shadowPlan(ACCTS, ["listing-health"]);
   const lhJobs = resolveFromPlan(plan)().sourceJobs;
   const extra = [];
-  for (const [lhKey, bbKey] of [["listing-health:inventory", "buy-box-loss:inventory"], ["listing-health:catalog", "buy-box-loss:catalog"]]) {
+  for (const [lhKey, bbKey] of [["listing-health:catalog", "buy-box-loss:catalog"]]) {
     const src = lhJobs.find((j) => j.requestKey === lhKey);
     const ownerId = sourceJobOwnerId({ reportKey: "buy-box-loss", connectionId: src.connectionId, organizationFingerprint: src.organizationFingerprint, accountScopeHash: src.accountScopeHash });
     extra.push({ ...src, requestKey: bbKey, owner: { ownerId, requestKey: bbKey, reportKey: "buy-box-loss", accountId: ID } });
   }
   const plannedJobs = [...lhJobs, ...extra];
   const r = await runSourceJobs({ store, dataDoe: dd, plannedJobs, ownerIds: [...new Set(plannedJobs.map((j) => j.owner.ownerId))], bucket: "us", cycleDate: "2026-08-11" });
-  for (const key of ["listing-health:inventory", "listing-health:catalog"]) {
+  for (const key of ["listing-health:catalog"]) {
     const h = srcOf(plan, key).requestHash;
     assert.equal(dd.createCount(h), 1, `${key} shared export created exactly once`);
     assert.equal(store.listSourceJobs(r.cycleId).filter((j) => j.request_hash === h).length, 1, "one canonical row");
@@ -540,20 +560,20 @@ test("26. one canonical export per shared inventory/catalog hash across Listing 
   }
 });
 
-test("27. owner reconciliation never stales another report's membership sharing inventory/catalog", async () => {
+test("27. owner reconciliation never stales another report's membership sharing the catalog", async () => {
   const store = makeStore(); const dd = makeDataDoe();
   const plan = shadowPlan(ACCTS, ["listing-health"]);
   const r = await runGeneric(store, dd, plan);
   const cid = r.cycleId;
-  for (const [lhKey, otherKey] of [["listing-health:inventory", "sales-movers:inventory"], ["listing-health:catalog", "sales-movers:catalog"]]) {
+  for (const [lhKey, otherKey] of [["listing-health:catalog", "sales-movers:catalog"]]) {
     const src = srcOf(plan, lhKey);
     const ownerId = sourceJobOwnerId({ reportKey: "sales-movers", connectionId: "primary", organizationFingerprint: src.organizationFingerprint, accountScopeHash: src.accountScopeHash });
     store.upsertSourceJobOwners([{ cycleId: cid, requestHash: src.requestHash, ownerId, requestKey: otherKey, reportKey: "sales-movers", accountId: ID, connectionId: "primary", organizationFingerprint: src.organizationFingerprint, accountScopeHash: src.accountScopeHash }]);
   }
   await runGeneric(store, dd, plan); // re-run to fixpoint: reconciliation touches only listing-health owners
   const smMemberships = store._owners(cid).filter((m) => m.report_key === "sales-movers");
-  assert.equal(smMemberships.length, 2);
-  assert.ok(smMemberships.every((m) => m.owner_status === "active"), "the second owner's shared memberships are never staled");
+  assert.equal(smMemberships.length, 1);
+  assert.ok(smMemberships.every((m) => m.owner_status === "active"), "the second owner's shared membership is never staled");
 });
 
 test("28. strict-cap: a listings export at the row cap fails TRUNCATED, saves no source, report never derives (LKG)", async () => {
@@ -571,18 +591,18 @@ test("28. strict-cap: a listings export at the row cap fails TRUNCATED, saves no
   assert.equal(saved.length, 0, "zero snapshot writes (LKG preserved)");
 });
 
-test("29. report stays PENDING until the four required sources succeed, then saves EXACTLY once; zero network in derive; idempotent", async () => {
+test("29. report stays PENDING until the three required sources succeed, then saves EXACTLY once; zero network in derive; idempotent", async () => {
   const store = makeStore(); const dd = makeDataDoe();
   const plan = shadowPlan(ACCTS, ["listing-health"]);
   const saved = [];
   const saveSnapshot = async ({ reportKey, accountId, payload }) => { store.saveCalls += 1; store.seedSnapshot(reportKey, accountId, payload); saved.push({ accountId, payload }); return { paramsHash: "ph" }; };
   const r1 = await runGeneric(store, dd, plan, { maxJobs: 2 });
-  assert.ok(store.listSourceJobs(r1.cycleId).filter((j) => j.fetch_status === "succeeded").length < 5, "not all sources succeeded yet");
+  assert.ok(store.listSourceJobs(r1.cycleId).filter((j) => j.fetch_status === "succeeded").length < 4, "not all sources succeeded yet");
   let res = await runReportJobs({ store, cycleId: r1.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: plan.reportRequests });
   assert.equal(res.succeeded, 0, "report PENDING while a required source is missing");
   assert.equal(saved.length, 0);
   const r2 = await runGeneric(store, dd, plan);
-  assert.ok(store.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all five sources succeeded after resume");
+  assert.ok(store.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"), "all four sources succeeded after resume");
   const realFetch = globalThis.fetch; let hits = 0;
   globalThis.fetch = () => { hits += 1; throw new Error("network during derivation"); };
   try { res = await runReportJobs({ store, cycleId: r2.cycleId, sourceRows: (h) => store.loadSourceRows(h), saveSnapshot, plannedReports: plan.reportRequests }); } finally { globalThis.fetch = realFetch; }
@@ -665,14 +685,14 @@ test("31. maxJobs partial + poll-deferral resume through the real driver with ON
   assert.ok(s1.listSourceJobs(r.cycleId).every((j) => j.fetch_status === "succeeded"), "all sources complete after maxJobs resume");
   for (const j of s1.listSourceJobs(r.cycleId)) assert.ok(d1.createCount(j.request_hash) <= 1, j.request_key + " exported at most once");
   const s2 = makeStore();
-  const dDefer = makeDataDoe({ deferKey: "listing-health:inventory" });
+  const dDefer = makeDataDoe({ deferKey: "listing-health:catalog" });
   const r1 = await runGeneric(s2, dDefer, plan);
   assert.ok((r1.deferred || 0) > 0, "the driver surfaces the resumable deferral");
   assert.ok(s2._owners(r1.cycleId).every((m) => m.owner_status === "active"), "no membership staled by a deferral");
-  const invHash = srcOf(plan, "listing-health:inventory").requestHash;
+  const invHash = srcOf(plan, "listing-health:catalog").requestHash;
   const dOk = makeDataDoe();
   const r2 = await runGeneric(s2, dOk, plan);
-  assert.equal(dDefer.createCount(invHash) + dOk.createCount(invHash), 1, "inventory export created exactly once across deferral + resume");
+  assert.equal(dDefer.createCount(invHash) + dOk.createCount(invHash), 1, "catalog export created exactly once across deferral + resume");
   assert.ok(s2.listSourceJobs(r2.cycleId).every((j) => j.fetch_status === "succeeded"));
 });
 
@@ -686,7 +706,7 @@ test("32. primary-only: a stale dd-secondary account is skipped read-only with Z
   const r = await runGeneric(store, dd, plan);
   const jobs = store.listSourceJobs(r.cycleId);
   assert.ok(jobs.every((j) => j.connection_id === "primary"), "no dd-secondary jobs; nothing routed to primary for the stale account");
-  assert.equal(jobs.length, 5, "exactly the five primary-account canonical jobs ran");
+  assert.equal(jobs.length, 4, "exactly the four primary-account canonical jobs ran (no Health job)");
 });
 
 async function main() {

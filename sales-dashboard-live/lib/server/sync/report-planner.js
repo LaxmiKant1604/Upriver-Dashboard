@@ -39,10 +39,9 @@ const BRAND_SALES_MONTH_START_LOOKBACK_DAYS = 420;
 // DESC; from/to null); only the catalog carries the 365-day window.
 const CONTENT_CHANGES_CATALOG_LOOKBACK_DAYS = 365;
 
-// FBA inventory-health window: EXACTLY the single snapshot day [inventoryAsOf .. inventoryAsOf] (D-1,
-// resolved by fbaInventoryAsOf / the workflow's shared inventory_asof). The former 10-day lookback is
-// removed everywhere -- the request identity IS the snapshot date, so cached rows from another day can
-// never be mistaken for the requested day, and no cross-date rows can ever arrive.
+// (The former FBA Inventory Health single-day window is gone: FBA Inventory Health is RETIRED (Listings inventory
+// cutover, 2026-10) and NO planner here emits a Health request -- FBA inventory comes from the canonical no-date Listings
+// export. inventoryAsOf still names the cycle day: it partitions the batches and bounds the Listings freshness.)
 
 // Keyword Rank SQP + catalog lookbacks (days) -- byte-identical to the api/datadoe.js
 // SQP_WEEKLY_LOOKBACK_DAYS / SQP_MONTHLY_LOOKBACK_DAYS (the monthly SQP + 365-day catalog share the
@@ -53,15 +52,15 @@ const SQP_LONG_LOOKBACK_DAYS = 365;
 const OPT_LOOKBACK_DAYS = 84;
 
 // Sales Movers lookbacks (days) -- byte-identical to the live builder/sources: the latest-completed-date
-// probe looks back (SALES_TRAFFIC.lagDays 4 + WINDOW_DAYS*3 = 25) days; the shared FBA inventory snapshot
-// is EXACTLY the single previous day [end-1 .. end-1] (fetchInventorySnapshot). The recent/prior weeks
+// probe looks back (SALES_TRAFFIC.lagDays 4 + WINDOW_DAYS*3 = 25) days. (FBA stock is no longer a fetched source here:
+// FBA Inventory Health is retired.) The recent/prior weeks
 // come from salesMoversWindows(latest); WINDOW_DAYS is 7.
 const SM_LAG_DAYS = 4;
 const SM_WINDOW_DAYS = 7;
 
 // Buy Box Loss lookbacks (days) -- byte-identical to the live builder/sources: buy-box.js WINDOW_DAYS (28)
-// + SLICE_DAYS (7) fetch the raw daily grain as four ordered 7-day slices; the shared FBA inventory
-// snapshot is EXACTLY the single previous day [end-1 .. end-1] (fetchInventorySnapshot). So the scheduled
+// + SLICE_DAYS (7) fetch the raw daily grain as four ordered 7-day slices (no FBA Inventory Health window: it is
+// retired). So the scheduled
 // windows match the live route exactly, and the derivation (which recomputes the same windows) validates
 // them by construction.
 const BB_WINDOW_DAYS = 28;
@@ -73,8 +72,8 @@ const BB_SLICE_DAYS = 7;
 const RET_WINDOW_DAYS = 60;
 
 // Listing Health lookbacks (days) -- byte-identical to the live builder/sources: listing-health.js
-// SALES_WINDOW_DAYS (30) for the trailing sales window; the shared inventory snapshot is EXACTLY the
-// single previous day [end-1 .. end-1] (fetchInventorySnapshot). Listings, Listings (Raw JSON) and the
+// SALES_WINDOW_DAYS (30) for the trailing sales window (no FBA Inventory Health window: it is retired). Listings,
+// Listings (Raw JSON) and the
 // catalog are no-date. So the scheduled windows match the live route exactly.
 const LH_SALES_WINDOW_DAYS = 30;
 
@@ -337,8 +336,8 @@ export function planReconciliation({ accountId, country, currency, connections, 
 /**
  * Plan FBA Shipment Plan for ONE account. Emits the exact route windows from planMonthWindows(asOf):
  * monthly-units = 3 completed months + current MTD (one fragment each), a current-month daily-date
- * probe, a catalog over completed[0].from .. asOf, an inventory-health snapshot over EXACTLY asOf..asOf,
- * and -- for US accounts only -- the no-date AWD listing source. All for the one raw seller id.
+ * probe, a catalog over completed[0].from .. asOf, and the no-date canonical Listings source (FBA inventory + AWD;
+ * FBA Inventory Health is retired and never planned). All for the one raw seller id.
  * `name` is the AUTHORITATIVE account name; `marketCountry` (raw) + `isUS` drive the US-only AWD +
  * per-row AWD payload fields. The AWD source is planned ONLY for US (the contract is US-conditional).
  */
@@ -348,9 +347,8 @@ export function planFbaPlan({ accountId, name, country, currency, connections, a
   const isUS = scope.country === "US";
   // OLI sales + Product Catalog are DERIVED durable dependencies for fba-plan (read from source_oli_daily_history +
   // the org Product Catalog snapshot via makeFbaPlanDurableContextLoader) -- NOT owned exports -- so the planner
-  // emits NO OLI/catalog windows. Only the FBA Inventory Health snapshot + US-only AWD listing are owned exports.
+  // emits NO OLI/catalog windows. The canonical Listings export is the ONLY owned export (FBA Inventory Health retired).
   const windowsByRequestKey = {
-    "fba-plan:inventory-health": [{ from: asOfStr, to: asOfStr }],
     // fba-plan:awd is the CANONICAL Listings export (no-date), now planned for EVERY marketplace (shared with
     // listing-health-v3:listings). AWD eligibility is decided in the DERIVE (awdCapableMarketplace), never here, so a
     // non-AWD marketplace still requests the shared Listings snapshot but its AWD stays honestly unavailable.
@@ -388,19 +386,9 @@ export function marketplaceCodeFor(country) {
  * within one region and connection/organization. Carry exact seller-marketplace pairs for source validation
  * and per-account ownership for derivation. inventoryAsOf is independent of the sales asOfFor cutoff.
  */
-// Split any batch that contains a proven-overflow seller into single-seller batches, leaving every other batch
-// byte-identical. `overflowSellers` is a Set of RAW seller ids proven to overflow the strict 50000-row cap (from prior
-// terminal TRUNCATED evidence). Empty set => byte-identical (existing hashes unchanged).
-function splitOverflowBatches(batches, byId, overflowSellers) {
-  if (!overflowSellers || overflowSellers.size === 0) return batches;
-  const out = [];
-  for (const batch of batches) {
-    const hasOverflow = batch.accounts.some((a) => overflowSellers.has(String(byId.get(a.accountId).scope.rawSellerId)));
-    if (hasOverflow) for (const a of batch.accounts) out.push({ accounts: [a] }); // isolate the whole overflow batch
-    else out.push(batch);
-  }
-  return out;
-}
+// (The former single-seller overflow split -- splitOverflowBatches over proven TRUNCATED FBA Inventory Health evidence --
+// is removed with FBA Inventory Health. `overflowSellers` is still ACCEPTED by both batched planners for caller
+// compatibility and is IGNORED: the canonical Listings batches are never split, one shared hash with listing-health-v3.)
 
 export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, inventoryAsOf = null, existingFbaMembership = new Map(), overflowSellers = new Set() }) {
   const scoped = (accounts || []).map((a) => {
@@ -431,20 +419,16 @@ export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, 
     // listing-health-v3:listings -- so both consumers resolve to ONE request_hash per <=5-seller batch and share ONE
     // paid Listings export (fba creates it first; v3 adopts it). AWD ELIGIBILITY is enforced in the DERIVE
     // (awdCapableMarketplace), never here: a non-AWD marketplace's Listings rows are still fetched (for v3 + the shared
-    // hash) but its AWD stays honestly unavailable. Inventory-health likewise batches every member (US-required + best-effort).
-    for (const requestKey of ["fba-plan:inventory-health", "fba-plan:awd"]) {
+    // hash) but its AWD stays honestly unavailable. Listings inventory cutover: it is also the FBA inventory source, and
+    // the ONLY owned fba-plan export -- FBA Inventory Health is retired and never planned.
+    for (const requestKey of ["fba-plan:awd"]) {
       const eligible = members;
       const byId = new Map(eligible.map((m) => [m.scope.accountId, m]));
       const membership = new Map([...existingFbaMembership].filter(([id]) => byId.has(id)));
       const { batches } = assignAccountBatches(eligible.map((m) => ({ accountId: m.scope.accountId, rawSellerId: m.scope.rawSellerId })), membership, MAX_ACCOUNTS_PER_BATCH);
-      // Adaptive self-heal: isolate proven-overflow sellers into single-seller INVENTORY batches (never AWD/Listings).
-      // The overflowSellers set also carries readiness-isolation sellers (DATADOE_INITIAL_LOAD_INCOMPLETE) folded in by
-      // the release composition, so a readiness-poisoned inventory seller is split off the same way. Empty set =>
-      // byte-identical to the default plan (existing hashes unchanged).
-      //
-      // WHY the canonical Listings (fba-plan:awd) is DELIBERATELY excluded from the split (mirrors v3's listings, which
-      // also never splits -- see planListingHealthV3BucketBatched): (1) the overflowSellers evidence is SINGLE-DAY
-      // INVENTORY-specific (isSingleDayOverflowEvidence in fba-inventory-overflow.js) -- a seller whose dense SKUxdate
+      // WHY the canonical Listings (fba-plan:awd) is never split (mirrors v3's listings, which also never splits -- see
+      // planListingHealthV3BucketBatched): (1) the former overflowSellers evidence was SINGLE-DAY FBA Inventory Health
+      // specific (the retired fba-inventory-overflow.js) -- a seller whose dense SKUxdate
       // inventory truncates says NOTHING about its date-free Listings row count, so peeling it off the Listings batch
       // would be unjustified AND would fork the shared hash (fba peels, v3 does not) exactly when a seller overflows,
       // breaking the one-paid-export invariant. (2) Listings is a per-SKU snapshot with NO date dimension; the largest
@@ -458,15 +442,13 @@ export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, 
       // Listings export, and a truncation degrades exactly one hard-required account to truthful stale data, never wrong
       // data. Should real account listings ever approach the cap, add a SEPARATE listings-truncation evidence path
       // applied IDENTICALLY here and in the v3 planner (to keep the shared hash), not this inventory-only set.
-      const effectiveBatches = requestKey === "fba-plan:inventory-health" ? splitOverflowBatches(batches, byId, overflowSellers) : batches;
-      for (const batch of effectiveBatches) {
+      for (const batch of batches) {
         const owners = batch.accounts.map((a) => byId.get(a.accountId));
         const pairs = owners.map((m) => ({ sellerId: m.scope.rawSellerId, marketplace: marketplaceCodeFor(m.scope.country) }));
         const markets = [...new Set(pairs.map((p) => p.marketplace))];
         const inventoryTo = owners[0].inventoryTo;
-        const windowsByRequestKey = { "fba-plan:inventory-health": [{ from: inventoryTo, to: inventoryTo }] };
         // The canonical Listings (fba-plan:awd) is a no-date snapshot fetched for EVERY marketplace (shared with v3).
-        windowsByRequestKey["fba-plan:awd"] = [{ from: null, to: null }];
+        const windowsByRequestKey = { "fba-plan:awd": [{ from: null, to: null }] };
         const resolved = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey, ids: batchSellerIds(batch), windowsByRequestKey, marketplaceCountry: markets[0] }).filter((s) => s.requestKey === requestKey);
         const sources = resolved.map((s) => ({ ...s, marketplaceConstraint: markets.length === 1 ? markets[0] : null,
           marketplacePairs: pairs, ...(inventoryAsOf == null ? {} : { freshnessNotBefore: inventoryTo + "T00:00:00.000Z" }) }));
@@ -501,8 +483,8 @@ export function planFbaPlanBucketBatched({ accounts = [], connections, asOfFor, 
 
 /**
  * Regional Advanced Listing Health (SHADOW) planning: pack the region's accounts into STABLE <=5-seller batches
- * ACROSS marketplaces, within one connection/organization, for the three OWNED exports (Listings, Listings Raw,
- * inventory). Carry the EXACT seller-marketplace pairs (so every returned row is validated + isolated per account)
+ * ACROSS marketplaces, within one connection/organization, for the two OWNED exports (Listings, Listings Raw; FBA stock
+ * is read from the Listings rows -- FBA Inventory Health is retired and never planned). Carry the EXACT seller-marketplace pairs (so every returned row is validated + isolated per account)
  * and per-account owner metadata (for derive-time isolation). OLI sales/units + Product Catalog are DERIVED durable
  * dependencies (never exports), injected into the derive context by the loader. inventoryAsOf is independent of the
  * sales asOf. This planner is NOT in PLANNERS / SHADOW_PLANNED_REPORT_KEYS: v3 is dormant (nothing dispatches it),
@@ -534,15 +516,8 @@ export function planListingHealthV3BucketBatched({ accounts = [], connections, a
     const byId = new Map(members.map((m) => [m.scope.accountId, m]));
     const membership = new Map([...existingMembership].filter(([id]) => byId.has(id)));
     const { batches } = assignAccountBatches(members.map((m) => ({ accountId: m.scope.accountId, rawSellerId: m.scope.rawSellerId })), membership, MAX_ACCOUNTS_PER_BATCH);
-    // Mirror the FBA adaptive self-heal (planFbaPlanBucketBatched) so v3's inventory read hash matches the FBA single-
-    // seller child for proven-overflow sellers -- but ONLY for inventory. Listings + Listings-Raw do NOT truncate, so
-    // they stay BATCHED (splitting them would multiply the owned Listings/Raw create count past the region ceiling).
-    // The overflow evidence is inventory-specific; applying it beyond inventory would be incorrect over-splitting.
-    // Empty overflow set => inventoryBatches === batches => byte-identical to the pre-split single-loop result. The
-    // overflowSellers set also carries readiness-isolation sellers (DATADOE_INITIAL_LOAD_INCOMPLETE) folded in by the
-    // v3 ingestion composition, so a readiness-poisoned inventory seller is split off the same way; Listings +
-    // Listings-Raw stay BATCHED (splitting them would multiply the create count past the region ceiling).
-    const inventoryBatches = splitOverflowBatches(batches, byId, overflowSellers);
+    // Listings + Listings-Raw stay BATCHED (never split). There is NO inventory source: FBA Inventory Health is retired
+    // (the former inventory-only overflow split is gone with it); v3 reads FBA stock from its own Listings rows.
     const sourcesByAccount = new Map(members.map((m) => [m.scope.accountId, []]));
     const buildSourcesInto = (batchSet, keepRequestKeys) => {
       for (const batch of batchSet) {
@@ -550,12 +525,10 @@ export function planListingHealthV3BucketBatched({ accounts = [], connections, a
         const pairs = owners.map((m) => ({ sellerId: m.scope.rawSellerId, marketplace: marketplaceCodeFor(m.scope.country) }));
         const markets = [...new Set(pairs.map((p) => p.marketplace))];
         const inventoryTo = owners[0].inventoryTo;
-        // reportSourceRequestHashes requires a window for EVERY active contract, so all three are supplied; only the
-        // requested keys are kept for this batch set (listings/raw from the batched set; inventory from the split set).
+        // reportSourceRequestHashes requires a window for EVERY active contract, so both are supplied.
         const windowsByRequestKey = {
           "listing-health-v3:listings": [{ from: null, to: null }],
           "listing-health-v3:listings-raw": [{ from: null, to: null }],
-          "listing-health-v3:inventory": [{ from: inventoryTo, to: inventoryTo }],
         };
         const resolved = reportSourceRequestHashes({ reportKey: "listing-health-v3", apiKey, ids: batchSellerIds(batch), windowsByRequestKey, marketplaceCountry: markets[0] }).filter((s) => keepRequestKeys.includes(s.requestKey));
         const sources = resolved.map((s) => ({ ...s, marketplaceConstraint: markets.length === 1 ? markets[0] : null,
@@ -563,9 +536,8 @@ export function planListingHealthV3BucketBatched({ accounts = [], connections, a
         for (const m of owners) sourcesByAccount.get(m.scope.accountId).push(...sources);
       }
     };
-    // Contract order preserved (listings, listings-raw, inventory): non-inventory from the unsplit batches, then inventory.
+    // Contract order preserved (listings, listings-raw). (No inventory source: FBA Inventory Health is retired.)
     buildSourcesInto(batches, ["listing-health-v3:listings", "listing-health-v3:listings-raw"]);
-    buildSourcesInto(inventoryBatches, ["listing-health-v3:inventory"]);
     for (const m of members) {
       requests.push({
         reportKey: "listing-health-v3",
@@ -667,7 +639,6 @@ export function planSalesMovers({ accountId, country, currency, connections, asO
       const { recent, prior } = salesMoversWindows(probeSignal.latestReportedDate);
       windowsByRequestKey["sales-movers:traffic"] = [recent, prior];
       windowsByRequestKey["sales-movers:ads"] = [recent, prior];
-      windowsByRequestKey["sales-movers:inventory"] = [{ from: invAsOf, to: invAsOf }];
       windowsByRequestKey["sales-movers:catalog"] = [{ from: null, to: null }];
     }
   }
@@ -799,7 +770,6 @@ export function planBuyBoxLoss({ accountId, country, currency, connections, asOf
   const windowsByRequestKey = {
     "buy-box-loss:daily": dailySlices,
     "buy-box-loss:oli-sales": canonicalOliSlices(from, end),
-    "buy-box-loss:inventory": [{ from: invAsOf, to: invAsOf }],
     "buy-box-loss:catalog": [{ from: null, to: null }],
   };
   const sources = reportSourceRequestHashes({
@@ -881,7 +851,6 @@ export function planListingHealth({ accountId, country, currency, connections, a
     "listing-health:listings": [{ from: null, to: null }],
     "listing-health:listings-raw": [{ from: null, to: null }],
     "listing-health:sales": [{ from: salesFrom, to: end }],
-    "listing-health:inventory": [{ from: invAsOf, to: invAsOf }],
     "listing-health:catalog": [{ from: null, to: null }],
   };
   const sources = reportSourceRequestHashes({

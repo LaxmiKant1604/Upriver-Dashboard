@@ -320,7 +320,7 @@ const smFullWin = (date) => {
     "sales-movers:sales-latest-probe": [{ from: "2025-07-12", to: "2025-08-06" }],
     "sales-movers:traffic": [w.recent, w.prior],
     "sales-movers:ads": [w.recent, w.prior],
-    "sales-movers:inventory": [{ from: "2025-07-27", to: "2025-08-06" }],
+    // (no sales-movers:inventory window: FBA Inventory Health is retired -- the builder reads saved Listings stock)
     "sales-movers:catalog": [{ from: null, to: null }],
   };
 };

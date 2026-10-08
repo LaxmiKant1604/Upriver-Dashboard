@@ -4,16 +4,26 @@
 // report jobs). This composition RE-DERIVES ONLY brand-inventory for ONE account over ONE dedicated cycle and NEVER
 // derives, saves, publishes, or mutates Daily Reporting or Brand Sales:
 //   1. open the dedicated priority-partial cycle (permitted by migration 20260924);
-//   2. read the EXACT durable FBA snapshot the revision selected (getSourceSnapshot + hydrate rows) -- zero export;
+//   2. read the account's SAVED inventory evidence -- zero export, read-only: its saved Listings snapshot and its LAST
+//      SAVED durable FBA Inventory Health snapshot (the dated bridge). Listings inventory CUTOVER: no Health export
+//      exists any more, so the freshness proof is NO LONGER "a new D-1 Health snapshot": a Listings-sourced compact
+//      needs a Listings pointer saved for a cycle no older than requestedAsOf - LISTINGS_MAX_CYCLE_LAG_DAYS (else Listings
+//      is not used); a bridge-sourced compact needs the bridge's own snapshot date >= requestedAsOf -
+//      HEALTH_BRIDGE_MAX_AGE_DAYS (decided by selectAccountInventory); neither => an honest UNAVAILABLE compact (never 0).
+//      A durable READ FAILURE (not an absence) defers (LKG preserved);
 //   3. resolve ONE PUBLISHER-IDENTICAL Brand Sales candidate (resolveValidatedLiveCandidate): the canonical LIVE
 //      brand-sales proven to be the promotion of the LATEST PROMOTABLE brand-sales job's shadow -- its dependsOn (the
 //      OLI attribution provenance) AND its payload come from that SINGLE proven candidate. A newer unpromoted job can
 //      NEVER lend its dependsOn to an older live payload; if the latest job is not demonstrably the source of canonical
 //      live brand-sales, DEFER (LKG preserved, zero brand-inventory writes). Brand Sales is NEVER republished;
-//   4. buildBrandInventorySnapshot (the EXISTING contract) over the durable FBA rows + that proven Brand Sales payload;
+//   4. buildBrandInventorySnapshot over the saved Health BRIDGE rows + the account's SAVED LISTINGS rows
+//      (public.source_listings_snapshot; an absent / dangling / stale Listings pointer simply means no Listings
+//      evidence) + that proven Brand Sales payload, with asOf = requestedAsOf: validated Listings, else the bridge within
+//      its threshold, else Unavailable (lib/server/inventory-source.js);
 //   5. save ONE validated brand-inventory shadow with EXACT lineage -- depends_on = the proven Brand Sales OLI/Catalog
-//      provenance (so the OLI reconciler still sees it covered) + durable_content_deps = the FBA content token
-//      (fbaContentProvenanceToken) so a same-date correction is provable;
+//      provenance (so the OLI reconciler still sees it covered) + durable_content_deps = the FBA content token of the
+//      saved Health snapshot READ (when one exists; fbaContentProvenanceToken) + the Listings content token when Listings
+//      rows were read (provenance; the FBA reconciler's revision stays the Health token, a subset check);
 //   6. finalize ONLY this dedicated cycle via finalize_sync_cycle DIRECTLY (NOT the trio finalizeBucket);
 //   7. preflight + publish + canonical read-back ONLY brand-inventory through the reviewed FENCED publisher + CAS +
 //      buildLiveReadback.
@@ -31,6 +41,7 @@
 // statusFromRelease classifies it unchanged. 7-bit ASCII, LF.
 
 import { BRAND_INVENTORY_SNAPSHOT_KEY, BRAND_INVENTORY_REPORT_VERSION } from "../reports/brand-view.js";
+import { HEALTH_BRIDGE_MAX_AGE_DAYS } from "../inventory-source.js";
 import { fbaContentProvenanceToken } from "./fba-inventory-revision.js";
 import { FBA_INVENTORY_SOURCE_KEY } from "./source-durable-model.js";
 import { resolveValidatedLiveCandidate } from "./publication-binding.js";
@@ -38,7 +49,17 @@ import { resolveValidatedLiveCandidate } from "./publication-binding.js";
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
 const SHADOW_KEY = "scheduler-v2/" + BRAND_INVENTORY_SNAPSHOT_KEY; // "scheduler-v2/brand-inventory"
-const BRAND_INVENTORY_ROW_LIMIT = 5000;
+const BRAND_INVENTORY_ROW_LIMIT = 5000; // the durable FBA Inventory Health rows (unchanged)
+// Per-account SAVED Listings rows (every listing, incl. merchant-fulfilled / inactive; the largest account is ~4k rows):
+// the cap is the canonical Listings export ceiling (a truncated batch is already rejected at the source).
+const BRAND_INVENTORY_LISTINGS_ROW_LIMIT = 50000;
+// The durable Listings source key the Listings content token names (provenance only).
+const LISTINGS_CONTENT_SOURCE_KEY = "listings";
+// A saved Listings pointer is fresh evidence for requestedAsOf only when its cycle (as_of) is no more than this many
+// days before it -- the SAME validated lag the insight reports apply (lib/server/reports/common.js
+// INSIGHT_LISTINGS_MAX_CYCLE_LAG_DAYS) and equal to the bridge threshold.
+const LISTINGS_MAX_CYCLE_LAG_DAYS = HEALTH_BRIDGE_MAX_AGE_DAYS;
+const addDaysIso = (d, n) => { const t = Date.parse(S(d).slice(0, 10) + "T00:00:00Z"); return Number.isFinite(t) ? new Date(t + n * 86400000).toISOString().slice(0, 10) : ""; };
 
 const ok = () => ({ code: 0, ok: true, stage: "complete", status: null, leaseLost: false, reason: null, blockerCodes: [], problems: [] });
 // A retryable DEFERRAL (source/attribution not yet available; LKG preserved). stage:'reconcile' is a RETRYABLE_STAGE in
@@ -49,14 +70,24 @@ const contention = (reason) => ({ code: 1, ok: false, stage: "contention", statu
 // A HARD, non-retryable failure (integrity / publish / readback). stage NOT in RETRYABLE_STAGES -> FAILED_* + non-green.
 const hardFail = (stage, reason) => ({ code: 1, ok: false, stage, status: null, leaseLost: false, reason, blockerCodes: stage.startsWith("derive") ? ["derive:" + reason] : [], problems: [reason] });
 
+// Default readListingsSnapshot = supabase getSourceListingsSnapshot (the account's saved Listings pointer), loaded LAZILY
+// on first use: supabase.js captures its credentials at module evaluation, so a STATIC import would evaluate it whenever
+// this module is imported (the release-env import-ordering defect, release-env-ordering.test.js). Returns
+// { snapshot, read } (read in ok | schema-missing | read-failed).
+const defaultReadListingsSnapshot = async (args) => (await import("../supabase.js")).getSourceListingsSnapshot(args);
+
 /**
  * Build the dedicated brand-inventory release. Injected collaborators (production wired by the entrypoint). Every
  * read/write that supports it receives { signal }; the publisher's live write is protected by the control fence.
  *   resolveOrg() -> { organizationFingerprint, connectionId }
  *   openCycle({ bucket, cycleDate, trigger }, { signal }) ; getCycleByBucketDate(bucket, cycleDate, { signal }) -> cycleRow
- *   readFbaSnapshot({ organizationFingerprint, connectionId, accountId, signal }) -> { read, snapshot }
- *   loadSnapshotPayload(objectPath, { signal }) -> { rows } | rows
- *   resolveExpectedRequestHash({ accountId, requestedAsOf }) -> "<request hash>" | ""   (D-1 proof; pure)
+ *   readFbaSnapshot({ organizationFingerprint, connectionId, accountId, signal }) -> { read, snapshot }   (the account's
+ *       LAST SAVED Health snapshot -- the read-only bridge; an absence is honest, a read failure defers)
+ *   readListingsSnapshot({ organizationFingerprint, connectionId, accountId, signal }) -> { read, snapshot }   (the
+ *       account's SAVED LISTINGS pointer; default getSourceListingsSnapshot, lazy; read fail-soft)
+ *   loadSnapshotPayload(objectPath, { signal }) -> { rows } | rows   (also hydrates the Listings payload)
+ *   resolveExpectedRequestHash -- accepted for wiring compatibility; NO LONGER a freshness proof (Health is no longer
+ *       exported, so no D-1 Health snapshot will ever exist again)
  *   resolveAccountCountry(accountId) -> "<marketplace country>"
  *   readReportJob(reportKey, accountId, { signal }) / readSnapshot({ reportKey, accountId, paramsHash }, { signal })
  *   loadStoragePayload(path, { signal })            (report_snapshots storage-first hydration, for the BS candidate)
@@ -78,12 +109,14 @@ export function buildFbaBrandInventoryRelease({
   upsertReportJob, claimLease, saveShadow, reconcileSuccess,
   finalizeCycle,
   publisher, readbackLive,
+  readListingsSnapshot = defaultReadListingsSnapshot,
   verifyLease = async () => ({ ok: true }),
   snapshotBytes = (p) => Buffer.byteLength(JSON.stringify(p == null ? null : p), "utf8"),
   leaseSeconds = 300,
   log = () => {},
 } = {}) {
-  for (const [name, fn] of [["resolveOrg", resolveOrg], ["openCycle", openCycle], ["getCycleByBucketDate", getCycleByBucketDate], ["claimCycle", claimCycle], ["readFbaSnapshot", readFbaSnapshot], ["loadSnapshotPayload", loadSnapshotPayload], ["resolveExpectedRequestHash", resolveExpectedRequestHash], ["resolveAccountCountry", resolveAccountCountry], ["readReportJob", readReportJob], ["readSnapshot", readSnapshot], ["loadStoragePayload", loadStoragePayload], ["buildInventorySnapshot", buildInventorySnapshot], ["computeHash", computeHash], ["upsertReportJob", upsertReportJob], ["claimLease", claimLease], ["saveShadow", saveShadow], ["reconcileSuccess", reconcileSuccess], ["finalizeCycle", finalizeCycle], ["readbackLive", readbackLive]]) {
+  void resolveExpectedRequestHash; // wiring compatibility only (see above)
+  for (const [name, fn] of [["resolveOrg", resolveOrg], ["openCycle", openCycle], ["getCycleByBucketDate", getCycleByBucketDate], ["claimCycle", claimCycle], ["readFbaSnapshot", readFbaSnapshot], ["loadSnapshotPayload", loadSnapshotPayload], ["resolveAccountCountry", resolveAccountCountry], ["readReportJob", readReportJob], ["readSnapshot", readSnapshot], ["loadStoragePayload", loadStoragePayload], ["buildInventorySnapshot", buildInventorySnapshot], ["computeHash", computeHash], ["upsertReportJob", upsertReportJob], ["claimLease", claimLease], ["saveShadow", saveShadow], ["reconcileSuccess", reconcileSuccess], ["finalizeCycle", finalizeCycle], ["readbackLive", readbackLive], ["readListingsSnapshot", readListingsSnapshot]]) {
     if (typeof fn !== "function") throw new Error(`buildFbaBrandInventoryRelease requires ${name} (fail closed).`);
   }
   if (!liveContracts || !reportDerivations) throw new Error("buildFbaBrandInventoryRelease requires liveContracts + reportDerivations (fail closed).");
@@ -101,26 +134,55 @@ export function buildFbaBrandInventoryRelease({
     const connectionId = S(org && org.connectionId) || "primary";
     if (!organizationFingerprint) return defer("org-unreadable");
 
-    // (2) durable FBA snapshot + D-1 proof (fresh read; the reconciler already gated, we independently re-prove).
+    // (2) the account's LAST SAVED FBA Inventory Health snapshot -- the read-only BRIDGE (Listings inventory cutover: no
+    // longer a D-1 proof; no Health export exists). A successful ABSENCE is honest (no bridge); a READ FAILURE / an
+    // incomplete pointer / an unreadable payload DEFERS (LKG preserved) -- never a degraded compact from a transient read.
     let snapRead;
     try { snapRead = await readFbaSnapshot({ organizationFingerprint, connectionId, accountId, signal }); }
     catch (e) { return defer("fba-snapshot-read-threw:" + S(e && e.message)); }
     if (aborted()) return DEADLINE();
+    if (snapRead && snapRead.read === "read-failed") return defer("fba-snapshot-read-" + S(snapRead.read));
     const snapshot = snapRead && snapRead.read === "ok" ? (snapRead.snapshot || null) : null;
-    if (!snapshot) return defer("no-durable-fba-snapshot");
-    const requestHash = S(snapshot.source_request_hash ?? snapshot.sourceRequestHash);
-    const payloadSha = S(snapshot.payload_sha ?? snapshot.payloadSha);
-    if (!nb(requestHash) || !nb(payloadSha)) return defer("fba-snapshot-incomplete");
-    let expected = "";
-    try { expected = S(await resolveExpectedRequestHash({ accountId, requestedAsOf })); } catch { expected = ""; }
-    if (aborted()) return DEADLINE();
-    if (!nb(expected)) return defer("expected-request-hash-unresolved");
-    if (requestHash !== expected) return defer("fba-snapshot-not-d1"); // older/other day -> never publish stale as fresh
+    let requestHash = "";
+    let payloadSha = "";
     let invRows = [];
-    try { const p = await loadSnapshotPayload(S(snapshot.object_path ?? snapshot.objectPath), opt); invRows = Array.isArray(p) ? p : (p && Array.isArray(p.rows) ? p.rows : null); }
-    catch (e) { return defer("fba-payload-unreadable:" + S(e && e.message)); }
+    if (snapshot) {
+      requestHash = S(snapshot.source_request_hash ?? snapshot.sourceRequestHash);
+      payloadSha = S(snapshot.payload_sha ?? snapshot.payloadSha);
+      if (!nb(requestHash) || !nb(payloadSha)) return defer("fba-snapshot-incomplete");
+      try { const p = await loadSnapshotPayload(S(snapshot.object_path ?? snapshot.objectPath), opt); invRows = Array.isArray(p) ? p : (p && Array.isArray(p.rows) ? p.rows : null); }
+      catch (e) { return defer("fba-payload-unreadable:" + S(e && e.message)); }
+      if (aborted()) return DEADLINE();
+      if (!Array.isArray(invRows)) return defer("fba-payload-dangling");
+    }
+
+    // (2b) The account's SAVED LISTINGS snapshot (the preferred inventory source when validated). Read-only and
+    // FAIL-SOFT: no pointer / a non-ok read / a throw / a dangling or row-count-mismatched payload = no Listings evidence.
+    // FRESHNESS PROOF (replaces the retired D-1 Health proof): the pointer's cycle as_of must be a real date no older
+    // than requestedAsOf - LISTINGS_MAX_CYCLE_LAG_DAYS; an older pointer is never used (listings-snapshot-stale) -- the
+    // compact then uses the bridge (within its own threshold) or is Unavailable. Only an abort stops the op.
+    let listingsRows = [];
+    let listingsSnap = null;
+    let listingsUnavailableReason = null;
+    try {
+      const lr = await readListingsSnapshot({ organizationFingerprint, connectionId, accountId, signal });
+      const ls = lr && lr.read === "ok" ? (lr.snapshot || null) : null;
+      if (!ls || !nb(S(ls.object_path ?? ls.objectPath))) listingsUnavailableReason = lr && lr.read === "read-failed" ? "listings-snapshot-read-failed" : "listings-snapshot-missing";
+      else {
+        const cycle = S(ls.as_of ?? ls.asOf).slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(cycle) || cycle < addDaysIso(requestedAsOf, -LISTINGS_MAX_CYCLE_LAG_DAYS)) listingsUnavailableReason = "listings-snapshot-stale";
+        else {
+          if (aborted()) return DEADLINE();
+          const p = await loadSnapshotPayload(S(ls.object_path ?? ls.objectPath), opt);
+          const rows = Array.isArray(p) ? p : (p && Array.isArray(p.rows) ? p.rows : null);
+          const expected = Number(ls.row_count ?? ls.rowCount);
+          if (Array.isArray(rows) && (!Number.isFinite(expected) || rows.length === expected)) { listingsRows = rows; listingsSnap = ls; }
+          else listingsUnavailableReason = "listings-payload-row-count-mismatch";
+        }
+      }
+    } catch (_e) { listingsRows = []; listingsSnap = null; listingsUnavailableReason = "listings-snapshot-read-failed"; }
     if (aborted()) return DEADLINE();
-    if (!Array.isArray(invRows)) return defer("fba-payload-dangling");
+    const listingsRefreshedAt = listingsSnap ? (S(listingsSnap.validated_at ?? listingsSnap.validatedAt).trim() || null) : null;
 
     // (3) ONE PUBLISHER-IDENTICAL Brand Sales candidate (attribution) -- payload AND dependsOn from a SINGLE proven
     // candidate (the canonical live brand-sales that IS the promotion of the latest promotable brand-sales job's
@@ -136,8 +198,9 @@ export function buildFbaBrandInventoryRelease({
     const salesPayload = bs.payload;
     const bsDeps = Array.isArray(bs.dependsOn) ? bs.dependsOn : [];
 
-    // (4) DERIVE brand-inventory ONLY (the existing contract) over the durable FBA rows + the PROVEN brand-sales
-    // payload. An empty brand map THROWS -> defer (LKG preserved). Brand Sales is read here, NEVER republished.
+    // (4) DERIVE brand-inventory ONLY (the existing contract) over the saved Listings + the saved Health bridge rows +
+    // the PROVEN brand-sales payload, with the bridge threshold measured against requestedAsOf (`to`). An empty brand
+    // map THROWS -> defer (LKG preserved). Brand Sales is read here, NEVER republished.
     if (aborted()) return DEADLINE();
     let accountCountry = "";
     try { accountCountry = S(await resolveAccountCountry(accountId)); } catch { accountCountry = ""; }
@@ -145,9 +208,13 @@ export function buildFbaBrandInventoryRelease({
     let built;
     try {
       built = await buildInventorySnapshot({
-        accountId, accountCountry, from: requestedAsOf, to: requestedAsOf, rowLimit: BRAND_INVENTORY_ROW_LIMIT,
+        accountId, accountCountry, from: requestedAsOf, to: requestedAsOf,
+        rowLimit: BRAND_INVENTORY_ROW_LIMIT, listingsRowLimit: BRAND_INVENTORY_LISTINGS_ROW_LIMIT,
         getSnapshot: async ({ reportKey }) => (S(reportKey) === "brand-sales" ? { payload: salesPayload } : null),
         fetchInventoryRows: async () => invRows,
+        fetchListingsRows: async () => listingsRows,
+        listingsRefreshedAt,
+        listingsUnavailableReason,
       });
     } catch (e) { return defer("brand-inventory-derive-refused:" + S(e && e.message)); }
     if (aborted()) return DEADLINE();
@@ -156,7 +223,13 @@ export function buildFbaBrandInventoryRelease({
 
     const params = { reportVersion: BRAND_INVENTORY_REPORT_VERSION, accountId, to: requestedAsOf };
     const paramsHash = computeHash(BRAND_INVENTORY_REPORT_VERSION, params);
-    const contentToken = fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId, connectionId, requestHash, contentSha: payloadSha });
+    // The saved Health snapshot actually READ (when one exists): provenance of the read-only bridge only.
+    const contentToken = snapshot ? fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId, connectionId, requestHash, contentSha: payloadSha }) : null;
+    // The Listings content actually read: the FBA reconciler's revision token since the Listings inventory cutover
+    // (computeFbaAccountRevision keys on the saved Listings pointer; revisionCoveredByJob is a subset check).
+    const listingsToken = listingsSnap && nb(S(listingsSnap.source_request_hash ?? listingsSnap.sourceRequestHash)) && nb(S(listingsSnap.payload_sha ?? listingsSnap.payloadSha))
+      ? fbaContentProvenanceToken({ sourceKey: LISTINGS_CONTENT_SOURCE_KEY, accountId, connectionId, requestHash: S(listingsSnap.source_request_hash ?? listingsSnap.sourceRequestHash), contentSha: S(listingsSnap.payload_sha ?? listingsSnap.payloadSha) })
+      : null;
 
     // (5) open the dedicated cycle (WRITE) -- abort-check immediately before every write from here on.
     if (aborted()) return DEADLINE();
@@ -197,7 +270,7 @@ export function buildFbaBrandInventoryRelease({
       await upsertReportJob({
         cycleId, reportKey: BRAND_INVENTORY_SNAPSHOT_KEY, reportVersion: BRAND_INVENTORY_REPORT_VERSION,
         accountId, connectionId: "primary", bucket: jobBucket,
-        dependsOn: bsDeps, durableContentDeps: [contentToken],
+        dependsOn: bsDeps, durableContentDeps: [contentToken, listingsToken].filter(Boolean),
       }, opt);
     } catch (e) { return hardFail("derive", "lineage-upsert-threw:" + S(e && e.message)); }
 

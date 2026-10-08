@@ -14,15 +14,25 @@
 //
 // Revenue at risk comes from Profit by SKU & Date over a trailing 30-day
 // window, grouped per SKU and currency so currencies are never combined.
+//
+// On-hand FBA (Listings inventory cutover) comes, per account, from its validated
+// SAVED canonical Listings snapshot (zero export), else from its last SAVED FBA
+// Inventory Health snapshot as a dated read-only bridge (within
+// HEALTH_BRIDGE_MAX_AGE_DAYS of the as-of), else Unavailable (null, never 0) --
+// never mixed. No FBA Inventory Health export is requested. The listing record's
+// own FBA quantities are kept as reported (null when blank), display only.
 
 import { addDaysStr, isSourceDisabledError, num } from "../datadoe.js";
 import {
   brandLabel,
   fetchCatalog,
   fetchExportRowsStrict,
-  fetchInventorySnapshot,
+  readInsightInventoryEvidence,
   sumField,
 } from "./common.js";
+import { insightInventory, insightInventoryFields, insightSkuStock } from "./derivation-core.js";
+import { asinForSkuFrom } from "./inventory-consumer.js";
+import { listingsQuantity } from "../listings-inventory.js";
 import { LISTINGS, LISTINGS_RAW, PROFIT_BY_SKU, ROW_LIMITS } from "./sources.js";
 
 export const LISTING_HEALTH_REPORT_KEY = "listing-health";
@@ -103,7 +113,9 @@ function hasLiveOffer(value) {
   });
 }
 
-export async function buildListingHealth({ apiKey, ids, to }) {
+// `listings` = saved-evidence identity/readers for readInsightInventoryEvidence (saved Listings + the saved Health
+// bridge); zero export either way (no FBA Inventory Health export is requested).
+export async function buildListingHealth({ apiKey, ids, to, listings = {} }) {
   const salesFrom = addDaysStr(to, -(SALES_WINDOW_DAYS - 1));
 
   const listingRows = await fetchExportRowsStrict(
@@ -138,7 +150,11 @@ export async function buildListingHealth({ apiKey, ids, to }) {
     salesBySku.set(sku, current);
   }
 
-  const inventory = await fetchInventorySnapshot(apiKey, ids, to);
+  // The per-account stock source: the saved canonical Listings when they validate, else the saved Health bridge
+  // (read-only, threshold measured against the as-of), else Unavailable. ZERO export. The account's own 30-day sales
+  // rows are the only SKU -> ASIN evidence the Listings fold may use.
+  const evidence = await readInsightInventoryEvidence({ apiKey, ids, to, listings });
+  const inventory = insightInventory({ listings: evidence.listings, healthBridge: evidence.healthBridge, asOf: to, sellerId: ids[0], asinForSku: asinForSkuFrom(salesRows) });
   const catalog = await fetchCatalog(apiKey, ids);
 
   // Optional enrichment. A disabled table is a setup state, not a failure: the
@@ -177,13 +193,13 @@ export async function buildListingHealth({ apiKey, ids, to }) {
     if (!sku && !asin) continue;
     const meta = catalog.byAsin.get(asin) || {};
     const sales = salesBySku.get(sku) || null;
-    const stock = sku ? inventory.bySku.get(sku) || null : null;
+    const stock = sku ? insightSkuStock(inventory, sku) : null;
     const raw = rawBySku.get(sku) || null;
     const channelRaw = String(listing.listing_fulfillment_channel || "").trim().toUpperCase();
 
-    const fbaAvailable = num(listing.fba_quantity_available);
     const listingQuantity = num(listing.listing_current_quantity);
-    const snapshotAvailable = stock ? num(stock.available) : null;
+    // On-hand FBA from the account's selected source (never mixed with the listing record's own fields).
+    const onHandFba = stock && stock.listed && stock.fbaContext === "fba" ? stock.fbaAvailable : null;
 
     rows.push({
       sku: sku || null,
@@ -200,10 +216,13 @@ export async function buildListingHealth({ apiKey, ids, to }) {
         : num(listing.listing_price_value),
       currency: String(listing.listing_price_currency || "").trim() || sales?.currency || null,
       listingQuantity,
-      fbaAvailable,
-      fbaInbound: num(listing.fba_quantity_inbound),
-      fbaReserved: num(listing.fba_quantity_reserved),
-      snapshotAvailable,
+      // The listing record's own FBA quantities, as reported (unknown => null, never 0). Display only: on-hand stock
+      // claims use onHandFba.
+      fbaAvailable: listingsQuantity(listing.fba_quantity_available).value,
+      fbaInbound: listingsQuantity(listing.fba_quantity_inbound).value,
+      fbaReserved: listingsQuantity(listing.fba_quantity_reserved).value,
+      onHandFba,
+      onHandFbaSource: onHandFba === null ? null : inventory.sel.source,
       openDate: listing.listing_open_date || null,
       sales30d: sales ? sales.sales : 0,
       units30d: sales ? sales.units : 0,
@@ -224,8 +243,7 @@ export async function buildListingHealth({ apiKey, ids, to }) {
     issuesAvailable,
     issuesUnavailableReason,
     issuesSourceLabel: LISTINGS_RAW.label,
-    inventoryAvailable: inventory.available,
-    inventorySnapshotDate: inventory.snapshotDate,
+    ...insightInventoryFields(inventory),
     currencies: [...currencies].sort(),
     listingCount: listingRows.length,
     rows,

@@ -8,7 +8,7 @@
 // but it cannot catch readiness that flips AFTER a frozen cycle's membership was created, nor a frozen continuation
 // that retains an account which later becomes unready -- in both cases the frozen batch still 400s.
 //
-// This module is the OLI/source-worker analogue of fba-inventory-overflow.js. From recent DURABLE typed evidence
+// This module is the OLI/source-worker analogue of the former (retired) FBA inventory overflow reader. From recent DURABLE typed evidence
 // (source jobs that failed terminal with error_code === DATADOE_INITIAL_LOAD_INCOMPLETE), matched by the
 // date-INDEPENDENT account_scope_hash on sync_source_job_owners (a readiness-rejected export's request_hash encodes
 // the window, so it changes daily; the scope hash of a seller id does not), it derives -- per source, scoped by
@@ -49,16 +49,13 @@ export function isInitialLoadIncompleteMessage(text) {
 
 // The durable owner request_keys whose readiness evidence is WIRED into single-seller isolation, per source:
 //   - source-oli:slice-v1        -> OLI, isolated in the source-sync runtime (planBucketSourceSync peel-off).
-//   - fba-plan:inventory-health  -> FBA Inventory Health AND Listing Health v3 inventory (v3 REUSES this export
-//                                   identity), isolated by folding into the existing inventory overflow channel in
-//                                   fba-plan-release-composition + listing-health-v3-ingestion-composition.
-// AWD (fba-plan:awd) also carries the all-selected-sellers requirement and its rejections ARE classified + recorded,
-// but AWD batch-isolation is intentionally NOT wired here: the planner splits inventory batches only, and AWD is a
-// stable no-date export that never runs single-seller (so it could neither be split nor self-clear on this channel).
-// A dedicated AWD single-seller split is the follow-up; folding AWD here would only force needless inventory splits.
+// The retired FBA Inventory Health identity (fba-plan:inventory-health) is no longer fetched (Listings inventory cutover,
+// 2026-10), so it is no longer protected here. The canonical Listings (fba-plan:awd, shared with listing-health-v3) also
+// carries the all-selected-sellers requirement and its rejections ARE classified + recorded, but Listings batch-isolation
+// is intentionally NOT wired here: it is a stable no-date export with ONE shared hash across the fba + v3 jobs that never
+// runs single-seller (so it could neither be split nor self-clear on this channel).
 export const READINESS_PROTECTED_REQUEST_KEYS = Object.freeze([
   "source-oli:slice-v1",       // Order Line Items (order-line-items) -- runtime isolation
-  "fba-plan:inventory-health", // FBA Inventory Health + Listing Health v3 inventory (shared identity) -- overflow fold
 ]);
 
 /**
@@ -97,7 +94,7 @@ const isFailed = (v) => S(v) === "failed";
 
 /**
  * Read the recency-resolved isolate scope hashes for ONE source + region cycle bucket, within the recency window.
- * Injectable readers (offline-testable), identical shape to readRecentTruncatedInventoryOwnership:
+ * Injectable readers (offline-testable):
  *   readRecentCycleIds(cycleBucket, sinceDate) -> [cycleId]   (MUST be ordered newest-first; getRecentSyncCycleIds is)
  *   readSourceJobs(cycleId) -> [{ request_hash, source_key, fetch_status, error_code, terminal }]
  *   readOwners(cycleId)     -> [{ request_hash, request_key, account_id, account_scope_hash, connection_id,

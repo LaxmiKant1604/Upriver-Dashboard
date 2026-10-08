@@ -493,7 +493,9 @@ export async function getInventorySnapshotCandidates({ reportKey, accountId, rep
     order: "updated_at.desc",
     limit: "1",
   });
-  if (reportVersion != null) availableQuery.append("params->>reportVersion", `eq.${reportVersion}`);
+  // reportVersion: one version, or a LIST (the newest available compact among them -- the phase-2 v2 / legacy v1 window).
+  if (Array.isArray(reportVersion)) availableQuery.append("params->>reportVersion", `in.(${reportVersion.map((v) => String(v)).join(",")})`);
+  else if (reportVersion != null) availableQuery.append("params->>reportVersion", `eq.${reportVersion}`);
   const [availableRows, latest] = await Promise.all([
     request(`/rest/v1/report_snapshots?${availableQuery}`).catch(() => []),
     getLatestReportSnapshot({ reportKey, accountId }).catch(() => null),

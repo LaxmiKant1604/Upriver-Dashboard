@@ -394,6 +394,8 @@ function makeHarness(over = {}) {
     readSourceControls: over.readSourceControls || (async () => ({ rows: [], read: "ok", error: null })),
     readCoverage: over.readCoverage || (async () => ({ windows: [{ from: "2025-01-01", to: dates.addDaysStr(ASOF, -7) }], read: "ok", error: null })),
     readSnapshot: over.readSnapshot || (async () => ({ snapshot: null, read: "ok", error: null })),
+    // Listings inventory cutover phase 2: the account's saved Listings pointer (undefined -> no Listings evidence).
+    readListingsSnapshot: over.readListingsSnapshot,
     readAdsCoverage: over.readAdsCoverage || (async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null })),
     readBatchMembership: over.readBatchMembership || (async () => {
       recorded.membershipReads += 1;
@@ -996,22 +998,22 @@ test("F9c. a dropped replace RPC => RPC_MISSING; a gutted body (no DELETE / no c
   assert.ok(noAck.blockers.some((b) => b.code === "REPLACE_OLI_COVERAGE_ACK_MISSING"), JSON.stringify(noAck.blockers.map((b) => b.code)));
 });
 
-/* ================================= F10. FBA seller-scoping + marketplace validation ================================= */
-group("F10. FBA rows validated per account marketplace before any snapshot");
+/* ================================= F10. FBA Inventory Health is RETIRED ================================= */
+group("F10. FBA Inventory Health is retired: no bucket run plans / creates / records it");
 
-test("F10a. a cross-marketplace or marketplace-less FBA row STOPS the bucket typed (round-4 finding 5; latest-good preserved)", async () => {
-  const wrong = makeHarness({ ddOpts: { fbaRows: [{ date: ASOF, sku: "K", child_asin: "B", marketplace_country_code: "DE", available: 3 }] } });
-  const r1 = await wrong.runtime.run({ bucket: "us", today: TODAY });
-  assert.equal(r1.stopped, true, "domain-invalid payload stops the bucket");
-  assert.equal(r1.stopReason.code, "SOURCE_PAYLOAD_UNAVAILABLE");
-  assert.equal(r1.stopReason.detail, "FBA_CROSS_MARKETPLACE");
-  assert.equal(r1.globalDrained, false, "never reported drained");
-  assert.ok(r1.snapshots.rejected.some((x) => x.code === "FBA_CROSS_MARKETPLACE"), "cross-marketplace recorded typed");
-  assert.ok(!r1.snapshots.recorded.some((k) => String(k).startsWith("fba-inventory-health:")), "no FBA snapshot recorded");
-  const blank = makeHarness({ ddOpts: { fbaRows: [{ date: ASOF, sku: "K", child_asin: "B", available: 3 }] } });
-  const r2 = await blank.runtime.run({ bucket: "us", today: TODAY });
-  assert.equal(r2.stopped, true);
-  assert.equal(r2.stopReason.detail, "FBA_ROW_NO_MARKETPLACE");
+test("F10a. an UNPAUSED full bucket run plans, creates and records NO fba-inventory-health work (even with no inventory evidence at all)", async () => {
+  // Absent catalog + absent saved Health snapshots + Health-shaped rows available from the DataDoe double: the
+  // pre-cutover runtime would have planned + fetched one FBA Health export per account. Now there is no such family
+  // (the last SAVED Health snapshot is only a dated read-only bridge; nothing here refreshes it).
+  const h = makeHarness({ ddOpts: { fbaRows: [{ date: ASOF, sku: "K", child_asin: "B", marketplace_country_code: "US", available: 3 }] } });
+  const r = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r.stopped, false, JSON.stringify(r.stopReason));
+  assert.equal(r.plan.plannedJobsByFamily["fba-inventory-health"], undefined, "no Health family in the plan");
+  assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "fba-inventory-health").length, 0, "ZERO Health creates");
+  assert.ok(!r.snapshots.recorded.some((k) => String(k).startsWith("fba-inventory-health:")), "no Health snapshot recorded");
+  assert.ok(!h.recorded.snapshots.some((x) => x.sourceKey === "fba-inventory-health"), "no source_snapshots(fba-inventory-health) write");
+  const jobs = r.cycleId ? h.store.listSourceJobs(r.cycleId) : [];
+  assert.ok(!jobs.some((j) => j.source_key === "fba-inventory-health"), "no Health job in the cycle");
 });
 
 
@@ -1295,9 +1297,12 @@ test("S3b. stale Catalog/FBA evidence is a refresh signal and cannot block a nar
 
   const preflight = await h.runtime.preflightEvidence({ bucket: "us", sourceKey: "order-line-items" });
   assert.ok(preflight.evidence.readBlockers.some((b) => b.sourceKey === "product-catalog" && b.reason === "snapshot-stale"), "stale Catalog remains typed");
-  assert.ok(preflight.evidence.readBlockers.some((b) => b.sourceKey === "fba-inventory-health" && b.reason === "snapshot-stale"), "stale FBA remains typed");
+  // Listings inventory cutover: the SAVED FBA Inventory Health snapshot is a READ-ONLY bridge that no export refreshes any
+  // more -- the daily-refresh policy (stale-day => a SALES-BLOCKING blocker) never applies to it; its own as-of rule
+  // (lib/server/inventory-source.js HEALTH_BRIDGE_MAX_AGE_DAYS) decides whether it may drive figures.
+  assert.ok(!preflight.evidence.readBlockers.some((b) => b.sourceKey === "fba-inventory-health" && b.reason === "snapshot-stale"), "the saved Health bridge is never a stale (sales-blocking) blocker");
   assert.equal(preflight.evidence.catalogSnapshot, null, "stale Catalog rows are never used");
-  assert.deepEqual(preflight.evidence.fbaSnapshotsByAccount, {}, "stale FBA rows are never used");
+  assert.ok(preflight.evidence.fbaSnapshotsByAccount.A01 && Array.isArray(preflight.evidence.fbaRowsByAccount.A01), "the saved Health bridge rows are carried read-only (the bridge's as-of rule decides their use)");
   assert.equal(h.store._opens, 0, "preflight performs zero cycle writes");
   assert.equal(h.dd.totalCreates(), 0, "preflight performs zero DataDoe creates");
 
@@ -1305,7 +1310,7 @@ test("S3b. stale Catalog/FBA evidence is a refresh signal and cannot block a nar
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   assert.ok(rollup.plan.plannedJobsByFamily["order-line-items"] >= 1, "OLI remains runnable");
   assert.equal(rollup.plan.plannedJobsByFamily["product-catalog"], undefined, "Catalog is outside the narrowed plan");
-  assert.equal(rollup.plan.plannedJobsByFamily["fba-inventory-health"], undefined, "FBA is outside the narrowed plan");
+  assert.equal(rollup.plan.plannedJobsByFamily["fba-inventory-health"], undefined, "Health is never planned (retired)");
 });
 
 test("S4. an UNREADABLE cache loader (throws) at persistence is the SAME typed SOURCE_PAYLOAD_UNAVAILABLE stop", async () => {
@@ -1530,8 +1535,9 @@ test("T3. blocker 2: the durable FBA evidence reaches Brand View through its REA
   assert.ok(rollup.derived.brandInventory.saved >= 1, "the compact brand-inventory shadow snapshot saved: " + JSON.stringify(rollup.derived.brandInventory));
   const invSave = h.recorded.shadowSaves.find((s) => s.reportKey === "scheduler-v2/brand-inventory" && s.accountId === "A01");
   assert.ok(invSave, "saved under the EXISTING shadow key");
-  assert.equal(invSave.params.reportVersion, "brand-inventory-shared-v1", "the EXISTING compact report version");
-  assert.ok(Array.isArray(invSave.payload.inventoryByBrandCountry), "the EXISTING compact payload contract");
+  assert.equal(invSave.params.reportVersion, "brand-inventory-shared-v2", "the phase-2 compact report version");
+  assert.ok(Array.isArray(invSave.payload.inventoryByBrandCountry), "the compact payload contract");
+  assert.equal(invSave.payload.inventorySource, "health-fallback", "no saved Listings here -> the labelled FBA Inventory Health fallback");
   // THE REAL production orchestration: buildAccountBrandSlice reads brand-sales + the compact inventory
   // through its own snapshot gate (isCompactInventorySnapshot) -- the ONLY injected seam is readSnapshot.
   const bv = await import("../lib/server/reports/brand-view.js");
@@ -1547,6 +1553,39 @@ test("T3. blocker 2: the durable FBA evidence reaches Brand View through its REA
   assert.equal(slice.inventory.accountTotal, 5, "the durable FBA quantity arrived via the real read path");
   assert.equal(slice.inventoryDate, ASOF, "the inventory date travels from the durable evidence");
   assert.ok(slice.sales, "the brand-sales half of the REAL slice consumed the durable-derived snapshot");
+});
+
+test("T3b. phase 2: the account's VALIDATED saved Listings (read lazily, fail-soft) are the compact's source; the Listings content token is recorded; an unreadable pointer falls back to Health", async () => {
+  const lrow = (sku, asin, available) => ({ sku, child_asin: asin, fnsku: "X" + sku, listing_fulfillment_channel: "AMAZON_NA", marketplace_country_code: "US", fba_quantity_available: available, fba_quantity_inbound: 0, fba_quantity_reserved: 0, fba_quantity_fc_transfer: 0 });
+  const pointer = (accountId) => ({ object_path: "source-listings/v1/" + accountId + ".json", row_count: 2, validated_at: TODAY + "T02:30:00Z", payload_sha: "lsha-" + accountId, source_request_hash: "lrh-batch", as_of: ASOF });
+  const reads = [];
+  const h = fullFixture({ readListingsSnapshot: async ({ accountId, organizationFingerprint, connectionId }) => { reads.push([accountId, connectionId, !!organizationFingerprint]); return { read: "ok", snapshot: pointer(accountId), error: null }; } });
+  for (const a of ["A01", "A02"]) h.snapStore.set("source-listings/v1/" + a + ".json", { rows: [lrow("SKU-A", "B0A", 7), lrow("SKU-B", "B0A", 2)] });
+  const rollup = await h.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
+  const invSave = h.recorded.shadowSaves.find((x) => x.reportKey === "scheduler-v2/brand-inventory" && x.accountId === "A01");
+  assert.ok(invSave, "the compact was saved");
+  assert.deepEqual([invSave.payload.inventorySource, invSave.payload.listingsRefreshedAt, invSave.payload.inventoryDate], ["listings", TODAY + "T02:30:00Z", null], "validated Listings are the source (never the Health 5)");
+  assert.equal(invSave.payload.inventoryByBrandCountry.find((b) => b.brand === "Acme").fbaAvailable, 9);
+  assert.ok(reads.some(([a, c, org]) => a === "A01" && c === "primary" && org), "the pointer is read per account, primary connection, org-scoped");
+  const upsert = h.recorded.lineage.find((l) => l.op === "upsert" && (l.reportKey === "brand-inventory" || l.reportKey === "scheduler-v2/brand-inventory") && l.accountId === "A01");
+  const deps = (upsert && upsert.durableContentDeps) || [];
+  assert.ok(deps.some((t) => String(t).startsWith("listings|A01|primary|lrh-batch|lsha-A01")), "the Listings content token is recorded as provenance: " + JSON.stringify(deps));
+  // A FAILED pointer read is fail-soft: no readiness blocker, the compact uses the Health fallback.
+  const h2 = fullFixture({ readListingsSnapshot: async () => { throw new Error("listings pointer read failed"); } });
+  const r2 = await h2.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r2.stopped, false, JSON.stringify(r2.stopReason));
+  const inv2 = h2.recorded.shadowSaves.find((x) => x.reportKey === "scheduler-v2/brand-inventory" && x.accountId === "A01");
+  assert.deepEqual([inv2.payload.inventorySource, inv2.payload.inventoryHealthDate], ["health-fallback", ASOF]);
+  // Listings inventory CUTOVER freshness: a saved Listings pointer whose cycle as_of is older than asOf - 2 is NEVER used
+  // (typed listings-snapshot-stale; its payload is not even hydrated) -> the dated saved Health bridge serves instead.
+  const staleAsOf = new Date(Date.parse(ASOF + "T00:00:00Z") - 3 * 86400000).toISOString().slice(0, 10);
+  const h3 = fullFixture({ readListingsSnapshot: async ({ accountId }) => ({ read: "ok", snapshot: { ...pointer(accountId), as_of: staleAsOf }, error: null }) });
+  for (const a of ["A01", "A02"]) h3.snapStore.set("source-listings/v1/" + a + ".json", { rows: [lrow("SKU-A", "B0A", 7), lrow("SKU-B", "B0A", 2)] });
+  const r3 = await h3.runtime.run({ bucket: "us", today: TODAY });
+  assert.equal(r3.stopped, false, JSON.stringify(r3.stopReason));
+  const inv3 = h3.recorded.shadowSaves.find((x) => x.reportKey === "scheduler-v2/brand-inventory" && x.accountId === "A01");
+  assert.deepEqual([inv3.payload.inventorySource, inv3.payload.inventoryHealthDate, inv3.payload.inventoryListingsReasons], ["health-fallback", ASOF, ["listings-snapshot-stale"]], "a stale Listings pointer never drives stock");
 });
 
 test("T4. blocker 3: preflight sweeps hydration/integrity/ads-coverage/ads-metrics/history typed BEFORE any write; execution consumes ONE memoized bundle with ZERO repeated reads", async () => {
@@ -1853,7 +1892,7 @@ test("U3. fix 3: brand-inventory promotes through the REAL publisher composition
   assert.equal(resInv.liveReportKey, "brand-inventory", "the EXACT live report key");
   assert.equal((await publisher.publish("brand-sales", "A01")).disposition, "published");
   const liveInv = liveRows.get("brand-inventory|A01");
-  assert.equal(liveInv.params.reportVersion, "brand-inventory-shared-v1", "the EXACT live shared version");
+  assert.equal(liveInv.params.reportVersion, "brand-inventory-shared-v2", "the EXACT live shared version (phase 2)");
   assert.deepEqual(Object.keys(liveInv.params).sort(), ["reportVersion", "to"], "the EXACT live params contract ({ to })");
   assert.equal(liveInv.params.to, ASOF);
   // LIVE read path: buildAccountBrandSlice reads the PROMOTED PRODUCTION rows by their PLAIN live report
@@ -1953,12 +1992,14 @@ test("U5. fix 5: 30 accounts / 6 batches -- every report's depends_on is ACCOUNT
     readCoverage: dynamicTailCoverage(durableCoverage),
     readSnapshot: async ({ sourceKey, scopeKey }) => {
       if (sourceKey === "product-catalog") return { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/product-catalog/__organization.json", row_count: 1 }, read: "ok", error: null };
-      return { snapshot: null, read: "ok", error: null }; // FBA absent => the sync FETCHES one export per account
+      // Each account's SAVED (retired) Health snapshot: the read-only bridge. No bucket family fetches inventory.
+      return { snapshot: { validated_at: TODAY + "T01:00:00Z", object_path: "source-snapshots/v1/fba-inventory-health/" + scopeKey + ".json", row_count: 1, source_request_hash: "rh-health-" + scopeKey, payload_sha: "sha-health-" + scopeKey }, read: "ok", error: null };
     },
   });
   h.snapStore.set("source-snapshots/v1/product-catalog/__organization.json", { rows: [{ child_asin: "B0A", sku: "SKU-A", product_brand: "Acme" }] });
   for (const id of ids) {
     h.durableHistory.set(id + "|x", { accountId: id, saleDate: ASOF, sku: "SKU-A", childAsin: "B0A", currency: "USD", salesAmount: 10, units: 1 });
+    h.snapStore.set("source-snapshots/v1/fba-inventory-health/" + id + ".json", { rows: [{ date: ASOF, sku: "SKU-A", child_asin: "B0A", marketplace_country_code: "US", available: 5 }] });
   }
   const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
   const rollup = await h.runtime.run({ bucket: "us", today: TODAY, preflight: pf });
@@ -1969,19 +2010,17 @@ test("U5. fix 5: 30 accounts / 6 batches -- every report's depends_on is ACCOUNT
   const jobs = h.store.listSourceJobs(rollup.cycleId);
   const jobByHash = new Map(jobs.map((j) => [j.request_hash, j]));
   const oliOwned = (aid) => new Set(owners.filter((o) => o.account_id === aid && jobByHash.get(o.request_hash) && jobByHash.get(o.request_hash).source_key === "order-line-items").map((o) => o.request_hash));
-  const fbaOwned = (aid) => new Set(owners.filter((o) => o.account_id === aid && jobByHash.get(o.request_hash) && jobByHash.get(o.request_hash).source_key === "fba-inventory-health").map((o) => o.request_hash));
   const upserts = h.recorded.lineage.filter((l) => l.op === "upsert");
   assert.ok(upserts.length >= 60, "daily + brand-sales (+ inventory) lineage for the fleet: " + upserts.length);
   for (const u of upserts) {
     const myOli = oliOwned(u.accountId);
-    const myFba = fbaOwned(u.accountId);
     for (const hash of u.dependsOn) {
       const job = jobByHash.get(hash);
       assert.ok(job, "every dependency is a real cycle job");
       if (job.source_key === "order-line-items") assert.ok(myOli.has(hash), u.reportKey + "/" + u.accountId + " depends only on ITS OWN batch's OLI export");
-      else if (job.source_key === "fba-inventory-health") assert.ok(myFba.has(hash) && u.reportKey === "brand-inventory", u.accountId + " depends only on ITS OWN FBA export (brand-inventory only)");
+      assert.notEqual(job.source_key, "fba-inventory-health", "no report depends on a (retired) Health export job");
     }
-    if (u.reportKey !== "brand-inventory") assert.ok(u.dependsOn.every((hash) => (jobByHash.get(hash) || {}).source_key !== "fba-inventory-health"), "daily/brand-sales never depend on FBA");
+    if (u.reportKey !== "brand-inventory") assert.deepEqual(u.durableContentDeps || [], [], "daily/brand-sales never bind inventory content");
     assert.ok(u.dependsOn.length >= 1, u.reportKey + "/" + u.accountId + ": nonempty account-owned dependency set");
   }
   // Cross-batch DISJOINTNESS: accounts in different batches share ZERO OLI dependencies.
@@ -1994,14 +2033,16 @@ test("U5. fix 5: 30 accounts / 6 batches -- every report's depends_on is ACCOUNT
   assert.ok(shared.every((hash) => (jobByHash.get(hash) || {}).source_key === "product-catalog"), "cross-batch shared dependencies can ONLY be the organization-wide catalog scope: " + JSON.stringify(shared.map((x) => (jobByHash.get(x) || {}).source_key)));
   const sameBatchPeer = ids.find((id) => id !== "A01" && batchOf(id) === batchOf("A01"));
   assert.deepEqual(dailyOf(sameBatchPeer).dependsOn.filter((hash) => (jobByHash.get(hash) || {}).source_key === "order-line-items").sort(), a.dependsOn.filter((hash) => (jobByHash.get(hash) || {}).source_key === "order-line-items").sort(), "batch members genuinely SHARE their batch's OLI export hashes");
-  // FBA: each brand-inventory row depends on exactly ITS account's FBA hash.
+  // Inventory: each brand-inventory job binds exactly ITS account's SAVED (read-only bridge) Health content token -- never
+  // a Health export job (none exists in the cycle) and never another account's content.
   const invA01 = upserts.find((u) => u.reportKey === "brand-inventory" && u.accountId === "A01");
   const invPeer = upserts.find((u) => u.reportKey === "brand-inventory" && u.accountId === bAcct);
   assert.ok(invA01 && invPeer, "brand-inventory lineage for both probes");
-  const fbaDeps = (u) => u.dependsOn.filter((hash) => (jobByHash.get(hash) || {}).source_key === "fba-inventory-health");
-  assert.equal(fbaDeps(invA01).length, 1);
-  assert.equal(fbaDeps(invPeer).length, 1);
-  assert.notEqual(fbaDeps(invA01)[0], fbaDeps(invPeer)[0], "one account NEVER depends on another account's FBA export");
+  const tok = (aid) => ["fba-inventory-health", aid, "primary", "rh-health-" + aid, "sha-health-" + aid].join("|");
+  assert.ok((invA01.durableContentDeps || []).includes(tok("A01")), "A01 binds its OWN saved Health content: " + JSON.stringify(invA01.durableContentDeps));
+  assert.ok((invPeer.durableContentDeps || []).includes(tok(bAcct)), bAcct + " binds its OWN saved Health content");
+  assert.ok(!(invA01.durableContentDeps || []).includes(tok(bAcct)), "one account NEVER binds another account's inventory content");
+  assert.ok(!jobs.some((j) => j.source_key === "fba-inventory-health"), "the cycle holds NO Health export job");
 });
 
 test("U6. fix 6: the ACL model includes PostgreSQL 17 MAINTAIN -- GRANT ALL leaves MAINTAIN behind the legacy-seven revoke; explicit MAINTAIN is forbidden; REVOKE ALL clears it; the real migration stays clean", () => {
@@ -3371,8 +3412,8 @@ test("F11e. priority plans ZERO non-catalog source JOBS in the owning cycle (OLI
 
 test("F11f. ordinary callers CANNOT activate priority mode: a normally-built runtime ignores a run({priority:true}) arg and still fetches FBA (non-priority)", async () => {
   const accounts = [dirAccount("A01"), dirAccount("A02")];
-  // NORMAL runtime (NO priorityMode). Absent catalog + FBA, full coverage => a normal run fetches catalog AND
-  // per-account FBA (the very cost the priority path avoids). Passing priority:true as a run arg must be INERT.
+  // NORMAL runtime (NO priorityMode). Absent catalog + no inventory evidence, full coverage => a normal run SKIPS the
+  // compact brand-inventory typed (the priority path publishes it Unavailable). Passing priority:true as a run arg must be INERT.
   const h = makeHarness({
     primaryAccounts: accounts,
     readCoverage: async () => ({ windows: [{ from: "2025-01-01", to: TODAY }], read: "ok", error: null }),
@@ -3382,7 +3423,12 @@ test("F11f. ordinary callers CANNOT activate priority mode: a normally-built run
   const pf = await h.runtime.preflightEvidence({ bucket: "us", today: TODAY });
   const rollup = await h.runtime.run({ bucket: "us", today: TODAY, priority: true, preflight: pf }); // the arg is INERT
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
-  assert.ok(h.dd.createSeq.some((c) => c.sourceKey === "fba-inventory-health"), "a normal runtime fetches FBA -> the priority run arg had NO effect");
+  // Listings inventory cutover: FBA Inventory Health is never fetched by ANY runtime. The NON-priority proof is now the
+  // brand-inventory behaviour: with no inventory evidence at all a normal run SKIPS the compact typed (the priority path
+  // would instead publish it Unavailable for every account).
+  assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "fba-inventory-health").length, 0, "Health is never fetched (retired)");
+  assert.equal(rollup.derived.brandInventory.saved, 0, "no brand-inventory saved without inventory evidence (non-priority)");
+  assert.deepEqual(rollup.derived.brandInventory.skipped.map((x) => x.accountId).sort(), ["A01", "A02"], "both accounts skipped typed -> the priority run arg had NO effect: " + JSON.stringify(rollup.derived.brandInventory.skipped));
 });
 
 /* ===== F12. priority release with the REAL runtime + REAL worker + the DURABLE Catalog reservation ===== */

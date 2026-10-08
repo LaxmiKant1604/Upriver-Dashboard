@@ -295,28 +295,16 @@ function makeSalesMoversDataDoe(inventoryDate) {
   };
 }
 
-test("(inventoryAsOf threaded) the REAL dispatcher passes inventoryAsOf into runSalesMoversShadowCycle; the staged inventory export uses it EXACTLY", async () => {
-  // Deliberately DIFFERENT dates: report/sales asOf vs the explicit inventory snapshot day. The staged
-  // runner must use the threaded inventoryAsOf -- never the report asOf, and never asOf-1 (D-2).
+test("(Listings inventory cutover) the REAL dispatcher's staged Sales Movers cycle creates NO FBA Inventory Health export -- threaded inventoryAsOf or not (stock comes from the saved Listings snapshot; the retired 'sales-movers:inventory' request no longer exists)", async () => {
   const INV = "2025-08-07";
-  assert.notEqual(INV, ASOF); assert.notEqual(INV, "2025-08-09"); // != asOf and != asOf-1
-  const store = makeStore();
-  const dd = makeSalesMoversDataDoe(INV);
-  const r = await dispatch({ store, dataDoe: dd, inventoryAsOf: INV, manualReportKeys: ["sales-movers"], controlCatalog: mkCatalog(["sales-movers"]) }).promise;
-  assert.ok(r.perUnit.some((u) => u.unit === "sales-movers"), "sales-movers ran through its staged cycle unit");
-  const inv = dd.created.filter((c) => c.requestKey === "sales-movers:inventory");
-  assert.equal(inv.length, 1, "exactly one staged inventory export");
-  assert.deepEqual([inv[0].from, inv[0].to], [INV, INV], "the staged inventory window IS the threaded inventoryAsOf (single day)");
-  assert.ok(!dd.created.some((c) => c.from === "2025-08-09" || c.to === "2025-08-09"), "nothing inferred asOf-1 (no ambiguous inventory date)");
-});
-
-test("(inventoryAsOf default) with NO threaded inventoryAsOf the staged inventory day is the report asOf ITSELF -- an unambiguous default, never asOf-1", async () => {
-  const store = makeStore();
-  const dd = makeSalesMoversDataDoe(ASOF);
-  await dispatch({ store, dataDoe: dd, manualReportKeys: ["sales-movers"], controlCatalog: mkCatalog(["sales-movers"]) }).promise;
-  const inv = dd.created.filter((c) => c.requestKey === "sales-movers:inventory");
-  assert.equal(inv.length, 1);
-  assert.deepEqual([inv[0].from, inv[0].to], [ASOF, ASOF], "default inventory day === the report asOf (already D-1 on a scheduled run)");
+  for (const threaded of [true, false]) {
+    const store = makeStore();
+    const dd = makeSalesMoversDataDoe(threaded ? INV : ASOF);
+    const r = await dispatch({ store, dataDoe: dd, ...(threaded ? { inventoryAsOf: INV } : {}), manualReportKeys: ["sales-movers"], controlCatalog: mkCatalog(["sales-movers"]) }).promise;
+    assert.ok(r.perUnit.some((u) => u.unit === "sales-movers"), "sales-movers ran through its staged cycle unit");
+    assert.equal(dd.created.filter((c) => /inventory/.test(String(c.requestKey))).length, 0, "ZERO inventory (Health) exports from the staged cycle");
+    assert.ok(dd.created.length > 0 && dd.created.every((c) => String(c.requestKey).startsWith("sales-movers:")), "only the remaining Sales Movers requests were created");
+  }
 });
 
 /* ============================= controls / readiness ============================= */

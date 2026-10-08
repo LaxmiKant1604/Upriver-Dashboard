@@ -13,7 +13,9 @@ import { planFbaPlan } from "../../lib/server/sync/report-planner.js";
 import { getSourceExportCache } from "../../lib/server/supabase.js";
 
 const asOf = process.env.FBA_AS_OF || new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-const PREMIUM = new Set(["fba-plan:inventory-health", "fba-plan:awd"]);
+// The canonical Listings request (FBA inventory + AWD) is the ONLY owned fba-plan export (premium); FBA Inventory Health is
+// retired and never planned.
+const PREMIUM = new Set(["fba-plan:awd"]);
 const tokFor = (rk) => (PREMIUM.has(rk) ? 5 : 2);
 
 const u = new URL(process.env.POSTGRES_URL); u.searchParams.set("sslmode", "no-verify");
@@ -59,4 +61,4 @@ for (const [rk, hashes] of [...perKey.entries()].sort()) {
   console.log(`  ${rk}: distinct=${hashes.size} adoptable(cached)=${cached} need-fetch=${need} tokenClass=${PREMIUM.has(rk) ? "premium(5)" : "standard(2)"} fetch-tokens=${tokens}`);
 }
 console.log(`== PER-ACCOUNT TOTAL: ${totalFetch} creates need fetching / ${totalTokens} tokens (before any 5-seller batching) ==`);
-console.log(`(5-seller batching would REDUCE OLI + catalog + FBA-Health create counts where multi-account/marketplace batches apply; AWD stays US-only.)`);
+console.log(`(5-seller batching REDUCES the canonical Listings create count where multi-account batches apply; the batched plan shares ONE export per <=5-seller batch with listing-health-v3.)`);

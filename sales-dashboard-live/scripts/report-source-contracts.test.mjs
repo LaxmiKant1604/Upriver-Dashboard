@@ -396,12 +396,10 @@ const reconWin = { "reconciliation:order-lines": reconMonths, "reconciliation:se
 const FBA_ASOF = "2025-08-06";
 const fbaPlanMonths = planMonthWindows(FBA_ASOF); // completed[0].from = 2025-05-01, current.to = asOf
 const fbaOliSlices = canonicalOliSlices(fbaPlanMonths.completed[0].from, FBA_ASOF);
-const fbaBase = {
-  // OLI sales + Product Catalog are DERIVED durable deps for fba-plan (no owned export), so they are NOT resolved
-  // here. Only the FBA Inventory Health snapshot (all markets) + the US-only AWD listing are owned exports.
-  "fba-plan:inventory-health": [{ from: "2025-07-27", to: "2025-08-06" }],
-};
-const fbaWithAwd = { ...fbaBase, "fba-plan:awd": [{ from: null, to: null }] };
+// OLI sales + Product Catalog are DERIVED durable deps for fba-plan (no owned export), and FBA Inventory Health is
+// RETIRED (FBA stock now comes from the shared canonical Listings export), so fba-plan owns ONE request: fba-plan:awd.
+const fbaBase = {};
+const fbaWithAwd = { "fba-plan:awd": [{ from: null, to: null }] };
 
 /* --- executable parity: reconciliation --- */
 test("reconciliation order-lines contract matches RECONCILIATION_ORDER_* constants", () => {
@@ -471,24 +469,17 @@ test("daily-reporting derivation strategy derives all-brand + named-brand from t
   assert.ok(!/splitDateRangeByMonth/.test(fdBody.slice(0, fdBody.indexOf("\n}\n"))), "named-brand fetch must NOT use splitDateRangeByMonth");
 });
 
-/* --- executable parity: fba-plan (OLI + catalog are DERIVED durable deps; only FBA Health + AWD are owned) --- */
+/* --- executable parity: fba-plan (OLI + catalog are DERIVED durable deps; FBA Health is retired; only Listings is owned) --- */
 test("fba-plan owns NO OLI/catalog contract (both are durable derived deps)", () => {
   assert.equal(byKey(fba, "fba-plan:oli-sales"), undefined, "fba-plan:oli-sales is not an owned contract");
   assert.equal(byKey(fba, "fba-plan:catalog"), undefined, "fba-plan:catalog is not an owned contract");
-  // The two owned contracts remain FBA Health + AWD.
-  assert.ok(byKey(fba, "fba-plan:inventory-health"), "fba-plan:inventory-health is owned");
+  // FBA Inventory Health is retired: the ONLY owned contract is the shared canonical Listings request.
+  assert.equal(byKey(fba, "fba-plan:inventory-health"), undefined, "fba-plan:inventory-health is retired (not owned)");
   assert.ok(byKey(fba, "fba-plan:awd"), "fba-plan:awd is owned");
+  assert.deepEqual(fba.map((c) => c.requestKey), ["fba-plan:awd"]);
+  assert.ok(!DD.includes("const FBA_HEALTH_COLUMNS = ["), "api/datadoe.js no longer builds the FBA Health column set");
 });
-test("fba-plan inventory-health / awd match their constants (both now seller-scoped for marketplace-safe batching)", () => {
-  const inv = byKey(fba, "fba-plan:inventory-health");
-  // The scheduler-v2 contract carries the marketplace-safe batch-split key seller_or_vendor_id IN ADDITION to the
-  // route's FBA_HEALTH_COLUMNS. The derive IGNORES that column (fbaPlanPayload never reads it), so the derived
-  // payload stays byte-identical to the route -- only the fetch identity gains the split key needed to batch.
-  assert.ok(inv.columns.includes("seller_or_vendor_id"), "batchable FBA Health contract carries the seller split key");
-  assert.deepEqual(inv.columns.filter((c) => c !== "seller_or_vendor_id"), constArray("FBA_HEALTH_COLUMNS"));
-  assert.equal(inv.limit, constNumber("PLAN_INVENTORY_ROW_LIMIT"));
-  assert.equal(inv.orderByColumn, "date");
-  assert.equal(inv.orderByDirection, "DESC");
+test("fba-plan:awd matches the canonical Listings constants (seller-scoped for marketplace-safe batching)", () => {
   const awd = byKey(fba, "fba-plan:awd");
   // UNIFIED canonical Listings export: fba-plan:awd no longer carries the AWD-only column set. It requests the
   // validated UNION of the v3 listing fields + the AWD fields (LISTINGS_CANONICAL_COLUMNS), so one paid Listings
@@ -502,6 +493,12 @@ test("fba-plan inventory-health / awd match their constants (both now seller-sco
   for (const c of ["listing_status", "listing_price_value", "fba_quantity_available", "listing_fulfillment_channel", "listing_open_date"]) {
     assert.ok(awd.columns.includes(c), "canonical Listings must carry the v3 listing field " + c);
   }
+  // The Listings inventory cutover adds EXACTLY three FBA quantity fields, and never fba_inventory_supply_at_fba.
+  for (const c of ["fba_quantity_inbound", "fba_quantity_reserved", "fba_quantity_fc_transfer"]) {
+    assert.ok(awd.columns.includes(c), "canonical Listings must carry the FBA inventory field " + c);
+  }
+  assert.ok(!awd.columns.includes("fba_inventory_supply_at_fba"), "fba_inventory_supply_at_fba is never requested");
+  assert.equal(awd.columns.length, 18, "15 pre-cutover Listings columns + exactly 3 FBA quantity fields");
   // Limit is now the 50,000-row provider ceiling (was CATALOG_ROW_LIMIT/10,000) -- byte-identical to
   // listing-health-v3:listings so both consumers resolve to ONE request_hash.
   assert.equal(awd.limit, 50000);
@@ -521,13 +518,13 @@ test("reconciliation segments orders + settlements per month; catalog stays a si
   assert.equal(got.length, 13); // 6 + 6 + 1, single chunk (no cross-product)
   assert.equal(new Set(got.filter((r) => r.requestKey === "reconciliation:order-lines").map((r) => r.requestHash)).size, 6);
 });
-test("fba-plan resolves ONLY its owned FBA Health + US AWD sources (OLI/catalog are durable derived)", () => {
+test("fba-plan resolves ONLY its owned canonical Listings source (OLI/catalog are durable derived; Health retired)", () => {
   const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });
   assert.equal(got.filter((r) => r.requestKey === "fba-plan:oli-sales").length, 0, "no owned OLI fragments");
   assert.equal(got.filter((r) => r.requestKey === "fba-plan:catalog").length, 0, "no owned catalog fragment");
-  assert.equal(got.filter((r) => r.requestKey === "fba-plan:inventory-health").length, 1);
+  assert.equal(got.filter((r) => r.requestKey === "fba-plan:inventory-health").length, 0, "no FBA Health fragment");
   assert.equal(got.filter((r) => r.requestKey === "fba-plan:awd").length, 1);
-  assert.equal(got.length, 2);
+  assert.equal(got.length, 1);
 });
 
 /* --- unified canonical Listings: fba-plan:awd is now planned for EVERY marketplace (the former US+EU5 gate is
@@ -537,7 +534,7 @@ test("fba-plan resolves the canonical Listings (fba-plan:awd) for a non-AWD mark
   // IN is NOT AWD-capable, yet it still resolves the shared canonical Listings export (for v3's benefit + the shared
   // hash). The window is therefore REQUIRED for IN now, so fbaBase (no awd window) would throw -- use fbaWithAwd.
   const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "IN" });
-  assert.equal(got.length, 2); // owned FBA Health snapshot + the shared canonical Listings export (OLI/catalog derived)
+  assert.equal(got.length, 1); // only the shared canonical Listings export (OLI/catalog derived; FBA Health retired)
   assert.equal(got.filter((r) => r.requestKey === "fba-plan:awd").length, 1, "IN resolves the shared canonical Listings export");
 });
 test("fba-plan resolves AWD for the AWD-capable European marketplaces (UK/GB, DE, FR, IT, ES)", () => {
@@ -569,7 +566,7 @@ test("fba-plan no longer requires marketplace metadata to resolve its Listings c
   // country-conditional and marketplaceCountry is no longer required to resolve. It resolves with none supplied.
   const got = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd });
   assert.equal(got.filter((r) => r.requestKey === "fba-plan:awd").length, 1);
-  assert.equal(got.length, 2);
+  assert.equal(got.length, 1);
 });
 test("US fba-plan cannot silently omit its AWD request", () => {
   assert.throws(
@@ -593,14 +590,13 @@ test("ONE SHARED EXPORT: fba-plan:awd and listing-health-v3:listings resolve to 
   // owns, the other adopts from source_export_cache). Mirrors scripts/listings-canonical-reuse.test.js.
   const batch = ["sA", "sB", "sC", "sD", "sE"]; // one <=5-seller batch (the provider ceiling)
   const NO_DATE = [{ from: null, to: null }];
-  const INV = [{ from: "2025-08-06", to: "2025-08-06" }];
   const awd = reportSourceRequestHashes({
     reportKey: "fba-plan", apiKey: "shared-key", ids: batch,
-    windowsByRequestKey: { "fba-plan:inventory-health": INV, "fba-plan:awd": NO_DATE }, marketplaceCountry: "US",
+    windowsByRequestKey: { "fba-plan:awd": NO_DATE }, marketplaceCountry: "US",
   }).find((r) => r.requestKey === "fba-plan:awd");
   const v3 = reportSourceRequestHashes({
     reportKey: "listing-health-v3", apiKey: "shared-key", ids: batch,
-    windowsByRequestKey: { "listing-health-v3:listings": NO_DATE, "listing-health-v3:listings-raw": NO_DATE, "listing-health-v3:inventory": INV },
+    windowsByRequestKey: { "listing-health-v3:listings": NO_DATE, "listing-health-v3:listings-raw": NO_DATE },
     marketplaceCountry: "US",
   }).find((r) => r.requestKey === "listing-health-v3:listings");
   assert.ok(awd && v3, "both consumers resolve a Listings request");
@@ -625,9 +621,11 @@ for (const n of [0, 1, 5, 6, 11]) {
   });
 }
 
-test("validation still applies to the new reports (missing required key throws)", () => {
-  // A US fba-plan with only AWD supplied is missing its required FBA Health snapshot window -> throws.
-  assert.throws(() => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "fba-plan:awd": [{ from: null, to: null }] }, marketplaceCountry: "US" }), /Missing windows/);
+test("validation still applies to the new reports (missing required key throws; a retired Health key is rejected)", () => {
+  // fba-plan with no Listings window is missing its one required request -> throws.
+  assert.throws(() => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: {}, marketplaceCountry: "US" }), /Missing windows.*fba-plan:awd/);
+  // A caller still supplying the retired FBA Health window is refused (unknown request key), never silently planned.
+  assert.throws(() => reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: { "fba-plan:inventory-health": [{ from: "2025-08-06", to: "2025-08-06" }], "fba-plan:awd": [{ from: null, to: null }] }, marketplaceCountry: "US" }), /Unknown request key "fba-plan:inventory-health"/);
 });
 
 /* ===================== keyword-rank + content-changes ===================== */
@@ -882,16 +880,15 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
   // Insight reports fetch through the shared fetchExportRowsStrict transport, whose
   // generic guard rejects rows.length >= limit. Each strict insight request maps to
   // the builder file that issues the strict fetch (common.js for the shared
-  // catalog/inventory helpers). The Sales Movers latest-date probe is deliberately
-  // NOT strict (a date rollup never nears its 500 cap), so it is absent here.
+  // catalog helper). The Sales Movers latest-date probe is deliberately
+  // NOT strict (a date rollup never nears its 500 cap), so it is absent here. No insight report owns an
+  // inventory request any more (FBA Inventory Health is retired; FBA stock is read from saved Listings).
   const INSIGHT_STRICT = {
     "sales-movers:traffic": "sales-movers.js",
     "sales-movers:ads": "sales-movers.js",
-    "sales-movers:inventory": "common.js",
     "sales-movers:catalog": "common.js",
     "buy-box-loss:daily": "buy-box.js",
     "buy-box-loss:oli-sales": "buy-box.js",
-    "buy-box-loss:inventory": "common.js",
     "buy-box-loss:catalog": "common.js",
     "returns-leakage:returns": "returns.js",
     "returns-leakage:settlements": "returns.js",
@@ -900,7 +897,6 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
     "listing-health:listings": "listing-health.js",
     "listing-health:listings-raw": "listing-health.js",
     "listing-health:sales": "listing-health.js",
-    "listing-health:inventory": "common.js",
     "listing-health:catalog": "common.js",
     "ppc-performance:oli-sales": "ppc.js",
     "ppc-performance:catalog": "common.js",
@@ -917,13 +913,14 @@ test("every strict:true contract is backed by an executable rows.length >= LIMIT
   // Phase 1e re-review (their canonical Scheduler-v2 dispatch is strict even though the live route is not).
   const SCHEDULER_V2_STRICT = [
     "reconciliation:catalog",
-    // fba-plan's OLI + catalog are durable derived deps now (no owned export); only its FBA Health + AWD remain.
-    "fba-plan:inventory-health", "fba-plan:awd",
+    // fba-plan's OLI + catalog are durable derived deps now (no owned export) and FBA Health is retired; only the
+    // shared canonical Listings request remains.
+    "fba-plan:awd",
     "brand-sales:order-lines", "brand-sales:catalog",
     "content-changes:events", "content-changes:catalog",
     // Advanced Listing Health (shadow) owned exports -- scheduler-only strict (no live route), backed by the source
-    // worker's cap guard. OLI + catalog are durable derived deps (not owned). inventory reuses fba-plan's identity.
-    "listing-health-v3:listings", "listing-health-v3:listings-raw", "listing-health-v3:inventory",
+    // worker's cap guard. OLI + catalog are durable derived deps (not owned). FBA stock is read from the Listings rows.
+    "listing-health-v3:listings", "listing-health-v3:listings-raw",
   ];
   const routeBacked = new Set([...Object.keys(OPERATIONAL_STRICT), ...Object.keys(INSIGHT_STRICT)]);
   // The categories are disjoint: a strict key is EITHER route-backed OR scheduler-only, never both.
@@ -1029,7 +1026,7 @@ test("execution metadata does NOT change request_hash (identity ignores strict/p
 
 test("Scheduler-v2 integrity: every fba-plan resolved job + reconciliation:catalog is strict:true", () => {
   const fbaJobs = reportSourceRequestHashes({ reportKey: "fba-plan", apiKey: "k", ids: ["A1"], windowsByRequestKey: fbaWithAwd, marketplaceCountry: "US" });
-  for (const rk of ["fba-plan:inventory-health", "fba-plan:awd"]) {
+  for (const rk of ["fba-plan:awd"]) {
     const jobs = fbaJobs.filter((j) => j.requestKey === rk);
     assert.ok(jobs.length >= 1, rk + " must resolve at least one job");
     for (const j of jobs) assert.equal(j.strict, true, rk + " resolved job must be strict:true");
@@ -1064,11 +1061,9 @@ test("Scheduler-v2 strict metadata does NOT change fba-plan / reconciliation req
 const INSIGHT_SPEC = [
   { rk: "sales-movers:traffic", file: "sales-movers.js", cols: "TRAFFIC_COLUMNS", group: "TRAFFIC_COLUMNS", aggs: "TRAFFIC_AGGREGATIONS", src: "sales-traffic-asin-date", limit: 50000, oc: "child_asin", od: "ASC", strict: true },
   { rk: "sales-movers:ads", file: "sales-movers.js", cols: "ADS_COLUMNS", group: "ADS_COLUMNS", aggs: "ADS_AGGREGATIONS", src: "profit-by-sku-date", limit: 50000, oc: "child_asin", od: "ASC", strict: true },
-  { rk: "sales-movers:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
   { rk: "sales-movers:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   { rk: "buy-box-loss:daily", file: "buy-box.js", cols: "DAILY_COLUMNS", group: null, aggs: null, src: "profit-by-sku-date", limit: 50000, oc: "date", od: "ASC", strict: true },
   { rk: "buy-box-loss:oli-sales", file: "buy-box.js", cols: "OLI_SALES_GROUP_BY", group: "OLI_SALES_GROUP_BY", aggs: "OLI_SALES_AGGREGATIONS", src: "order-line-items", limit: 50000, oc: "date", od: "ASC", strict: true },
-  { rk: "buy-box-loss:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
   { rk: "buy-box-loss:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   { rk: "returns-leakage:returns", file: "returns.js", cols: "RETURN_COLUMNS", group: null, aggs: null, src: "returns", limit: 50000, oc: "date", od: "DESC", strict: true },
   { rk: "returns-leakage:settlements", file: "returns.js", cols: "SETTLEMENT_GROUP_BY", group: "SETTLEMENT_GROUP_BY", aggs: "SETTLEMENT_AGGREGATIONS", src: "settlements", limit: 50000, oc: "sku", od: "ASC", strict: true },
@@ -1078,7 +1073,6 @@ const INSIGHT_SPEC = [
   { rk: "listing-health:listings", file: "listing-health.js", cols: "LISTING_COLUMNS", group: null, aggs: null, src: "listings", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   { rk: "listing-health:listings-raw", file: "listing-health.js", cols: "LISTING_RAW_COLUMNS", group: null, aggs: null, src: "listings-raw", limit: 20000, oc: "child_asin", od: "ASC", strict: true, policy: "degraded" },
   { rk: "listing-health:sales", file: "listing-health.js", cols: "SALES_COLUMNS", group: "SALES_COLUMNS", aggs: "SALES_AGGREGATIONS", src: "profit-by-sku-date", limit: 50000, oc: "sku", od: "ASC", strict: true },
-  { rk: "listing-health:inventory", file: "common.js", cols: "INVENTORY_COLUMNS", group: null, aggs: null, src: "fba-inventory-health", limit: 15000, oc: "date", od: "DESC", strict: true },
   { rk: "listing-health:catalog", file: "common.js", cols: "CATALOG_COLUMNS", group: null, aggs: null, src: "product-catalog", limit: 20000, oc: "child_asin", od: "ASC", strict: true },
   // PPC Performance (ads are derived; this is the only owned export besides catalog)
   { rk: "ppc-performance:oli-sales", file: "ppc.js", cols: "OLI_SALES_GROUP_BY", group: "OLI_SALES_GROUP_BY", aggs: "OLI_SALES_AGGREGATIONS", src: "order-line-items", limit: 50000, oc: "date", od: "ASC", strict: true },
@@ -1113,6 +1107,24 @@ test("insight contracts (all six reports) match their executable builder constan
   }
 });
 
+test("FBA Inventory Health retired: no insight contract requests it and no insight builder FETCHES it", () => {
+  for (const rk of ["sales-movers", "buy-box-loss", "listing-health"]) {
+    assert.ok(!REPORT_SOURCE_CONTRACTS[rk].some((c) => /:inventory$/.test(c.requestKey)), rk + " owns no inventory request");
+    assert.ok(!REPORT_SOURCE_CONTRACTS[rk].some((c) => c.sourceKey === "fba-inventory-health"), rk + " never requests FBA Inventory Health");
+  }
+  // CODE lines only (a comment documenting the retirement is not a fetch): no insight builder calls a Health fetch helper,
+  // names the Health columns / table / id, or imports the FBA_INVENTORY_HEALTH source definition. (The saved Health
+  // snapshot is read only through the dated read-only bridge -- source_snapshots, never an export.)
+  const code = (f) => builderText(f).split("\n").filter((l) => { const t = l.trim(); return !t.startsWith("//") && !t.startsWith("*"); }).join("\n");
+  for (const f of ["common.js", "sales-movers.js", "buy-box.js", "listing-health.js"]) {
+    assert.ok(!/fetchInventorySnapshot|\bINVENTORY_COLUMNS\b|FBA_INVENTORY_HEALTH|44fc5ba0|amazon_fba_inventory_health/.test(code(f)), f + " carries no FBA Inventory Health fetch or constant");
+  }
+  // sources.js may keep the retired identity constant, but NOTHING imports it (so no builder can fetch with it).
+  for (const f of ["common.js", "sales-movers.js", "buy-box.js", "listing-health.js", "listing-health-advanced.js", "derivation-core.js"]) {
+    assert.ok(!/FBA_INVENTORY_HEALTH/.test(code(f)), f + " never imports FBA_INVENTORY_HEALTH");
+  }
+});
+
 test("sales-movers latest-date probe is a NON-strict date rollup (limit 500) matching fetchSalesTrafficLatestDate", () => {
   const c = byKey(REPORT_SOURCE_CONTRACTS["sales-movers"], "sales-movers:sales-latest-probe");
   assert.deepEqual(c.columns, ["date"]);
@@ -1133,7 +1145,6 @@ const smWin = {
   "sales-movers:sales-latest-probe": [{ from: "2025-07-12", to: "2025-08-06" }],
   "sales-movers:traffic": [{ from: "2025-07-24", to: "2025-07-30" }, { from: "2025-07-17", to: "2025-07-23" }],
   "sales-movers:ads": [{ from: "2025-07-24", to: "2025-07-30" }, { from: "2025-07-17", to: "2025-07-23" }],
-  "sales-movers:inventory": [{ from: "2025-07-27", to: "2025-08-06" }],
   "sales-movers:catalog": [{ from: null, to: null }],
 };
 const bbWin = {
@@ -1143,7 +1154,6 @@ const bbWin = {
   ],
   // Blocker 1: canonical OLI sales fragment sliced by canonicalOliSlices over the buy-box 28-day window.
   "buy-box-loss:oli-sales": canonicalOliSlices("2025-07-10", "2025-08-06"),
-  "buy-box-loss:inventory": [{ from: "2025-07-27", to: "2025-08-06" }],
   "buy-box-loss:catalog": [{ from: null, to: null }],
 };
 const retWin = {
@@ -1174,7 +1184,7 @@ for (const [rep, win, sig] of [["sales-movers", smWin, SM_PROBE_OK], ["buy-box-l
   }
 }
 
-test("sales-movers traffic + ads each resolve to exactly their 2 windows; probe/inventory/catalog do not inherit them", () => {
+test("sales-movers traffic + ads each resolve to exactly their 2 windows; probe/catalog do not inherit them", () => {
   const got = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: smWin, dependencySignals: SM_PROBE_OK });
   assert.equal(got.filter((r) => r.requestKey === "sales-movers:traffic").length, 2);
   assert.equal(got.filter((r) => r.requestKey === "sales-movers:ads").length, 2);
@@ -1190,7 +1200,8 @@ test("buy-box-loss daily resolves to one request per 7-day slice (4 slices; addi
   const daily = got.filter((r) => r.requestKey === "buy-box-loss:daily");
   assert.equal(daily.length, 4);
   assert.equal(new Set(daily.map((r) => r.requestHash)).size, 4); // four distinct slice identities
-  assert.equal(got.filter((r) => r.requestKey === "buy-box-loss:inventory").length, 1);
+  // FBA Inventory Health is retired: Buy Box owns NO inventory request (stock comes from saved Listings).
+  assert.equal(got.filter((r) => r.requestKey.endsWith(":inventory")).length, 0);
 });
 
 test("(12) the common insight catalog is ONE request identity shared across Sales Movers / Buy Box / Returns", () => {
@@ -1200,10 +1211,18 @@ test("(12) the common insight catalog is ONE request identity shared across Sale
   assert.equal(h1, h2); assert.equal(h2, h3); // identical columns/limit/window/order => fetched once
 });
 
-test("(12) the FBA inventory snapshot is ONE request identity shared by Sales Movers + Buy Box", () => {
-  const inv = (rep, win, sig) => reportSourceRequestHashes({ reportKey: rep, apiKey: "k", ids: ["A1"], windowsByRequestKey: win, dependencySignals: sig })
-    .find((r) => r.requestKey.endsWith(":inventory")).requestHash;
-  assert.equal(inv("sales-movers", smWin, SM_PROBE_OK), inv("buy-box-loss", bbWin));
+test("(12) FBA Inventory Health retired: Sales Movers, Buy Box and Listing Health resolve NO inventory / Health request", () => {
+  const all = [
+    ...reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: smWin, dependencySignals: SM_PROBE_OK }),
+    ...reportSourceRequestHashes({ reportKey: "buy-box-loss", apiKey: "k", ids: ["A1"], windowsByRequestKey: bbWin }),
+    ...reportSourceRequestHashes({ reportKey: "listing-health", apiKey: "k", ids: ["A1"], windowsByRequestKey: {
+      "listing-health:listings": [{ from: null, to: null }], "listing-health:listings-raw": [{ from: null, to: null }],
+      "listing-health:sales": [{ from: "2025-07-08", to: "2025-08-06" }], "listing-health:catalog": [{ from: null, to: null }],
+    } }),
+  ];
+  assert.ok(all.length > 0);
+  assert.equal(all.filter((r) => r.requestKey.endsWith(":inventory")).length, 0);
+  assert.equal(all.filter((r) => r.sourceKey === "fba-inventory-health").length, 0);
 });
 
 test("(Blocker 1) Buy Box + Returns SHARE the same request_hash on an overlapping canonical OLI slice (one export, many owners)", () => {
@@ -1239,7 +1258,6 @@ const lhWin = {
   "listing-health:listings": [{ from: null, to: null }],
   "listing-health:listings-raw": [{ from: null, to: null }],
   "listing-health:sales": [{ from: "2025-07-08", to: "2025-08-06" }],
-  "listing-health:inventory": [{ from: "2025-07-27", to: "2025-08-06" }],
   "listing-health:catalog": [{ from: null, to: null }],
 };
 const ppcWin = {
@@ -1401,11 +1419,11 @@ test("Sales Movers — fresh validated probe with a date activates downstream wi
     "sales-movers:sales-latest-probe": [{ from: "2025-07-12", to: "2025-08-06" }],
     "sales-movers:traffic": [w.recent, w.prior],
     "sales-movers:ads": [w.recent, w.prior],
-    "sales-movers:inventory": [{ from: "2025-07-27", to: "2025-08-06" }],
     "sales-movers:catalog": [{ from: null, to: null }],
   };
   const jobs = reportSourceRequestHashes({ reportKey: "sales-movers", apiKey: "k", ids: ["A1"], windowsByRequestKey: win, dependencySignals: SM_PROBE_OK });
-  assert.deepEqual(keysOf(jobs), ["sales-movers:ads", "sales-movers:catalog", "sales-movers:inventory", "sales-movers:sales-latest-probe", "sales-movers:traffic"]);
+  // No inventory job: FBA Inventory Health is retired (Sales Movers reads FBA stock from saved Listings).
+  assert.deepEqual(keysOf(jobs), ["sales-movers:ads", "sales-movers:catalog", "sales-movers:sales-latest-probe", "sales-movers:traffic"]);
   const traffic = jobs.filter((j) => j.requestKey === "sales-movers:traffic");
   assert.deepEqual(traffic.map((j) => [j.from, j.to]).sort(), [["2025-07-17", "2025-07-23"], ["2025-07-24", "2025-07-30"]]); // derived, not calendar-guessed
   const dep = traffic[0].dependency;
@@ -1553,7 +1571,6 @@ const smDownstreamWin = (date) => {
     "sales-movers:sales-latest-probe": [{ from: "2025-07-12", to: "2025-08-06" }],
     "sales-movers:traffic": [w.recent, w.prior],
     "sales-movers:ads": [w.recent, w.prior],
-    "sales-movers:inventory": [{ from: "2025-07-27", to: "2025-08-06" }],
     "sales-movers:catalog": [{ from: null, to: null }],
   };
 };
@@ -1599,19 +1616,19 @@ test("Sales Movers — mismatched / missing / duplicated / extra / reordered win
 test("Sales Movers — latestReportedDate must fall inside the actual probe window (boundaries inclusive)", () => {
   // probe window is 2025-07-12 .. 2025-08-06
   // equal to boundaries => allowed
-  assert.equal(smResolve(smDownstreamWin("2025-07-12"), "2025-07-12").length, 7); // == from
-  assert.equal(smResolve(smDownstreamWin("2025-08-06"), "2025-08-06").length, 7); // == to
+  // probe + 2 traffic + 2 ads + catalog (no inventory job: FBA Inventory Health is retired)
+  assert.equal(smResolve(smDownstreamWin("2025-07-12"), "2025-07-12").length, 6); // == from
+  assert.equal(smResolve(smDownstreamWin("2025-08-06"), "2025-08-06").length, 6); // == to
   // before from / after to => rejected
   assert.throws(() => smResolve(smDownstreamWin("2025-07-11"), "2025-07-11"), /outside the probe window/);
   assert.throws(() => smResolve(smDownstreamWin("2025-08-07"), "2025-08-07"), /outside the probe window/);
 });
 
-test("Sales Movers — inventory as-of window and catalog no-date window are preserved (not bound)", () => {
+test("Sales Movers — catalog no-date window is preserved (not bound); no inventory job exists", () => {
   const jobs = smResolve(smDownstreamWin("2025-07-30"), "2025-07-30");
-  const inv = jobs.find((j) => j.requestKey === "sales-movers:inventory");
   const cat = jobs.find((j) => j.requestKey === "sales-movers:catalog");
-  assert.deepEqual([inv.from, inv.to], ["2025-07-27", "2025-08-06"]); // as-of preserved
   assert.deepEqual([cat.from, cat.to], [null, null]);                  // no-date preserved
+  assert.equal(jobs.filter((j) => j.requestKey.endsWith(":inventory")).length, 0); // FBA Inventory Health retired
 });
 
 test("Sales Movers — kickoff (probe only) is untouched by the window binding", () => {

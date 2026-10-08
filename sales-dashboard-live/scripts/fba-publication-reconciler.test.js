@@ -1,14 +1,15 @@
 // FBA-inventory publication reconciler orchestration: the REAL shared reconciler core + REAL FBA revision/binding, with
-// injected durable-FBA readers / control hooks / release execution (clearly labelled). Covers the required reproduction
-// cases: saved-but-unpromoted -> publish+readback; same revision -> zero writes; date-advanced revision -> republish;
-// valid-empty -> eligible (unavailable, never zero); one bad/absent account does not block healthy accounts;
-// per-account read isolation; missing snapshot preserves LKG; readback failure -> non-green; manual dry-run -> zero
+// injected durable-inventory readers / control hooks / release execution (clearly labelled). Since the Listings inventory
+// cutover the durable evidence is the account's SAVED LISTINGS pointer (public.source_listings_snapshot) and the
+// requested-day proof is its as_of (no request-hash resolver). Covers the required reproduction cases: saved-but-unpromoted
+// -> publish+readback; same revision -> zero writes; same-day correction -> republish; valid-empty -> eligible
+// (unavailable, never zero); wrong-day pointer -> defer; one bad/absent account does not block healthy accounts;
+// per-account read isolation; missing pointer preserves LKG; readback failure -> non-green; manual dry-run -> zero
 // writes; zero provider export. Offline; zero network. 7-bit ASCII, LF.
 import assert from "node:assert/strict";
 import { writeSync, readFileSync } from "node:fs";
 import { buildFbaPublicationReconciler, FBA_RECONCILE_STATUS } from "../lib/server/sync/fba-publication-reconciler.js";
-import { fbaContentProvenanceToken } from "../lib/server/sync/fba-inventory-revision.js";
-import { FBA_INVENTORY_SOURCE_KEY } from "../lib/server/sync/source-durable-model.js";
+import { fbaContentProvenanceToken, FBA_INVENTORY_DURABLE_SOURCE_KEY } from "../lib/server/sync/fba-inventory-revision.js";
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -22,19 +23,23 @@ const RD = { "brand-inventory": { snapshotVersion: "brand-inventory/shadow", val
 const HASH = (v, params) => v + "|" + JSON.stringify(params);
 const shParamsFor = (accountId, to) => ({ reportVersion: "brand-inventory/shadow", accountId, to: to || ASOF });
 const shHashFor = (accountId, to) => HASH("brand-inventory/shadow", shParamsFor(accountId, to));
+// A SAVED LISTINGS pointer (public.source_listings_snapshot) for the requested day unless overridden.
+const ptr = (rh, ps, rc, over = {}) => ({
+  as_of: ASOF, source_request_hash: rh, payload_sha: ps, row_count: rc,
+  validated_at: "2026-09-10T04:00:00Z", object_path: "source-snapshots/listings/acct/" + ps + ".json", ...over,
+});
 
-// Harness: REAL FBA reconciler + REAL revision/binding + injected readers/control/release. Per-account durable FBA
-// snapshot modelled by snapshotByAccount; the expected D-1 request hash by expectedHashByAccount (default = the
-// snapshot's own request hash, i.e. a proven-D-1 snapshot). Staleness is modelled by liveRefresh (set on a successful
-// promote) + jobDurableContentDeps (the report job's durable_content_deps; default = the account's CURRENT FBA content
-// token -> covered; set to [] or an OLD token to model a not-covered same-date/date-advance correction).
+// Harness: REAL FBA reconciler + REAL revision/binding + injected readers/control/release. Per-account saved Listings
+// pointer modelled by snapshotByAccount (as_of = ASOF -> the requested day unless a test overrides it). Staleness is
+// modelled by liveRefresh (set on a successful promote) + jobDurableContentDeps (the report job's durable_content_deps;
+// default = the account's CURRENT content token -> covered; set to [] or an OLD token to model a not-covered correction).
+// resolveExpectedRequestHash is NOT passed by default (retired); a test passes a trap to prove it is never called.
 function makeHarness(over = {}) {
   const calls = { release: [], openControls: [], closeControls: [], releaseRevisions: [], snapshotReads: [] };
   const snapshotByAccount = over.snapshotByAccount || new Map([
-    ["A01", { source_request_hash: "rh-A01", payload_sha: "ps-A01", row_count: 12 }],
-    ["A02", { source_request_hash: "rh-A02", payload_sha: "ps-A02", row_count: 0 }], // valid EMPTY (unavailable, not zero)
-  ]); // A03 (in accounts, not here) -> no snapshot -> DEFERRED_PROVENANCE
-  const expectedHashByAccount = over.expectedHashByAccount || null; // null -> derive from the snapshot (proven-D-1)
+    ["A01", ptr("rh-A01", "ps-A01", 12)],
+    ["A02", ptr("rh-A02", "ps-A02", 0)], // valid EMPTY (unavailable, not zero)
+  ]); // A03 (in accounts, not here) -> no pointer -> DEFERRED_PROVENANCE
   const jobDurableContentDeps = over.jobDurableContentDeps || null; // null -> [current content token] (covered)
   const shadowRefresh = over.shadowRefresh || new Map();
   const liveRefresh = over.liveRefresh || new Map();
@@ -45,15 +50,14 @@ function makeHarness(over = {}) {
   const attempts = new Map();
   const releaseFor = over.releaseFor || (() => ({ ok: true, code: 0 }));
   const shRef = (a) => shadowRefresh.get(a) || "2026-09-10T05:00:00Z";
-  const expectedHashOf = (a) => (expectedHashByAccount ? (expectedHashByAccount.get(a) || "") : (snapshotByAccount.get(a) ? snapshotByAccount.get(a).source_request_hash : ""));
-  // The CURRENT FBA content token for account a (what computeFbaAccountRevision produces as contentDeps[0]).
-  const tokenOf = (a) => { const s = snapshotByAccount.get(a); return s ? fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: a, connectionId: "primary", requestHash: s.source_request_hash, contentSha: s.payload_sha }) : ""; };
+  // The CURRENT content token for account a (what computeFbaAccountRevision produces as contentDeps[0]).
+  const tokenOf = (a) => { const s = snapshotByAccount.get(a); return s ? fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_DURABLE_SOURCE_KEY, accountId: a, connectionId: "primary", requestHash: s.source_request_hash, contentSha: s.payload_sha }) : ""; };
   const contentDepsOf = (a) => (jobDurableContentDeps ? (jobDurableContentDeps.get(a) || []) : (snapshotByAccount.get(a) ? [tokenOf(a)] : []));
   const reconciler = buildFbaPublicationReconciler({
     resolveOrg: async () => over.org || ({ organizationFingerprint: "org-1", connectionId: "primary" }),
     bucketAccounts: async () => over.accounts || [{ accountId: "A01" }, { accountId: "A02" }, { accountId: "A03" }],
     readFbaSnapshot: over.readFbaSnapshot || (async ({ accountId }) => { calls.snapshotReads.push(accountId); const s = snapshotByAccount.get(accountId); return s ? { read: "ok", snapshot: s } : { read: "ok", snapshot: null }; }),
-    resolveExpectedRequestHash: over.resolveExpectedRequestHash || (async ({ accountId }) => expectedHashOf(accountId)),
+    ...(over.resolveExpectedRequestHash ? { resolveExpectedRequestHash: over.resolveExpectedRequestHash } : {}),
     readLatestReportJob: async ({ accountId }) => {
       if (!snapshotByAccount.has(accountId)) return null;
       const promo = jobPromotable.has(accountId) ? jobPromotable.get(accountId) : true;
@@ -107,9 +111,9 @@ test("test 2: current durable FBA already promoted (live bound + verified) -> PU
 // a new token, likewise not covered).
 test("test 3: durable FBA SAME-DATE correction (new payload_sha) -> content token not covered -> STALE -> re-derive + promote", async () => {
   const liveRefresh = new Map([["A01", "2026-09-10T05:00:00Z"]]); // a live exists (built from the OLD content)
-  const snapshotByAccount = new Map([["A01", { source_request_hash: "rh-A01", payload_sha: "ps-CORRECTED", row_count: 9 }]]);
-  // the latest job recorded the OLD content token (built before the same-date correction)
-  const oldToken = fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_SOURCE_KEY, accountId: "A01", connectionId: "primary", requestHash: "rh-A01", contentSha: "ps-OLD" });
+  const snapshotByAccount = new Map([["A01", ptr("rh-A01", "ps-CORRECTED", 9)]]);
+  // the latest job recorded the OLD content token (built before the same-day correction)
+  const oldToken = fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_DURABLE_SOURCE_KEY, accountId: "A01", connectionId: "primary", requestHash: "rh-A01", contentSha: "ps-OLD" });
   const jobDurableContentDeps = new Map([["A01", [oldToken]]]);
   const h = makeHarness({ accounts: [{ accountId: "A01" }], snapshotByAccount, jobDurableContentDeps, liveRefresh });
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
@@ -121,7 +125,7 @@ test("test 3: durable FBA SAME-DATE correction (new payload_sha) -> content toke
 test("test 2b: current FBA content already promoted (durable_content_deps holds the current token) -> PUBLICATION_NOT_REQUIRED, zero writes", async () => {
   const h = makeHarness({
     accounts: [{ accountId: "A01" }],
-    snapshotByAccount: new Map([["A01", { source_request_hash: "rh-A01", payload_sha: "ps-A01", row_count: 5 }]]),
+    snapshotByAccount: new Map([["A01", ptr("rh-A01", "ps-A01", 5)]]),
     liveRefresh: new Map([["A01", "2026-09-10T05:00:00Z"]]),
     // jobDurableContentDeps defaults to [current token] -> covered
   });
@@ -131,7 +135,7 @@ test("test 2b: current FBA content already promoted (durable_content_deps holds 
 
 // (4) one bad account (ineligible) does not block healthy accounts.
 test("test 4: one account with NO durable snapshot does not block a healthy account (per-account isolation)", async () => {
-  const snapshotByAccount = new Map([["A01", { source_request_hash: "rh-A01", payload_sha: "ps-A01", row_count: 3 }]]); // A02 absent
+  const snapshotByAccount = new Map([["A01", ptr("rh-A01", "ps-A01", 3)]]); // A02 absent
   const h = makeHarness({ accounts: [{ accountId: "A01" }, { accountId: "A02" }], snapshotByAccount });
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
   ok("A01 published; A02 deferred; the healthy account was NOT suppressed", stateOf(out, "A01", "brand-inventory") === FBA_RECONCILE_STATUS.READBACK_VERIFIED && stateOf(out, "A02", "brand-inventory") === FBA_RECONCILE_STATUS.DEFERRED_PROVENANCE);
@@ -139,7 +143,7 @@ test("test 4: one account with NO durable snapshot does not block a healthy acco
 
 // (per-account read isolation) a snapshot read that THROWS for one account defers ONLY that account.
 test("per-account read isolation: readFbaSnapshot THROWS for A02 -> A02 deferred, A01 healthy publishes", async () => {
-  const snapshotByAccount = new Map([["A01", { source_request_hash: "rh-A01", payload_sha: "ps-A01", row_count: 3 }], ["A02", { source_request_hash: "rh-A02", payload_sha: "ps-A02", row_count: 3 }]]);
+  const snapshotByAccount = new Map([["A01", ptr("rh-A01", "ps-A01", 3)], ["A02", ptr("rh-A02", "ps-A02", 3)]]);
   const h = makeHarness({
     accounts: [{ accountId: "A01" }, { accountId: "A02" }], snapshotByAccount,
     readFbaSnapshot: async ({ accountId }) => { if (accountId === "A02") throw new Error("boom"); const s = snapshotByAccount.get(accountId); return { read: "ok", snapshot: s }; },
@@ -152,8 +156,8 @@ test("per-account read isolation: readFbaSnapshot THROWS for A02 -> A02 deferred
 test("read!='ok' for A02 -> A02 deferred (LKG preserved); A01 publishes; whole run stays ok", async () => {
   const h = makeHarness({
     accounts: [{ accountId: "A01" }, { accountId: "A02" }],
-    snapshotByAccount: new Map([["A01", { source_request_hash: "rh-A01", payload_sha: "ps", row_count: 4 }], ["A02", { source_request_hash: "rh-A02", payload_sha: "ps", row_count: 4 }]]),
-    readFbaSnapshot: async ({ accountId }) => (accountId === "A02" ? { read: "read-failed" } : { read: "ok", snapshot: { source_request_hash: "rh-A01", payload_sha: "ps", row_count: 4 } }),
+    snapshotByAccount: new Map([["A01", ptr("rh-A01", "ps", 4)], ["A02", ptr("rh-A02", "ps", 4)]]),
+    readFbaSnapshot: async ({ accountId }) => (accountId === "A02" ? { read: "read-failed" } : { read: "ok", snapshot: ptr("rh-A01", "ps", 4) }),
   });
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
   ok("A02 read-failed -> DEFERRED_PROVENANCE; A01 published; ok:true", stateOf(out, "A02", "brand-inventory") === FBA_RECONCILE_STATUS.DEFERRED_PROVENANCE && stateOf(out, "A01", "brand-inventory") === FBA_RECONCILE_STATUS.READBACK_VERIFIED && out.ok === true);
@@ -170,25 +174,53 @@ test("test 6: a missing durable FBA snapshot preserves the existing live LKG (no
 
 // (7) valid FBA empty becomes an eligible (unavailable) publication, never zero -- proven at the reconciler level.
 test("test 7: a VALID EMPTY durable FBA snapshot is ELIGIBLE and publishes (inventory unavailable), never deferred-as-missing, never zero", async () => {
-  const snapshotByAccount = new Map([["A02", { source_request_hash: "rh-A02", payload_sha: "ps-empty", row_count: 0 }]]);
+  const snapshotByAccount = new Map([["A02", ptr("rh-A02", "ps-empty", 0)]]);
   const h = makeHarness({ accounts: [{ accountId: "A02" }], snapshotByAccount });
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
   ok("A02 valid-empty is eligible + published (not DEFERRED_PROVENANCE)", stateOf(out, "A02", "brand-inventory") === FBA_RECONCILE_STATUS.READBACK_VERIFIED);
   ok("its revision folded a real content hash (a genuine snapshot, not a manufactured zero)", h.calls.releaseRevisions.find((r) => r.accountId === "A02").revisionId.length === 32);
 });
 
-// (8) an OLDER/other-day durable snapshot (cannot prove D-1) is DEFERRED, never published as fresh.
-test("test 8: a durable snapshot that cannot prove the requested D-1 (request hash != recomputed) -> DEFERRED_PROVENANCE (never published as fresh)", async () => {
-  const snapshotByAccount = new Map([["A01", { source_request_hash: "rh-STALE", payload_sha: "ps", row_count: 5 }]]);
-  const expectedHashByAccount = new Map([["A01", "rh-D1-EXPECTED"]]); // recomputed D-1 hash differs from the snapshot's
-  const h = makeHarness({ accounts: [{ accountId: "A01" }], snapshotByAccount, expectedHashByAccount });
+// (8) a WRONG-DAY saved Listings pointer (as_of != the requested day) is DEFERRED, never published as fresh.
+test("test 8: a saved Listings pointer for ANOTHER day (as_of != requested) -> DEFERRED_PROVENANCE (never published as fresh)", async () => {
+  const snapshotByAccount = new Map([["A01", ptr("rh-A01", "ps", 5, { as_of: "2026-09-09" })]]);
+  const h = makeHarness({ accounts: [{ accountId: "A01" }], snapshotByAccount });
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
-  ok("A01 DEFERRED_PROVENANCE (snapshot-not-d1); no release; LKG preserved", stateOf(out, "A01", "brand-inventory") === FBA_RECONCILE_STATUS.DEFERRED_PROVENANCE && h.calls.release.length === 0);
+  ok("A01 DEFERRED_PROVENANCE (listings-snapshot-not-requested-day); no release; no controls; LKG preserved", stateOf(out, "A01", "brand-inventory") === FBA_RECONCILE_STATUS.DEFERRED_PROVENANCE && h.calls.release.length === 0 && h.calls.openControls.length === 0);
+  // The SAME pointer is eligible on the day it was recorded for.
+  const h2 = makeHarness({ accounts: [{ accountId: "A01" }], snapshotByAccount, candTo: "2026-09-09" });
+  const out2 = await h2.reconciler.run({ bucket: "india", requestedAsOf: "2026-09-09", mode: "periodic" });
+  ok("the same pointer publishes for ITS own requested day (2026-09-09)", h2.calls.release.length === 1 && stateOf(out2, "A01", "brand-inventory") === FBA_RECONCILE_STATUS.READBACK_VERIFIED);
+});
+
+// (8b) the retired request-hash resolver is neither required nor consulted.
+test("test 8b: resolveExpectedRequestHash is RETIRED -- not required to build, and a provided one is NEVER called", async () => {
+  let threw = null;
+  try { makeHarness({ accounts: [{ accountId: "A01" }] }); } catch (e) { threw = e; }
+  ok("the reconciler builds WITHOUT resolveExpectedRequestHash", threw === null);
+  let resolverCalls = 0;
+  const h = makeHarness({ accounts: [{ accountId: "A01" }], resolveExpectedRequestHash: async () => { resolverCalls += 1; return "rh-SOMETHING-ELSE"; } });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("a provided resolver is never called; the as_of-proven pointer still publishes", resolverCalls === 0 && stateOf(out, "A01", "brand-inventory") === FBA_RECONCILE_STATUS.READBACK_VERIFIED);
+  let threwNoReader = null;
+  try { buildFbaPublicationReconciler({}); } catch (e) { threwNoReader = e; }
+  ok("readFbaSnapshot is still REQUIRED (fail closed)", !!threwNoReader && /requires readFbaSnapshot/.test(String(threwNoReader.message)));
+});
+
+// (8c) a brand-inventory job published BEFORE the cutover recorded a Health-keyed content token: it never covers the
+// Listings revision, so the first requested-day Listings pointer re-derives + promotes the compact.
+test("test 8c: a pre-cutover Health-keyed durable_content_deps token never covers the Listings revision -> STALE -> re-derive + promote", async () => {
+  const snapshotByAccount = new Map([["A01", ptr("rh-A01", "ps-A01", 6)]]);
+  const healthToken = ["fba-inventory-health", "A01", "primary", "rh-A01", "ps-A01"].join("|");
+  const h = makeHarness({ accounts: [{ accountId: "A01" }], snapshotByAccount, jobDurableContentDeps: new Map([["A01", [healthToken]]]), liveRefresh: new Map([["A01", "2026-09-10T05:00:00Z"]]) });
+  const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
+  ok("A01 re-derived from the saved Listings pointer (READBACK_VERIFIED, one release)", stateOf(out, "A01", "brand-inventory") === FBA_RECONCILE_STATUS.READBACK_VERIFIED && h.calls.release.length === 1);
+  ok("the Listings content token is 'listings|...'", fbaContentProvenanceToken({ sourceKey: FBA_INVENTORY_DURABLE_SOURCE_KEY, accountId: "A01", connectionId: "primary", requestHash: "rh-A01", contentSha: "ps-A01" }).startsWith("listings|A01|primary|"));
 });
 
 // (14) a readback failure after a write produces a NON-GREEN status.
 test("test 14: a release that fails at readback -> FAILED_READBACK, outcome failed, ok:false", async () => {
-  const h = makeHarness({ accounts: [{ accountId: "A01" }], snapshotByAccount: new Map([["A01", { source_request_hash: "rh-A01", payload_sha: "ps", row_count: 5 }]]), releaseFor: () => ({ ok: false, code: 1, stage: "readback", reason: "live read-back failed" }) });
+  const h = makeHarness({ accounts: [{ accountId: "A01" }], snapshotByAccount: new Map([["A01", ptr("rh-A01", "ps", 5)]]), releaseFor: () => ({ ok: false, code: 1, stage: "readback", reason: "live read-back failed" }) });
   const out = await h.reconciler.run({ bucket: "india", requestedAsOf: ASOF, mode: "periodic" });
   ok("A01 FAILED_READBACK; outcome failed; ok:false", stateOf(out, "A01", "brand-inventory") === FBA_RECONCILE_STATUS.FAILED_READBACK && out.outcome === "failed" && out.ok === false);
 });
@@ -217,6 +249,7 @@ test("dependency-safety: the FBA reconciler wrapper + core reference NO provider
     ok("core has no '" + sym + "'", !core.includes(sym));
   }
   ok("wrapper imports the FBA registry + FBA revision + shared core only (never datadoe/source-sync-driver)", /from "\.\/fba-dependent-reports\.js"/.test(wrap) && /from "\.\/fba-inventory-revision\.js"/.test(wrap) && /from "\.\/saved-data-reconciler\.js"/.test(wrap) && !/from "\.\.\/datadoe/.test(wrap) && !/source-sync-driver/.test(wrap));
+  ok("wrapper no longer consults a request-hash resolver (the pointer's as_of is the proof)", !/await resolveExpectedRequestHash\(/.test(wrap) && !/expectedRequestHash:/.test(wrap));
 });
 
 // ENTRYPOINT GUARD (blocker 3): the FBA reconcile path re-derives + publishes ONLY brand-inventory via the DEDICATED
@@ -232,6 +265,10 @@ test("entrypoint guard: fba-publication-reconcile.mjs drives the DEDICATED brand
   ok("the entrypoint drives buildFbaBrandInventoryRelease.runForAccount (dedicated brand-inventory release)", /buildFbaBrandInventoryRelease\(/.test(mjs) && /release\.runForAccount\(/.test(mjs));
   ok("the entrypoint NEVER uses the priority trio release (buildPriorityDashboardsRelease / runPriorityDashboardsRelease)", !/buildPriorityDashboardsRelease/.test(mjs) && !/runPriorityDashboardsRelease/.test(mjs));
   ok("no real provider export/token transport symbol in the entrypoint", !/createExport\(/.test(mjs) && !/makeDataDoeAdapter/.test(mjs) && !/exportsCreate/.test(mjs) && !/reserveTokens/.test(mjs) && !/oli-refresh-d1/.test(mjs) && !/source-sync-driver/.test(mjs));
+  // Listings inventory cutover with the read-only Health bridge: the RECONCILER's revision evidence is the SAVED LISTINGS
+  // pointer; the brand-inventory RELEASE may still read the last saved Health snapshot, but only as the dated bridge.
+  ok("the reconciler's revision reads the SAVED LISTINGS pointer (getSourceListingsSnapshot); no request-hash resolver is wired",
+    /sb\.getSourceListingsSnapshot\(/.test(mjs) && /readFbaSnapshot: readListingsRevisionSnapshot,/.test(mjs) && /readListingsSnapshot: readListingsRevisionSnapshot,/.test(mjs) && !/resolvedFbaSnapshot/.test(mjs) && !/resolveExpectedRequestHash/.test(mjs));
   ok("no export transport symbol in the dedicated release module (reads only durable data + writes the fenced CAS)", !/createExport/.test(rel) && !/makeDataDoeAdapter/.test(rel) && !/exportsCreate/.test(rel) && !/reserveTokens/.test(rel) && !/source-sync-driver/.test(rel) && !/from "\.\.\/datadoe/.test(rel));
   // (2) reviewed priority-partial namespace + capability preflight; cycle bucket over {accountId, FBA revisionId}.
   ok("cycle bucket is priority-partial-<region>-<16hex> over {accountId, revisionId}", /"priority-partial-" \+ b \+ "-" \+ sha256\(JSON\.stringify\(\[accountId, revisionId/.test(mjs));

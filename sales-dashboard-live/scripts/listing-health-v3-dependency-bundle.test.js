@@ -37,7 +37,8 @@ const durableCtxOk = () => ({
 });
 const INV_HASH = "rh-inv";
 const INV_PATH = pathFor("fba-inventory-health", "sha-i");
-// A fully-valid FBA inventory pointer (source_snapshots projection: org/conn/source_key/scope_key + real namespace path).
+// A fully-valid saved FBA Inventory Health pointer (source_snapshots projection: org/conn/source_key/scope_key + real
+// namespace path) -- the read-only BRIDGE (Listings inventory CUTOVER: no D-1 Health identity is required any more).
 const invPtr = (o = {}) => ({ organization_fingerprint: ORG, connection_id: CONN, source_key: "fba-inventory-health", scope_key: ACCT, object_path: o.object_path || INV_PATH, payload_sha: o.payload_sha || "sha-i", row_count: o.row_count == null ? 1 : o.row_count, source_request_hash: o.source_request_hash || INV_HASH, validated_at: o.validated_at || "2026-09-04T06:00:00.000Z" });
 const invRows = [{ date: ASOF, seller_or_vendor_id: SELLER, marketplace_country_code: MKT, sku: "A", child_asin: "ASIN-A", available: 30 }];
 
@@ -53,7 +54,6 @@ function harness(over = {}) {
     readListingsRawSnapshot: over.readListingsRawSnapshot || (async () => ({ read: "ok", snapshot: ptr("listings-raw", (over.rawPtr || {})) })),
     readInventorySnapshot: over.readInventorySnapshot || (async () => ({ read: "ok", snapshot: invPtr() })),
     loadSnapshotPayload: over.loadSnapshotPayload || (async (path) => { const p = payloadByPath[path]; if (p === undefined) throw new Error("no payload for " + path); return p; }),
-    resolveExpectedInventoryRequestHash: over.resolveExpectedInventoryRequestHash || (async () => INV_HASH),
     loadDurableContext: over.loadDurableContext || (async () => durableCtxOk()),
     buildObjectPath: sourceSnapshotObjectPath,
   };
@@ -162,7 +162,8 @@ const run = (over = {}) => { const { deps, args } = harness(over); return resolv
 {
   const b = await run();
   ok("happy path: eligible with a 32-hex revisionId + one manifest contentDep + deps=[]", b.eligible === true && /^[0-9a-f]{32}$/.test(b.revisionId) && b.contentDeps.length === 1 && b.contentDeps[0].startsWith("listing-health-v3-manifest|") && b.deps.length === 0);
-  ok("bundle carries listings/raw rows + inventorySource(available) + context(OLI+catalog+rawSellerId)", b.bundle.listingsRows.length === 2 && b.bundle.rawRows.length === 2 && b.bundle.inventorySource.available === true && b.bundle.context.listingHealthV3DurableOli.available === true && b.bundle.context.listingHealthV3DurableCatalog.payloadSha === "sha-cat" && b.bundle.context.rawSellerId === SELLER);
+  ok("bundle carries listings/raw rows + inventoryBridge(available, dated, savedAt) + context(OLI+catalog+rawSellerId)", b.bundle.listingsRows.length === 2 && b.bundle.rawRows.length === 2 && b.bundle.inventoryBridge.available === true && b.bundle.inventoryBridge.rows.length === 1 && b.bundle.inventoryBridge.snapshotDate === ASOF && b.bundle.inventoryBridge.savedAt === "2026-09-04T06:00:00.000Z" && b.bundle.context.listingHealthV3DurableOli.available === true && b.bundle.context.listingHealthV3DurableCatalog.payloadSha === "sha-cat" && b.bundle.context.rawSellerId === SELLER);
+  ok("the derive context carries the SAME saved bridge (listingHealthV3DurableInventory); no inventory fragment", b.bundle.context.listingHealthV3DurableInventory === b.bundle.inventoryBridge && !("inventorySource" in b.bundle));
   // The live-promote / durable-rederive derive validates row ownership against context.marketCountry; the bundle MUST
   // carry the SAME trusted marketplace it proved every durable pointer against, or the derive would fail closed for a
   // legitimate account. This is the provenance thread that keeps the marketplace guard enforced (not fail-open) yet
@@ -179,7 +180,8 @@ const run = (over = {}) => { const { deps, args } = harness(over); return resolv
   ok("a same-as_of OLI row correction changes the revisionId (closes the OLI-freshness gap)", (await run({ loadDurableContext: async () => { const c = durableCtxOk(); c.listingHealthV3DurableOli.rows = [{ ...oliRows[0], sales_amount: 999.5 }]; return c; } })).revisionId !== base);
   ok("an OLI completeness provisional->final changes the revisionId", (await run({ loadDurableContext: async () => { const c = durableCtxOk(); c.listingHealthV3DurableOli.completenessRows = [{ ...durableCtxOk().listingHealthV3DurableOli.completenessRows[0], completeness_status: "provisional", itemization_percent: 20 }]; return c; } })).revisionId !== base);
   ok("a Catalog content (payload_sha) change changes the revisionId", (await run({ loadDurableContext: async () => { const c = durableCtxOk(); c.listingHealthV3DurableCatalog.payloadSha = "sha-cat-v2"; return c; } })).revisionId !== base);
-  ok("FBA available->unavailable changes the revisionId", (await run({ resolveExpectedInventoryRequestHash: async () => "no-match" })).revisionId !== base);
+  ok("FBA bridge available->unavailable (no saved snapshot) changes the revisionId", (await run({ readInventorySnapshot: async () => ({ read: "ok", snapshot: null }) })).revisionId !== base);
+  ok("a saved Health snapshot correction (new payload_sha) changes the revisionId", (await run({ readInventorySnapshot: async () => ({ read: "ok", snapshot: invPtr({ payload_sha: "sha-i2", object_path: pathFor("fba-inventory-health", "sha-i2") }) }), payloadByPath: { [pathFor("fba-inventory-health", "sha-i2")]: { rows: invRows } } })).revisionId !== base);
   // DEFECT-1 (final adversarial review): a same-date, BYTE-IDENTICAL-content re-validation that ONLY advances a
   // dependency's validated_at surfaces into payload.provenance.*FetchedAt, so it MUST flip the revisionId (else equal
   // fingerprint => unequal payload). payload_sha / row_count / request_hash / hydrated rows are all unchanged here.
@@ -220,10 +222,16 @@ await miss("durable OLI unavailable -> defer", { loadDurableContext: async () =>
 await miss("durable Catalog unavailable -> defer", { loadDurableContext: async () => ({ listingHealthV3DurableOli: durableCtxOk().listingHealthV3DurableOli }) }, "durable-catalog-unavailable");
 await miss("catalog sha missing -> defer", { loadDurableContext: async () => { const c = durableCtxOk(); delete c.listingHealthV3DurableCatalog.payloadSha; return c; } }, "durable-catalog-sha-missing");
 
-// ---- (7) resolver: FBA optional -- absent inventory is a stable UNAVAILABLE identity, still eligible ----
+// ---- (7) resolver: the saved bridge is optional -- absent/empty is a stable UNAVAILABLE identity, still eligible ----
 {
-  const b = await run({ resolveExpectedInventoryRequestHash: async () => "" }); // no expected hash -> inventory unavailable
-  ok("optional FBA absence -> eligible with inventorySource.available:false (never an error)", b.eligible === true && b.bundle.inventorySource.available === false);
+  const b = await run({ readInventorySnapshot: async () => ({ read: "ok", snapshot: null }) }); // no saved Health pointer
+  ok("no saved Health snapshot -> eligible with inventoryBridge {available:false, health-snapshot-missing} (never an error)", b.eligible === true && b.bundle.inventoryBridge.available === false && b.bundle.inventoryBridge.reason === "health-snapshot-missing");
+  const e = await run({ readInventorySnapshot: async () => ({ read: "ok", snapshot: invPtr({ row_count: 0 }) }), payloadByPath: { [INV_PATH]: { rows: [] } } });
+  ok("an EMPTY saved Health snapshot -> eligible, bridge unavailable (health-snapshot-empty), never 0 stock", e.eligible === true && e.bundle.inventoryBridge.available === false && e.bundle.inventoryBridge.reason === "health-snapshot-empty");
+  // CUTOVER: an OLD saved snapshot (any date, any request hash) is still handed over -- the derive applies the asOf - 2
+  // bridge threshold and turns a stale bridge into Unavailable; the bundle never demands a D-1 Health identity.
+  const old = await run({ readInventorySnapshot: async () => ({ read: "ok", snapshot: invPtr({ source_request_hash: "rh-some-older-day" }) }), payloadByPath: { [INV_PATH]: { rows: invRows.map((r) => ({ ...r, date: "2026-08-20" })) } } });
+  ok("an older saved Health snapshot (non-D-1 hash/date) is handed over dated -> the derive decides freshness", old.eligible === true && old.bundle.inventoryBridge.available === true && old.bundle.inventoryBridge.snapshotDate === "2026-08-20");
 }
 
 // ---- (8) resolver: abort -> defer, no derive ----

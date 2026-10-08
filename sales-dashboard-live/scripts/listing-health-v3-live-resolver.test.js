@@ -34,7 +34,9 @@ const validPayload = (asOf = EXPECTED_D1, extra = {}) => ({
   accountId: ACCT, asOf, rows: [], catalogBrands: [], currencies: [], issuesAvailable: true,
   window: { kind: "30D", from: WINDOW_FROM, to: asOf, days: 30 },
   coverage: { requestedFrom: WINDOW_FROM, requestedTo: asOf, coveredFrom: WINDOW_FROM, coveredTo: asOf, complete: true, gaps: [] }, salesWindowStatus: "covered",
-  inventory: { available: false }, listingCount: 0, issuesUnavailableReason: null, salesSource: "order-line-items", ...extra,
+  // Listings inventory cutover phase 2: the per-account inventory-source model (validatePayload requires it).
+  inventory: { model: "inventory-source-v1", source: "unavailable", label: "FBA inventory unavailable", available: false, snapshotDate: null, refreshedAt: null, fallbackReasons: ["listings-empty"], unavailableReasons: ["listings-empty", "health-snapshot-missing"], conflicts: [], resolvedConflicts: [] },
+  listingCount: 0, issuesUnavailableReason: null, salesSource: "order-line-items", ...extra,
 });
 // A promoted live row keyed by the EXACT expected D-1 (params_hash = D1_HASH), payload inline unless a storage path.
 const liveRow = (o = {}) => ({
@@ -101,6 +103,10 @@ function make(cfg = {}) {
 // ---- invalid payload / dataUnavailable / no row / blank account ----
 {
   ok("payload fails validatePayload -> payload-contract", (await make({ row: liveRow({ payload: { accountId: ACCT, asOf: EXPECTED_D1 } }) })({ accountId: ACCT })).reason === "payload-contract");
+  // Listings inventory cutover phase 2: a PRE-phase-2 live row (its On Hand FBA chained Health -> Listings per SKU; no
+  // inventory.model) is NEVER served -- the api falls through to the read-only preview, which derives the phase-2 source.
+  ok("a pre-phase-2 live payload (no inventory-source-v1 model) -> payload-contract (never served)",
+    (await make({ row: liveRow({ payload: validPayload(EXPECTED_D1, { inventory: { available: true, snapshotDate: "2026-09-03" } }) }) })({ accountId: ACCT })).reason === "payload-contract");
   ok("payload dataUnavailable:true -> payload-contract", (await make({ row: liveRow({ payload: validPayload(EXPECTED_D1, { dataUnavailable: true }) }) })({ accountId: ACCT })).reason === "payload-contract");
   ok("no promoted row -> no-live-snapshot", (await make({ row: null })({ accountId: ACCT })).reason === "no-live-snapshot");
   ok("blank account -> blank-account (never a cross-account read)", (await make({ row: liveRow() })({ accountId: "" })).reason === "blank-account");

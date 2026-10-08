@@ -2,7 +2,9 @@
 //
 // Part A drives deriveReportSnapshot("sales-movers") against hand-built saved fragments and proves the
 // pure payload deep-equals a hand-computed production-route fixture, plus the no-data path, mixed-currency
-// withholding, inventory null-vs-zero, name/brand precedence, zero-tail exclusion, fail-closed window/
+// withholding, inventory source (Listings inventory CUTOVER: no sales-movers:inventory fragment exists; the derive reads
+// the SAVED evidence from context.insightInventoryEvidence -- here the saved Health bridge with no saved Listings --
+// within the bridge threshold) + null-vs-zero, name/brand precedence, zero-tail exclusion, fail-closed window/
 // account validation, LKG on missing sources, zero network, and idempotency. Part B drives the REAL
 // runSalesMoversShadowCycle + runReportJobs and proves kickoff/staging/resume/isolation and shared-hash
 // canonical dedup.
@@ -52,22 +54,25 @@ function buildSources(planned, rowsByHash, statusOverride = {}) {
 }
 
 // Build Sales Movers planned fragments + rows. `downstream:false` builds only the probe (no-date path).
+// `inventory` = the account's SAVED durable FBA Inventory Health rows (the read-only bridge), delivered to the derive as
+// context evidence (never a fragment); null => no bridge evidence at all.
 function smPlanned({ probeRows, trafficRecent = [], trafficPrior = [], adsRecent = [], adsPrior = [], inventory = [], catalog = [], ids = [ID], downstream = true } = {}) {
   const planned = []; const rows = {};
+  const evidence = inventory == null ? null : { listings: null, healthBridge: { rows: inventory, unavailableReason: null, snapshotDate: null, savedAt: null } };
   const pf = frag("sales-movers:sales-latest-probe", PROBE_FROM, ASOF, ids); planned.push(pf); rows[pf.requestHash] = probeRows;
   if (downstream) {
     const tr = frag("sales-movers:traffic", RECENT.from, RECENT.to, ids); planned.push(tr); rows[tr.requestHash] = trafficRecent;
     const tp = frag("sales-movers:traffic", PRIOR.from, PRIOR.to, ids); planned.push(tp); rows[tp.requestHash] = trafficPrior;
     const ar = frag("sales-movers:ads", RECENT.from, RECENT.to, ids); planned.push(ar); rows[ar.requestHash] = adsRecent;
     const ap = frag("sales-movers:ads", PRIOR.from, PRIOR.to, ids); planned.push(ap); rows[ap.requestHash] = adsPrior;
-    const inv = frag("sales-movers:inventory", INV_FROM, INV_FROM, ids); planned.push(inv); rows[inv.requestHash] = inventory; // EXACT single day [asOf-1 .. asOf-1]
     const cat = frag("sales-movers:catalog", null, null, ids); planned.push(cat); rows[cat.requestHash] = catalog;
   }
-  return { planned, rows };
+  return { planned, rows, evidence };
 }
 const ctx = (over = {}) => ({ to: ASOF, rawSellerId: ID, accountId: ID, ...over });
 const deriveSm = (built, context = ctx(), statusOverride) =>
-  deriveReportSnapshot({ reportKey: "sales-movers", sources: buildSources(built.planned, built.rows, statusOverride), context });
+  deriveReportSnapshot({ reportKey: "sales-movers", sources: buildSources(built.planned, built.rows, statusOverride),
+    context: built.evidence && !("insightInventoryEvidence" in context) ? { ...context, insightInventoryEvidence: built.evidence } : context });
 
 // ---- The hand-computed production-route fixture ----
 const FIXTURE = () => ({
@@ -88,9 +93,10 @@ const FIXTURE = () => ({
   ],
   adsPrior: [{ child_asin: "A", currency: "USD", ad_spend_sum: 15, ad_sales_sum: 45, ad_clicks_sum: 80 }],
   inventory: [
-    // EXACTLY the single previous day (asOf-1 = 2025-08-09); a row on any other date is now rejected.
-    { date: "2025-08-09", child_asin: "A", available: 8, inbound_shipped: 3, inbound_received: 0, days_of_supply: 12, units_shipped_t30: 40 },
-    { date: "2025-08-09", child_asin: "B", available: 0, inbound_shipped: 0, inbound_received: 0, days_of_supply: null, units_shipped_t30: 0 },
+    // The account's LAST SAVED durable Health snapshot (dated 2025-08-09, within asOf - 2): the read-only bridge. Its
+    // legacy Health-only fields (days of supply, units shipped t30) must never surface.
+    { date: "2025-08-09", child_asin: "A", sku: "SA", available: 8, inbound_working: 1, inbound_shipped: 3, inbound_received: 0, days_of_supply: 12, units_shipped_t30: 40 },
+    { date: "2025-08-09", child_asin: "B", sku: "SB", available: 0, inbound_working: 0, inbound_shipped: 0, inbound_received: 0, days_of_supply: null, units_shipped_t30: 0 },
   ],
   catalog: [
     { child_asin: "A", parent_asin: "P1", product_name: "Catalog A Name", product_brand: "Acme" },
@@ -101,21 +107,28 @@ const expectedFixturePayload = () => ({
   accountId: "A1", asOf: "2025-08-10", salesLatestDate: "2025-08-08", lagDays: 4, sourceLabel: LABEL,
   dataUnavailable: false,
   windows: { recent: { from: "2025-08-02", to: "2025-08-08" }, prior: { from: "2025-07-26", to: "2025-08-01" }, days: 7 },
-  currencies: ["CAD", "USD"], buyBoxEvaluated: false, inventoryAvailable: true, inventorySnapshotDate: "2025-08-09",
+  currencies: ["CAD", "USD"], buyBoxEvaluated: false,
+  // No saved Listings evidence here -> the account's saved Health snapshot is the dated read-only bridge.
+  inventoryModel: "inventory-source-v1", inventorySource: "health-fallback",
+  inventorySourceLabel: "FBA Inventory Health snapshot 2025-08-09 (saved, no longer refreshed -- temporary bridge: listings-not-loaded)",
+  inventoryAvailable: true, listingsRefreshedAt: null, inventoryHealthDate: "2025-08-09",
+  inventoryFallbackReasons: ["listings-not-loaded"], inventoryUnavailableReasons: [], inventoryResolvedConflicts: 0,
+  inventorySnapshotDate: "2025-08-09",
   rows: [
     {
       asin: "A", productName: "Catalog A Name", brand: "Acme",
       recent: { sales: 100, units: 10, orders: 8, sessions: 50, pageViews: 60, unitsShipped: 9, unitsRefunded: 1 },
       prior: { sales: 80, units: 8, orders: 6, sessions: 40, pageViews: 48, unitsShipped: 7, unitsRefunded: 0 },
       ads: { recentSpend: 20, recentSales: 60, recentClicks: 100, priorSpend: 15, priorSales: 45, priorClicks: 80, currency: "USD", mixedCurrency: false },
-      inventory: { available: 8, inbound: 3, daysOfSupply: 12, unitsShippedT30: 40 },
+      // Bridge inbound = working + shipped + received (4); NO Health-only metric (days of supply / run rate) is carried.
+      stock: { source: "health-fallback", listed: true, fbaContext: "fba", fbaAvailable: 8, fbaInbound: 4, conflict: false },
     },
     {
       asin: "B", productName: "Widget B", brand: "Beta",
       recent: { sales: 0, units: 0, orders: 0, sessions: 5, pageViews: 6, unitsShipped: 0, unitsRefunded: 0 },
       prior: { sales: 0, units: 0, orders: 0, sessions: 0, pageViews: 0, unitsShipped: 0, unitsRefunded: 0 },
       ads: { recentSpend: null, recentSales: null, recentClicks: null, priorSpend: null, priorSales: null, priorClicks: null, currency: null, mixedCurrency: true },
-      inventory: { available: 0, inbound: 0, daysOfSupply: null, unitsShippedT30: 0 },
+      stock: { source: "health-fallback", listed: true, fbaContext: "fba", fbaAvailable: 0, fbaInbound: 0, conflict: false },
     },
   ],
   catalogBrands: ["Acme", "Beta"],
@@ -158,16 +171,32 @@ test("4. mixed-currency ASIN advertising is WITHHELD (never combined across curr
   assert.deepEqual(p.currencies, ["CAD", "USD"], "account currencies reported, not combined");
 });
 
-test("5. inventory is genuine zero when available, and null for EVERY row when the snapshot is unavailable", () => {
-  // Genuine zero (B) with an available snapshot.
+test("5. inventory: the saved Health bridge keeps a genuine zero (dated); a stale bridge / no saved Health => Unavailable, every row's stock null (never zero)", () => {
+  // Genuine zero (B) from the bridge, dated by its snapshot.
   const withInv = deriveSm(smPlanned(FIXTURE())).payload;
-  assert.deepEqual(withInv.rows.find((r) => r.asin === "B").inventory, { available: 0, inbound: 0, daysOfSupply: null, unitsShippedT30: 0 });
+  assert.equal(withInv.rows.find((r) => r.asin === "B").stock.fbaAvailable, 0);
   assert.equal(withInv.inventoryAvailable, true);
-  // Empty inventory fragment => snapshot unavailable => every row's inventory is null (never zero).
+  assert.equal(withInv.inventorySource, "health-fallback");
+  assert.equal(withInv.inventorySnapshotDate, "2025-08-09");
+  assert.ok(!withInv.rows.some((r) => "inventory" in r), "the pre-phase-2 row.inventory shape is gone");
+  // An ASIN absent from the Health snapshot is "not listed" (unknown) -- never 0.
+  const partial = deriveSm(smPlanned({ ...FIXTURE(), inventory: [FIXTURE().inventory[0]] })).payload;
+  assert.deepEqual(partial.rows.find((r) => r.asin === "B").stock, { source: "health-fallback", listed: false, fbaContext: null, fbaAvailable: null, fbaInbound: null, conflict: false });
+  // A STALE bridge (older than asOf - 2) never drives stock.
+  const stale = deriveSm(smPlanned({ ...FIXTURE(), inventory: FIXTURE().inventory.map((r) => ({ ...r, date: "2025-08-07" })) })).payload;
+  assert.deepEqual([stale.inventorySource, stale.inventoryAvailable, stale.inventorySnapshotDate], ["unavailable", false, null]);
+  assert.deepEqual(stale.inventoryUnavailableReasons, ["listings-not-loaded", "health-bridge-stale:2025-08-07"]);
+  assert.ok(stale.rows.every((r) => r.stock === null), "never the stale 8 and never 0");
+  // No evidence at all (a derive context without the loader) => Unavailable (not loaded).
+  const none = deriveSm(smPlanned({ ...FIXTURE(), inventory: null })).payload;
+  assert.deepEqual(none.inventoryUnavailableReasons, ["listings-not-loaded", "health-bridge-not-loaded"]);
+  // Empty saved Health snapshot + no Listings => Unavailable => every row's stock is null (never zero).
   const noInv = deriveSm(smPlanned({ ...FIXTURE(), inventory: [] })).payload;
   assert.equal(noInv.inventoryAvailable, false);
+  assert.equal(noInv.inventorySource, "unavailable");
+  assert.deepEqual(noInv.inventoryUnavailableReasons, ["listings-not-loaded", "health-snapshot-empty"]);
   assert.equal(noInv.inventorySnapshotDate, null);
-  assert.ok(noInv.rows.every((r) => r.inventory === null), "inventory is null (not zero) when the snapshot is missing");
+  assert.ok(noInv.rows.every((r) => r.stock === null), "stock is null (not zero) when no source is available");
 });
 
 test("6. product-name precedence is catalog -> recent traffic -> prior traffic; brand from catalog", () => {
@@ -339,7 +368,7 @@ function makeDataDoe(opts = {}) {
     if (rk === "sales-movers:sales-latest-probe") return [{ date: "2025-08-08", units_sum: 5 }];
     if (rk === "sales-movers:traffic") return [{ child_asin: "A", product_name: "Widget A", sales_sum: 10, units_sum: 1, orders_sum: 1, sessions_sum: 5, page_views_sum: 6, units_shipped_sum: 1, units_refunded_sum: 0 }];
     if (rk === "sales-movers:ads") return [{ child_asin: "A", currency: "USD", ad_spend_sum: 1, ad_sales_sum: 2, ad_clicks_sum: 3 }];
-    if (rk === "sales-movers:inventory") return [{ date: "2025-08-09", child_asin: "A", available: 5, inbound_shipped: 1, inbound_received: 0, days_of_supply: 9, units_shipped_t30: 20 }];
+    if (rk === "sales-movers:inventory" || job.sourceKey === "fba-inventory-health") throw new Error("an FBA Inventory Health export was requested (the cutover forbids it)");
     return [{ child_asin: "A", parent_asin: "P1", product_name: "Catalog A", product_brand: "Acme" }];
   };
   return {
@@ -364,10 +393,11 @@ test("13. kickoff (maxRounds:1) creates ONLY the latest-date probe (no downstrea
 test("14. a validated dated probe stages each downstream canonical source EXACTLY once", async () => {
   const store = makeStore(); const dd = makeDataDoe();
   const r = await runCycle(store, dd, [A1], {});
-  assert.deepEqual(keyOf(store, r.cycleId), ["sales-movers:ads", "sales-movers:catalog", "sales-movers:inventory", "sales-movers:sales-latest-probe", "sales-movers:traffic"], "probe + 4 downstream staged");
+  assert.deepEqual(keyOf(store, r.cycleId), ["sales-movers:ads", "sales-movers:catalog", "sales-movers:sales-latest-probe", "sales-movers:traffic"], "probe + 3 downstream staged (NO FBA Inventory Health fragment)");
   for (const j of store.listSourceJobs(r.cycleId)) assert.ok(dd.createCount(j.request_hash) <= 1, j.request_key + " created at most once");
-  // 7 canonical exports: probe + traffic(recent,prior) + ads(recent,prior) + inventory + catalog.
-  assert.equal(dd.totalCreates(), 7, "probe + 2 traffic + 2 ads + inventory + catalog = 7 exports");
+  // 6 canonical exports: probe + traffic(recent,prior) + ads(recent,prior) + catalog. No FBA Inventory Health export.
+  assert.equal(dd.totalCreates(), 6, "probe + 2 traffic + 2 ads + catalog = 6 exports");
+  assert.ok(store.listSourceJobs(r.cycleId).every((j) => j.source_key !== "fba-inventory-health"), "no Health source job");
 });
 
 for (const scenario of [{ n: "maxRounds:1", o: { maxRounds: 1 } }, { n: "maxJobs:1", o: { maxJobs: 1 } }, { n: "poll deferral", d: { deferStage: "poll", deferKey: "sales-movers:sales-latest-probe" } }, { n: "download deferral", d: { deferStage: "download", deferKey: "sales-movers:sales-latest-probe" } }]) {
@@ -380,7 +410,7 @@ for (const scenario of [{ n: "maxRounds:1", o: { maxRounds: 1 } }, { n: "maxJobs
     const dd2 = makeDataDoe();
     const r2 = await runCycle(store, dd2, [A1], {});
     assert.equal(dd1.createCount(probeHash) + dd2.createCount(probeHash), 1, "the probe export is created exactly once across the resume");
-    assert.deepEqual(keyOf(store, r2.cycleId), ["sales-movers:ads", "sales-movers:catalog", "sales-movers:inventory", "sales-movers:sales-latest-probe", "sales-movers:traffic"], "resume completes all downstream");
+    assert.deepEqual(keyOf(store, r2.cycleId), ["sales-movers:ads", "sales-movers:catalog", "sales-movers:sales-latest-probe", "sales-movers:traffic"], "resume completes all downstream");
     for (const j of store.listSourceJobs(r2.cycleId)) assert.ok((dd1.createCount(j.request_hash) + dd2.createCount(j.request_hash)) <= 1, j.request_key + " never exported twice");
   });
 }

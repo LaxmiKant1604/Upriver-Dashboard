@@ -113,8 +113,10 @@ export function makeSourceTranche(spec) {
 //   [2] product-catalog                                      -- the organization-wide catalog
 //   [3] settlements, returns, profit-by-sku-date,            -- remaining DATE-SLICEABLE families (a date
 //       sales-traffic-asin-date                                 window; not OLI/catalog)
-//   [4] listings, listings-raw, fba-inventory-health,        -- CURRENT-STATE families (no/short as-of
-//       content-changes                                         snapshot; not date-sliced history)
+//   [4] listings, listings-raw, content-changes              -- CURRENT-STATE families (no/short as-of
+//                                                               snapshot; not date-sliced history). FBA Inventory
+//                                                               Health is RETIRED (Listings inventory cutover): no
+//                                                               contract fetches it, so it is in no tranche.
 //   [5] sqp-weekly, sqp-monthly                              -- STAGED / SIGNAL-DEPENDENT SQP families
 //
 // NOTE on sales-traffic-asin-date: it is EXCLUSIVE to Sales Movers (a signal-dependent staged report),
@@ -125,7 +127,7 @@ const TRANCHE_CLASSIFICATION = [
   { name: "order-line-items", sourceKeys: ["order-line-items"] },
   { name: "product-catalog", sourceKeys: ["product-catalog"] },
   { name: "date-sliceable", sourceKeys: ["settlements", "returns", "profit-by-sku-date", "sales-traffic-asin-date"] },
-  { name: "current-state", sourceKeys: ["listings", "listings-raw", "fba-inventory-health", "content-changes"] },
+  { name: "current-state", sourceKeys: ["listings", "listings-raw", "content-changes"] },
   { name: "staged-signal", sourceKeys: ["sqp-weekly", "sqp-monthly"] },
 ];
 

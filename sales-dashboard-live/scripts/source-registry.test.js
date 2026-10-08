@@ -9,7 +9,7 @@
 //      campaign-performance-v1 (ads-campaign-date) -> Daily Reporting + Brand View + PPC (the ACTIVE Ads grain);
 //      asin-performance-v1 (ads-asin-date) -> PPC Performance ONLY (retired from Daily/Brand; history retained);
 //      FBA Inventory Health -> Brand View, FBA Plan, Buy Box Loss, Listing Health, Sales Movers.
-//   C. DataDoe token classes -- premium is EXACTLY {profit-by-sku-date, listings, fba-inventory-health}
+//   C. DataDoe token classes -- premium is EXACTLY {profit-by-sku-date, listings} (FBA Inventory Health is retired)
 //      (5 tokens); every other family standard (2); pricing reads fail closed on an unregistered family.
 //   D. fail-closed reads + immutability -- unregistered key throws typed UNREGISTERED_SOURCE; records and
 //      arrays are deeply frozen.
@@ -62,8 +62,9 @@ test("every fetched family, derived Ads family, and tranche family is registered
     assert.equal(r.storage, "durable-ads", `${k} uses the existing durable Ads architecture`);
     assert.ok(!fetched.has(k), `${k} is never fetched as a Scheduler-v2 source job`);
   }
-  // 12 fetched families + 4 durable Ads families.
-  assert.equal(reg.SOURCE_REGISTRY.length, 16);
+  // 11 fetched families + 4 durable Ads families (FBA Inventory Health is RETIRED: unregistered, never fetched).
+  assert.equal(reg.SOURCE_REGISTRY.length, 15);
+  assert.ok(!keys.includes("fba-inventory-health") && !fetched.has("fba-inventory-health"), "the retired FBA Inventory Health family is neither registered nor fetched");
 });
 
 test("derived-only dashboards (brand-view / priority-feed) are not registered as source families", () => {
@@ -108,18 +109,19 @@ test("ASIN Ads FULLY RETIRED: asin-performance-v1 (ads-asin-date) has ZERO activ
   assert.ok(entry && entry.storage === "durable-ads", "the ASIN family stays registered (durable-ads) for rollback");
 });
 
-test("FBA Inventory Health feeds Brand View, FBA Plan, Buy Box Loss, Listing Health, Sales Movers", () => {
-  const d = reg.dashboardsUsingSource("fba-inventory-health");
+test("Listings (FBA inventory since the cutover) feeds Brand View, FBA Plan, Buy Box Loss, Listing Health, Sales Movers; the retired FBA Inventory Health feeds nothing (unregistered, fails closed)", () => {
+  const d = reg.dashboardsUsingSource("listings");
   for (const want of ["brand-view", "fba-plan", "buy-box-loss", "listing-health", "sales-movers"]) {
-    assert.ok(d.includes(want), `fba-inventory-health -> ${want}`);
+    assert.ok(d.includes(want), `listings -> ${want}`);
   }
+  assert.throws(() => reg.dashboardsUsingSource("fba-inventory-health"), /UNREGISTERED_SOURCE/);
 });
 
 group("C. DataDoe token classes");
 
-test("premium is EXACTLY {profit-by-sku-date, listings, fba-inventory-health}; everything else standard", () => {
+test("premium is EXACTLY {profit-by-sku-date, listings}; everything else standard (FBA Inventory Health retired)", () => {
   const premium = reg.SOURCE_REGISTRY.filter((r) => r.tokenClass === "premium").map((r) => r.sourceKey).sort();
-  assert.deepEqual(premium, ["fba-inventory-health", "listings", "profit-by-sku-date"]);
+  assert.deepEqual(premium, ["listings", "profit-by-sku-date"]);
   assert.equal(reg.registryIsPremiumOf({ sourceKey: "order-line-items" }), false);
   assert.equal(reg.registryIsPremiumOf({ source_key: "profit-by-sku-date" }), true, "snake_case job shape reads too");
   assert.equal(reg.registryIsPremiumOf({ sourceKey: "listings-raw" }), false, "the raw Listings twin is standard");
@@ -274,15 +276,15 @@ test("OLI initial backfill covers the LONGEST Daily/Brand window the real contra
   assert.deepEqual(oli.incrementalRefresh, { kind: "rolling-window-days", days: 7, upsert: "replace-matching-rows" });
 });
 
-test("Product Catalog refreshes once daily per ORGANIZATION (never per dashboard or seller); FBA keeps the latest validated snapshot", () => {
+test("Product Catalog refreshes once daily per ORGANIZATION (never per dashboard or seller); the FBA inventory source (Listings) is a current-only daily snapshot", () => {
   const cat = reg.sourceRegistryEntry("product-catalog");
   assert.equal(cat.scope, "organization");
   assert.deepEqual(cat.incrementalRefresh, { kind: "daily-snapshot", perOrganization: true });
   assert.equal(cat.storage, "durable-snapshot");
-  const fba = reg.sourceRegistryEntry("fba-inventory-health");
-  assert.equal(fba.storage, "durable-snapshot");
-  assert.equal(fba.initialBackfill.kind, "current-only", "historical inventory is never repeatedly backfilled");
-  assert.deepEqual(fba.incrementalRefresh, { kind: "daily-snapshot", perOrganization: false });
+  const lst = reg.sourceRegistryEntry("listings");
+  assert.equal(lst.initialBackfill.kind, "current-only", "historical inventory is never repeatedly backfilled");
+  assert.deepEqual(lst.incrementalRefresh, { kind: "daily-snapshot", perOrganization: false });
+  assert.throws(() => reg.sourceRegistryEntry("fba-inventory-health"), /UNREGISTERED_SOURCE/, "the retired Health family has no record");
 });
 
 async function main() {

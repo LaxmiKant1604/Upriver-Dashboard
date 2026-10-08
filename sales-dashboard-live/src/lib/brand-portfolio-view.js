@@ -5,7 +5,7 @@
 // helpers; the status ordering is a deterministic severity sort. Dependency-light
 // so Node can unit-test it without a browser.
 
-import { inventoryCoverDays, tacos } from "./brand-view.js";
+import { inventoryCoverDays, tacos, euPoolAllMarketRule } from "./brand-view.js";
 
 /**
  * The six headline KPI values, derived from the built tables.
@@ -35,9 +35,18 @@ export function portfolioKpis(tables) {
   //      malformed, non-finite, negative or non-number group returns null -- a partial
   //      sum of only the known groups is never exposed as a complete total.
   //   3. Otherwise unavailable (null). Inventory is never currency converted.
+  // EU ALL-MARKET RULE (first, over EVERY marketplace row -- also for a payload built before the rule existed, whose
+  // overall total may count pooled EU stock several times): two or more pan-EU pool marketplaces with positive stock
+  // WITHHOLD the overall FBA total and FBA Cover (fbaWithheldReason), never a max / heuristic. A marketplace of UNKNOWN
+  // inventory (fbaUnknown) also withholds them -- a partial sum is never shown as complete.
   const fbaOk = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+  const allRows = groups.flatMap((group) => group.rows || []);
+  const eu = euPoolAllMarketRule(allRows.map((row) => [row.country, row.fbaAvailable]));
+  const anyUnknown = groups.some((group) => group.fbaUnknown === true) || allRows.some((row) => row.fbaUnknown === true);
   let fba = null;
-  if (daily && fbaOk(daily.inventoryAccountTotal)) {
+  if (eu.withheld || anyUnknown) {
+    fba = null;
+  } else if (daily && fbaOk(daily.inventoryAccountTotal)) {
     fba = daily.inventoryAccountTotal;
   } else if (daily && daily.inventoryScope === "country" && groups.length) {
     let sum = 0;
@@ -48,6 +57,7 @@ export function portfolioKpis(tables) {
     }
     fba = complete ? sum : null;
   }
+  const fbaWithheldReason = eu.withheld && !anyUnknown ? eu.reason : null;
   const rangeUnits = groups.reduce((sum, group) => sum + group.rows.reduce((inner, row) => inner + (Number(row.coverUnits) || 0), 0), 0);
   const cover = daily?.selectedRangeDays ? inventoryCoverDays(fba, rangeUnits, daily.selectedRangeDays) : null;
   const sales = single ? single.totals.sales : null;
@@ -61,7 +71,7 @@ export function portfolioKpis(tables) {
   const lyDelta = sales != null && Number.isFinite(ly) && ly > 0 ? (sales - ly) / ly : null;
   return {
     single: Boolean(single), currency: single?.currency || null,
-    sales, ly, lyDelta, units: tables?.totalUnits ?? null, fba, cover, adSpend, adSpendPartial,
+    sales, ly, lyDelta, units: tables?.totalUnits ?? null, fba, fbaWithheldReason, cover, adSpend, adSpendPartial,
     tacos: adSpendPartial ? null : tacos(adSpend, sales),
   };
 }

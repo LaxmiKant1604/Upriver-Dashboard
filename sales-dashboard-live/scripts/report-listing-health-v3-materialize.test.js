@@ -1,6 +1,6 @@
 // Phase 4A -- Advanced Listing Health v3 PER-ACCOUNT SOURCE MATERIALIZATION.
 //
-// PRIMARY DEFECT (reproduced in A): regional Listings/Listings-Raw/inventory are exported in <=5-seller BATCHES, so
+// PRIMARY DEFECT (reproduced in A): regional Listings/Listings-Raw are exported in <=5-seller BATCHES, so
 // the batch rows live under the BATCH request_hash; the v3 serve resolves a PER-ACCOUNT identity (one seller) whose
 // hash differs, so a valid per-account read MISSES. The fix splits one validated batch back into N per-account cache
 // aliases (ZERO new exports) so the serve's per-account read HITS with ONLY that seller's rows.
@@ -8,7 +8,9 @@
 // Proves: reproduction of the miss; 5-seller batch -> 5 isolated per-account reads from ONE source export; end-to-end
 // serve HIT after materialization; empty-seller valid-empty (distinct from missing); mixed-marketplace isolation;
 // malformed-identity + cross-org rejection (never written); idempotent replay (no duplicate rows); partial/failed
-// batch preserves last-known-good; zero DataDoe/network. Offline. 7-bit ASCII, LF.
+// batch preserves last-known-good; zero DataDoe/network. Listings inventory cutover: there is NO inventory family (FBA
+// Inventory Health retired) -- only listings + listings-raw are read keys / new exports, and a plan carrying any other
+// v3 key fails the ceiling gate closed. Offline. 7-bit ASCII, LF.
 
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
@@ -41,7 +43,6 @@ const usAccounts = SELLERS.map((id, i) => ({ accountId: id, country: "US", curre
 
 // Row builders (shapes match the v3 integration test).
 const listingRow = (seller, mkt, sku, o = {}) => ({ seller_or_vendor_id: seller, marketplace_country_code: mkt, sku, child_asin: `ASIN-${sku}`, listing_name: o.name ?? `L ${sku}`, listing_status: o.status ?? "Active", listing_price_value: o.price ?? 9, listing_price_currency: "USD", listing_current_quantity: o.qty ?? 0, fba_quantity_available: o.fba ?? 0, listing_fulfillment_channel: o.channel ?? "AMAZON_NA", listing_open_date: "2024-01-01" });
-const invRow = (date, seller, mkt, sku, available) => ({ date, seller_or_vendor_id: seller, marketplace_country_code: mkt, child_asin: `ASIN-${sku}`, sku, available });
 const rawRow = (seller, mkt, sku) => ({ seller_or_vendor_id: seller, marketplace_country_code: mkt, sku, child_asin: `ASIN-${sku}`, summaries: JSON.stringify({ status: ["BUYABLE", "DISCOVERABLE"] }), issues: JSON.stringify([]), offers: JSON.stringify([{ price: { amount: 9 } }]) });
 
 // A tiny in-memory source_export_cache, keyed by request_hash (upsert). Both the batch download and the per-account
@@ -63,9 +64,9 @@ function makeCache() {
 
 const plans = () => planListingHealthV3BucketBatched({ accounts: usAccounts, connections, asOfFor: () => asOf, inventoryAsOf: inv });
 
-// Seed the batch payloads under the batch (source-job) hashes for the three v3 keys.
-function seedBatch(cache, plan, { listings, raw, inventory }) {
-  const rowsByKey = { "listing-health-v3:listings": listings, "listing-health-v3:listings-raw": raw, "listing-health-v3:inventory": inventory };
+// Seed the batch payloads under the batch (source-job) hashes for the two v3 keys.
+function seedBatch(cache, plan, { listings, raw }) {
+  const rowsByKey = { "listing-health-v3:listings": listings, "listing-health-v3:listings-raw": raw };
   const seen = new Set();
   for (const src of plan[0].sources) {
     if (seen.has(src.requestHash)) continue; seen.add(src.requestHash);
@@ -84,13 +85,12 @@ const listingsBatch = [
   // acct-04: intentionally no listings rows (a genuine empty-success owner).
 ];
 const rawBatch = SELLERS.filter((s) => s !== "acct-04").map((s) => rawRow(s, "US", `RAW-${s}`));
-const inventoryBatch = [invRow("2026-09-03", "acct-02", "US", "S02a", 30), invRow("2026-09-03", "acct-00", "US", "S00", 5)];
 
 /* ===================== A. reproduce the miss, then 5->5 from ONE export + end-to-end serve HIT ===================== */
 await (async () => {
   const cache = makeCache();
   const p = plans();
-  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch, inventory: inventoryBatch });
+  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch });
 
   // REPRODUCTION: before materialization, the per-account read hash for acct-02 misses (only the batch hash exists).
   const h02 = listingHealthV3PerAccountReadHashes({ apiKey: API_KEY, rawSellerId: "acct-02", marketplaceCountry: "US" });
@@ -140,7 +140,7 @@ await (async () => {
 await (async () => {
   const cache = makeCache();
   const p = plans();
-  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch, inventory: inventoryBatch });
+  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch });
   await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache });
   const h04 = listingHealthV3PerAccountReadHashes({ apiKey: API_KEY, rawSellerId: "acct-04", marketplaceCountry: "US" });
   const rows = await cache.getSavedSourceRows(h04["listing-health-v3:listings"]);
@@ -157,7 +157,7 @@ await (async () => {
   const p = plans();
   // A stray row for acct-02's seller but a DIFFERENT marketplace (DE) alongside its US rows.
   const tainted = [...listingsBatch, listingRow("acct-02", "DE", "S02-DE")];
-  seedBatch(cache, p, { listings: tainted, raw: rawBatch, inventory: inventoryBatch });
+  seedBatch(cache, p, { listings: tainted, raw: rawBatch });
   await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache });
   const h02 = listingHealthV3PerAccountReadHashes({ apiKey: API_KEY, rawSellerId: "acct-02", marketplaceCountry: "US" });
   const rows = await cache.getSavedSourceRows(h02["listing-health-v3:listings"]);
@@ -168,7 +168,7 @@ await (async () => {
 await (async () => {
   const cache = makeCache();
   const p = plans();
-  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch, inventory: inventoryBatch });
+  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch });
   // Corrupt one plan's owner (blank rawSellerId) -- it must be skipped, and NOTHING written for it.
   const broken = p.map((r) => (r.owner.accountId === "acct-03" ? { ...r, owner: { ...r.owner, rawSellerId: "" } } : r));
   const summary = await materializeListingHealthV3PerAccount({ plans: broken, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache });
@@ -181,7 +181,7 @@ await (async () => {
 await (async () => {
   const cache = makeCache();
   const p = plans();
-  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch, inventory: inventoryBatch });
+  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch });
   // Force a batch fragment whose org differs from the owner's -> isolateFragmentRowsForOwner rejects (fail closed).
   const crossOrg = p.map((r) => (r.owner.accountId === "acct-01"
     ? { ...r, sources: r.sources.map((s) => ({ ...s, organizationFingerprint: "different-org-fingerprint" })) }
@@ -195,7 +195,7 @@ await (async () => {
 await (async () => {
   const cache = makeCache();
   const p = plans();
-  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch, inventory: inventoryBatch });
+  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch });
   await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache });
   const sizeAfterFirst = cache.map.size;
   const h02 = listingHealthV3PerAccountReadHashes({ apiKey: API_KEY, rawSellerId: "acct-02", marketplaceCountry: "US" })["listing-health-v3:listings"];
@@ -209,15 +209,15 @@ await (async () => {
 await (async () => {
   const cache = makeCache();
   const p = plans();
-  // A PRIOR successful cycle already materialized acct-00's inventory alias (last-known-good).
-  const invH00 = listingHealthV3PerAccountReadHashes({ apiKey: API_KEY, rawSellerId: "acct-00", marketplaceCountry: "US" })["listing-health-v3:inventory"];
-  cache.map.set(invH00, { rows: [invRow("2026-08-01", "acct-00", "US", "S00", 77)], expires_at: "2999-01-01T00:00:00.000Z" });
-  // This cycle: listings batch present, inventory batch MISSING (failed download this cycle).
-  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch }); // inventory intentionally not seeded
+  // A PRIOR successful cycle already materialized acct-00's Listings-Raw alias (last-known-good).
+  const rawH00 = listingHealthV3PerAccountReadHashes({ apiKey: API_KEY, rawSellerId: "acct-00", marketplaceCountry: "US" })["listing-health-v3:listings-raw"];
+  cache.map.set(rawH00, { rows: [rawRow("acct-00", "US", "PRIOR-RAW")], expires_at: "2999-01-01T00:00:00.000Z" });
+  // This cycle: listings batch present, listings-raw batch MISSING (failed download this cycle).
+  seedBatch(cache, p, { listings: listingsBatch }); // raw intentionally not seeded
   const summary = await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache });
-  ok("G: a missing inventory batch is counted, not written", summary.batchMissing >= 1);
-  const invNow = await cache.getSavedSourceRows(invH00);
-  ok("G: the prior inventory alias (LKG) SURVIVES an absent batch (never deleted/overwritten)", Array.isArray(invNow) && invNow.length === 1 && invNow[0].available === 77);
+  ok("G: a missing listings-raw batch is counted, not written", summary.batchMissing >= 1);
+  const rawNow = await cache.getSavedSourceRows(rawH00);
+  ok("G: the prior listings-raw alias (LKG) SURVIVES an absent batch (never deleted/overwritten)", Array.isArray(rawNow) && rawNow.length === 1 && rawNow[0].sku === "PRIOR-RAW");
   const lh00 = listingHealthV3PerAccountReadHashes({ apiKey: API_KEY, rawSellerId: "acct-00", marketplaceCountry: "US" })["listing-health-v3:listings"];
   ok("G: this cycle still materialized the available (listings) fragment", Array.isArray(await cache.getSavedSourceRows(lh00)));
 })();
@@ -226,17 +226,21 @@ await (async () => {
 (() => {
   const idHashes = listingHealthV3PerAccountReadHashes({ apiKey: API_KEY, rawSellerId: "acct-02", marketplaceCountry: "US" });
   ok("H: every v3 read key resolves a per-account hash", LISTING_HEALTH_V3_READ_KEYS.every((k) => typeof idHashes[k] === "string" && idHashes[k].length > 0));
+  ok("H: the read keys are EXACTLY listings + listings-raw (no inventory read identity exists)",
+    LISTING_HEALTH_V3_READ_KEYS.join(",") === "listing-health-v3:listings,listing-health-v3:listings-raw" && Object.keys(idHashes).sort().join(",") === "listing-health-v3:listings,listing-health-v3:listings-raw");
   ok("H: marketplace does NOT change the per-account read hash (serve passes null; ingestion passes the marketplace)",
     listingHealthV3PerAccountReadHashes({ apiKey: API_KEY, rawSellerId: "acct-02", marketplaceCountry: null })["listing-health-v3:listings"] === idHashes["listing-health-v3:listings"]);
   ok("H: the owner scope equals accountScopeHash([rawSellerId]) (single-account identity)", accountScopeHash(["acct-02"]).length > 0 && organizationFingerprint(API_KEY).length > 0);
 })();
 
-/* ===================== I. per-region export ceiling (new Listings + Listings-Raw only; inventory reuse = 0) ===================== */
+/* ===================== I. per-region export ceiling (new Listings + Listings-Raw only; no inventory family) ===================== */
 (() => {
-  const p = plans(); // 5 US accounts -> ONE batch -> 1 listings + 1 listings-raw + 1 inventory hash
+  const p = plans(); // 5 US accounts -> ONE batch -> 1 listings + 1 listings-raw hash
   const counts = listingHealthV3PlannedExports(p);
   ok("I: only Listings + Listings-Raw count as NEW exports (one batch -> 2 new)", counts.newExports === 2);
-  ok("I: inventory is counted as a REUSED export (zero incremental), never a new create", counts.reusedExports === 1 && !counts.newExportHashes.includes(counts.reusedExportHashes[0]));
+  ok("I: the plan carries NO other v3 request key (no reused / inventory family)", counts.unplannedRequestKeys.length === 0 && counts.reusedExports === 0 && counts.reusedExportHashes.length === 0);
+  throwsSync("I: a plan carrying a retired listing-health-v3:inventory source FAILS the ceiling gate closed (before any create)",
+    () => assertListingHealthV3ExportCeiling({ region: "us-ca", plans: [{ reportKey: "listing-health-v3", sources: [{ requestKey: "listing-health-v3:listings", requestHash: "L" }, { requestKey: "listing-health-v3:inventory", requestHash: "I" }] }], accountCount: 1 }));
   // Within ceiling: us-ca baseline is 4 (2 batches x 2); one batch (2 new) is well within.
   const within = assertListingHealthV3ExportCeiling({ region: "us-ca", plans: p });
   ok("I: a plan within the region ceiling passes and reports the new-export count", within.withinCeiling === true && within.newExports === 2 && within.ceiling === LISTING_HEALTH_V3_REGION_EXPORT_CEILING["us-ca"]);
@@ -253,7 +257,6 @@ await (async () => {
     sources: [
       { requestKey: "listing-health-v3:listings", requestHash: "L" + b },
       { requestKey: "listing-health-v3:listings-raw", requestHash: "R" + b },
-      { requestKey: "listing-health-v3:inventory", requestHash: "I" + b },
     ],
   }));
   ok("I(computed): expectedListingHealthV3NewExports scales as 2 x ceil(accounts/5); null/invalid -> null",
@@ -306,7 +309,7 @@ await (async () => {
   // A DEDICATED operator CAN plan v3 by explicit request (the Phase-4B ingestion seam) -- batched, per-account owners.
   const v3Plan = buildShadowReportPlan({ accounts: usAccounts, reportKeys: ["listing-health-v3"], connections, asOfFor: () => asOf, inventoryAsOf: inv });
   const v3Requests = v3Plan.reportRequests.filter((r) => r.reportKey === "listing-health-v3");
-  ok("J: an explicit reportKeys:['listing-health-v3'] plans one batched request per account with owner metadata", v3Requests.length === 5 && v3Requests.every((r) => r.owner && r.owner.rawSellerId && r.sources.length === 3));
+  ok("J: an explicit reportKeys:['listing-health-v3'] plans one batched request per account with owner metadata", v3Requests.length === 5 && v3Requests.every((r) => r.owner && r.owner.rawSellerId && r.sources.length === 2));
   ok("J: the explicit v3 plan matches the direct batched planner (same source hashes)",
     JSON.stringify(v3Requests.map((r) => r.sources.map((s) => s.requestHash)).flat().sort())
     === JSON.stringify(plans().map((r) => r.sources.map((s) => s.requestHash)).flat().sort()));
@@ -326,7 +329,7 @@ await (async () => {
     const seen = new Set();
     for (const src of p[0].sources) {
       if (seen.has(src.requestHash)) continue; seen.add(src.requestHash);
-      const rows = src.requestKey === "listing-health-v3:listings" ? listings : (src.requestKey === "listing-health-v3:listings-raw" ? rawBatch : inventoryBatch);
+      const rows = src.requestKey === "listing-health-v3:listings" ? listings : rawBatch;
       cache.map.set(src.requestHash, { rows: [...rows], fetched_at: fetchedAt, expires_at: "2999-01-01T00:00:00.000Z", source_id: src.sourceId, organization_fingerprint: src.organizationFingerprint, account_scope_hash: src.accountScopeHash });
     }
   };
@@ -363,8 +366,8 @@ await (async () => {
 await (async () => {
   const cache = makeCache();
   const p = plans();
-  // Seed listings + raw but NOT inventory -> inventory fragments emit "missing"; listings/raw emit "materialized".
-  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch });
+  // Seed listings but NOT listings-raw -> raw fragments emit "missing"; listings emit "materialized".
+  seedBatch(cache, p, { listings: listingsBatch });
   const events = [];
   const emit = (tag, obj) => events.push({ tag, obj });
   await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache, emit, runId: "op-us-ca-2026-09-02" });
@@ -377,8 +380,9 @@ await (async () => {
     byResult("materialized").some((o) => o.fragmentType === "listing-health-v3:listings") && byResult("materialized").some((o) => o.rowCount === 0));
   ok("L: 'materialized' carries the canonical marketplace, effective date, source-export + correlation hashes, and a numeric row count",
     byResult("materialized").every((o) => o.marketplace === "US" && o.effectiveDate === asOf && typeof o.sourceExportHash === "string" && o.sourceExportHash && typeof o.correlationId === "string" && o.correlationId && typeof o.rowCount === "number"));
-  ok("L: the absent inventory batch yields 'missing' events (rowCount null, savedAt null)",
-    byResult("missing").length >= 1 && byResult("missing").every((o) => o.fragmentType === "listing-health-v3:inventory" && o.rowCount === null && o.savedAt === null));
+  ok("L: the absent listings-raw batch yields 'missing' events (rowCount null, savedAt null)",
+    byResult("missing").length >= 1 && byResult("missing").every((o) => o.fragmentType === "listing-health-v3:listings-raw" && o.rowCount === null && o.savedAt === null));
+  ok("L: no fragment event ever names an inventory family", !frag.some((o) => /inventory/.test(String(o.fragmentType))));
 
   // SECURITY: no forbidden KEY on any event, and no credential / org fingerprint VALUE anywhere in the serialized bodies.
   const FORBIDDEN = ["apiKey", "api_key", "rawSellerId", "raw_seller_id", "sellerOrVendorId", "seller_or_vendor_id", "organizationFingerprint", "organization_fingerprint", "listing_name", "rows", "url", "signedUrl", "objectPath", "object_path"];
@@ -392,7 +396,7 @@ await (async () => {
 await (async () => {
   const cache = makeCache();
   const p = plans();
-  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch, inventory: inventoryBatch });
+  seedBatch(cache, p, { listings: listingsBatch, raw: rawBatch });
   // Cross-org for acct-01 -> its fragments are isolation-rejected. A throwing writer for acct-00's listings -> failed.
   const crossOrg = p.map((r) => (r.owner.accountId === "acct-01" ? { ...r, sources: r.sources.map((s) => ({ ...s, organizationFingerprint: "different-org-fingerprint" })) } : r));
   const failHash = listingHealthV3PerAccountReadHashes({ apiKey: API_KEY, rawSellerId: "acct-00", marketplaceCountry: "US" })["listing-health-v3:listings"];
@@ -415,7 +419,7 @@ await (async () => {
     const seen = new Set();
     for (const src of p[0].sources) {
       if (seen.has(src.requestHash)) continue; seen.add(src.requestHash);
-      const rows = src.requestKey === "listing-health-v3:listings" ? listings : (src.requestKey === "listing-health-v3:listings-raw" ? rawBatch : inventoryBatch);
+      const rows = src.requestKey === "listing-health-v3:listings" ? listings : rawBatch;
       cache.map.set(src.requestHash, { rows: [...rows], fetched_at: fetchedAt, expires_at: "2999-01-01T00:00:00.000Z", source_id: src.sourceId, organization_fingerprint: src.organizationFingerprint, account_scope_hash: src.accountScopeHash });
     }
   };

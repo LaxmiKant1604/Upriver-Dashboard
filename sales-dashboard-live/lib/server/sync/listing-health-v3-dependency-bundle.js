@@ -98,9 +98,11 @@ export function oliCompletenessDigest(rows) {
   return sha("oli-completeness" + list.join(RS));
 }
 
-// The FBA inventory identity: proven-D-1 -> request_hash + payload_sha + validated_at; absent/other-day/empty -> a
-// stable UNAVAILABLE sentinel. available<->unavailable, a date advance, a same-date content correction, AND a same-date
-// content-identical re-validation that advances validated_at (inventoryFetchedAt reaches payload.provenance) all change it.
+// The FBA inventory identity (Listings inventory CUTOVER: the account's LAST SAVED Health snapshot -- the read-only
+// bridge -- whatever its day): request_hash + payload_sha + validated_at; absent/empty -> a stable UNAVAILABLE sentinel.
+// available<->unavailable, a requested-as-of advance (the bridge threshold is measured against it), a content
+// correction, AND a content-identical re-validation that advances validated_at (inventoryFetchedAt reaches
+// payload.provenance) all change it.
 export function inventoryFingerprintToken({ accountId, connectionId, requestedAsOf, available, sourceRequestHash, payloadSha, validatedAt } = {}) {
   const base = "fba-inventory|" + S(accountId) + "|" + S(connectionId) + "|" + S(requestedAsOf) + "|";
   return available === true ? base + S(sourceRequestHash) + "|" + S(payloadSha) + "|" + S(validatedAt) : base + "UNAVAILABLE";
@@ -173,18 +175,19 @@ const rowsOf = (payload) => (Array.isArray(payload) ? payload : (payload && Arra
  * Resolve + integrity-validate the COMPLETE dependency bundle for ONE account, and compute its fingerprint. Every read
  * is injected + { signal }-threaded. Returns:
  *   { eligible:true, status, revisionId, deps:[], contentDeps:[manifestToken], bundle:{ listingsRows, rawRows,
- *     inventorySource, context, listingsSnapshot, rawSnapshot, inventorySnapshot } }   when every mandatory input is proven,
+ *     inventoryBridge, context, listingsSnapshot, rawSnapshot, inventorySnapshot } }   when every mandatory input is proven,
  *   { eligible:false, status:MISSING, revisionId:null, deps:[], contentDeps:[], reason }   otherwise (defer, LKG kept).
  *
  * deps (injected): readListingsSnapshot, readListingsRawSnapshot, readInventorySnapshot, loadSnapshotPayload,
- *   resolveExpectedInventoryRequestHash, loadDurableContext (the STRICT reconciler loader), buildObjectPath.
+ *   loadDurableContext (the STRICT reconciler loader), buildObjectPath. (resolveExpectedInventoryRequestHash is accepted
+ *   for compatibility and no longer used: the saved Health snapshot is a read-only bridge, never a D-1 export.)
  */
 export async function resolveListingHealthV3DependencyBundle(deps = {}, args = {}) {
-  const { readListingsSnapshot, readListingsRawSnapshot, readInventorySnapshot, loadSnapshotPayload, resolveExpectedInventoryRequestHash, loadDurableContext, buildObjectPath } = deps;
+  const { readListingsSnapshot, readListingsRawSnapshot, readInventorySnapshot, loadSnapshotPayload, loadDurableContext, buildObjectPath } = deps;
   const { organizationFingerprint, connectionId = "primary", accountId, marketplace, rawSellerId, requestedAsOf, signal = null } = args;
   const miss = (reason) => ({ eligible: false, status: LISTING_HEALTH_V3_BUNDLE_STATUS.MISSING, revisionId: null, deps: [], contentDeps: [], reason });
   const aborted = () => !!(signal && signal.aborted);
-  for (const [n, f] of [["readListingsSnapshot", readListingsSnapshot], ["readListingsRawSnapshot", readListingsRawSnapshot], ["readInventorySnapshot", readInventorySnapshot], ["loadSnapshotPayload", loadSnapshotPayload], ["resolveExpectedInventoryRequestHash", resolveExpectedInventoryRequestHash], ["loadDurableContext", loadDurableContext], ["buildObjectPath", buildObjectPath]]) {
+  for (const [n, f] of [["readListingsSnapshot", readListingsSnapshot], ["readListingsRawSnapshot", readListingsRawSnapshot], ["readInventorySnapshot", readInventorySnapshot], ["loadSnapshotPayload", loadSnapshotPayload], ["loadDurableContext", loadDurableContext], ["buildObjectPath", buildObjectPath]]) {
     if (typeof f !== "function") throw new Error("resolveListingHealthV3DependencyBundle requires " + n + " (fail closed).");
   }
   if (!nb(organizationFingerprint) || !nb(accountId) || !isRealCalendarDate(S(requestedAsOf)) || !MKT_RE.test(S(marketplace)) || !nb(rawSellerId)) return miss("incomplete-account-boundary");
@@ -216,51 +219,48 @@ export async function resolveListingHealthV3DependencyBundle(deps = {}, args = {
   const r = await proveAndHydrate(readListingsRawSnapshot, LISTINGS_RAW_SOURCE_KEY);
   if (r.reason) return miss(r.reason);
 
-  // --- OPTIONAL FBA inventory (blockers 3 + 4): a READ THROW / typed read!=ok / pointer corruption / hydration
-  //     failure / row-count mismatch DEFERS (preserve LKG). A proven successful absence, or a VALID pointer whose
-  //     request_hash != the expected D-1 identity, or a proven-D-1 pointer with zero D-1 rows -> the stable
-  //     UNAVAILABLE sentinel (FBA is optional). ONLY a proven-D-1, integrity-valid, non-empty snapshot is included. ---
-  let inventorySource = { available: false };
+  // --- OPTIONAL saved FBA Inventory Health BRIDGE (Listings inventory CUTOVER; blockers 3 + 4 integrity kept): no Health
+  //     export exists any more, so the account's LAST SAVED durable Health snapshot -- whatever its day -- is read
+  //     READ-ONLY as the dated bridge. A READ THROW / typed read!=ok / pointer corruption / hydration failure / row-count
+  //     mismatch DEFERS (preserve LKG). A proven successful absence or a pointer with zero rows -> the stable UNAVAILABLE
+  //     sentinel (inventory is optional). Whether the bridge may drive On Hand FBA is decided in the derive (validated
+  //     Listings first; the bridge only while its snapshot date >= requestedAsOf - HEALTH_BRIDGE_MAX_AGE_DAYS). ---
+  let inventoryBridge = { available: false, reason: "health-snapshot-missing" };
   let inventorySnapshot = null;
   {
-    let expected = "";
-    try { expected = S(await resolveExpectedInventoryRequestHash({ accountId, requestedAsOf })); }
-    catch (e) { return miss("inventory-expected-hash-threw:" + S(e && e.message)); }
+    let invRes;
+    try { invRes = await readInventorySnapshot({ organizationFingerprint, connectionId, accountId, signal }); }
+    catch (e) { return miss("inventory-read-threw:" + S(e && e.message)); }
     if (aborted()) return miss("aborted");
-    if (nb(expected)) {
-      let invRes;
-      try { invRes = await readInventorySnapshot({ organizationFingerprint, connectionId, accountId, signal }); }
-      catch (e) { return miss("inventory-read-threw:" + S(e && e.message)); }
+    if (invRes && invRes.read && invRes.read !== "ok") return miss("inventory-read-" + S(invRes.read)); // transient/schema -> defer
+    const snap = invRes && invRes.read === "ok" ? (invRes.snapshot || null) : null;
+    if (snap) {
+      const invSha = S(snap.payload_sha);
+      const expectedInvPath = buildObjectPath({ organizationFingerprint, connectionId, sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: accountId, payloadSha: invSha });
+      if (S(snap.organization_fingerprint) !== S(organizationFingerprint) || S(snap.connection_id) !== S(connectionId)
+        || S(snap.source_key) !== S(FBA_INVENTORY_SOURCE_KEY) || S(snap.scope_key) !== S(accountId)
+        || !nb(invSha) || !S(snap.object_path).endsWith("/" + invSha + ".json") || S(snap.object_path) !== expectedInvPath) return miss("inventory-pointer-corrupt");
+      // row_count strictness parity with validateListingsPointer / the round-4 Catalog check: an ACTUAL safe
+      // non-negative integer, never a Number(...) coercion of a string/null/bool that fail-opens when it matches
+      // invRows.length.
+      if (typeof snap.row_count !== "number" || !Number.isSafeInteger(snap.row_count) || snap.row_count < 0 || !isRealTimestamp(snap.validated_at)) return miss("inventory-pointer-invalid");
+      let invRows;
+      try { invRows = rowsOf(await loadSnapshotPayload(S(snap.object_path), { signal })); }
+      catch (e) { return miss("inventory-payload-unreadable:" + S(e && e.message)); }
       if (aborted()) return miss("aborted");
-      if (invRes && invRes.read && invRes.read !== "ok") return miss("inventory-read-" + S(invRes.read)); // transient/schema -> defer
-      const snap = invRes && invRes.read === "ok" ? (invRes.snapshot || null) : null;
-      if (snap && S(snap.source_request_hash) === expected) {
-        const invSha = S(snap.payload_sha);
-        const expectedInvPath = buildObjectPath({ organizationFingerprint, connectionId, sourceKey: FBA_INVENTORY_SOURCE_KEY, scopeKey: accountId, payloadSha: invSha });
-        if (S(snap.organization_fingerprint) !== S(organizationFingerprint) || S(snap.connection_id) !== S(connectionId)
-          || S(snap.source_key) !== S(FBA_INVENTORY_SOURCE_KEY) || S(snap.scope_key) !== S(accountId)
-          || !nb(invSha) || !S(snap.object_path).endsWith("/" + invSha + ".json") || S(snap.object_path) !== expectedInvPath) return miss("inventory-pointer-corrupt");
-        // row_count strictness parity with validateListingsPointer / the round-4 Catalog check: an ACTUAL safe
-        // non-negative integer, never a Number(...) coercion of a string/null/bool that fail-opens when it matches
-        // invRows.length.
-        if (typeof snap.row_count !== "number" || !Number.isSafeInteger(snap.row_count) || snap.row_count < 0 || !isRealTimestamp(snap.validated_at)) return miss("inventory-pointer-invalid");
-        let invRows;
-        try { invRows = rowsOf(await loadSnapshotPayload(S(snap.object_path), { signal })); }
-        catch (e) { return miss("inventory-payload-unreadable:" + S(e && e.message)); }
-        if (aborted()) return miss("aborted");
-        if (!Array.isArray(invRows) || invRows.length !== snap.row_count) return miss("inventory-row-count-mismatch");
-        const d1Rows = invRows.filter((row) => row && S(row.date) === S(requestedAsOf));
-        if (d1Rows.length > 0) {
-          inventorySource = { available: true, rows: d1Rows, fragments: [{ requestKey: "listing-health-v3:inventory", from: requestedAsOf, to: requestedAsOf, sellerOrVendorIds: [rawSellerId], rows: d1Rows }], disabled: false, disabledPolicy: null, reason: null };
-          inventorySnapshot = snap;
-        }
-        // proven-D-1 pointer with zero D-1 rows -> genuine "no usable D-1 FBA" -> UNAVAILABLE (leave available:false)
+      if (!Array.isArray(invRows) || invRows.length !== snap.row_count) return miss("inventory-row-count-mismatch");
+      if (invRows.length > 0) {
+        let snapshotDate = null;
+        for (const row of invRows) { const d = S(row && row.date).slice(0, 10); if (isRealCalendarDate(d) && (!snapshotDate || d > snapshotDate)) snapshotDate = d; }
+        inventoryBridge = { available: true, rows: invRows, snapshotDate, savedAt: S(snap.validated_at) || null };
+        inventorySnapshot = snap;
+      } else {
+        inventoryBridge = { available: false, reason: "health-snapshot-empty" };
       }
-      // snap absent (read ok, no pointer) OR request_hash != expected (valid pointer for another day) -> UNAVAILABLE
     }
-    // expected blank (unresolvable) -> UNAVAILABLE (FBA optional)
+    // snap absent (read ok, no pointer) -> UNAVAILABLE (inventory optional)
   }
-  const inventoryToken = inventoryFingerprintToken({ accountId, connectionId, requestedAsOf, available: inventorySource.available === true, sourceRequestHash: inventorySnapshot && inventorySnapshot.source_request_hash, payloadSha: inventorySnapshot && inventorySnapshot.payload_sha, validatedAt: inventorySnapshot && inventorySnapshot.validated_at });
+  const inventoryToken = inventoryFingerprintToken({ accountId, connectionId, requestedAsOf, available: inventoryBridge.available === true, sourceRequestHash: inventorySnapshot && inventorySnapshot.source_request_hash, payloadSha: inventorySnapshot && inventorySnapshot.payload_sha, validatedAt: inventorySnapshot && inventorySnapshot.validated_at });
 
   // --- Durable OLI (rows+coverage+completeness) + Product Catalog (rows + payload_sha), via the SHARED loader in its
   //     STRICT reconciler mode: a read failure on OLI rows/coverage/completeness or a Catalog integrity failure returns
@@ -306,9 +306,12 @@ export async function resolveListingHealthV3DependencyBundle(deps = {}, args = {
     catalogFetchedAt: S(durableCatalog.validatedAt) || null,
     listingHealthV3DurableOli: durableOli,
     listingHealthV3DurableCatalog: durableCatalog,
+    // The saved FBA Inventory Health bridge proven above (read-only; replaces the retired listing-health-v3:inventory
+    // fragment). The derive applies the bridge threshold against `to`.
+    listingHealthV3DurableInventory: inventoryBridge,
   };
   return {
     eligible: true, status, revisionId: fp.revisionId, deps: [], contentDeps: [fp.manifestToken],
-    bundle: { listingsRows: l.rows, rawRows: r.rows, inventorySource, context, listingsSnapshot: l.snapshot, rawSnapshot: r.snapshot, inventorySnapshot },
+    bundle: { listingsRows: l.rows, rawRows: r.rows, inventoryBridge, context, listingsSnapshot: l.snapshot, rawSnapshot: r.snapshot, inventorySnapshot },
   };
 }

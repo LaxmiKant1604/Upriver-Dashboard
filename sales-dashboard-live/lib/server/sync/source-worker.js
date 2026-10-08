@@ -33,11 +33,10 @@
 //     download(job, exportId) -> rows            // returns the rows array (or throws)
 //   }
 
-import { isDataDoeDeadlineError, isDataDoePollPendingError, isSourceDisabledError, withDataDoeDeadline } from "../datadoe.js";
+import { isDataDoeDeadlineError, isDataDoePollPendingError, isSourceDisabledError, withDataDoeDeadline, isRetiredDataDoeSourceId, isRetiredSourceError, RETIRED_SOURCE_ERROR_CODE } from "../datadoe.js";
 import { sourceJobOwnerId } from "../source-identity.js";
 import { validateBatchSourcePayload } from "./source-account-isolation.js";
 import { isRoutingScope } from "./scheduler-scope.js";
-import { compactLatestInventorySnapshot, isLatestSnapshotSource } from "./fba-inventory-latest-snapshot.js";
 import { isInitialLoadIncompleteMessage, READINESS_INCOMPLETE_CODE } from "./source-readiness-isolation.js";
 import { ORGANIZATION_SCOPE_KEY } from "./source-durable-model.js";
 
@@ -91,6 +90,11 @@ export function classifyFetchError(error, stage = "create-export") {
   }
   if (isSourceDisabledError(error)) {
     return { stage, code: "SOURCE_DISABLED", message: "Source is disabled for this organization.", terminal: true, transient: false };
+  }
+  // A RETIRED source (FBA Inventory Health) refused by createExport: a DEFINITE, terminal, non-transient refusal -- the
+  // same request is refused again, so it is NEVER retried (no EXPORT_ERROR transient loop).
+  if (isRetiredSourceError(error)) {
+    return { stage, code: RETIRED_SOURCE_ERROR_CODE, message: "FBA Inventory Health is retired (Listings inventory cutover); no export is created for it.", terminal: true, transient: false };
   }
   // The ZERO-EXPORT reconciler's no-export inner adapter refused a create/poll/download (error.code NO_EXPORT_REQUIRED):
   // the durable source it needs is not adoptable THIS pass. That is a routine, next-cycle-resolvable readiness gap, NOT a
@@ -365,6 +369,12 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
       }
       return { requestKey, requestHash, status: "missing-reusable-source", validated: false, code: "MISSING_REUSABLE_SOURCE" };
     }
+    // RETIRED source (FBA Inventory Health): refused HERE, BEFORE the create claim / frozen-budget token reservation, so a
+    // stale (pre-cutover frozen) Health job never reserves a token or reaches a POST. Recorded TERMINAL with the typed
+    // code -- never retried. (No planner emits a Health job; createExport refuses the id as well.)
+    if (isRetiredDataDoeSourceId(job.sourceId ?? job.source_id) || job.retired === true) {
+      return fail("create-export", RETIRED_SOURCE_ERROR_CODE, "FBA Inventory Health is retired (Listings inventory cutover); no export is created for it.", true);
+    }
     // Blocker 4d: when a FROZEN tranche budget is active, the create-claim goes through the ATOMIC pre-POST
     // reservation (reserve_source_export_create) instead of the plain claim -- it claims the still-pending job
     // AND reserves the create + AI-token cost in one transaction, so only the reservation winner may POST and
@@ -440,32 +450,11 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   if (!Array.isArray(rows)) {
     return fail("validate", "MALFORMED_PAYLOAD", "DataDoe payload was not an array; result not saved.", true);
   }
-  // LATEST-SNAPSHOT normalization exception: a SINGLE-seller inventory payload from a contract EXPLICITLY marked
-  // `latestSnapshot` (fba-plan:inventory-health + listing-health-v3:inventory -- FBA Plan + Listing Health v3 consume
-  // only the latest inventory date) is reduced to its latest PROVABLY-COMPLETE date so an oversized/cap-sized payload
-  // fits the row cap + 8MB cache limit -- NEVER summing across dates. Gated by BOTH the contract flag AND the inventory
-  // source key (defense in depth) AND a single seller; EVERY other source (the insight reports' own inventory contract
-  // with different columns/limit, OLI, Ads, catalog, ...) and any multi-seller batch keep the generic strict TRUNCATED
-  // validator below unchanged. An unprovable latest date is a terminal validate failure (never inferred complete). The
-  // contract's own row limit is the cap (so a 50000-row inventory export is judged against 50000, never a default).
-  const fpLs = job.fetchParams || {};
-  const lsIds = Array.isArray(fpLs.sellerOrVendorIds) ? fpLs.sellerOrVendorIds : [];
-  const isLatestSnapshotSingle = job.latestSnapshot === true && isLatestSnapshotSource(job.sourceKey) && lsIds.length === 1;
-  let rowsToPersist = rows;
-  let latestSnapshotMeta = null;
-  if (isLatestSnapshotSingle) {
-    const compacted = compactLatestInventorySnapshot({
-      rows, seller: lsIds[0],
-      marketplace: job.marketplaceConstraint ?? (Array.isArray(job.marketplacePairs) && job.marketplacePairs[0] && job.marketplacePairs[0].marketplace) ?? null,
-      rowCap: Number(job.limit) > 0 ? Number(job.limit) : undefined,
-      exportRef: exportId, requestedFrom: fpLs.from, requestedTo: fpLs.to,
-    });
-    if (!compacted.complete) {
-      return fail("validate", "LATEST_SNAPSHOT_INCOMPLETE", "Latest inventory date is not provably complete; not saved (previous data preserved).", true, rows.length);
-    }
-    rowsToPersist = compacted.rows;
-    latestSnapshotMeta = compacted.metadata;
-  } else if (job.strict === true && rows.length >= Number(job.limit)) {
+  // (The former LATEST-SNAPSHOT normalization exception -- a single-seller FBA Inventory Health payload reduced to its
+  // latest provably-complete date -- is gone with the Listings inventory cutover: no contract fetches Health, so EVERY
+  // source keeps the generic strict TRUNCATED validator below.)
+  const rowsToPersist = rows;
+  if (job.strict === true && rows.length >= Number(job.limit)) {
     return fail("validate", "TRUNCATED", "Result reached the row cap; partial data was not saved.", true, rows.length);
   }
 
@@ -480,8 +469,7 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
   const fp = job.fetchParams || {};
   const batchIds = Array.isArray(fp.sellerOrVendorIds) ? fp.sellerOrVendorIds : [];
   if (batchIds.length > 1 || job.marketplacePairs) {
-    // Validate the rows that will ACTUALLY be persisted (the compacted latest-date block for a latest-snapshot single
-    // seller; the raw rows otherwise) so a cross-account/marketplace row can never be saved.
+    // Validate the rows that will ACTUALLY be persisted so a cross-account/marketplace row can never be saved.
     const bv = validateBatchSourcePayload({
       rows: rowsToPersist,
       sellerOrVendorIds: batchIds,
@@ -497,12 +485,7 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
 
   // ---- STEP 7: persist (atomic last-known-good). A save error / empty object path is a
   // SEPARATE persist-stage failure and never overwrites the previous good data. ----
-  // A latest-snapshot job persists the COMPACTED latest-date block + records the normalization provenance in the cache
-  // row's request_meta (so an old full-range cache can never be mistaken for a normalized latest-snapshot cache); the
-  // request_hash is UNCHANGED (only the stored payload + metadata differ), so no unrelated identity moves.
-  const persistJob = latestSnapshotMeta
-    ? { ...job, request_meta: { ...(job.request_meta ?? job.requestMeta ?? {}), ...latestSnapshotMeta } }
-    : job;
+  const persistJob = job;
   const payloadBytes = approxPayloadBytes(rowsToPersist);
   let saveResult;
   try {

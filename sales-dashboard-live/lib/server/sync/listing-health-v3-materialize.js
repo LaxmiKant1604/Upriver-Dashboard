@@ -19,8 +19,9 @@
 //   - a missing/failed batch is SKIPPED (no write, no delete) so the previous per-account alias (last-known-good)
 //     survives;
 //   - the write is an UPSERT keyed by request_hash, so replay can never duplicate a row;
-//   - inventory reuses the FBA Plan batch export byte-identically -- this module reads that batch and only ALIASES
-//     the per-account fragment; it never plans, creates, or alters any FBA/AWD export or hash.
+//   - the Listings batch is the ONE canonical Listings export shared byte-identically with fba-plan:awd -- this module
+//     reads that batch and only ALIASES the per-account fragment; it never plans, creates, or alters any export or hash.
+//     FBA Inventory Health is RETIRED: there is no inventory family here.
 
 import { reportSourceRequestHashes } from "./report-source-contracts.js";
 import { isolateFragmentRowsForOwner } from "./source-account-isolation.js";
@@ -28,23 +29,21 @@ import { organizationFingerprint as orgFingerprintOf } from "../source-identity.
 import { MAX_ACCOUNTS_PER_BATCH } from "./source-batching.js";
 import { LISTINGS_SOURCE_KEY, LISTINGS_RAW_SOURCE_KEY } from "./source-durable-model.js";
 
-// The three v3 source families that need per-account materialization. Catalog + OLI are DURABLE, org/per-account
-// reads (never batched here), so they are deliberately absent.
+// The two v3 source families that need per-account materialization. Catalog + OLI are DURABLE, org/per-account
+// reads (never batched here), so they are deliberately absent. (The former "listing-health-v3:inventory" family -- a
+// per-account alias of the FBA Inventory Health batch export -- is gone: FBA Inventory Health is retired, no planner
+// emits it, and the request key is no longer a declared contract. v3 reads FBA stock from its own Listings rows, else
+// the dated read-only Health bridge read from source_snapshots, never from this alias.)
 export const LISTING_HEALTH_V3_READ_KEYS = Object.freeze([
   "listing-health-v3:listings",
   "listing-health-v3:listings-raw",
-  "listing-health-v3:inventory",
 ]);
 
-// The per-account READ identity uses DATE-FREE windows for ALL three keys, so it is a STABLE key that both the writer
-// (this module) and the reader (the serve) agree on regardless of the day. The inventory alias is deliberately
-// date-free too: inventory is the "latest snapshot", not a windowed series, so coupling its read identity to a
-// rolling as-of would make the serve miss the freshly-written alias on the next day. The dated batch export
-// (fba-plan:inventory-health) is UNCHANGED -- this only governs the per-account alias/read identity.
+// The per-account READ identity uses DATE-FREE windows for both keys, so it is a STABLE key that both the writer
+// (this module) and the reader (the serve) agree on regardless of the day.
 const DATE_FREE_WINDOWS = Object.freeze({
   "listing-health-v3:listings": [{ from: null, to: null }],
   "listing-health-v3:listings-raw": [{ from: null, to: null }],
-  "listing-health-v3:inventory": [{ from: null, to: null }],
 });
 
 /**
@@ -109,7 +108,7 @@ const S = (v) => (v == null ? "" : String(v));
 function approxBytes(rows) { try { return Buffer.byteLength(JSON.stringify({ rows })); } catch { return 0; } }
 const isDateStr = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
 // The v3 per-account read key -> the DURABLE Listings/Raw source key (migration table source_key). ONLY the two NEW
-// export families persist a durable pointer; :inventory is fba-inventory-health (reuse-only, already durable) -> absent.
+// export families persist a durable pointer (there is no inventory family: FBA Inventory Health is retired).
 const V3_DURABLE_SOURCE_KEY = Object.freeze({
   "listing-health-v3:listings": LISTINGS_SOURCE_KEY,
   "listing-health-v3:listings-raw": LISTINGS_RAW_SOURCE_KEY,
@@ -122,7 +121,9 @@ const V3_DURABLE_SOURCE_KEY = Object.freeze({
 // count (not a token maximum): DataDoe reports rowCountBilling=true, so the observed 2-token price is NOT an
 // unconditional maximum -- the defensive gate bounds the number of creates so a plan drift can never fan out exports.
 export const LISTING_HEALTH_V3_NEW_EXPORT_KEYS = Object.freeze(["listing-health-v3:listings", "listing-health-v3:listings-raw"]);
-export const LISTING_HEALTH_V3_REUSED_EXPORT_KEYS = Object.freeze(["listing-health-v3:inventory"]);
+// No reused export family any more (the former FBA Inventory Health reuse is retired). Kept (empty) for shape
+// compatibility of listingHealthV3PlannedExports / the ingestion cost evidence.
+export const LISTING_HEALTH_V3_REUSED_EXPORT_KEYS = Object.freeze([]);
 
 // DEPRECATED fixed per-region baseline (India 2 / Europe-AU 4 / US-CA 2 batches -> 4 / 8 / 4). Retained ONLY as a
 // last-resort fallback when neither an explicit ceiling nor the eligible account count is available. The gate now
@@ -141,23 +142,29 @@ export function expectedListingHealthV3NewExports(accountCount) {
   return LISTING_HEALTH_V3_NEW_EXPORT_KEYS.length * Math.ceil(n / MAX_ACCOUNTS_PER_BATCH);
 }
 
-/** Count the DISTINCT planned v3 export request_hashes, split into NEW (listings + listings-raw) vs REUSED (inventory). */
+/**
+ * Count the DISTINCT planned v3 export request_hashes (NEW = listings + listings-raw; REUSED = none since FBA Inventory
+ * Health is retired). Any OTHER planned v3 request key is reported in unplannedRequestKeys -- the ceiling gate fails
+ * closed on it (v3 owns no other export, never an inventory one).
+ */
 export function listingHealthV3PlannedExports(plans) {
   const newHashes = new Set();
   const reusedHashes = new Set();
+  const unplanned = new Set();
   for (const plan of plans || []) {
     if (!plan || plan.reportKey !== "listing-health-v3") continue;
     for (const s of plan.sources || []) {
       if (LISTING_HEALTH_V3_NEW_EXPORT_KEYS.includes(s.requestKey)) newHashes.add(s.requestHash);
       else if (LISTING_HEALTH_V3_REUSED_EXPORT_KEYS.includes(s.requestKey)) reusedHashes.add(s.requestHash);
+      else unplanned.add(String(s.requestKey));
     }
   }
-  return { newExports: newHashes.size, reusedExports: reusedHashes.size, newExportHashes: [...newHashes], reusedExportHashes: [...reusedHashes] };
+  return { newExports: newHashes.size, reusedExports: reusedHashes.size, newExportHashes: [...newHashes], reusedExportHashes: [...reusedHashes], unplannedRequestKeys: [...unplanned].sort() };
 }
 
 /**
- * FAIL-CLOSED export-ceiling gate. Counts ONLY the new Listings + Listings-Raw creates (inventory reuse = zero
- * incremental) and throws BEFORE any create when the planned count exceeds the ceiling.
+ * FAIL-CLOSED export-ceiling gate. Counts ONLY the new Listings + Listings-Raw creates and throws BEFORE any create when
+ * the planned count exceeds the ceiling, or when the plan carries ANY other v3 request key (an unplanned family).
  *
  * The ceiling is COMPUTED from the exact frozen plan's eligible account membership (`accountCount`): two creates per
  * <=5-seller batch. This scales with account growth (no fixed 4/8/4) while still catching DRIFT -- a plan that fans
@@ -167,6 +174,9 @@ export function listingHealthV3PlannedExports(plans) {
  */
 export function assertListingHealthV3ExportCeiling({ region, plans, accountCount = null, ceiling = null }) {
   const counts = listingHealthV3PlannedExports(plans);
+  if (counts.unplannedRequestKeys.length) {
+    throw new Error(`listing-health-v3 plan for region "${region}" carries request key(s) ${counts.unplannedRequestKeys.join(", ")} outside listings + listings-raw; refusing (fail closed).`);
+  }
   const computed = expectedListingHealthV3NewExports(accountCount);
   let cap = ceiling != null ? Number(ceiling) : computed;
   const computedFromAccounts = ceiling == null && computed != null;

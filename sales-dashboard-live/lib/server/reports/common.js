@@ -1,15 +1,23 @@
 // Pieces every insight report needs: the ASIN/brand map, honest source
-// freshness, and the latest FBA inventory snapshot.
+// freshness, and the account's SAVED inventory evidence -- its saved Listings
+// rows and its last SAVED FBA Inventory Health snapshot (the dated read-only
+// bridge) -- the two inputs of the per-account stock-source decision
+// (derivation-core insightInventory: validated Listings, else the bridge within
+// its freshness threshold, else Unavailable). Listings inventory CUTOVER: no
+// FBA Inventory Health export is requested here (the former
+// fetchInventorySnapshot is removed; lib/server/datadoe.js refuses the source).
 
 import {
   addDaysStr,
   fetchExportRows,
   fetchExportRowsStrict,
+  isDateStr,
   num,
-  numOrNull,
 } from "../datadoe.js";
+import { getSourceListingsSnapshot, getSourceSnapshotPayload } from "../supabase.js";
+import { organizationFingerprint as orgFingerprintOf } from "../source-identity.js";
+import { readSavedHealthBridge } from "./health-bridge.js";
 import {
-  FBA_INVENTORY_HEALTH,
   PRODUCT_CATALOG,
   ROW_LIMITS,
   SALES_TRAFFIC,
@@ -81,104 +89,94 @@ export async function fetchSalesTrafficLatestDate(apiKey, ids, from, to) {
   return latest;
 }
 
-export const INVENTORY_COLUMNS = [
-  "date",
-  "sku",
-  "child_asin",
-  "product_name",
-  "currency",
-  "available",
-  "unfulfillable_quantity",
-  "inbound_shipped",
-  "inbound_received",
-  "days_of_supply",
-  "units_shipped_t30",
-  "your_price",
-  "sales_price",
-  "featuredoffer_price",
-  "lowest_price_new_plus_shipping",
-  "alert",
-];
+/* ---------------------------------------------------------------- saved Listings (zero export) */
+
+// The insight reports read the account's SAVED durable Listings snapshot (the source_listings_snapshot pointer + its
+// content-addressed payload, written by the scheduled Listings run) as the PREFERRED FBA stock source; the per-account
+// decision (derivation-core insightInventory) uses it only when it validates, else the account's last SAVED FBA
+// Inventory Health snapshot as the dated read-only bridge (within its threshold), else Unavailable. ZERO DataDoe exports.
+// Freshness: the pointer's as_of is the scheduled cycle (D-1) that saved it. It is accepted only when that cycle is no
+// more than INSIGHT_LISTINGS_MAX_CYCLE_LAG_DAYS before the report's as-of (the browser's as-of is the viewer's local date
+// and each region's cycle runs once a day); anything older means a scheduled Listings run was missed, and Listings is
+// not used (the bridge may be, labelled) rather than shown as current.
+export const INSIGHT_LISTINGS_MAX_CYCLE_LAG_DAYS = 2;
 
 /**
- * The latest FBA Inventory Health snapshot, keyed by SKU and folded to ASIN.
- *
- * The source is a daily per-SKU snapshot (INITIAL 1 / RECURRING_DAILY 1), so the
- * export looks back a few days ordered by date DESC and keeps only the newest
- * date present. Prices are kept per SKU because a competitive price is a
- * per-offer fact and must not be summed or averaged across SKUs.
- *
- * `available: null` on the returned object means the whole snapshot is missing,
- * which the UI must show as unavailable rather than as zero stock.
+ * The account's saved Listings rows for the stock-source decision. NEVER throws: every failure is
+ * { rows: null, unavailableReason } so the report falls back to the saved Health bridge (or Unavailable), never 0.
+ *   accountId -- the account's RAW DataDoe seller id (the durable pointer's account_id). connectionId -- "primary" |
+ *   "dd-secondary". asOf -- the report's as-of. readPointer / readPayload -- injectable (tests); default to the
+ *   read-only Supabase readers.
+ * Returns { rows, unavailableReason, refreshedAt, marketplace }.
  */
-export async function fetchInventorySnapshot(apiKey, ids, asOf) {
-  // Strict on purpose. The window is EXACTLY the single previous day [asOf-1 .. asOf-1] (the latest
-  // complete D-1 snapshot; never a lookback range), so a payload at the cap is genuinely ambiguous and
-  // must fail: a SKU absent from a truncated result would look like zero stock and produce a false
-  // stockout claim. That is exactly the kind of confident-but-wrong output worth failing for.
-  const inventoryDay = addDaysStr(asOf, -1);
-  const rows = await fetchExportRowsStrict(
-    apiKey, FBA_INVENTORY_HEALTH.id, INVENTORY_COLUMNS, ids,
-    inventoryDay, inventoryDay, ROW_LIMITS.inventory,
-    { orderByColumn: "date", orderByDirection: "DESC" },
-    "FBA inventory snapshot export"
-  );
-
-  let snapshotDate = null;
-  for (const row of rows) {
-    if (row.date && (!snapshotDate || row.date > snapshotDate)) snapshotDate = row.date;
+export async function readSavedListingsRows({
+  apiKey = null, organizationFingerprint = null, connectionId = "primary", accountId, asOf,
+  readPointer = getSourceListingsSnapshot, readPayload = getSourceSnapshotPayload,
+} = {}) {
+  const unavailable = (reason) => ({ rows: null, unavailableReason: reason, refreshedAt: null, marketplace: null });
+  let org = organizationFingerprint ? String(organizationFingerprint) : null;
+  if (!org && apiKey) {
+    try { org = orgFingerprintOf(apiKey); } catch { org = null; }
   }
-  const current = snapshotDate ? rows.filter((row) => row.date === snapshotDate) : [];
-
-  const bySku = new Map();
-  const byAsin = new Map();
-  for (const row of current) {
-    const sku = String(row.sku || "").trim();
-    const asin = String(row.child_asin || "").trim();
-    const entry = {
-      sku: sku || null,
-      asin: asin || null,
-      productName: String(row.product_name || "").trim() || null,
-      currency: String(row.currency || "").trim() || null,
-      available: num(row.available),
-      unfulfillable: num(row.unfulfillable_quantity),
-      inbound: num(row.inbound_shipped) + num(row.inbound_received),
-      daysOfSupply: numOrNull(row.days_of_supply),
-      unitsShippedT30: num(row.units_shipped_t30),
-      // Competitive prices are nullable in the source; keep null so a missing
-      // price is never read as "priced at zero".
-      yourPrice: numOrNull(row.your_price),
-      salesPrice: numOrNull(row.sales_price),
-      featuredOfferPrice: numOrNull(row.featuredoffer_price),
-      lowestPriceNewPlusShipping: numOrNull(row.lowest_price_new_plus_shipping),
-      alert: String(row.alert || "").trim() || null,
-    };
-    if (sku && !bySku.has(sku)) bySku.set(sku, entry);
-    if (asin) {
-      const folded = byAsin.get(asin) || {
-        asin, available: 0, unfulfillable: 0, inbound: 0, unitsShippedT30: 0,
-        daysOfSupply: null, skuCount: 0,
-      };
-      folded.available += entry.available;
-      folded.unfulfillable += entry.unfulfillable;
-      folded.inbound += entry.inbound;
-      folded.unitsShippedT30 += entry.unitsShippedT30;
-      if (entry.daysOfSupply !== null) {
-        folded.daysOfSupply = folded.daysOfSupply === null
-          ? entry.daysOfSupply
-          : Math.min(folded.daysOfSupply, entry.daysOfSupply);
-      }
-      folded.skuCount += 1;
-      byAsin.set(asin, folded);
-    }
+  const account = String(accountId || "").trim();
+  if (!org || !account || account.includes(":") || !isDateStr(asOf)) return unavailable("listings-identity-unavailable");
+  let pointer;
+  try {
+    const read = await readPointer({ organizationFingerprint: org, connectionId, accountId: account });
+    if (!read || read.read !== "ok") return unavailable(read && read.read === "schema-missing" ? "listings-snapshot-missing" : "listings-snapshot-read-failed");
+    pointer = read.snapshot;
+  } catch {
+    return unavailable("listings-snapshot-read-failed");
   }
+  if (!pointer || !pointer.object_path) return unavailable("listings-snapshot-missing");
+  const cycle = String(pointer.as_of || "").slice(0, 10);
+  if (!isDateStr(cycle) || cycle < addDaysStr(asOf, -INSIGHT_LISTINGS_MAX_CYCLE_LAG_DAYS)) return unavailable("listings-snapshot-stale");
+  let rows;
+  try {
+    const payload = await readPayload(String(pointer.object_path));
+    rows = payload && Array.isArray(payload.rows) ? payload.rows : null;
+  } catch {
+    rows = null;
+  }
+  if (!rows) return unavailable("listings-payload-unreadable");
+  if (pointer.row_count != null && Number(pointer.row_count) !== rows.length) return unavailable("listings-payload-row-count-mismatch");
+  return { rows, unavailableReason: null, refreshedAt: pointer.validated_at || null, marketplace: String(pointer.marketplace || "") || null };
+}
 
-  return {
-    snapshotDate,
-    available: current.length > 0,
-    bySku,
-    byAsin,
-  };
+/**
+ * BOTH saved inventory inputs of one insight report (READ-ONLY; zero DataDoe; never throws): the account's saved
+ * Listings rows (readSavedListingsRows, keyed by the RAW seller id) and its last SAVED durable FBA Inventory Health
+ * snapshot (lib/server/reports/health-bridge.js readSavedHealthBridge -- the dated read-only bridge). The SAME function
+ * feeds the manual refresh builders and the scheduled derive's context loader, so both decide the stock source on
+ * identical evidence.
+ *   ids      -- [raw seller id] (exactly one account).
+ *   to       -- the report as-of (the Listings lag + the bridge threshold are measured against it).
+ *   listings -- { organizationFingerprint, connectionId, readPointer, readPayload } for the Listings pointer, plus
+ *               healthScopeKey (the durable Health scope_key; default the raw seller id) and readHealthPointer /
+ *               readHealthPayload (injectable; default the read-only Supabase readers).
+ * Returns { listings: { rows, unavailableReason, refreshedAt, marketplace }, healthBridge: { rows, unavailableReason,
+ *   snapshotDate, savedAt } }.
+ */
+export async function readInsightInventoryEvidence({ apiKey = null, ids, to, listings = {} } = {}) {
+  const opt = listings && typeof listings === "object" ? listings : {};
+  const rawSellerId = String((Array.isArray(ids) ? ids[0] : ids) || "").trim();
+  const savedListings = await readSavedListingsRows({
+    apiKey, accountId: rawSellerId, asOf: to,
+    ...(opt.organizationFingerprint ? { organizationFingerprint: opt.organizationFingerprint } : {}),
+    ...(opt.connectionId ? { connectionId: opt.connectionId } : {}),
+    ...(typeof opt.readPointer === "function" ? { readPointer: opt.readPointer } : {}),
+    ...(typeof opt.readPayload === "function" ? { readPayload: opt.readPayload } : {}),
+  });
+  const healthBridge = await readSavedHealthBridge({
+    apiKey,
+    organizationFingerprint: opt.organizationFingerprint || null,
+    connectionId: opt.connectionId || "primary",
+    accountId: String(opt.healthScopeKey || "").trim() || rawSellerId,
+    rawSellerId,
+    ...(typeof opt.readHealthPointer === "function" ? { readPointer: opt.readHealthPointer } : {}),
+    ...(typeof opt.readHealthPayload === "function" ? { readPayload: opt.readHealthPayload } : {}),
+  });
+  return { listings: savedListings, healthBridge };
 }
 
 /** Sum helper for grouped exports that return `<alias>` or the raw column. */

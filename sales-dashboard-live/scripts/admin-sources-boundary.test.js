@@ -125,8 +125,8 @@ test("6. legitimate admin PATCH for ads-campaign-date is NOT retired-blocked: se
   assert.equal(calls.audit[0].action, "source.paused");
 });
 
-test("7. normal OLI + Catalog + FBA-health PATCH controls unchanged (not retired-blocked): control written + audited", async () => {
-  for (const sourceKey of ["order-line-items", "product-catalog", "fba-inventory-health"]) {
+test("7. normal OLI + Catalog + Listings PATCH controls unchanged (not retired-blocked): control written + audited", async () => {
+  for (const sourceKey of ["order-line-items", "product-catalog", "listings"]) {
     const { deps, calls } = makeDeps();
     const res = fakeRes();
     await handler({ method: "PATCH", body: { sourceKey, paused: false } }, res, deps);
@@ -152,7 +152,27 @@ test("8. the retirement gate uses the REAL centralized authority (nothing retire
   assert.equal(isAdsRegistryKeyRetired("ads-asin-date"), false, "ASIN registry grain is operable (runner-only exports), not retired");
   assert.equal(isAdsRegistryKeyRetired("ads-campaign-date"), false, "Campaign registry grain is never retired");
   assert.equal(isAdsRegistryKeyRetired("order-line-items"), false);
-  assert.equal(isAdsRegistryKeyRetired("fba-inventory-health"), false);
+  assert.equal(isAdsRegistryKeyRetired("listings"), false);
+});
+
+test("7b. Listings inventory cutover: the retired fba-inventory-health card is GONE -- a PATCH for it is refused with the TYPED 409 HEALTH_SOURCE_RETIRED (user-readable, never retryable) with ZERO control write / audit, and a POST sync for it never reaches a runtime / preflight (no Health export can be planned from the Data Sync Center)", async () => {
+  const { deps, calls } = makeDeps();
+  const res = fakeRes();
+  await handler({ method: "PATCH", body: { sourceKey: "fba-inventory-health", paused: false } }, res, deps);
+  assert.equal(res.statusCode, 409, JSON.stringify(res.body));
+  assert.equal(res.body.code, "HEALTH_SOURCE_RETIRED");
+  assert.equal(res.body.retryable, false);
+  assert.match(String(res.body.message), /retired/i);
+  assert.equal(calls.setSourceControl.length, 0, "no control written");
+  assert.equal(calls.audit.length, 0, "no audit");
+  const { deps: d2, calls: c2 } = makeDeps();
+  const r2 = fakeRes();
+  await handler({ method: "POST", body: { bucket: "us", sourceKey: "fba-inventory-health", preview: true } }, r2, d2);
+  assert.equal(r2.statusCode, 409, "the retired card cannot be previewed / synced: " + r2.statusCode);
+  assert.equal(r2.body.code, "HEALTH_SOURCE_RETIRED");
+  assert.equal(r2.body.retryable, false);
+  assert.equal(c2.setSourceControl.length, 0);
+  assert.ok(!JSON.stringify(r2.body || {}).includes("confirmationToken\":\"") , "no confirmation token is ever issued for it");
 });
 
 async function main() {

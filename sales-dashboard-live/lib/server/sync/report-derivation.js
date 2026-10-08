@@ -35,6 +35,8 @@ import {
   returnsLeakagePayload,
   listingHealthPayload,
   assertListingHealthCurrencyIsolation,
+  INSIGHT_INVENTORY_CONTEXT_KEY,
+  insightEvidenceFromContext,
   listingOptimizerPayload,
   listingOptimizerUnavailablePayload,
   ppcPerformancePayload,
@@ -72,6 +74,11 @@ import { adsCurrencyEvidence } from "../currency.js";
 // window (including the retired 10-day-lookback shape) is rejected -- the derivation never implicitly
 // trusts the fragment's window, and no row outside the exact requested day can ever be accepted.
 
+// FBA Plan canonical Listings (fba-plan:awd) row ceiling = its contract limit (the 50,000-row DataDoe provider ceiling):
+// a fragment AT the ceiling is potentially truncated and never validates (rejectsAtCap -- the source worker's own rule).
+import { REPORT_SOURCE_CONTRACTS as FBA_PLAN_SOURCE_CONTRACTS, rejectsAtCap } from "./report-source-contracts.js";
+const FBA_PLAN_LISTINGS_ROW_CAP = Number(((FBA_PLAN_SOURCE_CONTRACTS["fba-plan"] || []).find((c) => c.requestKey === "fba-plan:awd") || {}).limit) || 50000;
+
 // Keyword Rank SQP + catalog lookbacks (days) -- byte-identical to the api/datadoe.js
 // SQP_WEEKLY_LOOKBACK_DAYS / SQP_MONTHLY_LOOKBACK_DAYS (the monthly SQP and the 365-day catalog share
 // the long window). The derivation RECOMPUTES both window starts from asOf and pins both endpoints.
@@ -88,20 +95,20 @@ const OPT_SQP_ENABLE_HINT = "In DataDoe, open Settings > Data tables and enable 
 const OPT_CATALOG_LABEL = "Product Catalog by ASIN";
 
 // Sales Movers constants -- byte-identical to the live builder/sources: SALES_TRAFFIC.lagDays (4),
-// sales-movers.js WINDOW_DAYS (7), the single-day [asOf-1 .. asOf-1] inventory snapshot, SALES_TRAFFIC.label.
-// The derivation RECOMPUTES the probe/inventory windows from asOf and pins them, never trusting a caller.
+// sales-movers.js WINDOW_DAYS (7), SALES_TRAFFIC.label. The derivation RECOMPUTES the probe window from asOf and
+// pins it, never trusting a caller. (No FBA Inventory Health window any more: the Listings inventory cutover retired
+// the insight Health fragment; stock comes from the derived saved evidence, see INSIGHT_INVENTORY_CONTEXT_KEY.)
 const SM_LAG_DAYS = 4;
 const SM_WINDOW_DAYS = 7;
 const SM_SOURCE_LABEL = "Sales & Traffic by ASIN & Date";
 
 // Buy Box Loss constants -- byte-identical to the live builder/sources: buy-box.js WINDOW_DAYS (28) +
-// SLICE_DAYS (7), the single-day [asOf-1 .. asOf-1] inventory snapshot, PROFIT_BY_SKU.label, and the fixed
-// price-source label. The derivation RECOMPUTES the four 7-day daily slices + the inventory window from
-// asOf and pins every endpoint, never trusting a caller's fragment windows.
+// SLICE_DAYS (7) and PROFIT_BY_SKU.label. The derivation RECOMPUTES the four 7-day daily slices from asOf and
+// pins every endpoint, never trusting a caller's fragment windows. (The former FBA Inventory Health price-source
+// label is gone: competitive prices were Health-only metrics and are removed by the Listings inventory cutover.)
 const BB_WINDOW_DAYS = 28;
 const BB_SLICE_DAYS = 7;
 const BB_SOURCE_LABEL = "Profit by SKU & Date";
-const BB_PRICE_SOURCE_LABEL = "FBA Inventory Health";
 
 // Returns & Refund Leakage constants -- byte-identical to the live builder/sources: returns.js WINDOW_DAYS
 // = RETURNS.historyDays (60); the source labels + ORDER_LINE_ITEMS.lagDays (0). The return-rate denominator
@@ -114,9 +121,9 @@ const RET_RATE_LABEL = "Order Line Items";
 const RET_RATE_LAG_DAYS = 0;
 
 // Listing Health constants -- byte-identical to the live builder/sources: listing-health.js
-// SALES_WINDOW_DAYS (30), the single-day [asOf-1 .. asOf-1] inventory snapshot, the source labels, and the
-// exact LISTINGS_RAW.enableHint shown when the optional Listings (Raw JSON) enrichment is disabled. The
-// derivation RECOMPUTES the sales/inventory windows from asOf and pins them, never trusting a caller.
+// SALES_WINDOW_DAYS (30), the source labels, and the exact LISTINGS_RAW.enableHint shown when the optional
+// Listings (Raw JSON) enrichment is disabled. The derivation RECOMPUTES the sales window from asOf and pins it,
+// never trusting a caller. (No FBA Inventory Health window: stock comes from the derived saved evidence.)
 const LH_SALES_WINDOW_DAYS = 30;
 const LH_SOURCE_LABEL = "Listings";
 const LH_SALES_SOURCE_LABEL = "Profit by SKU & Date";
@@ -467,19 +474,30 @@ const REGISTRY = {
   // -> derive-invalid -> last-known-good preserved) so it can never silently become zero, while a
   // VALIDATED empty AWD source is honored as "no AWD rows". Non-US never plans or reads AWD.
   "fba-plan": {
-    // v2d-5: adds accountSkuDirectory (durable per-SKU identity: childAsin/productName/brand/marketplace/provenance)
-    // + catalogByAsin (ASIN -> brand/name enrichment + existence proof). v2d-4 added reserved_customer_order +
-    // awd_total_inbound_quantity and stores reserved_fc_transfer RAW (the unproven subtraction was removed). The LIVE
-    // served identity (fba-plan-shared-v1) is unchanged; the frontend reads accountSkuDirectory when present and falls
-    // back to the string-only accountSkus for older snapshots.
-    snapshotVersion: "fba-plan/v2d-5", optionalRequestKeys: ["fba-plan:awd"],
+    // v3-phase2 (Listings inventory cutover, phase 2): ONE Listings-model payload (inventoryModel "listings-v1") whatever
+    // the per-account inventory source -- validated Listings, else the labelled FBA Inventory Health fallback, else
+    // Unavailable (inventorySource / inventoryListingsReasons / inventoryHealthDate; rows carry fbaContext / fbaAvailable /
+    // fbaInbound / fbaReservedTotal / fbaFcTransfer / awdAvailable / awdInbound, null = unknown) + listingsRefreshedAt /
+    // healthFetchedAt. The former Health row fields (customer / FC reserved, FC processing, inbound working / shipped /
+    // received) are gone. The canonical Listings (fba-plan:awd) is optional at the gate (US keeps its hard requirement in
+    // the derive); since the cutover (below) no Health fragment exists. The LIVE served identity
+    // (fba-plan-shared-v1) is unchanged; the web renders a pre-phase-2 (v2d-5, Health-model) saved plan through its
+    // client adapter (src/lib/fba-planning.js adaptFbaPlanPayload), so a deploy-before-scheduler window keeps showing it.
+    // v2d-5 added accountSkuDirectory + catalogByAsin; v2d-4 reserved_customer_order + awd_total_inbound_quantity.
+    // v3-cutover (Listings inventory CUTOVER, owner decisions 2026-10-08): NO FBA Inventory Health fragment is requested or
+    // required; the Health input is the READ-ONLY bridge (the account's last saved durable snapshot, context
+    // fbaPlanHealthBridge) used only while its date >= inventoryAsOf - 2 days (inventoryHealthReasons /
+    // inventoryBridgeSnapshotDate / inventoryBridgeMaxAgeDays / inventoryAsOf say why not); a BLANK AWD cell on an
+    // AWD-eligible marketplace is ASSUMED 0 and flagged (rows[].awdAssumedZero, awdAssumedZeroSkus).
+    snapshotVersion: "fba-plan/v3-cutover", optionalRequestKeys: ["fba-plan:awd"],
     // OLI sales + Product Catalog are durable derived dependencies (source_oli_daily_history + the org catalog
     // snapshot), injected into the derive context by makeFbaPlanDurableContextLoader through the loadDerivedContext
     // seam. derivedContextKeys is the allowlist buildDeriveContext uses to admit them (they never enter the
     // snapshot params/identity). A missing/short durable input arrives absent -> the derive throws below ->
-    // last-known-good preserved (fail closed).
-    derivedSourceKeys: ["order-line-items", "product-catalog"],
-    derivedContextKeys: ["fbaPlanDurableOli", "fbaPlanDurableCatalog"],
+    // last-known-good preserved (fail closed). The READ-ONLY Health bridge (fbaPlanHealthBridge) arrives the same way but
+    // is SOFT (absent -> no bridge, never a block).
+    derivedSourceKeys: ["order-line-items", "product-catalog", "fba-inventory-health"],
+    derivedContextKeys: ["fbaPlanDurableOli", "fbaPlanDurableCatalog", "fbaPlanHealthBridge"],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";
       if (!isValidCalendarDate(asOf)) {
@@ -526,44 +544,66 @@ const REGISTRY = {
         throw deriveError("fba-plan requires the durable Product Catalog snapshot; it is missing, so the snapshot is deferred (previous data preserved; the next cycle re-derives once it materializes).", "unavailable");
       }
       const catalogRows = singleAccountFragmentRows(durableCatalog, "fba-plan:catalog", rawSellerId, completed[0].from, current.to);
-      // Inventory window is EXACTLY the single snapshot day [inventoryAsOf .. inventoryAsOf] (D-1). Pin
-      // BOTH endpoints to that one date (any lookback/shifted fragment is rejected -> derive-invalid ->
-      // last-known-good preserved), never implicitly trusting the planner/caller.
+      // The plan's inventory as-of (the cycle's D-1): the anchor of the READ-ONLY Health bridge's 2-day freshness rule.
       const inventoryAsOf = context.inventoryAsOf == null ? asOf : String(context.inventoryAsOf);
       if (!isValidCalendarDate(inventoryAsOf)) throw new Error("fba-plan inventoryAsOf must be a real calendar date.");
-      const expectedInventoryFrom = inventoryAsOf;
-      const invRows = singleAccountFragmentRows(sources["fba-plan:inventory-health"], "fba-plan:inventory-health", rawSellerId, expectedInventoryFrom, inventoryAsOf);
-      assertRowsInWindow(invRows, expectedInventoryFrom, inventoryAsOf, "fba-plan inventory");
+      // Listings inventory cutover: NO FBA Inventory Health fragment is requested or required any more. The Health input is
+      // the READ-ONLY BRIDGE -- the account's LAST SAVED durable snapshot (source_snapshots 'fba-inventory-health'), injected
+      // by the durable loader as context.fbaPlanHealthBridge (fba-plan-health-bridge.js). It is SOFT: absent / refused ->
+      // no bridge (the plan uses validated Listings or shows inventory Unavailable, never a block, never 0). Integrity is
+      // still fail-closed: a bridge row of ANOTHER seller is never folded, and a bridge snapshot dated AFTER the plan's
+      // inventory as-of is not this plan's evidence (refused, typed).
+      const bridge = context.fbaPlanHealthBridge;
+      let invRows = [];
+      let healthBridgeReason = null;
+      let healthBridgeValidatedAt = null;
+      if (bridge && typeof bridge === "object" && bridge.available === true && Array.isArray(bridge.rows)) {
+        if (bridge.rows.some((r) => !r || typeof r !== "object" || Array.isArray(r))) throw new Error("fba-plan Health bridge rows must be objects (fail closed).");
+        if (rawSellerId != null && bridge.rows.some((r) => r.seller_or_vendor_id != null && String(r.seller_or_vendor_id).trim() !== "" && String(r.seller_or_vendor_id).trim() !== rawSellerId)) {
+          throw new Error("fba-plan Health bridge carries another seller's rows; snapshot blocked (fail closed).");
+        }
+        let bridgeDate = null;
+        for (const r of bridge.rows) { const d = String((r && r.date) || "").slice(0, 10); if (isValidCalendarDate(d) && (!bridgeDate || d > bridgeDate)) bridgeDate = d; }
+        if (bridgeDate && bridgeDate > inventoryAsOf) healthBridgeReason = `health-bridge-after-as-of:${bridgeDate}`;
+        else invRows = bridge.rows;
+        healthBridgeValidatedAt = bridge.validatedAt != null && String(bridge.validatedAt) !== "" ? String(bridge.validatedAt) : null;
+      } else {
+        healthBridgeReason = bridge && typeof bridge === "object" && bridge.reason ? String(bridge.reason) : "health-snapshot-missing";
+      }
 
-      // 3) AWD -- the AWD-capable marketplaces (US + EU5). US is a HARD REQUIREMENT: a missing/failed/malformed AWD
-      //    source BLOCKS (never a silent zero) so last-known-good is preserved -- byte-identical to before. Europe is
-      //    BEST-EFFORT: a missing/failed/malformed AWD source leaves AWD honestly unavailable ([] rows) and NEVER
-      //    blocks the plan (a failed Europe AWD fetch must not blank the FBA plan; the account's other columns +
-      //    last-known-good stand). A non-AWD marketplace never reads AWD.
+      // 3) The canonical Listings fragment (fba-plan:awd; a NO-DATE snapshot) -- since phase 2 of the Listings inventory
+      //    cutover it is read for EVERY marketplace: FBA inventory (used when this account's Listings snapshot validates,
+      //    else the READ-ONLY Health bridge above) + AWD (US + EU5). US keeps its HARD requirement exactly as before:
+      //    a missing / failed / malformed (or capped) fragment BLOCKS (never a silent zero; last-known-good preserved).
+      //    Anywhere else such a fragment is NEVER used -- not for inventory, identity or AWD -- and never blocks: the plan
+      //    falls back to the labelled Health bridge (or Unavailable) with the typed reason. A fragment AT the 50,000-row ceiling
+      //    is potentially truncated: the strict source worker already refuses it upstream (TRUNCATED, never saved); the
+      //    derive re-checks the row count (defense in depth) so a capped Listings snapshot can never validate.
       const awdEligible = awdCapableMarketplace(context.marketCountry);
       const awdRequired = awdRequiredForMarketplace(context.marketCountry); // US only
-      let awdRows = [];
-      if (awdEligible) {
-        const awd = sources["fba-plan:awd"];
-        const present = awd && awd.available === true && Array.isArray(awd.rows);
-        if (!present) {
-          if (awdRequired) throw new Error("fba-plan US account requires a validated AWD source; it is missing or failed, so the snapshot is blocked (previous data preserved).");
-          // Europe best-effort: AWD unavailable -> continue with awdRows = [] (never block).
+      const listingsSource = sources["fba-plan:awd"];
+      let listingsRows = [];
+      let listingsUnavailableReason = null;
+      let listingsFragment = null;
+      if (!(listingsSource && listingsSource.available === true && Array.isArray(listingsSource.rows))) {
+        if (awdRequired) throw new Error("fba-plan US account requires a validated AWD source; it is missing or failed, so the snapshot is blocked (previous data preserved).");
+        listingsUnavailableReason = "listings-source-unavailable";
+      } else {
+        // EXACTLY one single-account fragment whose window is the canonical {from:null, to:null}.
+        const frags = listingsSource.fragments || [];
+        const f = frags.length === 1 ? frags[0] : null;
+        const ids = f && f.sellerOrVendorIds;
+        const ok = !!f && f.from === null && f.to === null
+          && Array.isArray(ids) && ids.length === 1 && (rawSellerId == null || String(ids[0]).trim() === rawSellerId);
+        if (!ok) {
+          if (awdRequired) throw new Error("fba-plan AWD must be exactly one single-account no-date fragment (from === null, to === null); snapshot blocked.");
+          listingsUnavailableReason = "listings-fragment-malformed";
+        } else if (rejectsAtCap(listingsSource.rows.length, FBA_PLAN_LISTINGS_ROW_CAP)) {
+          if (awdRequired) throw new Error("fba-plan Listings fragment reached the 50,000-row provider ceiling (potentially truncated); snapshot blocked.");
+          listingsUnavailableReason = `listings-capped:${FBA_PLAN_LISTINGS_ROW_CAP}`;
         } else {
-          // AWD is a NO-DATE source: require EXACTLY one single-account fragment whose window is the canonical
-          // {from:null, to:null}. A dated/malformed AWD fragment BLOCKS a US account (LKG preserved); for Europe it is
-          // best-effort (AWD unavailable, never block).
-          const frags = awd.fragments || [];
-          const f = frags.length === 1 ? frags[0] : null;
-          const ids = f && f.sellerOrVendorIds;
-          const ok = !!f && f.from === null && f.to === null
-            && Array.isArray(ids) && ids.length === 1 && (rawSellerId == null || String(ids[0]).trim() === rawSellerId);
-          if (!ok) {
-            if (awdRequired) throw new Error("fba-plan AWD must be exactly one single-account no-date fragment (from === null, to === null); snapshot blocked.");
-            // Europe best-effort: malformed AWD fragment -> AWD unavailable, continue.
-          } else {
-            awdRows = awd.rows;
-          }
+          listingsRows = listingsSource.rows;
+          listingsFragment = f;
         }
       }
 
@@ -575,12 +615,32 @@ const REGISTRY = {
         awdEligible,
         completed, current,
         completedUnitRows, mtdUnitRows,
-        dailyDateRows, catalogRows, invRows, awdRows,
+        dailyDateRows, catalogRows, invRows,
+        listingsRows, listingsUnavailableReason,
+        // The account's own OLI rows (sku + child_asin): the account-local SKU -> ASIN evidence for the Listings fold.
+        salesSkuAsinRows: oliSalesRows,
+        // The READ-ONLY bridge's freshness anchor + its upstream refusal (soft).
+        inventoryAsOf, healthBridgeReason,
       });
+      // Honest freshness of BOTH inventory inputs: the Listings fetch time (Listings has no inventory date) and the time
+      // the saved FBA Inventory Health bridge snapshot was recorded (it is no longer refreshed). The client labels the
+      // source it shows with the matching one (the bridge with its snapshot DATE).
+      payload.listingsRefreshedAt = listingsFragment ? (listingsFragment.fetchedAt || null) : null;
+      payload.healthFetchedAt = payload.inventorySource === "health-fallback" ? healthBridgeValidatedAt : null;
       if (context.inventoryAsOf != null) {
         payload.inventoryRequestedThrough = inventoryAsOf;
-        payload.inventoryStale = !payload.inventoryDate || payload.inventoryDate < inventoryAsOf;
-        payload.inventoryFetchedAt = sources["fba-plan:inventory-health"]?.fragments?.[0]?.fetchedAt || null;
+        // Stale = the Health bridge snapshot shown is older than the requested D-1 (allowed up to 2 days by the bridge
+        // rule; shown with its date). Listings carries no inventory date (its age is judged from listingsRefreshedAt), and
+        // an Unavailable plan shows no snapshot at all.
+        payload.inventoryStale = payload.inventorySource === "health-fallback"
+          ? (!payload.inventoryHealthDate || payload.inventoryHealthDate < inventoryAsOf)
+          : false;
+        // The newest instant among the inventory inputs this payload read (the Listings fetch when its rows were usable,
+        // the bridge's recorded instant when its rows were read) -- the route's same-day ordering stamp.
+        const instants = [listingsFragment ? listingsFragment.fetchedAt : null, invRows.length ? healthBridgeValidatedAt : null]
+          .filter((v) => v != null && String(v) !== "" && Number.isFinite(Date.parse(String(v))))
+          .sort((a, b) => Date.parse(String(a)) - Date.parse(String(b)));
+        payload.inventoryFetchedAt = instants.length ? String(instants[instants.length - 1]) : null;
         payload.awdFetchedAt = awdEligible ? (sources["fba-plan:awd"]?.fragments?.[0]?.fetchedAt || null) : null;
       }
       return payload;
@@ -588,7 +648,9 @@ const REGISTRY = {
     validatePayload: (p) => !!p && Array.isArray(p.rows) && Array.isArray(p.months)
       && Array.isArray(p.inventoryByBrandCountry) && typeof p.isUS === "boolean"
       && ("asOf" in p) && ("inventoryAvailable" in p) && ("awdAvailable" in p),
-    // Latest real data date = the most recent of the sales/inventory dates (already date-only).
+    // Latest real data date = the most recent of the sales date and the inventory snapshot date the plan SHOWS (the Health
+    // bridge's date when it is the source; Listings carries no date). A bridge too old to use is never a data date (no
+    // Health export is fetched any more, so there is no other dated inventory evidence).
     latestDataDate: (p) => maxIsoDate([p.salesLatestDate, p.inventoryDate]),
   },
   // Reconciliation: reproduce the api/datadoe.js `reconciliation` payload from the six monthly
@@ -762,18 +824,20 @@ const REGISTRY = {
   },
   // Sales Movers: reproduce the api/datadoe.js `sales-movers` payload from the validated saved fragments.
   // The latest-date PROBE is the only required source; a validated probe with NO reported date derives the
-  // honest dataUnavailable snapshot (no traffic/ads/inventory/catalog requested). A validated probe WITH a
-  // date requires the two-window traffic + ads, the shared inventory snapshot, and the shared no-date
-  // catalog (all optional in the static gate so the no-data path never blocks; the derive enforces them
-  // conditionally). Windows are recomputed from asOf + the probe date and pinned; a missing/failed/
-  // unreadable downstream => unavailable (LKG preserved); a wrong/reordered/duplicate/cross-account/
-  // out-of-window/malformed fragment => invalid (zero writes, LKG preserved). Advertising is never
-  // combined across currencies; inventory is null unless the snapshot is available; buy box is never
-  // evaluated. ZERO DataDoe/network calls (pure).
+  // honest dataUnavailable snapshot (no traffic/ads/catalog requested). A validated probe WITH a date requires
+  // the two-window traffic + ads and the shared no-date catalog (all optional in the static gate so the no-data
+  // path never blocks; the derive enforces them conditionally). Windows are recomputed from asOf + the probe date
+  // and pinned; a missing/failed/unreadable downstream => unavailable (LKG preserved); a wrong/reordered/duplicate/
+  // cross-account/out-of-window/malformed fragment => invalid (zero writes, LKG preserved). Advertising is never
+  // combined across currencies; buy box is never evaluated. LISTINGS INVENTORY CUTOVER: no FBA Inventory Health
+  // fragment exists any more; FBA stock comes from the derived SAVED evidence (context.insightInventoryEvidence =
+  // the account's saved Listings + its last saved Health snapshot as the dated read-only bridge, measured against
+  // asOf) -- absent => Unavailable, never 0. ZERO DataDoe/network calls (pure).
   "sales-movers": {
     snapshotVersion: "sales-movers/v2d-1",
-    optionalRequestKeys: ["sales-movers:traffic", "sales-movers:ads", "sales-movers:inventory", "sales-movers:catalog"],
+    optionalRequestKeys: ["sales-movers:traffic", "sales-movers:ads", "sales-movers:catalog"],
     derivedSourceKeys: [],
+    derivedContextKeys: [INSIGHT_INVENTORY_CONTEXT_KEY],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";
       if (!isValidCalendarDate(asOf)) {
@@ -803,7 +867,7 @@ const REGISTRY = {
       }
       const { recent, prior } = salesMoversWindows(latestReportedDate);
       // Downstream is REQUIRED now. A missing/failed/unreadable required source => unavailable (LKG kept).
-      for (const key of ["sales-movers:traffic", "sales-movers:ads", "sales-movers:inventory", "sales-movers:catalog"]) {
+      for (const key of ["sales-movers:traffic", "sales-movers:ads", "sales-movers:catalog"]) {
         const s = sources[key];
         if (!s || s.available !== true || !Array.isArray(s.rows)) {
           throw deriveError(`sales-movers ${key} is required (validated probe date) but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
@@ -812,14 +876,6 @@ const REGISTRY = {
       // Traffic + Ads: exactly two ordered single-account fragments [recent, prior].
       const trafficFrags = validateOrderedSingleAccountWindows(sources["sales-movers:traffic"], [recent, prior], rawSellerId, "sales-movers:traffic");
       const adsFrags = validateOrderedSingleAccountWindows(sources["sales-movers:ads"], [recent, prior], rawSellerId, "sales-movers:ads");
-      // Inventory: one single-account fragment over EXACTLY the single snapshot day (D-1), pinned to the
-      // planner's explicit context.inventoryAsOf. The scheduler's report asOf is ALREADY D-1, so the
-      // explicit value equals asOf there -- NEVER asOf-1 (that would accept a D-2 fragment). The -1
-      // fallback serves only a context WITHOUT the explicit value (a browser-parity fixture where asOf
-      // is TODAY, or a job planned before this field existed).
-      const inventoryDay = context.inventoryAsOf != null ? String(context.inventoryAsOf) : addDaysStr(asOf, -1);
-      if (!isValidCalendarDate(inventoryDay)) throw new Error("sales-movers inventoryAsOf must be a real calendar date.");
-      const inventoryRows = singleAccountFragmentRows(sources["sales-movers:inventory"], "sales-movers:inventory", rawSellerId, inventoryDay, inventoryDay);
       // Catalog: exactly one single-account no-date fragment.
       const catalogRows = noDateFragmentRows(sources["sales-movers:catalog"], "sales-movers:catalog", rawSellerId);
       // Every saved fragment row must be a plain object.
@@ -827,14 +883,17 @@ const REGISTRY = {
       assertPlainObjectRows(trafficFrags[1].rows, "sales-movers traffic (prior)");
       assertPlainObjectRows(adsFrags[0].rows, "sales-movers ads (recent)");
       assertPlainObjectRows(adsFrags[1].rows, "sales-movers ads (prior)");
-      assertPlainObjectRows(inventoryRows, "sales-movers inventory");
       assertPlainObjectRows(catalogRows, "sales-movers catalog");
+      // FBA stock: the derived SAVED evidence (saved Listings, else the dated read-only Health bridge within its
+      // threshold of asOf, else Unavailable) -- the SAME evidence + decision as the manual refresh. No Health fragment.
+      const evidence = insightEvidenceFromContext(context);
       return salesMoversPayload({
         accountId: publicAccountId, asOf, latestReportedDate, recent, prior,
         lagDays: SM_LAG_DAYS, sourceLabel: SM_SOURCE_LABEL, windowDays: SM_WINDOW_DAYS,
         recentTrafficRows: trafficFrags[0].rows, priorTrafficRows: trafficFrags[1].rows,
         recentAdsRows: adsFrags[0].rows, priorAdsRows: adsFrags[1].rows,
-        inventoryRows, catalogRows,
+        catalogRows,
+        listings: evidence.listings, healthBridge: evidence.healthBridge, sellerId: rawSellerId,
       });
     },
     validatePayload: (p) => !!p && ("accountId" in p) && ("asOf" in p) && typeof p.dataUnavailable === "boolean"
@@ -847,18 +906,20 @@ const REGISTRY = {
   },
   // Buy Box Loss: reproduce the api/datadoe.js `buy-box-loss` payload from the FOUR ordered 7-day raw
   // daily buy-box slices (Profit by SKU & Date -> buybox_percentage + page_views), the FOUR matching
-  // ordered slices (Order Line Items -> ordered sales/units, joined on currency|sku), the shared FBA
-  // inventory snapshot, and the shared no-date catalog. ALL four sources are required
-  // (optionalRequestKeys: []) -- the report fetch gate keeps the
-  // report PENDING until every slice + inventory + catalog succeeds, so a failed/terminal/truncated/
-  // missing required source never saves (last-known-good preserved). Windows are RECOMPUTED from asOf and
-  // pinned positionally: exactly four ordered non-overlapping 7-day slices covering [asOf-27d, asOf], the
-  // single-day inventory [asOf-1, asOf-1], and one no-date catalog -- a wrong/missing/duplicate/reordered/overlapping/
-  // partial/extra/cross-account/malformed fragment throws => derive-invalid => zero writes, LKG preserved.
-  // buybox_percentage is a ratio (page-view weighted, unweighted-mean fallback); null observations are
-  // excluded; currencies never merge. ZERO DataDoe/network calls (pure).
+  // ordered slices (Order Line Items -> ordered sales/units, joined on currency|sku), and the shared no-date
+  // catalog. ALL three sources are required (optionalRequestKeys: []) -- the report fetch gate keeps the
+  // report PENDING until every slice + catalog succeeds, so a failed/terminal/truncated/missing required source
+  // never saves (last-known-good preserved). Windows are RECOMPUTED from asOf and pinned positionally: exactly
+  // four ordered non-overlapping 7-day slices covering [asOf-27d, asOf] and one no-date catalog -- a wrong/
+  // missing/duplicate/reordered/overlapping/partial/extra/cross-account/malformed fragment throws =>
+  // derive-invalid => zero writes, LKG preserved. LISTINGS INVENTORY CUTOVER: no FBA Inventory Health fragment;
+  // stock + fulfilment-channel evidence comes from the derived SAVED evidence (context.insightInventoryEvidence:
+  // saved Listings, else the dated read-only Health bridge within its threshold of asOf, else Unavailable);
+  // competitive prices / run rate are removed (no price cause). buybox_percentage is a ratio (page-view weighted,
+  // unweighted-mean fallback); null observations are excluded; currencies never merge. ZERO DataDoe/network (pure).
   "buy-box-loss": {
     snapshotVersion: "buy-box-loss/v2d-3", optionalRequestKeys: [], derivedSourceKeys: [],
+    derivedContextKeys: [INSIGHT_INVENTORY_CONTEXT_KEY],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";
       if (!isValidCalendarDate(asOf)) {
@@ -873,7 +934,7 @@ const REGISTRY = {
       const from = addDaysStr(asOf, -(BB_WINDOW_DAYS - 1));
       // All three sources are required; defensively reject a missing/failed/unreadable cache (the worker
       // fetch gate already keeps such a report PENDING/blocked, but never derive an empty success).
-      for (const key of ["buy-box-loss:daily", "buy-box-loss:oli-sales", "buy-box-loss:inventory", "buy-box-loss:catalog"]) {
+      for (const key of ["buy-box-loss:daily", "buy-box-loss:oli-sales", "buy-box-loss:catalog"]) {
         const s = sources[key];
         if (!s || s.available !== true || !Array.isArray(s.rows)) {
           throw deriveError(`buy-box-loss ${key} is required but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
@@ -892,29 +953,24 @@ const REGISTRY = {
         if (!Array.isArray(f.rows)) throw new Error(`buy-box-loss:oli-sales fragment ${f.from}..${f.to} has no validated row array; snapshot blocked.`);
         assertRowsInWindow(f.rows, expectedOliSlices[i].from, expectedOliSlices[i].to, `buy-box-loss oli-sales slice ${f.from}..${f.to}`);
       });
-      // Inventory: one single-account fragment over EXACTLY the single snapshot day (D-1), pinned to the
-      // planner's explicit context.inventoryAsOf (equal to asOf on a scheduled run -- NEVER asOf-1,
-      // which would accept a D-2 fragment). The -1 fallback serves only a context WITHOUT the explicit
-      // value (a browser-parity fixture where asOf is TODAY, or a pre-existing queued job).
-      const inventoryDay = context.inventoryAsOf != null ? String(context.inventoryAsOf) : addDaysStr(asOf, -1);
-      if (!isValidCalendarDate(inventoryDay)) throw new Error("buy-box-loss inventoryAsOf must be a real calendar date.");
-      const inventoryRows = singleAccountFragmentRows(sources["buy-box-loss:inventory"], "buy-box-loss:inventory", rawSellerId, inventoryDay, inventoryDay);
       // Catalog: exactly one single-account no-date fragment.
       const catalogRows = noDateFragmentRows(sources["buy-box-loss:catalog"], "buy-box-loss:catalog", rawSellerId);
       // Bind EVERY source ROW to its validated window, not just the fragment metadata: each daily row must
       // be a plain object with a real calendar date INSIDE ITS OWN seven-day slice (never merely inside the
-      // 28-day range -- a row in the wrong slice is rejected), and each inventory row must carry the exact
-      // single inventory date (asOf-1). One malformed/impossible/future/out-of-window/wrong-slice row => invalid
-      // (zero writes, LKG preserved); bad rows are NEVER silently filtered. Catalog rows are no-date.
+      // 28-day range -- a row in the wrong slice is rejected). One malformed/impossible/future/out-of-window/
+      // wrong-slice row => invalid (zero writes, LKG preserved); bad rows are NEVER silently filtered. Catalog
+      // rows are no-date.
       dailyFrags.forEach((f, i) => assertRowsInWindow(f.rows, expectedSlices[i].from, expectedSlices[i].to, `buy-box-loss daily slice ${i}`));
-      assertRowsInWindow(inventoryRows, inventoryDay, inventoryDay, "buy-box-loss inventory");
       assertPlainObjectRows(catalogRows, "buy-box-loss catalog");
+      // Stock / channel: the derived SAVED evidence (same evidence + decision as the manual refresh). No Health fragment.
+      const evidence = insightEvidenceFromContext(context);
       return buyBoxLossPayload({
         accountId: publicAccountId, asOf, from, windowDays: BB_WINDOW_DAYS, sliceDays: BB_SLICE_DAYS,
-        sourceLabel: BB_SOURCE_LABEL, priceSourceLabel: BB_PRICE_SOURCE_LABEL,
+        sourceLabel: BB_SOURCE_LABEL,
         dailySliceRows: dailyFrags.map((f) => f.rows),
         orderedSliceRows: orderedFrags.map((f) => f.rows),
-        inventoryRows, catalogRows,
+        catalogRows,
+        listings: evidence.listings, healthBridge: evidence.healthBridge, sellerId: rawSellerId,
       });
     },
     validatePayload: (p) => !!p && ("accountId" in p) && ("asOf" in p) && Array.isArray(p.rows)
@@ -997,17 +1053,19 @@ const REGISTRY = {
     },
   },
   // Listing Health: reproduce the api/datadoe.js `listing-health` payload from the no-date Listings, the
-  // grouped 30d Sales, the shared FBA inventory snapshot, the shared no-date catalog, and the OPTIONAL
-  // no-date Listings (Raw JSON) enrichment. The four non-raw sources are required (fetch gate keeps the
-  // report PENDING until each succeeds); `listing-health:listings-raw` is OPTIONAL + degradable. Windows
-  // are RECOMPUTED from asOf and pinned; inventory ROW dates are validated real + exactly asOf-1 (single day);
+  // grouped 30d Sales, the shared no-date catalog, and the OPTIONAL no-date Listings (Raw JSON) enrichment.
+  // The three non-raw sources are required (fetch gate keeps the report PENDING until each succeeds);
+  // `listing-health:listings-raw` is OPTIONAL + degradable. The sales window is RECOMPUTED from asOf and pinned;
   // a wrong-window/cross-account/malformed/bad-date fragment => invalid (LKG, zero writes); a missing/failed
-  // required source => unavailable (LKG). Currencies never merge; buy box is never evaluated. ZERO DataDoe/
-  // network calls (pure).
+  // required source => unavailable (LKG). LISTINGS INVENTORY CUTOVER: no FBA Inventory Health fragment; on-hand FBA
+  // comes from the derived SAVED evidence (context.insightInventoryEvidence: saved Listings, else the dated
+  // read-only Health bridge within its threshold of asOf, else Unavailable). Currencies never merge; buy box is
+  // never evaluated. ZERO DataDoe/network calls (pure).
   "listing-health": {
     snapshotVersion: "listing-health/v2d-1",
     optionalRequestKeys: ["listing-health:listings-raw"],
     derivedSourceKeys: [],
+    derivedContextKeys: [INSIGHT_INVENTORY_CONTEXT_KEY],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";
       if (!isValidCalendarDate(asOf)) {
@@ -1019,13 +1077,8 @@ const REGISTRY = {
       const rawSellerId = context.rawSellerId != null ? String(context.rawSellerId) : null;
       const publicAccountId = context.accountId != null ? String(context.accountId) : rawSellerId;
       const salesFrom = addDaysStr(asOf, -(LH_SALES_WINDOW_DAYS - 1));
-      // EXACT single snapshot day (D-1): the planner's explicit context.inventoryAsOf (equal to asOf on
-      // a scheduled run -- NEVER asOf-1, which would accept a D-2 fragment); -1 fallback only for a
-      // context without the explicit value (browser-parity fixtures / pre-existing queued jobs).
-      const inventoryDay = context.inventoryAsOf != null ? String(context.inventoryAsOf) : addDaysStr(asOf, -1);
-      if (!isValidCalendarDate(inventoryDay)) throw new Error("listing-health inventoryAsOf must be a real calendar date.");
-      // The FOUR required sources must be a validated saved array (never an empty-success coercion).
-      for (const key of ["listing-health:listings", "listing-health:sales", "listing-health:inventory", "listing-health:catalog"]) {
+      // The THREE required sources must be a validated saved array (never an empty-success coercion).
+      for (const key of ["listing-health:listings", "listing-health:sales", "listing-health:catalog"]) {
         const s = sources[key];
         if (!s || s.available !== true || !Array.isArray(s.rows)) {
           throw deriveError(`listing-health ${key} is required but its cache is missing/failed/unreadable; last-known-good preserved.`, "unavailable");
@@ -1034,10 +1087,8 @@ const REGISTRY = {
       // Listings + Catalog: exactly one single-account NO-DATE fragment each (from === null, to === null).
       const listingRows = noDateFragmentRows(sources["listing-health:listings"], "listing-health:listings", rawSellerId);
       const catalogRows = noDateFragmentRows(sources["listing-health:catalog"], "listing-health:catalog", rawSellerId);
-      // Sales: one single-account fragment over [asOf-29d, asOf]. Inventory: one over EXACTLY the single
-      // previous day [asOf-1, asOf-1].
+      // Sales: one single-account fragment over [asOf-29d, asOf].
       const salesRows = singleAccountFragmentRows(sources["listing-health:sales"], "listing-health:sales", rawSellerId, salesFrom, asOf);
-      const inventoryRows = singleAccountFragmentRows(sources["listing-health:inventory"], "listing-health:inventory", rawSellerId, inventoryDay, inventoryDay);
       // Optional Listings (Raw JSON) enrichment -- EXACT state handling:
       //   validated success (incl. empty rows) => issuesAvailable true (build the raw fold);
       //   the approved degraded/disabled availabilityPolicy => save a valid snapshot with issuesAvailable
@@ -1059,49 +1110,58 @@ const REGISTRY = {
       } else {
         throw deriveError("listing-health:listings-raw is not a validated success and not the approved degraded/disabled state (pending/missing/failed/unreadable); last-known-good preserved.", "unavailable");
       }
-      // Row-level validation: every listings / sales / catalog / raw row must be a plain object; every
-      // inventory row must carry the exact single inventory date (asOf-1; never silently filtered).
+      // Row-level validation: every listings / sales / catalog / raw row must be a plain object (never silently
+      // filtered).
       assertPlainObjectRows(listingRows, "listing-health listings");
       assertPlainObjectRows(salesRows, "listing-health sales");
       assertPlainObjectRows(catalogRows, "listing-health catalog");
       assertPlainObjectRows(rawRows, "listing-health listings-raw");
-      assertRowsInWindow(inventoryRows, inventoryDay, inventoryDay, "listing-health inventory");
       // B2 fail-closed currency isolation: the route payload folds sales by SKU only, so a SKU split across
       // currencies (or a listing currency conflicting with its single sales currency) would silently merge
       // money. Reject BEFORE folding => typed invalid, zero writes, LKG preserved (route core unchanged).
       assertListingHealthCurrencyIsolation(listingRows, salesRows);
+      // On-hand FBA (onHandFba): the derived SAVED evidence -- the account's saved canonical Listings (the
+      // listing-health:listings fragment is not the canonical inventory contract), else the dated read-only Health
+      // bridge within its threshold of asOf, else Unavailable. inventorySnapshotDate = the bridge date only then.
+      const evidence = insightEvidenceFromContext(context);
       return listingHealthPayload({
         accountId: publicAccountId, asOf, salesFrom, windowDays: LH_SALES_WINDOW_DAYS,
         sourceLabel: LH_SOURCE_LABEL, salesSourceLabel: LH_SALES_SOURCE_LABEL, issuesSourceLabel: LH_ISSUES_SOURCE_LABEL,
         issuesAvailable, issuesUnavailableReason,
-        listingRows, salesRows, inventoryRows, catalogRows, rawRows,
+        listingRows, salesRows, catalogRows, rawRows,
+        listings: evidence.listings, healthBridge: evidence.healthBridge, sellerId: rawSellerId,
       });
     },
     validatePayload: (p) => !!p && ("accountId" in p) && ("asOf" in p) && Array.isArray(p.rows)
       && Array.isArray(p.catalogBrands) && Array.isArray(p.currencies) && typeof p.issuesAvailable === "boolean"
       && !!p.salesWindow && typeof p.salesWindow === "object" && ("inventoryAvailable" in p)
       && ("inventorySnapshotDate" in p) && ("listingCount" in p) && ("issuesUnavailableReason" in p),
-    // Latest real data date = the validated inventory snapshot date (source evidence), or null. Never asOf /
-    // fetched_at / saved_at / Date.now().
+    // Latest real data date = the saved Health BRIDGE's snapshot date when (and only when) the bridge is this
+    // account's stock source (a real source date, never presented as D-1), else null: Listings has no date and the
+    // grouped sales rows carry none. Never asOf / fetched_at / saved_at / Date.now().
     latestDataDate: (p) => (p && p.inventoryAvailable && isValidCalendarDate(p.inventorySnapshotDate) ? p.inventorySnapshotDate : null),
   },
   // Advanced Listing Health (SHADOW, snapshotVersion listing-health/v3-oli-window). NOT served: the live route stays
   // on listing-health/v1. Sales/units come from DURABLE Order Line Items (enriched: priced + operational overlay +
   // estimates) injected via context.listingHealthV3DurableOli (derivedContextKeys) -- NO Profit-by-SKU. The inclusive
   // window (7D/14D/30D-default/selected-month/custom) re-aggregates the already-stored OLI, so a window change spends
-  // ZERO exports. Listings / Listings Raw / inventory are batched owned exports whose rows the worker already isolated
-  // to this owner (assembleSources(..., owner)); catalog reuses the shared insight-catalog identity. Missing required
-  // source => unavailable (LKG preserved); disabled Raw => degraded per policy. Pure -- delegates to
-  // buildAdvancedListingHealth which re-asserts the trusted-owner projection boundary + currency isolation.
+  // ZERO exports. Listings / Listings Raw are batched owned exports whose rows the worker already isolated to this owner
+  // (assembleSources(..., owner)); catalog reuses the shared insight-catalog identity. Missing required source =>
+  // unavailable (LKG preserved); disabled Raw => degraded per policy. Pure -- delegates to buildAdvancedListingHealth
+  // which re-asserts the trusted-owner projection boundary + currency isolation. LISTINGS INVENTORY CUTOVER: the former
+  // listing-health-v3:inventory fragment (a reuse of the cycle's FBA Inventory Health export) is gone -- no Health export
+  // exists. The account's LAST SAVED durable Health snapshot arrives READ-ONLY as context.listingHealthV3DurableInventory
+  // (the dated bridge; listing-health-v3-durable-loader.js / the dependency bundle) and drives On Hand FBA only when the
+  // account's Listings are not validated AND the bridge is within HEALTH_BRIDGE_MAX_AGE_DAYS of asOf.
   "listing-health-v3": {
     snapshotVersion: "listing-health/v3-oli-window",
-    // Inventory is now OPTIONAL (Defect A / Section 3 partial-data contract): the required LISTING evidence +
-    // durable OLI publish per account even when THIS account's FBA inventory failed; inventory-dependent fields
-    // (FBA on-hand from the snapshot) simply resolve unavailable for that account. Listings-Raw stays optional/
-    // degradable exactly as before. Listings + durable OLI remain the only hard-required evidence.
-    optionalRequestKeys: ["listing-health-v3:listings-raw", "listing-health-v3:inventory"],
+    // Inventory is OPTIONAL (Defect A / Section 3 partial-data contract): the required LISTING evidence + durable OLI
+    // publish per account even when THIS account has no usable inventory; inventory-dependent fields (FBA on-hand)
+    // simply resolve unavailable for that account. Listings-Raw stays optional/degradable exactly as before. Listings +
+    // durable OLI remain the only hard-required evidence.
+    optionalRequestKeys: ["listing-health-v3:listings-raw"],
     derivedSourceKeys: ["order-line-items", "product-catalog"],
-    derivedContextKeys: ["listingHealthV3DurableOli", "listingHealthV3DurableCatalog"],
+    derivedContextKeys: ["listingHealthV3DurableOli", "listingHealthV3DurableCatalog", "listingHealthV3DurableInventory"],
     derive: ({ sources, context }) => {
       const asOf = context.to != null ? String(context.to) : "";
       if (!isValidCalendarDate(asOf)) {
@@ -1134,24 +1194,26 @@ const REGISTRY = {
       }
       // Listings is a single-account NO-DATE fragment (already isolated to this owner by the worker).
       const listingRows = noDateFragmentRows(sources["listing-health-v3:listings"], "listing-health-v3:listings", rawSellerId);
-      // Inventory is OPTIONAL and, when present, is EXACTLY the single snapshot day [inventoryAsOf .. inventoryAsOf]
-      // (D-1), INDEPENDENT of the sales window (inventoryAsOf defaults to asOf but may lead it), recomputed + pinned
-      // here (never trusted). Both endpoints are the ONE date, so no cross-date row can ever be accepted or summed.
-      // When inventory is ABSENT / not-a-validated-success (this account's FBA failed while other accounts' FBA
-      // succeeded), inventoryRows=[] -> buildAdvancedListingHealth yields inventory.available:false and FBA on-hand
-      // falls back to the Listings quantity or unavailable (never a fabricated zero). Listings/OLI still publish. A
-      // PRESENT-but-out-of-window inventory cache still fails closed (assertRowsInWindow) -- an integrity defect is
-      // never silently downgraded to "unavailable".
-      const inventoryAsOf = context.inventoryAsOf == null ? asOf : String(context.inventoryAsOf);
-      if (!isValidCalendarDate(inventoryAsOf)) throw new Error("listing-health-v3 inventoryAsOf must be a real calendar date.");
-      const inventorySource = sources["listing-health-v3:inventory"];
+      // Inventory BRIDGE (OPTIONAL, read-only): the account's LAST SAVED durable FBA Inventory Health snapshot injected
+      // as context.listingHealthV3DurableInventory = { available:true, rows, savedAt } | { available:false, reason }.
+      // It is SOFT: absent / unreadable / not this owner's (a row of another seller or marketplace) => inventoryRows=[]
+      // with the typed reason, and buildAdvancedListingHealth then uses validated Listings or reports On Hand FBA
+      // Unavailable (never a fabricated zero) -- Listings/OLI still publish. Its freshness is decided by the shared
+      // selection (snapshot date >= asOf - HEALTH_BRIDGE_MAX_AGE_DAYS, else Unavailable); it is never mixed per SKU.
+      const bridge = context.listingHealthV3DurableInventory;
       let inventoryRows = [];
-      if (inventorySource && inventorySource.available === true && Array.isArray(inventorySource.rows)) {
-        inventoryRows = singleAccountFragmentRows(inventorySource, "listing-health-v3:inventory", rawSellerId, inventoryAsOf, inventoryAsOf);
-        assertRowsInWindow(inventoryRows, inventoryAsOf, inventoryAsOf, "listing-health-v3 inventory");
-      } else if (inventorySource && inventorySource.disabled === true && sourceDisabledOutcome(inventorySource.disabledPolicy || null).blocks) {
-        // A TERMINALLY-disabled inventory source is a configuration block, not a partial-data state.
-        throw deriveError("listing-health-v3:inventory is terminally disabled; snapshot blocked.", "blocked");
+      let inventoryUnavailableReason = "health-bridge-not-loaded";
+      if (bridge && typeof bridge === "object" && bridge.available === true && Array.isArray(bridge.rows)) {
+        assertPlainObjectRows(bridge.rows, "listing-health-v3 saved FBA Inventory Health bridge");
+        const foreign = bridge.rows.some((r) => {
+          const seller = String(r.seller_or_vendor_id ?? "").trim();
+          const m = String(r.marketplace_country_code ?? "").trim().toUpperCase();
+          return (!!seller && seller !== String(rawSellerId || "")) || (!!m && (m === "UK" ? "GB" : m) !== ownerMarketplace);
+        });
+        if (foreign) inventoryUnavailableReason = "health-foreign-seller-or-marketplace-rows";
+        else { inventoryRows = bridge.rows; inventoryUnavailableReason = null; }
+      } else if (bridge && typeof bridge === "object") {
+        inventoryUnavailableReason = String(bridge.reason || bridge.unavailableReason || "health-snapshot-missing");
       }
       // Optional Listings (Raw JSON): validated success => enrich; approved degraded/disabled => issuesAvailable false;
       // anything else (pending/failed/unreadable) => unavailable (LKG preserved). Mirrors the v1 raw policy exactly.
@@ -1194,20 +1256,30 @@ const REGISTRY = {
         oliCoverageWindows: Array.isArray(durableOli.coverageWindows) ? durableOli.coverageWindows : [],
         completenessRows: Array.isArray(durableOli.completenessRows) ? durableOli.completenessRows : [],
         listingRows, inventoryRows, catalogRows, rawRows,
-        issuesAvailable, issuesUnavailableReason,
+        issuesAvailable, issuesUnavailableReason, inventoryUnavailableReason,
         provenance: {
           listingsFetchedAt: context.listingsFetchedAt || null,
-          inventoryFetchedAt: context.inventoryFetchedAt || null,
+          // The saved Health bridge's validation time (never a new Health export's fetch time).
+          inventoryFetchedAt: (inventoryRows.length && bridge && bridge.savedAt) || context.inventoryFetchedAt || null,
           rawFetchedAt: context.rawFetchedAt || null,
           catalogFetchedAt: context.catalogFetchedAt || null,
         },
       });
     },
+    // Listings inventory cutover: the payload must carry the per-account inventory-source model
+    // (inventory.model "inventory-source-v1": validated Listings, else the dated saved FBA Inventory Health bridge, else
+    // Unavailable). A pre-phase-2 payload (its On Hand FBA chained Health -> Listings per SKU) is never valid -- not
+    // promoted, not served by the live resolver (which then falls through to the read-only preview), and a stale shadow
+    // is re-derived. No version bump.
     validatePayload: (p) => !!p && ("accountId" in p) && ("asOf" in p) && Array.isArray(p.rows)
       && Array.isArray(p.catalogBrands) && Array.isArray(p.currencies) && typeof p.issuesAvailable === "boolean"
       && !!p.window && typeof p.window === "object" && !!p.coverage && ("salesWindowStatus" in p)
-      && !!p.inventory && ("listingCount" in p) && ("issuesUnavailableReason" in p) && p.salesSource === "order-line-items",
-    latestDataDate: (p) => (p && p.inventory && isValidCalendarDate(p.inventory.snapshotDate) ? p.inventory.snapshotDate : null),
+      && !!p.inventory && p.inventory.model === "inventory-source-v1"
+      && ("listingCount" in p) && ("issuesUnavailableReason" in p) && p.salesSource === "order-line-items",
+    // Latest real data date = the saved FBA Inventory Health BRIDGE date ONLY when the bridge is this account's On Hand
+    // FBA source (a real, older source date -- never presented as D-1); Listings carries no date (its freshness is the Listings fetch time), so a Listings-
+    // sourced or Unavailable payload claims none. Never asOf / fetched_at / saved_at / Date.now().
+    latestDataDate: (p) => (p && p.inventory && p.inventory.source === "health-fallback" && isValidCalendarDate(p.inventory.snapshotDate) ? p.inventory.snapshotDate : null),
   },
   // Listing & Search Optimizer: reproduce the api/datadoe.js `listing-optimizer` payload from the
   // validated saved fragments. SQP-weekly is the KICKOFF/required-but-DEGRADABLE source: a durable
@@ -1387,16 +1459,21 @@ const REGISTRY = {
   // equality is pinned by test), and validatePayload proves the exact compact shape Brand View's
   // isCompactInventorySnapshot gate consumes.
   "brand-inventory": {
-    snapshotVersion: "brand-inventory-shared-v1",
+    // v2 (Listings inventory cutover, phase 2): the compact records its per-account source (validated Listings, else
+    // the last FBA Inventory Health snapshot as a labelled fallback, else unavailable); a v1 compact never validates.
+    snapshotVersion: "brand-inventory-shared-v2",
     optionalRequestKeys: [],
     derivedSourceKeys: [],
     derive: null,
     validatePayload: (p) => !!p && typeof p === "object" && !Array.isArray(p)
+      && p.inventoryModel === "listings-v1"
+      && ["listings", "health-fallback", "unavailable"].includes(p.inventorySource)
       && Array.isArray(p.inventoryByBrandCountry)
       && ("inventoryDate" in p) && (p.inventoryDate === null || isValidCalendarDate(p.inventoryDate))
+      && ("listingsRefreshedAt" in p)
       && ("inventoryAvailable" in p),
-    // Latest real data date = the latest VALIDATED in-window FBA snapshot date the fold selected; null for
-    // a validated empty snapshot. Never asOf / fetched_at / saved_at.
+    // Latest real data date = the Health snapshot date of a Health fallback; null for Listings (no date -- its
+    // freshness is the fetch time) and for an unavailable compact. Never asOf / fetched_at / saved_at.
     latestDataDate: (p) => (p && isValidCalendarDate(p.inventoryDate) ? p.inventoryDate : null),
   },
   // SKU Movement -- a DURABLE, zero-export derived report over the account's OLI daily rollup + Product Catalog.

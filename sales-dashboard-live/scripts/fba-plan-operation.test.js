@@ -116,12 +116,30 @@ async function main() {
 // ---- source detection + helpers ----------------------------------------------------------------------------
 group("fba-plan-operation: source detection + bucket helpers");
 
-test("isFbaOperationSource: fba-inventory-health + listings only", () => {
-  assert.equal(OP.isFbaOperationSource("fba-inventory-health"), true);
+test("isFbaOperationSource: listings only (the retired fba-inventory-health is NOT an FBA operation source / card)", () => {
+  assert.equal(OP.isFbaOperationSource("fba-inventory-health"), false);
   assert.equal(OP.isFbaOperationSource("listings"), true);
+  assert.deepEqual([...OP.FBA_OPERATION_SOURCE_KEYS], ["listings"]);
   assert.equal(OP.isFbaOperationSource("order-line-items"), false);
   assert.equal(OP.isFbaOperationSource("ads-asin-date"), false);
   assert.equal(OP.isFbaOperationSource(""), false);
+});
+
+test("a Data Sync Center sync of the Listings card plans ONLY the canonical Listings export (fba-plan:awd, source listings) -- never an FBA Inventory Health request", () => {
+  const conns = [{ id: "primary", apiKey: "fixture-key", accountPrefix: "" }];
+  const accounts = [
+    { accountId: "A1", country: "US", currency: "USD" }, { accountId: "A2", country: "US", currency: "USD" },
+    { accountId: "C1", country: "CA", currency: "CAD" }, { accountId: "I1", country: "IN", currency: "INR" },
+  ];
+  for (const bucket of ["us", "non-us", "us-ca", "india"]) {
+    const bucketAccounts = OP.fbaBucketAccounts(accounts, bucket);
+    const plan = OP.buildFbaBucketPlan({ bucketAccounts, connections: conns, asOf: "2026-09-24", inventoryAsOf: "2026-09-24", overflowSellers: new Set(["A1"]) });
+    const sources = plan.reportRequests.flatMap((r) => r.sources);
+    assert.ok(bucketAccounts.length > 0 && plan.sourceJobs.length > 0, bucket + ": planned");
+    assert.ok(sources.every((x) => x.requestKey === "fba-plan:awd" && x.sourceKey === "listings"), bucket + ": only the canonical Listings request");
+    assert.ok(plan.sourceJobs.every((j) => (j.sourceKey ?? j.source_key) === "listings"), bucket + ": every planned source job is the Listings export");
+    assert.ok(!JSON.stringify(plan).includes("inventory-health") && !JSON.stringify(plan).includes("44fc5ba0"), bucket + ": no Health request key / source id anywhere in the plan");
+  }
 });
 
 test("fbaCycleBucket: namespaces the cycle so it never collides with the scheduler-v2 daily cycle", () => {
@@ -179,7 +197,7 @@ const OK_COST = { creates: 2, tokens: 10, byFamily: {} };
 // A minimal batched plan double: two source jobs + one per-account inventory report request per included account.
 const planFor = (ids) => ({
   sourceJobs: [{ requestHash: "BATCH-1" }, { requestHash: "BATCH-2" }],
-  reportRequests: ids.map((accountId) => ({ accountId, owner: { rawSellerId: "s-" + accountId }, sources: [{ requestKey: "fba-plan:inventory-health", requestHash: "BATCH-1" }] })),
+  reportRequests: ids.map((accountId) => ({ accountId, owner: { rawSellerId: "s-" + accountId }, sources: [{ requestKey: "fba-plan:awd", requestHash: "BATCH-1" }] })),
 });
 
 test("no bucket accounts -> complete, zero published (nothing to do, never a failure)", async () => {

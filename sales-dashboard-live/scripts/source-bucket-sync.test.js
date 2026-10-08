@@ -513,25 +513,30 @@ test("B6. production shape: 8 US + 22 non-US => 21 exports / 42-token worst case
   assert.equal(usB.maxTokens + nonUsB.maxTokens, 42, "combined: 42 tokens");
 });
 
-/* ================================= C. catalog + FBA ================================= */
-group("C. catalog once-daily per organization; FBA per account (premium ceiling)");
+/* ================================= C. catalog (+ NO FBA family) ================================= */
+group("C. catalog once-daily per organization; the retired FBA Inventory Health family is never planned");
 
-test("C1. a stale catalog refreshes ONCE org-wide; FBA refreshes per account with a PREMIUM (5-token) frozen ceiling", async () => {
-  const h = runHarness({}); // no catalog snapshot, no fba snapshots => both refresh
+test("C1. a stale catalog refreshes ONCE org-wide; NO FBA family is planned (FBA Inventory Health is retired: FBA inventory comes from the fba-plan operation's canonical Listings export)", async () => {
+  const h = runHarness({}); // no catalog snapshot => the catalog refreshes; a legacy fbaSnapshotsByAccount input is ignored
   const rollup = await h.run();
   assert.equal(rollup.stopped, false, JSON.stringify(rollup.stopReason));
   const catCreates = h.dd.createSeq.filter((c) => c.sourceKey === "product-catalog");
   assert.equal(catCreates.length, 1, "ONE catalog export for the whole organization");
   assert.deepEqual(catCreates[0].ids, [CATALOG_CARRIER], "org-wide request carries exactly the one carrier seller (empty => DataDoe HTTP 400)");
-  const fbaCreates = h.dd.createSeq.filter((c) => c.sourceKey === "fba-inventory-health");
-  assert.equal(fbaCreates.length, 5, "one FBA snapshot per account");
-  const fbaBudget = h.store._budget(rollup.cycleId, "source-sync:fba-inventory-health");
-  assert.ok(fbaBudget, "FBA family froze its ceiling");
-  assert.equal(fbaBudget.spentTokens, 5 * 5, "FBA is PREMIUM: 5 tokens per create");
+  assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "fba-inventory-health" || /inventory-health|source-fba/.test(c.requestKey)).length, 0, "ZERO FBA Inventory Health exports");
+  assert.equal(h.store._budget(rollup.cycleId, "source-sync:fba-inventory-health"), null, "no FBA tranche budget is ever frozen");
+  assert.deepEqual(rollup.families.map((x) => x.sourceKey).sort(), ["order-line-items", "product-catalog"], "the bucket runs exactly OLI + Catalog");
   const oliBudget = h.store._budget(rollup.cycleId, "source-sync:order-line-items");
   assert.equal(oliBudget.spentTokens, oliBudget.spentCreates * 2, "OLI is standard: 2 tokens per create");
   assert.ok(rollup.snapshots.recorded.includes("product-catalog"), "the validated catalog snapshot was recorded");
-  assert.equal(rollup.snapshots.recorded.filter((s) => s.startsWith("fba-inventory-health:")).length, 5, "five per-account FBA snapshots recorded");
+  assert.equal(rollup.snapshots.recorded.filter((x) => String(x).startsWith("fba-inventory-health")).length, 0, "no Health snapshot recorded");
+  // The retired Health request identity survives ONLY as a READ-ONLY identity of a SAVED snapshot (the bridge readers
+  // verify a saved pointer's request hash with it): it is flagged retired/readOnly and its source id is refused by
+  // createExport, so it can never become an export.
+  const ident = bucketSync.resolvedFbaSnapshot({ apiKey: API_KEY, account: { rawSellerId: "S01", country: "US" }, asOf: ASOF, bucket: BUCKET });
+  assert.ok(ident && ident.retired === true && ident.readOnly === true && /^[0-9a-f]{64}$/.test(String(ident.requestHash)), "read-only retired identity (hash recomputable for saved-snapshot verification)");
+  const { isRetiredDataDoeSourceId } = await import("../lib/server/datadoe.js");
+  assert.equal(isRetiredDataDoeSourceId(ident.sourceId), true, "its source id is the refused (retired) Health id");
 });
 
 /* ================================= D. durable persistence ================================= */
@@ -584,14 +589,14 @@ test("E1. a PAUSED source plans ZERO new exports while everything else proceeds"
   assert.equal(h.sinks.history.length, 0, "durable history untouched by the pause");
 });
 
-test("E2. an OLI failure STOPS the bucket typed BEFORE catalog/FBA launch; a fresh bucket run is unaffected", async () => {
+test("E2. an OLI failure STOPS the bucket typed BEFORE catalog launches (no FBA family exists); a fresh bucket run is unaffected", async () => {
   const h = runHarness({ dd: makeDataDoe({ failKey: "source-oli" }) });
   const rollup = await h.run();
   assert.equal(rollup.stopped, true);
   assert.equal(rollup.stopReason.code, "REQUIRED_SOURCE_FAILED");
   assert.equal(rollup.stopReason.family, "order-line-items");
   assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "product-catalog").length, 0, "catalog never launched");
-  assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "fba-inventory-health").length, 0, "FBA never launched");
+  assert.equal(h.dd.createSeq.filter((c) => c.sourceKey === "fba-inventory-health").length, 0, "no FBA Inventory Health export ever");
   assert.equal(h.sinks.coverage.length, 0, "no coverage recorded for failed slices");
   // The OTHER bucket (fresh harness) still completes -- independent orchestration.
   const other = runHarness({ catalogSnapshot: { validated_at: TODAY + "T01:00:00Z" }, fbaSnapshotsByAccount: Object.fromEntries(FIVE.map((a) => [a.accountId, { validated_at: TODAY + "T01:00:00Z" }])) });
@@ -713,10 +718,10 @@ test("E2j. (DR1) a succeeded catalog job with a COLD cache AND NO durable snapsh
 });
 
 test("E3. >=60s completion-anchored cooldown between families on the FAKE clock (never sleeps)", async () => {
-  const h = runHarness({}); // OLI + catalog + FBA all have work => 2 inter-family cooldowns
+  const h = runHarness({}); // OLI + catalog both have work (no FBA family) => 1 inter-family cooldown
   const rollup = await h.run();
   assert.equal(rollup.stopped, false);
-  assert.equal(h.waits.reduce((a, b) => a + b, 0), 2 * 60_000, "exactly two 60s cooldowns, entirely on the injected clock");
+  assert.equal(h.waits.reduce((a, b) => a + b, 0), 1 * 60_000, "exactly one 60s cooldown, entirely on the injected clock");
 });
 
 test("E4. reuseOnly adopts seeded exact caches with ZERO creates; a missing reusable source stops typed", async () => {
@@ -1066,12 +1071,14 @@ test("G5. an ORGANIZATION-ONLY cycle is recognised ONLY from POSITIVE persisted 
 
 // A store wrapper that THROWS at the FBA tranche budget write (simulating the process/serverless deadline dying right
 // there): the FBA canonical jobs were already upserted during the OLI pass, but the FBA budget is never persisted.
-function fbaBudgetInterrupt(store) {
-  return { ...store, persistBudget(args) { if (String(args.trancheKey) === "source-sync:fba-inventory-health") throw new Error("interrupted before FBA budget write"); return store.persistBudget(args); } };
+// The continuation-mechanics probes below use the CATALOG family as the "second" family (the retired FBA Inventory
+// Health family no longer exists): newly-enabled vs originally-planned-unfrozen behave identically for any family.
+function catalogBudgetInterrupt(store) {
+  return { ...store, persistBudget(args) { if (String(args.trancheKey) === "source-sync:product-catalog") throw new Error("interrupted before Catalog budget write"); return store.persistBudget(args); } };
 }
-const FBA_TRANCHE = "source-sync:fba-inventory-health";
-const fbaSellers = (dd) => [...new Set(dd.createSeq.filter((c) => c.sourceKey === "fba-inventory-health").flatMap((c) => c.ids))].sort();
-const fbaPersistedHashes = (store, cycleId) => store.listSourceJobs(cycleId).filter((j) => j.source_key === "fba-inventory-health").map((j) => j.request_hash).sort();
+const CAT_TRANCHE = "source-sync:product-catalog";
+const catalogExports = (dd) => dd.createSeq.filter((c) => c.sourceKey === "product-catalog").map((c) => c.ids.join(","));
+const catalogPersistedHashes = (store, cycleId) => store.listSourceJobs(cycleId).filter((j) => j.source_key === "product-catalog").map((j) => j.request_hash).sort();
 
 // A mutation-free snapshot of everything a continuation could touch (cycles, jobs, owners, budgets, reservations, POSTs).
 function snapshotStore(store, cycleId, dd) {
@@ -1162,108 +1169,107 @@ test("G10. an UNREADABLE required budget DEFERS (budget-read-failed) BEFORE any 
   //     that these exports belonged to the original authorized work -> it joins the NEXT fresh cycle.
   {
     const store = makeStore();
-    const h1 = runHarness({ accounts: THREE, store, pausedSources: new Set(["fba-inventory-health"]) });
+    const h1 = runHarness({ accounts: THREE, store, pausedSources: new Set(["product-catalog"]) });
     const r1 = await h1.run();
-    assert.equal(store._budget(r1.cycleId, FBA_TRANCHE), null, "no frozen FBA budget after the paused original run");
-    assert.equal(fbaPersistedHashes(store, r1.cycleId).length, 0, "a PAUSED family has NO persisted jobs in the original cycle (the original-vs-new signal)");
+    assert.equal(store._budget(r1.cycleId, CAT_TRANCHE), null, "no frozen Catalog budget after the paused original run");
+    assert.equal(catalogPersistedHashes(store, r1.cycleId).length, 0, "a PAUSED family has NO persisted jobs in the original cycle (the original-vs-new signal)");
     const snap = snapshotStore(store, r1.cycleId, h1.dd);
-    // FBA now UNPAUSED on the continuation (+ a post-freeze 4th account, to prove neither current pausedSources nor
+    // Catalog now UNPAUSED on the continuation (+ a post-freeze 4th account, to prove neither current pausedSources nor
     // discovery can inject the family into the old cycle).
     const r2 = await runHarness({ accounts: [1, 2, 3, 4].map(acct), store, dd: h1.dd }).run();
     assert.notEqual(r2.deferred, true, "the continuation still proceeds for the frozen families (only the newly-enabled family is deferred)");
-    assert.equal(store._budget(r1.cycleId, FBA_TRANCHE), null, "NEWLY-ENABLED FBA is NOT frozen on the original cycle");
-    assert.equal(fbaSellers(h1.dd).length, 0, "ZERO FBA exports on the original cycle for the newly-enabled family");
-    assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations from enabling FBA on the old cycle");
-    const fbaFam = r2.families.find((x) => x.sourceKey === "fba-inventory-health");
-    assert.equal(fbaFam && fbaFam.skipped, "newly-enabled-deferred", "FBA is honestly reported as newly-enabled-deferred (not silently nothing-to-do, never marked successful)");
-    assert.ok(!r2.plan.continuation.resumedUnfrozenFamilies.includes("fba-inventory-health"), "FBA was NOT resumed as originally-planned work");
+    assert.equal(store._budget(r1.cycleId, CAT_TRANCHE), null, "NEWLY-ENABLED Catalog is NOT frozen on the original cycle");
+    assert.equal(catalogExports(h1.dd).length, 0, "ZERO Catalog exports on the original cycle for the newly-enabled family");
+    assert.equal(snapshotStore(store, r1.cycleId, h1.dd), snap, "ZERO mutations from enabling Catalog on the old cycle");
+    const catFam = r2.families.find((x) => x.sourceKey === "product-catalog");
+    assert.equal(catFam && catFam.skipped, "newly-enabled-deferred", "Catalog is honestly reported as newly-enabled-deferred (not silently nothing-to-do, never marked successful)");
+    assert.ok(!r2.plan.continuation.resumedUnfrozenFamilies.includes("product-catalog"), "Catalog was NOT resumed as originally-planned work");
   }
 });
 
-test("G14. ORIGINALLY-PLANNED FBA interrupted BEFORE its budget was written RESUMES using EXACTLY the original persisted identities + valid deterministic authorization (no divergent plan, no duplicate export)", async () => {
+test("G14. an ORIGINALLY-PLANNED family (Catalog) interrupted BEFORE its budget was written RESUMES using EXACTLY the original persisted identity + valid deterministic authorization (no divergent plan, no duplicate export)", async () => {
   const THREE = [1, 2, 3].map(acct);
   const store = makeStore();
-  // ORIGINAL run: FBA is planned (not paused) but the process dies at the FBA budget write. FBA canonical jobs were
-  // upserted during the OLI pass; the FBA budget is never persisted.
+  // ORIGINAL run: Catalog is planned (not paused) but the process dies at the Catalog budget write. Its canonical job was
+  // upserted during the OLI pass; the Catalog budget is never persisted.
   let threw = null;
-  try { await runHarness({ accounts: THREE, store: fbaBudgetInterrupt(store) }).run(); } catch (e) { threw = e; }
-  assert.match(String(threw && threw.message), /interrupted before FBA budget/, "the original run died at the FBA budget write");
+  try { await runHarness({ accounts: THREE, store: catalogBudgetInterrupt(store) }).run(); } catch (e) { threw = e; }
+  assert.match(String(threw && threw.message), /interrupted before Catalog budget/, "the original run died at the Catalog budget write");
   const cycleId = store.getCycleByBucketDate(BUCKET, CYCLE_DATE).id;
-  const originalFbaHashes = fbaPersistedHashes(store, cycleId);
-  assert.equal(originalFbaHashes.length, 3, "the 3 FBA canonical jobs were persisted (upserted on the OLI pass) though the FBA budget was not: " + JSON.stringify(originalFbaHashes));
-  assert.equal(store._budget(cycleId, FBA_TRANCHE), null, "the FBA budget was NEVER written (interrupted)");
-  // CONTINUATION on a healthy store: FBA has persisted jobs but no budget -> originally-planned-unfrozen -> resume.
+  const originalCatHashes = catalogPersistedHashes(store, cycleId);
+  assert.equal(originalCatHashes.length, 1, "the ONE org-wide Catalog canonical job was persisted (upserted on the OLI pass) though its budget was not: " + JSON.stringify(originalCatHashes));
+  assert.equal(store._budget(cycleId, CAT_TRANCHE), null, "the Catalog budget was NEVER written (interrupted)");
+  // CONTINUATION on a healthy store: Catalog has a persisted job but no budget -> originally-planned-unfrozen -> resume.
   const dd2 = makeDataDoe();
   const r2 = await runHarness({ accounts: THREE, store, dd: dd2 }).run();
   assert.notEqual(r2.deferred, true, "the originally-planned family RESUMES (not deferred): " + JSON.stringify(r2.stopReason));
-  assert.ok(r2.plan.continuation.resumedUnfrozenFamilies.includes("fba-inventory-health"), "FBA is typed as a resumed originally-planned family");
-  const fbaBudget = store._budget(cycleId, FBA_TRANCHE);
-  assert.ok(fbaBudget && fbaBudget.maxCreates === 3, "FBA budget frozen NOW from the 3 original persisted jobs (the deterministic ceiling that would have been frozen): " + JSON.stringify(fbaBudget));
-  assert.deepEqual(fbaPersistedHashes(store, cycleId), originalFbaHashes, "EXACT original persisted FBA request identities preserved (no regenerated hash)");
-  assert.deepEqual(fbaSellers(dd2), ["S01", "S02", "S03"], "FBA exported for exactly the original sellers");
+  assert.ok(r2.plan.continuation.resumedUnfrozenFamilies.includes("product-catalog"), "Catalog is typed as a resumed originally-planned family");
+  const catBudget = store._budget(cycleId, CAT_TRANCHE);
+  assert.ok(catBudget && catBudget.maxCreates === 1, "Catalog budget frozen NOW from the original persisted job (the deterministic ceiling that would have been frozen): " + JSON.stringify(catBudget));
+  assert.deepEqual(catalogPersistedHashes(store, cycleId), originalCatHashes, "EXACT original persisted Catalog request identity preserved (no regenerated hash)");
+  assert.deepEqual(catalogExports(dd2), [CATALOG_CARRIER], "Catalog exported ONCE for the original carrier");
 });
 
-test("G15. resume never admits NEWLY DISCOVERED accounts or CHANGED coverage into the original FBA work", async () => {
+test("G15. resume never admits NEWLY DISCOVERED accounts or CHANGED coverage into the original work", async () => {
   const THREE = [1, 2, 3].map(acct);
   const store = makeStore();
-  try { await runHarness({ accounts: THREE, store: fbaBudgetInterrupt(store) }).run(); } catch { /* interrupted */ }
+  try { await runHarness({ accounts: THREE, store: catalogBudgetInterrupt(store) }).run(); } catch { /* interrupted */ }
   const cycleId = store.getCycleByBucketDate(BUCKET, CYCLE_DATE).id;
-  const originalFbaHashes = fbaPersistedHashes(store, cycleId);
+  const originalCatHashes = catalogPersistedHashes(store, cycleId);
   const dd2 = makeDataDoe();
-  // Continuation: a 4th (post-freeze) account + CHANGED coverage. Neither may alter the original FBA identities.
+  // Continuation: a 4th (post-freeze) account + CHANGED coverage. Neither may alter the original identities.
   const r2 = await runHarness({ accounts: [1, 2, 3, 4].map(acct), store, dd: dd2, coverage: steadyCoverage([1, 2, 3, 4].map(acct), dates.addDaysStr(ASOF, -30)) }).run();
   assert.notEqual(r2.deferred, true, "resume proceeds for the frozen membership: " + JSON.stringify(r2.stopReason));
-  assert.deepEqual(fbaPersistedHashes(store, cycleId), originalFbaHashes, "the persisted FBA identities are UNCHANGED (new account/coverage never rewrote them)");
-  assert.deepEqual(fbaSellers(dd2), ["S01", "S02", "S03"], "FBA exported for exactly the 3 original sellers; the 4th account got no FBA export");
+  assert.deepEqual(catalogPersistedHashes(store, cycleId), originalCatHashes, "the persisted Catalog identity is UNCHANGED (new account/coverage never rewrote it)");
+  assert.deepEqual(catalogExports(dd2), [CATALOG_CARRIER], "Catalog exported exactly once for the original identity");
   assert.equal(store.listCycleOwners(cycleId).some((o) => o.account_id === "A04"), false, "the post-freeze account never joined the frozen cycle");
 });
 
 test("G16. resume is REPLAY-idempotent: a watchdog/second continuation and a concurrent late-budget attempt create nothing new (same frozen budget, no duplicate export)", async () => {
   const THREE = [1, 2, 3].map(acct);
   const store = makeStore();
-  try { await runHarness({ accounts: THREE, store: fbaBudgetInterrupt(store) }).run(); } catch { /* interrupted */ }
+  try { await runHarness({ accounts: THREE, store: catalogBudgetInterrupt(store) }).run(); } catch { /* interrupted */ }
   const cycleId = store.getCycleByBucketDate(BUCKET, CYCLE_DATE).id;
-  // First continuation resumes FBA.
+  // First continuation resumes Catalog.
   const dd2 = makeDataDoe();
   await runHarness({ accounts: THREE, store, dd: dd2 }).run();
-  const fbaBudget1 = JSON.stringify(store._budget(cycleId, FBA_TRANCHE));
-  const fbaSellers1 = fbaSellers(dd2);
-  assert.deepEqual(fbaSellers1, ["S01", "S02", "S03"], "first resume exported the 3 sellers");
-  // Watchdog/replay: a SECOND continuation now sees a frozen FBA budget -> reuse; no new creates, byte-identical budget.
+  const catBudget1 = JSON.stringify(store._budget(cycleId, CAT_TRANCHE));
+  const catExports1 = catalogExports(dd2);
+  assert.deepEqual(catExports1, [CATALOG_CARRIER], "first resume exported the Catalog once");
+  // Watchdog/replay: a SECOND continuation now sees a frozen Catalog budget -> reuse; no new creates, byte-identical budget.
   const snapAfter = snapshotStore(store, cycleId, dd2);
   const r3 = await runHarness({ accounts: THREE, store, dd: dd2 }).run();
   assert.notEqual(r3.deferred, true, "replay proceeds");
-  assert.equal(JSON.stringify(store._budget(cycleId, FBA_TRANCHE)), fbaBudget1, "the frozen FBA budget is byte-identical on replay (reused, never re-persisted differently)");
-  assert.deepEqual(fbaSellers(dd2), fbaSellers1, "replay created NO new FBA export");
+  assert.equal(JSON.stringify(store._budget(cycleId, CAT_TRANCHE)), catBudget1, "the frozen Catalog budget is byte-identical on replay (reused, never re-persisted differently)");
+  assert.deepEqual(catalogExports(dd2), catExports1, "replay created NO new Catalog export");
   assert.equal(snapshotStore(store, cycleId, dd2), snapAfter, "ZERO mutations on the replay");
-  // Concurrent late-budget attempts: two fresh continuations from the SAME interrupted state both freeze deterministically.
+  // Concurrent late-budget attempts: two continuations from the SAME interrupted state both freeze deterministically.
   const store2 = makeStore();
-  try { await runHarness({ accounts: THREE, store: fbaBudgetInterrupt(store2) }).run(); } catch { /* interrupted */ }
-  const cyc2 = store2.getCycleByBucketDate(BUCKET, CYCLE_DATE).id;
+  try { await runHarness({ accounts: THREE, store: catalogBudgetInterrupt(store2) }).run(); } catch { /* interrupted */ }
   const ddA = makeDataDoe();
   await runHarness({ accounts: THREE, store: store2, dd: ddA }).run();
   let concurrentThrew = null;
   try { await runHarness({ accounts: THREE, store: store2, dd: ddA }).run(); } catch (e) { concurrentThrew = e; }
   assert.equal(concurrentThrew, null, "a same-plan late-budget re-attempt is an idempotent 'exists', never PLAN_BUDGET_MISMATCH");
-  assert.deepEqual(fbaSellers(ddA), ["S01", "S02", "S03"], "no double FBA export under the concurrent late-budget attempt");
+  assert.deepEqual(catalogExports(ddA), [CATALOG_CARRIER], "no double Catalog export under the concurrent late-budget attempt");
 });
 
 test("G17. a FRESH SUBSEQUENT cycle can legitimately plan + freeze the newly-enabled family", async () => {
   const THREE = [1, 2, 3].map(acct);
   const store = makeStore();
-  // Original cycle at CYCLE_DATE with FBA paused (its jobs never planned).
-  const r1 = await runHarness({ accounts: THREE, store, pausedSources: new Set(["fba-inventory-health"]) }).run();
-  assert.equal(store._budget(r1.cycleId, FBA_TRANCHE), null, "no FBA budget on the original paused cycle");
-  // A FRESH cycle (a different cycle_date) with FBA enabled: it is NOT a continuation of the old cycle, so FBA is
+  // Original cycle at CYCLE_DATE with Catalog paused (its job never planned).
+  const r1 = await runHarness({ accounts: THREE, store, pausedSources: new Set(["product-catalog"]) }).run();
+  assert.equal(store._budget(r1.cycleId, CAT_TRANCHE), null, "no Catalog budget on the original paused cycle");
+  // A FRESH cycle (a different cycle_date) with Catalog enabled: it is NOT a continuation of the old cycle, so Catalog is
   // planned + frozen normally.
   const nextDate = dates.addDaysStr(CYCLE_DATE, 1);
   const dd2 = makeDataDoe();
   const r2 = await runHarness({ accounts: THREE, store, dd: dd2, cycleDate: nextDate }).run();
   assert.notEqual(r2.deferred, true, "the fresh cycle proceeds");
   assert.notEqual(r2.cycleId, r1.cycleId, "a NEW cycle was opened for the new date");
-  const fbaBudget = store._budget(r2.cycleId, FBA_TRANCHE);
-  assert.ok(fbaBudget && fbaBudget.maxCreates === 3, "the fresh cycle legitimately freezes the newly-enabled FBA family: " + JSON.stringify(fbaBudget));
-  assert.deepEqual(fbaSellers(dd2), ["S01", "S02", "S03"], "the fresh cycle exports FBA for the current membership");
+  const catBudget = store._budget(r2.cycleId, CAT_TRANCHE);
+  assert.ok(catBudget && catBudget.maxCreates === 1, "the fresh cycle legitimately freezes the newly-enabled Catalog family: " + JSON.stringify(catBudget));
+  assert.deepEqual(catalogExports(dd2), [CATALOG_CARRIER], "the fresh cycle exports the Catalog once");
 });
 
 test("G18. a FAILED original-job read on a continuation DEFERS typed (job-read-failed) BEFORE any mutation", async () => {

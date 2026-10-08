@@ -8,12 +8,17 @@
 //     NOT Profit by SKU & Date -- so the NEW path has no Profit-by-SKU reachability at all.
 //   - It serves ANY inclusive window (7D / 14D / 30D-default / selected calendar month / custom) by
 //     RE-AGGREGATING the already-stored OLI daily history -- selecting a window creates ZERO DataDoe exports.
-//   - It keeps status / issues / inventory on the LATEST snapshots, independent of the sales window, and never
-//     sums stock across dates.
+//   - It keeps status / issues / on-hand stock on the LATEST saved snapshots, independent of the sales window, and
+//     never sums stock across dates. On-hand FBA follows the ONE per-account inventory-source decision (Listings
+//     inventory CUTOVER): the account's VALIDATED Listings rows, else its LAST SAVED FBA Inventory Health snapshot as a
+//     dated read-only temporary bridge (only while it is within HEALTH_BRIDGE_MAX_AGE_DAYS of the report as-of; no
+//     Health export -- and no listing-health-v3:inventory fragment -- exists any more), else Unavailable -- never a mix
+//     of the two inside one account.
 //
 // Reuse (never reinvent): the enriched OLI merge output shape (mergeOrderedOliHistory); the coverage-window
 // union (source-durable-model.mergeCoverageWindows); the completeness summary (oli-completeness-serve); the
-// existing Listing Health folds/guards (derivation-core); and numOrNull for honest unknown-vs-zero values.
+// existing Listing Health folds/guards (derivation-core); the shared inventory-source consumer glue
+// (inventory-consumer.js); and numOrNull for honest unknown-vs-zero values.
 
 import {
   num,
@@ -25,6 +30,16 @@ import {
 import { addDaysStr, monthStartStr, daysInMonthUTC } from "../date-windows.js";
 import { mergeCoverageWindows } from "../sync/source-durable-model.js";
 import { summarizeCompleteness } from "./oli-completeness-serve.js";
+import {
+  HEALTH_BRIDGE_MAX_AGE_DAYS,
+  INVENTORY_SOURCE_MODEL,
+  INVENTORY_SOURCE_HEALTH_FALLBACK,
+  INVENTORY_SOURCE_LISTINGS,
+  INVENTORY_SOURCE_UNAVAILABLE,
+  asinForSkuFrom,
+  selectConsumerInventory,
+} from "./inventory-consumer.js";
+import { listingsAsin } from "../listings-inventory.js";
 
 export const LISTING_HEALTH_ADVANCED_VERSION = "listing-health/v3-oli-window";
 export const LISTING_HEALTH_ADVANCED_SALES_SOURCE = "order-line-items";
@@ -172,28 +187,40 @@ export function foldOliWindowSales(enrichedRows, { from, to } = {}) {
   return { salesBySku, currencies };
 }
 
+// The per-row On Hand FBA source tag for each account-level inventory source (null when the value is unknown). The
+// "fba-health-fallback" tag is kept for payload compatibility; it now means the dated saved Health BRIDGE.
+export const ON_HAND_FBA_SOURCE = Object.freeze({
+  [INVENTORY_SOURCE_LISTINGS]: "listings",
+  [INVENTORY_SOURCE_HEALTH_FALLBACK]: "fba-health-fallback",
+});
+
 /**
- * The LATEST FBA inventory snapshot per SKU, PRESERVING unknown (null) stock distinctly from a genuine 0. Keeps
- * ONLY the newest snapshot date present (never sums across dates, never silently presents an older snapshot as
- * current). `available` is numOrNull: null/blank/malformed/non-finite -> null (UNKNOWN); a finite number
- * (including 0) -> that number. This is a LOCAL fold -- it deliberately does NOT reuse buyBoxInventoryFold, which
- * coerces null->0 (correct for its own consumers, wrong here) -- so no shared fold / unrelated report is changed.
+ * The account's ONE On Hand FBA source decision (Listings inventory CUTOVER), over the shared consumer glue
+ * (inventory-consumer.js selectConsumerInventory -> lib/server/inventory-source.js selectAccountInventory):
+ *   - "listings"        : the account's Listings rows are VALIDATED inventory evidence (expanded fields, no unresolved
+ *                         duplicate conflict, no unattributed stock, no blank FBA field, no foreign rows). Duplicate
+ *                         identical listing rows of one SKU count ONCE; a still-conflicting SKU is unknown (null).
+ *   - "health-fallback" : Listings is not validated (reasons listed) and the account's LAST SAVED FBA Inventory Health
+ *                         snapshot (`inventoryRows`, read-only -- the bridge) is no older than asOf -
+ *                         HEALTH_BRIDGE_MAX_AGE_DAYS: its LATEST date only (never summed across dates), labelled with
+ *                         that date as a saved, no-longer-refreshed temporary bridge.
+ *   - "unavailable"     : neither (or the bridge is stale / there is no asOf) -- every On Hand FBA is unknown (null),
+ *                         never 0.
+ * The two sources are never mixed inside one account. `asinForSku` is the account's own unambiguous SKU -> ASIN map
+ * (from its OLI rows) used ONLY to resolve a missing / conflicting Listings ASIN.
  */
-export function latestInventoryBySku(inventoryRows) {
-  const all = Array.isArray(inventoryRows) ? inventoryRows : [];
-  let snapshotDate = null;
-  for (const row of all) {
-    const d = row ? S(row.date) : "";
-    if (isCalendarDate(d) && (!snapshotDate || d > snapshotDate)) snapshotDate = d;
-  }
-  const current = snapshotDate ? all.filter((r) => r && S(r.date) === snapshotDate) : [];
-  const bySku = new Map();
-  for (const row of current) {
-    const sku = S(row.sku).trim();
-    if (!sku || bySku.has(sku)) continue;
-    bySku.set(sku, { available: numOrNull(row.available) }); // null = UNKNOWN; 0 = genuine zero
-  }
-  return { snapshotDate, available: current.length > 0, bySku };
+export function listingHealthInventorySelection({ listingRows = [], inventoryRows = [], marketplace = "", asinForSku = null, listingsRefreshedAt = null, asOf = null, inventoryUnavailableReason = null } = {}) {
+  const healthRows = Array.isArray(inventoryRows) ? inventoryRows : [];
+  return selectConsumerInventory({
+    listingsRows: Array.isArray(listingRows) ? listingRows : [],
+    healthRows,
+    marketplace: canonMarketplace(marketplace),
+    awdEligible: false, // Listing Health shows no AWD figure
+    asinForSku,
+    listingsRefreshedAt: listingsRefreshedAt || null,
+    healthUnavailableReason: healthRows.length ? null : (S(inventoryUnavailableReason).trim() || "health-snapshot-missing"),
+    asOf,
+  });
 }
 
 // Deterministic flag evidence. CONFIRMED = Amazon's own facts; POSSIBLE = heuristics that alone do not prove a
@@ -265,17 +292,22 @@ function windowCompleteness(rows, from, to, coverageComplete) {
  * Provides everything the agreed 16 columns and future deterministic diagnostics need, with provenance. Does NOT
  * compute the visual "Gate" label -- it exposes deterministic `flagged`/`flagReasons` (confirmed/possible).
  *
- * Inventory: FBA on-hand is the FBA Inventory snapshot quantity (authoritative) when the snapshot has a KNOWN
- * value for the SKU (including a genuine 0); when the snapshot value is UNKNOWN or the SKU is absent, the explicit
- * Listings `fba_quantity_available` fallback is used and marked; when neither is known it is `null` = UNAVAILABLE.
- * The non-applicable channel's on-hand is `null`, applicable=false. Latest status/inventory/issues are independent
- * of the selected sales window.
+ * Inventory: FBA on-hand follows ONE per-account source (listingHealthInventorySelection): the VALIDATED Listings
+ * per-SKU fba_quantity_available, else the account's last SAVED FBA Inventory Health snapshot (`inventoryRows` -- the
+ * dated read-only bridge, only while within HEALTH_BRIDGE_MAX_AGE_DAYS of `asOf`), else Unavailable.
+ * A genuine 0 is kept; unknown (blank, conflicting duplicate, SKU absent from the selected source) is `null` =
+ * UNAVAILABLE, never 0, and never filled from the other source. payload.inventory carries the model, source, label,
+ * the Health snapshot date (fallback only -- Listings has no date), the Listings refresh time (Listings only), the
+ * fallback / unavailable reasons and the Listings fold's unresolved conflicts. The non-applicable channel's on-hand is
+ * `null`, applicable=false -- except that a merchant-fulfilled (DEFAULT) listing with PROVEN positive FBA stock keeps
+ * it visible (never blanket-exclude DEFAULT). Latest status/stock/issues are independent of the selected sales window.
  */
 export function buildAdvancedListingHealth({
   owner, asOf, window,
   enrichedOliRows = [], oliCoverageWindows = [], completenessRows = [],
   listingRows = [], inventoryRows = [], catalogRows = [], rawRows = [],
   issuesAvailable = false, issuesUnavailableReason = null,
+  inventoryUnavailableReason = null,
   provenance = {},
 } = {}) {
   if (!isCalendarDate(asOf)) throw new Error("buildAdvancedListingHealth requires a real calendar asOf.");
@@ -308,7 +340,14 @@ export function buildAdvancedListingHealth({
   assertListingHealthCurrencyIsolation(listingRows, windowedOli);
 
   const { salesBySku, currencies } = foldOliWindowSales(windowedOli, { from: win.from, to: win.to });
-  const inventory = latestInventoryBySku(inventoryRows);       // latest snapshot; unknown preserved
+  // ONE per-account On Hand FBA source (validated Listings -> the dated saved Health bridge within its threshold of the
+  // report as-of -> Unavailable). The SKU -> ASIN resolver uses ONLY this account's own (owner-asserted) OLI rows.
+  const inv = listingHealthInventorySelection({
+    listingRows, inventoryRows, marketplace: owner.marketplace,
+    asinForSku: asinForSkuFrom(enrichedOliRows), listingsRefreshedAt: provenance.listingsFetchedAt || null,
+    asOf, inventoryUnavailableReason,
+  });
+  const onHandFbaSourceTag = ON_HAND_FBA_SOURCE[inv.source] || null;
   const catalog = salesMoversCatalogFold(catalogRows);
   const rawBySku = issuesAvailable ? listingHealthRawFold(rawRows) : new Map();
   const coverage = assessOliCoverage({ oliCoverageWindows, from: win.from, to: win.to });
@@ -323,29 +362,30 @@ export function buildAdvancedListingHealth({
   const rows = [];
   for (const listing of Array.isArray(listingRows) ? listingRows : []) {
     const sku = S(listing.sku).trim();
-    const asin = S(listing.child_asin).trim();
+    const asin = listingsAsin(listing.child_asin); // DataDoe's "__EMPTY__" placeholder is a missing ASIN (shown blank)
     if (!sku && !asin) continue;
     const meta = catalog.byAsin.get(asin) || {};
     const sales = salesBySku.get(sku) || null;
-    const stock = sku ? inventory.bySku.get(sku) || null : null;
+    const stock = sku ? inv.skus.get(sku) || null : null;
     const raw = rawBySku.get(sku) || null;
 
     const channelRaw = S(listing.listing_fulfillment_channel).trim().toUpperCase();
     const channel = channelRaw ? (channelRaw === "DEFAULT" ? "FBM" : "FBA") : null;
     const channelKnown = channel !== null;
 
-    // FBA on-hand: snapshot KNOWN value (incl. genuine 0) is authoritative -> explicit Listings fallback ->
-    // null (UNAVAILABLE). A snapshot row whose available is UNKNOWN (null) does NOT count as known.
-    const snapshotAvail = stock ? stock.available : null; // null = SKU absent OR snapshot value unknown
-    const listingFba = numOrNull(listing.fba_quantity_available); // null = missing/blank/malformed
-    let onHandFba = null; let onHandFbaSource = null;
-    if (snapshotAvail !== null) { onHandFba = snapshotAvail; onHandFbaSource = "fba-snapshot"; }
-    else if (listingFba !== null) { onHandFba = listingFba; onHandFbaSource = "listings-fallback"; }
+    // FBA on-hand: the SELECTED source's per-SKU value (incl. a genuine 0), or null (UNAVAILABLE) when unknown, a
+    // conflicting duplicate, merchant-fulfilled-only, or absent from that source. Never filled from the other source.
+    const onHandFba = stock && stock.fbaAvailable !== undefined ? stock.fbaAvailable : null;
+    const onHandFbaSource = onHandFba !== null ? onHandFbaSourceTag : null;
+    const inventoryConflict = !!(stock && stock.conflict);
     // FBM on-hand from the Listings current quantity (unknown-preserving).
     const onHandFbm = numOrNull(listing.listing_current_quantity);
 
     // The OTHER channel is "not applicable". Unknown channel -> both applicable (values may still be unavailable).
-    const fbaApplicable = !channelKnown || channel === "FBA";
+    // A merchant-fulfilled (DEFAULT) listing that still holds PROVEN positive FBA stock keeps it visible (owner rule:
+    // never blanket-exclude DEFAULT; a merchant-fulfilled zero is simply not applicable, never an FBA stockout).
+    const channelFbaApplicable = !channelKnown || channel === "FBA";
+    const fbaApplicable = channelFbaApplicable || (onHandFba !== null && onHandFba > 0);
     const fbmApplicable = !channelKnown || channel === "FBM";
 
     const statusRaw = S(listing.listing_status).trim();
@@ -359,7 +399,8 @@ export function buildAdvancedListingHealth({
     const issues = raw ? raw.issues : [];
     const errorIssue = Array.isArray(issues) && issues.some((i) => S(i.severity).toUpperCase() === "ERROR");
 
-    const applicableOnHand = fbaApplicable ? onHandFba : onHandFbm;
+    // Stranded-stock gate: the on-hand of the listing's OWN channel (unchanged channel rule).
+    const applicableOnHand = channelFbaApplicable ? onHandFba : onHandFbm;
     const strandedStock = applicableOnHand !== null && applicableOnHand > 0 && statusRaw !== "" && !statusActive;
     const flagReasons = flagEvidence({
       statusActive: statusActive || statusRaw === "", // an unknown status is not itself a flag
@@ -387,6 +428,9 @@ export function buildAdvancedListingHealth({
       onHandFba: fbaApplicable ? onHandFba : null,
       onHandFbaApplicable: fbaApplicable,
       onHandFbaSource: fbaApplicable ? onHandFbaSource : null,
+      // True when this SKU's Listings rows conflict (Listings source only: duplicates that disagree / an invalid
+      // quantity): on-hand FBA is Unavailable for it and the SKU is listed in inventory.conflicts.
+      inventoryConflict,
       onHandFbm: fbmApplicable ? onHandFbm : null,
       onHandFbmApplicable: fbmApplicable,
       // Window sales/units from durable enriched OLI (actual priced + estimate; ordered units). No profit, no refunds.
@@ -419,7 +463,23 @@ export function buildAdvancedListingHealth({
     coverage,
     salesWindowStatus,
     completeness,
-    inventory: { available: inventory.available, snapshotDate: inventory.snapshotDate },
+    // On Hand FBA source (model inventory-source-v1; a payload without it predates phase 2 and is never served as
+    // current). snapshotDate is the saved FBA Inventory Health BRIDGE date ONLY when the bridge is the source (Listings
+    // has no date); refreshedAt is the Listings fetch time ONLY when Listings is the source. bridgeMaxAgeDays = how old
+    // the saved bridge may be (vs asOf) before inventory turns Unavailable (FBA Inventory Health is no longer refreshed).
+    inventory: {
+      model: INVENTORY_SOURCE_MODEL,
+      source: inv.source,
+      label: inv.label,
+      available: inv.source !== INVENTORY_SOURCE_UNAVAILABLE,
+      bridgeMaxAgeDays: HEALTH_BRIDGE_MAX_AGE_DAYS,
+      snapshotDate: inv.source === INVENTORY_SOURCE_HEALTH_FALLBACK ? (inv.healthDate || null) : null,
+      refreshedAt: inv.source === INVENTORY_SOURCE_LISTINGS ? (inv.listingsRefreshedAt || null) : null,
+      fallbackReasons: inv.source === INVENTORY_SOURCE_LISTINGS ? [] : [...(inv.listingsReasons || [])],
+      unavailableReasons: [...(inv.unavailableReasons || [])],
+      conflicts: inv.conflicts || [],
+      resolvedConflicts: inv.source === INVENTORY_SOURCE_LISTINGS ? (inv.resolvedConflicts || []) : [],
+    },
     issuesAvailable,
     issuesUnavailableReason,
     provenance: {
@@ -436,7 +496,8 @@ export function buildAdvancedListingHealth({
       listingsSourceType: provenance.listingsSourceType || null,
       inventorySourceType: provenance.inventorySourceType || null,
       rawSourceType: provenance.rawSourceType || null,
-      inventorySnapshotDate: inventory.snapshotDate,
+      // The saved FBA Inventory Health bridge date ONLY when the bridge is this account's source.
+      inventorySnapshotDate: inv.source === INVENTORY_SOURCE_HEALTH_FALLBACK ? (inv.healthDate || null) : null,
       oliCoveredTo: coverage.coveredTo,
     },
     currencies: [...currencies].sort(),

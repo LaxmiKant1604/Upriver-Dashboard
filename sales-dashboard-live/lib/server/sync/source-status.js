@@ -28,7 +28,9 @@ export const PRIORITY_DASHBOARD_SOURCES = Object.freeze({
   }),
   "brand-view": Object.freeze({
     blocking: Object.freeze(["order-line-items", "product-catalog"]),
-    degrading: Object.freeze([ACTIVE_ADS_REGISTRY_KEY, "fba-inventory-health"]),
+    // The inventory half degrades on the canonical Listings source (FBA inventory since the Listings inventory cutover;
+    // FBA Inventory Health is retired and has no card).
+    degrading: Object.freeze([ACTIVE_ADS_REGISTRY_KEY, "listings"]),
   }),
 });
 

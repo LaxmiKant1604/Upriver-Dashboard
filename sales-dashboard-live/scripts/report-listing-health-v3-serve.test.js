@@ -4,7 +4,11 @@
 // export, NEVER writes, re-aggregates stored OLI for any window with ZERO network, keeps status/issues/inventory on
 // the LATEST snapshot independent of the sales window, rejects cross-account rows (fail closed), preserves null vs
 // zero + FBA/FBM applicability, reports honest covered/partial/unavailable, and maps an invalid window to a throw
-// (caller -> 400). Offline, zero DataDoe/network. 7-bit ASCII, LF.
+// (caller -> 400). Listings inventory CUTOVER: no listing-health-v3:inventory cache fragment exists any more; the serve
+// reads the account's LAST SAVED durable FBA Inventory Health snapshot READ-ONLY (readers.getHealthBridge -- the dated
+// bridge); On Hand FBA follows ONE per-account source (validated Listings, else the bridge within asOf - 2, else
+// Unavailable) and evidence.inventoryEvidenceAvailable mirrors payload.inventory.available. Offline, zero DataDoe/network.
+// 7-bit ASCII, LF.
 
 import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
@@ -46,19 +50,24 @@ const OLI = [oliRow("2026-09-01", "A", 100, 10), oliRow("2026-08-20", "A", 50, 5
 const FULL_COVERAGE = [{ from: "2024-01-01", to: asOf }];
 
 // Build a read-only reader set backed by saved-hash maps. Records which saved hashes were requested + the OLI window.
+// The account's LAST SAVED durable FBA Inventory Health snapshot as the bridge reader returns it (read-only).
+const bridgeOf = (rows) => (rows ? { rows: rows.slice(), unavailableReason: null, snapshotDate: rows.reduce((d, r) => (r.date > d ? r.date : d), ""), savedAt: "2026-09-02T04:00:00Z" } : { rows: null, unavailableReason: "health-snapshot-missing", snapshotDate: null, savedAt: null });
+
 function makeReaders({ oli = OLI, coverage = FULL_COVERAGE, catalog = CATALOG, listings = LISTINGS, inventory = INVENTORY, raw = RAW, to = asOf } = {}) {
   const H = hashesFor({ to });
   const savedByHash = new Map();
   if (listings) savedByHash.set(H["listing-health-v3:listings"], listings);
-  if (inventory) savedByHash.set(H["listing-health-v3:inventory"], inventory);
   if (raw) savedByHash.set(H["listing-health-v3:listings-raw"], raw);
   const requestedHashes = [];
   const oliCalls = [];
+  const bridgeCalls = [];
   return {
     H,
     requestedHashes,
     oliCalls,
+    bridgeCalls,
     readers: {
+      getHealthBridge: async (a) => { bridgeCalls.push(a); return bridgeOf(inventory); },
       getEnrichedOli: async (a) => { oliCalls.push({ from: a.from, to: a.to, accountIds: a.accountIds }); return oli.slice(); },
       getOliCoverage: async () => ({ read: "ok", windows: coverage }),
       getCompleteness: async () => [],
@@ -85,6 +94,8 @@ await (async () => {
   const b = payload.rows.find((r) => r.sku === "B");
   ok("A: 30D OLI window sales/units for SKU-A = 150/15 (08-20 + 09-01, June excluded)", a.sales === 150 && a.units === 15);
   ok("A: SKU-A is FBA -> latest inventory 30 (09-01), FBM not applicable", a.onHandFba === 30 && a.onHandFbaApplicable === true && a.onHandFbmApplicable === false);
+  ok("A: 15-column saved Listings -> the saved Health bridge (source fba-health-fallback, snapshot 09-01, its latest date only)",
+    a.onHandFbaSource === "fba-health-fallback" && payload.inventory.source === "health-fallback" && payload.inventory.snapshotDate === "2026-09-01");
   ok("A: SKU-B is FBM -> on-hand 7 from listing qty, FBA not applicable", b.onHandFbm === 7 && b.onHandFbmApplicable === true && b.onHandFbaApplicable === false);
   ok("A: SKU-A healthy (Active/priced/buyable) -> not flagged", a.flagged === false);
   ok("A: SKU-B flagged (Inactive + stranded); salesAtRisk = window sales 200 for a listing flagged NOW", b.flagged === true && b.salesAtRisk === 200);
@@ -103,10 +114,12 @@ await (async () => {
     ok("B: 7D window sales for SKU-A = 100 (08-20 excluded) -- date change, no new export", p7.rows.find((r) => r.sku === "A").sales === 100);
     ok("B: 30D window sales for SKU-A = 150 -- same durable OLI, re-aggregated", p30.rows.find((r) => r.sku === "A").sales === 150);
     ok("B: the OLI reader window differs by preset (7D from != 30D from)", s7.m.oliCalls[0].from !== s30.m.oliCalls[0].from && s7.m.oliCalls[0].from === "2026-08-27" && s30.m.oliCalls[0].from === "2026-08-04");
-    // LATEST inventory is independent of the sales window: the inventory saved-hash requested is IDENTICAL across windows.
-    ok("B: latest inventory identity is independent of the sales window (same inventory hash for 7D and 30D)",
-      s7.m.H["listing-health-v3:inventory"] === s30.m.H["listing-health-v3:inventory"] &&
-      s7.m.requestedHashes.includes(s7.m.H["listing-health-v3:inventory"]) && s30.m.requestedHashes.includes(s30.m.H["listing-health-v3:inventory"]));
+    // LATEST inventory is independent of the sales window: the saved Health bridge is read with the SAME identity for
+    // both windows (no window in its read), and no inventory cache fragment is ever requested.
+    ok("B: the saved Health bridge read is independent of the sales window (identical identity for 7D and 30D)",
+      JSON.stringify(s7.m.bridgeCalls) === JSON.stringify(s30.m.bridgeCalls) && s7.m.bridgeCalls.length === 1
+      && s7.m.bridgeCalls[0].accountId === SELLER && s7.m.bridgeCalls[0].rawSellerId === SELLER && s7.m.bridgeCalls[0].connectionId === "primary");
+    ok("B: no listing-health-v3:inventory cache fragment exists or is requested", !("listing-health-v3:inventory" in s7.m.H) && s7.m.requestedHashes.length === 2);
   } finally { globalThis.fetch = realFetch; }
   ok("B: zero network across both window reads", hits === 0);
 })();
@@ -127,10 +140,64 @@ await (async () => {
   const noListings = await serve({ listings: null }).run; // listings cache MISS
   ok("D: listings cache miss -> listingsEvidenceAvailable false + empty rows + honest reason (no export attempted)",
     noListings.evidence.listingsEvidenceAvailable === false && noListings.rows.length === 0 && typeof noListings.evidence.listingsUnavailableReason === "string");
-  // inventory cache MISS AND no listings FBA fallback -> on-hand UNAVAILABLE (null), never coerced to 0.
+  // no saved Health snapshot AND no listings FBA fallback -> on-hand UNAVAILABLE (null), never coerced to 0.
   const noInv = await serve({ inventory: null, listings: [listingRow(SELLER, "US", "A", { status: "Active", price: 25, fba: "", channel: "AMAZON_NA" }), LISTINGS[1]] }).run;
   const a = noInv.rows.find((r) => r.sku === "A");
-  ok("D: inventory cache miss + no listing fallback -> FBA on-hand null (UNAVAILABLE), never coerced to 0", noInv.evidence.inventoryEvidenceAvailable === false && a.onHandFba === null);
+  ok("D: no saved Health snapshot + no listing fallback -> FBA on-hand null (UNAVAILABLE), never coerced to 0", noInv.evidence.inventoryEvidenceAvailable === false && a.onHandFba === null);
+  // No saved Health snapshot with NON-validated (15-column) Listings never reads the Listings quantity per SKU.
+  const noInv30 = await serve({ inventory: null }).run;
+  ok("D: no saved Health + 15-column Listings fba 30 -> Unavailable (null), never the Listings 30 and never 0; reason health-snapshot-missing",
+    noInv30.inventory.source === "unavailable" && noInv30.evidence.inventoryEvidenceAvailable === false && noInv30.rows.find((r) => r.sku === "A").onHandFba === null
+    && JSON.stringify(noInv30.inventory.unavailableReasons) === JSON.stringify(["listings-not-expanded", "health-snapshot-missing"]));
+  // A STALE saved Health snapshot (older than asOf - 2) never drives On Hand FBA.
+  const stale = await serve({ inventory: [invRow("2026-08-30", SELLER, "US", "A", 30)] }).run;
+  ok("D: a stale saved Health snapshot (2026-08-30 < 2026-09-02 - 2) -> Unavailable with the typed reason, never the stale 30",
+    stale.inventory.source === "unavailable" && stale.rows.find((r) => r.sku === "A").onHandFba === null && stale.inventory.unavailableReasons.includes("health-bridge-stale:2026-08-30"));
+  // A bridge read that throws is an honest unavailable reason (the read-only preview never fails on it).
+  const m = makeReaders(); m.readers.getHealthBridge = async () => { throw new Error("db down"); };
+  const thrown = await serveListingHealthV3Preview({ owner: { accountId: SELLER, rawSellerId: SELLER, marketplace: "US" }, identity: { apiKey: API_KEY, connectionId: "primary" }, windowControls: { preset: "30D" }, asOf, readers: m.readers });
+  ok("D: a bridge read failure -> Unavailable (health-snapshot-read-failed), the preview still serves", thrown.inventory.source === "unavailable" && thrown.inventory.unavailableReasons.includes("health-snapshot-read-failed"));
+})();
+
+/* ===================== J. PHASE 2: validated Listings vs labelled Health fallback in the read-only serve ===================== */
+await (async () => {
+  const X = { fba_quantity_inbound: 0, fba_quantity_reserved: 0, fba_quantity_fc_transfer: 0 };
+  const xListings = LISTINGS.map((r) => ({ ...r, ...X }));
+  const H = hashesFor({ to: asOf });
+  // Production-shape reader: Listings with an effective (batch download) time; the saved Health bridge ALSO exists (999).
+  const reader = (listings, inventory) => ({
+    getEnrichedOli: async () => OLI.slice(), getOliCoverage: async () => ({ read: "ok", windows: FULL_COVERAGE }), getCompleteness: async () => [], getCatalog: async () => CATALOG.slice(),
+    requested: [],
+    getHealthBridge: async () => bridgeOf(inventory),
+    getSavedSourceRows: async function (h) {
+      if (h === H["listing-health-v3:listings"]) return listings ? { rows: listings, fetchedAt: "2026-09-02T09:00:00Z", effectiveAt: "2026-09-02T03:00:00Z", sourceType: "listings" } : null;
+      if (h === H["listing-health-v3:listings-raw"]) return RAW.slice();
+      return null;
+    },
+  });
+  const run = (r) => serveListingHealthV3Preview({ owner: { accountId: SELLER, rawSellerId: SELLER, marketplace: "US" }, identity: { apiKey: API_KEY, connectionId: "primary" }, windowControls: { preset: "30D" }, asOf, readers: r });
+  const seen = [];
+  const rl = reader(xListings, [invRow("2026-09-01", SELLER, "US", "A", 999)]);
+  const inner = rl.getSavedSourceRows; rl.getSavedSourceRows = async (h) => { seen.push(h); return inner(h); };
+  const pl = await run(rl);
+  const a = pl.rows.find((r) => r.sku === "A");
+  ok("J: validated (expanded) Listings -> SKU-A on-hand 30 from Listings (source listings), never the saved Health 999", a.onHandFba === 30 && a.onHandFbaSource === "listings");
+  ok("J: ... payload.inventory listings with the Listings effective time, NO inventory date; evidence available",
+    pl.inventory.model === "inventory-source-v1" && pl.inventory.source === "listings" && pl.inventory.refreshedAt === "2026-09-02T03:00:00Z"
+    && pl.inventory.snapshotDate === null && pl.provenance.inventorySnapshotDate === null && pl.evidence.inventoryEvidenceAvailable === true);
+  ok("J: ... only Listings + Listings-Raw cache fragments are read (no inventory fragment); the saved bridge provenance is its saved time",
+    seen.length === 2 && pl.provenance.inventorySourceType === "fba-inventory-health (saved bridge)" && pl.provenance.inventoryFetchedAt === "2026-09-02T04:00:00Z");
+  const pf = await run(reader(LISTINGS, INVENTORY));
+  ok("J: 15-column Listings + saved Health -> the bridge labelled with its date + reason; evidence available",
+    pf.inventory.source === "health-fallback" && pf.inventory.snapshotDate === "2026-09-01" && pf.inventory.refreshedAt === null
+    && pf.inventory.label === "FBA Inventory Health snapshot 2026-09-01 (saved, no longer refreshed -- temporary bridge: listings-not-expanded)" && pf.evidence.inventoryEvidenceAvailable === true
+    && pf.provenance.inventorySnapshotDate === "2026-09-01" && pf.rows.find((r) => r.sku === "A").onHandFbaSource === "fba-health-fallback");
+  const pu = await run(reader(LISTINGS, null));
+  ok("J: 15-column Listings + no saved Health -> unavailable (every on-hand null), evidence NOT available",
+    pu.inventory.source === "unavailable" && pu.evidence.inventoryEvidenceAvailable === false && pu.rows.every((r) => r.onHandFba === null));
+  const pm = await run(reader(null, INVENTORY));
+  ok("J: a Listings cache miss + saved Health -> health-fallback (reason listings-empty); no rows to show",
+    pm.inventory.source === "health-fallback" && pm.inventory.fallbackReasons.join(",") === "listings-empty" && pm.rows.length === 0);
 })();
 
 /* ===================== E. cross-account isolation (fail closed) ===================== */
@@ -161,6 +228,7 @@ await (async () => {
   const H = hashesFor({ to: asOf });
   const rich = {
     getEnrichedOli: async () => [], getOliCoverage: async () => ({ read: "ok", windows: FULL_COVERAGE }), getCompleteness: async () => [], getCatalog: async () => [],
+    getHealthBridge: async () => bridgeOf(null),
     // Production { rows, fetchedAt, effectiveAt, sourceType } shape: effectiveAt = the batch's real download time
     // (truer data as-of), fetchedAt = the materialization time, sourceType = the source id.
     getSavedSourceRows: async (h) => (h === H["listing-health-v3:listings"]
@@ -179,6 +247,7 @@ await (async () => {
   const H = hashesFor({ to: asOf });
   const cross = {
     getEnrichedOli: async () => [], getOliCoverage: async () => ({ read: "ok", windows: FULL_COVERAGE }), getCompleteness: async () => [], getCatalog: async () => [],
+    getHealthBridge: async () => bridgeOf(null),
     getSavedSourceRows: async (h) => (h === H["listing-health-v3:listings"] ? [listingRow(SELLER, "DE", "A", { status: "Active", price: 12 })] : null),
   };
   await throwsAsync("I: a DE listing row under a US owner fails closed (cross-marketplace; never merged)",
