@@ -85,7 +85,11 @@ function syncArr(name) {
 // The canonical Listings column set = the exact UNION the sync module composes:
 //   LISTINGS_CANONICAL_COLUMNS = [...new Set([...LH_V3_LISTING_COLUMNS, ...LISTINGS_AWD_COLUMNS])]
 // Recomputed here from the two real constants (verbatim) so the fba-plan:awd union assertion tracks source.
-const LISTINGS_CANONICAL_COLUMNS = [...new Set([...syncArr("LH_V3_LISTING_COLUMNS"), ...syncArr("LISTINGS_AWD_COLUMNS")])];
+// Shadow step of the Listings inventory cutover: the canonical set also carries the three FBA quantity fields.
+const LISTINGS_CANONICAL_COLUMNS = [...new Set([...syncArr("LH_V3_LISTING_COLUMNS"), ...syncArr("LISTINGS_AWD_COLUMNS"), ...syncArr("LISTINGS_SHADOW_INVENTORY_FIELDS")])];
+assert.deepEqual(syncArr("LISTINGS_SHADOW_INVENTORY_FIELDS"), ["fba_quantity_inbound", "fba_quantity_reserved", "fba_quantity_fc_transfer"], "exactly the three FBA quantity fields are added");
+assert.ok(!LISTINGS_CANONICAL_COLUMNS.includes("fba_inventory_supply_at_fba"), "fba_inventory_supply_at_fba is never requested");
+assert.equal(LISTINGS_CANONICAL_COLUMNS.length, 18, "15 existing Listings columns + 3");
 
 /* ---- insight builders: read the real column/aggregation constants out of the
    executable builder files (lib/server/reports/*.js). Same parity discipline as

@@ -256,7 +256,13 @@ const LH_V3_LISTING_RAW_COLUMNS = ["seller_or_vendor_id", "marketplace_country_c
 // export; AWD capability is decided by the DERIVE gate (awdCapableMarketplace), NOT by column presence, so a non-AWD
 // marketplace stays honestly unavailable (never a fabricated zero). Listings Raw is a DIFFERENT source (id 6ea445cd)
 // and keeps its own separate export. Order-independent (the request identity sorts the column set).
-const LISTINGS_CANONICAL_COLUMNS = [...new Set([...LH_V3_LISTING_COLUMNS, ...LISTINGS_AWD_COLUMNS])];
+// SHADOW (Listings inventory cutover, step 1 of a staged rollout): the canonical Listings request also carries the three
+// FBA quantity fields so every scheduled batch saves EXPANDED rows that can be validated read-only per account BEFORE any
+// consumer switches off FBA Inventory Health. Still ONE export per <=5-seller batch (no extra create; the request hash
+// changes once). No consumer reads these fields yet; FBA Inventory Health stays the inventory source.
+// fba_inventory_supply_at_fba is deliberately NOT requested.
+const LISTINGS_SHADOW_INVENTORY_FIELDS = ["fba_quantity_inbound", "fba_quantity_reserved", "fba_quantity_fc_transfer"];
+const LISTINGS_CANONICAL_COLUMNS = [...new Set([...LH_V3_LISTING_COLUMNS, ...LISTINGS_AWD_COLUMNS, ...LISTINGS_SHADOW_INVENTORY_FIELDS])];
 
 // ppc.js — PPC's TACoS denominator (total account sales) comes from the shared canonical Order Line
 // Items sales fragment (OLI_SALES_*, Blocker 1); all advertising figures are derived from persisted rows.
