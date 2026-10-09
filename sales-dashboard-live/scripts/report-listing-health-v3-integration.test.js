@@ -22,6 +22,11 @@ import { REPORT_SOURCE_CONTRACTS, SELLER_SCOPED_REQUEST_KEYS, reportSourceCovera
 import { REPORT_SOURCE_REQUIREMENTS } from "../lib/server/source-contracts.js";
 import { REPORT_CAPABILITIES, CAPABILITY, isBrandAccessible, resolveUserReportScope } from "../lib/server/report-authorization.js";
 import { makeListingHealthV3DurableContextLoader } from "../lib/server/sync/listing-health-v3-durable-loader.js";
+import { __setSourcePauseForTests, __resetSourcePauseForTests } from "../lib/server/source-pause.js";
+// Listings (Raw JSON) is code-level PAUSED in production (lib/server/source-pause.js). This suite keeps covering the
+// UNPAUSED (rollback) Listings + Listings-Raw behaviour via the module's test seam; the PAUSED behaviour is asserted at
+// the end of this file (where present) and in scripts/listings-raw-paused.test.js.
+__setSourcePauseForTests({});
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -415,5 +420,17 @@ function makeStore() {
     recordReportSuccess({ reportKey, accountId, latestDataDate }) { Object.assign(reportJobs.get(rkey(reportKey, accountId)), { fetch_status: "ready", derive_status: "succeeded", save_status: "succeeded", validated: true, latest_data_date: latestDataDate ?? null }); },
   };
 }
+
+/* ===================== P. Listings (Raw JSON) PAUSED (production): Listings-only v3 batches, FBA hashes unchanged ===================== */
+__resetSourcePauseForTests();
+(() => {
+  const euPlan = planListingHealthV3BucketBatched({ accounts: mk(["UK", "DE", "FR", "IT", "ES", "UK", "DE", "IT", "UK", "NL", "BE", "PL", "AU", "NL", "FR", "ES"]), connections, asOfFor: () => asOf, inventoryAsOf: inv });
+  ok("P: while Raw is PAUSED Europe-Australia 16 -> 4 listings batches and ZERO listings-raw sources", distinctHashes(euPlan, "listing-health-v3:listings").size === 4 && distinctHashes(euPlan, "listing-health-v3:listings-raw").size === 0);
+  const fba = planFbaPlanBucketBatched({ accounts: mk(["UK", "DE", "FR", "IT", "ES", "UK", "DE", "IT", "UK", "NL", "BE", "PL", "AU", "NL", "FR", "ES"]), connections, asOfFor: () => asOf, inventoryAsOf: inv });
+  ok("P: the paused v3 Listings batches are EXACTLY the fba-plan:awd hashes (one shared canonical Listings export per batch)",
+    JSON.stringify([...distinctHashes(euPlan, "listing-health-v3:listings")].sort()) === JSON.stringify([...distinctHashes(fba, "fba-plan:awd")].sort()));
+  ok("P: the Raw contract stays DECLARED (paused, not deleted): listings-raw is still a seller-scoped v3 request key + requirement",
+    SELLER_SCOPED_REQUEST_KEYS.includes("listing-health-v3:listings-raw") && REPORT_SOURCE_REQUIREMENTS["listing-health-v3"].includes("listings-raw"));
+})();
 
 writeSync(1, `\nreport-listing-health-v3-integration: ${passed} assertions passed\n`);

@@ -191,6 +191,7 @@
     "test:listing-health-v3-authorization-binding": "node scripts/report-listing-health-v3-authorization-binding.test.js",
     "test:fba-inventory-truncated": "node scripts/report-fba-inventory-truncated.test.js",
     "test:health-source-retired": "node scripts/health-source-retired.test.js",
+    "test:listings-raw-paused": "node scripts/listings-raw-paused.test.js",
     "test:lhv3-cycle-bucket-migration": "node scripts/listing-health-v3-cycle-bucket-migration.test.js",
     "test:brand-view-dependency-fingerprint": "node scripts/brand-view-dependency-fingerprint.test.js",
     "test:brand-inventory-rebuild": "node scripts/brand-inventory-rebuild.test.js",

@@ -24,6 +24,11 @@ import {
   computeListingHealthV3AuthorizationBinding,
   LISTING_HEALTH_V3_PRICING_REVISION,
 } from "../lib/server/sync/listing-health-v3-authorization.js";
+import { __setSourcePauseForTests, __resetSourcePauseForTests } from "../lib/server/source-pause.js";
+// Listings (Raw JSON) is code-level PAUSED in production (lib/server/source-pause.js). This suite keeps covering the
+// UNPAUSED (rollback) Listings + Listings-Raw behaviour via the module's test seam; the PAUSED behaviour is asserted at
+// the end of this file (where present) and in scripts/listings-raw-paused.test.js.
+__setSourcePauseForTests({});
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -177,6 +182,30 @@ await (async () => {
       sp.calls.runSources === 1 && sp.calls.bindings[0] && typeof sp.calls.bindings[0].bindingHash === "string" && sp.calls.bindings[0].maxTokens === 14);
     ok(`3: India (reuse=${reuse}) bound the frozen NEW tranche (lhv3-new#india), 4 creates / 14 tokens -- unchanged by reuse (reuse lowers observed creates truthfully, never the bound ceiling)`,
       sp.calls.bindings[0].trancheKey === "lhv3-new#india" && sp.calls.bindings[0].maxCreates === 4 && sp.calls.bindings[0].maxTokens === 14);
+  }
+})();
+
+/* ===== P. Listings (Raw JSON) PAUSED (production): Listings-only frozen budget binds within the UNCHANGED authorization ===== */
+__resetSourcePauseForTests();
+await (async () => {
+  for (const [region, accounts, creates, tokens, authC, authT] of [["us-ca", US11, 3, 15, 8, 28], ["india", IN8, 2, 10, 8, 28]]) {
+    const rel = makeRelease({ accounts });
+    const plan = await rel.buildPlan({ accounts, connections, cycleDate, region });
+    const frozen = rel.freezeBudget({ plan, region });
+    ok(`P: ${region} ${accounts.length} accounts freeze to ${creates} Listings creates / ${tokens} tokens while Raw is PAUSED (premium Listings only, zero Raw)`,
+      frozen.maxCreates === creates && frozen.maxTokens === tokens && frozen.hashes.length === creates);
+    const authz = readListingHealthV3Authorization({ region });
+    ok(`P: ${region} stored authorization UNCHANGED + still valid (${authC} creates / ${authT} tokens, pricing ${LISTING_HEALTH_V3_PRICING_REVISION})`,
+      authz.authorized === true && authz.maxCreates === authC && authz.maxTokens === authT);
+    const bound = computeListingHealthV3AuthorizationBinding({
+      region, cycleDate, operationId: "op", trancheKey: `lhv3-new#${region}`,
+      accountIds: accounts.map((a) => a.accountId), frozen, pricingRevision: LISTING_HEALTH_V3_PRICING_REVISION, authorization: authz,
+    });
+    ok(`P: ${region} the cheaper Listings-only frozen budget BINDS (plan cost only went down; <= the authorized ceiling)`, bound.ok === true && bound.binding.maxCreates === creates);
+    const sp = spies();
+    const ev = await runListingHealthV3Ingestion(liveArgs(rel, sp, region, accounts));
+    ok(`P: ${region} the live run proceeds to runSources with the bound Listings-only binding (no awaiting-budget)`,
+      sp.calls.runSources === 1 && sp.calls.bindings[0] && sp.calls.bindings[0].maxCreates === creates && ev.awaitingBudget !== true);
   }
 })();
 

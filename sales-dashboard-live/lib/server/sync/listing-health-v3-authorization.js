@@ -44,6 +44,11 @@ export const V3_INGESTION_REGIONS = Object.freeze(["india", "europe-au", "us-ca"
 // authorized, zero creates). rowCountBilling=true means the real bill can EXCEED this -- it is an ESTIMATE, never a
 // guaranteed maximum. The authorization caps the STRUCTURAL plan; the frozen tranche budget's atomic pre-POST reservation
 // + the live balance gate remain the true runtime enforcers.
+// LISTINGS (RAW JSON) PAUSE (lib/server/source-pause.js, 2026-10-09): these AUTHORIZATION constants and the reviewed
+// regional ceilings below are deliberately UNCHANGED, so every stored/standing authorization (and its pricing revision +
+// drift guard) stays valid with no DB or config change. While Raw is paused the PLAN needs one PREMIUM Listings export
+// per batch (1 create / 5 tokens), which is compared with <= against these ceilings (decideListingHealthV3Authorization,
+// computeListingHealthV3AuthorizationBinding): the plan cost only goes DOWN, the authorization is only a ceiling.
 export const V3_CREATES_PER_BATCH = 2; // one Listings + one Listings-Raw export per <=5-seller batch
 export const V3_TOKENS_PER_BATCH = PREMIUM_SOURCE_TOKENS + STANDARD_SOURCE_TOKENS; // premium listings (5) + standard listings-raw (2) = 7
 

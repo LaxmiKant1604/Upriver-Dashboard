@@ -56,6 +56,7 @@ const SUITES = [
   "test:listing-health-v3-authorization-binding",
   "test:fba-inventory-truncated",
   "test:health-source-retired",
+  "test:listings-raw-paused",
   "test:fba-d1-guard",
   "test:account-onboarding",
   "test:account-onboarding-reconcile",

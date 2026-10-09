@@ -35,6 +35,7 @@
 
 import { isDataDoeDeadlineError, isDataDoePollPendingError, isSourceDisabledError, withDataDoeDeadline, isRetiredDataDoeSourceId, isRetiredSourceError, RETIRED_SOURCE_ERROR_CODE } from "../datadoe.js";
 import { sourceJobOwnerId } from "../source-identity.js";
+import { isPausedDataDoeSourceId, isPausedSourceKey, isPausedSourceError, SOURCE_CODE_PAUSED_ERROR_CODE, PAUSED_SOURCE_MESSAGE } from "../source-pause.js";
 import { validateBatchSourcePayload } from "./source-account-isolation.js";
 import { isRoutingScope } from "./scheduler-scope.js";
 import { isInitialLoadIncompleteMessage, READINESS_INCOMPLETE_CODE } from "./source-readiness-isolation.js";
@@ -95,6 +96,11 @@ export function classifyFetchError(error, stage = "create-export") {
   // same request is refused again, so it is NEVER retried (no EXPORT_ERROR transient loop).
   if (isRetiredSourceError(error)) {
     return { stage, code: RETIRED_SOURCE_ERROR_CODE, message: "FBA Inventory Health is retired (Listings inventory cutover); no export is created for it.", terminal: true, transient: false };
+  }
+  // A code-level PAUSED source (Listings (Raw JSON), lib/server/source-pause.js) refused by createExport: terminal and
+  // non-transient while paused (the same request is refused again) -- never an EXPORT_ERROR transient retry loop.
+  if (isPausedSourceError(error)) {
+    return { stage, code: SOURCE_CODE_PAUSED_ERROR_CODE, message: PAUSED_SOURCE_MESSAGE, terminal: true, transient: false };
   }
   // The ZERO-EXPORT reconciler's no-export inner adapter refused a create/poll/download (error.code NO_EXPORT_REQUIRED):
   // the durable source it needs is not adoptable THIS pass. That is a routine, next-cycle-resolvable readiness gap, NOT a
@@ -374,6 +380,12 @@ async function runJobLifecycle({ store, dataDoe, clock, cycleId, job, progress, 
     // code -- never retried. (No planner emits a Health job; createExport refuses the id as well.)
     if (isRetiredDataDoeSourceId(job.sourceId ?? job.source_id) || job.retired === true) {
       return fail("create-export", RETIRED_SOURCE_ERROR_CODE, "FBA Inventory Health is retired (Listings inventory cutover); no export is created for it.", true);
+    }
+    // PAUSED source (Listings (Raw JSON), lib/server/source-pause.js): refused HERE, BEFORE the create claim / frozen-budget
+    // token reservation / POST -- recorded TERMINAL with the typed LISTINGS_RAW_PAUSED code, never retried. Only a leftover
+    // (pre-pause frozen) job can reach this: no planner emits a paused-source job, and createExport refuses the id too.
+    if (isPausedDataDoeSourceId(job.sourceId ?? job.source_id) || isPausedSourceKey(job.sourceKey ?? job.source_key)) {
+      return fail("create-export", SOURCE_CODE_PAUSED_ERROR_CODE, PAUSED_SOURCE_MESSAGE, true);
     }
     // Blocker 4d: when a FROZEN tranche budget is active, the create-claim goes through the ATOMIC pre-POST
     // reservation (reserve_source_export_create) instead of the plain claim -- it claims the still-pending job

@@ -36,6 +36,7 @@ import { classifyDirectoryAccounts, getDataDoeConnections } from "./datadoe-conn
 // per-region live publisher. Registry-derived (never hardcoded) so a superseded/shadow report drops out of the Publish
 // universe automatically. Pure + offline (report-derivation.js it transitively reaches declares "NO transport/supabase").
 import { REPORT_MATERIALIZATION } from "./reports/report-materialization-registry.js";
+import { isPausedSourceKey, SOURCE_CODE_PAUSED_ERROR_CODE } from "./source-pause.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const isDate = (v) => isValidCalendarDate(S(v));
@@ -68,6 +69,10 @@ export function normalizeDeliveryRegion(region) {
   const r = S(region).trim();
   return REGION_VALUES.has(r) ? r : REGIONS.INDIA; // default to the first region; never throw for a bad param
 }
+
+// A code-level PAUSED source column (Listings (Raw JSON), lib/server/source-pause.js): labelled paused, its saved
+// pointer's validated_at is NOT presented as current (null), and it has no expected publication while paused.
+const PAUSED_EXPORT = Object.freeze({ status: "Paused", mode: null, validatedAt: null, sourceAsOf: null, safeCode: SOURCE_CODE_PAUSED_ERROR_CODE, safeStage: "source-paused" });
 
 // ---- The five source columns of the matrix, in display order. Each declares how its per-account EXPORT evidence is
 // read + whether that evidence is calendar-DATED (D-1 coverage) or a DATE-FREE current-state snapshot (validated_at
@@ -295,8 +300,9 @@ export function shapeDeliveryPayload({
   for (const acct of accounts || []) {
     const evForAcct = (exportEvidenceByAccount || {})[acct.accountId] || {};
     const reports = DELIVERY_SOURCES.map((src) => {
-      const exp = classifyExport({ evidence: evForAcct[src.sourceKey], cycle: cycleContext, dated: src.dated });
-      const dependents = dependentsFor(src.sourceKey);
+      const paused = isPausedSourceKey(src.sourceKey);
+      const exp = paused ? PAUSED_EXPORT : classifyExport({ evidence: evForAcct[src.sourceKey], cycle: cycleContext, dated: src.dated });
+      const dependents = paused ? [] : dependentsFor(src.sourceKey);
       const perReport = {};
       for (const rk of dependents) {
         const contract = SCHEDULER_LIVE_SNAPSHOT_CONTRACTS[rk] || null;
@@ -309,7 +315,7 @@ export function shapeDeliveryPayload({
       const agg = aggregatePublish({ dependentReports: dependents, perReport });
       return {
         sourceKey: src.sourceKey,
-        label: src.label,
+        label: paused ? src.label + " (paused)" : src.label,
         exportStatus: exp.status,
         exportMode: exp.mode,
         validatedAt: exp.validatedAt,

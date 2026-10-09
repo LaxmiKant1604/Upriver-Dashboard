@@ -307,6 +307,9 @@ export function buildAdvancedListingHealth({
   enrichedOliRows = [], oliCoverageWindows = [], completenessRows = [],
   listingRows = [], inventoryRows = [], catalogRows = [], rawRows = [],
   issuesAvailable = false, issuesUnavailableReason = null,
+  // OPTIONAL typed code for WHY issues are unavailable (e.g. "listings-raw-paused"); emitted only when set, so every
+  // payload built without it is byte-identical to before.
+  issuesUnavailableCode = null,
   inventoryUnavailableReason = null,
   provenance = {},
 } = {}) {
@@ -482,6 +485,7 @@ export function buildAdvancedListingHealth({
     },
     issuesAvailable,
     issuesUnavailableReason,
+    ...(issuesUnavailableCode ? { issuesUnavailableCode: S(issuesUnavailableCode) } : {}),
     provenance: {
       // *FetchedAt = the truer EFFECTIVE/as-of date (the source batch's real download time); *SavedAt = the
       // materialization time; *SourceType = the fragment's source id -- so every fragment records source type, saved

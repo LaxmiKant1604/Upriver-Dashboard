@@ -14,6 +14,11 @@ import assert from "node:assert/strict";
 import { writeSync } from "node:fs";
 import { serveListingHealthV3Preview } from "../lib/server/reports/listing-health-v3-serve.js";
 import { listingHealthV3PerAccountReadHashes } from "../lib/server/sync/listing-health-v3-materialize.js";
+import { __setSourcePauseForTests, __resetSourcePauseForTests } from "../lib/server/source-pause.js";
+// Listings (Raw JSON) is code-level PAUSED in production (lib/server/source-pause.js). This suite keeps covering the
+// UNPAUSED (rollback) Listings + Listings-Raw behaviour via the module's test seam; the PAUSED behaviour is asserted at
+// the end of this file (where present) and in scripts/listings-raw-paused.test.js.
+__setSourcePauseForTests({});
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -252,6 +257,22 @@ await (async () => {
   };
   await throwsAsync("I: a DE listing row under a US owner fails closed (cross-marketplace; never merged)",
     () => serveListingHealthV3Preview({ owner: { accountId: SELLER, rawSellerId: SELLER, marketplace: "US" }, identity: { apiKey: API_KEY, connectionId: "primary" }, windowControls: { preset: "30D" }, asOf, readers: cross }));
+})();
+
+/* ===================== P. Listings (Raw JSON) PAUSED (production): the saved Raw alias is never read / presented ===================== */
+__resetSourcePauseForTests();
+await (async () => {
+  const { m, run } = serve(); // the saved Raw alias IS present in the cache
+  const p = await run;
+  ok("P: while Raw is PAUSED the serve never reads the saved Raw alias (only the Listings alias is requested)",
+    !m.requestedHashes.includes(m.H["listing-health-v3:listings-raw"]) && m.requestedHashes.includes(m.H["listing-health-v3:listings"]));
+  ok("P: issues are Unavailable with the PAUSED wording + code (not 'not yet saved', not zero issues)",
+    p.issuesAvailable === false && p.evidence.issuesEvidenceAvailable === false && p.issuesUnavailableCode === "listings-raw-paused"
+    && /Listings \(Raw JSON\) is paused/.test(p.issuesUnavailableReason) && !/not yet saved/.test(p.issuesUnavailableReason));
+  ok("P: no Raw-only evidence is presented (buyable / discoverable / liveOffer null, issues []) and rawFetchedAt is null",
+    p.rows.every((r) => r.buyable === null && r.discoverable === null && r.liveOffer === null && Array.isArray(r.issues) && r.issues.length === 0) && p.provenance.rawFetchedAt === null);
+  const b = p.rows.find((r) => r.sku === "B");
+  ok("P: Listings-only flags still derive (the Inactive FBM listing is still flagged)", b && b.flagged === true);
 })();
 
 writeSync(1, `\nreport-listing-health-v3-serve: ${passed} assertions passed\n`);

@@ -240,7 +240,10 @@ export function buildV3Rows(payload, selectedBrand = null) {
   const reportAsOf = (payload && payload.asOf) || null;
   // The evidence as-of for a row's HEALTH finding: the saved Listings/Raw snapshot's fetched_at (falling back to the
   // report as-of). Never a fabricated date and never the inventory day -- null when nothing is available.
-  const evidenceAsOf = dateOnly(prov.rawFetchedAt) || dateOnly(prov.listingsFetchedAt) || reportAsOf || null;
+  // When Raw issue evidence is UNAVAILABLE for this payload (e.g. Listings (Raw JSON) paused) a Raw fetch time is never
+  // the evidence date: only the Listings fetch time (else the report as-of) is.
+  const issuesUnavailable = !!payload && payload.issuesAvailable === false;
+  const evidenceAsOf = (issuesUnavailable ? null : dateOnly(prov.rawFetchedAt)) || dateOnly(prov.listingsFetchedAt) || reportAsOf || null;
   const evidenceStale = isEvidenceStale(evidenceAsOf, reportAsOf);
   const legacyInventory = rows.length > 0 && !isInventorySourcePayload(payload);
   const out = [];
@@ -293,6 +296,25 @@ export function buildV3PriorityActions(rows) {
       ],
     };
   });
+}
+
+// The Priority Actions header suffix + empty-state wording. When Amazon issue evidence is UNAVAILABLE for this payload
+// (issuesAvailable === false -- e.g. Listings (Raw JSON) is paused, issuesUnavailableCode "listings-raw-paused"), an empty
+// list is NOT an all-clear: only the Listings-based checks (status, price, stock) ran, so it never says "none" /
+// "No action needed". Pure; 7-bit ASCII.
+export const V3_LISTINGS_RAW_PAUSED_CODE = "listings-raw-paused";
+export function v3PriorityActionsText(payload, count) {
+  const n = Number(count) || 0;
+  const unavailable = !!payload && payload.issuesAvailable === false;
+  if (!unavailable) return { headerSuffix: n ? "" : "\u2014 none", emptyNote: "No action needed from this preview right now.", issuesUnavailable: false, paused: false };
+  const paused = payload.issuesUnavailableCode === V3_LISTINGS_RAW_PAUSED_CODE;
+  const why = paused ? "Listings (Raw JSON) is paused" : "Listings (Raw JSON) evidence is not available";
+  return {
+    headerSuffix: "- Listings checks only (Amazon issue checks unavailable)",
+    emptyNote: "No Listings-based action found (status, price, stock). Amazon issue, buyable, discoverable and live-offer checks are unavailable because " + why + " -- this is not a confirmed all-clear.",
+    issuesUnavailable: true,
+    paused,
+  };
 }
 
 // Display helpers (null/unavailable vs genuine zero vs not-applicable) -- kept here so the view + tests share them.

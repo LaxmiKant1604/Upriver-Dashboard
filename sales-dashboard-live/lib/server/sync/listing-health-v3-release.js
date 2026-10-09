@@ -27,6 +27,8 @@
 // publisher + control fence. It imports NO provider export transport. The returned per-account result is the SAME typed
 // shape the release runner returns. 7-bit ASCII, LF.
 
+import { isListingsRawPaused, LISTINGS_RAW_PAUSED_REASON_CODE } from "../source-pause.js";
+
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -53,6 +55,11 @@ function noDateSource(requestKey, rows, rawSellerId) {
     fragments: [{ requestKey, from: null, to: null, sellerOrVendorIds: [rawSellerId], rows }],
     disabled: false, disabledPolicy: null, reason: null,
   };
+}
+// Listings (Raw JSON) PAUSED (lib/server/source-pause.js): Raw is handed to the derive as UNAVAILABLE (never saved Raw
+// rows), so the derive reports issues unavailable with the paused reason instead of stale issue evidence.
+function pausedRawSource() {
+  return { available: false, rows: null, fragments: [], disabled: false, disabledPolicy: null, reason: LISTINGS_RAW_PAUSED_REASON_CODE };
 }
 
 /**
@@ -116,7 +123,7 @@ export function buildListingHealthV3Release({
     if (aborted()) return DEADLINE();
     const sources = {
       [LISTINGS_REQUEST_KEY]: noDateSource(LISTINGS_REQUEST_KEY, bundle.listingsRows, rawSellerId),
-      [LISTINGS_RAW_REQUEST_KEY]: noDateSource(LISTINGS_RAW_REQUEST_KEY, bundle.rawRows, rawSellerId),
+      [LISTINGS_RAW_REQUEST_KEY]: isListingsRawPaused() ? pausedRawSource() : noDateSource(LISTINGS_RAW_REQUEST_KEY, bundle.rawRows, rawSellerId),
       // (No inventory source: the retired listing-health-v3:inventory fragment is gone. The saved FBA Inventory Health
       // BRIDGE rides in the bundle context as listingHealthV3DurableInventory -- read-only, Listings inventory cutover.)
     };

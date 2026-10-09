@@ -11,7 +11,7 @@ import React, { useMemo, useState } from "react";
 import { ShieldAlert } from "lucide-react";
 
 import {
-  buildV3Rows, buildV3PriorityActions, v3ExportRows, v3WindowStatusLabel, v3InventoryFreshness,
+  buildV3Rows, buildV3PriorityActions, v3PriorityActionsText, v3ExportRows, v3WindowStatusLabel, v3InventoryFreshness,
   fmtOnHand, fmtBool, fmtIssue, GATE_RANK, V3_GATES,
 } from "../lib/listing-health-v3-view.js";
 import { reportFilename } from "../lib/csv.js";
@@ -60,6 +60,8 @@ export default function ListingHealthV3({ data, loading, error, accountName, sel
   const preset = (win && win.preset) || "30D";
   const rows = useMemo(() => buildV3Rows(data, selectedBrand), [data, selectedBrand]);
   const priority = useMemo(() => buildV3PriorityActions(rows), [rows]);
+  // Issues unavailable (e.g. Listings (Raw JSON) paused): an empty list is never shown as "none" / "No action needed".
+  const priorityText = v3PriorityActionsText(data, priority.length);
   const windowStatus = useMemo(() => v3WindowStatusLabel(data), [data]);
   const inventoryFreshness = useMemo(() => v3InventoryFreshness(data), [data]);
   const counts = useMemo(() => {
@@ -173,11 +175,11 @@ export default function ListingHealthV3({ data, loading, error, accountName, sel
           {/* Priority Actions -- COLLAPSED by default; expand for ranked evidence, reason, confidence, action. */}
           <div className="panel" style={{ marginTop: 10 }}>
             <button type="button" className="auth-link" aria-expanded={priorityOpen} onClick={() => setPriorityOpen((v) => !v)} style={{ fontWeight: 600 }}>
-              {priorityOpen ? "▾" : "▸"} Priority Actions ({priority.length}) {priority.length ? "" : "— none"}
+              {priorityOpen ? "▾" : "▸"} Priority Actions ({priority.length}) {priorityText.headerSuffix}
             </button>
             {priorityOpen && (
               <div className="insight-list" style={{ marginTop: 8 }}>
-                {priority.length === 0 && <div className="empty-note">No action needed from this preview right now.</div>}
+                {priority.length === 0 && <div className="empty-note">{priorityText.emptyNote}</div>}
                 {priority.slice(0, 50).map((p) => (
                   <div className={`insight-row insight-${p.severity}`} key={p.id}>
                     <div className="insight-head"><span className={`pt-badge sku-badge-${V3_GATES[p.gate] ? V3_GATES[p.gate].tone : "warn"}`}>{p.gateLabel}</span> <span className="insight-title">{p.productName || p.sku}</span> <span className="insight-money mono">{money(p.salesAtRisk)}</span></div>

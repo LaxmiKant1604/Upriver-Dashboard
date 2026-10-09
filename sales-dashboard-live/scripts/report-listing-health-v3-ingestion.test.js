@@ -58,32 +58,37 @@ function makeFakeRelease({ ceiling = 4, jobsAfter = null } = {}) {
   return { release, calls, evidenceReads };
 }
 
-/* ===================== A. ONE source pass: listings + listings-raw only (no inventory pass) ===================== */
+/* ===================== A. ONE source pass: listings only while Listings (Raw JSON) is PAUSED (no inventory pass) ===================== */
 await (async () => {
   const fake0 = makeFakeRelease();
   const plan = await fake0.release.buildPlan({ accounts: IN8, connections, cycleDate, region: "india" });
   const v3 = plan.reportRequests.filter((r) => r.reportKey === "listing-health-v3");
   const keys = new Set(v3.flatMap((r) => r.sources.map((s) => s.requestKey)));
   const newHashes = [...new Set(v3.flatMap((r) => r.sources.map((s) => s.requestHash)))];
-  ok("A: the plan carries ONLY listings + listings-raw (no inventory source)", [...keys].sort().join(",") === "listing-health-v3:listings,listing-health-v3:listings-raw");
-  ok("A: an 8-account India plan yields exactly 4 new-export batch hashes (2 listings + 2 listings-raw)", newHashes.length === 4);
+  // Listings (Raw JSON) is code-level PAUSED (lib/server/source-pause.js): the plan carries the canonical Listings only.
+  ok("A: the plan carries ONLY listings (no inventory source; listings-raw PAUSED)", [...keys].sort().join(",") === "listing-health-v3:listings");
+  ok("A: an 8-account India plan yields exactly 2 new-export batch hashes (2 listings; zero listings-raw while paused)", newHashes.length === 2);
   ok("A: planning made ZERO durable evidence reads (no overflow / readiness / Health evidence)", fake0.evidenceReads.cycles === 0 && fake0.evidenceReads.jobs === 0 && fake0.evidenceReads.owners === 0);
 
-  // Fabricate post-run jobs: the 4 new hashes created (create_export_count=1).
-  const jobsAfter = newHashes.map((h, i) => ({ request_hash: h, source_key: i % 2 ? "listings-raw" : "listings", create_export_count: 1 }));
+  // Fabricate post-run jobs: the 2 new Listings hashes created (create_export_count=1).
+  const jobsAfter = newHashes.map((h) => ({ request_hash: h, source_key: "listings", create_export_count: 1 }));
   const { release, calls } = makeFakeRelease({ ceiling: 4, jobsAfter });
   const res = await release.runSources({ plan, region: "india", cycleDate, authorizationBinding: bindFor(release, plan, "india") });
   ok("A: runSources opened the DEDICATED namespaced cycle (listing-health-v3-india)", calls.lastCycleBucket === listingHealthV3CycleBucket("india"));
-  ok("A: it froze + persisted the create budget once, with maxCreates=4 (listings+raw only)", calls.persistBudget.length === 1 && calls.persistBudget[0].maxCreates === 4);
+  ok("A: it froze + persisted the create budget once, with maxCreates=2 (listings only; Raw paused)", calls.persistBudget.length === 1 && calls.persistBudget[0].maxCreates === 2);
   ok("A: it ran exactly ONE source pass (no inventory reuse pass)", calls.sourceCycle.length === 1);
   ok("A: the pass = the NEW tranche, create mode, WITH the frozen budget, fail-closed on a missing source", calls.sourceCycle[0].reuseOnly === false && calls.sourceCycle[0].hasBudget === true && /lhv3-new/.test(calls.sourceCycle[0].tranche) && calls.sourceCycle[0].completeUnavailableOnMissingReuse === false);
   ok("A: the pass scopes the account bucket to the real region (india), not the namespaced cycle key", calls.sourceCycle.every((c) => c.bucket === "india" && c.cycleBucket === "listing-health-v3-india"));
-  ok("A: actual creates counted honestly = 4; nothing unplanned created", res.creates === 4 && res.unplannedCreated === false && res.maxCreates === 4 && res.inventoryCreated === false && res.inventoryPass.retired === true);
-  ok("A: observed token estimate = 4 creates x 2 (an estimate, not a guaranteed max)", res.tokens === 8);
+  ok("A: actual creates counted honestly = 2; nothing unplanned created", res.creates === 2 && res.unplannedCreated === false && res.maxCreates === 2 && res.inventoryCreated === false && res.inventoryPass.retired === true);
+  ok("A: observed token estimate = 2 creates x 2 (an estimate, not a guaranteed max)", res.tokens === 4);
+  // While PAUSED a created listings-raw job (e.g. a leftover) is OUTSIDE the active families -> unplannedCreated (fail closed).
+  const rawLeft = makeFakeRelease({ ceiling: 4, jobsAfter: [...jobsAfter, { request_hash: "h-raw", source_key: "listings-raw", create_export_count: 1 }] });
+  const resRaw = await rawLeft.release.runSources({ plan, region: "india", cycleDate, authorizationBinding: bindFor(rawLeft.release, plan, "india") });
+  ok("A: a created listings-raw job while Raw is PAUSED -> unplannedCreated:true (the operator fails closed on it)", resRaw.unplannedCreated === true && resRaw.creates === 2);
   // A created job of ANY other source family (e.g. the retired FBA Inventory Health) is surfaced for the operator to fail closed.
   const bad = makeFakeRelease({ ceiling: 4, jobsAfter: [...jobsAfter, { request_hash: "h-health", source_key: "fba-inventory-health", create_export_count: 1 }] });
   const resBad = await bad.release.runSources({ plan, region: "india", cycleDate, authorizationBinding: bindFor(bad.release, plan, "india") });
-  ok("A: a created non-Listings job -> unplannedCreated:true (the operator fails closed on it); creates still counts only the frozen hashes", resBad.unplannedCreated === true && resBad.inventoryCreated === true && resBad.creates === 4);
+  ok("A: a created non-Listings job -> unplannedCreated:true (the operator fails closed on it); creates still counts only the frozen hashes", resBad.unplannedCreated === true && resBad.inventoryCreated === true && resBad.creates === 2);
   // A pre-existing (adopted, zero-create) job of another family is NOT a violation.
   const adopted = makeFakeRelease({ ceiling: 4, jobsAfter: [...jobsAfter, { request_hash: "h-old", source_key: "fba-inventory-health", create_export_count: 0 }] });
   const resAdopted = await adopted.release.runSources({ plan, region: "india", cycleDate, authorizationBinding: bindFor(adopted.release, plan, "india") });
@@ -95,15 +100,16 @@ await (async () => {
   const plan = await makeFakeRelease().release.buildPlan({ accounts: IN8, connections, cycleDate, region: "india" });
   // The obsolete fixed regional ceiling is REMOVED: a low legacy `ceiling` no longer hard-fails a VALID plan.
   // The authorization is the frozen tranche budget's maxCreates (= the exact structural count) + the atomic
-  // pre-POST reservation (never a fixed 4/8/4 assumption). An 8-account plan freezes maxCreates=4 and proceeds.
+  // pre-POST reservation (never a fixed 4/8/4 assumption). An 8-account plan freezes maxCreates=2 (Listings only while
+  // Listings (Raw JSON) is paused) and proceeds.
   const { release, calls } = makeFakeRelease({ ceiling: 1 }); // legacy ceiling param is now ignored
   await release.runSources({ plan, region: "india", cycleDate, authorizationBinding: bindFor(release, plan, "india") });
   let missingBinding = null; try { await release.runSources({ plan, region: "india", cycleDate }); } catch (e) { missingBinding = e; }
   ok("B(binding): runSources REFUSES without the exact authorization binding (AUTHORIZATION_BINDING_MISSING); nothing new persisted", /AUTHORIZATION_BINDING_MISSING/.test(String(missingBinding && missingBinding.message)) && calls.persistBudget.length === 1);
   let wrongBinding = null; try { await release.runSources({ plan, region: "india", cycleDate, authorizationBinding: { ...bindFor(release, plan, "india"), planFingerprint: "tampered" } }); } catch (e) { wrongBinding = e; }
   ok("B(binding): a binding whose plan fingerprint differs from the frozen plan is refused (AUTHORIZATION_BINDING_MISMATCH) before any persist/POST", /AUTHORIZATION_BINDING_MISMATCH.*planFingerprint/.test(String(wrongBinding && wrongBinding.message)) && calls.persistBudget.length === 1);
-  ok("B(P1): the obsolete fixed regional ceiling is gone -- a valid 8-account plan proceeds and freezes the exact structural maxCreates=4 (authorization = frozen budget + reservation), the one source pass ran",
-    calls.persistBudget.length === 1 && calls.persistBudget[0].maxCreates === 4 && calls.sourceCycle.length === 1);
+  ok("B(P1): the obsolete fixed regional ceiling is gone -- a valid 8-account plan proceeds and freezes the exact structural maxCreates=2 (Listings only; Raw paused) (authorization = frozen budget + reservation), the one source pass ran",
+    calls.persistBudget.length === 1 && calls.persistBudget[0].maxCreates === 2 && calls.sourceCycle.length === 1);
   // The composition keeps a STRUCTURAL DRIFT guard (frozen.maxCreates > 2 x ceil(accounts/5) => fail closed).
   const comp = readFileSync(new URL("../lib/server/sync/listing-health-v3-ingestion-composition.js", import.meta.url), "utf8");
   ok("B(P1): a structural drift guard (expectedListingHealthV3NewExports) replaces the fixed ceiling and fails closed on over-fan-out; no fixed regionCeilings[region] throw remains",

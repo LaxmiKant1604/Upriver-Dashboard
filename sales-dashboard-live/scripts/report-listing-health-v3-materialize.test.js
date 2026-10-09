@@ -28,6 +28,11 @@ import { serveListingHealthV3Preview } from "../lib/server/reports/listing-healt
 import { organizationFingerprint, accountScopeHash } from "../lib/server/source-identity.js";
 import { CONTROLLED_REPORT_KEYS, SCHEDULER_V2_READY_REPORT_KEYS, schedulerV2ReportControlCatalog } from "../lib/server/sync/report-controls.js";
 import { selectSchedulerV2ReportKeys, classifySchedulerV2ReportKey } from "../lib/server/sync/sync-dispatch.js";
+import { __setSourcePauseForTests, __resetSourcePauseForTests } from "../lib/server/source-pause.js";
+// Listings (Raw JSON) is code-level PAUSED in production (lib/server/source-pause.js). This suite keeps covering the
+// UNPAUSED (rollback) Listings + Listings-Raw behaviour via the module's test seam; the PAUSED behaviour is asserted at
+// the end of this file (where present) and in scripts/listings-raw-paused.test.js.
+__setSourcePauseForTests({});
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -437,6 +442,41 @@ await (async () => {
   await materializeListingHealthV3PerAccount({ plans: p, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache, readAliasMeta: cache.readAliasMeta, emit: (t, o) => stale.push(o), runId: "op-stale" });
   ok("L3: a late older batch emits 'stale' events (older-batch-preserved-lkg), never replacing the newer alias",
     stale.some((o) => o.result === "stale" && o.reason === "older-batch-preserved-lkg"));
+})();
+
+/* ===================== P. Listings (Raw JSON) PAUSED (production): Listings-only ceiling + no Raw alias / pointer ===================== */
+__resetSourcePauseForTests();
+await (async () => {
+  const pl = plans();
+  ok("P: while Raw is PAUSED the v3 plan carries listings only", pl.every((r) => r.sources.length > 0 && r.sources.every((s) => s.requestKey === "listing-health-v3:listings")));
+  ok("P: the structural expectation is ONE create per <=5-seller batch (5 accounts -> 1; 16 -> 4)", expectedListingHealthV3NewExports(5) === 1 && expectedListingHealthV3NewExports(16) === 4);
+  const ceil = assertListingHealthV3ExportCeiling({ region: "us-ca", plans: pl, accountCount: 5 });
+  ok("P: the computed ceiling is 1 for one batch and the Listings-only plan fits it (1 new export)", ceil.ceiling === 1 && ceil.newExports === 1 && ceil.withinCeiling === true);
+  // A plan that still carries a listings-raw source while paused is UNPLANNED -> the gate fails closed (zero creates).
+  __setSourcePauseForTests({});
+  const withRaw = plans();
+  __resetSourcePauseForTests();
+  throwsSync("P: a plan still carrying listings-raw while PAUSED fails the ceiling gate closed (unplanned family)", () => assertListingHealthV3ExportCeiling({ region: "us-ca", plans: withRaw, accountCount: 5 }));
+  // Materialize over a (leftover) plan carrying listings-raw while paused: NO Raw alias and NO Raw durable pointer is
+  // written; the Listings alias still is.
+  const cache = makeCache();
+  seedBatch(cache, withRaw, { listings: listingsBatch, raw: [rawRow("acct-00", "US", "S00")] });
+  for (const e of cache.map.values()) e.fetched_at = "2026-09-04T06:00:00.000Z"; // a validated batch download time
+  const durable = [];
+  const res = await materializeListingHealthV3PerAccount({
+    plans: withRaw, connections, readSourceCache: cache.readSourceCache, writeSourceCache: cache.writeSourceCache,
+    saveDurablePayload: async ({ sourceKey, scopeKey }) => ({ objectPath: `p/${sourceKey}/${scopeKey}/x.json`, payloadSha: "x", payloadBytes: 1 }),
+    recordDurableByKey: {
+      "listing-health-v3:listings": async (a) => { durable.push(["listings", a.accountId]); return { ack: "replaced" }; },
+      "listing-health-v3:listings-raw": async (a) => { durable.push(["listings-raw", a.accountId]); return { ack: "replaced" }; },
+    },
+  });
+  const rawIds = listingHealthV3PerAccountReadHashes({ apiKey: API_KEY, rawSellerId: "acct-00" });
+  ok("P: while PAUSED materialize writes NO listings-raw per-account alias (Listings aliases still written)",
+    !cache.map.has(rawIds["listing-health-v3:listings-raw"]) && cache.map.has(rawIds["listing-health-v3:listings"]) && res.aliasesWritten >= 4);
+  ok("P: while PAUSED materialize records NO listings-raw durable pointer (Listings pointers still recorded)",
+    durable.every(([k]) => k === "listings") && durable.length > 0
+    && Object.values(res.durableByAccount || {}).every((r) => !Object.prototype.hasOwnProperty.call(r, "listing-health-v3:listings-raw")));
 })();
 
 writeSync(1, `\nreport-listing-health-v3-materialize: ${passed} assertions passed\n`);

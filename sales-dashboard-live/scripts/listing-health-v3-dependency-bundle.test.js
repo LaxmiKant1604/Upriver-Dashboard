@@ -14,6 +14,11 @@ import {
   oliRowsDigest, oliCoverageDigest, oliCompletenessDigest, inventoryFingerprintToken, LISTING_HEALTH_V3_BUNDLE_STATUS,
 } from "../lib/server/sync/listing-health-v3-dependency-bundle.js";
 import { sourceSnapshotObjectPath } from "../lib/server/supabase.js";
+import { __setSourcePauseForTests, __resetSourcePauseForTests } from "../lib/server/source-pause.js";
+// Listings (Raw JSON) is code-level PAUSED in production (lib/server/source-pause.js). This suite keeps covering the
+// UNPAUSED (rollback) Listings + Listings-Raw behaviour via the module's test seam; the PAUSED behaviour is asserted at
+// the end of this file (where present) and in scripts/listings-raw-paused.test.js.
+__setSourcePauseForTests({});
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -239,6 +244,26 @@ await miss("catalog sha missing -> defer", { loadDurableContext: async () => { c
   const ac = new AbortController(); ac.abort();
   const b = await run({ signal: ac.signal });
   ok("aborted signal -> defer (miss)", b.eligible === false && String(b.reason).includes("abort"));
+}
+
+// ---- (P) Listings (Raw JSON) PAUSED (production): the Raw pointer is NOT required and NOT used ----
+{
+  const unpaused = await run();
+  __resetSourcePauseForTests();
+  let rawReads = 0;
+  const missingRaw = await run({ readListingsRawSnapshot: async () => { rawReads += 1; return { read: "ok", snapshot: null }; } });
+  ok("P: while Raw is PAUSED a MISSING Raw pointer never defers -- the bundle is eligible (Listings + OLI + Catalog prove it)", missingRaw.eligible === true);
+  ok("P: while PAUSED the Raw pointer is never even read (zero Raw reads)", rawReads === 0);
+  const staleRaw = await run({ rawPtr: { as_of: "2026-08-01", validated_at: "2026-08-01T06:00:00.000Z" } });
+  ok("P: while PAUSED a saved (stale) Raw pointer is NOT adopted: rawRows/rawSnapshot null, context.rawFetchedAt null",
+    staleRaw.eligible === true && staleRaw.bundle.rawRows === null && staleRaw.bundle.rawSnapshot === null && staleRaw.bundle.context.rawFetchedAt === null);
+  ok("P: while PAUSED a corrupt Raw pointer / read failure cannot defer either (Raw is out of the bundle)",
+    (await run({ readListingsRawSnapshot: async () => ({ read: "read-failed" }) })).eligible === true
+    && (await run({ rawPtr: { payload_sha: "zz", object_path: "bad/path.json" } })).eligible === true);
+  ok("P: the paused fingerprint is DETERMINISTIC (independent of any saved Raw pointer) and DIFFERS from the unpaused one (pause/unpause re-derives)",
+    missingRaw.revisionId === staleRaw.revisionId && unpaused.eligible === true && missingRaw.revisionId !== unpaused.revisionId);
+  ok("P: while PAUSED a missing LISTINGS pointer still defers (Listings stays mandatory)", (await run({ readListingsSnapshot: async () => ({ read: "ok", snapshot: null }) })).eligible === false);
+  __setSourcePauseForTests({});
 }
 
 writeSync(1, `\nlisting-health-v3-dependency-bundle: ${passed} assertions passed\n`);

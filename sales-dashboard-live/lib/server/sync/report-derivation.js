@@ -46,6 +46,7 @@ import { skuMovementPayload } from "../reports/sku-movement-core.js";
 // date-windows + source-durable-model + oli-completeness-serve; NO transport/supabase), so importing it keeps the
 // "derivation graph has no transport import" guarantee intact.
 import { buildAdvancedListingHealth, resolveListingHealthWindow } from "../reports/listing-health-advanced.js";
+import { isListingsRawPaused, LISTINGS_RAW_PAUSED_ISSUES_REASON, LISTINGS_RAW_PAUSED_REASON_CODE } from "../source-pause.js";
 import { awdCapableMarketplace, awdRequiredForMarketplace } from "../reports/awd-capability.js";
 import {
   declaredReportKeys,
@@ -1094,11 +1095,16 @@ const REGISTRY = {
       //   the approved degraded/disabled availabilityPolicy => save a valid snapshot with issuesAvailable
       //     false + the exact enable hint (a terminal-disabled policy would block instead);
       //   pending / missing / failed-for-other-reasons / unreadable => unavailable (LKG preserved).
+      //   Listings (Raw JSON) PAUSED (lib/server/source-pause.js) => issuesAvailable false + the PAUSED reason (never the
+      //     DataDoe enable hint), and any supplied/saved Raw rows are IGNORED (never presented as current issues).
       const rawSource = sources["listing-health:listings-raw"];
       let issuesAvailable = true;
       let issuesUnavailableReason = null;
       let rawRows = [];
-      if (rawSource && rawSource.available === true && Array.isArray(rawSource.rows)) {
+      if (isListingsRawPaused()) {
+        issuesAvailable = false;
+        issuesUnavailableReason = LISTINGS_RAW_PAUSED_ISSUES_REASON;
+      } else if (rawSource && rawSource.available === true && Array.isArray(rawSource.rows)) {
         rawRows = noDateFragmentRows(rawSource, "listing-health:listings-raw", rawSellerId);
       } else if (rawSource && rawSource.disabled === true) {
         const outcome = sourceDisabledOutcome(rawSource.disabledPolicy || null);
@@ -1217,11 +1223,19 @@ const REGISTRY = {
       }
       // Optional Listings (Raw JSON): validated success => enrich; approved degraded/disabled => issuesAvailable false;
       // anything else (pending/failed/unreadable) => unavailable (LKG preserved). Mirrors the v1 raw policy exactly.
+      // Listings (Raw JSON) PAUSED (lib/server/source-pause.js): Raw is NOT required -- issuesAvailable false with the
+      // PAUSED reason (never the DataDoe enable hint), any supplied/saved Raw rows IGNORED, rawFetchedAt null. The
+      // Listings-only flags (status / price / stranded stock) still derive; Raw-only flags (Amazon issue error / not
+      // buyable / not discoverable / no live offer) are unavailable, never "zero issues".
+      const rawPaused = isListingsRawPaused();
       const rawSource = sources["listing-health-v3:listings-raw"];
       let issuesAvailable = true;
       let issuesUnavailableReason = null;
       let rawRows = [];
-      if (rawSource && rawSource.available === true && Array.isArray(rawSource.rows)) {
+      if (rawPaused) {
+        issuesAvailable = false;
+        issuesUnavailableReason = LISTINGS_RAW_PAUSED_ISSUES_REASON;
+      } else if (rawSource && rawSource.available === true && Array.isArray(rawSource.rows)) {
         rawRows = noDateFragmentRows(rawSource, "listing-health-v3:listings-raw", rawSellerId);
       } else if (rawSource && rawSource.disabled === true) {
         if (sourceDisabledOutcome(rawSource.disabledPolicy || null).blocks) {
@@ -1257,11 +1271,12 @@ const REGISTRY = {
         completenessRows: Array.isArray(durableOli.completenessRows) ? durableOli.completenessRows : [],
         listingRows, inventoryRows, catalogRows, rawRows,
         issuesAvailable, issuesUnavailableReason, inventoryUnavailableReason,
+        ...(rawPaused ? { issuesUnavailableCode: LISTINGS_RAW_PAUSED_REASON_CODE } : {}),
         provenance: {
           listingsFetchedAt: context.listingsFetchedAt || null,
           // The saved Health bridge's validation time (never a new Health export's fetch time).
           inventoryFetchedAt: (inventoryRows.length && bridge && bridge.savedAt) || context.inventoryFetchedAt || null,
-          rawFetchedAt: context.rawFetchedAt || null,
+          rawFetchedAt: rawPaused ? null : (context.rawFetchedAt || null),
           catalogFetchedAt: context.catalogFetchedAt || null,
         },
       });

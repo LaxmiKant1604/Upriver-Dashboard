@@ -15,6 +15,7 @@ import { shapeSourceCards, dashboardReadinessSummary, CARD_BUCKETS } from "../..
 import { sourceRegistryEntry } from "../../lib/server/sync/source-registry.js";
 import { isRetiredSourceKey } from "../../lib/server/source-contracts.js";
 import { RETIRED_SOURCE_ERROR_CODE, RETIRED_SOURCE_MESSAGE } from "../../lib/server/datadoe.js";
+import { isPausedSourceKey, SOURCE_CODE_PAUSED_ERROR_CODE, PAUSED_SOURCE_MESSAGE } from "../../lib/server/source-pause.js";
 import { buildBucketSourceSyncRuntime } from "../../lib/server/sync/source-bucket-sync-runtime.js";
 import { validateSourceSyncRequest, runReleaseSlice, ORCHESTRATED_SOURCE_KEYS } from "../../lib/server/sync/source-sync-operation.js";
 import { isFbaOperationSource, resolveFbaPlanScope, planFbaBucketCost, buildFbaBucketPlan, fbaBucketAccounts, advanceFbaPlanBucket, fbaServerCeiling, fbaCycleBucket, fbaInventoryAsOf } from "../../lib/server/sync/fba-plan-operation.js";
@@ -124,6 +125,12 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
         res.status(409).json({ error: RETIRED_SOURCE_ERROR_CODE, code: RETIRED_SOURCE_ERROR_CODE, sourceKey, retryable: false, message: RETIRED_SOURCE_MESSAGE });
         return;
       }
+      // A code-level PAUSED source (Listings (Raw JSON), lib/server/source-pause.js): typed 409 with ZERO writes (the
+      // code-level pause is not an operator toggle; un-pausing is a reviewed code change).
+      if (isPausedSourceKey(sourceKey)) {
+        res.status(409).json({ error: SOURCE_CODE_PAUSED_ERROR_CODE, code: SOURCE_CODE_PAUSED_ERROR_CODE, sourceKey, retryable: false, message: PAUSED_SOURCE_MESSAGE });
+        return;
+      }
       try { sourceRegistryEntry(sourceKey); } catch {
         res.status(400).json({ error: "Unknown source." });
         return;
@@ -168,6 +175,12 @@ export async function handler(req, res, deps = DEFAULT_DEPS) {
       // token estimate / runtime / audit / DataDoe work (no card exists for it; a forged or stale POST lands here).
       if (onlySourceKey && isRetiredSourceKey(onlySourceKey)) {
         res.status(409).json({ error: RETIRED_SOURCE_ERROR_CODE, code: RETIRED_SOURCE_ERROR_CODE, sourceKey: onlySourceKey, retryable: false, message: RETIRED_SOURCE_MESSAGE });
+        return;
+      }
+      // A code-level PAUSED source (Listings (Raw JSON)): typed, NEVER-retryable 409 BEFORE any preview / token estimate /
+      // runtime / audit / DataDoe work.
+      if (onlySourceKey && isPausedSourceKey(onlySourceKey)) {
+        res.status(409).json({ error: SOURCE_CODE_PAUSED_ERROR_CODE, code: SOURCE_CODE_PAUSED_ERROR_CODE, sourceKey: onlySourceKey, retryable: false, message: PAUSED_SOURCE_MESSAGE });
         return;
       }
       if (onlySourceKey) {

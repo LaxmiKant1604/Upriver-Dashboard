@@ -116,6 +116,7 @@ import {
   RETIRED_SOURCE_ERROR_CODE,
   RETIRED_SOURCE_MESSAGE,
 } from "../lib/server/datadoe.js";
+import { isPausedDataDoeSourceId, isPausedSourceError, SOURCE_CODE_PAUSED_ERROR_CODE, PAUSED_SOURCE_MESSAGE } from "../lib/server/source-pause.js";
 import {
   connectionForApiKey,
   decorateDataDoeAccount,
@@ -2614,6 +2615,11 @@ export function classifyDataDoeRouteError(err) {
   if (isRetiredSourceError(err)) {
     return { status: 409, body: { error: RETIRED_SOURCE_MESSAGE, code: RETIRED_SOURCE_ERROR_CODE, retryable: false } };
   }
+  // A code-level PAUSED source (Listings (Raw JSON), lib/server/source-pause.js) refused by createExport: the same typed,
+  // user-readable, NEVER-retryable 409 (no export was created; a retry is refused again while paused).
+  if (isPausedSourceError(err)) {
+    return { status: 409, body: { error: PAUSED_SOURCE_MESSAGE, code: SOURCE_CODE_PAUSED_ERROR_CODE, retryable: false } };
+  }
   if (isDataDoeDeadlineError(err) || isDataDoePollPendingError(err)) {
     return {
       status: 504,
@@ -4137,6 +4143,11 @@ async function handleDataDoe(req, res) {
       // takes a browser-supplied id and POSTs directly (it does not go through createExport).
       if (isRetiredDataDoeSourceId(sourceId)) {
         res.status(409).json({ error: RETIRED_SOURCE_ERROR_CODE, code: RETIRED_SOURCE_ERROR_CODE, sourceId, retryable: false, note: RETIRED_SOURCE_MESSAGE });
+        return;
+      }
+      // A code-level PAUSED source (Listings (Raw JSON) long id or a >= 10-char prefix): typed 409 BEFORE the direct POST.
+      if (isPausedDataDoeSourceId(sourceId)) {
+        res.status(409).json({ error: SOURCE_CODE_PAUSED_ERROR_CODE, code: SOURCE_CODE_PAUSED_ERROR_CODE, sourceId, retryable: false, note: PAUSED_SOURCE_MESSAGE });
         return;
       }
       if (isAdsExportRunnerOnlyForSourceId(sourceId)) {

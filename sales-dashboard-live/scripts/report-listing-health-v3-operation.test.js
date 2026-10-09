@@ -14,6 +14,11 @@ import {
   V3_INGESTION_REGIONS,
 } from "../lib/server/sync/listing-health-v3-operation.js";
 import { readListingHealthV3Authorization, decideListingHealthV3Authorization } from "../lib/server/sync/listing-health-v3-authorization.js";
+import { __setSourcePauseForTests, __resetSourcePauseForTests } from "../lib/server/source-pause.js";
+// Listings (Raw JSON) is code-level PAUSED in production (lib/server/source-pause.js). This suite keeps covering the
+// UNPAUSED (rollback) Listings + Listings-Raw behaviour via the module's test seam; the PAUSED behaviour is asserted at
+// the end of this file (where present) and in scripts/listings-raw-paused.test.js.
+__setSourcePauseForTests({});
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -253,6 +258,29 @@ await (async () => {
   s.runSources = async () => { throw new Error("datadoe boom"); };
   const r = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...s }));
   ok("J: a source-run throw is caught and fails closed at the source phase (LKG preserved, no crash)", r.ok === false && r.phase === "source" && s.calls.materialize === 0);
+})();
+
+/* ===================== P. Listings (Raw JSON) PAUSED (production): Listings-only plan, cost and authorization ===================== */
+__resetSourcePauseForTests();
+await (async () => {
+  const plan = buildListingHealthV3Plan({ accounts: usAccounts, connections, cycleDate });
+  const v3 = plan.reportRequests.filter((r) => r.reportKey === "listing-health-v3");
+  ok("P: while Raw is PAUSED the v3 plan carries ONLY listing-health-v3:listings (zero listings-raw)", v3.length === 2 && v3.every((r) => r.sources.length > 0 && r.sources.every((x) => x.requestKey === "listing-health-v3:listings")));
+  const stale = "2026-09-03T12:00:00.000Z";
+  const costStale = await planListingHealthV3IngestionCost({ plan, getSourceExportCache: async () => ({ fetched_at: stale, rows: [] }) });
+  ok("P: one batch => ONE new Listings create priced PREMIUM 5 (no standard Raw 2)", costStale.newExports === 1 && costStale.creates === 1 && costStale.estimatedTokens === 5);
+  const eleven = Array.from({ length: 11 }, (_, i) => ({ accountId: `uc-${String(i).padStart(2, "0")}`, country: "US", currency: "USD", name: `UC${i}` }));
+  const cost11 = await planListingHealthV3IngestionCost({ plan: buildListingHealthV3Plan({ accounts: eleven, connections, cycleDate }), getSourceExportCache: async () => ({ fetched_at: stale, rows: [] }) });
+  ok("P: 11 US accounts => 3 batches => 3 Listings creates / 15 tokens (was 6 / 21 with Raw)", cost11.newExports === 3 && cost11.creates === 3 && cost11.estimatedTokens === 15);
+  const authz = readListingHealthV3Authorization({ region: "us-ca" });
+  const decision = decideListingHealthV3Authorization({ region: "us-ca", accountCount: 11, requiredCreates: cost11.creates, requiredTokens: cost11.estimatedTokens, authorization: authz });
+  ok("P: the UNCHANGED stored authorization (8 creates / 28 tokens, same pricing revision) stays valid and authorizes the cheaper Listings-only plan", authz.authorized === true && authz.maxCreates === 8 && authz.maxTokens === 28 && decision.ok === true);
+  const s = spies({ cost: { newExports: 1, reusedExports: 0, creates: 1, estimatedTokens: 5, inventoryAdoptable: false } });
+  const r = await runListingHealthV3Ingestion(base({ authorized: true, mode: "dry-run", gate: { enabled: false }, ...s }));
+  ok("P: a dry-run over the paused plan is planned (ceiling = 1 create per batch) with zero creates", r.ok === true && r.phase === "planned" && r.plannedCreates === 1 && r.estimatedTokens === 5 && r.creates === 0);
+  const sBad = spies({ cost: { newExports: 2, reusedExports: 0, creates: 2, estimatedTokens: 7, inventoryAdoptable: false } });
+  const rBad = await runListingHealthV3Ingestion(base({ authorized: true, mode: "live", gate: { enabled: true }, ...sBad }));
+  ok("P: a stale 2-creates-per-batch (Listings + Raw) count exceeds the paused ceiling and fails closed BEFORE any source run", rBad.ok === false && rBad.phase === "ceiling" && sBad.calls.runSources === 0);
 })();
 
 writeSync(1, `\nreport-listing-health-v3-operation: ${passed} assertions passed\n`);

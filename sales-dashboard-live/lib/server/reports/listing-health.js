@@ -34,6 +34,7 @@ import { insightInventory, insightInventoryFields, insightSkuStock } from "./der
 import { asinForSkuFrom } from "./inventory-consumer.js";
 import { listingsQuantity } from "../listings-inventory.js";
 import { LISTINGS, LISTINGS_RAW, PROFIT_BY_SKU, ROW_LIMITS } from "./sources.js";
+import { isListingsRawPaused, LISTINGS_RAW_PAUSED_ISSUES_REASON } from "../source-pause.js";
 
 export const LISTING_HEALTH_REPORT_KEY = "listing-health";
 export const LISTING_HEALTH_VERSION = "listing-health-v1";
@@ -162,7 +163,13 @@ export async function buildListingHealth({ apiKey, ids, to, listings = {} }) {
   let issuesAvailable = true;
   let issuesUnavailableReason = null;
   const rawBySku = new Map();
-  try {
+  // Listings (Raw JSON) PAUSED (lib/server/source-pause.js): the Raw fetch is SKIPPED entirely (no cache read, no
+  // createExport) and issues are reported unavailable with the paused reason -- never zero issues. Every other source
+  // of this report is unchanged.
+  if (isListingsRawPaused()) {
+    issuesAvailable = false;
+    issuesUnavailableReason = LISTINGS_RAW_PAUSED_ISSUES_REASON;
+  } else try {
     const rawRows = await fetchExportRowsStrict(
       apiKey, LISTINGS_RAW.id, LISTING_RAW_COLUMNS, ids, null, null, ROW_LIMITS.listings,
       { orderByColumn: "child_asin", orderByDirection: "ASC" },

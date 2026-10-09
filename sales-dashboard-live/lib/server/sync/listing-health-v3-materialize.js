@@ -23,7 +23,7 @@
 //     reads that batch and only ALIASES the per-account fragment; it never plans, creates, or alters any export or hash.
 //     FBA Inventory Health is RETIRED: there is no inventory family here.
 
-import { reportSourceRequestHashes } from "./report-source-contracts.js";
+import { reportSourceRequestHashes, isPausedRequestKey } from "./report-source-contracts.js";
 import { isolateFragmentRowsForOwner } from "./source-account-isolation.js";
 import { organizationFingerprint as orgFingerprintOf } from "../source-identity.js";
 import { MAX_ACCOUNTS_PER_BATCH } from "./source-batching.js";
@@ -121,6 +121,13 @@ const V3_DURABLE_SOURCE_KEY = Object.freeze({
 // count (not a token maximum): DataDoe reports rowCountBilling=true, so the observed 2-token price is NOT an
 // unconditional maximum -- the defensive gate bounds the number of creates so a plan drift can never fan out exports.
 export const LISTING_HEALTH_V3_NEW_EXPORT_KEYS = Object.freeze(["listing-health-v3:listings", "listing-health-v3:listings-raw"]);
+// The NEW export families v3 may plan / budget / create RIGHT NOW: LISTING_HEALTH_V3_NEW_EXPORT_KEYS minus any code-level
+// PAUSED family (lib/server/source-pause.js). While Listings (Raw JSON) is paused this is ["listing-health-v3:listings"]
+// (one create per <=5-seller batch); a planned paused key is counted as UNPLANNED, so the ceiling gate fails closed on it.
+// Read lazily (a function, never cached at import).
+export function activeListingHealthV3NewExportKeys() {
+  return LISTING_HEALTH_V3_NEW_EXPORT_KEYS.filter((k) => !isPausedRequestKey(k));
+}
 // No reused export family any more (the former FBA Inventory Health reuse is retired). Kept (empty) for shape
 // compatibility of listingHealthV3PlannedExports / the ingestion cost evidence.
 export const LISTING_HEALTH_V3_REUSED_EXPORT_KEYS = Object.freeze([]);
@@ -139,7 +146,7 @@ export function expectedListingHealthV3NewExports(accountCount) {
   const n = Number(accountCount);
   if (!Number.isInteger(n) || n < 0) return null;
   if (n === 0) return 0;
-  return LISTING_HEALTH_V3_NEW_EXPORT_KEYS.length * Math.ceil(n / MAX_ACCOUNTS_PER_BATCH);
+  return activeListingHealthV3NewExportKeys().length * Math.ceil(n / MAX_ACCOUNTS_PER_BATCH);
 }
 
 /**
@@ -151,10 +158,11 @@ export function listingHealthV3PlannedExports(plans) {
   const newHashes = new Set();
   const reusedHashes = new Set();
   const unplanned = new Set();
+  const activeNew = activeListingHealthV3NewExportKeys(); // a PAUSED family (Listings (Raw JSON)) is unplanned -> fail closed
   for (const plan of plans || []) {
     if (!plan || plan.reportKey !== "listing-health-v3") continue;
     for (const s of plan.sources || []) {
-      if (LISTING_HEALTH_V3_NEW_EXPORT_KEYS.includes(s.requestKey)) newHashes.add(s.requestHash);
+      if (activeNew.includes(s.requestKey)) newHashes.add(s.requestHash);
       else if (LISTING_HEALTH_V3_REUSED_EXPORT_KEYS.includes(s.requestKey)) reusedHashes.add(s.requestHash);
       else unplanned.add(String(s.requestKey));
     }
@@ -175,7 +183,7 @@ export function listingHealthV3PlannedExports(plans) {
 export function assertListingHealthV3ExportCeiling({ region, plans, accountCount = null, ceiling = null }) {
   const counts = listingHealthV3PlannedExports(plans);
   if (counts.unplannedRequestKeys.length) {
-    throw new Error(`listing-health-v3 plan for region "${region}" carries request key(s) ${counts.unplannedRequestKeys.join(", ")} outside listings + listings-raw; refusing (fail closed).`);
+    throw new Error(`listing-health-v3 plan for region "${region}" carries request key(s) ${counts.unplannedRequestKeys.join(", ")} outside the active v3 export families (${activeListingHealthV3NewExportKeys().join(", ")}); refusing (fail closed).`);
   }
   const computed = expectedListingHealthV3NewExports(accountCount);
   let cap = ceiling != null ? Number(ceiling) : computed;
@@ -186,7 +194,7 @@ export function assertListingHealthV3ExportCeiling({ region, plans, accountCount
   }
   if (counts.newExports > cap) {
     const basis = computedFromAccounts
-      ? `the computed ceiling ${cap} (2 x ceil(${accountCount} eligible accounts / ${MAX_ACCOUNTS_PER_BATCH}))`
+      ? `the computed ceiling ${cap} (${activeListingHealthV3NewExportKeys().length} x ceil(${accountCount} eligible accounts / ${MAX_ACCOUNTS_PER_BATCH}))`
       : `the ceiling ${cap}`;
     throw new Error(`listing-health-v3 planned ${counts.newExports} new Listings/Listings-Raw exports for region "${region}" exceeds ${basis}; refusing to create (drift, fail closed).`);
   }
@@ -303,6 +311,9 @@ export async function materializeListingHealthV3PerAccount({ plans = [], connect
 
     for (const src of plan.sources || []) {
       if (!LISTING_HEALTH_V3_READ_KEYS.includes(src.requestKey)) continue;
+      // A code-level PAUSED family (Listings (Raw JSON)) never gets a NEW per-account alias or durable pointer while
+      // paused (no planner emits it; this is defence in depth). Existing saved aliases / pointers are left untouched.
+      if (isPausedRequestKey(src.requestKey)) continue;
       const ident = identities[src.requestKey];
       if (!ident || !ident.requestHash) continue;
       const t0 = clock();

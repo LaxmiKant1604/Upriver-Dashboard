@@ -14,7 +14,7 @@
 // No other adapter (Keyword Rank, insight reports) is started.
 
 import { resolveDataDoeAccountIds, classifyDirectoryAccounts } from "../datadoe-connections.js";
-import { reportSourceRequestHashes, REPORT_SOURCE_CONTRACTS, evaluateFallbackCondition, evaluateStagedActivation, evaluateAdsCurrencyGate, salesMoversWindows, isValidCalendarDate } from "./report-source-contracts.js";
+import { reportSourceRequestHashes, isPausedRequestKey, REPORT_SOURCE_CONTRACTS, evaluateFallbackCondition, evaluateStagedActivation, evaluateAdsCurrencyGate, salesMoversWindows, isValidCalendarDate } from "./report-source-contracts.js";
 import { REPORT_DERIVATIONS } from "./report-derivation.js";
 import { monthBackStr, monthStartStr, splitDateRangeByMonth, sixCompleteCalendarMonths, planMonthWindows, addDaysStr, splitDateRangeByDays, canonicalOliSlices } from "../date-windows.js";
 import { bucketForCountry } from "./registry.js";
@@ -536,8 +536,10 @@ export function planListingHealthV3BucketBatched({ accounts = [], connections, a
         for (const m of owners) sourcesByAccount.get(m.scope.accountId).push(...sources);
       }
     };
-    // Contract order preserved (listings, listings-raw). (No inventory source: FBA Inventory Health is retired.)
-    buildSourcesInto(batches, ["listing-health-v3:listings", "listing-health-v3:listings-raw"]);
+    // Contract order preserved (listings, listings-raw). (No inventory source: FBA Inventory Health is retired.) A
+    // code-level PAUSED family (Listings (Raw JSON), lib/server/source-pause.js) is dropped here, so the dedicated plan
+    // keeps EXACTLY its canonical Listings batches (the same hashes as fba-plan:awd) and plans/budgets ZERO Raw exports.
+    buildSourcesInto(batches, ["listing-health-v3:listings", "listing-health-v3:listings-raw"].filter((k) => !isPausedRequestKey(k)));
     for (const m of members) {
       requests.push({
         reportKey: "listing-health-v3",
@@ -853,10 +855,13 @@ export function planListingHealth({ accountId, country, currency, connections, a
     "listing-health:sales": [{ from: salesFrom, to: end }],
     "listing-health:catalog": [{ from: null, to: null }],
   };
+  // A code-level PAUSED family (Listings (Raw JSON), lib/server/source-pause.js) is dropped from the plan (its optional
+  // window is still resolved so the contract stays verifiable): ZERO Raw jobs; the derive then reports issues as
+  // unavailable with the paused reason. Every other source is unchanged.
   const sources = reportSourceRequestHashes({
     reportKey: "listing-health", apiKey: scope.apiKey, ids: [scope.rawSellerId],
     windowsByRequestKey, marketplaceCountry: scope.country,
-  });
+  }).filter((s) => !isPausedRequestKey(s.requestKey));
   return {
     reportKey: "listing-health",
     reportVersion: REPORT_DERIVATIONS["listing-health"].snapshotVersion,

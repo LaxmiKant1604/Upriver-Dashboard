@@ -10,6 +10,11 @@ import { createHash } from "node:crypto";
 import { planListingHealthV3BucketBatched } from "../lib/server/sync/report-planner.js";
 import { materializeListingHealthV3PerAccount } from "../lib/server/sync/listing-health-v3-materialize.js";
 import { LISTINGS_SOURCE_KEY, LISTINGS_RAW_SOURCE_KEY } from "../lib/server/sync/source-durable-model.js";
+import { __setSourcePauseForTests, __resetSourcePauseForTests } from "../lib/server/source-pause.js";
+// Listings (Raw JSON) is code-level PAUSED in production (lib/server/source-pause.js). This suite keeps covering the
+// UNPAUSED (rollback) Listings + Listings-Raw behaviour via the module's test seam; the PAUSED behaviour is asserted at
+// the end of this file (where present) and in scripts/listings-raw-paused.test.js.
+__setSourcePauseForTests({});
 
 let passed = 0;
 const ok = (n, c) => { assert.ok(c, n); passed += 1; writeSync(1, `  ok ${n}\n`); };
@@ -226,6 +231,20 @@ ok("LISTINGS_SOURCE_KEY / LISTINGS_RAW_SOURCE_KEY match the migration table sour
   seedBatch(cache, p, { listings: SELLERS.map((s) => listingRow(s, "K1")), raw: SELLERS.map((s) => rawRow(s, "K1")) }); // inventory intentionally ABSENT
   const sum = await run(cache, d);
   ok("11: Listings + Listings-Raw both persist with NO OLI/Catalog present (persistence is source-decoupled; no inventory read key exists since the Listings cutover)", d.count(LISTINGS_SOURCE_KEY) === 2 && d.count(LISTINGS_RAW_SOURCE_KEY) === 2 && sum.durableWritten === 4 && sum.batchMissing === 0);
+}
+
+// ---- (P) Listings (Raw JSON) PAUSED (production): only the Listings pointer is persisted; an existing Raw pointer is untouched ----
+__resetSourcePauseForTests();
+{
+  const cache = makeCache(); const d = makeDurable(); const p = plans();
+  // A pre-pause Raw pointer already stored for acct-00 must stay EXACTLY as it was (never deleted / rewritten).
+  const org0 = p[0].owner.organizationFingerprint;
+  const oldRaw = { organization_fingerprint: org0, connection_id: "primary", account_id: "acct-00", marketplace: "US", source_key: LISTINGS_RAW_SOURCE_KEY, as_of: "2026-08-30", object_path: "old/raw.json", payload_sha: "oldsha", row_count: 1, payload_bytes: 10, source_request_hash: "old-raw-hash", validated_at: "2026-08-30T06:00:00.000Z" };
+  d.pointers.set([LISTINGS_RAW_SOURCE_KEY, org0, "primary", "acct-00"].join("|"), { ...oldRaw });
+  seedBatch(cache, p, { listings: SELLERS.flatMap((s) => [listingRow(s, "K1"), listingRow(s, "K2")]), raw: SELLERS.map((s) => rawRow(s, "K1")) });
+  const sum = await run(cache, d, { plans: p });
+  ok("P: while Raw is PAUSED the plan has no listings-raw source and only Listings pointers are written (2), zero new Raw pointers", p.every((r) => r.sources.every((s) => s.requestKey === "listing-health-v3:listings")) && d.count(LISTINGS_SOURCE_KEY) === 2 && d.count(LISTINGS_RAW_SOURCE_KEY) === 1 && sum.durableWritten === 2);
+  ok("P: the pre-pause saved Raw pointer is left byte-identical (stored + readable, never deleted or rewritten)", JSON.stringify(d.ptrOf(LISTINGS_RAW_SOURCE_KEY, org0, "acct-00")) === JSON.stringify(oldRaw));
 }
 
 writeSync(1, `\nlistings-durable-model: ${passed} assertions passed\n`);

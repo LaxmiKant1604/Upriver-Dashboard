@@ -29,9 +29,15 @@ import { getDataDoeTokenBalance } from "../datadoe-usage.js";
 import { discoverPrimaryAccountIds } from "./priority-control-pg-store.js";
 import { buildListingHealthV3Plan, planListingHealthV3IngestionCost } from "./listing-health-v3-operation.js";
 import { materializeListingHealthV3PerAccount, LISTING_HEALTH_V3_REGION_EXPORT_CEILING, expectedListingHealthV3NewExports } from "./listing-health-v3-materialize.js";
+import { isPausedSourceKey } from "../source-pause.js";
 
 // The ONLY source families a v3 ingestion ever runs (and may create): the canonical Listings + Listings-Raw.
 const V3_NEW_SOURCE_KEYS = Object.freeze(["listings", "listings-raw"]);
+// The families this run may actually create: V3_NEW_SOURCE_KEYS minus any code-level PAUSED family
+// (lib/server/source-pause.js). While Listings (Raw JSON) is paused this is ["listings"]: the frozen tranche, the drift
+// guard and the unplannedCreated guard all count Listings only, so a Raw create is a contract violation (fail closed)
+// and the Listings-only cycle can finalize 'succeeded'. Read lazily (never cached at import).
+export function activeV3NewSourceKeys() { return V3_NEW_SOURCE_KEYS.filter((k) => !isPausedSourceKey(k)); }
 
 // The dedicated per-region cycle namespace -- NEVER collides with the scheduler-v2 daily (region, cycle_date) cycle.
 export function listingHealthV3CycleBucket(region) { return `listing-health-v3-${String(region)}`; }
@@ -115,7 +121,7 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
 
   // The frozen NEW-tranche budget (listings + listings-raw -- the only v3 source families), computed WITHOUT persisting.
   // The operation binds the standing authorization to exactly this (fingerprint + hashes + ceilings) BEFORE paid work.
-  const newTranche = (region) => makeSourceTranche({ sourceKeys: [...V3_NEW_SOURCE_KEYS], name: `lhv3-new#${region}` });
+  const newTranche = (region) => makeSourceTranche({ sourceKeys: activeV3NewSourceKeys(), name: `lhv3-new#${region}` });
   const freezeBudget = ({ plan, region }) => {
     const plannedJobs = resolveFromGenericPlan(plan)().sourceJobs;
     return computeFrozenTrancheBudget({ plannedJobs, sourceTranche: newTranche(region), isPremiumOf: budgetPlanner.isPremiumOf, trancheKey: `lhv3-new#${region}` });
@@ -170,7 +176,7 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     // frozen tranche budget + the atomic pre-POST reservation, never a fabricated 0-expectation that would refuse
     // a legitimate plan.
     if (expectedNew != null && acctIds.size > 0 && frozen.maxCreates > expectedNew) {
-      throw new Error(`listing-health-v3 ingestion: frozen create count ${frozen.maxCreates} exceeds the structural expectation ${expectedNew} (2 x ceil(${acctIds.size} accounts / 5)) -- drift, fail closed.`);
+      throw new Error(`listing-health-v3 ingestion: frozen create count ${frozen.maxCreates} exceeds the structural expectation ${expectedNew} (${activeV3NewSourceKeys().length} x ceil(${acctIds.size} accounts / 5)) -- drift, fail closed.`);
     }
     // Persist the frozen budget on the namespaced cycle BEFORE any create (idempotent).
     const cycleId = await runtime.store.openCycle({ bucket: cycleBucket, cycleDate, trigger: "manual" });
@@ -204,7 +210,8 @@ export function buildListingHealthV3IngestionRelease(overrides = {}) {
     const tokens = createdNewJobs.reduce((sum, j) => sum + (tokenCostByHash.get(j.request_hash ?? j.requestHash) || 0), 0);
     // STRUCTURAL GUARD: any created job of a source family OTHER than listings / listings-raw (e.g. the retired FBA
     // Inventory Health) is a contract violation the operator fails closed on.
-    const unplannedCreated = jobs.some((j) => !V3_NEW_SOURCE_KEYS.includes(String(j.source_key ?? j.sourceKey ?? "")) && created(j));
+    const activeKeys = activeV3NewSourceKeys();
+    const unplannedCreated = jobs.some((j) => !activeKeys.includes(String(j.source_key ?? j.sourceKey ?? "")) && created(j));
     return {
       cycleId: p1.cycleId || cycleId,
       drained: !!p1.drained,

@@ -29,6 +29,7 @@
 
 import { sourceRequestIdentity } from "../source-identity.js";
 import { sourceContractForKey } from "../source-contracts.js";
+import { isPausedSourceKey } from "../source-pause.js";
 import { chunkAccountIds } from "../id-batching.js";
 // addDaysStr for the derived Sales Movers windows; the strict calendar-month helpers
 // (splitDateRangeByMonth / isFullCalendarMonthWindow) are the SAME helpers the production
@@ -1099,6 +1100,22 @@ export function declaredReportKeys() {
 export function declaredRequestKeys(reportKey) {
   const contracts = REPORT_SOURCE_CONTRACTS[reportKey];
   return contracts ? contracts.map((c) => c.requestKey) : null;
+}
+
+// The source family a declared request key fetches (null for an undeclared key).
+export function requestKeySourceKey(requestKey) {
+  const rk = String(requestKey || "");
+  for (const contracts of Object.values(REPORT_SOURCE_CONTRACTS)) {
+    for (const c of contracts) if (c.requestKey === rk) return c.sourceKey;
+  }
+  return null;
+}
+
+// True when a declared request key fetches a code-level PAUSED source (lib/server/source-pause.js -- Listings (Raw JSON)):
+// planners drop such a window, and the Listing Health v3 export ceiling / ingestion count only the remaining families.
+// The contract itself stays declared (its request identity is still described / hash-verifiable); only planning stops.
+export function isPausedRequestKey(requestKey) {
+  return isPausedSourceKey(requestKeySourceKey(requestKey));
 }
 
 export function reportSourceCoverage(reportKey) {

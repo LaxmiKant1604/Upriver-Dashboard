@@ -387,7 +387,8 @@ await (async () => {
     baseL.map((s) => s.sellerOrVendorIds.length).sort((a, b) => a - b).join(",") === "3,5"
     && JSON.stringify(withOverflow.map((s) => s.requestHash).sort()) === JSON.stringify(baseL.map((s) => s.requestHash).sort()));
   const v3 = planner.planListingHealthV3BucketBatched({ accounts: IN8, connections: conns, asOfFor: () => asOf, inventoryAsOf: asOf });
-  ok("G: the v3 plan carries no inventory (Health) request -- listings + listings-raw only", keysOf(v3).join(",") === "listing-health-v3:listings,listing-health-v3:listings-raw");
+  // Listings (Raw JSON) is code-level PAUSED (lib/server/source-pause.js): the v3 plan carries the canonical Listings only.
+  ok("G: the v3 plan carries no inventory (Health) request and, while Listings (Raw JSON) is paused, no listings-raw -- listings only", keysOf(v3).join(",") === "listing-health-v3:listings");
   ok("G: READINESS_PROTECTED_REQUEST_KEYS is the WIRED set -- OLI only (the retired Health identity is not protected; Listings is never split)",
     JSON.stringify([...iso.READINESS_PROTECTED_REQUEST_KEYS]) === JSON.stringify(["source-oli:slice-v1"]));
 })();

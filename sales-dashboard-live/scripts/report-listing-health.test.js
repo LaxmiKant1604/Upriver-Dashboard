@@ -39,6 +39,10 @@ const DEGRADED = { disabledSource: "degraded", safeCode: "SOURCE_DISABLED", repo
 const TERMINAL = { disabledSource: "terminal", safeCode: "SOURCE_DISABLED", reportOutcome: "blocked" };
 
 let SALES_FROM, INV_FROM; // computed in main()
+// Listings (Raw JSON) is code-level PAUSED in production (lib/server/source-pause.js). Tests 1-32 keep covering the UNPAUSED
+// (rollback) Raw behaviour via the module's test seam (set in main()); the P-tests below re-apply the real pause.
+let SOURCE_PAUSE;
+const withRealPause = async (fn) => { SOURCE_PAUSE.__resetSourcePauseForTests(); try { return await fn(); } finally { SOURCE_PAUSE.__setSourcePauseForTests({}); } };
 
 let hashSeq = 0;
 const frag = (requestKey, from, to, ids = [ID], extra = {}) => ({ requestKey, requestHash: "h" + (hashSeq += 1), from, to, sellerOrVendorIds: ids, ...extra });
@@ -709,7 +713,34 @@ test("32. primary-only: a stale dd-secondary account is skipped read-only with Z
   assert.equal(jobs.length, 4, "exactly the four primary-account canonical jobs ran (no Health job)");
 });
 
+group("P. Listings (Raw JSON) PAUSED (production)");
+test("P1. while Raw is PAUSED the listing-health plan has ZERO listings-raw jobs: exactly THREE canonical jobs (listings, sales, catalog), other sources unchanged", () => withRealPause(() => {
+  const plan = shadowPlan(ACCTS, ["listing-health"]);
+  const lh = plan.reportRequests.find((r) => r.reportKey === "listing-health");
+  assert.equal(srcOf(plan, "listing-health:listings-raw"), undefined, "no listings-raw source while paused");
+  assert.equal(plan.sourceJobs.length, 3, "exactly three deduplicated canonical source jobs");
+  assert.deepEqual(lh.sources.map((x) => x.requestKey).sort(), ["listing-health:catalog", "listing-health:listings", "listing-health:sales"]);
+  assert.ok(plan.sourceJobs.every((j) => String(j.sourceId || j.source_id || "").toLowerCase() !== "6ea445cdc459f9fbb9517c5c009384da60ef31a1e70d4de9187ea3d4c28535c4"), "the Raw source id is never planned");
+  assert.deepEqual([srcOf(plan, "listing-health:sales").from, srcOf(plan, "listing-health:sales").to], [SALES_FROM, ASOF], "the sales window is unchanged");
+}));
+test("P2. while Raw is PAUSED the derive ignores even a VALIDATED saved Raw fragment: issuesAvailable false + the PAUSED reason (never the enable hint, never zero issues)", () => withRealPause(async () => {
+  const fx = FIXTURE();
+  const res = await deriveLH(lhPlanned({ listings: fx.listings, raw: fx.raw, sales: fx.sales, inventory: fx.inventory, catalog: fx.catalog }));
+  assert.equal(res.status, "derived");
+  assert.equal(res.payload.issuesAvailable, false);
+  assert.match(res.payload.issuesUnavailableReason, /Listings \(Raw JSON\) is paused/);
+  assert.notEqual(res.payload.issuesUnavailableReason, ENABLE_HINT);
+  assert.ok(res.payload.rows.every((r) => Array.isArray(r.issues) && r.issues.length === 0 && r.summary === null && r.hasLiveOffer === null), "no Raw-derived issue / summary / live-offer is presented");
+  // Raw missing entirely (the paused plan has no Raw job) derives the same way -- never 'unavailable' / LKG-blocked.
+  const none = await deriveLH(lhPlanned({ listings: fx.listings, sales: fx.sales, inventory: fx.inventory, catalog: fx.catalog, rawState: "missing" }));
+  assert.equal(none.status, "derived");
+  assert.equal(none.payload.issuesAvailable, false);
+  assert.equal(none.payload.issuesUnavailableReason, res.payload.issuesUnavailableReason);
+}));
+
 async function main() {
+  SOURCE_PAUSE = await import("../lib/server/source-pause.js");
+  SOURCE_PAUSE.__setSourcePauseForTests({});
   ({ assembleSources, runReportJobs } = await import("../lib/server/sync/report-worker.js"));
   ({ deriveReportSnapshot } = await import("../lib/server/sync/report-derivation.js"));
   ({ runSourceJobs } = await import("../lib/server/sync/source-worker.js"));

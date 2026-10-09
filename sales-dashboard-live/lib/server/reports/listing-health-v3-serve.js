@@ -24,6 +24,7 @@ import { organizationFingerprint as orgFingerprintOf } from "../source-identity.
 import { getEnrichedOliHistoryRows } from "../sync/oli-enriched-history.js";
 import { getSourceCoverageWindows, getOliCompleteness, getSourceSnapshot, getSourceSnapshotPayload, getSourceExportCache } from "../supabase.js";
 import { readSavedHealthBridge } from "./health-bridge.js";
+import { isListingsRawPaused, LISTINGS_RAW_PAUSED_ISSUES_REASON, LISTINGS_RAW_PAUSED_REASON_CODE } from "../source-pause.js";
 
 const S = (v) => (v == null ? "" : String(v));
 
@@ -123,7 +124,10 @@ export async function serveListingHealthV3Preview({ owner, identity, windowContr
     } catch (_e) { return null; }
   };
   const listingRows = await readSaved("listing-health-v3:listings");
-  const rawRows = await readSaved("listing-health-v3:listings-raw");
+  // Listings (Raw JSON) PAUSED (lib/server/source-pause.js): the saved Raw alias is NOT read (it stays stored) -- a
+  // possibly stale Raw snapshot is never presented as current issue evidence; issues are Unavailable (paused reason).
+  const rawPaused = isListingsRawPaused();
+  const rawRows = rawPaused ? null : await readSaved("listing-health-v3:listings-raw");
   const metaOf = (rk) => savedMeta[rk] || {};
   // 3b) The account's LAST SAVED durable FBA Inventory Health snapshot -- the dated READ-ONLY bridge (never an export,
   //     never a cache adoption). Whether it may drive On-Hand FBA is decided by buildAdvancedListingHealth (validated
@@ -140,7 +144,7 @@ export async function serveListingHealthV3Preview({ owner, identity, windowContr
   try {
     // Availability is the actual hydrated rows (Array.isArray), NOT savedMeta presence -- an injected plain-array
     // reader (tests) has no savedMeta yet still has rows, so keying off savedMeta would falsely log everything missing.
-    const missing = [["listing-health-v3:listings", listingRows], ["listing-health-v3:listings-raw", rawRows], ["fba-inventory-health (saved bridge)", inventoryRows]]
+    const missing = [["listing-health-v3:listings", listingRows], ...(rawPaused ? [] : [["listing-health-v3:listings-raw", rawRows]]), ["fba-inventory-health (saved bridge)", inventoryRows]]
       .filter(([, v]) => !Array.isArray(v)).map(([rk]) => rk);
     if (missing.length && typeof console !== "undefined" && console.warn) {
       console.warn(JSON.stringify({ evt: "lhv3.serve.unavailable_fragments", accountId, marketplace: owner.marketplace || null, missing }));
@@ -159,7 +163,8 @@ export async function serveListingHealthV3Preview({ owner, identity, windowContr
     catalogRows,
     rawRows: Array.isArray(rawRows) ? rawRows : [],
     issuesAvailable,
-    issuesUnavailableReason: issuesAvailable ? null : "Listings (Raw JSON) evidence is not yet saved for this account (populated when v3 ingestion is scheduled).",
+    issuesUnavailableReason: issuesAvailable ? null : (rawPaused ? LISTINGS_RAW_PAUSED_ISSUES_REASON : "Listings (Raw JSON) evidence is not yet saved for this account (populated when v3 ingestion is scheduled)."),
+    ...(rawPaused ? { issuesUnavailableCode: LISTINGS_RAW_PAUSED_REASON_CODE } : {}),
     inventoryUnavailableReason: Array.isArray(inventoryRows) ? null : (bridge.unavailableReason || "health-snapshot-missing"),
     // Honest per-fragment provenance so the read-only UI shows each row's evidence source + as-of and labels stale
     // evidence. `*FetchedAt` is the truer EFFECTIVE date (the batch's real download time, batchFetchedAt) falling back

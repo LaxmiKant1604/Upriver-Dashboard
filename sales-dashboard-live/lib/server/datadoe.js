@@ -14,6 +14,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { marketplaceProfile } from "../marketplaces.js";
 import { cacheHoursForSource } from "./source-contracts.js";
+import { assertSourceNotPaused } from "./source-pause.js";
 // The canonical source request identity (request_hash) lives in a shared module so
 // the scheduler can compute the same hash without this DataDoe/report module graph.
 // Byte-identical to the previous in-file implementation: the source cache stays valid.
@@ -280,6 +281,10 @@ export function assertSourceNotRetired(sourceId) {
 
 export async function createExport(apiKey, sourceId, columns, sellerOrVendorIds, from, to, limit, options = {}) {
   assertSourceNotRetired(sourceId); // a retired source is refused before authorization or any network call
+  // A code-level PAUSED source (Listings (Raw JSON), lib/server/source-pause.js) is refused here too -- typed
+  // LISTINGS_RAW_PAUSED, non-retryable, before authorization or any network call. fetchExportRows deliberately does NOT
+  // refuse before its cache (saved rows stay readable); a cache miss reaches this create and is refused here.
+  assertSourceNotPaused(sourceId);
   const { groupBy, aggregations, orderByColumn = "date", orderByDirection = "ASC" } = options;
   const r = await ddFetch(ENDPOINTS.exportsCreate, {
     method: "POST",
@@ -481,6 +486,11 @@ async function fetchSourceChunk(apiKey, sourceId, columns, ids, from, to, limit,
       return persisted.rows;
     }
   }
+
+  // A code-level PAUSED source (Listings (Raw JSON)): its SAVED rows above stay readable, but a cache miss is refused
+  // HERE -- before the in-flight share, the manual continuation marker claim and the create (zero marker writes, zero
+  // POSTs). createExport refuses it as well (defence in depth for every other caller).
+  assertSourceNotPaused(sourceId);
 
   const existing = sourceExportInflight.get(identity.requestHash);
   if (existing) return existing;

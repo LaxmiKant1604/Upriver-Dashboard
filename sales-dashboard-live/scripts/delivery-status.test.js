@@ -268,7 +268,19 @@ function baseDeps(over = {}) {
 {
   const noOrg = baseDeps({ primaryOrganizationFingerprint: () => null }).deps;
   const p = await loadDeliveryStatus({ region: "us-ca" }, noOrg);
-  ok("[#13] no org identity -> all per-account source evidence Unavailable (never Yes)", p.accounts.every((a) => a.reports.every((r) => r.exportStatus === "Unavailable")) && p.notes.some((n) => /organization identity/i.test(n)));
+  // Listings (Raw JSON) is code-level PAUSED (lib/server/source-pause.js): its column is "Paused" (never Yes), every other
+  // source column is Unavailable.
+  ok("[#13] no org identity -> all per-account source evidence Unavailable (never Yes); the paused Listings Raw column is Paused", p.accounts.every((a) => a.reports.every((r) => (r.sourceKey === "listings-raw" ? r.exportStatus === "Paused" : r.exportStatus === "Unavailable"))) && p.notes.some((n) => /organization identity/i.test(n)));
+}
+
+// [P] Listings (Raw JSON) PAUSED: the Listings Raw column is labelled paused, its saved validated_at is NOT presented as
+// current (null), it has no expected publication, and the account remark is never blamed on it.
+{
+  const p = await loadDeliveryStatus({ region: "us-ca" }, baseDeps().deps);
+  const rawCells = p.accounts.map((a) => a.reports.find((r) => r.sourceKey === "listings-raw"));
+  ok("[P] the paused Listings Raw column: label '(paused)', exportStatus Paused, validatedAt null, safeCode LISTINGS_RAW_PAUSED, publish Not applicable",
+    rawCells.length > 0 && rawCells.every((r) => r.label === "Listings Raw (paused)" && r.exportStatus === "Paused" && r.validatedAt === null && r.safeCode === "LISTINGS_RAW_PAUSED" && r.publishStatus === "Not applicable" && r.dependentReports.length === 0));
+  ok("[P] no account remark names the paused Listings Raw column", p.accounts.every((a) => !/Listings Raw/.test(String(a.remark || ""))));
 }
 
 // [#15] full happy path: a correct-version live row with a fresh as_of yields Publish Yes for that report's source.

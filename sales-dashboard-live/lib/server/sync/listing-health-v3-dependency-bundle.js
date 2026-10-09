@@ -22,6 +22,7 @@
 import { createHash } from "node:crypto";
 import { LISTINGS_SOURCE_KEY, LISTINGS_RAW_SOURCE_KEY, FBA_INVENTORY_SOURCE_KEY } from "./source-durable-model.js";
 import { isValidRfc3339Timestamp } from "../rfc3339-timestamp.js";
+import { isListingsRawPaused } from "../source-pause.js";
 
 const S = (v) => (v == null ? "" : String(v));
 const nb = (v) => S(v).trim() !== "";
@@ -216,7 +217,12 @@ export async function resolveListingHealthV3DependencyBundle(deps = {}, args = {
   }
   const l = await proveAndHydrate(readListingsSnapshot, LISTINGS_SOURCE_KEY);
   if (l.reason) return miss(l.reason);
-  const r = await proveAndHydrate(readListingsRawSnapshot, LISTINGS_RAW_SOURCE_KEY);
+  // Listings (Raw JSON) PAUSED (lib/server/source-pause.js): the Raw pointer is NOT required (a missing pointer never
+  // defers) and NOT read or used (a saved, possibly stale pointer is never adopted as current issue evidence -- it stays
+  // stored, untouched). The derive then reports issues unavailable with the paused reason. The fingerprint folds a
+  // stable PAUSED sentinel in place of the Raw pointer, so pause <-> unpause always flips the revision (re-derive).
+  const rawPaused = isListingsRawPaused();
+  const r = rawPaused ? { snapshot: null, rows: null } : await proveAndHydrate(readListingsRawSnapshot, LISTINGS_RAW_SOURCE_KEY);
   if (r.reason) return miss(r.reason);
 
   // --- OPTIONAL saved FBA Inventory Health BRIDGE (Listings inventory CUTOVER; blockers 3 + 4 integrity kept): no Health
@@ -283,11 +289,13 @@ export async function resolveListingHealthV3DependencyBundle(deps = {}, args = {
   };
   // Both row_counts are proven ACTUAL numbers (=== their hydrated rows.length) by proveAndHydrate above -> compare
   // DIRECTLY (no Number(...) re-coercion).
-  const status = l.snapshot.row_count === 0 && r.snapshot.row_count === 0 ? LISTING_HEALTH_V3_BUNDLE_STATUS.PROVEN_EMPTY : LISTING_HEALTH_V3_BUNDLE_STATUS.AVAILABLE;
+  const status = l.snapshot.row_count === 0 && (rawPaused || r.snapshot.row_count === 0) ? LISTING_HEALTH_V3_BUNDLE_STATUS.PROVEN_EMPTY : LISTING_HEALTH_V3_BUNDLE_STATUS.AVAILABLE;
   const fp = fingerprintListingHealthV3Bundle({
     organizationFingerprint, connectionId, accountId, marketplace, requestedAsOf,
     listings: { sourceRequestHash: l.snapshot.source_request_hash, payloadSha: l.snapshot.payload_sha, asOf: l.snapshot.as_of, validatedAt: l.snapshot.validated_at },
-    listingsRaw: { sourceRequestHash: r.snapshot.source_request_hash, payloadSha: r.snapshot.payload_sha, asOf: r.snapshot.as_of, validatedAt: r.snapshot.validated_at },
+    listingsRaw: rawPaused
+      ? { sourceRequestHash: "PAUSED", payloadSha: "PAUSED", asOf: "", validatedAt: "" }
+      : { sourceRequestHash: r.snapshot.source_request_hash, payloadSha: r.snapshot.payload_sha, asOf: r.snapshot.as_of, validatedAt: r.snapshot.validated_at },
     catalogPayloadSha: durableCatalog.payloadSha, catalogValidatedAt: durableCatalog.validatedAt, inventoryToken, oliDigests, status,
   });
 
@@ -301,7 +309,7 @@ export async function resolveListingHealthV3DependencyBundle(deps = {}, args = {
     // canonicalizes UK->GB exactly as the row compare does, so an account directory that labels GB as "UK" still matches.
     marketCountry: marketplace,
     listingsFetchedAt: S(l.snapshot.validated_at) || null,
-    rawFetchedAt: S(r.snapshot.validated_at) || null,
+    rawFetchedAt: rawPaused ? null : (S(r.snapshot.validated_at) || null),
     inventoryFetchedAt: inventorySnapshot ? (S(inventorySnapshot.validated_at) || null) : null,
     catalogFetchedAt: S(durableCatalog.validatedAt) || null,
     listingHealthV3DurableOli: durableOli,

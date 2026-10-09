@@ -756,7 +756,10 @@ export function buildListingHealthV3Insights(payload, selectedBrand = null) {
   const freshness = freshnessNote({
     sourceLabel: "durable OLI window + latest saved listing snapshot",
     asOf,
-    extra: payload.issuesAvailable ? null : "Buyable/Discoverable/issue evidence not yet saved",
+    // Listings (Raw JSON) PAUSED: say so (never "not yet saved"); Listings-only alerts still appear below.
+    extra: payload.issuesAvailable ? null : (payload.issuesUnavailableCode === "listings-raw-paused"
+      ? "Buyable/Discoverable/issue evidence unavailable (Listings (Raw JSON) is paused)"
+      : "Buyable/Discoverable/issue evidence not yet saved"),
   });
   // Severity share = an item's exposure as a fraction of the ACCOUNT/brand window sales -- so the denominator is the
   // window sales across ALL rows (not just at-risk rows). Using r.sales (set for every row) mirrors the v1 and Buy Box
